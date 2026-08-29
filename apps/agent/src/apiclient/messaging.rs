@@ -310,6 +310,39 @@ pub(crate) struct GetMessagingCallStateRequest<'a> {
     pub place_id: Option<&'a str>,
 }
 
+/// Search only messages already visible to the authenticated participant.
+/// Visibility and optional place scoping are enforced by Messaging itself.
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchMessagingRequest<'a> {
+    pub query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationPlace<'a> {
+    pub place_id: &'a str,
+    pub level: &'a str,
+}
+
+/// Read or partially update the authenticated participant's notification
+/// setting. No fields means read; fields that are absent must stay absent on
+/// the wire so the server can preserve their current values.
+#[derive(Debug, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MessagingNotificationSettingsRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults_level: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_place: Option<Vec<MessagingNotificationPlace<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<&'a str>>,
+}
+
 #[async_trait]
 pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
     async fn overview(&self, scope: &ExactMessagingScope) -> Result<Value>;
@@ -372,6 +405,18 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         &self,
         scope: &ExactMessagingScope,
         request: GetMessagingCallStateRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn search(
+        &self,
+        scope: &ExactMessagingScope,
+        request: SearchMessagingRequest<'_>,
+    ) -> Result<Value>;
+
+    async fn notification_settings(
+        &self,
+        scope: &ExactMessagingScope,
+        request: MessagingNotificationSettingsRequest<'_>,
     ) -> Result<Value>;
 }
 

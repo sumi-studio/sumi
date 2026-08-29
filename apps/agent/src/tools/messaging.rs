@@ -24,9 +24,10 @@ use crate::{
     apiclient::messaging::{
         CreateMessagingReplyLaterRequest, ExactMessagingScope, GetMessagingCallStateRequest,
         MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        MessagingNotificationPlace, MessagingNotificationSettingsRequest,
         OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
         ReactMessagingReactionRequest, ReadMessagingThroughRequest,
-        ResolveMessagingReplyLaterRequest, SetMessagingStatusRequest,
+        ResolveMessagingReplyLaterRequest, SearchMessagingRequest, SetMessagingStatusRequest,
         UploadMessagingAttachmentRequest, WriteMessagingMessageRequest,
     },
     approval::authority::MessagingSourceSigningContinuation,
@@ -63,6 +64,11 @@ const MAX_REPLY_LATER_NOTE_CHARS: usize = 500;
 const DEFAULT_OPEN_LIMIT: usize = 20;
 // A week, matching the server's bound on relative durations.
 const MAX_RELATIVE_MINUTES: u32 = 7 * 24 * 60;
+const MAX_SEARCH_QUERY_BYTES: usize = 200;
+const MAX_SEARCH_LIMIT: u16 = 50;
+const MAX_NOTIFICATION_KEYWORDS: usize = 32;
+const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
+const MAX_NOTIFICATION_PLACES: usize = 200;
 const MESSAGING_APP_ID: &str = "messaging";
 // A single PersonalityAgent is single-threaded and normally inhabits only a
 // handful of Workspace installations at once. Sixteen retains ample locality
@@ -142,6 +148,40 @@ enum MessagingAction {
         #[serde(default)]
         place_id: Option<String>,
     },
+    /// Find messages the participant can already see, optionally within one
+    /// place. Results are references, not an opened Messaging view.
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    /// Read or partially update this participant's own notification setting.
+    /// No fields means read; present arrays replace their respective lists.
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MessagingNotifyLevel {
+    All,
+    Mentions,
+    Mute,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MessagingNotifyPlace {
+    place_id: String,
+    level: MessagingNotifyLevel,
 }
 
 /// Registry-sealed app arguments. Unlike the model-facing schema, every
@@ -197,6 +237,21 @@ enum BoundMessagingAction {
     GetCallState {
         #[serde(default)]
         place_id: Option<String>,
+    },
+    Search {
+        query: String,
+        #[serde(default)]
+        place_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u16>,
+    },
+    NotificationSettings {
+        #[serde(default)]
+        defaults_level: Option<MessagingNotifyLevel>,
+        #[serde(default)]
+        per_place: Option<Vec<MessagingNotifyPlace>>,
+        #[serde(default)]
+        keywords: Option<Vec<String>>,
     },
 }
 
@@ -567,9 +622,11 @@ fn messaging_parameters_schema() -> Value {
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
             "one of message_id or seq and may include note or remind_in_minutes; status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
-            "marker_id; get_call_state may include place_id. Write, react and reply_later act ",
-            "on the place most recently opened in this tool view; status and get_call_state ",
-            "need no open place; resolve_reply_later needs a marker ",
+            "marker_id; get_call_state may include place_id; search requires query and may ",
+            "include place_id or limit; notification_settings reads when given no setting ",
+            "fields and otherwise changes only the fields present. Write, react and reply_later ",
+            "act on the place most recently opened in this tool view; status, get_call_state, ",
+            "search and notification_settings need no open place; resolve_reply_later needs a marker ",
             "already shown or returned in this tool view, but not its place open."
         ),
         "properties": {
@@ -581,7 +638,8 @@ fn messaging_parameters_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "overview", "open", "write", "open_attachment", "react",
-                    "status", "reply_later", "resolve_reply_later", "get_call_state"
+                    "status", "reply_later", "resolve_reply_later", "get_call_state",
+                    "search", "notification_settings"
                 ],
                 "description": concat!(
                     "Action to perform: overview lists available places and unread state; open ",
@@ -591,12 +649,14 @@ fn messaging_parameters_schema() -> Value {
                     "visible in the currently open place; reply_later promises a later reply to ",
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
-                    "get_call_state reports who is currently in calls you can see."
+                    "get_call_state reports who is currently in calls you can see; search finds ",
+                    "messages in places you can already see; notification_settings reads or ",
+                    "partially updates what is allowed to interrupt you."
                 )
             },
             "place_id": {
                 "type": "string",
-                "description": "Required for open, optional for get_call_state, and omitted for other actions. The place to open or whose current call to report."
+                "description": "Required for open, optional for get_call_state and search, and omitted for other actions. The place to open, whose current call to report, or the one place to search."
             },
             "before_seq": {
                 "type": "integer",
@@ -607,7 +667,7 @@ fn messaging_parameters_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Optional for open and omitted for other actions. Maximum number of messages to return."
+                "description": "Optional for open and search and omitted for other actions. Maximum number of messages or search results to return."
             },
             "content": {
                 "type": "string",
@@ -698,6 +758,38 @@ fn messaging_parameters_schema() -> Value {
                     "marker_id of your unresolved promise already shown or returned in this ",
                     "tool view."
                 )
+            },
+            "query": {
+                "type": "string",
+                "description": concat!(
+                    "Required for search and omitted for other actions. Case-insensitive ",
+                    "substring to find in messages from places you can currently access."
+                )
+            },
+            "defaults_level": {
+                "type": "string",
+                "enum": ["all", "mentions", "mute"],
+                "description": "Optional for notification_settings and omitted for other actions. The default notification level for places without an override."
+            },
+            "per_place": {
+                "type": "array",
+                "maxItems": 200,
+                "description": "Optional for notification_settings and omitted for other actions. When present, replaces the complete per-place override list; an empty array clears it.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "place_id": {"type": "string"},
+                        "level": {"type": "string", "enum": ["all", "mentions", "mute"]}
+                    },
+                    "required": ["place_id", "level"],
+                    "additionalProperties": false
+                }
+            },
+            "keywords": {
+                "type": "array",
+                "maxItems": 32,
+                "description": "Optional for notification_settings and omitted for other actions. When present, replaces the complete keyword list; an empty array clears it.",
+                "items": {"type": "string", "maxLength": 64}
             }
         },
         "required": ["workspace_id", "action"],
@@ -718,6 +810,9 @@ impl Tool for MessagingTool {
                 "message visible in it. Declare your own availability with status. ",
                 "Opening never publishes presence: what others see about your ",
                 "attention is only what you declare. ",
+                "Search results are references: open their place before acting on a hit. ",
+                "Read or partially change your own notification preferences with ",
+                "notification_settings; explicit per_place and keywords arrays replace those lists. ",
                 "A message may carry attachments; each one reports filename, mime, ",
                 "size_bytes, an `alt` description written by the sender, and `spoiler`. ",
                 "A spoilered attachment is one the sender chose to keep covered until ",
@@ -1070,6 +1165,94 @@ impl BoundToolAdapter for MessagingTool {
                     arguments,
                 )
             }
+            MessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => {
+                let scopes = match &place_id {
+                    Some(place_id) => {
+                        vec![ResourceScope::resource("messaging", "place", place_id)]
+                    }
+                    None => vec![ResourceScope::collection("messaging", "place")],
+                };
+                let mut arguments = object([
+                    ("action", Value::String("search".to_owned())),
+                    ("query", Value::String(query)),
+                ]);
+                insert_optional_string(&mut arguments, "place_id", place_id);
+                insert_optional_u64(&mut arguments, "limit", limit.map(u64::from));
+                messaging_binding(
+                    &scope,
+                    "search",
+                    CapabilityClass::Read,
+                    scopes,
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            MessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let changes = defaults_level.is_some() || per_place.is_some() || keywords.is_some();
+                let mut arguments =
+                    object([("action", Value::String("notification_settings".to_owned()))]);
+                if let Some(level) = defaults_level {
+                    arguments.insert(
+                        "defaults_level".to_owned(),
+                        Value::String(notify_level_text(level).to_owned()),
+                    );
+                }
+                if let Some(entries) = &per_place {
+                    arguments.insert(
+                        "per_place".to_owned(),
+                        Value::Array(
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    Value::Object(object([
+                                        ("place_id", Value::String(entry.place_id.clone())),
+                                        (
+                                            "level",
+                                            Value::String(
+                                                notify_level_text(entry.level).to_owned(),
+                                            ),
+                                        ),
+                                    ]))
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(words) = &keywords {
+                    arguments.insert(
+                        "keywords".to_owned(),
+                        Value::Array(words.iter().cloned().map(Value::String).collect()),
+                    );
+                }
+                let mut review_projection = arguments.clone();
+                review_projection.insert("changes_setting".to_owned(), Value::Bool(changes));
+                let mut scopes = vec![ResourceScope::resource("messaging", "participant", "self")];
+                if let Some(entries) = &per_place {
+                    scopes.extend(entries.iter().map(|entry| {
+                        ResourceScope::resource("messaging", "place", &entry.place_id)
+                    }));
+                }
+                messaging_binding(
+                    &scope,
+                    "notification_settings",
+                    if changes {
+                        CapabilityClass::Mutate
+                    } else {
+                        CapabilityClass::Read
+                    },
+                    scopes,
+                    review_projection,
+                    arguments,
+                )
+            }
         }
     }
 
@@ -1406,6 +1589,48 @@ impl MessagingTool {
                 }) => result,
             }
             .map_err(|error| ToolError::Rpc(error.to_string()))?,
+            // Search results are not an open page. In particular, they do not
+            // enter visible_messages and cannot authorize react/reply-later.
+            BoundMessagingAction::Search {
+                query,
+                place_id,
+                limit,
+            } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.search(scope, SearchMessagingRequest {
+                    query: &query,
+                    place_id: place_id.as_deref(),
+                    limit,
+                }) => result,
+            }
+            .map_err(map_messaging_api_error)?,
+            BoundMessagingAction::NotificationSettings {
+                defaults_level,
+                per_place,
+                keywords,
+            } => {
+                let places = per_place.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| MessagingNotificationPlace {
+                            place_id: entry.place_id.as_str(),
+                            level: notify_level_text(entry.level),
+                        })
+                        .collect()
+                });
+                let words = keywords
+                    .as_ref()
+                    .map(|words| words.iter().map(String::as_str).collect());
+                tokio::select! {
+                    _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                    result = self.api.notification_settings(scope, MessagingNotificationSettingsRequest {
+                        defaults_level: defaults_level.map(notify_level_text),
+                        per_place: places,
+                        keywords: words,
+                    }) => result,
+                }
+                .map_err(map_messaging_api_error)?
+            }
         };
         Ok(ExactMessagingOutcome {
             response: ExactMessagingResponse::Json(response),
@@ -1819,6 +2044,24 @@ fn resolve_raw_action(
         MessagingAction::GetCallState { place_id } => {
             Ok(BoundMessagingAction::GetCallState { place_id })
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => Ok(BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        }),
+        MessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => Ok(BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        }),
     }
 }
 
@@ -1991,7 +2234,65 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
             }
             Ok(())
         }
+        MessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => {
+            if query.trim().is_empty() || query.len() > MAX_SEARCH_QUERY_BYTES {
+                return Err(ToolError::InvalidArguments);
+            }
+            if place_id
+                .as_deref()
+                .is_some_and(|place| validate_bounded_nonempty(place, MAX_PLACE_ID_BYTES).is_err())
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            validate_optional_limit(*limit, MAX_SEARCH_LIMIT)
+        }
+        MessagingAction::NotificationSettings {
+            per_place,
+            keywords,
+            ..
+        } => {
+            if per_place
+                .as_ref()
+                .is_some_and(|entries| entries.len() > MAX_NOTIFICATION_PLACES)
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if let Some(entries) = per_place {
+                let mut places = BTreeSet::new();
+                for entry in entries {
+                    validate_bounded_nonempty(&entry.place_id, MAX_PLACE_ID_BYTES)?;
+                    if !places.insert(entry.place_id.as_str()) {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            if let Some(words) = keywords {
+                if words.len() > MAX_NOTIFICATION_KEYWORDS {
+                    return Err(ToolError::InvalidArguments);
+                }
+                for word in words {
+                    if word.trim().is_empty()
+                        || word.chars().count() > MAX_NOTIFICATION_KEYWORD_CHARS
+                        || word.chars().any(char::is_control)
+                    {
+                        return Err(ToolError::InvalidArguments);
+                    }
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+fn validate_optional_limit(limit: Option<u16>, max: u16) -> Result<(), ToolError> {
+    if limit.is_some_and(|limit| limit == 0 || limit > max) {
+        return Err(ToolError::InvalidArguments);
+    }
+    Ok(())
 }
 
 fn validate_canonical_uuid_v7(value: &str) -> Result<(), ToolError> {
@@ -2108,6 +2409,24 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
                 place_id: place_id.clone(),
             })
         }
+        BoundMessagingAction::Search {
+            query,
+            place_id,
+            limit,
+        } => validate_action(&MessagingAction::Search {
+            query: query.clone(),
+            place_id: place_id.clone(),
+            limit: *limit,
+        }),
+        BoundMessagingAction::NotificationSettings {
+            defaults_level,
+            per_place,
+            keywords,
+        } => validate_action(&MessagingAction::NotificationSettings {
+            defaults_level: *defaults_level,
+            per_place: per_place.clone(),
+            keywords: keywords.clone(),
+        }),
     }
 }
 
@@ -2589,6 +2908,14 @@ const fn status_text(status: MessagingStatus) -> &'static str {
     }
 }
 
+const fn notify_level_text(level: MessagingNotifyLevel) -> &'static str {
+    match level {
+        MessagingNotifyLevel::All => "all",
+        MessagingNotifyLevel::Mentions => "mentions",
+        MessagingNotifyLevel::Mute => "mute",
+    }
+}
+
 fn client_nonce(flow_id: &str, call_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(CLIENT_NONCE_DOMAIN);
@@ -2917,6 +3244,8 @@ mod tests {
         statuses: AsyncMutex<Vec<RecordedStatus>>,
         promises: AsyncMutex<Vec<RecordedReplyLater>>,
         resolutions: AsyncMutex<Vec<String>>,
+        notification_requests: AsyncMutex<Vec<Value>>,
+        search_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
@@ -3273,6 +3602,64 @@ mod tests {
                 "started_at": "2026-08-17T00:00:00Z",
                 "participants": []
             }]}))
+        }
+
+        async fn search(
+            &self,
+            scope: &ExactMessagingScope,
+            request: SearchMessagingRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            self.calls
+                .lock()
+                .await
+                .push(format!("search:{}", request.query));
+            if self.failures.lock().await.pop_front() == Some("search") {
+                return Err(anyhow!("search failed"));
+            }
+            if let Some(gate) = self.search_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("test search gate remains open")
+                    .forget();
+            }
+            Ok(json!({"results": [{
+                "message_id": "message-1",
+                "place": {"kind": "channel", "channel_id": request.place_id.unwrap_or("general")},
+                "seq": 7,
+                "author": {"kind": "human", "human_id": "human-1"},
+                "snippet": request.query,
+                "created_at": "2026-08-17T00:00:00Z"
+            }]}))
+        }
+
+        async fn notification_settings(
+            &self,
+            scope: &ExactMessagingScope,
+            request: MessagingNotificationSettingsRequest<'_>,
+        ) -> Result<Value> {
+            self.record_scope(scope).await;
+            let changed = request.defaults_level.is_some()
+                || request.per_place.is_some()
+                || request.keywords.is_some();
+            self.calls.lock().await.push(format!(
+                "notification_settings:{}",
+                if changed { "set" } else { "read" }
+            ));
+            self.notification_requests.lock().await.push(json!({
+                "defaults_level": request.defaults_level,
+                "per_place": request.per_place.as_ref().map(|entries| entries
+                    .iter()
+                    .map(|entry| json!({"place_id": entry.place_id, "level": entry.level}))
+                    .collect::<Vec<_>>()),
+                "keywords": request.keywords,
+            }));
+            Ok(json!({"setting": {
+                "owner": {"kind": "personality_agent", "personality_agent_id": "agent-1"},
+                "defaults": {"level": request.defaults_level.unwrap_or("all")},
+                "per_place": [],
+                "keywords": []
+            }}))
         }
     }
 
@@ -3701,7 +4088,9 @@ mod tests {
                 "status",
                 "reply_later",
                 "resolve_reply_later",
-                "get_call_state"
+                "get_call_state",
+                "search",
+                "notification_settings"
             ])
         );
         assert_eq!(schema["properties"]["before_seq"]["minimum"], 0);
@@ -3720,6 +4109,9 @@ mod tests {
         );
         assert_eq!(schema["properties"]["note"]["type"], "string");
         assert_eq!(schema["properties"]["marker_id"]["type"], "string");
+        assert_eq!(schema["properties"]["query"]["type"], "string");
+        assert_eq!(schema["properties"]["per_place"]["maxItems"], 200);
+        assert_eq!(schema["properties"]["keywords"]["maxItems"], 32);
         for field in ["expires_in_minutes", "remind_in_minutes"] {
             assert_eq!(schema["properties"][field]["minimum"], 1);
             assert_eq!(schema["properties"][field]["maximum"], 10080);
@@ -3737,13 +4129,17 @@ mod tests {
                 "attachments",
                 "before_seq",
                 "content",
+                "defaults_level",
                 "emoji",
                 "expires_in_minutes",
                 "limit",
                 "marker_id",
                 "message_id",
                 "note",
+                "keywords",
+                "per_place",
                 "place_id",
+                "query",
                 "remind_in_minutes",
                 "reply_to",
                 "seq",
@@ -4421,6 +4817,251 @@ mod tests {
             api.calls.lock().await.last().map(String::as_str),
             Some("call_state:*")
         );
+    }
+
+    #[tokio::test]
+    async fn search_is_an_exact_read_and_does_not_make_hits_actionable() {
+        let (api, tool, registry) = binding_fixture().await;
+
+        let broad = bind_action(
+            &registry,
+            "search-all",
+            json!({"action": "search", "query": "デプロイ", "limit": 10}),
+        )
+        .await
+        .expect("bind workspace-visible search");
+        assert_eq!(broad.descriptor.operation, "search");
+        assert_eq!(broad.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(
+            broad.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::collection("messaging", "place")])
+        );
+        assert_eq!(
+            Value::Object(broad.execution_arguments.as_object().clone()),
+            scoped_execution(json!({
+                "action": "search",
+                "query": "デプロイ",
+                "limit": 10
+            }))
+        );
+
+        let one_place = bind_action(
+            &registry,
+            "search-place",
+            json!({"action": "search", "query": "デプロイ", "place_id": "place-a"}),
+        )
+        .await
+        .expect("bind place-scoped search");
+        assert_eq!(
+            one_place.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "place",
+                "place-a"
+            )])
+        );
+
+        let before = default_state(&tool).await.visible_messages.clone();
+        let output = execute_bound_action(
+            &registry,
+            "search-run",
+            json!({"action": "search", "query": "デプロイ"}),
+        )
+        .await
+        .expect("execute search");
+        assert_eq!(
+            output.output.details["results"][0]["message_id"],
+            "message-1"
+        );
+        assert_eq!(default_state(&tool).await.visible_messages, before);
+        assert_eq!(
+            api.calls.lock().await.last().map(String::as_str),
+            Some("search:デプロイ")
+        );
+
+        let hit_action = bind_action(
+            &registry,
+            "react-to-hit",
+            json!({"action": "react", "message_id": "message-1", "emoji": "👍"}),
+        )
+        .await
+        .expect_err("a search hit must be opened before it becomes actionable");
+        assert!(matches!(
+            hit_action,
+            DescribeError::AppPrecondition { precondition }
+                if precondition.code == "visible_target_required"
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_cancellation_and_errors_stay_typed() {
+        let (api, _tool, registry) = binding_fixture().await;
+        let gate = Arc::new(Semaphore::new(0));
+        *api.search_gate.lock().await = Some(gate);
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let sealed = registry
+            .bind(
+                &tool_call(
+                    "search-cancel",
+                    json!({"action": "search", "query": "blocked"}),
+                ),
+                "flow",
+                &workspace,
+            )
+            .await
+            .expect("bind cancellable search");
+        let authorized = crate::approval::authority::AuthorizedBoundInvocation::for_test(sealed);
+        let registry = Arc::new(registry);
+        let cancel = CancellationToken::new();
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute_bound(authorized, cancel, Arc::new(|_| {}))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if api
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|call| call == "search:blocked")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search reaches the cancellation gate");
+        cancel.cancel();
+        let error = match execution.await.expect("search execution joins") {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled search must fail"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Cancelled)
+        ));
+
+        *api.search_gate.lock().await = None;
+        api.failures.lock().await.push_back("search");
+        let error = match execute_bound_action(
+            registry.as_ref(),
+            "search-error",
+            json!({"action": "search", "query": "failure"}),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("search RPC error must surface"),
+        };
+        assert!(matches!(
+            error,
+            BoundExecutionError::Tool(ToolError::Rpc(message)) if message == "search failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn notification_settings_distinguishes_reads_from_partial_replacements() {
+        let (api, _tool, registry) = binding_fixture().await;
+
+        let read = bind_action(
+            &registry,
+            "notification-read",
+            json!({"action": "notification_settings"}),
+        )
+        .await
+        .expect("bind notification setting read");
+        assert_eq!(read.descriptor.operation, "notification_settings");
+        assert_eq!(read.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(read.review_projection.as_object()["changes_setting"], false);
+        assert_eq!(
+            read.descriptor.resource_scopes,
+            scoped_resources(vec![ResourceScope::resource(
+                "messaging",
+                "participant",
+                "self"
+            )])
+        );
+
+        let update = bind_action(
+            &registry,
+            "notification-update",
+            json!({
+                "action": "notification_settings",
+                "defaults_level": "mentions",
+                "per_place": [{"place_id": "place-a", "level": "mute"}]
+            }),
+        )
+        .await
+        .expect("bind notification setting update");
+        assert_eq!(update.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            update.review_projection.as_object()["changes_setting"],
+            true
+        );
+        assert_eq!(
+            update.descriptor.resource_scopes,
+            scoped_resources(vec![
+                ResourceScope::resource("messaging", "participant", "self"),
+                ResourceScope::resource("messaging", "place", "place-a"),
+            ])
+        );
+
+        execute_bound_action(
+            &registry,
+            "notification-keywords",
+            json!({"action": "notification_settings", "keywords": ["リリース"]}),
+        )
+        .await
+        .expect("execute keyword-only update");
+        let requests = api.notification_requests.lock().await;
+        let keyword_only = requests.last().expect("record keyword-only request");
+        assert_eq!(keyword_only["keywords"], json!(["リリース"]));
+        assert_eq!(keyword_only["defaults_level"], Value::Null);
+        assert_eq!(keyword_only["per_place"], Value::Null);
+        drop(requests);
+
+        execute_bound_action(
+            &registry,
+            "notification-clear-lists",
+            json!({"action": "notification_settings", "per_place": [], "keywords": []}),
+        )
+        .await
+        .expect("execute explicit list replacement");
+        let requests = api.notification_requests.lock().await;
+        let cleared = requests.last().expect("record explicit empty arrays");
+        assert_eq!(cleared["per_place"], json!([]));
+        assert_eq!(cleared["keywords"], json!([]));
+        drop(requests);
+
+        for (id, action) in [
+            (
+                "duplicate-place",
+                json!({
+                    "action": "notification_settings",
+                    "per_place": [
+                        {"place_id": "place-a", "level": "all"},
+                        {"place_id": "place-a", "level": "mute"}
+                    ]
+                }),
+            ),
+            (
+                "blank-keyword",
+                json!({"action": "notification_settings", "keywords": ["   "]}),
+            ),
+            ("blank-search", json!({"action": "search", "query": "   "})),
+        ] {
+            let error = bind_action(&registry, id, action)
+                .await
+                .expect_err("invalid search or notification setting must not bind");
+            assert_eq!(error, DescribeError::InvalidArguments, "case {id}");
+        }
     }
 
     #[tokio::test]
@@ -5313,7 +5954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_and_bound_paths_share_one_exact_executor_for_all_eight_actions() {
+    async fn raw_and_bound_paths_share_one_exact_executor_for_all_ten_actions() {
         let cases = [
             ("overview", json!({"action": "overview"})),
             (
@@ -5363,6 +6004,18 @@ mod tests {
             (
                 "call-state",
                 json!({"action": "get_call_state", "place_id": "place-a"}),
+            ),
+            (
+                "search",
+                json!({"action": "search", "query": "デプロイ", "limit": 10}),
+            ),
+            (
+                "notification-settings",
+                json!({
+                    "action": "notification_settings",
+                    "defaults_level": "mentions",
+                    "keywords": ["リリース"]
+                }),
             ),
         ];
 
