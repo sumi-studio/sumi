@@ -59,11 +59,14 @@ import {
   setActiveMessagingScope,
   validateMessagingScope,
 } from "./scope";
-import type { MessageContentRevision, PendingMessage } from "./timeline";
+import type {
+  MessageContentRevision,
+  MessagePayloadKind,
+  PendingMessage,
+} from "./timeline";
 import {
   applyMessageRevision,
   applyPollRevision,
-  mergeMessages,
   upsertMessage,
 } from "./timeline";
 
@@ -191,6 +194,76 @@ function retireDefinitivePlaceCreationAttempt(
 // guard keeps presentation side effects idempotent if a transport ever repeats
 // a frame. Timeline reconciliation already deduplicates the message itself.
 const presentedMessageNotifications = new Set<string>();
+
+/**
+ * poll_updated is cursorless and can arrive after a place is held but before
+ * its initial message page. Keep only the newest field projection until that
+ * message is installed; otherwise the later rev0 snapshot would permanently
+ * erase a vote state that the server will not replay.
+ */
+const orphanPollProjectionsByPlace = new Map<
+  PlaceKey,
+  Map<string, MessagePoll>
+>();
+
+function rememberOrphanPollProjection(
+  key: PlaceKey,
+  messageId: string,
+  poll: MessagePoll,
+): void {
+  let projections = orphanPollProjectionsByPlace.get(key);
+  if (!projections) {
+    projections = new Map();
+    orphanPollProjectionsByPlace.set(key, projections);
+  }
+  const current = projections.get(messageId);
+  if (!current || poll.revision > current.revision) {
+    projections.set(messageId, poll);
+  }
+}
+
+function discardOrphanPollProjection(key: PlaceKey, messageId: string): void {
+  const projections = orphanPollProjectionsByPlace.get(key);
+  if (!projections) return;
+  projections.delete(messageId);
+  if (projections.size === 0) orphanPollProjectionsByPlace.delete(key);
+}
+
+function upsertMessageWithOrphanPoll(
+  key: PlaceKey,
+  messages: readonly Message[],
+  incoming: Message,
+  payload: MessagePayloadKind,
+): Message[] {
+  const orphan = orphanPollProjectionsByPlace.get(key)?.get(incoming.messageId);
+  const projected =
+    orphan && !incoming.deleted
+      ? { ...incoming, poll: applyPollRevision(incoming.poll, orphan) }
+      : incoming;
+  const next = upsertMessage(messages, projected, payload);
+  // A same-seq collision can reject a different message id. Keep the orphan in
+  // that exceptional case so the real target can still consume it later.
+  if (
+    orphan &&
+    next.some((message) => message.messageId === incoming.messageId)
+  ) {
+    discardOrphanPollProjection(key, incoming.messageId);
+  }
+  return next;
+}
+
+function mergeMessagesWithOrphanPolls(
+  key: PlaceKey,
+  current: readonly Message[],
+  incoming: readonly Message[],
+  payload: MessagePayloadKind,
+): Message[] {
+  let merged = [...current];
+  for (const message of incoming) {
+    merged = upsertMessageWithOrphanPoll(key, merged, message, payload);
+  }
+  return merged;
+}
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
@@ -629,7 +702,8 @@ function reduceSuccessfulEditAcknowledgement(
   const acknowledgedRevision = committed.revision ?? submittedSession.revision;
   const messagesByPlace = {
     ...state.messagesByPlace,
-    [key]: upsertMessage(
+    [key]: upsertMessageWithOrphanPoll(
+      key,
       state.messagesByPlace[key] ?? [],
       committed,
       "revision",
@@ -1191,6 +1265,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
   const applyPollUpdateRaw = (event: PollUpdatedEvent) => {
     const key = placeKey(event.place);
+    const loaded = get().messagesByPlace[key]?.find(
+      (message) => message.messageId === event.messageId,
+    );
+    if (!loaded) {
+      // A frame already enqueued when a place was released must not become a
+      // projection for the next hold of that place.
+      if (heldPlaces.has(key)) {
+        rememberOrphanPollProjection(key, event.messageId, event.poll);
+      }
+      return;
+    }
+    if (loaded.deleted) {
+      discardOrphanPollProjection(key, event.messageId);
+      return;
+    }
     set((state) => {
       const current = state.messagesByPlace[key];
       if (!current) return {};
@@ -1695,7 +1784,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const { [message.messageId]: _discardedVote, ...pollVoteByMessage } =
         state.pollVoteByMessage;
       const messages = heldPlaces.has(key)
-        ? upsertMessage(state.messagesByPlace[key] ?? [], message, "revision")
+        ? upsertMessageWithOrphanPoll(
+            key,
+            state.messagesByPlace[key] ?? [],
+            message,
+            "revision",
+          )
         : null;
       return {
         messagesByPlace: messages
@@ -1729,7 +1823,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
     });
     // A committed tombstone terminates both the in-flight acknowledgement and
     // any later whole-selection intent that was queued behind it.
-    if (acceptedDeletion) pollVoteQueues.delete(message.messageId);
+    if (acceptedDeletion) {
+      discardOrphanPollProjection(key, message.messageId);
+      pollVoteQueues.delete(message.messageId);
+    }
     noteThreadProjectionChange(message.place);
   };
 
@@ -1785,7 +1882,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
                 ? {
                     messagesByPlace: {
                       ...state.messagesByPlace,
-                      [session.placeKey]: upsertMessage(
+                      [session.placeKey]: upsertMessageWithOrphanPoll(
+                        session.placeKey,
                         state.messagesByPlace[session.placeKey] ?? [],
                         refreshed,
                         "snapshot",
@@ -1845,7 +1943,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
           return {};
         }
         const messages = heldPlaces.has(key)
-          ? upsertMessage(
+          ? upsertMessageWithOrphanPoll(
+              key,
               state.messagesByPlace[key] ?? [],
               event.message,
               "revision",
@@ -2216,6 +2315,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     // A reopened place needs a fresh coordinator. An old pending mutation or
     // resync must not settle into the new timeline after release.
     reactionProjectionByPlace.delete(key);
+    orphanPollProjectionsByPlace.delete(key);
     if (place) backend.releasePlace?.(place);
     set((state) => {
       if (
@@ -2282,7 +2382,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
     set((state) => ({
       messagesByPlace: {
         ...state.messagesByPlace,
-        [key]: mergeMessages(
+        [key]: mergeMessagesWithOrphanPolls(
+          key,
           state.messagesByPlace[key] ?? [],
           messages,
           "snapshot",
@@ -2382,7 +2483,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
             set((state) => ({
               messagesByPlace: {
                 ...state.messagesByPlace,
-                [key]: upsertMessage(
+                [key]: upsertMessageWithOrphanPoll(
+                  key,
                   state.messagesByPlace[key] ?? [],
                   committed,
                   "snapshot",
@@ -2660,6 +2762,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       threadSummaryRefreshes.clear();
       threadListLoads.clear();
       pollVoteQueues.clear();
+      orphanPollProjectionsByPlace.clear();
       heldPlaces.clear();
       placeHoldGenerations.clear();
       knownLatestSeq.clear();
@@ -3259,7 +3362,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((state) => ({
         messagesByPlace: {
           ...state.messagesByPlace,
-          [key]: mergeMessages(
+          [key]: mergeMessagesWithOrphanPolls(
+            key,
             state.messagesByPlace[key] ?? [],
             messages,
             "snapshot",
@@ -3667,7 +3771,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
               }
               const messagesByPlace = {
                 ...current.messagesByPlace,
-                [key]: upsertMessage(
+                [key]: upsertMessageWithOrphanPoll(
+                  key,
                   current.messagesByPlace[key] ?? [],
                   latest,
                   "revision",
@@ -4026,7 +4131,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
         return {
           messagesByPlace: {
             ...entry.messagesByPlace,
-            [key]: mergeMessages(existing, older, "snapshot"),
+            [key]: mergeMessagesWithOrphanPolls(
+              key,
+              existing,
+              older,
+              "snapshot",
+            ),
           },
           hasMoreByPlace: {
             ...entry.hasMoreByPlace,
@@ -4161,6 +4271,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
   messagingSessionGeneration += 1;
   placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
+  orphanPollProjectionsByPlace.clear();
   presentedMessageNotifications.clear();
   releaseAllDraftFiles();
   backend.dispose();

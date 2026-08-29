@@ -244,6 +244,7 @@ export function Composer() {
             : "質問と選択肢",
         icon: BarChart3,
         disabled: !pollsEnabled || draftAttachments.length > 0,
+        opensDialog: true,
         onSelect: () => setPollDialogOpen(true),
       },
     ],
@@ -446,6 +447,7 @@ export function Composer() {
         <PollCreateDialog
           onClose={() => setPollDialogOpen(false)}
           onSubmit={(poll) => submit(poll)}
+          finalFocusRef={textareaRef}
         />
       ) : null}
     </section>

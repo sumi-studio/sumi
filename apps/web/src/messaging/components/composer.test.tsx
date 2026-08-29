@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ChannelSummary,
@@ -517,6 +523,26 @@ describe("Composer ＋メニュー", () => {
 });
 
 describe("Composer 投票", () => {
+  it("popoverの終了後も投票dialogへフォーカスを保ち、閉じると入力欄へ戻す", async () => {
+    render(<Composer />);
+    composer().focus();
+    openPlusMenu();
+    fireEvent.click(screen.getByRole("button", { name: /投票を作成/ }));
+    const question = screen.getByLabelText("質問");
+    await vi.waitFor(() => expect(question).toHaveFocus());
+
+    // Base UI keeps the closing popup mounted for its 150ms exit transition.
+    // Its delayed cleanup must not pull focus out of the newly opened dialog.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 200)));
+    expect(question).toHaveFocus();
+
+    fireEvent.keyDown(question, { key: "Escape" });
+    await vi.waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "投票を作成" })).toBeNull();
+      expect(composer()).toHaveFocus();
+    });
+  });
+
   it("＋メニューから投票を開き、本文・緊急度・返信先と一緒に送る", async () => {
     const replied = {
       ...ownMessage(""),

@@ -22,6 +22,8 @@ export interface ComposerPlusMenuItem {
   hint: string;
   icon: ComponentType<{ className?: string }>;
   disabled?: boolean;
+  /** Selecting this item transfers focus into a modal owned by the caller. */
+  opensDialog?: boolean;
   onSelect?: () => void;
 }
 
@@ -34,9 +36,16 @@ export function ComposerPlusMenu({
   finalFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const [open, setOpen] = useState(false);
+  const [suppressFinalFocus, setSuppressFinalFocus] = useState(false);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (nextOpen) setSuppressFinalFocus(false);
+        setOpen(nextOpen);
+      }}
+    >
       <PopoverTrigger
         render={
           <button
@@ -52,7 +61,7 @@ export function ComposerPlusMenu({
       <PopoverContent
         side="top"
         align="start"
-        finalFocus={finalFocusRef}
+        finalFocus={suppressFinalFocus ? false : finalFocusRef}
         className="w-64 p-1"
       >
         <ul className="flex flex-col">
@@ -64,6 +73,7 @@ export function ComposerPlusMenu({
                   type="button"
                   disabled={item.disabled}
                   onClick={() => {
+                    if (item.opensDialog) setSuppressFinalFocus(true);
                     item.onSelect?.();
                     setOpen(false);
                   }}

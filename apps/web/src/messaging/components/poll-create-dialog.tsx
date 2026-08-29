@@ -1,4 +1,5 @@
 import { Plus, X } from "lucide-react";
+import type { RefObject } from "react";
 import { useMemo, useRef, useState } from "react";
 import { clampCodePoints, codePointLength } from "../../lib/text-length";
 import {
@@ -24,9 +25,11 @@ const DEADLINES = [
 export function PollCreateDialog({
   onClose,
   onSubmit,
+  finalFocusRef,
 }: {
   onClose: () => void;
   onSubmit: (poll: PollInput) => boolean;
+  finalFocusRef?: RefObject<HTMLElement | null>;
 }) {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const pollsEnabled = useMessaging((state) =>
@@ -66,6 +69,7 @@ export function PollCreateDialog({
       label="投票を作成"
       onClose={onClose}
       initialFocusRef={questionRef}
+      finalFocusRef={finalFocusRef}
       className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
       onBackdropClick={(event) => {
         if (event.target === event.currentTarget) onClose();

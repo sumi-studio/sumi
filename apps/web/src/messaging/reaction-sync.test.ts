@@ -1060,6 +1060,156 @@ describe("poll convergence in the messaging store", () => {
     bindMessagingSessionIdentity(null);
   });
 
+  it("applies a poll event that arrives before its message_created frame", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    harness.holdFetches = true;
+    useMessaging.getState().selectPlace(placeKey);
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(1);
+
+    const initial = pollMessage(0);
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 3,
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [other] },
+        ],
+      },
+    });
+    harness.emit({ type: "message_created", message: initial, notify: null });
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll,
+    ).toMatchObject({
+      revision: 3,
+      options: [{ voters: [] }, { voters: [other] }],
+    });
+    harness.releaseFetches();
+    await harness.settle();
+  });
+
+  it("keeps the newest orphan poll revision across a deferred initial page", async () => {
+    const harness = new StubBackend();
+    const initial = pollMessage(0);
+    harness.history = [initial];
+    harness.holdFetches = true;
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.getState().selectPlace(placeKey);
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(1);
+
+    const newest = {
+      ...requiredPoll(initial),
+      revision: 4,
+      options: [
+        { optionId: "a", text: "A", voters: [other] },
+        { optionId: "b", text: "B", voters: [] },
+      ],
+    };
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: newest,
+    });
+    harness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: { ...requiredPoll(initial), revision: 2 },
+    });
+    harness.releaseFetches();
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll,
+    ).toEqual(newest);
+  });
+
+  it("discards orphan poll projections when a watch-only place is released", async () => {
+    const harness = new StubBackend();
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    const thread = {
+      ...threadSummary(),
+      participants: [other],
+    };
+    const threadPlace = { kind: "thread", threadId: thread.threadId } as const;
+    const threadKey = `thread:${thread.threadId}` as const;
+    const initial = { ...pollMessage(0), place: threadPlace };
+    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
+    harness.history = [initial];
+    harness.holdFetches = true;
+    useMessaging.getState().selectPlace(threadKey);
+    await harness.settle();
+    expect(harness.heldFetchCount).toBe(1);
+    harness.emit({
+      type: "poll_updated",
+      place: threadPlace,
+      messageId: initial.messageId,
+      poll: { ...requiredPoll(initial), revision: 5 },
+    });
+
+    // Switching away releases a thread the current participant never joined.
+    harness.history = [];
+    harness.holdFetches = false;
+    useMessaging.getState().selectPlace(placeKey);
+    await harness.settle();
+    harness.history = [initial];
+    useMessaging.getState().selectPlace(threadKey);
+    await harness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[threadKey]?.[0]?.poll?.revision,
+    ).toBe(0);
+    harness.releaseFetches();
+    await harness.settle();
+  });
+
+  it("does not carry an orphan poll projection into a replacement session", async () => {
+    const oldHarness = new StubBackend();
+    const initial = pollMessage(0);
+    oldHarness.history = [initial];
+    oldHarness.holdFetches = true;
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    useMessaging.getState().selectPlace(placeKey);
+    await oldHarness.settle();
+    oldHarness.emit({
+      type: "poll_updated",
+      place,
+      messageId: initial.messageId,
+      poll: { ...requiredPoll(initial), revision: 6 },
+    });
+
+    bindMessagingSessionIdentity("poll-orphan-replacement-session");
+    const newHarness = new StubBackend();
+    newHarness.history = [initial];
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    useMessaging.getState().selectPlace(placeKey);
+    await newHarness.settle();
+
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey]?.[0]?.poll?.revision,
+    ).toBe(0);
+    oldHarness.releaseFetches();
+    await oldHarness.settle();
+  });
+
   it("applies poll-only live state and never rolls it back through resync or edit", async () => {
     const harness = new StubBackend();
     installMessagingBackend(harness);

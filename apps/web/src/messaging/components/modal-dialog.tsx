@@ -25,6 +25,7 @@ export function ModalDialog({
   children,
   className,
   initialFocusRef,
+  finalFocusRef,
   onBackdropClick,
   testId,
 }: {
@@ -33,6 +34,7 @@ export function ModalDialog({
   children: ReactNode;
   className: string;
   initialFocusRef?: RefObject<HTMLElement | null>;
+  finalFocusRef?: RefObject<HTMLElement | null>;
   onBackdropClick?: (event: ReactMouseEvent<HTMLDivElement>) => void;
   testId?: string;
 }) {
@@ -46,10 +48,10 @@ export function ModalDialog({
         : null;
     (initialFocusRef?.current ?? dialogRef.current)?.focus();
     return () => {
-      const trigger = returnFocusRef.current;
+      const trigger = finalFocusRef?.current ?? returnFocusRef.current;
       if (trigger?.isConnected) trigger.focus();
     };
-  }, [initialFocusRef]);
+  }, [finalFocusRef, initialFocusRef]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
