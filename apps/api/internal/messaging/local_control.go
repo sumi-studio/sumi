@@ -479,10 +479,15 @@ func (s *Server) localCreatePoll(
 	if !created {
 		status = http.StatusOK
 	}
+	var projection *messageWire
+	if created {
+		wire := messageToWire(place, message)
+		projection = &wire
+	}
 	writeJSON(w, status, struct {
-		Message messageWire `json:"message"`
-		Created bool        `json:"created"`
-	}{Message: messageToWire(place, message), Created: created})
+		messageReceiptWire
+		Message *messageWire `json:"message"`
+	}{messageReceiptWire: messageReceiptToWire(message, created), Message: projection})
 }
 
 func (s *Server) localVotePoll(

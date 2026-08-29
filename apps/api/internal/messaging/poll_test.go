@@ -689,6 +689,61 @@ func TestPollHTTPRejectsAttachmentCombinationAndPublishesPartialUpdate(t *testin
 	}
 }
 
+func TestLocalCreatePollReceiptStaysStableAcrossReplayEditAndTombstone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	request := map[string]any{
+		"place_id": channel.PlaceID, "content": "before", "question": "どちら？",
+		"options": []string{"A", "B"}, "client_nonce": "stable-poll-receipt",
+	}
+	status, fresh := callLocal(
+		t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization,
+	)
+	if status != http.StatusCreated || fresh["created"] != true || len(fresh) != 5 {
+		t.Fatalf("fresh local poll receipt = %d %v", status, fresh)
+	}
+	projection, ok := fresh["message"].(map[string]any)
+	poll, hasPoll := projection["poll"].(map[string]any)
+	if !ok || !hasPoll || projection["content"] != "before" || poll["question"] != "どちら？" {
+		t.Fatalf("fresh local poll projection = %v", fresh["message"])
+	}
+	messageID, _ := fresh["message_id"].(string)
+	seq, _ := fresh["seq"].(float64)
+	if messageID == "" || projection["message_id"] != messageID || seq != projection["seq"] ||
+		fresh["client_nonce"] != "stable-poll-receipt" {
+		t.Fatalf("fresh local poll identity = %v", fresh)
+	}
+	assertReplay := func(stage string) {
+		t.Helper()
+		status, replay := callLocal(
+			t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization,
+		)
+		message, hasMessage := replay["message"]
+		if status != http.StatusOK || len(replay) != 5 || replay["created"] != false ||
+			replay["client_nonce"] != "stable-poll-receipt" ||
+			replay["message_id"] != messageID || replay["seq"] != seq ||
+			!hasMessage || message != nil {
+			t.Fatalf("%s local poll replay = %d %v", stage, status, replay)
+		}
+	}
+	assertReplay("immediate")
+
+	agent := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	revision := int64(projection["revision"].(float64))
+	if _, err := agent.EditMessage(ctx, channel.PlaceID, messageID, "after", revision); err != nil {
+		t.Fatal(err)
+	}
+	assertReplay("after edit")
+	if _, err := agent.DeleteMessage(ctx, channel.PlaceID, messageID); err != nil {
+		t.Fatal(err)
+	}
+	assertReplay("after tombstone")
+}
+
 func TestLocalPollRelativeDeadlineReplayAndVoteUseExactScope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -705,15 +760,19 @@ func TestLocalPollRelativeDeadlineReplayAndVoteUseExactScope(t *testing.T) {
 		t.Fatalf("first local poll = %d %v", status, first)
 	}
 	firstMessage := first["message"].(map[string]any)
-	messageID := firstMessage["message_id"].(string)
+	messageID := first["message_id"].(string)
+	seq := first["seq"]
+	if firstMessage["message_id"] != messageID || firstMessage["seq"] != seq {
+		t.Fatalf("fresh local poll identity = %v", first)
+	}
 	if _, err := w.store.pool.Exec(ctx, `
 		UPDATE message_polls SET closes_at = clock_timestamp() - interval '1 second'
 		WHERE message_id = $1`, messageID); err != nil {
 		t.Fatal(err)
 	}
 	status, replay := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization)
-	if status != http.StatusOK || replay["created"] != false ||
-		replay["message"].(map[string]any)["message_id"] != messageID {
+	if status != http.StatusOK || replay["created"] != false || replay["message"] != nil ||
+		replay["message_id"] != messageID || replay["seq"] != seq {
 		t.Fatalf("closed local replay = %d %v", status, replay)
 	}
 	changed := map[string]any{
@@ -731,13 +790,47 @@ func TestLocalPollRelativeDeadlineReplayAndVoteUseExactScope(t *testing.T) {
 		WHERE message_id = $1`, messageID); err != nil {
 		t.Fatal(err)
 	}
-	options := replay["message"].(map[string]any)["poll"].(map[string]any)["options"].([]any)
+	options := firstMessage["poll"].(map[string]any)["options"].([]any)
 	optionID := options[0].(map[string]any)["option_id"].(string)
 	status, voted := callLocal(t, ctx, server.localVotePoll, LocalVotePollPath, map[string]any{
 		"place_id": channel.PlaceID, "message_id": messageID, "option_ids": []string{optionID},
 	}, authorization)
 	if status != http.StatusOK || voted["message"].(map[string]any)["poll"].(map[string]any)["revision"] != float64(1) {
 		t.Fatalf("local vote = %d %v", status, voted)
+	}
+}
+
+func TestPollOnlyThreadSummaryUsesQuestionPreviewOverHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, server := newTestServer(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	thread, created, err := owner.CreateThread(
+		ctx, channel.PlaceID, "poll preview", "", "poll-preview-thread",
+	)
+	if err != nil || !created {
+		t.Fatalf("create thread: created=%t err=%v", created, err)
+	}
+	question := strings.Repeat("界", ThreadPreviewChars+5)
+	appendTestPoll(t, ctx, owner, thread.Place.PlaceID, "poll-preview-message", PollInput{
+		Question: question, Options: []string{"A", "B"},
+	})
+
+	response, body := call(t, server, http.MethodGet,
+		"/messaging/places/"+channel.PlaceID+"/threads", w.humanA.ID, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("thread summaries = %d %v", response.StatusCode, body)
+	}
+	threads := body["threads"].([]any)
+	if len(threads) != 1 {
+		t.Fatalf("thread summaries = %v", threads)
+	}
+	summary := threads[0].(map[string]any)
+	want := truncateRunes(question, ThreadPreviewChars)
+	if summary["thread_id"] != thread.Place.PlaceID || summary["last_message"] != want ||
+		summary["message_count"] != float64(1) || summary["latest_seq"] != float64(1) {
+		t.Fatalf("poll-only thread summary = %v, want preview %q", summary, want)
 	}
 }
 

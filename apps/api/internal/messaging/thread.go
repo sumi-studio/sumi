@@ -299,7 +299,11 @@ func (s *ScopedStore) threadsWhere(ctx context.Context, q querier, workspaceMemb
 		       t.parent_place_id, t.parent_message_id,
 		       (SELECT count(*) FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL),
 		       (SELECT m.created_at FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1),
-		       (SELECT m.content FROM messages m WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL ORDER BY m.seq DESC LIMIT 1),
+		       (SELECT COALESCE(NULLIF(m.content, ''), mp.question)
+		        FROM messages m
+		        LEFT JOIN message_polls mp ON mp.message_id=m.message_id
+		        WHERE m.workspace_id=$1 AND m.place_id=t.place_id AND m.deleted_at IS NULL
+		        ORDER BY m.seq DESC LIMIT 1),
 		       ARRAY(SELECT pm.member_kind FROM place_members pm
 		             JOIN workspace_members wm ON wm.workspace_id=pm.workspace_id
 		               AND wm.workspace_member_id=pm.workspace_member_id AND wm.left_at IS NULL

@@ -254,6 +254,13 @@
   browser は正規化した絶対時刻、agent は相対分数そのものを digest に残すため、同じ
   agent request の retry が別の wall-clock instant を再計算しても同一 request である。
   exact retry は締切後も元の receipt を返し、poll の変更は `409 idempotency_conflict`。
+- local-control `create_poll` の receipt は常に `client_nonce`, `message_id`, `seq`,
+  `created`, `message` を持つ。fresh `201` は `created:true` と full Message projection、
+  exact replay `200` は同じ identity/seq、`created:false`, `message:null` を返す。元 message
+  が後から edit / tombstone されても replay receipt は変えず、nonce digest を正本とする。
+- thread summary の最新 message が poll-only なら、空 content の代わりに canonical
+  question を `last_message` とし、その後に既存の preview truncation（先頭 120 code
+  point と、overflow 時の `…`）を適用する。
 - `POST /messaging/places/{place_id}/messages/{message_id}/poll/vote` の `option_ids` は
   actor の選択全体を置換し、`[]` は取り下げる。single choice への複数票、重複 id、
   別 poll の option、見えない・削除済み message、締切後を拒否する。message と poll を
