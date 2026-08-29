@@ -209,7 +209,7 @@ type messageWire struct {
 	Urgency     string            `json:"urgency"`
 	Reactions   []reactionWire    `json:"reactions"`
 	Attachments []attachmentWire  `json:"attachments"`
-	Poll        *pollWire         `json:"poll,omitempty"`
+	Poll        *pollWire         `json:"poll"`
 	ReplyTo     *string           `json:"reply_to"`
 	ClientNonce string            `json:"client_nonce"`
 	CreatedAt   time.Time         `json:"created_at"`

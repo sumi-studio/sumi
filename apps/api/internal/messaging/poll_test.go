@@ -762,3 +762,51 @@ func TestPollUpdateEventJSONNeverContainsFullMessage(t *testing.T) {
 		t.Fatalf("partial event leaked full Message fields: %s", raw)
 	}
 }
+
+func TestMessageWireEmitsExplicitNullOrPollObject(t *testing.T) {
+	place := Place{
+		PlaceID: "01900000-0000-7000-8000-000000000091", Kind: PlaceChannel,
+	}
+	message := Message{
+		MessageID: "01900000-0000-7000-8000-000000000092",
+		PlaceID:   place.PlaceID, Author: Human("01900000-0000-7000-8000-000000000093"),
+		Content: "ordinary", Urgency: UrgencyNormal,
+	}
+	pollField := func(message Message) json.RawMessage {
+		t.Helper()
+		raw, err := json.Marshal(messageToWire(place, message))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		poll, exists := fields["poll"]
+		if !exists {
+			t.Fatalf("message wire omitted poll: %s", raw)
+		}
+		return poll
+	}
+
+	if poll := bytes.TrimSpace(pollField(message)); !bytes.Equal(poll, []byte("null")) {
+		t.Fatalf("ordinary message poll = %s, want null", poll)
+	}
+	message.Poll = &Poll{
+		Question: "どちら？", Options: []PollOption{
+			{OptionID: "01900000-0000-7000-8000-000000000094", Text: "A", Voters: []ParticipantRef{}},
+			{OptionID: "01900000-0000-7000-8000-000000000095", Text: "B", Voters: []ParticipantRef{}},
+		},
+	}
+	poll := bytes.TrimSpace(pollField(message))
+	if len(poll) == 0 || poll[0] != '{' {
+		t.Fatalf("poll message projection = %s, want object", poll)
+	}
+	var projected pollWire
+	if err := json.Unmarshal(poll, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.Question != "どちら？" || len(projected.Options) != 2 {
+		t.Fatalf("poll message projection = %+v", projected)
+	}
+}
