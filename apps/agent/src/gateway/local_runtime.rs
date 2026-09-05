@@ -271,22 +271,19 @@ struct MessagingPollMessageWire {
     deleted: bool,
 }
 
-/// Short-lived credential accepted only by the local-control transport.
+/// Credential accepted by local control until its exact runtime epoch is fenced.
 ///
 /// This is not the Gateway bearer token and is not a signing key.  It is bound
 /// to the exact PAID/generation/boot nonce before the HTTP client can use it.
+/// The control plane owns revocation; a client-only deadline cannot revoke a
+/// bearer and would prevent an otherwise authorized runtime from reconnecting.
 pub(crate) struct LocalControlCredential {
     token: Zeroizing<String>,
     identity: RpcIdentity,
-    expires_at: SystemTime,
 }
 
 impl LocalControlCredential {
-    pub(crate) fn new(
-        token: impl Into<String>,
-        identity: RpcIdentity,
-        expires_at: SystemTime,
-    ) -> Result<Self> {
+    pub(crate) fn new(token: impl Into<String>, identity: RpcIdentity) -> Result<Self> {
         let token = token.into();
         if token.is_empty() || token.len() > MAX_LOCAL_CONTROL_CREDENTIAL_BYTES {
             bail!(
@@ -298,17 +295,13 @@ impl LocalControlCredential {
         Ok(Self {
             token: Zeroizing::new(token),
             identity,
-            expires_at,
         })
     }
 
-    fn validate_at(&self, authority: &RuntimeEpochAuthority, now: SystemTime) -> Result<()> {
+    fn validate(&self, authority: &RuntimeEpochAuthority) -> Result<()> {
         authority
             .validate_rpc_identity(&self.identity)
             .context("local control credential runtime identity mismatch")?;
-        if now >= self.expires_at {
-            bail!("local control credential expired");
-        }
         Ok(())
     }
 }
@@ -320,7 +313,6 @@ impl fmt::Debug for LocalControlCredential {
             .field("token", &"[REDACTED]")
             .field("personality_agent_id", self.identity.personality_agent_id())
             .field("generation", &self.identity.generation())
-            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -450,7 +442,7 @@ impl LocalControlHttpClient {
         authority: RuntimeEpochAuthority,
         credential: LocalControlCredential,
     ) -> Result<Self> {
-        credential.validate_at(&authority, SystemTime::now())?;
+        credential.validate(&authority)?;
         let endpoint = validate_unix_socket_path(
             socket_path.as_ref(),
             expected_server_uid,
@@ -487,7 +479,7 @@ impl LocalControlHttpClient {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self> {
-        credential.validate_at(&authority, SystemTime::now())?;
+        credential.validate(&authority)?;
         let base_url = validate_loopback_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
@@ -717,8 +709,7 @@ impl LocalControlHttpClient {
     where
         Request: Serialize + Sync,
     {
-        self.credential
-            .validate_at(&self.authority, SystemTime::now())?;
+        self.credential.validate(&self.authority)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => {
                 (build_unix_http_client(&endpoint.path)?, Some(endpoint))
@@ -782,8 +773,7 @@ impl LocalControlHttpClient {
         // Keep failures before execute() terminal: the request cannot have
         // reached the server before its credential, URL, body, and transport
         // identity have all been validated.
-        self.credential
-            .validate_at(&self.authority, SystemTime::now())?;
+        self.credential.validate(&self.authority)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => {
                 (build_unix_http_client(&endpoint.path)?, Some(endpoint))
@@ -864,7 +854,7 @@ impl LocalControlHttpClient {
         publication: &LocalRuntimeStatePublication,
     ) -> LocalPublicationResult<LocalRuntimeStateAck> {
         self.credential
-            .validate_at(&self.authority, SystemTime::now())
+            .validate(&self.authority)
             .map_err(LocalPublicationError::terminal)?;
         let url = self
             .base_url
@@ -992,7 +982,7 @@ impl AppInstallationResolver for LocalControlHttpClient {
     ) -> AppInstallationResolutionResult<ResolvedAppInstallation> {
         let expected_workspace_id = request.workspace_id.to_owned();
         self.credential
-            .validate_at(&self.authority, SystemTime::now())
+            .validate(&self.authority)
             .map_err(|_| AppInstallationResolutionError::AuthenticationUnavailable)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => (
@@ -1129,15 +1119,18 @@ fn validate_channel_mutation_response(
     if response.channel.revision == 0 || response.channel.revision > i64::MAX as u64 {
         bail!("Messaging channel response revision is invalid");
     }
+    // A nonce replay returns the same channel's current row. Its name and
+    // topic may have changed since creation; only a fresh receipt must still
+    // match those original display values.
     if response.channel.name.is_empty()
         || response.channel.name.len() > 800
         || response.channel.name.chars().count() > 200
-        || expected_name.is_some_and(|name| response.channel.name != name)
+        || (response.created && expected_name.is_some_and(|name| response.channel.name != name))
     {
         bail!("Messaging channel response name mismatch");
     }
     if response.channel.topic.len() > 1000
-        || expected_topic.is_some_and(|topic| response.channel.topic != topic)
+        || (response.created && expected_topic.is_some_and(|topic| response.channel.topic != topic))
     {
         bail!("Messaging channel response topic mismatch");
     }
@@ -1430,8 +1423,7 @@ impl MessagingApi for LocalControlHttpClient {
         validate_sealed_attachment_source(&request)?;
         let (place_id, client_nonce, filename, size_bytes, sha256, declared_mime, descriptor) =
             request.into_parts();
-        self.credential
-            .validate_at(&self.authority, SystemTime::now())?;
+        self.credential.validate(&self.authority)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => {
                 (build_unix_http_client(&endpoint.path)?, Some(endpoint))
@@ -1541,8 +1533,7 @@ impl MessagingApi for LocalControlHttpClient {
         {
             bail!("invalid Messaging attachment read request");
         }
-        self.credential
-            .validate_at(&self.authority, SystemTime::now())?;
+        self.credential.validate(&self.authority)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => {
                 (build_unix_http_client(&endpoint.path)?, Some(endpoint))
@@ -4595,12 +4586,9 @@ mod tests {
     #[tokio::test]
     async fn credential_secrets_are_redacted_from_debug_and_errors() {
         let expected = authority();
-        let control_credential = LocalControlCredential::new(
-            "control-secret-sentinel",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let control_credential =
+            LocalControlCredential::new("control-secret-sentinel", expected.rpc_identity().clone())
+                .unwrap();
         assert!(!format!("{control_credential:?}").contains("control-secret-sentinel"));
 
         let response = LocalCredentialIssueResponse {
@@ -4628,14 +4616,10 @@ mod tests {
     }
 
     #[test]
-    fn loopback_client_rejects_non_loopback_and_expired_control_credentials() {
+    fn loopback_client_rejects_non_loopback_control_endpoint() {
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         assert!(
             LocalControlHttpClient::new_loopback(
                 "http://192.0.2.1:8080",
@@ -4644,28 +4628,13 @@ mod tests {
             )
             .is_err()
         );
-
-        let expired = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now(),
-        )
-        .unwrap();
-        assert!(
-            LocalControlHttpClient::new_loopback("http://127.0.0.1:8080", expected, expired)
-                .is_err()
-        );
     }
 
     #[tokio::test]
     async fn loopback_client_rejects_cross_epoch_payloads_before_http() {
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             "http://127.0.0.1:9",
             expected.clone(),
@@ -4782,6 +4751,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unix_epoch_control_credential_remints_on_reconnect_and_obeys_server_revocation() {
+        let directory = TestSocketDir::new();
+        let socket_path = directory.socket("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+        )
+        .unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut previous_request_id = None;
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (request_line, authorization, body) = read_unix_http_request(&mut stream).await;
+                assert_eq!(
+                    request_line,
+                    format!("POST /{ISSUE_CREDENTIAL_PATH} HTTP/1.1")
+                );
+                assert_eq!(authorization, "Bearer control-secret");
+                let request: LocalCredentialIssueRequest = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.personality_agent_id, PAID);
+                assert_eq!(request.generation, 7);
+                assert_eq!(request.rpc_boot_nonce, "boot-a");
+                assert_eq!(request.audience, LOCAL_AGENT_AUDIENCE);
+                assert_ne!(previous_request_id.as_ref(), Some(&request.request_id));
+                previous_request_id = Some(request.request_id.clone());
+                if attempt == 2 {
+                    stream
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    stream.shutdown().await.unwrap();
+                } else {
+                    write_unix_http_json(
+                        &mut stream,
+                        &LocalCredentialIssueResponse {
+                            request_id: request.request_id,
+                            personality_agent_id: request.personality_agent_id,
+                            generation: request.generation,
+                            rpc_boot_nonce: request.rpc_boot_nonce,
+                            audience: request.audience,
+                            expires_at_unix: unix_now() + 30,
+                            delivery_authorization: DeliveryAuthorization::Raw,
+                            token: format!("gateway-connection-{attempt}"),
+                        },
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let expected = authority();
+        let control = Arc::new(
+            LocalControlHttpClient::new_unix(
+                &socket_path,
+                current_euid(),
+                current_egid(),
+                expected.clone(),
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut provider =
+            LocalCredentialProvider::new(expected, DeliveryAuthorization::Raw, control);
+        let first = provider.fresh_credential().await.unwrap();
+        let second = provider.fresh_credential().await.unwrap();
+        assert_eq!(first.token(), "gateway-connection-0");
+        assert_eq!(second.token(), "gateway-connection-1");
+        let error = provider.fresh_credential().await.unwrap_err().to_string();
+        assert!(
+            error.contains("401"),
+            "revocation must reach the caller: {error}"
+        );
+        assert!(!error.contains("control-secret"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unix_client_round_trip_sends_exact_bearer_and_epoch_bodies() {
         let directory = TestSocketDir::new();
         let socket_path = directory.socket("control.sock");
@@ -4845,12 +4894,8 @@ mod tests {
         });
 
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let control = Arc::new(
             LocalControlHttpClient::new_unix(
                 &socket_path,
@@ -4887,12 +4932,9 @@ mod tests {
         .unwrap();
 
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "replacement-test-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("replacement-test-secret", expected.rpc_identity().clone())
+                .unwrap();
         let client = LocalControlHttpClient::new_unix(
             &socket_path,
             current_euid(),
@@ -4942,12 +4984,7 @@ mod tests {
     fn unix_client_rejects_wrong_mode_symlink_and_hardlinked_socket() {
         let expected = authority();
         let credential = || {
-            LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap()
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap()
         };
 
         let wrong_uid_dir = TestSocketDir::new();
@@ -5251,7 +5288,14 @@ mod tests {
             return committed_response_loss();
         }
         drop(requests);
-        let (status, response) = canonical_place_mutation_fixture_response(&request);
+        let (status, mut response) = canonical_place_mutation_fixture_response(&request);
+        if let Some(channel) = response.get_mut("channel") {
+            // The server's nonce receipt resolves the same channel, whose
+            // display metadata another participant edited after creation.
+            channel["revision"] = serde_json::json!(2);
+            channel["name"] = serde_json::json!("renamed after creation");
+            channel["topic"] = serde_json::json!("updated after creation");
+        }
         (status, Json(response)).into_response()
     }
 
@@ -5680,12 +5724,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -5724,12 +5764,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -5784,12 +5820,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -5829,12 +5861,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -5880,12 +5908,8 @@ mod tests {
             .with_state(state.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -5965,12 +5989,9 @@ mod tests {
                 });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -6388,12 +6409,8 @@ mod tests {
             .with_state(state.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -6415,29 +6432,35 @@ mod tests {
             .await
             .expect("canonical thread response loss reconciles");
         assert_eq!(thread["name"], "foo");
-        client
+        let channel = client
             .create_channel(
                 &scope,
                 CreateMessagingChannelRequest {
                     name: "reconciled",
-                    topic: None,
+                    topic: Some("original topic"),
                     voice: false,
                     client_nonce: "lost-create",
                 },
             )
             .await
             .expect("create response loss reconciles");
-        client
+        assert_eq!(channel["created"], false);
+        assert_eq!(channel["channel"]["name"], "renamed after creation");
+        assert_eq!(channel["channel"]["topic"], "updated after creation");
+        let duplicate = client
             .duplicate_channel(
                 &scope,
                 DuplicateMessagingChannelRequest {
                     place_id: "01900000-0000-7000-8000-000000000002",
-                    name: None,
+                    name: Some("requested copy name"),
                     client_nonce: "lost-duplicate",
                 },
             )
             .await
             .expect("duplicate response loss reconciles");
+        assert_eq!(duplicate["created"], false);
+        assert_eq!(duplicate["channel"]["name"], "renamed after creation");
+        assert_eq!(duplicate["channel"]["topic"], "updated after creation");
         let participants = vec![
             crate::apiclient::messaging::MessagingParticipant {
                 kind: "human".to_owned(),
@@ -6632,12 +6655,9 @@ mod tests {
                     .with_state(state.clone());
                 let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 let expected = authority();
-                let credential = LocalControlCredential::new(
-                    "control-secret",
-                    expected.rpc_identity().clone(),
-                    SystemTime::now() + Duration::from_secs(30),
-                )
-                .unwrap();
+                let credential =
+                    LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                        .unwrap();
                 let client = LocalControlHttpClient::new_loopback_with_timeouts(
                     format!("http://{address}/"),
                     expected,
@@ -6708,12 +6728,9 @@ mod tests {
                 });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -6773,12 +6790,9 @@ mod tests {
                 });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -6847,12 +6861,9 @@ mod tests {
                     });
                 let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 let expected = authority();
-                let credential = LocalControlCredential::new(
-                    "control-secret",
-                    expected.rpc_identity().clone(),
-                    SystemTime::now() + Duration::from_secs(30),
-                )
-                .unwrap();
+                let credential =
+                    LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                        .unwrap();
                 let client = LocalControlHttpClient::new_loopback(
                     format!("http://{address}/"),
                     expected,
@@ -6913,12 +6924,9 @@ mod tests {
                 });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -6953,12 +6961,9 @@ mod tests {
                 .with_state(attempts.clone());
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -7004,12 +7009,8 @@ mod tests {
             });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7041,12 +7042,8 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let expected = authority();
         let foreign = authority_with(OTHER_PAID, 7, "boot-a");
-        let mismatched = LocalControlCredential::new(
-            "control-secret",
-            foreign.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let mismatched =
+            LocalControlCredential::new("control-secret", foreign.rpc_identity().clone()).unwrap();
         assert!(
             LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
@@ -7087,7 +7084,7 @@ mod tests {
         let mut fresh_channel_value = channel_value.clone();
         fresh_channel_value["created"] = serde_json::json!(true);
         let fresh_channel: MessagingChannelMutationResponse =
-            serde_json::from_value(fresh_channel_value).unwrap();
+            serde_json::from_value(fresh_channel_value.clone()).unwrap();
         validate_channel_mutation_response(
             StatusCode::CREATED,
             &fresh_channel,
@@ -7098,6 +7095,25 @@ mod tests {
             None,
         )
         .unwrap();
+        for field in ["name", "topic"] {
+            let mut mismatched = fresh_channel_value.clone();
+            mismatched["channel"][field] = serde_json::json!("different from the request");
+            let mismatched: MessagingChannelMutationResponse =
+                serde_json::from_value(mismatched).unwrap();
+            assert!(
+                validate_channel_mutation_response(
+                    StatusCode::CREATED,
+                    &mismatched,
+                    &scope,
+                    Some("reconciled"),
+                    Some("exact topic"),
+                    Some(true),
+                    None,
+                )
+                .is_err(),
+                "fresh creation must still match the requested {field}"
+            );
+        }
         for (label, mut malformed) in [
             ("created", channel_value.clone()),
             ("kind", channel_value.clone()),
@@ -7114,8 +7130,8 @@ mod tests {
                 "identity" => malformed["channel"]["channel_id"] = serde_json::json!("bad"),
                 "scope" => malformed["installation_id"] = serde_json::json!(OTHER_PAID),
                 "revision" => malformed["channel"]["revision"] = serde_json::json!(0),
-                "name" => malformed["channel"]["name"] = serde_json::json!("wrong"),
-                "topic" => malformed["channel"]["topic"] = serde_json::json!("wrong"),
+                "name" => malformed["channel"]["name"] = serde_json::json!(""),
+                "topic" => malformed["channel"]["topic"] = serde_json::json!("x".repeat(1001)),
                 "voice" => malformed["channel"]["voice"] = serde_json::json!(false),
                 _ => unreachable!(),
             }
@@ -7224,12 +7240,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -7290,12 +7303,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7351,12 +7360,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7469,12 +7474,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7663,12 +7664,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7729,12 +7726,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let authority = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                authority.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", authority.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 authority,
@@ -7811,12 +7805,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let authority = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                authority.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", authority.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback_with_timeouts(
                 format!("http://{address}/"),
                 authority,
@@ -7857,12 +7848,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -7929,12 +7916,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -8033,12 +8016,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -8213,12 +8193,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -8379,12 +8355,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected,
@@ -8469,12 +8441,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let expected = authority();
-            let credential = LocalControlCredential::new(
-                "control-secret",
-                expected.rpc_identity().clone(),
-                SystemTime::now() + Duration::from_secs(30),
-            )
-            .unwrap();
+            let credential =
+                LocalControlCredential::new("control-secret", expected.rpc_identity().clone())
+                    .unwrap();
             let client = LocalControlHttpClient::new_loopback(
                 format!("http://{address}/"),
                 expected,
@@ -8564,12 +8533,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected.clone(),
@@ -8617,12 +8582,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let client = LocalControlHttpClient::new_loopback(
             format!("http://{address}/"),
             expected.clone(),
@@ -8672,12 +8633,8 @@ mod tests {
         });
 
         let expected = authority();
-        let credential = LocalControlCredential::new(
-            "control-secret",
-            expected.rpc_identity().clone(),
-            SystemTime::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
         let control = Arc::new(
             LocalControlHttpClient::new_loopback(
                 format!("http://{address}"),

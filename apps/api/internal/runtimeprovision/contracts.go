@@ -63,30 +63,29 @@ type ActivateRequest struct {
 // ActivationConfig is backend-neutral runtime boot configuration. Keeping it
 // typed prevents an API caller from injecting the root daemon's environment.
 type ActivationConfig struct {
-	GatewayURL                      string           `json:"gateway_url"`
-	LocalControlBearer              string           `json:"local_control_bearer"`
-	LocalControlBearerExpiresAtUnix int64            `json:"local_control_bearer_expires_at_unix"`
-	LocalControlServerUID           uint32           `json:"local_control_server_uid"`
-	LocalControlSocketGID           uint32           `json:"local_control_socket_gid"`
-	AgentWrappingKey                string           `json:"agent_wrapping_key"`
-	AgentWrappingKeyID              string           `json:"agent_wrapping_key_id"`
-	ApprovalSecretDigestKey         string           `json:"approval_secret_digest_key"`
-	ProviderAPIKey                  string           `json:"provider_api_key"`
-	ModelPreset                     string           `json:"model_preset,omitempty"`
-	ModelID                         string           `json:"model_id,omitempty"`
-	ExecutionReviewerAPIKey         string           `json:"execution_reviewer_api_key"`
-	ExecutionReviewerModelPreset    string           `json:"execution_reviewer_model_preset"`
-	ExecutionReviewerModelID        string           `json:"execution_reviewer_model_id,omitempty"`
-	ExecutionReviewerModelBaseURL   string           `json:"execution_reviewer_model_base_url,omitempty"`
-	ExecutionReviewerAccountScope   string           `json:"execution_reviewer_account_scope,omitempty"`
-	EscalationReviewerAPIKey        string           `json:"escalation_reviewer_api_key"`
-	EscalationReviewerModelPreset   string           `json:"escalation_reviewer_model_preset"`
-	EscalationReviewerModelID       string           `json:"escalation_reviewer_model_id,omitempty"`
-	EscalationReviewerModelBaseURL  string           `json:"escalation_reviewer_model_base_url,omitempty"`
-	EscalationReviewerAccountScope  string           `json:"escalation_reviewer_account_scope,omitempty"`
-	AllowInsecureLoopbackGateway    bool             `json:"allow_insecure_loopback_gateway,omitempty"`
-	LogFilter                       string           `json:"log_filter,omitempty"`
-	ReapAttestation                 *ReapAttestation `json:"reap_attestation,omitempty"`
+	GatewayURL                     string           `json:"gateway_url"`
+	LocalControlBearer             string           `json:"local_control_bearer"`
+	LocalControlServerUID          uint32           `json:"local_control_server_uid"`
+	LocalControlSocketGID          uint32           `json:"local_control_socket_gid"`
+	AgentWrappingKey               string           `json:"agent_wrapping_key"`
+	AgentWrappingKeyID             string           `json:"agent_wrapping_key_id"`
+	ApprovalSecretDigestKey        string           `json:"approval_secret_digest_key"`
+	ProviderAPIKey                 string           `json:"provider_api_key"`
+	ModelPreset                    string           `json:"model_preset,omitempty"`
+	ModelID                        string           `json:"model_id,omitempty"`
+	ExecutionReviewerAPIKey        string           `json:"execution_reviewer_api_key"`
+	ExecutionReviewerModelPreset   string           `json:"execution_reviewer_model_preset"`
+	ExecutionReviewerModelID       string           `json:"execution_reviewer_model_id,omitempty"`
+	ExecutionReviewerModelBaseURL  string           `json:"execution_reviewer_model_base_url,omitempty"`
+	ExecutionReviewerAccountScope  string           `json:"execution_reviewer_account_scope,omitempty"`
+	EscalationReviewerAPIKey       string           `json:"escalation_reviewer_api_key"`
+	EscalationReviewerModelPreset  string           `json:"escalation_reviewer_model_preset"`
+	EscalationReviewerModelID      string           `json:"escalation_reviewer_model_id,omitempty"`
+	EscalationReviewerModelBaseURL string           `json:"escalation_reviewer_model_base_url,omitempty"`
+	EscalationReviewerAccountScope string           `json:"escalation_reviewer_account_scope,omitempty"`
+	AllowInsecureLoopbackGateway   bool             `json:"allow_insecure_loopback_gateway,omitempty"`
+	LogFilter                      string           `json:"log_filter,omitempty"`
+	ReapAttestation                *ReapAttestation `json:"reap_attestation,omitempty"`
 }
 
 // ReapAttestation binds a host-observed empty-project teardown to the exact
@@ -285,9 +284,6 @@ func (config ActivationConfig) Validate() error {
 	}
 	if err := ValidateAgentWrappingKeyID(config.AgentWrappingKeyID); err != nil {
 		return err
-	}
-	if config.LocalControlBearerExpiresAtUnix <= 0 {
-		return errors.New("local_control_bearer_expires_at_unix must be positive")
 	}
 	if config.LocalControlServerUID == 0 {
 		return errors.New("local_control_server_uid must be non-root")

@@ -752,7 +752,6 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 	values := map[string]string{
 		"SUMI_GATEWAY_URL":                           config.GatewayURL,
 		"SUMI_LOCAL_CONTROL_BEARER":                  config.LocalControlBearer,
-		"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX":  fmt.Sprint(config.LocalControlBearerExpiresAtUnix),
 		"SUMI_LOCAL_CONTROL_SERVER_UID":              fmt.Sprint(config.LocalControlServerUID),
 		"SUMI_LOCAL_CONTROL_SOCKET_GID":              fmt.Sprint(config.LocalControlSocketGID),
 		"SUMI_AGENT_WRAPPING_KEY":                    config.AgentWrappingKey,
@@ -888,7 +887,6 @@ var reservedEnvironment = map[string]bool{
 var allowedActivationEnvironment = map[string]bool{
 	"SUMI_GATEWAY_URL":                             true,
 	"SUMI_LOCAL_CONTROL_BEARER":                    true,
-	"SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX":    true,
 	"SUMI_LOCAL_CONTROL_SERVER_UID":                true,
 	"SUMI_LOCAL_CONTROL_SOCKET_GID":                true,
 	"SUMI_AGENT_WRAPPING_KEY":                      true,

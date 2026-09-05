@@ -20,19 +20,18 @@ const (
 
 func testActivationConfig() ActivationConfig {
 	return ActivationConfig{
-		GatewayURL:                      "wss://gateway.invalid",
-		LocalControlBearer:              "bearer",
-		LocalControlBearerExpiresAtUnix: 2_000_000_000,
-		LocalControlServerUID:           65532,
-		LocalControlSocketGID:           20000,
-		AgentWrappingKey:                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		AgentWrappingKeyID:              "wrapping/v1",
-		ApprovalSecretDigestKey:         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-		ProviderAPIKey:                  "provider-key",
-		ExecutionReviewerAPIKey:         "execution-reviewer-key",
-		ExecutionReviewerModelPreset:    "kimi-k3",
-		EscalationReviewerAPIKey:        "escalation-reviewer-key",
-		EscalationReviewerModelPreset:   "glm-5.2",
+		GatewayURL:                    "wss://gateway.invalid",
+		LocalControlBearer:            "bearer",
+		LocalControlServerUID:         65532,
+		LocalControlSocketGID:         20000,
+		AgentWrappingKey:              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AgentWrappingKeyID:            "wrapping/v1",
+		ApprovalSecretDigestKey:       "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+		ProviderAPIKey:                "provider-key",
+		ExecutionReviewerAPIKey:       "execution-reviewer-key",
+		ExecutionReviewerModelPreset:  "kimi-k3",
+		EscalationReviewerAPIKey:      "escalation-reviewer-key",
+		EscalationReviewerModelPreset: "glm-5.2",
 	}
 }
 

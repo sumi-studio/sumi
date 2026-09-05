@@ -13,7 +13,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -93,7 +93,6 @@ struct BootstrapContext {
     allow_insecure_loopback_gateway: bool,
     local_control_endpoint: LocalControlEndpoint,
     local_control_bearer: Zeroizing<String>,
-    local_control_bearer_expires_at: SystemTime,
     wrapping_key_id: String,
     reap_attestation: Option<PhysicalReapAttestation>,
     executor_call_authority_private_key: Option<Zeroizing<[u8; 32]>>,
@@ -145,10 +144,6 @@ impl BootstrapContext {
         let gateway_url = required_value(&mut get, "SUMI_GATEWAY_URL")?;
         let local_control_endpoint = local_control_endpoint_from_env(&mut get)?;
         let local_control_bearer = required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER")?;
-        let local_control_bearer_expires_at = parse_unix_time(
-            "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
-            &required_value(&mut get, "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX")?,
-        )?;
         let wrapping_key_id = required_value(&mut get, "SUMI_AGENT_WRAPPING_KEY_ID")?;
         let encoded_executor_call_authority_private_key = Zeroizing::new(required_value(
             &mut get,
@@ -178,7 +173,6 @@ impl BootstrapContext {
             allow_insecure_loopback_gateway,
             local_control_endpoint,
             local_control_bearer: Zeroizing::new(local_control_bearer),
-            local_control_bearer_expires_at,
             wrapping_key_id,
             reap_attestation,
             executor_call_authority_private_key: Some(executor_call_authority_private_key),
@@ -329,15 +323,6 @@ fn required_absolute_path(
         bail!("{name} must be an absolute path");
     }
     Ok(path)
-}
-
-fn parse_unix_time(name: &str, value: &str) -> Result<SystemTime> {
-    let seconds = value
-        .parse::<u64>()
-        .with_context(|| format!("{name} must be a nonnegative Unix timestamp"))?;
-    UNIX_EPOCH
-        .checked_add(Duration::from_secs(seconds))
-        .with_context(|| format!("{name} overflows SystemTime"))
 }
 
 /// T17 authenticates and orders this plan, but intentionally does not assign
@@ -1035,7 +1020,6 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
     let control_credential = LocalControlCredential::new(
         std::mem::take(&mut *context.local_control_bearer),
         context.authority.rpc_identity().clone(),
-        context.local_control_bearer_expires_at,
     )
     .context("invalid local-control bearer")?;
     let control_client = match &context.local_control_endpoint {
@@ -2361,10 +2345,6 @@ mod tests {
                 "local-control-secret".into(),
             ),
             (
-                "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX".to_owned(),
-                "1800000000".into(),
-            ),
-            (
                 "SUMI_AGENT_WRAPPING_KEY_ID".to_owned(),
                 "wrapping-key-a".into(),
             ),
@@ -2854,7 +2834,6 @@ mod tests {
             "SUMI_LOCAL_CONTROL_SERVER_UID",
             "SUMI_LOCAL_CONTROL_SOCKET_GID",
             "SUMI_LOCAL_CONTROL_BEARER",
-            "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
             "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
         ] {
@@ -2880,7 +2859,6 @@ mod tests {
             "SUMI_LOCAL_CONTROL_SERVER_UID",
             "SUMI_LOCAL_CONTROL_SOCKET_GID",
             "SUMI_LOCAL_CONTROL_BEARER",
-            "SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX",
             "SUMI_AGENT_WRAPPING_KEY_ID",
             "SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY",
         ] {

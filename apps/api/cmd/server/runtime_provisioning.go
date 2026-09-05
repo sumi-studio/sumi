@@ -49,7 +49,6 @@ type provisionedRuntimeSpawnerConfig struct {
 	TenantID            string
 	Audience            string
 	Delivery            agentevents.LocalDeliveryAuthorization
-	BearerTTL           time.Duration
 	LifecycleTimeout    time.Duration
 	TeardownTimeout     time.Duration
 	StartupReadyTimeout time.Duration
@@ -73,9 +72,6 @@ func newProvisionedRuntimeSpawner(config provisionedRuntimeSpawnerConfig) (*prov
 	if config.Delivery != agentevents.LocalDeliveryRaw &&
 		config.Delivery != agentevents.LocalDeliveryRedactionOnly {
 		return nil, errors.New("provisioned runtime spawner requires a valid delivery authorization")
-	}
-	if config.BearerTTL <= 0 {
-		config.BearerTTL = 8 * time.Hour
 	}
 	if config.LifecycleTimeout <= 0 {
 		config.LifecycleTimeout = defaultProvisionedLifecycleTimeout
@@ -201,7 +197,6 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	activation := s.config.Activation
 	activation.GatewayURL = config.GatewayURL
 	activation.LocalControlBearer = bearer
-	activation.LocalControlBearerExpiresAtUnix = time.Now().Add(s.config.BearerTTL).Unix()
 	activation.AgentWrappingKey = config.WrappingKey.Bytes
 	activation.AgentWrappingKeyID = config.WrappingKey.ID
 	if reapedThroughGeneration != nil {
