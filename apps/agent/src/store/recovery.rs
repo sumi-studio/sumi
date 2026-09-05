@@ -886,6 +886,15 @@ pub(crate) struct HydratedRunState {
     /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
     pub memory: HydratedMemoryRuntime,
     pub resume: ResumeDirective,
+    /// Still-unclassified inputs whose authenticated gateway replay must be
+    /// admitted once by the new Session. They remain durably `received`.
+    pub received_user_commands: Vec<ReceivedUserCommand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ReceivedUserCommand {
+    pub command_id: String,
+    pub seq: u64,
 }
 
 /// Runtime instruction carried only by a hydration result that reached a
@@ -1101,7 +1110,7 @@ impl SuffixRecovery {
         // and event evidence, and the physical terminals change neither, so this
         // is the same plan the next hydration would produce - it just reaches
         // SQLite in the same transaction instead of a later one.
-        let steps = Self::plan_full_suffix(store, recovery).await?;
+        let (steps, _) = Self::plan_boot_recovery(store, recovery).await?;
         if !steps.is_empty() {
             let suffix = LogicalRecoveryExecutor::plan_batch(
                 store,
@@ -1378,6 +1387,42 @@ impl SuffixRecovery {
             steps.push(step);
         }
         Ok(steps)
+    }
+
+    /// Unclassified user inputs need the ordinary Session router, not a
+    /// fabricated classification or terminal disposition during bootstrap.
+    /// Keep them on disk while repairing the preceding run, then hand their
+    /// exact identities to the Session after hydration reaches a fixed point.
+    pub(crate) async fn plan_boot_recovery(
+        store: &Store,
+        recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
+    ) -> Result<(Vec<RecoveryStep>, Vec<ReceivedUserCommand>)> {
+        let steps = Self::plan_full_suffix(store, recovery).await?;
+        let mut repairs = Vec::new();
+        let mut received = Vec::new();
+        for step in steps {
+            if let RecoveryStep::Reclassify { command_id } = step {
+                // plan_full_suffix authenticated the bounded pending window.
+                // The bootstrap guard keeps this row stable through handoff.
+                let seq: i64 = sqlx::query_scalar(
+                    "SELECT seq FROM inbound_commands WHERE command_id=?
+                     AND status='received' AND run_phase='received'
+                     AND command_kind='user_message' AND application_kind IS NULL
+                     AND run_id IS NULL AND turn_id IS NULL",
+                )
+                .bind(&command_id)
+                .fetch_one(store.pool())
+                .await
+                .context("received user recovery plan does not name an unclassified input")?;
+                received.push(ReceivedUserCommand {
+                    command_id,
+                    seq: u64::try_from(seq).context("received user sequence is negative")?,
+                });
+            } else {
+                repairs.push(step);
+            }
+        }
+        Ok((repairs, received))
     }
 
     async fn plan_next_without_history_scan(
@@ -2774,6 +2819,50 @@ pub(crate) mod tests {
         let writer = EventWriter::new(store.clone());
         seed_boot_running_tools(&writer, calls).await;
         (store, writer)
+    }
+
+    #[tokio::test]
+    async fn physical_recovery_closes_owner_and_preserves_queued_received_inputs() {
+        let (store, writer) =
+            setup_boot_running_tools(&[("tool-queued-physical", "read_file", 0)]).await;
+        for seq in [2, 3] {
+            persist_user(&writer, seq, &format!("00000000-0000-4000-8000-{seq:012}")).await;
+        }
+        let (lease, fence, attestation) = boot_recovery_authority(&store);
+        let HydrationOutcome::PhysicalRecoveryRequired(intents) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate running tool with queued inputs")
+        else {
+            panic!("old physical execution needs recovery");
+        };
+        SuffixRecovery::apply_boot_physical_receipt(&store, &lease, &fence, &attestation, &intents)
+            .await
+            .expect("physical terminal and owner suffix must commit together despite the queue");
+        assert_indeterminate_surface(&store, "tool-queued-physical").await;
+        let HydrationOutcome::Complete(hydrated) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate physically recovered owner")
+        else {
+            panic!("untouched queued inputs must not leave startup blocked");
+        };
+        assert_eq!(
+            hydrated
+                .received_user_commands
+                .iter()
+                .map(|command| command.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT status,
+                (SELECT COUNT(*) FROM inbound_commands WHERE status='received' AND run_phase='received'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
+                (SELECT COUNT(*) FROM physical_recovery_receipt_applications)
+             FROM inbound_commands WHERE seq=1",
+        ).fetch_one(store.pool()).await.expect("atomic receipt and preserved queue"),
+        ("applied".to_owned(), 2, 1, 1));
     }
 
     /// Admitting the co-committed suffix widened what may sit inside a

@@ -134,7 +134,8 @@ pub(crate) use recovery::tests::{
 )]
 pub(crate) use recovery::{
     HydratedRunState, HydrationOutcome, LogicalRecoveryExecutor, PendingApprovalRecovery,
-    PendingErrorContextRecovery, RecoveryStep, ResumeDirective, SuffixRecovery,
+    PendingErrorContextRecovery, ReceivedUserCommand, RecoveryStep, ResumeDirective,
+    SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -753,7 +754,8 @@ impl Store {
             .commit()
             .await
             .context("failed to commit hydration snapshot transaction")?;
-        let mut recovery_steps = SuffixRecovery::plan_full_suffix(self, &recovery).await?;
+        let (mut recovery_steps, received_user_commands) =
+            SuffixRecovery::plan_boot_recovery(self, &recovery).await?;
         if let Some(pending_error_context) = pending_error_context {
             let mut matching_steps = recovery_steps.iter_mut().filter(|step| {
                 matches!(step, RecoveryStep::ResumeAssistantFromDurableEvents { .. })
@@ -803,6 +805,7 @@ impl Store {
             provider_context,
             memory,
             resume: ResumeDirective::AdmitCommands,
+            received_user_commands,
         }))
     }
 
@@ -6640,7 +6643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_with_pending_logical_suffix_exposes_no_ready_receipt() {
+    async fn hydrate_hands_unclassified_user_input_to_session_without_changing_it() {
         let store = store().await;
         let command_id = CommandId::parse(&Uuid::now_v7().hyphenated().to_string())
             .expect("canonical command UUID");
@@ -6665,15 +6668,24 @@ mod tests {
             .await
             .expect("hydrate pending logical suffix")
         {
-            HydrationOutcome::LogicalRecoveryRequired { steps } => {
-                assert!(matches!(
-                    steps.as_slice(),
-                    [RecoveryStep::Reclassify { command_id: recovered_id }]
-                        if recovered_id == command_id.as_str()
-                ));
+            HydrationOutcome::Complete(hydrated) => {
+                assert_eq!(
+                    hydrated.received_user_commands,
+                    vec![ReceivedUserCommand {
+                        command_id: command_id.to_string(),
+                        seq: 1,
+                    }]
+                );
+                let row: (String, String, Option<String>) = sqlx::query_as(
+                    "SELECT status, run_phase, application_kind FROM inbound_commands WHERE seq=1",
+                )
+                .fetch_one(store.pool())
+                .await
+                .expect("unclassified input remains durable");
+                assert_eq!(row, ("received".to_owned(), "received".to_owned(), None));
             }
-            HydrationOutcome::Complete(_) => {
-                panic!("a pending logical suffix must not expose a ready receipt")
+            HydrationOutcome::LogicalRecoveryRequired { steps } => {
+                panic!("unclassified input must not deadlock bootstrap: {steps:?}")
             }
             HydrationOutcome::PhysicalRecoveryRequired(intents) => {
                 panic!("fixture has no running execution: {intents:?}")

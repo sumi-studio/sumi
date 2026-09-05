@@ -280,11 +280,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // read during that interval must not cancel the popup's eventual exchange.
     if (signInPending.current) return "checking";
     const generation = nextGeneration();
-    setSessionState("checking");
+    // A dropped socket does not end the authenticated session. Keep the
+    // workspace mounted while checking it so drafts and uploads survive a
+    // temporary network failure. Initial authentication still blocks the UI.
+    if (!serverSession.current.authenticated) setSessionState("checking");
+    let nextSession: SumiSessionStatus;
     try {
-      const nextSession = await getSumiSession();
+      nextSession = await getSumiSession();
+    } catch (error) {
       if (!isCurrentGeneration(generation)) return "checking";
-      serverSession.current = nextSession;
+      let nextState = classifySessionFailure(error);
+      if (nextState === "unavailable" && serverSession.current.authenticated) {
+        return "authenticated";
+      }
+      const sessionRejected = nextState === "unauthenticated";
+      flushSync(() => {
+        if (sessionRejected && !clearDirectChatAuthority()) {
+          nextState = "unavailable";
+        }
+        serverSession.current = { authenticated: false };
+        setSession({ authenticated: false });
+        setSessionState(nextState);
+      });
+      if (sessionRejected) {
+        clearAuthOutcomeNotice();
+        setOutcomeNotice(null);
+      }
+      return nextState;
+    }
+    if (!isCurrentGeneration(generation)) return "checking";
+    try {
       let nextState: AuthSessionState = nextSession.authenticated
         ? "authenticated"
         : "unauthenticated";
@@ -296,6 +321,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } else if (!clearDirectChatAuthority()) {
           nextState = "unavailable";
         }
+        serverSession.current = nextSession;
         setSession(nextSession);
         setSessionState(nextState);
       });
@@ -305,12 +331,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setOutcomeNotice(null);
       }
       return nextState;
-    } catch (error) {
-      if (!isCurrentGeneration(generation)) return "checking";
-      setSession({ authenticated: false });
-      const nextState = classifySessionFailure(error);
-      setSessionState(nextState);
-      return nextState;
+    } catch {
+      // A failed private-state reset is an authority-transition failure,
+      // not a transient session read that can retain the previous workspace.
+      flushSync(() => {
+        clearDirectChatAuthority();
+        serverSession.current = { authenticated: false };
+        setSession({ authenticated: false });
+        setSessionState("unavailable");
+      });
+      return "unavailable";
     }
   }, [claimSavedOutcomeNotice, isCurrentGeneration, nextGeneration]);
 

@@ -317,7 +317,6 @@ func newProvisioningTestSpawner(t *testing.T) (*provisionedRuntimeSpawner, *fake
 		TenantID:         "tenant-context",
 		Audience:         agentevents.DefaultAgentAudience(),
 		Delivery:         agentevents.LocalDeliveryRaw,
-		BearerTTL:        time.Hour,
 		LifecycleTimeout: time.Second,
 		Activation: runtimeprovision.ActivationConfig{
 			LocalControlServerUID:         65532,
@@ -680,7 +679,7 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 		Provisioner: provisioner, Authorizations: freshAuthorizations, Listeners: freshListeners,
 		Readiness: &fakeRuntimeReadiness{ready: true},
 		TenantID:  "tenant-context", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
-		BearerTTL: time.Hour, LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
+		LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
 		Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: 65532, LocalControlSocketGID: 20000, AgentWrappingKeyID: "wrapping/v1", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider-key", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
 	})
 	if err != nil {

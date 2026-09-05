@@ -11919,3 +11919,482 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
     drop(store);
     std::fs::remove_dir_all(&root).expect("remove duplicate approval restart fixture root");
 }
+struct QueuedRecoveryDriver {
+    identity: RpcIdentity,
+    starts: Mutex<Vec<(Vec<ContextMessage>, bool)>>,
+    started: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl RunDriver for QueuedRecoveryDriver {
+    fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+        if identity != &self.identity {
+            bail!("queued recovery driver identity mismatch");
+        }
+        Ok(())
+    }
+
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        if generation != self.identity.generation() {
+            bail!("queued recovery driver generation mismatch");
+        }
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        context: &[ContextMessage],
+        received_monotonic: Option<Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let count = {
+            let mut starts = self.starts.lock().expect("provider starts");
+            starts.push((context.to_vec(), received_monotonic.is_some()));
+            starts.len()
+        };
+        self.started.notify_one();
+        if count == 1 {
+            self.release.notified().await;
+        }
+        Ok(provider_attempt_stop(100 + count))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        panic!("recovery must never rerun the old tool")
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        panic!("queued command unexpectedly failed: {message}")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        bail!("queued recovery fixture has no overflow")
+    }
+}
+
+fn queued_recovery_authority(store: &Store, generation: u64) -> RuntimeEpochAuthority {
+    let generation = ProcessGeneration::from_wire(generation).expect("recovery generation");
+    let lease = ProcessGenerationLease::new(
+        store.scope().personality_agent_id.clone(),
+        generation,
+        format!("queued-recovery-lease-{}", generation.as_u64()),
+    )
+    .expect("recovery lease");
+    let fence =
+        GenerationRecoveryFence::new(&lease, "queued-recovery-fence").expect("recovery fence");
+    let identity = RpcIdentity::new(
+        store.scope().personality_agent_id.clone(),
+        generation,
+        crate::runtime::contracts::RpcBootNonce::new("queued-recovery-nonce").expect("boot nonce"),
+    );
+    RuntimeEpochAuthority::new(identity, lease, fence).expect("recovery authority")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "SIGKILL child for queued received command recovery"]
+async fn queued_received_restart_child() {
+    let path = std::env::var("SUMI_QUEUED_RECOVERY_DATABASE").expect("child database");
+    let scenario = std::env::var("SUMI_QUEUED_RECOVERY_SCENARIO").expect("child scenario");
+    let assistant = if scenario == "error" {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.provider_code = Some("http_503".to_owned());
+        assistant.error_message = Some("provider temporarily unavailable".to_owned());
+        PublicMessage::Assistant(assistant)
+    } else {
+        assert_eq!(scenario, "tool_use");
+        approval_fixture_assistant("queued-recovery-old-tool")
+    };
+    let store = Arc::new(open_kill_restart_store(std::path::Path::new(&path)).await);
+    let (_store, writer, _bridge, _binding) =
+        fixture_bridge_after_assistant_in_store(store, assistant).await;
+    for seq in [2, 3] {
+        writer
+            .persist_inbound(&user(seq))
+            .await
+            .expect("save queued input");
+    }
+    // No graceful Store shutdown or destructors: reopen committed WAL state
+    // after an actual process death at the unfinished-owner boundary.
+    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    panic!("SIGKILL must terminate the child");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queued_received_command_survives_owner_recovery_and_executes_once() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for scenario in ["error", "tool_use"] {
+        let directory = std::env::temp_dir().join(format!(
+            "sumi-queued-recovery-{scenario}-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&directory).expect("fixture directory");
+        let path = directory.join("agent.db");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "agent::session_tests::queued_received_restart_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SUMI_QUEUED_RECOVERY_DATABASE", &path)
+            .env("SUMI_QUEUED_RECOVERY_SCENARIO", scenario)
+            .output()
+            .expect("run crash child");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "child must reach committed crash boundary: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let store = open_kill_restart_store(&path).await;
+        let original_assistant: String =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE id='approval-assistant'")
+                .fetch_one(store.pool())
+                .await
+                .expect("original assistant");
+        let received_times: Vec<String> = sqlx::query_scalar(
+            "SELECT received_at FROM inbound_commands WHERE seq IN (2,3) ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("original receipt times");
+        let original_run_id: String =
+            sqlx::query_scalar("SELECT run_id FROM inbound_commands WHERE seq=1")
+                .fetch_one(store.pool())
+                .await
+                .expect("original run owner");
+        let authority = queued_recovery_authority(&store, 74);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate crashed owner")
+        else {
+            panic!("old owner needs its logical suffix");
+        };
+        assert_eq!(
+            steps.len(),
+            1,
+            "queued input must not deadlock owner recovery"
+        );
+        crate::store::LogicalRecoveryExecutor
+            .execute(&store, &steps, authority.lease(), authority.fence())
+            .await
+            .expect("finish original owner atomically");
+        let HydrationOutcome::Complete(hydrated) = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("hydrate after owner recovery")
+        else {
+            panic!("recovery must reach readiness");
+        };
+        assert_eq!(
+            hydrated.received_user_commands,
+            [2, 3]
+                .map(|seq| ReceivedUserCommand {
+                    command_id: format!("00000000-0000-4000-8000-{seq:012}"),
+                    seq,
+                })
+                .to_vec()
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status, run_phase FROM inbound_commands WHERE seq IN (2,3) ORDER BY seq"
+            )
+            .fetch_all(store.pool())
+            .await
+            .expect("queued row"),
+            vec![("received".to_owned(), "received".to_owned()); 2]
+        );
+        let recovery_event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count");
+        store.pool().close().await;
+        drop(store);
+
+        // A second restart before replay must reconstruct the pending input,
+        // without appending another old-run suffix or discarding its payload.
+        let store = open_kill_restart_store(&path).await;
+        let authority = queued_recovery_authority(&store, 75);
+        let HydrationOutcome::Complete(hydrated_again) = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .expect("reopen before replay")
+        else {
+            panic!("second restart must stay ready");
+        };
+        assert_eq!(
+            hydrated_again.received_user_commands,
+            hydrated.received_user_commands
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("fixed point events"),
+            recovery_event_count
+        );
+        let pool = store.pool().clone();
+        let broker = Arc::new(ApprovalBroker::headless(
+            crate::approval::policy::Policy::new("/workspace"),
+            make_projector(),
+        ));
+        let (core, start) =
+            SessionStartAuthority::from_hydrated(authority.clone(), &hydrated_again, broker)
+                .expect("bind recovered Session");
+        let driver = Arc::new(QueuedRecoveryDriver {
+            identity: authority.rpc_identity().clone(),
+            starts: Mutex::new(Vec::new()),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let (gateway, commands, frames) = gateway();
+        let session = Session::start_hydrated(
+            store,
+            gateway,
+            core,
+            Arc::new(SequentialRunWorker::new(driver.clone())),
+            start,
+        )
+        .await
+        .expect("start hydrated Session");
+        assert!(
+            driver.starts.lock().expect("provider starts").is_empty(),
+            "startup cannot call the provider before gateway replay"
+        );
+        let task = tokio::spawn(session.run());
+        commands.send(user(1)).await.expect("replay terminal owner");
+        commands.send(user(2)).await.expect("replay queued command");
+        tokio::time::timeout(Duration::from_secs(3), driver.started.notified())
+            .await
+            .expect("queued command starts provider");
+        commands
+            .send(user(2))
+            .await
+            .expect("duplicate active replay");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if received_acks(&frames)
+                    .iter()
+                    .filter(|ack| ack.seq == 2)
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "Session failed before duplicate ACK");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("duplicate received ACK");
+        {
+            let starts = driver.starts.lock().expect("provider starts");
+            assert_eq!(
+                starts.len(),
+                1,
+                "duplicate replay cannot start or steer another attempt"
+            );
+            assert!(
+                !starts[0].1,
+                "replayed receipt has no new monotonic timestamp"
+            );
+            let users: Vec<_> = starts[0]
+                .0
+                .iter()
+                .map(crate::memory::overflow::context_message_to_public)
+                .filter_map(|message| match message {
+                    PublicMessage::User(user)
+                        if user.content
+                            == vec![UserContent::Text {
+                                text: "message 2".to_owned(),
+                            }] =>
+                    {
+                        Some(user)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                users.len(),
+                1,
+                "queued input occurs once in provider context"
+            );
+            assert_eq!(
+                users[0].timestamp,
+                chrono::DateTime::parse_from_rfc3339(&received_times[0])
+                    .expect("receipt timestamp")
+                    .with_timezone(&Utc)
+            );
+        }
+        // The second recovered input and a fresh input arrive while the
+        // first provider start is held. Both use the ordinary active router.
+        commands
+            .send(user(3))
+            .await
+            .expect("second recovered input");
+        commands
+            .send(user(3))
+            .await
+            .expect("duplicate second recovered input");
+        commands
+            .send(user(4))
+            .await
+            .expect("fresh input behind recovered queue");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let received = received_acks(&frames);
+                if received.iter().filter(|ack| ack.seq == 3).count() >= 2
+                    && received.iter().any(|ack| ack.seq == 4)
+                {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "Session failed while receiving the queue"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all inputs received while provider held");
+        driver.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let applied = applied_acks(&frames);
+                if [2, 3, 4]
+                    .iter()
+                    .all(|seq| applied.iter().any(|ack| ack.seq == *seq))
+                {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "Session failed before queued inputs completed"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered and fresh inputs complete");
+        commands
+            .send(user(2))
+            .await
+            .expect("terminal replay of first recovered input");
+        commands
+            .send(user(3))
+            .await
+            .expect("terminal replay of second recovered input");
+        close_mock_gateway_after_idle_boundary(commands, &frames, &task, 5).await;
+        completed(task.await.expect("Session join"));
+        {
+            let starts = driver.starts.lock().expect("provider starts");
+            assert!(
+                starts.len() >= 2,
+                "new inputs must reach a provider after the held request"
+            );
+            // Steering may combine inputs into one continuation. Check their
+            // actual ordered presence, not one provider call/run per input.
+            let texts = |context: &[ContextMessage]| -> Vec<String> {
+                context
+                    .iter()
+                    .map(crate::memory::overflow::context_message_to_public)
+                    .filter_map(|message| match message {
+                        PublicMessage::User(user) => match user.content.as_slice() {
+                            [UserContent::Text { text }] => Some(text.clone()),
+                            other => panic!("unexpected user content: {other:?}"),
+                        },
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let expected: Vec<String> = (1..=4).map(|seq| format!("message {seq}")).collect();
+            for (context, _) in starts.iter() {
+                assert!(
+                    expected.starts_with(&texts(context)),
+                    "provider context reordered or duplicated an input"
+                );
+            }
+            assert_eq!(
+                texts(&starts.last().expect("last provider request").0),
+                expected
+            );
+        }
+        let persisted_users: Vec<String> =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE role='user' ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .expect("durable user inputs");
+        assert_eq!(
+            persisted_users.len(),
+            4,
+            "every input must be durably injected exactly once"
+        );
+        for (index, payload) in persisted_users.iter().enumerate() {
+            let message: UserMessage = serde_json::from_str(payload).expect("user payload");
+            assert_eq!(
+                message.content,
+                vec![UserContent::Text {
+                    text: format!("message {}", index + 1)
+                }]
+            );
+            if index == 1 || index == 2 {
+                assert_eq!(
+                    message.timestamp,
+                    chrono::DateTime::parse_from_rfc3339(&received_times[index - 1])
+                        .expect("stored receipt timestamp")
+                        .with_timezone(&Utc)
+                );
+            }
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT payload FROM messages WHERE id='approval-assistant'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("retained original assistant"),
+            original_assistant
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end' AND json_extract(internal_metadata, '$.run_id')=?"
+            )
+            .bind(&original_run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("original owner ends exactly once"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM inbound_commands WHERE seq<=4 AND status='applied'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("completed command count"),
+            4
+        );
+        pool.close().await;
+        std::fs::remove_dir_all(directory).expect("remove crash fixture");
+    }
+}

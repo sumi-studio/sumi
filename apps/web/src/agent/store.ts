@@ -88,7 +88,7 @@ export function createConversationStore({
   let connectionGeneration = 0;
   let pendingConnectionGeneration: number | null = null;
   let boundInstallation: DirectChatInstallationBinding | null = null;
-  const approvalSubmissionLatches = new Set<string>();
+  const approvalSubmissionLatches = new Map<string, string>();
   const undurableAdmissions = new Map<
     string,
     Extract<PrivateOutboxEntry, { state: "admitted" }>
@@ -517,6 +517,11 @@ export function createConversationStore({
         return;
       }
       if (frame.type === "command_rejected") {
+        for (const [requestId, key] of approvalSubmissionLatches) {
+          if (key === frame.idempotency_key) {
+            approvalSubmissionLatches.delete(requestId);
+          }
+        }
         const entry = outbox.findByIdempotencyKey(frame.idempotency_key);
         if (!entry) {
           publish(`Command rejected: ${frame.reject_reason}`);
@@ -674,17 +679,21 @@ export function createConversationStore({
           publish();
           return false;
         }
+        const key = idempotencyKey();
         // This latch is set before sendCommand because transports are allowed
         // to synchronously return or emit frames. It prevents conflicting
-        // decisions during the durable-resolution gap.
-        approvalSubmissionLatches.add(requestId);
+        // decisions until resolution or rejection of this exact submission.
+        approvalSubmissionLatches.set(requestId, key);
         publish(null);
-        const sent = transport.sendCommand({
-          type: "approval_decision",
-          request_id: requestId,
-          decision,
-        });
-        if (!sent) {
+        const sent = transport.sendCommand(
+          {
+            type: "approval_decision",
+            request_id: requestId,
+            decision,
+          },
+          key,
+        );
+        if (!sent && approvalSubmissionLatches.get(requestId) === key) {
           approvalSubmissionLatches.delete(requestId);
           publish("Approval decision could not be queued");
         }

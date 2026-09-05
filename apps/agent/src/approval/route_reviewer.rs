@@ -1926,8 +1926,19 @@ fn build_provider_review_request(
         ReviewerTransportError::Fatal(format!("reviewer evidence serialization failed: {error}"))
     })?;
     messages.push(synthetic_user_message(structured_evidence));
+    // The tool-enabled attempt still needs the final decision schema. Keep it
+    // in trusted instructions without requiring response_format alongside tools.
+    // The tool-free repair attempt receives its schema through the adapter.
+    let system = if structured_retry {
+        system.to_owned()
+    } else {
+        format!(
+            "{system}\n\nAfter any verification reads, return your final decision as one JSON object conforming to this JSON Schema:\n{}",
+            output_schema.schema
+        )
+    };
     let context = PromptContext::new(
-        system.to_owned(),
+        system,
         prompt
             .personality_agent_context()
             .map(|context| context.memory_blocks.clone())
@@ -2200,8 +2211,7 @@ impl ExecutionReviewer {
                     }
                 }
                 AttemptOutcome::RetryTransient(attempt_trace)
-                    if !structured_retry_used
-                        && attempts < self.budget.budget.max_attempts
+                    if attempts < self.budget.budget.max_attempts
                         && started.elapsed() < self.budget.budget.total_timeout =>
                 {
                     tool_trace.extend(attempt_trace);
@@ -2330,8 +2340,7 @@ impl EscalationReviewer {
                     }
                 }
                 AttemptOutcome::RetryTransient(attempt_trace)
-                    if !structured_retry_used
-                        && attempts < self.budget.budget.max_attempts
+                    if attempts < self.budget.budget.max_attempts
                         && started.elapsed() < self.budget.budget.total_timeout =>
                 {
                     tool_trace.extend(attempt_trace);
@@ -2450,8 +2459,7 @@ impl EscalationObjectionResponder {
                     }
                 },
                 AttemptOutcome::RetryTransient(_)
-                    if !structured_retry_used
-                        && attempts < self.budget.budget.max_attempts
+                    if attempts < self.budget.budget.max_attempts
                         && started.elapsed() < self.budget.budget.total_timeout => {}
                 AttemptOutcome::RetryTransient(_) => {
                     return self.evidence(
@@ -3327,7 +3335,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_review_uses_tools_without_response_format_and_retry_inverts_that_shape() {
+    fn initial_review_carries_schema_with_tools_and_retry_uses_response_format() {
         let spec = ModelSpec::preset("openai-responses").unwrap();
         let prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
@@ -3355,6 +3363,11 @@ mod tests {
         assert_eq!(initial_context.tools, vec![tool]);
         assert_eq!(initial_options.max_tokens, Some(4_096));
         assert!(initial_options.structured_output.is_none());
+        assert!(
+            initial_context
+                .system_prompt
+                .contains(&prompt.output_schema.provider_schema().schema.to_string())
+        );
 
         let (retry_context, retry_options) = build_provider_review_request(
             &spec,
@@ -3636,6 +3649,48 @@ mod tests {
         assert_eq!(invalid_json_retries, 4);
         assert_eq!(schema_mismatch_retries, 4);
         assert_eq!(retry_fields, 8);
+    }
+
+    fn reviewer_wire_system<'a>(provider: &str, body: &'a Value) -> &'a str {
+        match provider {
+            "kimi" | "glm" => body["messages"][0]["content"].as_str().unwrap(),
+            "openai-responses" => body["instructions"].as_str().unwrap(),
+            "anthropic" => body["system"]
+                .as_str()
+                .unwrap_or_else(|| body["system"][0]["text"].as_str().unwrap()),
+            other => panic!("unexpected reviewer provider {other}"),
+        }
+    }
+
+    #[test]
+    fn initial_review_provider_wire_includes_the_exact_decision_schema_in_system() {
+        let execution = ExecutionReviewOutputSchema::v7()
+            .provider_schema()
+            .schema
+            .clone();
+        let escalation = EscalationReviewOutputSchema::v7()
+            .provider_schema()
+            .schema
+            .clone();
+        for (bodies, schema) in [
+            (
+                execution_provider_wire_bodies_for_test(execution_request()),
+                execution,
+            ),
+            (
+                escalation_provider_wire_bodies_for_test(escalation_request()),
+                escalation,
+            ),
+        ] {
+            // The first four bodies are initial attempts, before a provider-enforced repair.
+            for (provider, body) in bodies.into_iter().take(4) {
+                let system = reviewer_wire_system(provider, &body);
+                assert!(
+                    system.contains(&schema.to_string()),
+                    "{provider} omitted the schema"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4226,6 +4281,66 @@ mod tests {
         assert!(transport.prompts.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn objection_schema_repair_can_retry_a_transient_failure() {
+        let transport = Arc::new(RecordingObjectionTransport {
+            responses: Mutex::new(VecDeque::from([
+                Ok("not-json".to_owned()),
+                Err(ReviewerTransportError::Transient(
+                    "http_503: unavailable".to_owned(),
+                )),
+                Ok(r#"{"outcome":"proceed","reason":null}"#.to_owned()),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let responder = EscalationObjectionResponder::new(
+            reviewer_model(),
+            transport.clone(),
+            ReviewerBudgetV1::escalation(),
+            PersonalityAgentPromptContextHandle::new(&pa_prompt_context()),
+        )
+        .unwrap();
+        let evidence = responder
+            .answer(
+                EscalationObjectionRequest {
+                    review: escalation_request(),
+                    reviewer_objection: "verify the request".to_owned(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(evidence.budget.attempts, 3);
+        assert_eq!(
+            evidence.budget.terminal,
+            ReviewerTerminalClass::ValidDecision
+        );
+        assert_eq!(
+            evidence.answer.unwrap().outcome,
+            EscalationObjectionOutcome::Proceed
+        );
+        let prompts = transport.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        for prompt in &prompts[1..] {
+            assert_eq!(
+                prompt.retry_validation_code,
+                Some(ReviewerValidationCode::InvalidJson)
+            );
+        }
+        let initial = &prompts[0];
+        for (provider, body) in provider_wire_bodies_for_test(
+            &initial.system,
+            initial.output_schema.provider_schema(),
+            initial,
+            false,
+        ) {
+            assert!(
+                reviewer_wire_system(provider, &body)
+                    .contains(&initial.output_schema.provider_schema().schema.to_string()),
+                "{provider} omitted the objection schema"
+            );
+        }
+    }
+
     #[test]
     fn provider_review_terminal_rejects_truncation_abort_and_permanent_errors() {
         let valid_json = r#"{"outcome":"allow","risk":"low","rationale":"complete"}"#;
@@ -4322,6 +4437,9 @@ mod tests {
         let transport = Arc::new(RecordingExecutionTransport {
             responses: Mutex::new(VecDeque::from([
                 Ok("not-json".to_owned()),
+                Err(ReviewerTransportError::Transient(
+                    "http_503: unavailable".to_owned(),
+                )),
                 Ok(r#"{"outcome":"allow","risk":"low","rationale":"bounded"}"#.to_owned()),
             ])),
             prompts: Mutex::new(Vec::new()),
@@ -4337,9 +4455,11 @@ mod tests {
             .review(execution_request(), CancellationToken::new())
             .await
         else {
-            panic!("second valid response should allow")
+            panic!(
+                "a transient failure during schema repair must leave the third attempt available"
+            )
         };
-        assert_eq!(evidence.budget.attempts, 2);
+        assert_eq!(evidence.budget.attempts, 3);
         assert_eq!(
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
@@ -4348,7 +4468,7 @@ mod tests {
         assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V7);
         assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V7);
         let prompts = transport.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts.len(), 3);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v7());
             assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V7);
@@ -4386,6 +4506,7 @@ mod tests {
                     r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":""}"#
                         .to_owned(),
                 ),
+                Err(ReviewerTransportError::Transient("http_503: unavailable".to_owned())),
                 Ok(
                     r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"request matches the exact action"}"#
                         .to_owned(),
@@ -4406,7 +4527,7 @@ mod tests {
         else {
             panic!("a valid bounded retry should permit a Human prompt")
         };
-        assert_eq!(evidence.budget.attempts, 2);
+        assert_eq!(evidence.budget.attempts, 3);
         assert_eq!(
             evidence.budget.terminal,
             ReviewerTerminalClass::ValidDecision
@@ -4415,7 +4536,7 @@ mod tests {
         assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V7);
         assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V7);
         let prompts = transport.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts.len(), 3);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v7());
             assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V7);
@@ -4497,6 +4618,41 @@ mod tests {
             evidence.budget.terminal,
             ReviewerTerminalClass::MalformedExhausted
         );
+    }
+
+    #[tokio::test]
+    async fn execution_schema_repair_transport_retries_stop_at_the_total_attempt_budget() {
+        let model = reviewer_model();
+        let transport = Arc::new(ExecutionTransport(Mutex::new(VecDeque::from([
+            Ok("not-json".to_owned()),
+            Err(ReviewerTransportError::Transient(
+                "http_503: unavailable".to_owned(),
+            )),
+            Err(ReviewerTransportError::Transient(
+                "http_503: unavailable".to_owned(),
+            )),
+            Ok(r#"{"outcome":"allow","risk":"low","rationale":"must remain unused"}"#.to_owned()),
+        ]))));
+        let reviewer = ExecutionReviewer::new(
+            model.clone(),
+            reviewer_trust(&model),
+            transport.clone(),
+            ReviewerBudgetV1::execution(),
+        )
+        .unwrap();
+        let ExecutionReviewResult::Block(evidence) = reviewer
+            .review(execution_request(), CancellationToken::new())
+            .await
+        else {
+            panic!("transport exhaustion must not permit execution")
+        };
+        assert_eq!(evidence.budget.attempts, 3);
+        assert_eq!(
+            evidence.budget.terminal,
+            ReviewerTerminalClass::TransientExhausted
+        );
+        assert_eq!(evidence.decision.outcome, ExecutionReviewOutcome::Block);
+        assert_eq!(transport.0.lock().unwrap().len(), 1);
     }
 
     struct ToolThenVerdictTransport {

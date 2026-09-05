@@ -2,12 +2,69 @@ package agentevents
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestEpochControlCredentialOutlivesEightHoursButCannotOutliveFence(t *testing.T) {
+	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))
+	control, server := newLocalControlHTTPServer(
+		t, gateway,
+		localControlAuthorization(localControlTestBearer, localControlTestPAID, 7, "boot-a"),
+	)
+	var clock atomic.Int64
+	clock.Store(time.Now().Unix())
+	control.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	response, body := postLocalControl(
+		t, server.URL, LocalRuntimeStatePublishPath, localControlTestBearer,
+		startupPublication("long-lived-startup", localControlTestPAID, 7, "boot-a"),
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("startup: status=%d body=%s", response.StatusCode, body)
+	}
+	issue := func(requestID string) LocalCredentialIssueResponse {
+		t.Helper()
+		response, body := postLocalControl(
+			t, server.URL, LocalCredentialIssuePath, localControlTestBearer,
+			credentialRequest(requestID, localControlTestPAID, 7, "boot-a"),
+		)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("issue %s: status=%d body=%s", requestID, response.StatusCode, body)
+		}
+		var issued LocalCredentialIssueResponse
+		if err := json.Unmarshal(body, &issued); err != nil {
+			t.Fatal(err)
+		}
+		if issued.ExpiresAtUnix != control.now().Add(defaultLocalCredentialTTL).Unix() {
+			t.Fatal("an epoch-lived control credential must still mint a short-lived Gateway token")
+		}
+		return issued
+	}
+	first := issue("before-eight-hours")
+	clock.Add(int64((9 * time.Hour) / time.Second))
+	if first.ExpiresAtUnix > clock.Load() {
+		t.Fatal("the original Gateway token must have expired before reconnect")
+	}
+	second := issue("reconnect-after-nine-hours")
+	if first.Token == second.Token || second.ExpiresAtUnix <= first.ExpiresAtUnix {
+		t.Fatal("reconnect must receive a fresh Gateway token")
+	}
+	if err := control.FenceLocalRuntimeAuthorization(context.Background(), localControlTestPAID, 7, "boot-a"); err != nil {
+		t.Fatal(err)
+	}
+	response, _ = postLocalControl(
+		t, server.URL, LocalCredentialIssuePath, localControlTestBearer,
+		credentialRequest("after-fence", localControlTestPAID, 7, "boot-a"),
+	)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("fenced epoch remained authorized: status=%d", response.StatusCode)
+	}
+}
 
 func TestLocalRuntimeAuthorizationCanBeInstalledReplacedAndRemoved(t *testing.T) {
 	_, gateway := openLocalControlTestGateway(t, privateRuntimeDir(t))

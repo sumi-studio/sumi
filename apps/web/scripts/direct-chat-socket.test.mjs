@@ -1551,3 +1551,112 @@ test("the mounted store surfaces a stated runtime failure and clears it on retry
   assert.equal(store.getState().ready, "ready");
   release();
 });
+
+test("a rejected approval can be retried after reconnect without a stale rejection unlocking the new attempt", async (t) => {
+  FakeWebSocket.instances = [];
+  const transport = new DirectChatSocket();
+  const store = createConversationStore({ transport });
+  const release = store.getState().acquireConnection(binding);
+  t.after(release);
+  await new Promise((resolve) => queueMicrotask(resolve));
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
+  const request = approvalRequest();
+  first.receive(event(1, { type: "approval_requested", request }));
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "approve_once" }),
+    true,
+  );
+  const rejectedKey = transport.pendingIdempotencyKeys()[0];
+  first.receive({
+    type: "command_rejected",
+    idempotency_key: rejectedKey,
+    reject_reason: "unavailable",
+  });
+  assert.deepEqual(transport.pendingIdempotencyKeys(), []);
+  assert.equal(store.getState().approval?.id, request.id);
+  assert.equal(store.getState().sendingApprovalRequestId, null);
+
+  // The chat's retry control must preserve the request and permit a new decision.
+  store.getState().disconnect();
+  store.getState().resumeMountedConnection();
+  await new Promise((resolve) => queueMicrotask(resolve));
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  second.receive({ type: "direct_chat_status", status: "ready" });
+  assert.deepEqual(
+    second.sent.map(JSON.parse).filter((frame) => frame.type === "command"),
+    [],
+  );
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "deny_once" }),
+    true,
+  );
+  const retryKey = transport.pendingIdempotencyKeys()[0];
+  assert.notEqual(retryKey, rejectedKey);
+  for (const key of [rejectedKey, "unrelated-command"]) {
+    second.receive({
+      type: "command_rejected",
+      idempotency_key: key,
+      reject_reason: "unavailable",
+    });
+    assert.equal(store.getState().sendingApprovalRequestId, request.id);
+    assert.equal(
+      store.getState().decideApproval(request.id, { type: "approve_once" }),
+      false,
+    );
+  }
+  assert.deepEqual(transport.pendingIdempotencyKeys(), [retryKey]);
+  second.receive(accepted(retryKey));
+  assert.equal(store.getState().sendingApprovalRequestId, request.id);
+  second.receive(
+    event(2, {
+      type: "approval_resolved",
+      request_id: request.id,
+      resolution: { decision: { type: "deny_once" } },
+    }),
+  );
+  assert.equal(store.getState().sendingApprovalRequestId, null);
+  assert.equal(store.getState().approval, null);
+});
+
+test("transport loss keeps an approval pending and resends the same decision and key", async (t) => {
+  FakeWebSocket.instances = [];
+  const transport = new DirectChatSocket();
+  const store = createConversationStore({ transport });
+  const release = store.getState().acquireConnection(binding);
+  t.after(release);
+  await new Promise((resolve) => queueMicrotask(resolve));
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive({ type: "direct_chat_status", status: "ready" });
+  const request = approvalRequest();
+  first.receive(event(1, { type: "approval_requested", request }));
+  assert.equal(
+    store.getState().decideApproval(request.id, { type: "approve_once" }),
+    true,
+  );
+  const command = first.sent
+    .map(JSON.parse)
+    .find((frame) => frame.type === "command");
+  withCapturedRetryTimer((fireReconnect) => {
+    first.drop();
+    fireReconnect();
+    const second = FakeWebSocket.instances.at(-1);
+    second.open();
+    second.receive({ type: "direct_chat_status", status: "ready" });
+    assert.deepEqual(
+      second.sent.map(JSON.parse).filter((frame) => frame.type === "command"),
+      [command],
+    );
+    assert.deepEqual(transport.pendingIdempotencyKeys(), [
+      command.idempotency_key,
+    ]);
+    assert.equal(store.getState().sendingApprovalRequestId, request.id);
+    assert.equal(
+      store.getState().decideApproval(request.id, { type: "deny_once" }),
+      false,
+    );
+  });
+});

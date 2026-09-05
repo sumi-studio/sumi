@@ -1311,9 +1311,6 @@ async function startRealAgentStackOnce(
           SUMI_LOCAL_CONTROL_SERVER_UID: String(executorServerUID),
           SUMI_LOCAL_CONTROL_SOCKET_GID: String(localControlSocketGID),
           SUMI_LOCAL_CONTROL_BEARER: localControlBearer,
-          SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX: String(
-            Math.floor(Date.now() / 1_000) + 30 * 60,
-          ),
           SUMI_AGENT_WRAPPING_KEY_ID: wrappingKeyID,
           SUMI_AGENT_WRAPPING_KEY: wrappingKey,
           SUMI_MODEL_PRESET: "opencode-go",

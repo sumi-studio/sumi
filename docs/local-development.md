@@ -362,9 +362,25 @@ while the process is alive, but this recovery path does not resume the remaining
 retry budget after a process restart. The retry-resumption behavior described in
 the implementation plan remains unimplemented.
 
-The supported suffix has one pending command and a completed Error in its
-authenticated open turn. Multiple pending recovery steps, a later unfinished
-assistant attempt, pending Error provider context, unresolved tools/approvals,
-and an already-closed turn awaiting `AgentEnd` still require their own recovery
-paths. Do not report these states as recovered or reset the agent's identity or
-erase their memory to hide them. See [issue #339](https://github.com/sumi-studio/sumi/issues/339).
+The supported Error suffix has one unfinished owner and a completed Error in
+its authenticated open turn. Unclassified user inputs received afterward remain
+on disk while that owner is recovered. On authenticated Gateway replay, the new
+Session admits those exact inputs once, in order, with their original receipt
+times. This also applies to existing ToolUse recovery and to startup with only
+unclassified user inputs. Another restart before replay preserves that queue.
+
+Multiple unfinished owners, queued control or classified commands, a later
+unfinished assistant attempt, pending Error provider context, and an
+already-closed turn awaiting `AgentEnd` still require their own recovery paths.
+Do not report these states as recovered or reset the agent's identity or erase
+their memory to hide them. See [issue #339](https://github.com/sumi-studio/sumi/issues/339).
+
+## Long-running local-control connections
+
+The internal local-control bearer belongs to one runtime epoch. It remains
+usable for that epoch's lifetime, including Gateway reconnects after eight
+hours. The server revokes it when that exact runtime is fenced or replaced;
+the socket, agent identity, generation, nonce, and application permissions still
+bound each request. Gateway tokens minted through this connection retain their
+short expiry and must be refreshed on reconnect. See
+[issue #354](https://github.com/sumi-studio/sumi/issues/354).

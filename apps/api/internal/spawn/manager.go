@@ -36,7 +36,6 @@ type AgentRuntimeConfig struct {
 	WrappingKey               WrappingKeyMaterial
 	Bearer                    string
 	Nonce                     string
-	BearerExpiresAtUnix       int64
 	Warmth                    string
 	Generation                uint64
 	GenerationLeaseID         string
@@ -85,7 +84,6 @@ type Config struct {
 	Generation      uint64
 	SharedBearer    string // shared control-plane bearer; per-agent value is derived
 	SharedNonce     string
-	BearerTTL       time.Duration // lifetime of the local-control bearer; 0 uses 8h
 	IdleTimeout     time.Duration // cold-mode idle stop delay; 0 disables auto-stop
 	ShutdownTimeout time.Duration // bound for in-flight starts during StopAll; 0 uses 5s
 	Now             func() time.Time
@@ -137,9 +135,6 @@ func New(cfg Config) (*Manager, error) {
 	now := cfg.Now
 	if now == nil {
 		now = time.Now
-	}
-	if cfg.BearerTTL <= 0 {
-		cfg.BearerTTL = 8 * time.Hour
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 5 * time.Second
@@ -254,7 +249,6 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRunti
 	if err != nil {
 		return nil, fmt.Errorf("resolve wrapping key for %s: %w", agentID, err)
 	}
-	now := m.now()
 	config := AgentRuntimeConfig{
 		AgentID:                   agentID,
 		StateDir:                  fmt.Sprintf("%s/%s", m.cfg.StateRoot, agentID),
@@ -262,7 +256,6 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRunti
 		WrappingKey:               wrappingKey,
 		Bearer:                    deriveCredential(m.cfg.SharedBearer, agentID),
 		Nonce:                     deriveCredential(m.cfg.SharedNonce, agentID),
-		BearerExpiresAtUnix:       now.Add(m.cfg.BearerTTL).Unix(),
 		Warmth:                    warmth,
 		Generation:                m.cfg.Generation,
 		GenerationLeaseID:         randomOpaqueID(),

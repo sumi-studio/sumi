@@ -47,8 +47,9 @@ use crate::{
     store::{
         ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
         EventWriter, HydratedRunState, HydrationReceiptIdentity, InboundAdmission,
-        InboundReceiptOrigin, Projection, RecoveryRequired as AdmissionRecoveryRequired,
-        RecoveryStep, ResumeDirective, Store, ToolExecutionMutation,
+        InboundReceiptOrigin, Projection, ReceivedUserCommand,
+        RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, ResumeDirective, Store,
+        ToolExecutionMutation,
     },
 };
 
@@ -365,6 +366,7 @@ struct HydratedSessionBinding {
     receipt: HydrationReceiptIdentity,
     core_ownership_id: Uuid,
     core_mutation_epoch: u64,
+    received_user_commands: Vec<ReceivedUserCommand>,
 }
 
 impl HydratedSessionBinding {
@@ -586,6 +588,7 @@ impl SessionStartAuthority {
             receipt: hydrated.receipt.clone(),
             core_ownership_id: core.ownership_id,
             core_mutation_epoch: core.mutation_epoch,
+            received_user_commands: hydrated.received_user_commands.clone(),
         };
         binding.validate_receipt()?;
         core.hydrated_session_binding_id = Some(binding.binding_id);
@@ -977,6 +980,9 @@ pub(crate) struct Session<G: Gateway> {
     writer: EventWriter,
     admission: InboundAdmission,
     recovery_steps: Vec<RecoveryStep>,
+    /// One admission per authenticated input recovered at Session startup.
+    /// This survives gateway reconnects; ordinary replays stay deduplicated.
+    received_user_replays: HashSet<ReceivedUserCommand>,
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
@@ -1105,6 +1111,13 @@ impl<G: Gateway + 'static> Session<G> {
             "completed hydration must not produce a second recovery plan"
         );
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
+        let received_user_replays = match &start_authority.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                binding.received_user_commands.iter().cloned().collect()
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => HashSet::new(),
+        };
         let (gateway_reader, gateway_writer) = gateway.split();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let volatile_in_flight = Arc::new(AtomicUsize::new(0));
@@ -1136,6 +1149,7 @@ impl<G: Gateway + 'static> Session<G> {
             writer,
             admission,
             recovery_steps,
+            received_user_replays,
             core: Some(core),
             active: None,
             worker,
@@ -1385,8 +1399,8 @@ impl<G: Gateway + 'static> Session<G> {
             )
             .into());
         }
-        // Capture live ingress before durable admission. Replay returns before
-        // construction below and therefore never fabricates a monotonic span.
+        // Capture live ingress before durable admission. A recovered replay
+        // retains its original wall-clock receipt without a monotonic span.
         let received_monotonic = Instant::now();
         let receipt = match self
             .admission
@@ -1407,7 +1421,12 @@ impl<G: Gateway + 'static> Session<G> {
         self.enqueue_durable_events(receipt.events).await?;
         self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])
             .await?;
-        if receipt_origin == InboundReceiptOrigin::Replay {
+        let recovered_replay = receipt_origin == InboundReceiptOrigin::Replay
+            && self.received_user_replays.remove(&ReceivedUserCommand {
+                command_id: ack.command_id.as_str().to_owned(),
+                seq: ack.seq,
+            });
+        if receipt_origin == InboundReceiptOrigin::Replay && !recovered_replay {
             return Ok(());
         }
         if ack.status != CommandAckStatus::Received
@@ -1423,7 +1442,11 @@ impl<G: Gateway + 'static> Session<G> {
         let InboundCommand::Valid(command) = inbound else {
             unreachable!("invalid commands return above");
         };
-        let command = AdmittedCommand::live(command, received_at, received_monotonic);
+        let command = if recovered_replay {
+            AdmittedCommand::new(command, received_at)
+        } else {
+            AdmittedCommand::live(command, received_at, received_monotonic)
+        };
         if self.active.is_some() {
             if self.route_retry_wait_command(&command).await? {
                 return Ok(());
