@@ -39,14 +39,6 @@ pipeline {
             error 'Dockerfile が 1 件も見つかりません'
           }
 
-          // Images that assemble source owned by another service need those
-          // inputs in addition to their automatically discovered app/deploy
-          // pair. Keep this dependency map next to target discovery so SCM
-          // polling cannot publish a stale composite image.
-          def extraWatchedDirsByImage = [
-            provisioner: ['apps/api', 'deploy/agent']
-          ]
-
           def discovered = found.readLines().collect { dockerfile ->
             if (!(dockerfile ==~ /[A-Za-z0-9._\/-]+/)) {
               error "安全でない文字を含む Dockerfile パスです: ${dockerfile}"
@@ -63,20 +55,9 @@ pipeline {
               error "コンテナイメージ名に使用できないディレクトリ名です: ${name}"
             }
 
-            // Sumi keeps build recipes under deploy/<service> and source under
-            // apps/<service>. Watch both while retaining automatic discovery.
-            def watchedDirs = [dir]
-            def appDir = "apps/${name}"
-            if (dir.startsWith('deploy/') &&
-                sh(script: "test -d '${appDir}'", returnStatus: true) == 0) {
-              watchedDirs << appDir
-            }
-            watchedDirs.addAll(extraWatchedDirsByImage[name] ?: [])
-
             [
               name: name,
-              dockerfile: dockerfile,
-              watchedDirs: watchedDirs
+              dockerfile: dockerfile
             ]
           }
 
@@ -92,8 +73,7 @@ pipeline {
 
           // null means that a safe comparison base is unavailable, so every
           // discovered image must be rebuilt. Manual "Build Now" runs are also
-          // full rebuilds, which provides the documented escape hatch for
-          // shared files that are outside a service's watched directories.
+          // full rebuilds.
           // An empty list is a valid diff for an SCM-poll-triggered build.
           List<String> changedPaths = null
           def manuallyStarted = !currentBuild
@@ -116,12 +96,20 @@ pipeline {
             }
           }
 
-          def targets = discovered.findAll { target ->
-            changedPaths == null || changedPaths.any { path ->
-              target.watchedDirs.any { watchedDir ->
-                watchedDir == '.' ||
-                  path == watchedDir ||
-                  path.startsWith("${watchedDir}/")
+          def targets = discovered
+          if (changedPaths != null) {
+            // Use the same executable dependency selection exercised by tests.
+            // Pass paths as data, never interpolate them into shell source.
+            withEnv(["SUMI_IMAGE_CHANGED_PATHS=${changedPaths.join('\n')}"]) {
+              targets = discovered.findAll { target ->
+                def decision = sh(
+                  script: "printf '%s\\n' \"\$SUMI_IMAGE_CHANGED_PATHS\" | sh scripts/operations/image-needs-build '${target.name}' '${target.dockerfile}'",
+                  returnStdout: true
+                ).trim()
+                if (!(decision in ['build', 'skip'])) {
+                  error "Invalid image selection result for ${target.name}: ${decision}"
+                }
+                decision == 'build'
               }
             }
           }

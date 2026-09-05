@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+# Jenkins supplies discovered image names and repository-relative Dockerfiles.
+# Changed paths arrive on stdin, one per line; no checkout or build is needed.
+if [ "$#" -ne 2 ]; then
+  printf 'usage: image-needs-build IMAGE DOCKERFILE < changed-paths\n' >&2
+  exit 2
+fi
+image=$1
+if [ ! -f "$2" ]; then
+  printf 'Dockerfile does not exist: %s\n' "$2" >&2
+  exit 2
+fi
+case $2 in
+  */*) image_dir=${2%/*} ;;
+  *) image_dir=. ;;
+esac
+expected_image=${image_dir##*/}
+[ "$image_dir" != . ] || expected_image=root
+if [ "$image" != "$expected_image" ]; then
+  printf 'image %s does not match Dockerfile directory %s\n' "$image" "$image_dir" >&2
+  exit 2
+fi
+
+while IFS= read -r changed_path || [ -n "$changed_path" ]; do
+  [ -n "$changed_path" ] || continue
+  case $changed_path in
+    Jenkinsfile|scripts/operations/image-needs-build|.dockerignore)
+      printf 'build\n'; exit 0 ;;
+  esac
+  if [ "$image_dir" = . ]; then
+    printf 'build\n'; exit 0
+  fi
+  case $changed_path in
+    "$image_dir"|"$image_dir/"*|"apps/$image"|"apps/$image/"*)
+      printf 'build\n'; exit 0 ;;
+  esac
+  case $image in
+    provisioner)
+      # The runtime binary and the supervisor it invokes live in other trees.
+      case $changed_path in
+        apps/api|apps/api/*|deploy/agent|deploy/agent/*)
+          printf 'build\n'; exit 0 ;;
+      esac ;;
+    web)
+      # Inputs copied by deploy/web/Dockerfile before pnpm install.
+      case $changed_path in
+        packages|packages/*|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.npmrc*|apps/api/package.json|apps/agent/package.json)
+          printf 'build\n'; exit 0 ;;
+      esac ;;
+  esac
+done
+printf 'skip\n'
