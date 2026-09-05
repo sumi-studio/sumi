@@ -1979,13 +1979,15 @@ function exactSingleMessagingChannel(
   if (!workspaceID || !isRecord(value)) return undefined;
   if (
     Object.keys(value).sort().join("\0") !==
-      "channels\0dms\0members\0read_markers\0reply_later_markers\0self\0unread_summaries\0workspaces" ||
+      "channels\0dms\0members\0read_markers\0reply_later_markers\0self\0threads\0unread_summaries\0workspaces" ||
     !Array.isArray(value.workspaces) ||
     value.workspaces.length !== 1 ||
     !Array.isArray(value.channels) ||
     value.channels.length !== 1 ||
     !Array.isArray(value.dms) ||
-    value.dms.length !== 0
+    value.dms.length !== 0 ||
+    !Array.isArray(value.threads) ||
+    value.threads.length !== 0
   ) {
     return undefined;
   }
@@ -1999,11 +2001,14 @@ function exactSingleMessagingChannel(
     workspace.name.length === 0 ||
     !isRecord(channel) ||
     Object.keys(channel).sort().join("\0") !==
-      "channel_id\0name\0topic\0visibility\0voice\0workspace_id" ||
+      "channel_id\0name\0revision\0topic\0visibility\0voice\0workspace_id" ||
     !isCanonicalUUIDv7(channel.channel_id) ||
     channel.workspace_id !== workspaceID ||
     typeof channel.name !== "string" ||
     channel.name.length === 0 ||
+    typeof channel.revision !== "number" ||
+    !Number.isSafeInteger(channel.revision) ||
+    channel.revision < 1 ||
     typeof channel.topic !== "string" ||
     typeof channel.visibility !== "string" ||
     typeof channel.voice !== "boolean"
