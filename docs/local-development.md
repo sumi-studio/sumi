@@ -336,3 +336,24 @@ generation allocation for that case.
 
 `make dev-workspaces` is retained only for raw package development. It does not
 orchestrate an authenticated usable Sumi stack.
+
+## Recovery after a provider error
+
+For a persistent agent, a process stop after a completed, tool-free Error
+`MessageEnd` can leave the command awaiting its lifecycle suffix. Cold recovery
+now preserves that exact error and transcript, atomically appends `TurnEnd` and
+`AgentEnd` with the command disposition, and admits new commands for the same
+personality agent. The failed attempt is not reported as successful. Repeated
+restarts do not append duplicate endings.
+
+This is a bounded interruption policy: automatic retries still run normally
+while the process is alive, but this recovery path does not resume the remaining
+retry budget after a process restart. The retry-resumption behavior described in
+the implementation plan remains unimplemented.
+
+The supported suffix has one pending command and a completed Error in its
+authenticated open turn. Multiple pending recovery steps, a later unfinished
+assistant attempt, pending Error provider context, unresolved tools/approvals,
+and an already-closed turn awaiting `AgentEnd` still require their own recovery
+paths. Do not report these states as recovered or reset the agent's identity or
+erase their memory to hide them. See [issue #339](https://github.com/sumi-studio/sumi/issues/339).
