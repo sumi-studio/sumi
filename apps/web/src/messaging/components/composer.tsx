@@ -1,5 +1,6 @@
 import {
   AtSign,
+  BarChart3,
   CornerUpLeft,
   Paperclip,
   SendHorizontal,
@@ -9,7 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
 import type { DraftAttachment } from "../draft-attachments";
-import type { Message, Urgency } from "../model";
+import type { Message, PollInput, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
@@ -20,6 +21,7 @@ import {
   MentionSuggestions,
   useMentionAutocomplete,
 } from "./mention-autocomplete";
+import { PollCreateDialog } from "./poll-create-dialog";
 import { useImeCommittedTextarea } from "./use-ime-committed-textarea";
 
 const MAX_HEIGHT_PX = 220;
@@ -81,8 +83,12 @@ export function Composer() {
   const editDraftAttachment = useMessaging(
     (state) => state.editDraftAttachment,
   );
+  const pollsEnabled = useMessaging((state) =>
+    Boolean(state.capabilities.polls),
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const [pollDialogOpen, setPollDialogOpen] = useState(false);
 
   const display = usePlaceDisplay(activePlaceKey);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -155,14 +161,30 @@ export function Composer() {
   );
   const canSend = canSubmitText(value);
 
-  const submit = useCallback(() => {
-    const text = ime.committedValue(value);
-    if (!canSubmitText(text)) return;
-    send(text, urgency);
-    setUrgency("normal");
-    mentionAutocomplete.dismiss();
-    textareaRef.current?.focus();
-  }, [value, send, urgency, canSubmitText, mentionAutocomplete, ime]);
+  const submit = useCallback(
+    (poll: PollInput | null = null): boolean => {
+      const text = ime.committedValue(value);
+      if (poll === null ? !canSubmitText(text) : draftAttachments.length > 0) {
+        return false;
+      }
+      const enqueued =
+        poll === null ? send(text, urgency) : send(text, urgency, poll);
+      if (!enqueued) return false;
+      setUrgency("normal");
+      mentionAutocomplete.dismiss();
+      textareaRef.current?.focus();
+      return true;
+    },
+    [
+      value,
+      send,
+      urgency,
+      canSubmitText,
+      draftAttachments.length,
+      mentionAutocomplete,
+      ime,
+    ],
+  );
 
   const acceptFiles = useCallback(
     (list: FileList | File[] | null | undefined) => {
@@ -212,8 +234,26 @@ export function Composer() {
         icon: AtSign,
         onSelect: mentionAutocomplete.insertTrigger,
       },
+      {
+        id: "poll",
+        label: "投票を作成",
+        hint: !pollsEnabled
+          ? "この接続では利用できません"
+          : draftAttachments.length > 0
+            ? "添付を外すと作成できます"
+            : "質問と選択肢",
+        icon: BarChart3,
+        disabled: !pollsEnabled || draftAttachments.length > 0,
+        opensDialog: true,
+        onSelect: () => setPollDialogOpen(true),
+      },
     ],
-    [attachmentsFull, mentionAutocomplete.insertTrigger],
+    [
+      attachmentsFull,
+      draftAttachments.length,
+      mentionAutocomplete.insertTrigger,
+      pollsEnabled,
+    ],
   );
 
   const onKeyDown = useCallback(
@@ -300,7 +340,13 @@ export function Composer() {
           <span className="font-medium text-foreground">
             {replyAuthor.displayName}
           </span>
-          <span className="truncate">{replyTarget.content}</span>
+          <span className="truncate">
+            {replyTarget.content ||
+              replyTarget.poll?.question ||
+              (replyTarget.attachments.length > 0
+                ? "添付ファイル"
+                : "メッセージ")}
+          </span>
           <button
             type="button"
             onClick={() => setReplyTarget(null)}
@@ -348,6 +394,7 @@ export function Composer() {
                 key={entry.value}
                 type="button"
                 title={entry.hint}
+                aria-pressed={urgency === entry.value}
                 onClick={() => setUrgency(entry.value)}
                 className={`rounded px-2 py-0.5 font-medium text-[11px] transition-colors ${
                   urgency === entry.value
@@ -385,7 +432,7 @@ export function Composer() {
             )}
             <button
               type="button"
-              onClick={submit}
+              onClick={() => submit()}
               disabled={!canSend}
               title="送信（Enter）"
               aria-label="送信"
@@ -396,6 +443,13 @@ export function Composer() {
           </div>
         </div>
       </div>
+      {pollDialogOpen ? (
+        <PollCreateDialog
+          onClose={() => setPollDialogOpen(false)}
+          onSubmit={(poll) => submit(poll)}
+          finalFocusRef={textareaRef}
+        />
+      ) : null}
     </section>
   );
 }

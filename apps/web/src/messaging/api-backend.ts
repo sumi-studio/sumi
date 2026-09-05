@@ -7,6 +7,7 @@ import type {
   DmSummary,
   MemberProfile,
   Message,
+  MessagePoll,
   MessageSearchResult,
   MessagingBackend,
   NotificationLevel,
@@ -81,6 +82,7 @@ export class ApiMessagingBackend implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly connectionListeners = new Set<
@@ -359,6 +361,18 @@ export class ApiMessagingBackend implements MessagingBackend {
             reply_to: input.replyTo ?? "",
             client_nonce: input.clientNonce,
             attachments: input.attachments,
+            poll:
+              input.poll == null
+                ? null
+                : {
+                    question: input.poll.question,
+                    options: input.poll.options,
+                    allow_multi: input.poll.allowMulti,
+                    closes_at:
+                      input.poll.closesAt === null
+                        ? null
+                        : new Date(input.poll.closesAt).toISOString(),
+                  },
           },
         },
       ),
@@ -474,6 +488,20 @@ export class ApiMessagingBackend implements MessagingBackend {
       `/messaging/places/${encodeURIComponent(placeID(place))}/read-through`,
       { method: "PUT", body: { seq: lastReadSeq } },
     );
+  }
+
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message> {
+    const body = asRecord(
+      await this.request(
+        `/messaging/places/${encodeURIComponent(placeID(place))}/messages/${encodeURIComponent(messageId)}/poll/vote`,
+        { method: "POST", body: { option_ids: optionIds } },
+      ),
+    );
+    return parseMessage(body.message);
   }
 
   /** 自分のstatusだけを置き換える。参加者はsessionが決め、bodyには載せない。 */
@@ -766,6 +794,19 @@ export class ApiMessagingBackend implements MessagingBackend {
         place,
         messageId: asString(update.message_id),
         reactions: asArray(update.reactions).map(parseReaction),
+      };
+    } else if (eventType === "poll_updated") {
+      // Poll revision is independent from message edits. Parse the raw full
+      // declaration into a field-only projection so it cannot roll back any
+      // other message field and never advances the place cursor.
+      const place = this.places.get(asString(wire.place_id));
+      if (!place) return;
+      const update = asRecord(wire.poll);
+      parsed = {
+        type: eventType,
+        place,
+        messageId: asString(update.message_id),
+        poll: parsePoll(update.poll),
       };
     } else if (eventType === "status_updated") {
       // 自己申告のattention。placeを持たず、seqも進めない。
@@ -1181,6 +1222,7 @@ function parseMessage(value: unknown): Message {
     urgency: asUrgency(wire.urgency),
     reactions: asArray(wire.reactions).map(parseReaction),
     attachments: asArray(wire.attachments ?? []).map(parseAttachment),
+    poll: wire.poll === null ? null : parsePoll(wire.poll),
     replyTo: wire.reply_to === null ? null : asString(wire.reply_to),
     clientNonce:
       typeof wire.client_nonce === "string" ? wire.client_nonce : undefined,
@@ -1188,6 +1230,25 @@ function parseMessage(value: unknown): Message {
     editedAt: wire.edited_at === null ? null : asTimestamp(wire.edited_at),
     revision: asRevision(wire.revision),
     deleted: asBoolean(wire.deleted),
+  };
+}
+
+function parsePoll(value: unknown): MessagePoll {
+  const wire = asRecord(value);
+  return {
+    question: asString(wire.question),
+    allowMulti: asBoolean(wire.allow_multi),
+    closesAt: wire.closes_at == null ? null : asTimestamp(wire.closes_at),
+    // A newly created poll starts at zero, but the field itself is mandatory.
+    revision: asSeq(wire.revision),
+    options: asArray(wire.options).map((entry) => {
+      const option = asRecord(entry);
+      return {
+        optionId: asString(option.option_id),
+        text: asString(option.text),
+        voters: asArray(option.voters).map(parseParticipant),
+      };
+    }),
   };
 }
 

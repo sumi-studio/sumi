@@ -20,6 +20,8 @@ const (
 	LocalOpenPath              = "/local-control/v1/messaging:open"
 	LocalThreadsPath           = "/local-control/v1/messaging:threads"
 	LocalCreateThreadPath      = "/local-control/v1/messaging:create-thread"
+	LocalCreatePollPath        = "/local-control/v1/messaging:create-poll"
+	LocalVotePollPath          = "/local-control/v1/messaging:vote-poll"
 	LocalWritePath             = "/local-control/v1/messaging:write"
 	LocalReactPath             = "/local-control/v1/messaging:react"
 	LocalStatusPath            = "/local-control/v1/messaging:status"
@@ -85,6 +87,8 @@ func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlSer
 		{"POST " + LocalOpenPath, s.localOpen},
 		{"POST " + LocalThreadsPath, s.localThreads},
 		{"POST " + LocalCreateThreadPath, s.localCreateThread},
+		{"POST " + LocalCreatePollPath, s.localCreatePoll},
+		{"POST " + LocalVotePollPath, s.localVotePoll},
 		{"POST " + LocalWritePath, s.localWrite},
 		{"POST " + LocalReactPath, s.localReact},
 		{"POST " + LocalStatusPath, s.localStatus},
@@ -385,7 +389,7 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		writeError(w, http.StatusBadRequest, "invalid_content")
 		return
 	}
-	if code := validateSendRequest(request.Content, request.Urgency, request.ClientNonce, request.Attachments); code != "" {
+	if code := validateSendRequest(request.Content, request.Urgency, request.ClientNonce, request.Attachments, nil); code != "" {
 		writeError(w, http.StatusBadRequest, code)
 		return
 	}
@@ -419,6 +423,111 @@ func (s *Server) localWrite(w http.ResponseWriter, r *http.Request, authorizatio
 		status = http.StatusOK
 	}
 	writeJSON(w, status, messageReceiptToWire(message, created))
+}
+
+func (s *Server) localCreatePoll(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization,
+) {
+	var request struct {
+		localScopeWire
+		PlaceID         string   `json:"place_id"`
+		Question        string   `json:"question"`
+		Options         []string `json:"options"`
+		AllowMulti      bool     `json:"allow_multi,omitempty"`
+		Content         string   `json:"content,omitempty"`
+		ClientNonce     string   `json:"client_nonce"`
+		ClosesInMinutes uint32   `json:"closes_in_minutes,omitempty"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.ClosesInMinutes > maxRelativeMinutes {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	poll := &PollInput{
+		Question: request.Question, AllowMulti: request.AllowMulti,
+		RelativeClosesInMinutes: request.ClosesInMinutes, Options: request.Options,
+	}
+	if code := validateSendRequest(request.Content, "", request.ClientNonce, nil, poll); code != "" {
+		writeError(w, http.StatusBadRequest, code)
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, created, err := store.AppendMessage(r.Context(), AppendInput{
+		PlaceID: request.PlaceID, Content: request.Content,
+		ClientNonce: request.ClientNonce, Poll: poll,
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if created {
+		publishMessageCreated(r.Context(), store, s.Hub, place, message)
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	var projection *messageWire
+	if created {
+		wire := messageToWire(place, message)
+		projection = &wire
+	}
+	writeJSON(w, status, struct {
+		messageReceiptWire
+		Message *messageWire `json:"message"`
+	}{messageReceiptWire: messageReceiptToWire(message, created), Message: projection})
+}
+
+func (s *Server) localVotePoll(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorization agentevents.LocalRuntimeAuthorization,
+) {
+	var request struct {
+		localScopeWire
+		PlaceID   string    `json:"place_id"`
+		MessageID string    `json:"message_id"`
+		OptionIDs *[]string `json:"option_ids"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.PlaceID == "" || request.MessageID == "" || request.OptionIDs == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	store, ok := s.localScopedStore(w, r, authorization, request.localScopeWire)
+	if !ok {
+		return
+	}
+	place, err := store.PlaceFor(r.Context(), request.PlaceID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	message, err := store.VotePoll(
+		r.Context(), request.PlaceID, request.MessageID, *request.OptionIDs,
+	)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	s.publishPollUpdated(r.Context(), store, message)
+	writeJSON(w, http.StatusOK, struct {
+		Message messageWire `json:"message"`
+	}{Message: messageToWire(place, message)})
 }
 
 // localReact toggles the agent's emoji on a message through the identical

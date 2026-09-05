@@ -664,6 +664,7 @@ describe("カードの束縛と転送先", () => {
       urgency: "normal",
       reactions: [],
       attachments: [],
+      poll: null,
       replyTo: null,
       createdAt: Date.now(),
       editedAt: null,

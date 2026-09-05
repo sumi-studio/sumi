@@ -211,8 +211,9 @@
   mention・seq 割当・notification intent と同じ transaction で行われ、1 件でも
   bind できなければ全部 rollback する（`404 not_found`）。bind できるのは同じ
   Workspace・place で自分が upload した未 bind の attachment だけである。
-- nonce 再送は canonical request digest（text・urgency・reply_to・順序付き attachment
-  identity）で比較され、同じ nonce で違う request は `409 idempotency_conflict`。
+- nonce 再送は Poll 節の単一 canonical request digest（text・urgency・reply_to・
+  順序付き attachment identity・`poll`）で比較され、同じ nonce で違う request は
+  `409 idempotency_conflict`。
 - download は `GET /messaging/attachments/{attachment_id}`（exact scope query 付き）。
   現在の membership・installation epoch・place visibility・`visible_from_seq`・
   tombstone で毎回再認可する。存在しない・他人の・見えない・削除済み・stale scope は
@@ -234,6 +235,63 @@
   descriptor 数を受け側で照合する）。
 - REST の `/messaging/*` は OpenAPI 契約（`contracts/openapi.yaml`）にはまだ 1 本も
   載っておらず、この文書が唯一の契約記述である。添付の 2 route も同じ扱いにしてある。
+
+### Poll — message と同時に確定する質問（追補）
+
+- `Message.poll` は任意の 1 件で carrier message と 1 対 1 である。question（trim 後
+  1〜500 code point）、`allow_multi`、任意の `closes_at`、sender 順の option
+  （trim 後 1〜200 code point、2〜10 件、相互に異なる）を持つ。question / option は
+  NUL と不正 UTF-8 を拒否し、option id は server が UUIDv7 で割り当てる。投票者は
+  匿名化せず `ParticipantRef` として閲覧者全員に見える。
+- browser は送信 body の `poll` に絶対 `closes_at` を渡す。agent local-control の
+  `create_poll` は server clock 基準の `closes_in_minutes` を渡す。締切は作成時点より後、
+  最大 7 日で、投票時は `now >= closes_at` を closed とする。
+- message insert・seq・mention・thread participant・notification intent・poll・option は
+  1 transaction で確定する。poll-only（空 content、attachment なし）は有効だが、v0 は
+  poll と attachment の同居を HTTP と Store の両方で拒否する。
+- すべての send nonce は同じ digest shape を使う。poll が無いときも `poll:null`、ある
+  ときは `poll:{question,allow_multi,closes_at,closes_in_minutes,options}` を含める。
+  browser は正規化した絶対時刻、agent は相対分数そのものを digest に残すため、同じ
+  agent request の retry が別の wall-clock instant を再計算しても同一 request である。
+  exact retry は締切後も元の receipt を返し、poll の変更は `409 idempotency_conflict`。
+- local-control `create_poll` の receipt は常に `client_nonce`, `message_id`, `seq`,
+  `created`, `message` を持つ。fresh `201` は `created:true` と full Message projection、
+  exact replay `200` は同じ identity/seq、`created:false`, `message:null` を返す。元 message
+  が後から edit / tombstone されても replay receipt は変えず、nonce digest を正本とする。
+- thread summary の最新 message が poll-only なら、空 content の代わりに canonical
+  question を `last_message` とし、その後に既存の preview truncation（先頭 120 code
+  point と、overflow 時の `…`）を適用する。
+- `POST /messaging/places/{place_id}/messages/{message_id}/poll/vote` の `option_ids` は
+  actor の選択全体を置換し、`[]` は取り下げる。single choice への複数票、重複 id、
+  別 poll の option、見えない・削除済み message、締切後を拒否する。message と poll を
+  lock し、既存 choice の delete・新 choice の insert・poll revision の +1 を同じ
+  transaction で行う。vote 自体は notification intent を作らない。
+- edit と reaction は poll を保持し、tombstone は poll root を消して option / vote を
+  FK cascade する。live `poll_updated` は place cursor を進めない partial projection で、
+  full Message を絶対に運ばない。wire は次の固定 shape とする。
+
+```json
+{
+  "type": "poll_updated",
+  "place_id": "<UUIDv7>",
+  "poll": {
+    "message_id": "<UUIDv7>",
+    "poll": {
+      "question": "どちら？",
+      "allow_multi": false,
+      "closes_at": null,
+      "revision": 2,
+      "options": [
+        { "option_id": "<UUIDv7>", "text": "A", "voters": [] }
+      ]
+    }
+  }
+}
+```
+
+  `poll` 内側は question / allow_multi / closes_at / revision / options の完全な poll snapshot。
+  client は revision が新しい snapshot だけを Message.poll へ patch し、content・mentions・
+  reactions・attachments・edited_at をこの event から上書きしない。
 
 ## API / event（人間UI側）
 
@@ -294,6 +352,8 @@
   `connection_updated`, `reply_later_created`, `reply_later_resolved`,
   `message_pinned`。
 - WS event（volatile）: `typing`, `status_updated`（下記）。
+- WS event（projection update、place cursorを進めない）: `reaction_updated`,
+  `poll_updated`。どちらも full Message ではなく対象 field の partial snapshot だけを運ぶ。
 
 ### Status と ReplyLater — 自己申告のattention
 
@@ -402,6 +462,9 @@ agentにとってより適した方法があるときだけそちらで代替す
    Threadにはread-onlyの `threads` とmutatingな `create_thread` があり、後者は
    作成後にそのthreadを現在のviewとして開く。起点messageを指定する場合は現在の
    open画面に見えているmessageだけを対象にする。
+   Pollにはmutatingな `create_poll` と `vote_poll` がある。`create_poll` の締切は
+   server clock基準の相対分数で渡し、`vote_poll` は現在のopen画面に見えているpollを
+   option idで全置換する（空配列は取り下げ）。
 3. **人生ログへの記録**: agent基盤がprovenanceとともに記録する。正本はWorkspace
    API側で、agent DBはlocal copy/projection（ADR 0008 §8）。
 

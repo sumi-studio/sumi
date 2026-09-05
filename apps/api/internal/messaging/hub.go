@@ -8,9 +8,10 @@ import (
 
 // Event is one durable or volatile messaging event fanned out to live
 // subscribers. Message events carry the whole message (with its place seq);
-// reaction_updated carries only the partial reaction payload so it can never
-// roll back a concurrent edit. Place events carry a place summary but are not
-// replayed because reconnecting clients re-read the durable places table via
+// reaction_updated and poll_updated carry only their partial projections so
+// they can never roll back another concurrently changed message field. Place
+// events carry a place summary but are not replayed because reconnecting
+// clients re-read the durable places table via
 // bootstrap. Volatile events (typing, status_updated) are never replayed.
 // Place events scope delivery by PlaceID; participant-scoped events
 // (status_updated) leave PlaceID empty and set Subject instead.
@@ -19,6 +20,7 @@ type Event struct {
 	PlaceID  string              `json:"place_id,omitempty"`
 	Message  *messageWire        `json:"message,omitempty"`
 	Reaction *reactionUpdateWire `json:"reaction,omitempty"`
+	Poll     *pollUpdateWire     `json:"poll,omitempty"`
 	Actor    *participantWire    `json:"actor,omitempty"`
 	Channel  *channelWire        `json:"channel,omitempty"`
 	DM       *dmWire             `json:"dm,omitempty"`
@@ -71,6 +73,7 @@ const (
 	EventMessageEdited      = "message_edited"
 	EventMessageDeleted     = "message_deleted"
 	EventReactionUpdated    = "reaction_updated"
+	EventPollUpdated        = "poll_updated"
 	EventTyping             = "typing"
 	EventStatusUpdated      = "status_updated"
 	EventReplyLaterCreated  = "reply_later_created"

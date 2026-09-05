@@ -69,6 +69,7 @@ function targetMessage(): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: 0,
     editedAt: null,

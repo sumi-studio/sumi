@@ -111,6 +111,48 @@ export interface AttachmentDraftPatch {
   spoiler?: boolean;
 }
 
+/** A poll option and the participants whose current whole-selection includes it. */
+export interface PollOption {
+  optionId: string;
+  text: string;
+  voters: ParticipantRef[];
+}
+
+/** A message-owned poll. Revision advances independently from message edits. */
+export interface MessagePoll {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  revision: number;
+  options: PollOption[];
+}
+
+/** The browser declaration used when a poll and its message are committed together. */
+export interface PollInput {
+  question: string;
+  allowMulti: boolean;
+  closesAt: number | null;
+  options: string[];
+}
+
+export const MIN_POLL_OPTIONS = 2;
+export const MAX_POLL_OPTIONS = 10;
+export const MAX_POLL_QUESTION_CODE_POINTS = 500;
+export const MAX_POLL_OPTION_CODE_POINTS = 200;
+
+export function isPollClosed(poll: MessagePoll, now: number): boolean {
+  return poll.closesAt !== null && now >= poll.closesAt;
+}
+
+/** Unique participants are the denominator even when one voter chose many options. */
+export function pollVoterCount(poll: MessagePoll): number {
+  const voters = new Set<ParticipantKey>();
+  for (const option of poll.options) {
+    for (const voter of option.voters) voters.add(participantKey(voter));
+  }
+  return voters.size;
+}
+
 export function isInlineImageMime(mime: string): boolean {
   return (
     mime === "image/png" ||
@@ -133,6 +175,8 @@ export interface Message {
   reactions: ReactionSummary[];
   /** 送信者が選んだ順序。tombstoneでは空。 */
   attachments: Attachment[];
+  /** Poll absence is explicit; present polls always carry their own revision. */
+  poll: MessagePoll | null;
   replyTo: string | null;
   createdAt: number;
   editedAt: number | null;
@@ -338,6 +382,13 @@ export type ServerEvent =
       messageId: string;
       reactions: ReactionSummary[];
     }
+  /** Poll-only partial update; it must never roll back content or attachments. */
+  | {
+      type: "poll_updated";
+      place: Place;
+      messageId: string;
+      poll: MessagePoll;
+    }
   /**
    * placeのcatch-up完了。cursorより手前のmessageに付いたreactionはreplayされ
    * ないので、受け手はロード済み範囲を読み直して収束させる。
@@ -364,6 +415,8 @@ export interface SendMessageInput {
   clientNonce: string;
   /** upload済みattachmentのIDを送信者の順序で。contentが空でも1件あれば送れる。 */
   attachments: string[];
+  /** v0 deliberately disallows combining this with attachments. */
+  poll?: PollInput | null;
 }
 
 export interface UploadAttachmentInput {
@@ -398,6 +451,7 @@ export interface MessagingCapabilities {
   reactions: boolean;
   notifications: boolean;
   threads?: boolean;
+  polls?: boolean;
 }
 
 /**
@@ -535,6 +589,12 @@ export interface MessagingBackend {
     emoji: string,
     clientNonce: string,
   ): Promise<ReactionMutationResult>;
+  /** Replace this participant's complete selection; [] withdraws it. */
+  votePoll?(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message>;
   /**
    * 自分の通知設定を丸ごと置き換える。ownerはsessionが決め、bodyに載せない。
    * 返すのはサーバーが正規化した確定値。手元がそれと食い違ったまま残らないよう、

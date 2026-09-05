@@ -60,6 +60,7 @@ function makeMessage(overrides: Partial<Message> = {}): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: Date.UTC(2026, 0, 1, 3, 0),
     editedAt: null,
@@ -168,6 +169,36 @@ describe("MessageItem の行の見せ方", () => {
     expect(screen.getByTitle("余白 の返信元へ移動")).toHaveTextContent(
       "添付ファイル",
     );
+  });
+
+  it("投票だけの返信元は質問を抜粋し、投票カードも本文位置に描画する", () => {
+    const poll = {
+      question: "次の開催日は？",
+      allowMulti: false,
+      closesAt: null,
+      revision: 2,
+      options: [
+        { optionId: "today", text: "今日", voters: [] },
+        { optionId: "tomorrow", text: "明日", voters: [] },
+      ],
+    };
+    const target = makeMessage({
+      messageId: "m0",
+      seq: 0,
+      content: "",
+      poll,
+    });
+    renderItem(
+      makeMessage({ messageId: "m1", content: "", poll, replyTo: "m0" }),
+      { findMessage: () => target },
+    );
+
+    expect(screen.getByTitle("余白 の返信元へ移動")).toHaveTextContent(
+      "次の開催日は？",
+    );
+    expect(
+      screen.getByRole("region", { name: "投票: 次の開催日は？" }),
+    ).toBeInTheDocument();
   });
 });
 

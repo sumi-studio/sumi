@@ -158,6 +158,16 @@ function copyMessage(message: Message): Message {
       })),
     })),
     attachments: message.attachments.map((attachment) => ({ ...attachment })),
+    poll:
+      message.poll === null
+        ? null
+        : {
+            ...message.poll,
+            options: message.poll.options.map((option) => ({
+              ...option,
+              voters: option.voters.map((participant) => ({ ...participant })),
+            })),
+          },
   };
 }
 
@@ -226,6 +236,7 @@ function seedMessages(place: Place, specs: SeedSpec[]): Message[] {
     urgency: spec.urgency ?? "normal",
     reactions: spec.reactions ?? [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: now - spec.minutesAgo * 60_000,
     editedAt: null,
@@ -445,6 +456,7 @@ export class MockMessagingServer implements MessagingBackend {
     reactions: true,
     notifications: true,
     threads: true,
+    polls: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
@@ -887,6 +899,20 @@ export class MockMessagingServer implements MessagingBackend {
             .map((id) => this.uploads.get(id))
             .filter((entry): entry is Attachment => entry !== undefined)
             .map((entry, position) => ({ ...entry, position })),
+          poll:
+            input.poll == null
+              ? null
+              : {
+                  question: input.poll.question,
+                  allowMulti: input.poll.allowMulti,
+                  closesAt: input.poll.closesAt,
+                  revision: 0,
+                  options: input.poll.options.map((text) => ({
+                    optionId: secureRandomUUID(),
+                    text,
+                    voters: [],
+                  })),
+                },
         });
         // 束ねた添付は下書きではなくなる。実APIと同じく、以後の編集は拒む。
         for (const id of input.attachments) this.uploads.delete(id);
@@ -998,6 +1024,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.mentions = [];
     message.reactions = [];
     message.attachments = [];
+    message.poll = null;
     message.revision = (message.revision ?? 1) + 1;
     const deleted = copyMessage(message);
     this.reprojectThread(place);
@@ -1012,6 +1039,49 @@ export class MockMessagingServer implements MessagingBackend {
     const key = placeKey(place);
     const current = this.readMarkers.get(key) ?? 0;
     if (lastReadSeq > current) this.readMarkers.set(key, lastReadSeq);
+  }
+
+  async votePoll(
+    place: Place,
+    messageId: string,
+    optionIds: string[],
+  ): Promise<Message> {
+    const message = (this.history.get(placeKey(place)) ?? []).find(
+      (entry) => entry.messageId === messageId,
+    );
+    if (!message?.poll || message.deleted) throw new Error("poll_not_found");
+    if (
+      (message.poll.closesAt !== null && Date.now() >= message.poll.closesAt) ||
+      (!message.poll.allowMulti && optionIds.length > 1)
+    ) {
+      throw new Error("poll_closed_or_single_choice");
+    }
+    const unique = new Set(optionIds);
+    const valid = new Set(
+      message.poll.options.map((option) => option.optionId),
+    );
+    if (
+      unique.size !== optionIds.length ||
+      optionIds.some((optionId) => !valid.has(optionId))
+    ) {
+      throw new Error("poll_option_not_found");
+    }
+    for (const option of message.poll.options) {
+      option.voters = option.voters.filter(
+        (participant) => !sameParticipant(participant, SELF),
+      );
+      if (unique.has(option.optionId)) option.voters.push(SELF);
+    }
+    message.poll.revision += 1;
+    const committed = copyMessage(message);
+    if (!committed.poll) throw new Error("poll_not_found");
+    this.emit({
+      type: "poll_updated",
+      place: { ...place },
+      messageId,
+      poll: committed.poll,
+    });
+    return committed;
   }
 
   async fetchPresence(): Promise<{
@@ -1222,6 +1292,7 @@ export class MockMessagingServer implements MessagingBackend {
     replyTo: string | null;
     clientNonce?: string;
     attachments?: Attachment[];
+    poll?: Message["poll"];
   }): Message {
     const key = placeKey(input.place);
     const messages = this.history.get(key) ?? [];
@@ -1236,6 +1307,7 @@ export class MockMessagingServer implements MessagingBackend {
       urgency: input.urgency,
       reactions: [],
       attachments: input.attachments ?? [],
+      poll: input.poll ?? null,
       replyTo: input.replyTo,
       createdAt: Date.now(),
       editedAt: null,
@@ -1262,7 +1334,9 @@ export class MockMessagingServer implements MessagingBackend {
     const live = messages.filter((message) => !message.deleted);
     const latest = live[live.length - 1];
     thread.messageCount = live.length;
-    thread.lastMessage = latest ? latest.content.slice(0, 120) : "";
+    thread.lastMessage = latest
+      ? (latest.content || latest.poll?.question || "").slice(0, 120)
+      : "";
     thread.lastMessageAt = latest ? latest.createdAt : null;
     thread.latestSeq = messages[messages.length - 1]?.seq ?? 0;
   }

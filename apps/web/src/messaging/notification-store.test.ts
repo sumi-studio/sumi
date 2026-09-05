@@ -228,6 +228,7 @@ function incoming(overrides: Partial<Message> = {}): Message {
     urgency: "normal",
     reactions: [],
     attachments: [],
+    poll: null,
     replyTo: null,
     createdAt: 1,
     editedAt: null,

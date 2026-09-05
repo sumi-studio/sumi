@@ -22,9 +22,12 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	default:
 		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
-	// Empty text is valid only when at least one attachment binds; the
+	if in.Poll != nil && len(in.AttachmentIDs) != 0 {
+		return Message{}, false, fmt.Errorf("%w: polls cannot carry attachments in v0", ErrInvalidPoll)
+	}
+	// Empty text is valid only when at least one attachment or a poll binds; the
 	// deferred database trigger enforces the same rule at commit.
-	if in.Content == "" && len(in.AttachmentIDs) == 0 {
+	if in.Content == "" && len(in.AttachmentIDs) == 0 && in.Poll == nil {
 		return Message{}, false, errors.New("content must not be empty")
 	}
 	if !messageContentFitsStorage(in.Content) {
@@ -32,6 +35,11 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 	}
 	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
 		return Message{}, false, ErrTooManyAttachments
+	}
+	if in.Poll != nil {
+		if err := in.Poll.validateFields(); err != nil {
+			return Message{}, false, err
+		}
 	}
 	if !clientNonceValid(in.ClientNonce) {
 		return Message{}, false, errors.New("client nonce must be 1..128 bytes")
@@ -54,7 +62,7 @@ func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Messag
 // receipt of the message that already owns its nonce. A changed request under
 // the same nonce is a conflict, never a silent replay of the first message.
 func requestMatchesReplay(in AppendInput, storedDigest []byte) bool {
-	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs)
+	incoming := messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs, in.Poll)
 	return bytes.Equal(incoming, storedDigest)
 }
 
@@ -123,6 +131,15 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		}
 		return existing, false, nil
 	}
+	// A deadline controls creation, not recovery of the already-committed nonce
+	// receipt. The replay check above therefore deliberately precedes it.
+	if in.Poll != nil {
+		now := time.Now()
+		in.Poll.resolveRelativeDeadline(now)
+		if err := in.Poll.validateDeadline(now); err != nil {
+			return Message{}, false, err
+		}
+	}
 	if in.ReplyTo != "" {
 		var samePlace bool
 		if err := tx.QueryRow(ctx, `
@@ -167,7 +184,7 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		message.MessageID, s.Scope.WorkspaceID, message.PlaceID, message.Seq,
 		message.Author.Kind, message.Author.ID, message.Content, message.Urgency,
 		replyTo, message.ClientNonce,
-		messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs),
+		messageRequestDigest(in.Content, in.Urgency, in.ReplyTo, in.AttachmentIDs, in.Poll),
 	).Scan(&message.CreatedAt); err != nil {
 		return Message{}, false, fmt.Errorf("insert scoped message: %w", err)
 	}
@@ -179,6 +196,12 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, err
 	}
 	message.Attachments = attachments
+	if in.Poll != nil {
+		message.Poll, err = insertPoll(ctx, tx, message.MessageID, *in.Poll)
+		if err != nil {
+			return Message{}, false, err
+		}
+	}
 	if err := insertMentions(ctx, tx, message.MessageID, mentions); err != nil {
 		return Message{}, false, err
 	}
@@ -510,6 +533,11 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 			return Message{}, fmt.Errorf("clear tombstone projection: %w", err)
 		}
 	}
+	// The carrier message remains as a tombstone. Delete the poll root and let
+	// its foreign keys cascade through options and votes in this transaction.
+	if _, err := tx.Exec(ctx, "DELETE FROM message_polls WHERE message_id = $1", messageID); err != nil {
+		return Message{}, fmt.Errorf("clear scoped poll tombstone projection: %w", err)
+	}
 	if place.Kind == PlaceThread {
 		if err := bumpThreadProjectionRevision(ctx, tx, s.Scope.WorkspaceID, place.PlaceID); err != nil {
 			return Message{}, err
@@ -518,7 +546,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped delete: %w", err)
 	}
-	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Deleted = "", nil, nil, nil, true
+	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Poll, message.Deleted = "", nil, nil, nil, nil, true
 	return message, nil
 }
 
@@ -733,7 +761,10 @@ func attachMessagePartsWith(ctx context.Context, q querier, messages []Message) 
 	if err := attachReactionsWith(ctx, q, messages); err != nil {
 		return err
 	}
-	return attachAttachmentsWith(ctx, q, messages)
+	if err := attachAttachmentsWith(ctx, q, messages); err != nil {
+		return err
+	}
+	return attachPollsWith(ctx, q, messages)
 }
 
 func attachMentionsWith(ctx context.Context, q querier, messages []Message) error {

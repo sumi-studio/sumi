@@ -87,6 +87,31 @@ pub(crate) struct CreateMessagingThreadRequest<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingPollRequest<'a> {
+    pub place_id: &'a str,
+    pub question: &'a str,
+    pub options: &'a [String],
+    pub allow_multi: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<&'a str>,
+    pub client_nonce: &'a str,
+    /// Relative by contract: the server clock fixes the closing instant and
+    /// the same relative promise remains stable across a nonce replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closes_in_minutes: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VoteMessagingPollRequest<'a> {
+    pub place_id: &'a str,
+    pub message_id: &'a str,
+    /// The complete replacement selection. An empty list withdraws the vote.
+    pub option_ids: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WriteMessagingMessageRequest<'a> {
     pub place_id: &'a str,
     pub content: &'a str,
@@ -451,6 +476,22 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         _request: CreateMessagingThreadRequest<'_>,
     ) -> Result<Value> {
         Err(anyhow::anyhow!("Messaging thread creation is unavailable"))
+    }
+
+    async fn create_poll(
+        &self,
+        _scope: &ExactMessagingScope,
+        _request: CreateMessagingPollRequest<'_>,
+    ) -> Result<Value> {
+        Err(anyhow::anyhow!("Messaging poll creation is unavailable"))
+    }
+
+    async fn vote_poll(
+        &self,
+        _scope: &ExactMessagingScope,
+        _request: VoteMessagingPollRequest<'_>,
+    ) -> Result<Value> {
+        Err(anyhow::anyhow!("Messaging polling is unavailable"))
     }
 
     async fn write(
