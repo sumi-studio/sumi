@@ -13,8 +13,8 @@ import { preissuedSessionMode, useAuth } from "./auth-context";
 /**
  * A failed authenticated upgrade is indistinguishable from a transient close
  * at the WebSocket layer. Re-check the HttpOnly session after a live
- * connection attempt closes; AuthGate then unmounts ChatScreen and cancels its
- * reconnect timer when the session is no longer usable.
+ * connection attempt closes. The workspace stays mounted during revalidation;
+ * confirmed session loss makes AuthGate close it and cancel reconnects.
  */
 export function DirectChatGate() {
   const connection = useConversation((state) => state.connection);
