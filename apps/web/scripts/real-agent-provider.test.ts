@@ -12,6 +12,7 @@ import {
 const invitationID = "0198f0f4-9b72-7000-8000-000000000811";
 const workspaceID = "0198f0f4-9b72-7000-8000-000000000011";
 const workspaceMemberID = "0198f0f4-9b72-7000-8000-000000000911";
+const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000711";
 const workspaceName = "Provider Fixture Workspace";
 
 function providerToolCall(
@@ -114,7 +115,13 @@ test("loopback provider counts only requests that pass transport validation", as
   }
 });
 
-test("loopback provider derives and accepts one invitation before listing exact membership", async () => {
+test("loopback provider verifies membership and conversation context", () =>
+  verifyMembershipAndContext(false));
+
+test("loopback provider accepts the current Messaging overview", () =>
+  verifyMembershipAndContext(true));
+
+async function verifyMembershipAndContext(withMessaging: boolean) {
   const provider = new LoopbackChatProvider("test-provider-key");
   await provider.start();
   try {
@@ -240,15 +247,69 @@ test("loopback provider derives and accepts one invitation before listing exact 
       { role: "assistant", content: firstProviderResponse },
       { role: "user", content: secondUserMessage },
     );
-    const secondTextResponse = await completion(provider, messages);
-    assert.equal(secondTextResponse.status, 200);
-    assert.match(
-      await secondTextResponse.text(),
-      new RegExp(secondProviderResponse),
+    const secondTextResponse = await completion(
+      provider,
+      messages,
+      withMessaging ? [providerToolDefinition("messaging")] : [],
     );
-    assert.equal(provider.requestCount, 6);
+    assert.equal(secondTextResponse.status, 200);
+    if (withMessaging) {
+      assert.match(
+        await secondTextResponse.text(),
+        /call-real-agent-messaging-overview/,
+      );
+      const overviewCall = providerToolCall(
+        "call-real-agent-messaging-overview",
+        "messaging",
+        { workspace_id: workspaceID, action: "overview" },
+      );
+      const channelID = "0198f0f4-9b72-7000-8000-000000000021";
+      messages.push(
+        { role: "assistant", tool_calls: [overviewCall] },
+        {
+          role: "tool",
+          tool_call_id: overviewCall.id,
+          content: JSON.stringify({
+            workspaces: [{ workspace_id: workspaceID, name: workspaceName }],
+            channels: [
+              {
+                channel_id: channelID,
+                workspace_id: workspaceID,
+                name: "attachments",
+                topic: "",
+                visibility: "public",
+                voice: false,
+                revision: 1,
+              },
+            ],
+            dms: [],
+            threads: [],
+            members: [],
+            read_markers: [],
+            reply_later_markers: [],
+            unread_summaries: [],
+            self: {
+              kind: "personality_agent",
+              personality_agent_id: personalityAgentID,
+            },
+          }),
+        },
+      );
+      const openResponse = await completion(provider, messages);
+      assert.equal(openResponse.status, 200, await openResponse.clone().text());
+      const open = await openResponse.text();
+      assert.match(open, /call-real-agent-messaging-open-human/);
+      assert.ok(open.includes(channelID));
+      assert.equal(provider.requestCount, 7);
+    } else {
+      assert.match(
+        await secondTextResponse.text(),
+        new RegExp(secondProviderResponse),
+      );
+      assert.equal(provider.requestCount, 6);
+    }
     assert.equal(provider.contextVerified, true);
   } finally {
     await provider.stop();
   }
-});
+}
