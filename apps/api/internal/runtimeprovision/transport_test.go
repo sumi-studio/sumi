@@ -1,12 +1,97 @@
 package runtimeprovision
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestActivateAcceptsLegacyBearerExpiryWithoutRestoringIt(t *testing.T) {
+	const legacyField = "local_control_bearer_expires_at_unix"
+	currentConfig, err := json.Marshal(testActivationConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(currentConfig, []byte(legacyField)) {
+		t.Fatal("new activation producers must omit the obsolete expiry")
+	}
+	for _, test := range []struct {
+		name       string
+		mutate     func(map[string]any)
+		wantStatus int
+	}{
+		{name: "old producer", wantStatus: http.StatusOK},
+		{
+			name:       "unrecognized authority field",
+			mutate:     func(config map[string]any) { config["host_environment"] = "injected" },
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "missing bearer",
+			mutate:     func(config map[string]any) { delete(config, "local_control_bearer") },
+			wantStatus: http.StatusBadRequest,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			service := newTestService(t, backend)
+			epoch, err := service.Prepare(context.Background(), PrepareRequest{
+				Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "legacy-activation",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var activation map[string]any
+			if err := json.Unmarshal(currentConfig, &activation); err != nil {
+				t.Fatal(err)
+			}
+			// The old v1 producer always sent this field. An expired value must
+			// neither prevent activation nor reach the runtime environment.
+			activation[legacyField] = 1
+			if test.mutate != nil {
+				test.mutate(activation)
+			}
+			payload, err := json.Marshal(struct {
+				Version int `json:"version"`
+				PreparedEpoch
+				Activation map[string]any `json:"activation"`
+			}{Version: ProtocolVersion, PreparedEpoch: epoch, Activation: activation})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler, err := NewHandler(service)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/activate", bytes.NewReader(payload)))
+			if response.Code != test.wantStatus {
+				t.Fatalf("activation status = %d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.wantStatus != http.StatusOK {
+				if backend.activateCalls[testPAID] != 0 {
+					t.Fatal("invalid activation reached the backend")
+				}
+				return
+			}
+			if backend.activateCalls[testPAID] != 1 {
+				t.Fatal("legacy activation did not reach the backend")
+			}
+			var decoded ActivateRequest
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := activationEnvironment(decoded.Activation)["SUMI_LOCAL_CONTROL_BEARER_EXPIRES_AT_UNIX"]; exists {
+				t.Fatal("obsolete expiry was forwarded to the runtime")
+			}
+		})
+	}
+}
 
 func TestUnixTransportRoundTrip(t *testing.T) {
 	backend := newFakeBackend()

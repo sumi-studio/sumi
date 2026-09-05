@@ -63,8 +63,11 @@ type ActivateRequest struct {
 // ActivationConfig is backend-neutral runtime boot configuration. Keeping it
 // typed prevents an API caller from injecting the root daemon's environment.
 type ActivationConfig struct {
-	GatewayURL                     string           `json:"gateway_url"`
-	LocalControlBearer             string           `json:"local_control_bearer"`
+	GatewayURL         string `json:"gateway_url"`
+	LocalControlBearer string `json:"local_control_bearer"`
+	// Deprecated: accepted from older v1 API producers and ignored. The bearer
+	// follows the runtime epoch, not this former wall-clock deadline.
+	LegacyBearerExpiresAtUnix      int64            `json:"local_control_bearer_expires_at_unix,omitempty"`
 	LocalControlServerUID          uint32           `json:"local_control_server_uid"`
 	LocalControlSocketGID          uint32           `json:"local_control_socket_gid"`
 	AgentWrappingKey               string           `json:"agent_wrapping_key"`

@@ -384,3 +384,10 @@ the socket, agent identity, generation, nonce, and application permissions still
 bound each request. Gateway tokens minted through this connection retain their
 short expiry and must be refreshed on reconnect. See
 [issue #354](https://github.com/sumi-studio/sumi/issues/354).
+
+For an upgrade from the former expiring credential, update the provisioner and
+its configured agent image before updating the API. The new provisioner accepts
+and ignores the older API's optional expiry field. The reverse mix is not
+compatible: the older provisioner expects that field, and the older agent image
+requires the removed expiry environment variable. Compose permits independent
+image tags, so socket health alone does not establish version compatibility.
