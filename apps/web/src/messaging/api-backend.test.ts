@@ -17,6 +17,7 @@ const bootstrap = {
     {
       channel_id: "channel-1",
       workspace_id: "workspace-1",
+      revision: 1,
       name: "general",
       topic: "",
       visibility: "public",
@@ -525,6 +526,12 @@ describe("ApiMessagingBackend", () => {
         ) {
           return json(channelSummaryWire("新しいトピック"));
         }
+        if (
+          path === "/messaging/places/channel-2/duplicate" &&
+          init?.method === "POST"
+        ) {
+          return json(channelSummaryWire("開発の相談"), 201);
+        }
         throw new Error(`unexpected request ${path}`);
       },
     );
@@ -533,10 +540,17 @@ describe("ApiMessagingBackend", () => {
     await backend.bootstrap();
 
     await expect(
-      backend.createChannel("workspace-1", "dev", "開発の相談", true),
+      backend.createChannel(
+        "workspace-1",
+        "dev",
+        "開発の相談",
+        true,
+        "create-channel-gesture",
+      ),
     ).resolves.toEqual({
       channelId: "channel-2",
       workspaceId: "workspace-1",
+      revision: 1,
       name: "dev",
       topic: "開発の相談",
       visibility: "public",
@@ -551,6 +565,7 @@ describe("ApiMessagingBackend", () => {
           name: "dev",
           topic: "開発の相談",
           voice: true,
+          client_nonce: "create-channel-gesture",
         }),
       }),
     );
@@ -569,15 +584,211 @@ describe("ApiMessagingBackend", () => {
     );
 
     await expect(
-      backend.createGroupDM([
-        { kind: "human", humanId: "human-2" },
-        { kind: "personality_agent", personalityAgentId: "agent-1" },
-      ]),
+      backend.createGroupDM(
+        [
+          { kind: "personality_agent", personalityAgentId: "agent-1" },
+          { kind: "human", humanId: "human-2" },
+        ],
+        "create-group-gesture",
+      ),
     ).resolves.toMatchObject({ dmId: "group-dm-1", kind: "group_dm" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/group-dms"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          participants: [
+            { kind: "human", human_id: "human-2" },
+            {
+              kind: "personality_agent",
+              personality_agent_id: "agent-1",
+            },
+          ],
+          client_nonce: "create-group-gesture",
+        }),
+      }),
+    );
+
+    // 省いた項目はwireにも載せない。トピックだけの編集で名前を巻き込まない。
+    await expect(
+      backend.updateChannel("channel-2", { topic: "新しいトピック" }),
+    ).resolves.toMatchObject({ topic: "新しいトピック" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-2"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ topic: "新しいトピック" }),
+      }),
+    );
+
+    // 複製の名前はサーバーが決める。クライアントは「〜 のコピー」を組み立てない。
+    await expect(
+      backend.duplicateChannel("channel-2", "duplicate-channel-gesture"),
+    ).resolves.toMatchObject({ channelId: "channel-2" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      scopedMessagingTestPath("/messaging/places/channel-2/duplicate"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          client_nonce: "duplicate-channel-gesture",
+        }),
+      }),
+    );
+  });
+
+  it("retries an ambiguous committed place creation once with the same nonce", async () => {
+    const creationBodies: string[] = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          creationBodies.push(String(init.body));
+          if (creationBodies.length === 1) {
+            // The server committed, but no response reached the browser.
+            throw new TypeError("response lost after commit");
+          }
+          return json(channelSummaryWire("reconciled"), 200);
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
 
     await expect(
-      backend.updateChannelTopic("channel-2", "新しいトピック"),
-    ).resolves.toMatchObject({ topic: "新しいトピック" });
+      backend.createChannel(
+        "workspace-1",
+        "incident",
+        "reconciled",
+        false,
+        "stable-logical-gesture",
+      ),
+    ).resolves.toMatchObject({ channelId: "channel-2" });
+    expect(creationBodies).toEqual([
+      JSON.stringify({
+        workspace_id: "workspace-1",
+        name: "incident",
+        topic: "reconciled",
+        voice: false,
+        client_nonce: "stable-logical-gesture",
+      }),
+      JSON.stringify({
+        workspace_id: "workspace-1",
+        name: "incident",
+        topic: "reconciled",
+        voice: false,
+        client_nonce: "stable-logical-gesture",
+      }),
+    ]);
+  });
+
+  it.each([
+    502, 503, 408, 429,
+  ])("reconciles an ambiguous HTTP %i once with the same request", async (status) => {
+    const bodies: string[] = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/group-dms" && init?.method === "POST") {
+          bodies.push(String(init.body));
+          if (bodies.length === 1) {
+            return json({ error: "intermediary_response_lost" }, status);
+          }
+          return json(
+            {
+              dm_id: "group-dm-reconciled",
+              kind: "group_dm",
+              participants: [
+                { kind: "human", human_id: "human-1" },
+                { kind: "human", human_id: "human-2" },
+                {
+                  kind: "personality_agent",
+                  personality_agent_id: "agent-1",
+                },
+              ],
+            },
+            200,
+          );
+        }
+        throw new Error(`unexpected request ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.createGroupDM(
+        [
+          { kind: "human", humanId: "human-2" },
+          { kind: "personality_agent", personalityAgentId: "agent-1" },
+        ],
+        "ambiguous-http-status",
+      ),
+    ).resolves.toMatchObject({ dmId: "group-dm-reconciled" });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+  });
+
+  it("stops after one reconciliation when both responses are ambiguous", async () => {
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (path === "/messaging/channels" && init?.method === "POST") {
+          bodies.push(String(init.body));
+          return json({ error: "upstream_response_unknown" }, 503);
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.createChannel(
+        "workspace-1",
+        "bounded",
+        "",
+        false,
+        "bounded-reconciliation",
+      ),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+  });
+
+  it.each([
+    400, 403, 404, 409,
+  ])("does not retry a definitive pre-mutation HTTP %i rejection", async (status) => {
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = expectScopedMessagingPath(input);
+        if (path === "/messaging/bootstrap") return json(bootstrap);
+        if (
+          path === "/messaging/places/channel-1/duplicate" &&
+          init?.method === "POST"
+        ) {
+          attempts += 1;
+          return json({ error: "definitive_rejection" }, status);
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    const backend = new ApiMessagingBackend(MESSAGING_SCOPE);
+    await backend.bootstrap();
+
+    await expect(
+      backend.duplicateChannel("channel-1", "definitive-http-status"),
+    ).rejects.toMatchObject({ status });
+    expect(attempts).toBe(1);
   });
 
   it("projects place_created and place_updated from the socket", async () => {
@@ -686,6 +897,7 @@ describe("ApiMessagingBackend", () => {
       statuses: [
         {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 5,
           status: "busy",
           note: "取り込み中",
           expires_at: null,
@@ -703,9 +915,12 @@ describe("ApiMessagingBackend", () => {
         if (path === "/messaging/status" && init?.method === "PUT") {
           return json({
             participant: { kind: "human", human_id: "human-1" },
+            revision: 6,
             status: "busy",
             note: "取り込み中",
-            expires_at: null,
+            expires_at: "2026-08-01T11:00:00Z",
+            base_status: "available",
+            base_note: "",
           });
         }
         if (path.endsWith("/reply-later") && init?.method === "POST") {
@@ -740,9 +955,12 @@ describe("ApiMessagingBackend", () => {
     expect(snapshot.statuses).toEqual([
       {
         participant: { kind: "human", humanId: "human-2" },
+        revision: 5,
         status: "busy",
         note: "取り込み中",
         expiresAt: null,
+        baseStatus: null,
+        baseNote: "",
       },
     ]);
     expect(snapshot.replyLaterMarkers.map((marker) => marker.remindAt)).toEqual(
@@ -752,21 +970,33 @@ describe("ApiMessagingBackend", () => {
     // 再接続後の再同期は、bootstrapと同じ現在値をもう一度読み直す。
     await expect(backend.fetchPresence()).resolves.toEqual({
       statuses: snapshot.statuses,
+      clearedStatuses: [],
       replyLaterMarkers: snapshot.replyLaterMarkers,
     });
 
     // mutationはserverが確定した値を返す。呼び出し側はecho待ちにならない。
-    await expect(backend.setStatus("busy", "取り込み中")).resolves.toEqual({
+    // 期限付きの申告は、戻る先までserverが確定して返す。
+    const until = Date.parse("2026-08-01T11:00:00Z");
+    await expect(
+      backend.setStatus("busy", "取り込み中", until),
+    ).resolves.toEqual({
       participant: { kind: "human", humanId: "human-1" },
+      revision: 6,
       status: "busy",
       note: "取り込み中",
-      expiresAt: null,
+      expiresAt: until,
+      baseStatus: "available",
+      baseNote: "",
     });
     expect(fetchMock).toHaveBeenCalledWith(
       scopedMessagingTestPath("/messaging/status"),
       expect.objectContaining({
         method: "PUT",
-        body: JSON.stringify({ status: "busy", note: "取り込み中" }),
+        body: JSON.stringify({
+          status: "busy",
+          note: "取り込み中",
+          expires_at: "2026-08-01T11:00:00.000Z",
+        }),
       }),
     );
 
@@ -806,6 +1036,7 @@ describe("ApiMessagingBackend", () => {
         type: "status_updated",
         status: {
           participant: { kind: "human", human_id: "human-2" },
+          revision: 7,
           status: "away",
           note: "",
           expires_at: "2026-08-01T12:00:00Z",
@@ -963,6 +1194,7 @@ function channelSummaryWire(topic: string, voice = false) {
   return {
     channel_id: "channel-2",
     workspace_id: "workspace-1",
+    revision: 1,
     name: "dev",
     topic,
     visibility: "public",

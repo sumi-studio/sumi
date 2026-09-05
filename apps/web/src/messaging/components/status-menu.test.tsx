@@ -1,0 +1,283 @@
+// @vitest-environment jsdom
+
+import "@testing-library/jest-dom/vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ParticipantStatus } from "../model";
+import { useMessaging } from "../store";
+import { StatusMenu } from "./status-menu";
+
+const SELF = { kind: "human", humanId: "human-a" } as const;
+const setStatus = vi.fn();
+const realSetStatus = useMessaging.getState().setStatus;
+
+function setSelfStatus(status: ParticipantStatus | undefined) {
+  useMessaging.setState({
+    self: SELF,
+    selfKey: "human:human-a",
+    membersByKey: {
+      "human:human-a": { participant: SELF, displayName: "Alice", tagline: "" },
+    },
+    statusByKey: status === undefined ? {} : { "human:human-a": status },
+    capabilities: {
+      status: true,
+      replyLater: true,
+      reactions: true,
+      notifications: true,
+    },
+    setStatus,
+  });
+}
+
+beforeEach(() => {
+  setStatus.mockReset();
+  vi.useFakeTimers();
+  vi.setSystemTime(Date.parse("2026-08-18T09:00:00Z"));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.useRealTimers();
+  useMessaging.setState({ setStatus: realSetStatus });
+});
+
+describe("StatusMenu", () => {
+  it("申告が無い人を対応可能とは表示せず、対応可能ドットも付けない", () => {
+    setSelfStatus(undefined);
+    const { container } = render(<StatusMenu />);
+
+    expect(screen.getByText("未設定")).toBeVisible();
+    expect(screen.queryByText("対応可能")).not.toBeInTheDocument();
+    expect(container.querySelector(".bg-emerald-500")).not.toBeInTheDocument();
+  });
+
+  it("期限を選ぶ前に、その期限が切れたときどこへ戻るかを見せる", () => {
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "away",
+      note: "在宅です",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /取り込み中/ }));
+
+    expect(
+      screen.getByRole("menu", { name: "取り込み中の期間" }),
+    ).not.toHaveClass("ml-1");
+
+    expect(
+      screen.getByText("期限が来たら「離席中 — 在宅です」に戻ります"),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "1時間" }));
+
+    expect(setStatus).toHaveBeenCalledWith(
+      "busy",
+      "在宅です",
+      Date.parse("2026-08-18T10:00:00Z"),
+    );
+  });
+
+  it("戻る先が無いときは、期限で宣言そのものが終わると言う", () => {
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+
+    expect(
+      screen.getByText("期限が来たら申告そのものが解除されます"),
+    ).toBeVisible();
+
+    // 「解除するまで」は期限なし。
+    fireEvent.click(screen.getByRole("menuitem", { name: "解除するまで" }));
+    expect(setStatus).toHaveBeenCalledWith("away", "", null);
+  });
+
+  it("同じ申告を期限付きにしても、サーバーが保存する元の一言を戻る先として見せる", () => {
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "away",
+      note: "外出",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "通院中" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+
+    expect(
+      screen.getByText("期限が来たら「離席中 — 外出」に戻ります"),
+    ).toBeVisible();
+  });
+
+  it("ひとことだけ書き替えたときに、いまの期限を黙って外さない", () => {
+    const until = Date.parse("2026-08-18T10:30:00Z");
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "busy",
+      note: "会議中",
+      expiresAt: until,
+      baseStatus: "away",
+      baseNote: "在宅です",
+    });
+    render(<StatusMenu />);
+
+    // アカウント行は、いま出ている申告と期限をそのまま読める形で見せる。
+    expect(screen.getByText(/取り込み中 — 会議中/)).toBeVisible();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    const note = screen.getByRole("textbox");
+    fireEvent.change(note, { target: { value: "電話中" } });
+    fireEvent.keyDown(note, { key: "Enter" });
+
+    expect(setStatus).toHaveBeenCalledWith("busy", "電話中", until);
+  });
+
+  it("IME変換確定のEnterでは宣言しない", () => {
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    const note = screen.getByRole("textbox");
+    fireEvent.change(note, { target: { value: "会議" } });
+    fireEvent.keyDown(note, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(note, { key: "Enter", keyCode: 229 });
+
+    expect(setStatus).not.toHaveBeenCalled();
+  });
+
+  it("成功するまで閉じず、送信中の二重申告を止めてから閉じる", async () => {
+    let resolve!: () => void;
+    setStatus.mockImplementationOnce(
+      () => new Promise<void>((done) => (resolve = done)),
+    );
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+    const choice = screen.getByRole("menuitem", { name: "1時間" });
+    fireEvent.click(choice);
+    fireEvent.click(choice);
+
+    expect(setStatus).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent("更新しています");
+    expect(screen.getByRole("dialog", { name: "ステータス" })).toBeVisible();
+
+    await act(async () => {
+      resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("申告と対応可能へのリセットの失敗を見せ、入力を保って再試行できる", async () => {
+    setStatus
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockRejectedValueOnce(new Error("response remained ambiguous"))
+      .mockResolvedValueOnce(undefined);
+    setSelfStatus({
+      participant: SELF,
+      revision: 1,
+      status: "busy",
+      note: "会議中",
+      expiresAt: null,
+      baseStatus: null,
+      baseNote: "",
+    });
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "電話中" },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "ステータスを更新できませんでした",
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("電話中");
+
+    fireEvent.click(screen.getByRole("button", { name: "対応可能に戻す" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("alert")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "対応可能に戻す" }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+    expect(setStatus).toHaveBeenNthCalledWith(2, "available", "", null);
+    expect(setStatus).toHaveBeenNthCalledWith(3, "available", "", null);
+  });
+
+  it("authority replacement clears pending state and fences its late failure", async () => {
+    let reject!: (error: Error) => void;
+    setStatus.mockImplementationOnce(
+      () => new Promise<void>((_resolve, fail) => (reject = fail)),
+    );
+    setSelfStatus(undefined);
+    render(<StatusMenu />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Alice(?!のプロフィール)/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "離席中" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "1時間" }));
+    expect(screen.getByRole("status")).toBeVisible();
+
+    await act(async () => {
+      useMessaging.setState((state) => ({
+        transportGeneration: state.transportGeneration + 1,
+      }));
+      reject(new Error("stale rejection"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "ステータス" }),
+    ).not.toBeInTheDocument();
+  });
+});

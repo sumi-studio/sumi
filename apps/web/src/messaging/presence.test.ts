@@ -27,8 +27,18 @@ function status(
   kind: StatusKind,
   note = "",
   expiresAt: number | null = null,
+  base: { status: StatusKind; note: string } | null = null,
+  revision = 1,
 ): ParticipantStatus {
-  return { participant, status: kind, note, expiresAt };
+  return {
+    participant,
+    revision,
+    status: kind,
+    note,
+    expiresAt,
+    baseStatus: base?.status ?? null,
+    baseNote: base?.note ?? "",
+  };
 }
 
 function marker(
@@ -99,6 +109,7 @@ class FakePresenceBackend implements MessagingBackend {
         {
           channelId: "channel-1",
           workspaceId: "workspace-1",
+          revision: 1,
           name: "general",
           topic: "",
           visibility: "public",
@@ -149,9 +160,10 @@ class FakePresenceBackend implements MessagingBackend {
   async createGroupDM(): ReturnType<MessagingBackend["createGroupDM"]> {
     throw new Error("unused");
   }
-  async updateChannelTopic(): ReturnType<
-    MessagingBackend["updateChannelTopic"]
-  > {
+  async updateChannel(): ReturnType<MessagingBackend["updateChannel"]> {
+    throw new Error("unused");
+  }
+  async duplicateChannel(): ReturnType<MessagingBackend["duplicateChannel"]> {
     throw new Error("unused");
   }
   async uploadAttachment(): Promise<never> {
@@ -260,7 +272,7 @@ describe("messaging presence convergence", () => {
     // in this interval has no replayable seq, so the first connected boundary
     // must re-read the authoritative presence projection.
     backend.presence = {
-      statuses: [status(OTHER, "available", "after bootstrap")],
+      statuses: [status(OTHER, "available", "after bootstrap", null, null, 2)],
       replyLaterMarkers: [],
     };
     backend.emitConnection("connected");
@@ -268,7 +280,7 @@ describe("messaging presence convergence", () => {
     await vi.waitFor(() => {
       const state = useMessaging.getState();
       expect(state.statusByKey["human:human-2"]).toEqual(
-        status(OTHER, "available", "after bootstrap"),
+        status(OTHER, "available", "after bootstrap", null, null, 2),
       );
       expect(state.replyLaterById["marker-at-bootstrap"]).toBeUndefined();
     });
@@ -290,7 +302,7 @@ describe("messaging presence convergence", () => {
     // 切断中に相手がavailableへ戻し、開いていたmarkerを解決する。
     // どちらもvolatile/非replayなので、cursorのcatch-upでは戻ってこない。
     backend.presence = {
-      statuses: [status(OTHER, "available")],
+      statuses: [status(OTHER, "available", "", null, null, 2)],
       replyLaterMarkers: [],
     };
     backend.emitConnection("reconnecting");
@@ -302,6 +314,25 @@ describe("messaging presence convergence", () => {
       expect(state.replyLaterById["marker-open"]).toBeUndefined();
     });
     expect(backend.presenceFetches).toBe(1);
+  });
+
+  it("removes a departed participant's status and revision from a full snapshot", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [status(OTHER, "busy", "before leaving", null, null, 4)],
+      replyLaterMarkers: [],
+    };
+    await startMessaging(backend);
+
+    backend.presence = { statuses: [], replyLaterMarkers: [] };
+    backend.emitConnection("reconnecting");
+    backend.emitConnection("connected");
+
+    await vi.waitFor(() => {
+      const state = useMessaging.getState();
+      expect(state.statusByKey["human:human-2"]).toBeUndefined();
+      expect(state.statusRevisionByKey["human:human-2"]).toBeUndefined();
+    });
   });
 
   it("replays live presence events that arrive during the snapshot fetch", async () => {
@@ -327,7 +358,7 @@ describe("messaging presence convergence", () => {
     // reaches us. They must survive the wholesale replacement below.
     backend.emit({
       type: "status_updated",
-      status: status(OTHER, "busy", "live update"),
+      status: status(OTHER, "busy", "live update", null, null, 2),
     });
     backend.emit({
       type: "reply_later_created",
@@ -336,7 +367,7 @@ describe("messaging presence convergence", () => {
     backend.emit({ type: "reply_later_resolved", markerId: "marker-open" });
 
     resolvePresence({
-      statuses: [status(OTHER, "available")],
+      statuses: [status(OTHER, "available", "", null, null, 1)],
       replyLaterMarkers: [marker("marker-open", OTHER)],
     });
     await vi.waitFor(() => {
@@ -369,7 +400,7 @@ describe("messaging presence convergence", () => {
     // E1 belongs only to resync A's journal.
     backend.emit({
       type: "status_updated",
-      status: status(OTHER, "busy", "E1"),
+      status: status(OTHER, "busy", "E1", null, null, 2),
     });
 
     let resolveSecond!: (presence: {
@@ -385,12 +416,12 @@ describe("messaging presence convergence", () => {
 
     // B's snapshot contains the later E2 state; its echo is deliberately lost.
     resolveSecond({
-      statuses: [status(OTHER, "away", "E2")],
+      statuses: [status(OTHER, "away", "E2", null, null, 3)],
       replyLaterMarkers: [],
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(useMessaging.getState().statusByKey["human:human-2"]).toEqual(
-      status(OTHER, "away", "E2"),
+      status(OTHER, "away", "E2", null, null, 3),
     );
 
     resolveFirst({
@@ -399,7 +430,7 @@ describe("messaging presence convergence", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(useMessaging.getState().statusByKey["human:human-2"]).toEqual(
-      status(OTHER, "away", "E2"),
+      status(OTHER, "away", "E2", null, null, 3),
     );
   });
 
@@ -441,6 +472,37 @@ describe("messaging presence convergence", () => {
     expect(settled?.remindAt).toBe(1_800_000);
   });
 
+  it("returns status rejection to the caller instead of reporting success", async () => {
+    const backend = new FakePresenceBackend();
+    vi.spyOn(backend, "setStatus").mockRejectedValue(
+      new Error("status permission denied"),
+    );
+    await startMessaging(backend);
+
+    await expect(
+      useMessaging.getState().setStatus("busy", "取り込み中"),
+    ).rejects.toThrow("status permission denied");
+    expect(
+      useMessaging.getState().statusByKey["human:human-1"],
+    ).toBeUndefined();
+  });
+
+  it("rejects a stale status acknowledgement after authority replacement", async () => {
+    const backend = new FakePresenceBackend();
+    let release!: (value: ParticipantStatus) => void;
+    vi.spyOn(backend, "setStatus").mockImplementation(
+      () => new Promise((resolve) => (release = resolve)),
+    );
+    await startMessaging(backend);
+
+    const pending = useMessaging.getState().setStatus("away", "旧authority");
+    bindMessagingSessionIdentity("replacement-human");
+    release(status(SELF, "away", "旧authority"));
+
+    await expect(pending).rejects.toThrow(/session changed/i);
+    expect(useMessaging.getState().statusByKey).toEqual({});
+  });
+
   it("replays a status REST acknowledgement over an older presence snapshot", async () => {
     const backend = new FakePresenceBackend();
     backend.presence = {
@@ -460,7 +522,7 @@ describe("messaging presence convergence", () => {
     backend.emitConnection("connected");
     await vi.waitFor(() => expect(backend.presenceFetches).toBe(1));
 
-    backend.nextStatus = status(SELF, "busy", "canonical ACK");
+    backend.nextStatus = status(SELF, "busy", "canonical ACK", null, null, 2);
     useMessaging.getState().setStatus("busy", "canonical ACK");
     await vi.waitFor(() =>
       expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
@@ -473,6 +535,36 @@ describe("messaging presence convergence", () => {
       replyLaterMarkers: [],
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
+      backend.nextStatus,
+    );
+  });
+
+  it("does not let an older expiry clear overwrite a newer status acknowledgement", async () => {
+    const backend = new FakePresenceBackend();
+    backend.presence = {
+      statuses: [
+        status(SELF, "busy", "old temporary declaration", null, null, 1),
+      ],
+      replyLaterMarkers: [],
+    };
+    await startMessaging(backend);
+
+    // A sweep changed the old declaration to a clear at revision 2, while a
+    // later self-declaration committed at revision 3 and its HTTP ACK arrived
+    // first. The delayed volatile expiry frame must not erase that ACK.
+    backend.nextStatus = status(SELF, "away", "new declaration", null, null, 3);
+    useMessaging.getState().setStatus("away", "new declaration");
+    await vi.waitFor(() =>
+      expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
+        backend.nextStatus,
+      ),
+    );
+    backend.emit({
+      type: "status_cleared",
+      participant: SELF,
+      revision: 2,
+    });
     expect(useMessaging.getState().statusByKey["human:human-1"]).toEqual(
       backend.nextStatus,
     );

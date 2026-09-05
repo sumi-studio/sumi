@@ -477,7 +477,7 @@ func TestChannelTopicPatchOverHTTP(t *testing.T) {
 	ws, _ := w.workspaceWithChannel(t, ctx)
 
 	resp, body := call(t, ts, http.MethodPost, "/messaging/channels", w.humanA.ID,
-		map[string]any{"workspace_id": ws.WorkspaceID, "name": "design", "topic": "デザインの話"})
+		map[string]any{"workspace_id": ws.WorkspaceID, "name": "design", "topic": "デザインの話", "client_nonce": "http-create-design"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create channel: status %d body %v", resp.StatusCode, body)
 	}

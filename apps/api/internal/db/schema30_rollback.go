@@ -125,12 +125,11 @@ func preflightSchema30Rollback(ctx context.Context, conn migrationDB) (string, e
 	if head != schema30Version {
 		return "", fmt.Errorf("%w: found %d", ErrSchema30RollbackWrongHead, head)
 	}
-	pending, err := pendingMigrations(ctx, conn)
+	// This verifies that the applied rows are the exact embedded prefix through
+	// head 30. Any returned 0031+ migrations are valid but intentionally pending.
+	_, err = pendingMigrations(ctx, conn)
 	if err != nil {
 		return "", fmt.Errorf("verify schema 30 rollback migration history: %w", err)
-	}
-	if len(pending) != 0 {
-		return "", fmt.Errorf("%w: canonical history is incomplete", ErrSchema30RollbackWrongHead)
 	}
 
 	var unsafeRevision bool
@@ -151,8 +150,14 @@ func sealedSchema30RollbackDownSQL() (string, error) {
 	if len(migrations) == 0 {
 		return "", errors.New("schema 30 rollback has no embedded migration history")
 	}
-	last := migrations[len(migrations)-1]
-	if last.version != schema30Version || last.name != schema30UpName || migrationChecksum(last.content) != sealedSchema30UpChecksum {
+	var up *pendingMigration
+	for i := range migrations {
+		if migrations[i].version == schema30Version {
+			up = &migrations[i]
+			break
+		}
+	}
+	if up == nil || up.name != schema30UpName || migrationChecksum(up.content) != sealedSchema30UpChecksum {
 		return "", errors.New("schema 30 rollback embedded up migration is not the sealed 0030 artifact")
 	}
 	down, err := migrationFS.ReadFile(migrationsDir + "/" + schema30DownName)
