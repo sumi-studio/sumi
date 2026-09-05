@@ -277,6 +277,78 @@ func TestLocalControlRequiresAuthenticatedExactScope(t *testing.T) {
 	}
 }
 
+func TestLocalSearchUsesExactAgentScopeAndDoesNotLeakInvisiblePlaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	visible := w.send(t, ctx, channel.PlaceID, w.humanA, "引き継ぎ検索メモ")
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.humanB)
+	if err != nil {
+		t.Fatalf("create invisible DM fixture: %v", err)
+	}
+	w.send(t, ctx, dm.PlaceID, w.humanA, "秘密の引き継ぎ検索メモ")
+
+	scoped := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
+	server := NewServer(w.store.core, nil)
+	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
+	base := map[string]any{
+		"workspace_id": scoped.Scope.WorkspaceID, "installation_id": scoped.Scope.InstallationID,
+		"authority_epoch": strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10),
+	}
+
+	search := make(map[string]any, len(base)+2)
+	for key, value := range base {
+		search[key] = value
+	}
+	search["query"] = "  引き継ぎ検索  "
+	search["limit"] = 1
+	status, body := callLocalWithoutFixtureInference(
+		t, ctx, server.localSearch, LocalSearchPath, search, authorization)
+	if status != http.StatusOK {
+		t.Fatalf("local search status=%d body=%v", status, body)
+	}
+	results, ok := body["results"].([]any)
+	if !ok || len(results) != 1 {
+		t.Fatalf("local search results=%v, want one visible hit", body)
+	}
+	hit, ok := results[0].(map[string]any)
+	if !ok || hit["message_id"] != visible.MessageID || hit["snippet"] == nil {
+		t.Fatalf("local search hit=%v, want snippet-only visible message %s", results[0], visible.MessageID)
+	}
+	if _, exists := hit["content"]; exists {
+		t.Fatalf("local search leaked full content: %v", hit)
+	}
+
+	invisible := make(map[string]any, len(base)+2)
+	for key, value := range base {
+		invisible[key] = value
+	}
+	invisible["query"] = "秘密"
+	invisible["place_id"] = dm.PlaceID
+	status, body = callLocalWithoutFixtureInference(
+		t, ctx, server.localSearch, LocalSearchPath, invisible, authorization)
+	if status != http.StatusNotFound || body["error"] != "not_found" {
+		t.Fatalf("invisible local search=%d %v, want 404 not_found", status, body)
+	}
+
+	for name, invalid := range map[string]any{
+		"blank query": "   ",
+		"long query":  strings.Repeat("x", MaxSearchQueryBytes+1),
+	} {
+		request := make(map[string]any, len(base)+1)
+		for key, value := range base {
+			request[key] = value
+		}
+		request["query"] = invalid
+		status, body = callLocalWithoutFixtureInference(
+			t, ctx, server.localSearch, LocalSearchPath, request, authorization)
+		if status != http.StatusBadRequest || body["error"] != "invalid_request" {
+			t.Fatalf("%s local search=%d %v, want 400 invalid_request", name, status, body)
+		}
+	}
+}
+
 func TestLocalExactCallStateReconcilesAfterRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
