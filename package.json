@@ -1,6 +1,7 @@
 {
   "name": "sumi",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "packageManager": "pnpm@11.9.0",
   "engines": {
     "node": ">=20.19"
