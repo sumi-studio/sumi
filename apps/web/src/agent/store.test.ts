@@ -1150,6 +1150,7 @@ test("approval decision is synchronously latched until durable resolution", () =
   const store = createConversationStore({
     transport,
     outbox: new PrivateOutbox(),
+    idempotencyKey: () => "approval-attempt-key",
   });
   store.getState().connect();
   const request = approvalRequest("approval-latch");
@@ -1174,7 +1175,7 @@ test("approval decision is synchronously latched until durable resolution", () =
         request_id: request.id,
         decision: { type: "approve_once" },
       },
-      idempotencyKey: undefined,
+      idempotencyKey: "approval-attempt-key",
     },
   ]);
 
