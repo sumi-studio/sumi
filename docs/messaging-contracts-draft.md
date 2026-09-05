@@ -44,7 +44,31 @@
 ```
 
 - author、membership、mention、read marker、通知設定ownerのすべてでこの型を使う。
-- 表示名はscope-local（Workspace membershipのnickname等）で解決し、IDを表示名にしない（ADR 0008 §1）。
+- 表示名とtaglineはParticipant-globalなプロフィールとして解決し、IDを表示名にしない。
+  Workspace membershipのnickname等をこのプロフィールへ混ぜない。Workspace固有の肩書きが
+  必要になればmembership側の別resourceにする（ADR 0008 §1）。
+
+### Participant profile — 名乗り
+
+```json
+{
+  "participant": { "kind": "human", "human_id": "<UUIDv7>" },
+  "display_name": "Yohaku",
+  "tagline": "開発"
+}
+```
+
+- プロフィールはParticipantに属するglobal resourceであり、Workspace-localではない。
+  `display_name` の正本は戸籍（human / personality agent）で、`tagline` は
+  `participant_profiles` の `(member_kind, member_id)` 一行に置く。member listや
+  bootstrapはこのglobal値を各Workspaceへ投影する。
+- 現行のHuman縦切りはglobal設定の `GET /auth/profile` で本人の確定値を読み、
+  `POST /auth/profile` で `display_name?: string` / `tagline?: string` を部分更新する。
+  subjectはsigned browser sessionのHumanだけで、requestから別Participantを指定できない。
+  省略fieldは保持し、同じtransactionで両fieldを確定して完全なprofileを返す。
+- PersonalityAgentの自己編集transportとWorkspace nicknameはこの縦切りに含めない。
+  storage/projectionのParticipant identityをHuman専用やWorkspace専用に狭めず、必要なlaneで
+  それぞれ明示的なauthority boundaryを追加する。
 
 ### Place — メッセージが流れる場所
 

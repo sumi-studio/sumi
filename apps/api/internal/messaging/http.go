@@ -290,6 +290,7 @@ type dmWire struct {
 type memberWire struct {
 	Participant participantWire `json:"participant"`
 	DisplayName string          `json:"display_name"`
+	Tagline     string          `json:"tagline"`
 }
 
 type readMarkerWire struct {
@@ -661,6 +662,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 			memberSet[key] = memberWire{
 				Participant: participantToWire(p.Participant),
 				DisplayName: p.ProjectedDisplayName(),
+				Tagline:     p.Tagline,
 			}
 			memberOrder = append(memberOrder, key)
 		}
@@ -1043,7 +1045,11 @@ func (s *Server) servePlace(w http.ResponseWriter, r *http.Request) {
 	}
 	members := make([]memberWire, len(profiles))
 	for i, p := range profiles {
-		members[i] = memberWire{Participant: participantToWire(p.Participant), DisplayName: p.ProjectedDisplayName()}
+		members[i] = memberWire{
+			Participant: participantToWire(p.Participant),
+			DisplayName: p.ProjectedDisplayName(),
+			Tagline:     p.Tagline,
+		}
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Place     placeWire    `json:"place"`

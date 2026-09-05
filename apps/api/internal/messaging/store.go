@@ -119,6 +119,9 @@ type MemberProfile struct {
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
+	// Tagline belongs to the global Participant profile. Workspace-specific
+	// labels remain membership data and must not overwrite it.
+	Tagline string
 	// Exact tenure IDs are internal delivery authority. They deliberately stay
 	// off every wire projection of MemberProfile.
 	workspaceMemberID string

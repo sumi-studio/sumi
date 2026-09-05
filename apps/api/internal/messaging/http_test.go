@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
 const testOrigin = "https://app.sumi.test"
@@ -271,6 +272,12 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	if _, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent); err != nil {
 		t.Fatalf("ensure dm: %v", err)
 	}
+	tagline := "開発"
+	if _, err := koseki.New(w.store.pool).UpdateHumanProfile(
+		ctx, w.humanA.ID, nil, &tagline,
+	); err != nil {
+		t.Fatalf("set profile: %v", err)
+	}
 	w.send(t, ctx, ch.PlaceID, w.humanB, "@Yohaku 見て")
 
 	resp, body := call(t, ts, http.MethodGet, "/messaging/bootstrap", w.humanA.ID, nil)
@@ -293,11 +300,18 @@ func TestBootstrapProjectsPlacesMembersAndUnread(t *testing.T) {
 	}
 	// Everyone in the workspace appears once with a display name.
 	members := body["members"].([]any)
-	names := map[string]bool{}
+	names := map[string]string{}
 	for _, m := range members {
-		names[m.(map[string]any)["display_name"].(string)] = true
+		member := m.(map[string]any)
+		names[member["display_name"].(string)] = member["tagline"].(string)
 	}
-	if !names["Yohaku"] || !names["Haru"] || !names["Kuro"] {
+	if names["Yohaku"] != tagline {
+		t.Fatalf("Human tagline = %q, members %v", names["Yohaku"], members)
+	}
+	if _, ok := names["Haru"]; !ok {
+		t.Fatalf("Haru missing: %v", members)
+	}
+	if _, ok := names["Kuro"]; !ok {
 		t.Fatalf("members missing display names: %v", members)
 	}
 	// The channel has one unread mention for the viewer.

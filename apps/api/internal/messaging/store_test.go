@@ -194,6 +194,45 @@ func TestMemberProfilesQualifyCanonicalSumiByStableHuman(t *testing.T) {
 	}
 }
 
+func TestMemberProfilesProjectOneParticipantGlobalTaglineAcrossWorkspaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	first, _ := w.workspaceWithChannel(t, ctx)
+	second, err := w.store.CreateWorkspace(ctx, "sumi-ops", w.humanA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.store.AddWorkspaceMember(ctx, second.WorkspaceID, w.humanB, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	tagline := "開発"
+	if _, err := koseki.New(w.store.pool).UpdateHumanProfile(
+		ctx, w.humanA.ID, nil, &tagline,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, workspaceID := range []string{first.WorkspaceID, second.WorkspaceID} {
+		profiles, err := w.store.WorkspaceMemberProfiles(ctx, workspaceID, w.humanB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, profile := range profiles {
+			if profile.Participant == w.humanA {
+				found = true
+				if profile.Tagline != tagline {
+					t.Fatalf("Workspace %s tagline = %q", workspaceID, profile.Tagline)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Workspace %s omitted profile owner", workspaceID)
+		}
+	}
+}
+
 func TestChannelPostingFollowsWorkspaceMembership(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

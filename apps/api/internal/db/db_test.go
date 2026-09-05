@@ -1212,6 +1212,9 @@ func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	applyMigrationsThrough(t, ctx, pool, 31)
+	if version, err := LatestAppliedVersion(ctx, pool); err != nil || version != 31 {
+		t.Fatalf("migrate through 0031: version=%d err=%v", version, err)
+	}
 
 	assertShape := func(want bool) {
 		t.Helper()
@@ -1291,6 +1294,73 @@ func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
 		t.Fatalf("reapply 0031: %v", err)
 	}
 	assertShape(true)
+}
+
+func TestParticipantProfilesMigrationUpDownAndReupgrade(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate through 0033: %v", err)
+	}
+
+	assertShape := func(want bool) {
+		t.Helper()
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			"SELECT to_regclass('participant_profiles') IS NOT NULL",
+		).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != want {
+			t.Fatalf("participant_profiles exists=%t, want %t", exists, want)
+		}
+	}
+	assertShape(true)
+
+	const humanID = "0198f0f4-9b72-7000-8000-000000000132"
+	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
+		(member_kind, member_id, tagline) VALUES ('human', $1, '開発')`, humanID); err != nil {
+		t.Fatalf("insert valid Participant profile: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO participant_profiles
+		(member_kind, member_id, tagline) VALUES ('human', $1, repeat('名', 101))`,
+		"0198f0f4-9b72-7000-8000-000000000133"); err == nil {
+		t.Fatal("0033 accepted an overlong tagline")
+	}
+
+	down, err := migrationFS.ReadFile("migrations/0033_participant_profiles.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(down)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("apply 0033 down transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM schema_migrations WHERE version = 33"); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("remove 0033 migration record: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit 0033 down transaction: %v", err)
+	}
+	assertShape(false)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("reapply 0033: %v", err)
+	}
+	assertShape(true)
+	var rows int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM participant_profiles").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("recreated Participant profile table retained %d rows", rows)
+	}
 }
 
 func applyMigrationsThrough(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maxVersion int) {
