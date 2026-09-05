@@ -22,11 +22,8 @@ import {
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
-import {
-  getMessagingScope,
-  setNotificationNavigator,
-  useMessaging,
-} from "../store";
+import { enablePushSubscription, isPushSupported } from "../push";
+import { getMessagingScope, useMessaging } from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
@@ -106,7 +103,9 @@ function NotificationPermissionBanner() {
     isPermissionPromptDismissed(),
   );
 
-  if (!enabled || dismissed || permission !== "default") return null;
+  if (!enabled || !isPushSupported() || dismissed || permission !== "default") {
+    return null;
+  }
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-accent/40 px-4 py-1.5 sm:px-5">
@@ -117,7 +116,10 @@ function NotificationPermissionBanner() {
       <button
         type="button"
         onClick={() => {
-          void requestNotificationPermission().then(setPermission);
+          void requestNotificationPermission().then((next) => {
+            setPermission(next);
+            if (next === "granted") void enablePushSubscription();
+          });
         }}
         className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
       >
@@ -460,12 +462,6 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     notificationLevelByPlace,
     notificationDefaultLevel,
   ]);
-
-  // デスクトップ通知のクリック先。URLが現在地の正本なのでrouterに任せる。
-  useEffect(() => {
-    setNotificationNavigator(placeNavigate);
-    return () => setNotificationNavigator(null);
-  }, [placeNavigate]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {

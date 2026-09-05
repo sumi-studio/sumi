@@ -435,7 +435,7 @@ describe("notification settings in the store", () => {
 });
 
 describe("presenting an incoming message", () => {
-  it("calls the person when the server said so and the tab is elsewhere", () => {
+  it("leaves OS notification presentation to the Service Worker", () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
 
     backend.emit({
@@ -444,11 +444,7 @@ describe("presenting an incoming message", () => {
       notify: { reason: "keyword" },
     });
 
-    expect(FakeNotification.constructed).toHaveLength(1);
-    expect(FakeNotification.constructed[0]?.title).toBe("#dev — Kuro");
-    expect(FakeNotification.constructed[0]?.options.body).toBe(
-      "デプロイの件です",
-    );
+    expect(FakeNotification.constructed).toHaveLength(0);
   });
 
   it("stays quiet when the server did not call this person", () => {

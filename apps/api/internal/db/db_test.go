@@ -1211,9 +1211,7 @@ func TestPlaceStatusRevisionReceiptsMigrationDownAndReupgrade(t *testing.T) {
 	pool := testdb.Create(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := Migrate(ctx, pool); err != nil {
-		t.Fatalf("migrate through 0031: %v", err)
-	}
+	applyMigrationsThrough(t, ctx, pool, 31)
 
 	assertShape := func(want bool) {
 		t.Helper()

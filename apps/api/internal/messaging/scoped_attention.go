@@ -473,9 +473,11 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 	for _, decision := range decisions {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_notification_intents
-				(message_id, recipient_kind, recipient_id, reason)
-			VALUES ($1, $2, $3, $4)`, message.MessageID,
-			decision.Participant.Kind, decision.Participant.ID, decision.Reason); err != nil {
+				(message_id, recipient_kind, recipient_id, reason,
+				 recipient_workspace_member_id, recipient_place_member_id)
+			VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::uuidv7)`, message.MessageID,
+			decision.Participant.Kind, decision.Participant.ID, decision.Reason,
+			decision.workspaceMemberID, decision.placeMemberID); err != nil {
 			return fmt.Errorf("issue scoped notification intent: %w", err)
 		}
 	}
@@ -483,13 +485,15 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 }
 
 func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context, q querier, place Place, message Message, members []MemberProfile) ([]NotificationDecision, error) {
-	candidates := make([]ParticipantRef, 0, len(members))
+	candidates := make([]MemberProfile, 0, len(members))
+	refs := make([]ParticipantRef, 0, len(members))
 	for _, member := range members {
 		if member.Participant != message.Author {
-			candidates = append(candidates, member.Participant)
+			candidates = append(candidates, member)
+			refs = append(refs, member.Participant)
 		}
 	}
-	settings, err := s.scopedNotificationSettingsFor(ctx, q, place.PlaceID, candidates)
+	settings, err := s.scopedNotificationSettingsFor(ctx, q, place.PlaceID, refs)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +504,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 	lowered := strings.ToLower(message.Content)
 	decisions := make([]NotificationDecision, 0, len(candidates))
 	for _, candidate := range candidates {
-		setting := settings[candidate.Key()]
+		setting := settings[candidate.Participant.Key()]
 		if setting.level == NotifyLevelMute {
 			continue
 		}
@@ -508,7 +512,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 		switch {
 		case place.Kind != PlaceChannel:
 			reason = NotifyReasonDM
-		case mentioned[candidate.Key()]:
+		case mentioned[candidate.Participant.Key()]:
 			reason = NotifyReasonMention
 		case matchesKeyword(lowered, setting.keywords):
 			reason = NotifyReasonKeyword
@@ -516,7 +520,12 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 			reason = NotifyReasonAll
 		}
 		if reason != "" {
-			decisions = append(decisions, NotificationDecision{Participant: candidate, Reason: reason})
+			decisions = append(decisions, NotificationDecision{
+				Participant:       candidate.Participant,
+				Reason:            reason,
+				workspaceMemberID: candidate.workspaceMemberID,
+				placeMemberID:     candidate.placeMemberID,
+			})
 		}
 	}
 	return decisions, nil
@@ -578,7 +587,9 @@ func (s *ScopedStore) NotificationIntentsForMessage(ctx context.Context, message
 		return nil, ErrMessageNotFound
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT recipient_kind, recipient_id, reason
+		SELECT recipient_kind, recipient_id, reason,
+		       recipient_workspace_member_id,
+		       COALESCE(recipient_place_member_id::text, '')
 		FROM message_notification_intents
 		WHERE message_id=$1 ORDER BY recipient_kind, recipient_id`, messageID)
 	if err != nil {
@@ -588,7 +599,13 @@ func (s *ScopedStore) NotificationIntentsForMessage(ctx context.Context, message
 	var out []NotificationDecision
 	for rows.Next() {
 		var item NotificationDecision
-		if err := rows.Scan(&item.Participant.Kind, &item.Participant.ID, &item.Reason); err != nil {
+		if err := rows.Scan(
+			&item.Participant.Kind,
+			&item.Participant.ID,
+			&item.Reason,
+			&item.workspaceMemberID,
+			&item.placeMemberID,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

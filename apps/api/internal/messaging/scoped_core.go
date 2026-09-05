@@ -760,7 +760,9 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 		condition = `wm.workspace_id = $1 AND wm.left_at IS NULL`
 	}
 	rows, err := q.Query(ctx, `
-		SELECT wm.member_kind, wm.member_id,
+		SELECT wm.workspace_member_id,
+		       COALESCE(pm.place_member_id::text, ''),
+		       wm.member_kind, wm.member_id,
 		       COALESCE(h.display_name, a.display_name, '') AS display_name
 		FROM workspace_members wm
 		-- Bound to the exact place: without pm.place_id the join multiplies a
@@ -783,8 +785,17 @@ func (s *ScopedStore) activeMembersScoped(ctx context.Context, q querier, place 
 	var members []MemberProfile
 	for rows.Next() {
 		var member MemberProfile
-		if err := rows.Scan(&member.Participant.Kind, &member.Participant.ID, &member.DisplayName); err != nil {
+		if err := rows.Scan(
+			&member.workspaceMemberID,
+			&member.placeMemberID,
+			&member.Participant.Kind,
+			&member.Participant.ID,
+			&member.DisplayName,
+		); err != nil {
 			return nil, fmt.Errorf("scan scoped active member: %w", err)
+		}
+		if place.Kind == PlaceChannel {
+			member.placeMemberID = ""
 		}
 		members = append(members, member)
 	}

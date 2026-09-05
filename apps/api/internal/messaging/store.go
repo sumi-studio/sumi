@@ -67,6 +67,10 @@ type Store struct {
 	pool       *pgxpool.Pool
 	workspaces WorkspaceAuthority
 	apps       AppAuthority
+	// push is optional. When absent, in-tab notification delivery remains
+	// available and the Web Push routes report that the deployment is disabled.
+	push   *PushDispatcher
+	egress *pushEgress
 	// blobs and attachmentPolicy are set by ConfigureAttachments. A nil blobs
 	// keeps every attachment operation failing closed.
 	blobs            AttachmentBlobs
@@ -115,6 +119,10 @@ type MemberProfile struct {
 	DisplayName             string
 	SecretaryForDisplayName string
 	Role                    string // workspace role; empty for dm/group_dm members
+	// Exact tenure IDs are internal delivery authority. They deliberately stay
+	// off every wire projection of MemberProfile.
+	workspaceMemberID string
+	placeMemberID     string
 }
 
 // ProjectedDisplayName is the temporary v1 wire compromise for multiple
