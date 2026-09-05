@@ -133,7 +133,7 @@ pub(crate) enum RecoveryStep {
     },
 }
 
-/// Store-owned consumer for the narrow, authenticated ToolUse restart seam.
+/// Store-owned consumer for authenticated completed-assistant restart seams.
 ///
 /// This executor intentionally supports only a complete single-step assistant
 /// suffix: either `ResumeAssistantFromDurableEvents` or
@@ -142,6 +142,9 @@ pub(crate) enum RecoveryStep {
 /// call a provider or tool: terminal calls reuse their exact durable result,
 /// rowless calls receive a synthetic pre-execution error, and a typed pending
 /// approval atomically becomes a cancelled prepared tool plus its error result.
+/// An Error terminal without tool calls closes the interrupted run while keeping
+/// its exact error in the transcript. This does not resume the old process's
+/// remaining automatic retries or turn the failed attempt into a success.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LogicalRecoveryExecutor;
 
@@ -178,7 +181,7 @@ struct PendingPhysicalResolution {
     result: ToolResultMessage,
 }
 
-struct ToolUseRecoverySnapshot {
+struct AssistantRecoverySnapshot {
     command_id: String,
     command_seq: u64,
     run_id: String,
@@ -205,7 +208,7 @@ impl LogicalRecoveryExecutor {
         recovery
             .apply_recovery_batch(batch)
             .await
-            .context("failed to atomically close ToolUse restart seam")?;
+            .context("failed to atomically close assistant restart seam")?;
         Ok(())
     }
 
@@ -280,7 +283,7 @@ impl LogicalRecoveryExecutor {
             .hydrate_messages(&mut transaction)
             .await
             .context("failed to authenticate logical-recovery transcript")?;
-        let snapshot = ToolUseRecoverySnapshot::load(
+        let snapshot = AssistantRecoverySnapshot::load(
             &mut transaction,
             &messages,
             command_id,
@@ -300,7 +303,7 @@ impl LogicalRecoveryExecutor {
     }
 }
 
-impl ToolUseRecoverySnapshot {
+impl AssistantRecoverySnapshot {
     #[expect(
         clippy::too_many_arguments,
         reason = "logical recovery authenticates each owner, turn, approval, and physical-resolution dimension explicitly"
@@ -399,6 +402,51 @@ impl ToolUseRecoverySnapshot {
         let PublicMessage::Assistant(assistant_message) = &assistant else {
             unreachable!("assistant transcript variant was matched")
         };
+        if assistant_message.stop_reason == StopReason::Error
+            && assistant_message.content.iter().all(|item| {
+                matches!(
+                    item,
+                    PublicAssistantContent::Text { .. } | PublicAssistantContent::Thinking { .. }
+                )
+            })
+        {
+            // A completed provider failure can be followed by a process exit
+            // before the retry wait or normal TurnEnd/AgentEnd finishes. Close
+            // that exact interrupted attempt, without replaying an external
+            // effect or erasing the original error. Pending provider context is
+            // rejected by plan_batch until its disposition is implemented.
+            let unsettled: i64 = sqlx::query_scalar(
+                "SELECT
+                    (SELECT COUNT(*) FROM tool_executions
+                     WHERE run_id = ? AND state IN ('prepared', 'running')) +
+                    (SELECT COUNT(*) FROM approval_log
+                     WHERE run_id = ? AND state = 'pending') +
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type = 'message_start' AND seq > ?
+                       AND json_extract(internal_metadata, '$.run_id') = ?
+                       AND json_extract(internal_metadata, '$.turn_id') = ?)",
+            )
+            .bind(run_id)
+            .bind(run_id)
+            .bind(i64::try_from(assistant_seq).context("assistant sequence overflows i64")?)
+            .bind(run_id)
+            .bind(active_turn_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to inspect the interrupted Error suffix")?;
+            if unsettled != 0 || expected_pending.is_some() || !pending_physical.is_empty() {
+                bail!("Error logical recovery cannot close unresolved work or a later attempt");
+            }
+            return Ok(Self {
+                command_id: command_id.to_owned(),
+                command_seq,
+                run_id: run_id.to_owned(),
+                turn_id: active_turn_id.to_owned(),
+                assistant,
+                tool_results: Vec::new(),
+                missing_dispositions: Vec::new(),
+            });
+        }
         if assistant_message.stop_reason != StopReason::ToolUse || assistant_message.interrupted {
             bail!(
                 "assistant logical-recovery owner {assistant_message_id} is not a completed ToolUse MessageEnd"
@@ -2418,6 +2466,10 @@ pub(crate) mod tests {
         assistant: PublicMessage,
         terminal_tools: &[(&str, &str, u32, bool)],
     ) {
+        let append_to_l0 = !matches!(
+            &assistant,
+            PublicMessage::Assistant(message) if message.stop_reason == StopReason::Error
+        );
         persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
         writer
             .apply(EventBatch {
@@ -2646,7 +2698,7 @@ pub(crate) mod tests {
                             message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned(),
                             role: "assistant",
                             message: assistant,
-                            append_to_l0: true,
+                            append_to_l0,
                             provider_context: Vec::new(),
                             eviction_footprint_tokens: 0,
                         }],
@@ -3011,6 +3063,247 @@ pub(crate) mod tests {
             })
             .await
             .expect("persist pending messaging approval");
+    }
+
+    fn error_recovery_assistant(interrupted: bool) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = tool_use_recovery_initial_assistant() else {
+            unreachable!("assistant fixture")
+        };
+        if !interrupted {
+            assistant.content.clear();
+        }
+        assistant.stop_reason = StopReason::Error;
+        assistant.provider_code = Some("http_503".to_owned());
+        assistant.error_message = Some("provider temporarily unavailable".to_owned());
+        assistant.interrupted = interrupted;
+        PublicMessage::Assistant(assistant)
+    }
+
+    #[tokio::test]
+    async fn logical_error_recovery_preserves_transcript_and_restarts_at_fixed_point() {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-logical-error-recovery-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let path = root.join("agent.db");
+        let store = open_boot_running_tools_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let assistant = error_recovery_assistant(false);
+        seed_tool_use_restart_seam_with_assistant(&writer, false, assistant.clone(), &[]).await;
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+
+        let restarted = open_boot_running_tools_store(&path).await;
+        let (lease, fence, _) = boot_recovery_authority(&restarted);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = restarted
+            .hydrate(&lease, &fence)
+            .await
+            .expect("authenticate the persisted provider error after restart")
+        else {
+            panic!("unfinished error run requires logical recovery")
+        };
+        LogicalRecoveryExecutor
+            .execute(&restarted, &steps, &lease, &fence)
+            .await
+            .expect("a persisted provider error must not permanently prevent startup");
+        let HydrationOutcome::Complete(hydrated) = restarted
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate the recovered error run")
+        else {
+            panic!("recovery must reach a complete authenticated state")
+        };
+        assert_eq!(hydrated.resume, ResumeDirective::AdmitCommands);
+        assert!(
+            hydrated.messages.iter().any(|message| {
+                matches!(message, ContextMessage::Persisted { id, .. }
+                if id == TOOL_USE_RECOVERY_ASSISTANT_ID)
+                    && crate::memory::overflow::context_message_to_public(message) == assistant
+            }),
+            "the original provider error must remain in the authenticated transcript"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+                "SELECT status, run_phase,
+                    (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
+                    (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'),
+                    (SELECT COUNT(*) FROM messages)
+                 FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .fetch_one(restarted.pool())
+            .await
+            .expect("inspect recovered lifecycle"),
+            ("applied".to_owned(), "finished".to_owned(), 1, 1, 2),
+        );
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(restarted.pool())
+            .await
+            .expect("event count after recovery");
+        restarted.pool().close().await;
+        drop(restarted);
+
+        let second_restart = open_boot_running_tools_store(&path).await;
+        assert!(matches!(
+            second_restart
+                .hydrate(&lease, &fence)
+                .await
+                .expect("second restart"),
+            HydrationOutcome::Complete(_)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(second_restart.pool())
+                .await
+                .expect("event count after second restart"),
+            event_count,
+            "restarting again must not duplicate the recovery suffix"
+        );
+        second_restart.pool().close().await;
+        std::fs::remove_dir_all(root).expect("remove the disposable recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn logical_error_recovery_closes_the_current_continuation_during_retry_wait() {
+        let (store, writer) = setup().await;
+        let assistant = error_recovery_assistant(true);
+        seed_tool_use_restart_seam_with_assistant(&writer, true, assistant.clone(), &[]).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::retry_scheduled(
+                            TOOL_USE_RECOVERY_RUN_ID,
+                            TOOL_USE_RECOVERY_CONTINUATION_TURN_ID,
+                            1,
+                            2_000,
+                            Utc::now() + chrono::Duration::seconds(2),
+                            "provider temporarily unavailable",
+                        )
+                        .expect("retry schedule"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist retry wait before restart");
+        let (lease, fence, _) = boot_recovery_authority(&store);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate retry wait")
+        else {
+            panic!("retry wait needs recovery")
+        };
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect("close the interrupted continuation");
+        assert!(matches!(
+            store
+                .hydrate(&lease, &fence)
+                .await
+                .expect("hydrate after recovery"),
+            HydrationOutcome::Complete(_)
+        ));
+        let (turn_ends, retries, encoded): (i64, i64, String) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'),
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='retry_scheduled'),
+                json_extract(envelope, '$.message')
+             FROM agent_events WHERE event_type='turn_end'
+               AND json_extract(internal_metadata, '$.turn_id')=?",
+        )
+        .bind(TOOL_USE_RECOVERY_CONTINUATION_TURN_ID)
+        .fetch_one(store.pool())
+        .await
+        .expect("recovered continuation");
+        assert_eq!((turn_ends, retries), (2, 1));
+        assert_eq!(
+            serde_json::from_str::<PublicMessage>(&encoded).expect("error terminal"),
+            assistant
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_error_recovery_cannot_close_a_later_unfinished_attempt() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam_with_assistant(
+            &writer,
+            false,
+            error_recovery_assistant(false),
+            &[],
+        )
+        .await;
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::retry_scheduled(
+                                TOOL_USE_RECOVERY_RUN_ID,
+                                TOOL_USE_RECOVERY_TURN_ID,
+                                1,
+                                0,
+                                Utc::now(),
+                                "provider temporarily unavailable",
+                            )
+                            .expect("retry schedule"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "later-assistant-attempt",
+                                &tool_use_recovery_initial_assistant(),
+                                Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                                Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
+                            )
+                            .expect("later assistant start"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist later attempt without a terminal");
+        let (lease, fence, _) = boot_recovery_authority(&store);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate incomplete retry")
+        else {
+            panic!("incomplete retry needs recovery")
+        };
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count before rejected recovery");
+        let error = LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect_err("old Error must not stand in for a later unfinished attempt");
+        assert!(error.to_string().contains("later attempt"), "{error:#}");
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("event count after rejected recovery");
+        assert_eq!(before, after);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(TOOL_USE_RECOVERY_COMMAND_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("owner status"),
+            "applying"
+        );
     }
 
     #[tokio::test]
