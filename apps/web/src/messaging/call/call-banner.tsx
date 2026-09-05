@@ -24,6 +24,13 @@ export function CallBanner() {
   if (!key || (phase !== "connecting" && phase !== "connected")) return null;
   const control =
     "flex size-8 items-center justify-center rounded-md transition-colors hover:bg-background/70";
+  const resumeBlockedAudio = async () => {
+    try {
+      await resumeAudio();
+    } catch {
+      // Keep the recovery control available for the next explicit gesture.
+    }
+  };
   return (
     <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-emerald-500/10 px-4 py-2 sm:px-5">
       <span className="size-2 rounded-full bg-emerald-500" />
@@ -38,9 +45,10 @@ export function CallBanner() {
       {audioBlocked ? (
         <button
           type="button"
-          onClick={() => void resumeAudio()}
+          onClick={() => void resumeBlockedAudio()}
           className={`${control} text-amber-600`}
           title="音声を再生"
+          aria-label="音声を再生"
         >
           <Volume2 className="size-4" />
         </button>
@@ -51,6 +59,8 @@ export function CallBanner() {
         onClick={toggleMic}
         className={control}
         title={local.micEnabled ? "ミュート" : "ミュート解除"}
+        aria-label="マイク"
+        aria-pressed={local.micEnabled}
       >
         {local.micEnabled ? (
           <Mic className="size-4" />
@@ -64,6 +74,8 @@ export function CallBanner() {
         onClick={toggleCamera}
         className={control}
         title={local.cameraEnabled ? "カメラを止める" : "カメラを使う"}
+        aria-label="カメラ"
+        aria-pressed={local.cameraEnabled}
       >
         {local.cameraEnabled ? (
           <Video className="size-4" />
@@ -76,7 +88,9 @@ export function CallBanner() {
         disabled={phase !== "connected"}
         onClick={toggleScreen}
         className={`${control} ${local.screenShareEnabled ? "text-emerald-600" : ""}`}
-        title="画面共有"
+        title={local.screenShareEnabled ? "画面共有を停止" : "画面共有を開始"}
+        aria-label="画面共有"
+        aria-pressed={local.screenShareEnabled}
       >
         <MonitorUp className="size-4" />
       </button>

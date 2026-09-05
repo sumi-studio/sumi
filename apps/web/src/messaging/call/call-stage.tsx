@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { participantKey } from "../model";
 import { useMessaging } from "../store";
 import { useCall } from "./call-store";
@@ -36,11 +36,18 @@ export function CallStage() {
   const key = useCall((state) => state.activePlaceKey);
   const tracks = useCall((state) => state.tracks);
   const call = useCall((state) => (key ? state.stateByPlace[key] : undefined));
+  const speakingUntil = useCall((state) => state.speakingUntil);
   const members = useMessaging((state) => state.membersByKey);
-  if (!key || tracks.length === 0) return null;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!call?.participants.length) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [call?.participants.length]);
+  if (!key || (tracks.length === 0 && !call?.participants.length)) return null;
   return (
     <section
-      aria-label="通話映像"
+      aria-label="通話参加者"
       className="grid max-h-[42vh] shrink-0 grid-cols-1 gap-2 overflow-y-auto border-border/70 border-b bg-muted/20 p-3 sm:grid-cols-2"
     >
       {tracks.map((track) => (
@@ -57,15 +64,20 @@ export function CallStage() {
                 track.participantKey === participantKey(entry.participant),
             ),
         )
-        .map((entry) => (
-          <div
-            key={participantKey(entry.participant)}
-            className="grid min-h-36 place-items-center rounded-lg bg-muted text-sm text-muted-foreground"
-          >
-            {members[participantKey(entry.participant)]?.displayName ??
-              "参加者"}
-          </div>
-        ))}
+        .map((entry) => {
+          const participant = participantKey(entry.participant);
+          const speaking = (speakingUntil[participant] ?? 0) > now;
+          return (
+            <div
+              key={participant}
+              className={`grid min-h-36 place-items-center rounded-lg bg-muted text-sm text-muted-foreground ring-2 transition-colors ${
+                speaking ? "ring-emerald-500" : "ring-transparent"
+              }`}
+            >
+              {members[participant]?.displayName ?? "参加者"}
+            </div>
+          );
+        })}
     </section>
   );
 }

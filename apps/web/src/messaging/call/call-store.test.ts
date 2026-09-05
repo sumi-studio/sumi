@@ -27,6 +27,7 @@ function transport(): CallTransport & {
   setMicrophoneEnabled: ReturnType<typeof vi.fn>;
   setCameraEnabled: ReturnType<typeof vi.fn>;
   setScreenShareEnabled: ReturnType<typeof vi.fn>;
+  resumeAudio: ReturnType<typeof vi.fn>;
 } {
   return {
     connect: vi.fn().mockResolvedValue(undefined),
@@ -242,6 +243,24 @@ describe("call degradation", () => {
       failure: "unavailable",
       activePlaceKey: null,
     });
+  });
+});
+
+describe("blocked audio recovery", () => {
+  it("keeps recovery available until transport resume succeeds", async () => {
+    const created = transport();
+    created.resumeAudio.mockRejectedValueOnce(new Error("still blocked"));
+    installCallTransportFactory(() => created);
+    await useCall.getState().join(PLACE);
+    useCall.setState({ audioPlaybackBlocked: true });
+
+    await expect(useCall.getState().resumeAudio()).rejects.toThrow(
+      "still blocked",
+    );
+    expect(useCall.getState().audioPlaybackBlocked).toBe(true);
+
+    await useCall.getState().resumeAudio();
+    expect(useCall.getState().audioPlaybackBlocked).toBe(false);
   });
 });
 
