@@ -79,9 +79,15 @@ func (s *ScopedStore) SearchMessages(
 		escapeLikePattern(query), query, limit,
 	}
 	placeFilter := ""
+	visibleKindFilter := `(p.kind = 'channel' OR
+			       (p.kind IN ('thread', 'dm', 'group_dm') AND pm.place_member_id IS NOT NULL))`
 	if opt.PlaceID != "" {
 		placeFilter = "AND m.place_id = $6"
 		args = append(args, opt.PlaceID)
+		// The explicit place was authorized above. A visible thread may be
+		// searched while open without turning it into a global participant hit.
+		visibleKindFilter = `(p.kind IN ('channel', 'thread') OR
+			       (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))`
 	}
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 		WITH visible_places AS (
@@ -93,8 +99,7 @@ func (s *ScopedStore) SearchMessages(
 			  ON pm.workspace_id = p.workspace_id AND pm.place_id = p.place_id
 			 AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			  AND (p.kind = 'channel' OR
-			       (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
+			  AND %s
 		)
 		SELECT m.message_id, m.place_id, m.seq, m.author_kind, m.author_id,
 		       m.content, m.created_at,
@@ -106,7 +111,7 @@ func (s *ScopedStore) SearchMessages(
 		  AND m.content ILIKE ('%%' || $3 || '%%') %s
 		ORDER BY similarity(m.content, $4) DESC, m.created_at DESC, m.seq DESC,
 		         m.message_id DESC
-		LIMIT $5`, placeFilter), args...)
+		LIMIT $5`, visibleKindFilter, placeFilter), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query scoped message search: %w", err)
 	}

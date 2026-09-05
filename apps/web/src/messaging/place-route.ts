@@ -11,7 +11,12 @@ import { getMessagingScope } from "./store";
 export function placePath(workspaceId: string, key: PlaceKey): string {
   const place = parsePlaceKey(key);
   if (!place) return "/";
-  const placeId = place.kind === "channel" ? place.channelId : place.dmId;
+  const placeId =
+    place.kind === "channel"
+      ? place.channelId
+      : place.kind === "thread"
+        ? place.threadId
+        : place.dmId;
   return messagingPlacePath(workspaceId, place.kind, placeId);
 }
 
@@ -26,6 +31,11 @@ export function usePlaceNavigate() {
         void navigate({
           to: "/w/$workspaceId/messaging/c/$channelId",
           params: { workspaceId, channelId: place.channelId },
+        });
+      } else if (place.kind === "thread") {
+        void navigate({
+          to: "/w/$workspaceId/messaging/t/$threadId",
+          params: { workspaceId, threadId: place.threadId },
         });
       } else if (place.kind === "dm") {
         void navigate({

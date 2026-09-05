@@ -10,19 +10,41 @@ import type {
   Place,
   PlaceKey,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import { resetNotificationAudio } from "./notifications";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
+  notifiableUnreadCount,
   notificationLevelFor,
   useMessaging,
 } from "./store";
 
 const SELF = { kind: "human", humanId: "human-1" } as const;
 const OTHER = { kind: "human", humanId: "human-2" } as const;
-const CHANNEL: Place = { kind: "channel", channelId: "channel-1" };
+const PARENT_CHANNEL = { kind: "channel", channelId: "channel-1" } as const;
+const CHANNEL: Place = PARENT_CHANNEL;
 const CHANNEL_KEY: PlaceKey = "channel:channel-1";
+
+function threadIn(
+  threadId: string,
+  participants: ThreadSummary["participants"],
+): ThreadSummary {
+  return {
+    threadId,
+    revision: 1,
+    workspaceId: "ws",
+    parentPlace: PARENT_CHANNEL,
+    parentMessageId: "message-0",
+    name: threadId,
+    messageCount: 1,
+    lastMessageAt: 1,
+    lastMessage: "",
+    participants,
+    latestSeq: 1,
+  };
+}
 
 /** MessagingBackendの最小実装。設定の送信と、event配送だけを見る。 */
 class StubBackend implements MessagingBackend {
@@ -445,6 +467,67 @@ describe("presenting an incoming message", () => {
     });
 
     expect(FakeNotification.constructed).toHaveLength(0);
+  });
+
+  it("plays a repeated message_created frame only once", () => {
+    const startTone = vi.fn();
+    const gainNode = () => ({
+      gain: {
+        value: 0,
+        setValueAtTime: vi.fn(),
+        exponentialRampToValueAtTime: vi.fn(),
+      },
+      connect: vi.fn(),
+    });
+    class FakeAudioContext {
+      currentTime = 0;
+      destination = {};
+      resume = vi.fn();
+      createGain = vi.fn(gainNode);
+      createOscillator = vi.fn(() => ({
+        type: "",
+        frequency: { setValueAtTime: vi.fn() },
+        connect: vi.fn(),
+        start: startTone,
+        stop: vi.fn(),
+      }));
+    }
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    resetNotificationAudio();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const event = {
+      type: "message_created" as const,
+      message: incoming(),
+      notify: { reason: "keyword" as const },
+    };
+
+    backend.emit(event);
+    expect(startTone).toHaveBeenCalledTimes(2);
+    backend.emit(event);
+
+    expect(startTone).toHaveBeenCalledTimes(2);
+  });
+
+  it("タブの件数は自分の台帳にあるplaceだけを数える", () => {
+    // URLで開いただけのthreadはsidebarにもbootstrapのthreadsにも出ない。
+    // その未読をタイトルへ足すと、どのバッジにも無い数字だけが増える。
+    useMessaging.setState({
+      threadsById: {
+        "thread-joined": threadIn("thread-joined", [SELF, OTHER]),
+        "thread-visiting": threadIn("thread-visiting", [OTHER]),
+      },
+      unreadCountByPlace: {
+        [CHANNEL_KEY]: 2,
+        "thread:thread-joined": 3,
+        "thread:thread-visiting": 40,
+        "thread:thread-not-hydrated": 7,
+      },
+      mentionCountByPlace: {},
+      notificationDefaultLevel: "all",
+      notificationLevelByPlace: {},
+    });
+
+    expect(notifiableUnreadCount(useMessaging.getState())).toBe(5);
   });
 
   it("stays quiet when the server did not call this person", () => {

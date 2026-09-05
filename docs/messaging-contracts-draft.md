@@ -77,6 +77,7 @@
 | `channel` | Workspace | Workspaceメンバー（初期はpublicのみ） | private channelは後続 |
 | `dm` | なし（global） | 2名 | Secretary DMもこれ。到達性条件を満たす2者 |
 | `group_dm` | なし（global） | 3名以上 | 作成者が到達可能な相手を招待 |
+| `thread` | channel | 親channelのWorkspaceメンバーが閲覧・投稿。`place_members` は参加者投影 | v0はchannel配下だけ |
 
 - すべてのplaceはplace単位の**単調増加seq**を持つ（既存direct chatのdurable seq + catch-upと同じパターン）。
 - 未読・replay・read markerはすべてこのseqを基準にする。
@@ -255,6 +256,37 @@
   `message_id`、`place`、`seq`、`author`、`created_at` と、全文ではなくサーバー側で
   切り出したsnippetを返す。指定した `place_id` が閲覧不可なら `404 not_found` とし、
   placeの存在を明かさない。
+- Thread は通常の place で、`{ "kind": "thread", "thread_id": "..." }` と表す。
+  `GET /messaging/places/{channel_id}/threads` は親channelを開いたときの一覧、
+  `POST /messaging/places/{channel_id}/threads`（`name`, 任意の
+  `parent_message_id`, `client_nonce`）は作成である。同じ作成nonceの再送は最初の
+  threadを返す。1 message から作れるthreadは1つだけ。
+  bootstrapは閲覧者が参加しているthreadだけを返し、個別open responseは
+  `thread` summaryに親channelを含める。未読summaryとlive配信も同じ線で切る:
+  ambientに載るのは参加しているthreadだけで、開けるだけのthreadは読んでも
+  参加者にならない。参加していないthreadをURLで開いた閲覧者には、WSの
+  `open{place_id, since}` / `close{place_id}`（ackは `open_ack{place_id}`）で
+  宣言した「開いている間」だけliveが届く。宣言は配信の絞り込みであって認可では
+  ない。cursorを持つ台帳も同じ線で切る。serverのcatch-upはcursorを購読の根拠に
+  しない: helloでreplayするのは参加しているplaceだけで、開いているだけのthread
+  はその `open` frame のあとにreplayされる。
+  画面はRESTで履歴を取ってから開くので、その取得と宣言の隙間にcommitされた分は
+  手元のpageにもliveにも無い。`open` は「ここまで持っている」（`since`）を運び、
+  serverはそこからreplayして最後に `open_ack` を返す——replayが先、ackが後。
+  helloが預かったcursorも同じ経路に合流し（両者のうち手前から replay する）、
+  replayの経路は1本だけである。live配信は宣言の時点から始まるので、replayと
+  liveは重なる（重複はclientが畳めるが、隙間は畳めない）。まだ履歴を持って
+  いない場所でも、clientは0ではなく**知っている最新seq**（unread summaryや
+  thread summary、liveで見たseq）を名乗る。0は「先頭からreplayせよ」であり、
+  開くたびに古い履歴が流れてしまう。
+- 再接続の握手はWorkspaceの場所数に比例しない。clientがcursorを持つのは**いま
+  履歴を持っている場所**（開いて読み込んだ場所）と、いま開いている場所だけで、
+  手放すときはcursorと履歴を一緒に捨てる（片方だけ残すと穴の空いた履歴になる）。
+  それ以外の場所は、未読はbootstrapのunread summaryが正本、履歴は開いたときの
+  RESTが運ぶ。参加threadを何千持っていてもhelloは大きくならない。未読summary
+  自体は参加の数だけ並ぶので、そちらが重くなったら別途ページングを足す。Threadのmessageは既存の送信・添付・検索・
+  tombstone・read markerをそのまま使う。通知候補は参加者と新しいmention先だけで、
+  mentionされた人は同じtransactionで参加者になる。
 - 送信入力はraw contentとclient nonceを送り、解決済み `mentions` をclient assertionとして
   受け取らない。サーバーがadmission時のmembershipからMessageのmentionsを構成する。
 - WS event（durable、place-seq付き）: `message_created`, `message_edited`,
@@ -367,6 +399,9 @@ agentにとってより適した方法があるときだけそちらで代替す
    分解しない。** `mark_read` はtoolとして露出しない（開いて読めば進む）。
    ただしwire上には idempotent な `read_through(place, seq)` を残し、本人の
    durable admission後にackする（ADR 0011 §3・§6）。
+   Threadにはread-onlyの `threads` とmutatingな `create_thread` があり、後者は
+   作成後にそのthreadを現在のviewとして開く。起点messageを指定する場合は現在の
+   open画面に見えているmessageだけを対象にする。
 3. **人生ログへの記録**: agent基盤がprovenanceとともに記録する。正本はWorkspace
    API側で、agent DBはlocal copy/projection（ADR 0008 §8）。
 
@@ -452,7 +487,7 @@ agentにとってより適した方法があるときだけそちらで代替す
 
 ## Non-goals（v0）
 
-- private channelの実装（契約上はvisibilityとして予約）、スレッド、voice/video、
+- private channelの実装（契約上はvisibilityとして予約）、
   スタンプ・GIFピッカー、bot/webhook実体（authorの拡張性だけ確保）。
 - read receipt（既読の自動晒し）。自己申告のStatus/ReplyLaterで置き換える。
 - 要約・キュレーション等、agentの仕事を規定する機能。道具だけを作る。

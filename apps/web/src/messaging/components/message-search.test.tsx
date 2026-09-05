@@ -9,12 +9,13 @@ import {
   screen,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MessageSearchResult } from "../model";
+import type { MessageSearchResult, ThreadSummary } from "../model";
 import { MessageSearch } from "./message-search";
 
 const mocks = vi.hoisted(() => ({ searchMessages: vi.fn() }));
 const state = {
   searchMessages: mocks.searchMessages,
+  transportGeneration: 1,
   channels: [
     {
       channelId: "channel-1",
@@ -25,6 +26,7 @@ const state = {
     },
   ],
   dms: [],
+  threadsById: {} as Record<string, ThreadSummary>,
   membersByKey: {
     "human:author-1": {
       participant: { kind: "human" as const, humanId: "author-1" },
@@ -61,6 +63,8 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.resetAllMocks();
+  state.threadsById = {};
+  state.transportGeneration = 1;
 });
 
 describe("MessageSearch", () => {
@@ -98,6 +102,41 @@ describe("MessageSearch", () => {
     expect(mocks.searchMessages).toHaveBeenCalledWith("予定");
   });
 
+  it("labels a thread result with its thread name", async () => {
+    mocks.searchMessages.mockResolvedValueOnce([
+      {
+        ...result(),
+        place: { kind: "thread", threadId: "thread-1" },
+      },
+    ]);
+    state.threadsById = {
+      "thread-1": {
+        threadId: "thread-1",
+        revision: 1,
+        parentPlace: { kind: "channel", channelId: "channel-1" },
+        parentMessageId: null,
+        workspaceId: "workspace-1",
+        name: "認証リダイレクト",
+        messageCount: 1,
+        lastMessageAt: null,
+        lastMessage: "",
+        participants: [],
+        latestSeq: 1,
+      },
+    };
+    render(<MessageSearch onJump={vi.fn()} />);
+
+    fireEvent.change(screen.getByPlaceholderText("検索"), {
+      target: { value: "予定" },
+    });
+    await advance(300);
+
+    expect(
+      screen.getByRole("button", { name: /認証リダイレクト/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("DM")).not.toBeInTheDocument();
+  });
+
   it("closes on Escape and an outside pointer", async () => {
     mocks.searchMessages.mockResolvedValue([]);
     render(
@@ -116,5 +155,29 @@ describe("MessageSearch", () => {
     fireEvent.change(input, { target: { value: "予定" } });
     fireEvent.pointerDown(screen.getByRole("button", { name: "outside" }));
     expect(screen.queryByText(/「予定」の検索結果/)).not.toBeInTheDocument();
+  });
+
+  it("forgets snippets, controls, and in-flight results when authority changes", async () => {
+    let resolveSearch!: (results: MessageSearchResult[]) => void;
+    mocks.searchMessages.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSearch = resolve;
+      }),
+    );
+    const onJump = vi.fn();
+    const view = render(<MessageSearch onJump={onJump} />);
+    const input = screen.getByPlaceholderText("検索");
+    fireEvent.change(input, { target: { value: "秘密" } });
+    await advance(300);
+    expect(mocks.searchMessages).toHaveBeenCalledWith("秘密");
+
+    state.transportGeneration = 2;
+    view.rerender(<MessageSearch onJump={onJump} />);
+    expect(input).toHaveValue("");
+    expect(screen.queryByText(/「秘密」の検索結果/)).not.toBeInTheDocument();
+
+    await act(async () => resolveSearch([result()]));
+    expect(screen.queryByRole("button", { name: /# general/ })).toBeNull();
+    expect(onJump).not.toHaveBeenCalled();
   });
 });

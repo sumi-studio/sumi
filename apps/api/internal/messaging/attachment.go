@@ -227,7 +227,7 @@ type StagedAttachment struct {
 }
 
 func validateAttachmentNonce(clientNonce string) error {
-	if clientNonce == "" || len(clientNonce) > 128 {
+	if !clientNonceValid(clientNonce) {
 		return ErrAttachmentNonce
 	}
 	return nil

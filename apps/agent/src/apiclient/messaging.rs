@@ -71,6 +71,22 @@ pub(crate) struct OpenMessagingPlaceRequest<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ListMessagingThreadsRequest<'a> {
+    pub parent_place_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateMessagingThreadRequest<'a> {
+    pub parent_place_id: &'a str,
+    pub name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_message_id: Option<&'a str>,
+    pub client_nonce: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WriteMessagingMessageRequest<'a> {
     pub place_id: &'a str,
     pub content: &'a str,
@@ -420,6 +436,22 @@ pub(crate) trait MessagingApi: AppInstallationResolver + Send + Sync + 'static {
         scope: &ExactMessagingScope,
         request: OpenMessagingPlaceRequest<'_>,
     ) -> Result<Value>;
+
+    async fn threads(
+        &self,
+        _scope: &ExactMessagingScope,
+        _request: ListMessagingThreadsRequest<'_>,
+    ) -> Result<Value> {
+        Err(anyhow::anyhow!("Messaging threads are unavailable"))
+    }
+
+    async fn create_thread(
+        &self,
+        _scope: &ExactMessagingScope,
+        _request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<Value> {
+        Err(anyhow::anyhow!("Messaging thread creation is unavailable"))
+    }
 
     async fn write(
         &self,

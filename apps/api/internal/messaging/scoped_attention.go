@@ -391,16 +391,18 @@ func (s *ScopedStore) ReplyLaterMarkersFor(ctx context.Context) ([]ReplyLaterMar
 	}
 	rows, err := tx.Query(ctx, `
 		WITH visible_places AS (
-			SELECT p.place_id, p.kind FROM places p
+			SELECT p.place_id, p.kind, pm.place_member_id IS NOT NULL AS participates FROM places p
 			LEFT JOIN place_members pm ON pm.workspace_id = p.workspace_id
-			 AND pm.place_id = p.place_id AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
+				 AND pm.place_id = p.place_id AND pm.workspace_member_id = $2 AND pm.left_at IS NULL
 			WHERE p.workspace_id = $1
-			 AND (p.kind = 'channel' OR (p.kind IN ('dm','group_dm') AND pm.place_member_id IS NOT NULL))
+				 AND (p.kind IN ('channel', 'thread') OR (p.kind IN ('dm', 'group_dm') AND pm.place_member_id IS NOT NULL))
 		)
 		SELECT rl.marker_id, rl.member_kind, rl.member_id, rl.place_id, vp.kind,
 		       rl.message_id, rl.note, rl.remind_at
 		FROM reply_later_markers rl JOIN visible_places vp ON vp.place_id = rl.place_id
-		WHERE rl.resolved_at IS NULL ORDER BY rl.marker_id`, s.Scope.WorkspaceID, membership.WorkspaceMemberID)
+		WHERE rl.resolved_at IS NULL
+		  AND (vp.kind <> 'thread' OR vp.participates OR (rl.member_kind = $3 AND rl.member_id = $4))
+		ORDER BY rl.marker_id`, s.Scope.WorkspaceID, membership.WorkspaceMemberID, s.Scope.Actor.Kind, s.Scope.Actor.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +512,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 		}
 		reason := ""
 		switch {
-		case place.Kind != PlaceChannel:
+		case place.Kind == PlaceDM || place.Kind == PlaceGroupDM:
 			reason = NotifyReasonDM
 		case mentioned[candidate.Participant.Key()]:
 			reason = NotifyReasonMention
@@ -550,6 +552,12 @@ func (s *ScopedStore) NotificationDecisionsFor(ctx context.Context, place Place,
 	members, err := s.activeMembersScoped(ctx, tx, loaded)
 	if err != nil {
 		return nil, err
+	}
+	if loaded.Kind == PlaceThread {
+		members, err = s.threadNotificationMembers(ctx, tx, loaded.PlaceID, members)
+		if err != nil {
+			return nil, err
+		}
 	}
 	decisions, err := s.notificationDecisionsForMembersScoped(ctx, tx, loaded, message, members)
 	if err != nil {

@@ -16,6 +16,7 @@ type OpenSnapshot struct {
 	Messages    []Message
 	Members     []MemberProfile
 	LastReadSeq int64
+	Thread      *Thread
 }
 
 // OpenSnapshot loads one read-only screen at REPEATABLE READ. READ COMMITTED
@@ -35,7 +36,8 @@ func (s *ScopedStore) OpenSnapshot(
 	// Scope authority is part of the screen snapshot: the exact enabled
 	// installation and active Workspace tenure cannot change between
 	// authorization and any response projection.
-	if _, err := s.authorizeSnapshotInTx(ctx, tx); err != nil {
+	membership, err := s.authorizeSnapshotInTx(ctx, tx)
+	if err != nil {
 		return OpenSnapshot{}, err
 	}
 	place, err := s.loadScopedPlace(ctx, tx, placeID)
@@ -46,7 +48,7 @@ func (s *ScopedStore) OpenSnapshot(
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	snapshot, err := s.openSnapshotFromPlace(ctx, tx, place, access, opt)
+	snapshot, err := s.openSnapshotFromPlace(ctx, tx, membership.WorkspaceMemberID, place, access, opt)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
@@ -73,6 +75,7 @@ func (s *Store) beginOpenSnapshot(ctx context.Context) (pgx.Tx, error) {
 func (s *ScopedStore) openSnapshotFromPlace(
 	ctx context.Context,
 	q querier,
+	workspaceMemberID string,
 	place Place,
 	access PlaceAccess,
 	opt HistoryOptions,
@@ -85,7 +88,7 @@ func (s *ScopedStore) openSnapshotFromPlace(
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
-	lastRead, err := s.readMarkerAfterAuthorization(ctx, q, place, access)
+	lastRead, err := s.readMarkerAfterAuthorization(ctx, q, place, access.WorkspaceMemberID)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}
@@ -96,10 +99,18 @@ func (s *ScopedStore) openSnapshotFromPlace(
 			place.LastSeq,
 		)
 	}
-	return OpenSnapshot{
+	snapshot := OpenSnapshot{
 		Place:       place,
 		Messages:    messages,
 		Members:     members,
 		LastReadSeq: lastRead,
-	}, nil
+	}
+	if place.Kind == PlaceThread {
+		thread, err := s.threadForAuthorizedPlace(ctx, q, workspaceMemberID, place)
+		if err != nil {
+			return OpenSnapshot{}, err
+		}
+		snapshot.Thread = &thread
+	}
+	return snapshot, nil
 }

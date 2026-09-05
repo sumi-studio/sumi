@@ -747,14 +747,18 @@ export function Sidebar({
     activePlace?.kind === "channel"
       ? channels.find((channel) => channel.channelId === activePlace.channelId)
       : undefined;
-  const channelWorkspace = activeChannel
-    ? workspaces.find(
-        (workspace) => workspace.workspaceId === activeChannel.workspaceId,
-      )
-    : undefined;
+  const threadsById = useMessaging((state) => state.threadsById);
+  const activeThread =
+    activePlace?.kind === "thread"
+      ? threadsById[activePlace.threadId]
+      : undefined;
+  const activeWorkspaceId =
+    activeChannel?.workspaceId ?? activeThread?.workspaceId;
   const activeWorkspace =
-    channelWorkspace?.workspaceId === workspaceId
-      ? channelWorkspace
+    activeWorkspaceId === workspaceId
+      ? workspaces.find(
+          (workspace) => workspace.workspaceId === activeWorkspaceId,
+        )
       : selectedPlaceKey === null
         ? workspaces.find((workspace) => workspace.workspaceId === workspaceId)
         : undefined;

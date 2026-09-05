@@ -23,8 +23,9 @@ use crate::{
     apiclient::apps::{AppInstallationResolutionError, ResolveEnabledWorkspaceAppRequest},
     apiclient::messaging::{
         CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
-        DuplicateMessagingChannelRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-        MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
+        CreateMessagingThreadRequest, DuplicateMessagingChannelRequest, ExactMessagingScope,
+        GetMessagingCallStateRequest, ListMessagingThreadsRequest, MessagingApi,
+        MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
         MessagingNotificationPlace, MessagingNotificationSettingsRequest, MessagingParticipant,
         OpenMessagingAttachmentRequest, OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest,
         ReactMessagingReactionRequest, ReadMessagingThroughRequest,
@@ -62,6 +63,9 @@ const MAX_PARTICIPANT_ID_BYTES: usize = 256;
 // bytes; four bytes per character covers any UTF-8 within the name bound.
 const MAX_CHANNEL_NAME_CHARS: usize = 200;
 const MAX_CHANNEL_NAME_BYTES: usize = 800;
+// Thread names share the API's Unicode-code-point bound. Rust `chars()` is
+// the corresponding scalar-value count for valid UTF-8 input.
+const MAX_THREAD_NAME_CHARS: usize = 100;
 const MAX_TOPIC_BYTES: usize = 1000;
 // A group dm the agent opens in one gesture. Far beyond any real conversation,
 // tight enough that a malformed argument cannot fan out.
@@ -109,6 +113,16 @@ enum MessagingAction {
         before_seq: Option<u64>,
         #[serde(default)]
         limit: Option<u16>,
+    },
+    /// List side conversations under the place currently open in this view.
+    Threads {},
+    /// Create a side conversation under the open place, optionally from a visible message.
+    CreateThread {
+        name: String,
+        #[serde(default)]
+        message_id: Option<String>,
+        #[serde(default)]
+        seq: Option<u64>,
     },
     /// Write in the place currently open in this view.
     Write {
@@ -246,6 +260,15 @@ enum BoundMessagingAction {
         #[serde(default)]
         limit: Option<u16>,
     },
+    Threads {
+        parent_place_id: String,
+    },
+    CreateThread {
+        parent_place_id: String,
+        name: String,
+        #[serde(default)]
+        parent_message_id: Option<String>,
+    },
     Write {
         place_id: String,
         content: String,
@@ -341,6 +364,7 @@ impl BoundMessagingAction {
             | Self::ResolveReplyLater { .. }
             | Self::StartDm { .. }
             | Self::CreateChannel { .. }
+            | Self::CreateThread { .. }
             | Self::UpdateChannel { .. }
             | Self::DuplicateChannel { .. } => true,
             Self::NotificationSettings {
@@ -431,6 +455,8 @@ struct OpenPlaceWire {
     channel_id: Option<String>,
     #[serde(default)]
     dm_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,7 +744,9 @@ fn messaging_parameters_schema() -> Value {
             "or reply_to; open_attachment requires one attachment_id already visible in the ",
             "open page; react ",
             "requires emoji plus exactly one of message_id or seq; reply_later requires exactly ",
-            "one of message_id or seq and may include note or remind_in_minutes; status requires ",
+            "one of message_id or seq and may include note or remind_in_minutes; create_thread ",
+            "may include exactly one of message_id or seq to use a visible message as its origin; ",
+            "status requires ",
             "status and may include note or expires_in_minutes; resolve_reply_later requires ",
             "marker_id; get_call_state may include place_id; search requires query and may ",
             "include place_id or limit; notification_settings reads when given no setting ",
@@ -740,7 +768,7 @@ fn messaging_parameters_schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": [
-                    "overview", "open", "write", "open_attachment", "react",
+                    "overview", "open", "threads", "create_thread", "write", "open_attachment", "react",
                     "status", "reply_later", "resolve_reply_later", "get_call_state",
                     "search", "notification_settings",
                     "start_dm", "create_channel", "update_channel", "duplicate_channel"
@@ -754,7 +782,9 @@ fn messaging_parameters_schema() -> Value {
                     "such a message so others see it and you are reminded; status declares your ",
                     "own availability; resolve_reply_later marks one of your promises as kept; ",
                     "get_call_state reports who is currently in calls you can see; search finds ",
-                    "messages in places you can already see; notification_settings reads or ",
+                    "messages in places you can already see; threads lists side conversations ",
+                    "under the open place and create_thread creates and opens one; ",
+                    "notification_settings reads or ",
                     "partially updates what is allowed to interrupt you; ",
                     "start_dm opens a direct conversation with one person, or a group ",
                     "conversation with several, and puts it in view; create_channel opens a new ",
@@ -773,9 +803,10 @@ fn messaging_parameters_schema() -> Value {
             "name": {
                 "type": "string",
                 "description": concat!(
-                    "Required for create_channel; optional for update_channel and ",
-                    "duplicate_channel; omitted for other actions. The channel's name. For ",
-                    "duplicate_channel, omitting it takes the derived default name for a copy."
+                    "Required for create_thread and create_channel; optional for update_channel ",
+                    "and duplicate_channel; omitted for other actions. Thread names are at most ",
+                    "100 Unicode code points; channel names are at most 200. For duplicate_channel, ",
+                    "omitting it takes the derived default name for a copy."
                 )
             },
             "topic": {
@@ -858,17 +889,20 @@ fn messaging_parameters_schema() -> Value {
             "message_id": {
                 "type": "string",
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "message_id. Provide exactly one of message_id or seq; the message must be ",
-                    "visible in the currently open place."
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by message_id. React and reply_later ",
+                    "require exactly one of message_id or seq; create_thread may omit both or use ",
+                    "exactly one. The message must be visible in the currently open place."
                 )
             },
             "seq": {
                 "type": "integer",
                 "minimum": 1,
                 "description": concat!(
-                    "For react and reply_later, omitted for other actions. The target message by ",
-                    "its seq in the currently open place. Provide exactly one of message_id or seq."
+                    "For react, reply_later, and create_thread, omitted for other actions. The ",
+                    "target or optional thread-origin message by its seq in the currently open ",
+                    "place. React and reply_later require exactly one of message_id or seq; ",
+                    "create_thread may omit both or use exactly one."
                 )
             },
             "emoji": {
@@ -1050,6 +1084,70 @@ impl BoundToolAdapter for MessagingTool {
                     CapabilityClass::Read,
                     vec![ResourceScope::resource("messaging", "place", &place_id)],
                     review_projection,
+                    arguments,
+                )
+            }
+            MessagingAction::Threads {} => {
+                let state = view.lock().await;
+                let parent_place_id = focused_place_for_binding(&state, "threads")?;
+                let arguments = object([
+                    ("action", Value::String("threads".to_owned())),
+                    ("parent_place_id", Value::String(parent_place_id.clone())),
+                ]);
+                messaging_binding(
+                    &scope,
+                    "threads",
+                    CapabilityClass::Read,
+                    vec![ResourceScope::resource(
+                        "messaging",
+                        "place",
+                        &parent_place_id,
+                    )],
+                    arguments.clone(),
+                    arguments,
+                )
+            }
+            MessagingAction::CreateThread {
+                name,
+                message_id,
+                seq,
+            } => {
+                let name = name.trim().to_owned();
+                let state = view.lock().await;
+                let parent_place_id = focused_place_for_binding(&state, "create_thread")?;
+                let parent_message_id = if message_id.is_some() || seq.is_some() {
+                    Some(
+                        visible_target_for_binding(&state, &message_id, seq, "create_thread")?
+                            .message_id
+                            .clone(),
+                    )
+                } else {
+                    None
+                };
+                let mut arguments = object([
+                    ("action", Value::String("create_thread".to_owned())),
+                    ("parent_place_id", Value::String(parent_place_id.clone())),
+                    ("name", Value::String(name)),
+                ]);
+                insert_optional_string(
+                    &mut arguments,
+                    "parent_message_id",
+                    parent_message_id.clone(),
+                );
+                let mut scopes = vec![ResourceScope::resource(
+                    "messaging",
+                    "place",
+                    &parent_place_id,
+                )];
+                if let Some(id) = &parent_message_id {
+                    scopes.push(ResourceScope::resource("messaging", "message", id));
+                }
+                messaging_binding(
+                    &scope,
+                    "create_thread",
+                    CapabilityClass::Mutate,
+                    scopes,
+                    arguments.clone(),
                     arguments,
                 )
             }
@@ -1771,6 +1869,95 @@ impl MessagingTool {
                 }
                 response
             }
+            BoundMessagingAction::Threads { parent_place_id } => tokio::select! {
+                _ = execution.cancel.cancelled() => return Err(ToolError::Cancelled),
+                result = self.api.threads(scope, ListMessagingThreadsRequest { parent_place_id: &parent_place_id }) => result,
+            }.map_err(map_messaging_api_error)?,
+            BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id } => {
+                let nonce = client_nonce(execution.flow_id, execution.call_id);
+                // This is a mutation boundary. Once its HTTP future exists we
+                // must retain it until it produces either the durable receipt
+                // or the transport's indeterminate failure. Dropping it on a
+                // cancellation would lose a committed thread_id and invite a
+                // second create with another call id.
+                let mut response = self.api.create_thread(scope, CreateMessagingThreadRequest {
+                        parent_place_id: &parent_place_id,
+                        name: &name,
+                        parent_message_id: parent_message_id.as_deref(),
+                        client_nonce: &nonce,
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)?;
+                let thread_id = response.get("thread_id").and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| ToolError::Protocol("Messaging create_thread omitted thread_id".to_owned()))?
+                    .to_owned();
+                let response_object = response.as_object_mut().ok_or_else(|| ToolError::Protocol(
+                    "Messaging create_thread response is not an object".to_owned(),
+                ))?;
+                // Creating a thread opens it (契約: 作成後にそのthreadを現在の
+                // viewとして開く). This happens after the create commit, though:
+                // an open failure or cancellation must not turn the committed
+                // creation into an apparent failure that invites a duplicate.
+                // Retry once in this call, then return an explicit resumable
+                // partial success with the durable thread_id.
+                let open_created_thread = || async {
+                    self.api.open(scope, OpenMessagingPlaceRequest {
+                        place_id: &thread_id,
+                        before_seq: None,
+                        limit: None,
+                    })
+                    .await
+                    .map_err(map_messaging_api_error)
+                    .and_then(|opened| {
+                        validate_open_response(&opened, &thread_id, None, None)
+                            .map(|admission| (opened, admission))
+                    })
+                };
+                let first_open = tokio::select! {
+                    _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                    result = open_created_thread() => result,
+                };
+                let opened = match first_open {
+                    Ok(opened) => Ok(opened),
+                    Err(first_error) => match tokio::select! {
+                        _ = execution.cancel.cancelled() => Err(ToolError::Cancelled),
+                        result = open_created_thread() => result,
+                    } {
+                        Ok(opened) => Ok(opened),
+                        Err(retry_error) => Err((first_error, retry_error)),
+                    },
+                };
+                match opened {
+                    Ok((opened, admission)) => {
+                        state.focused_place_id = Some(thread_id.clone());
+                        state.visible_messages = admission.visible_messages;
+                        if let Some(seq) = admission.read_through_seq {
+                            record_pending_read_through(state, &thread_id, seq);
+                            if matches!(execution.post_commit_mode, PostCommitMode::ReturnLiveHook) {
+                                live_post_commit = Some(read_through_post_commit(
+                                    self.api.clone(),
+                                    scope.clone(),
+                                    view.clone(),
+                                    thread_id.clone(),
+                                    seq,
+                                ));
+                            }
+                        }
+                        response_object.insert("open".to_owned(), opened);
+                    }
+                    Err((first_error, retry_error)) => {
+                        response_object.insert("open_status".to_owned(), Value::String("pending".to_owned()));
+                        response_object.insert(
+                            "open_error".to_owned(),
+                            Value::String(format!(
+                                "thread was created but opening it failed twice: {first_error}; retry: {retry_error}"
+                            )),
+                        );
+                    }
+                }
+                response
+            }
             BoundMessagingAction::Write {
                 place_id,
                 content,
@@ -2363,6 +2550,17 @@ fn resolve_raw_action(
             before_seq,
             limit,
         }),
+        MessagingAction::Threads {} => Ok(BoundMessagingAction::Threads {
+            parent_place_id: state.focused_place_id.clone().ok_or_else(|| ToolError::Protocol("open a messaging place before listing threads".to_owned()))?,
+        }),
+        MessagingAction::CreateThread { name, message_id, seq } => {
+            let name = name.trim().to_owned();
+            let parent_place_id = state.focused_place_id.clone().ok_or_else(|| ToolError::Protocol("open a messaging place before creating a thread".to_owned()))?;
+            let parent_message_id = if message_id.is_some() || seq.is_some() {
+                Some(visible_target(state, &message_id, seq, "create_thread")?.message_id)
+            } else { None };
+            Ok(BoundMessagingAction::CreateThread { parent_place_id, name, parent_message_id })
+        }
         MessagingAction::Write {
             content,
             attachments,
@@ -2596,6 +2794,30 @@ fn validate_action(action: &MessagingAction) -> Result<(), ToolError> {
         } => {
             validate_bounded_nonempty(place_id, MAX_PLACE_ID_BYTES)?;
             if limit.is_some_and(|limit| !(1..=50).contains(&limit)) {
+                return Err(ToolError::InvalidArguments);
+            }
+            Ok(())
+        }
+        MessagingAction::Threads {} => Ok(()),
+        MessagingAction::CreateThread {
+            name,
+            message_id,
+            seq,
+        } => {
+            let canonical_name = name.trim();
+            if canonical_name.is_empty()
+                || canonical_name.chars().count() > MAX_THREAD_NAME_CHARS
+                || canonical_name.contains('\0')
+            {
+                return Err(ToolError::InvalidArguments);
+            }
+            if message_id.is_some() && seq.is_some() {
+                return Err(ToolError::InvalidArguments);
+            }
+            if let Some(id) = message_id {
+                validate_bounded_nonempty(id, MAX_MESSAGE_ID_BYTES)?;
+            }
+            if seq == &Some(0) {
                 return Err(ToolError::InvalidArguments);
             }
             Ok(())
@@ -2894,6 +3116,21 @@ fn validate_bound_action(action: &BoundMessagingAction) -> Result<(), ToolError>
             before_seq: *before_seq,
             limit: *limit,
         }),
+        BoundMessagingAction::Threads { parent_place_id } => {
+            validate_bounded_nonempty(parent_place_id, MAX_PLACE_ID_BYTES)
+        }
+        BoundMessagingAction::CreateThread {
+            parent_place_id,
+            name,
+            parent_message_id,
+        } => {
+            validate_bounded_nonempty(parent_place_id, MAX_PLACE_ID_BYTES)?;
+            validate_action(&MessagingAction::CreateThread {
+                name: name.clone(),
+                message_id: parent_message_id.clone(),
+                seq: None,
+            })
+        }
         BoundMessagingAction::Write {
             place_id,
             content,
@@ -3137,7 +3374,8 @@ fn reply_later_marker_from(marker: &Value) -> Option<VisibleReplyLaterMarker> {
     let place_kind = place.get("kind")?.as_str()?.to_owned();
     let place_id = match place_kind.as_str() {
         "channel" => place.get("channel_id")?.as_str()?,
-        "dm" => place.get("dm_id")?.as_str()?,
+        "dm" | "group_dm" => place.get("dm_id")?.as_str()?,
+        "thread" => place.get("thread_id")?.as_str()?,
         _ => return None,
     }
     .to_owned();
@@ -3288,8 +3526,15 @@ fn validate_open_response(
 
 fn validate_open_place(place: &OpenPlaceWire, requested_place_id: &str) -> Result<(), ToolError> {
     let place_id = match place.kind.as_str() {
-        "channel" if place.dm_id.is_none() => place.channel_id.as_deref(),
-        "dm" | "group_dm" if place.channel_id.is_none() => place.dm_id.as_deref(),
+        "channel" if place.dm_id.is_none() && place.thread_id.is_none() => {
+            place.channel_id.as_deref()
+        }
+        "dm" | "group_dm" if place.channel_id.is_none() && place.thread_id.is_none() => {
+            place.dm_id.as_deref()
+        }
+        "thread" if place.channel_id.is_none() && place.dm_id.is_none() => {
+            place.thread_id.as_deref()
+        }
         _ => None,
     }
     .filter(|id| is_bounded_nonempty(id, MAX_PLACE_ID_BYTES))
@@ -3667,6 +3912,8 @@ mod tests {
     type RecordedStatus = (String, Option<String>, Option<u32>);
     type RecordedReplyLater = (String, String, Option<String>, Option<u32>);
     type RecordedWrite = (String, String, String, Vec<String>);
+    type RecordedThreadCreate = (String, String, Option<String>, String);
+    type RecordedChannelUpdate = (String, Option<String>, Option<String>);
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedUpload {
@@ -3837,11 +4084,13 @@ mod tests {
         notification_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
         search_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         reply_later_markers: AsyncMutex<Vec<Value>>,
+        threads: AsyncMutex<Vec<RecordedThreadCreate>>,
+        create_thread_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         open_responses: AsyncMutex<VecDeque<Value>>,
         started_dms: AsyncMutex<Vec<Vec<MessagingParticipant>>>,
         started_dm_nonces: AsyncMutex<Vec<Option<String>>>,
         created_channels: AsyncMutex<Vec<(String, Option<String>, bool)>>,
-        updated_channels: AsyncMutex<Vec<(String, Option<String>, Option<String>)>>,
+        updated_channels: AsyncMutex<Vec<RecordedChannelUpdate>>,
         duplicated_channels: AsyncMutex<Vec<(String, Option<String>)>>,
         failures: AsyncMutex<VecDeque<&'static str>>,
     }
@@ -3915,6 +4164,12 @@ mod tests {
                 .lock()
                 .await
                 .push(format!("open:{}", request.place_id));
+            let mut failures = self.failures.lock().await;
+            if failures.front() == Some(&"open") {
+                failures.pop_front();
+                return Err(anyhow!("open failed"));
+            }
+            drop(failures);
             if let Some(response) = self.open_responses.lock().await.pop_front() {
                 return Ok(response);
             }
@@ -4368,6 +4623,15 @@ mod tests {
         action: Value,
         call_id: &str,
     ) -> Result<ToolOutput, ToolError> {
+        execute_with_cancel(tool, action, call_id, CancellationToken::new()).await
+    }
+
+    async fn execute_with_cancel(
+        tool: &MessagingTool,
+        action: Value,
+        call_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
         let args: ValidatedToolArguments =
             serde_json::from_value(with_default_workspace(action)).unwrap();
         let workspace = WorkspacePaths::new("/workspace").unwrap();
@@ -4377,7 +4641,7 @@ mod tests {
                 flow_id: "flow",
                 call_id,
                 args: &args,
-                cancel: CancellationToken::new(),
+                cancel,
                 on_update: Arc::new(|_| {}),
                 workspace: &workspace,
             },
@@ -4808,6 +5072,8 @@ mod tests {
             json!([
                 "overview",
                 "open",
+                "threads",
+                "create_thread",
                 "write",
                 "open_attachment",
                 "react",
@@ -4833,6 +5099,15 @@ mod tests {
         assert_eq!(schema["properties"]["seq"]["minimum"], 1);
         assert_eq!(schema["properties"]["emoji"]["type"], "string");
         assert_eq!(schema["properties"]["message_id"]["type"], "string");
+        for field in ["message_id", "seq"] {
+            assert!(
+                schema["properties"][field]["description"]
+                    .as_str()
+                    .expect("field description")
+                    .contains("create_thread"),
+                "{field} must advertise create_thread origin support"
+            );
+        }
         assert_eq!(
             schema["properties"]["status"]["enum"],
             json!(["available", "busy", "away"])
@@ -5980,6 +6255,39 @@ mod tests {
                 "place-b"
             )])
         );
+
+        let threads = bind_action(&registry, "threads", json!({"action": "threads"}))
+            .await
+            .expect("bind thread list");
+        assert_eq!(threads.descriptor.operation, "threads");
+        assert_eq!(threads.descriptor.capability, CapabilityClass::Read);
+        assert_eq!(
+            threads.execution_arguments.as_object()["parent_place_id"],
+            "place-a"
+        );
+
+        let create_thread = bind_action(
+            &registry,
+            "create-thread",
+            json!({"action": "create_thread", "name": "  認証  ", "seq": 7}),
+        )
+        .await
+        .expect("bind thread creation from a visible message");
+        assert_eq!(create_thread.descriptor.operation, "create_thread");
+        assert_eq!(create_thread.descriptor.capability, CapabilityClass::Mutate);
+        assert_eq!(
+            create_thread.execution_arguments.as_object()["parent_place_id"],
+            "place-a"
+        );
+        assert_eq!(
+            create_thread.execution_arguments.as_object()["parent_message_id"],
+            "message-7"
+        );
+        assert_eq!(
+            create_thread.execution_arguments.as_object()["name"],
+            "認証"
+        );
+        assert_eq!(create_thread.review_projection.as_object()["name"], "認証");
 
         let write = bind_action(
             &registry,

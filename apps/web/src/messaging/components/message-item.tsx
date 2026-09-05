@@ -53,6 +53,7 @@ import {
 } from "./message-attachments";
 import { MessageContent } from "./message-content";
 import { MessageEditor } from "./message-editor";
+import { MessageThreadAction, MessageThreadChip } from "./message-thread";
 import { conversationViewport, useWheelPassthrough } from "./overlay";
 import { ParticipantAvatar } from "./participant-avatar";
 import { ParticipantProfilePopover } from "./participant-profile";
@@ -457,6 +458,7 @@ export const MessageItem = memo(function MessageItem({
               onOpenImage={onOpenImage}
             />
           )}
+          <MessageThreadChip message={message} />
           {allowReactions ? (
             <ReactionChips
               message={message}
@@ -554,6 +556,7 @@ export const MessageItem = memo(function MessageItem({
           <ToolbarButton label="返信" onClick={() => onReply(message)}>
             <CornerUpLeft className="size-3.5" />
           </ToolbarButton>
+          <MessageThreadAction message={message} />
           {own || !allowReplyLater ? null : (
             <Popover
               open={openPanel === "replyLater"}

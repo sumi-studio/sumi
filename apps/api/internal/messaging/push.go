@@ -508,12 +508,12 @@ func (d *PushDispatcher) deliver(
 		scope,
 		liveBoundary{placeID: place.PlaceID},
 		false,
-		func(tx pgx.Tx, audience map[ParticipantRef]struct{}) error {
+		func(tx pgx.Tx, audience liveAudience) error {
 			humans := make([]NotificationDecision, 0, len(decisions))
 			recipients := make([]ParticipantRef, 0, len(decisions))
 			for _, decision := range decisions {
 				if decision.Participant.Kind == KindHuman {
-					if _, allowed := audience[decision.Participant]; allowed {
+					if _, allowed := audience.members[decision.Participant]; allowed {
 						humans = append(humans, decision)
 						recipients = append(recipients, decision.Participant)
 					}
@@ -740,7 +740,7 @@ func lockExactPushAudience(ctx context.Context, tx pgx.Tx, delivery pushDelivery
 	switch delivery.placeKind {
 	case PlaceChannel:
 		return delivery.placeMemberID == "", nil
-	case PlaceDM, PlaceGroupDM:
+	case PlaceDM, PlaceGroupDM, PlaceThread:
 		if delivery.placeMemberID == "" {
 			return false, nil
 		}

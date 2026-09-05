@@ -7,6 +7,7 @@ import type {
   Place,
   ReactionMutationResult,
   ServerEvent,
+  ThreadSummary,
 } from "./model";
 import {
   bindMessagingSessionIdentity,
@@ -16,6 +17,21 @@ import {
 
 const place: Place = { kind: "channel", channelId: "channel-1" };
 const placeKey = "channel:channel-1" as const;
+
+/**
+ * 履歴を持っている状態を作る。storeが履歴を受け付けるのはheldなplaceだけなので、
+ * stateへ直接置くのではなく画面を開く経路（selectPlace → loadPlace）で作る。
+ * 読み込みのfetchは記録から外し、後続のresyncだけを見えるようにする。
+ */
+async function holdLoaded(
+  harness: StubBackend,
+  messages: Message[],
+): Promise<void> {
+  harness.history = messages;
+  useMessaging.getState().selectPlace(placeKey);
+  await harness.settle();
+  harness.fetches.splice(0);
+}
 
 /**
  * reaction eventはmessage全体を運ばない、という契約のstore側の裏。編集を
@@ -37,9 +53,7 @@ describe("reaction convergence in the messaging store", () => {
     installMessagingBackend(harness);
     useMessaging.getState().init();
     await harness.bootstrapped;
-    useMessaging.setState({
-      messagesByPlace: { [placeKey]: [message(1, "編集前"), message(2, "隣")] },
-    });
+    await holdLoaded(harness, [message(1, "編集前"), message(2, "隣")]);
 
     // 編集がcommit/publishしたあとに、編集前のcontentを見ていたreaction eventが
     // 遅れて届く。reactionだけが乗るので編集は生き残る。
@@ -437,7 +451,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = message(1, "message");
-    useMessaging.setState({ messagesByPlace: { [placeKey]: [target] } });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().toggleReaction(target, "👍");
     await harness.settle();
@@ -462,6 +476,44 @@ describe("reaction convergence in the messaging store", () => {
     ).toMatchObject({ deleted: true, reactions: [] });
   });
 
+  it("projects a replayed thread tombstone as a deletion", async () => {
+    const harness = new StubBackend();
+    const thread = threadSummary();
+    harness.threadSummaries = [
+      {
+        ...thread,
+        revision: 2,
+        messageCount: 1,
+        lastMessageAt: 2,
+        lastMessage: "survives",
+      },
+    ];
+    installMessagingBackend(harness);
+    useMessaging.getState().init();
+    await harness.bootstrapped;
+    useMessaging.setState({ threadsById: { [thread.threadId]: thread } });
+
+    // WebSocket replay represents the offline deletion as message_created
+    // containing a tombstone, not as a message_deleted event.
+    harness.emit({
+      type: "message_created",
+      message: {
+        ...message(2, ""),
+        place: { kind: "thread", threadId: thread.threadId },
+        deleted: true,
+      },
+      notify: null,
+    });
+    await harness.settle();
+
+    expect(harness.fetchThread).toHaveBeenCalledWith(thread.threadId);
+    expect(useMessaging.getState().threadsById[thread.threadId]).toMatchObject({
+      messageCount: 1,
+      lastMessageAt: 2,
+      lastMessage: "survives",
+    });
+  });
+
   it("keeps a tombstone when message_deleted precedes the PATCH response and replay", async () => {
     const harness = new StubBackend();
     const committed = deferred<Message>();
@@ -470,10 +522,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = { ...message(1, "編集前"), revision: 1 };
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("PATCHで確定した本文");
@@ -518,10 +567,7 @@ describe("reaction convergence in the messaging store", () => {
     useMessaging.getState().init();
     await harness.bootstrapped;
     const target = { ...message(1, "編集前"), revision: 1 };
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("PATCHで確定した本文");
@@ -567,10 +613,7 @@ describe("reaction convergence in the messaging store", () => {
     installMessagingBackend(harness);
     useMessaging.getState().init();
     await harness.bootstrapped;
-    useMessaging.setState({
-      activePlaceKey: placeKey,
-      messagesByPlace: { [placeKey]: [target] },
-    });
+    await holdLoaded(harness, [target]);
 
     useMessaging.getState().startEdit(target.messageId);
     useMessaging.getState().setEditDraft("競合する編集");
@@ -781,6 +824,22 @@ function message(
   };
 }
 
+function threadSummary(): ThreadSummary {
+  return {
+    threadId: "thread-1",
+    revision: 1,
+    workspaceId: "workspace-1",
+    parentPlace: { kind: "channel", channelId: "channel-1" },
+    parentMessageId: "message-1",
+    name: "Thread",
+    messageCount: 2,
+    lastMessageAt: 1,
+    lastMessage: "deleted message",
+    participants: [self],
+    latestSeq: 2,
+  };
+}
+
 class StubBackend implements MessagingBackend {
   readonly capabilities = {
     status: false,
@@ -789,6 +848,7 @@ class StubBackend implements MessagingBackend {
     notifications: false,
   } as const;
   history: Message[] = [];
+  threadSummaries: ThreadSummary[] = [];
   readonly fetches: { beforeSeq?: number; limit?: number }[] = [];
   readonly toggleResults: (
     | ReactionMutationResult
@@ -874,6 +934,16 @@ class StubBackend implements MessagingBackend {
       this.heldFetches.push({ response, resolve });
     });
   }
+
+  fetchThreads = vi.fn(async (_parent: Place) => this.threadSummaries);
+
+  fetchThread = vi.fn(async (threadId: string) => {
+    const thread = this.threadSummaries.find(
+      (summary) => summary.threadId === threadId,
+    );
+    if (!thread) throw new Error("thread not found");
+    return thread;
+  });
 
   async searchMessages(): Promise<import("./model").MessageSearchResult[]> {
     return [];

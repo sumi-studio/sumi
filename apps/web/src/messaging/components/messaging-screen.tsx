@@ -1,4 +1,12 @@
-import { Bell, Clock, Hash, Users, X } from "lucide-react";
+import {
+  ArrowLeft,
+  Bell,
+  Clock,
+  Hash,
+  MessagesSquare,
+  Users,
+  X,
+} from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -12,18 +20,26 @@ import { CallFailureNotice } from "../call/call-failure-notice";
 import { CallStage } from "../call/call-stage";
 import { CallStartButtons } from "../call/call-start-buttons";
 import { IncomingCall } from "../call/incoming-call";
-import { type PlaceKey, participantKey, type ReplyLaterMarker } from "../model";
+import {
+  placeKey as keyForPlace,
+  type PlaceKey,
+  participantKey,
+  type ReplyLaterMarker,
+} from "../model";
 import {
   dismissPermissionPrompt,
   isPermissionPromptDismissed,
   type NotificationPermissionState,
-  notificationCountForPlace,
   notificationPermission,
   requestNotificationPermission,
 } from "../notifications";
 import { usePlaceNavigate } from "../place-route";
 import { enablePushSubscription, isPushSupported } from "../push";
-import { getMessagingScope, useMessaging } from "../store";
+import {
+  getMessagingScope,
+  notifiableUnreadCount,
+  useMessaging,
+} from "../store";
 import { usePlaceDisplay } from "../use-place-name";
 import { Composer } from "./composer";
 import { ConnectionBanner } from "./connection-banner";
@@ -35,11 +51,17 @@ import { MessageSearch } from "./message-search";
 import { NotificationSettingsMenu } from "./notification-settings";
 import { useOverlayPanel, useWheelPassthrough } from "./overlay";
 import { Sidebar } from "./sidebar";
+import { ThreadPanel } from "./thread-panel";
 
-interface PendingJump {
+interface PendingJumpTarget {
   placeKey: PlaceKey;
   messageId?: string;
   seq?: number;
+}
+
+interface PendingJump extends PendingJumpTarget {
+  transportGeneration: number;
+  routeObserved: boolean;
 }
 
 interface ViewingImage {
@@ -140,7 +162,11 @@ function NotificationPermissionBanner() {
   );
 }
 
-function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
+function ReplyLaterMenu({
+  onJump,
+}: {
+  onJump: (jump: PendingJumpTarget) => void;
+}) {
   const replyLaterById = useMessaging((state) => state.replyLaterById);
   const selfKey = useMessaging((state) => state.selfKey);
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
@@ -222,11 +248,7 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
                     onClick={() => {
                       setOpen(false);
                       onJump({
-                        placeKey: `${marker.place.kind}:${
-                          marker.place.kind === "channel"
-                            ? marker.place.channelId
-                            : marker.place.dmId
-                        }`,
+                        placeKey: keyForPlace(marker.place),
                         messageId: marker.messageId,
                       });
                     }}
@@ -262,7 +284,11 @@ function ReplyLaterMenu({ onJump }: { onJump: (jump: PendingJump) => void }) {
   );
 }
 
-function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
+function ReplyLaterKnock({
+  onJump,
+}: {
+  onJump: (jump: PendingJumpTarget) => void;
+}) {
   const replyLaterById = useMessaging((state) => state.replyLaterById);
   const selfKey = useMessaging((state) => state.selfKey);
   const resolveReplyLater = useMessaging((state) => state.resolveReplyLater);
@@ -303,11 +329,7 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
           type="button"
           onClick={() =>
             onJump({
-              placeKey: `${marker.place.kind}:${
-                marker.place.kind === "channel"
-                  ? marker.place.channelId
-                  : marker.place.dmId
-              }`,
+              placeKey: keyForPlace(marker.place),
               messageId: marker.messageId,
             })
           }
@@ -339,7 +361,11 @@ function ReplyLaterKnock({ onJump }: { onJump: (jump: PendingJump) => void }) {
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const ready = useMessaging((state) => state.ready);
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
+  const canUseThreads = useMessaging((state) => state.capabilities.threads);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const selectPlace = useMessaging((state) => state.selectPlace);
   const clearPlaceSelection = useMessaging(
     (state) => state.clearPlaceSelection,
@@ -347,29 +373,37 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const placeNavigate = usePlaceNavigate();
   const loadPlaceAround = useMessaging((state) => state.loadPlaceAround);
   const messagesByPlace = useMessaging((state) => state.messagesByPlace);
-  const unreadCountByPlace = useMessaging((state) => state.unreadCountByPlace);
-  const mentionCountByPlace = useMessaging(
-    (state) => state.mentionCountByPlace,
-  );
+  // 参加している場所だけを数えた、タブタイトルに出す件数。
+  const titleUnread = useMessaging(notifiableUnreadCount);
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const threadsById = useMessaging((state) => state.threadsById);
+  const threadLoadErrorsById = useMessaging(
+    (state) => state.threadLoadErrorsById,
+  );
+  const loadThreads = useMessaging((state) => state.loadThreads);
+  const loadThread = useMessaging((state) => state.loadThread);
   const workspaces = useMessaging((state) => state.workspaces);
   const selectedPlaceKey =
     placeKey &&
     (channels.some((channel) => placeKey === `channel:${channel.channelId}`) ||
-      dms.some((dm) => placeKey === `${dm.kind}:${dm.dmId}`))
+      dms.some((dm) => placeKey === `${dm.kind}:${dm.dmId}`) ||
+      (placeKey.startsWith("thread:") &&
+        threadsById[placeKey.slice("thread:".length)] !== undefined))
       ? placeKey
       : null;
+  const requestedThreadId = placeKey?.startsWith("thread:")
+    ? placeKey.slice("thread:".length)
+    : null;
+  const threadLoadError = requestedThreadId
+    ? threadLoadErrorsById[requestedThreadId]
+    : undefined;
   const display = usePlaceDisplay(selectedPlaceKey);
   const canNotify = useMessaging((state) => state.capabilities.notifications);
-  const notificationLevelByPlace = useMessaging(
-    (state) => state.notificationLevelByPlace,
-  );
-  const notificationDefaultLevel = useMessaging(
-    (state) => state.notificationDefaultLevel,
-  );
   const listRef = useRef<MessageListHandle>(null);
+  const threadsToggleRef = useRef<HTMLButtonElement>(null);
   const [membersOpen, setMembersOpen] = useState(true);
+  const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
   const [viewingImage, setViewingImage] = useState<ViewingImage | null>(null);
   const [revealedForPlace, setRevealedForPlace] = useState<{
@@ -413,9 +447,36 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   // 隠すのではなくcurrent placeを解除し、通知判定や編集状態にも同じ現在地を渡す。
   useLayoutEffect(() => {
     if (!ready) return;
+    if (
+      pendingJump &&
+      placeKey === pendingJump.placeKey &&
+      !pendingJump.routeObserved
+    ) {
+      setPendingJump({ ...pendingJump, routeObserved: true });
+    } else if (
+      pendingJump?.routeObserved &&
+      placeKey !== pendingJump.placeKey
+    ) {
+      // Once the target URL was actually observed, a later raw route is an
+      // explicit navigation away. Do not retain the old hit until a future
+      // ordinary visit to that thread.
+      setPendingJump(null);
+    }
     if (!selectedPlaceKey) {
       clearPlaceSelection();
-      setPendingJump(null);
+      const pendingThreadKey = requestedThreadId
+        ? (`thread:${requestedThreadId}` as PlaceKey)
+        : null;
+      // A search hit may name a visible thread that was not in bootstrap. Keep
+      // the target while its direct route hydrates; all terminal/non-thread
+      // routes still discard it.
+      if (
+        pendingThreadKey === null ||
+        threadLoadError !== undefined ||
+        pendingJump?.placeKey !== pendingThreadKey
+      ) {
+        setPendingJump(null);
+      }
       return;
     }
     if (selectedPlaceKey !== activePlaceKey) selectPlace(selectedPlaceKey);
@@ -425,7 +486,33 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     activePlaceKey,
     selectPlace,
     clearPlaceSelection,
+    requestedThreadId,
+    threadLoadError,
+    pendingJump,
+    placeKey,
   ]);
+
+  useEffect(() => {
+    setPendingJump((pending) =>
+      pending?.transportGeneration === transportGeneration ? pending : null,
+    );
+  }, [transportGeneration]);
+
+  useEffect(() => {
+    if (selectedPlaceKey?.startsWith("channel:"))
+      void loadThreads(selectedPlaceKey).catch(() => undefined);
+  }, [selectedPlaceKey, loadThreads]);
+
+  useEffect(() => {
+    if (
+      ready &&
+      requestedThreadId &&
+      threadsById[requestedThreadId] === undefined &&
+      threadLoadError === undefined
+    ) {
+      void loadThread(requestedThreadId);
+    }
+  }, [ready, requestedThreadId, threadsById, threadLoadError, loadThread]);
 
   // 開示とビューアーはこのplaceを見ている画面だけの状態。履歴行の仮想化では
   // 忘れず、placeを離れたら永続化せずに捨てる。
@@ -445,23 +532,8 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   // muteしたplaceはsidebar badgeと同じく外す。level=allのchannelは全未読、
   // mentionsはmention未読だけを数え、「呼ばれている数」を表示する。
   useEffect(() => {
-    let unread = 0;
-    for (const [key, count] of Object.entries(unreadCountByPlace)) {
-      const level = notificationLevelByPlace[key] ?? notificationDefaultLevel;
-      unread += notificationCountForPlace(
-        key,
-        level,
-        count,
-        mentionCountByPlace[key] ?? 0,
-      );
-    }
-    document.title = unread > 0 ? `(${unread}) Sumi` : "Sumi";
-  }, [
-    unreadCountByPlace,
-    mentionCountByPlace,
-    notificationLevelByPlace,
-    notificationDefaultLevel,
-  ]);
+    document.title = titleUnread > 0 ? `(${titleUnread}) Sumi` : "Sumi";
+  }, [titleUnread]);
 
   // permalink（/c/:id?m=seq）で開かれたら該当メッセージへジャンプする。
   useEffect(() => {
@@ -470,26 +542,45 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     const rawSeq = params.get("m");
     const seq = rawSeq === null ? null : Number(rawSeq);
     if (seq !== null && Number.isSafeInteger(seq) && seq > 0) {
-      setPendingJump({ placeKey, seq });
-      void loadPlaceAround(placeKey, seq);
+      setPendingJump({
+        placeKey,
+        seq,
+        transportGeneration,
+        routeObserved: true,
+      });
       window.history.replaceState(null, "", window.location.pathname);
     }
-  }, [ready, placeKey, loadPlaceAround]);
+  }, [ready, placeKey, transportGeneration]);
 
   const requestJump = useCallback(
-    (jump: PendingJump) => {
+    (jump: PendingJumpTarget) => {
       placeNavigate(jump.placeKey);
-      setPendingJump(jump);
-      if (jump.seq !== undefined) {
-        void loadPlaceAround(jump.placeKey, jump.seq);
-      }
+      setPendingJump({
+        ...jump,
+        transportGeneration,
+        routeObserved: placeKey === jump.placeKey,
+      });
     },
-    [placeNavigate, loadPlaceAround],
+    [placeNavigate, placeKey, transportGeneration],
   );
+
+  // Route selection creates a history hold synchronously. A jump to an old
+  // result therefore starts only after that selection, never from requestJump.
+  useEffect(() => {
+    if (
+      pendingJump?.seq === undefined ||
+      pendingJump.transportGeneration !== transportGeneration ||
+      activePlaceKey !== pendingJump.placeKey
+    ) {
+      return;
+    }
+    void loadPlaceAround(pendingJump.placeKey, pendingJump.seq);
+  }, [pendingJump, activePlaceKey, loadPlaceAround, transportGeneration]);
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
   useEffect(() => {
     if (!pendingJump) return;
+    if (pendingJump.transportGeneration !== transportGeneration) return;
     if (activePlaceKey !== pendingJump.placeKey) return;
     const messages = messagesByPlace[pendingJump.placeKey];
     if (!messages) return;
@@ -508,7 +599,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       setPendingJump(null);
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [pendingJump, activePlaceKey, messagesByPlace]);
+  }, [pendingJump, activePlaceKey, messagesByPlace, transportGeneration]);
 
   if (!ready) {
     return (
@@ -518,13 +609,19 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     );
   }
 
-  const hasSelectablePlace = channels.length > 0 || dms.length > 0;
+  const hasSelectablePlace =
+    channels.length > 0 ||
+    dms.length > 0 ||
+    Object.keys(threadsById).length > 0;
   const selectedPlaceIsLoaded =
     selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
   const selectedChannel = selectedPlaceKey?.startsWith("channel:")
     ? channels.find(
         (channel) => `channel:${channel.channelId}` === selectedPlaceKey,
       )
+    : undefined;
+  const selectedThread = selectedPlaceKey?.startsWith("thread:")
+    ? threadsById[selectedPlaceKey.slice("thread:".length)]
     : undefined;
 
   return (
@@ -538,12 +635,33 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       <div className="flex min-w-0 flex-1 flex-col">
         <NotificationPermissionBanner />
         <header className="flex h-12 shrink-0 items-center gap-2 border-border/70 border-b px-4 sm:px-5">
+          {selectedThread ? (
+            <button
+              type="button"
+              title="親チャンネルへ戻る"
+              onClick={() =>
+                placeNavigate(keyForPlace(selectedThread.parentPlace))
+              }
+              className="rounded p-1 text-muted-foreground hover:bg-accent"
+            >
+              <ArrowLeft className="size-4" />
+            </button>
+          ) : null}
           {display?.kind === "channel" ? (
             <Hash className="size-4 shrink-0 text-muted-foreground" />
           ) : null}
           <span className="truncate font-semibold text-[14.5px]">
             {display?.name ?? "メッセージ"}
           </span>
+          {selectedThread ? (
+            <span className="truncate text-xs text-muted-foreground">
+              親: #
+              {channels.find(
+                (channel) =>
+                  channel.channelId === selectedThread.parentPlace.channelId,
+              )?.name ?? "チャンネル"}
+            </span>
+          ) : null}
           {/* トピックの編集はサイドバーの place メニューへ移した。ヘッダーは
               いま居る場所を示すだけで、押せるものを置かない。 */}
           {display?.topic ? (
@@ -556,8 +674,25 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
           ) : null}
           <span className="ml-auto flex items-center gap-1">
             <MessageSearch onJump={requestJump} />
+            {canUseThreads && selectedPlaceKey?.startsWith("channel:") ? (
+              <button
+                ref={threadsToggleRef}
+                type="button"
+                title="スレッド"
+                aria-expanded={threadsOpen}
+                onClick={() => setThreadsOpen((value) => !value)}
+                className={`flex size-8 items-center justify-center rounded-md transition-colors hover:bg-accent ${
+                  threadsOpen
+                    ? "bg-accent text-foreground"
+                    : "text-muted-foreground"
+                }`}
+              >
+                <MessagesSquare className="size-4" />
+              </button>
+            ) : null}
             {selectedPlaceIsLoaded &&
             selectedPlaceKey &&
+            display?.kind !== "thread" &&
             (display?.kind !== "channel" || selectedChannel?.voice) ? (
               <CallStartButtons placeKey={selectedPlaceKey} />
             ) : null}
@@ -596,6 +731,34 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
                 <TypingIndicator />
                 <Composer />
               </>
+            ) : threadLoadError && requestedThreadId ? (
+              <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                <div className="max-w-sm">
+                  <h2 className="font-medium text-[15px] text-foreground">
+                    {threadLoadError === "not_found"
+                      ? "スレッドが見つかりません"
+                      : "スレッドを開けませんでした"}
+                  </h2>
+                  <p className="mt-1.5 text-[13px] text-muted-foreground leading-5">
+                    {threadLoadError === "not_found"
+                      ? "このスレッドは存在しないか、アクセスできません。"
+                      : "読み込みに失敗しました。接続を確認して、もう一度お試しください。"}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void loadThread(requestedThreadId)}
+                    className="mt-3 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+                  >
+                    再試行
+                  </button>
+                </div>
+              </section>
+            ) : requestedThreadId ? (
+              <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+                <p role="status" className="text-sm text-muted-foreground">
+                  スレッドを読み込み中…
+                </p>
+              </section>
             ) : (
               <section className="grid min-h-0 flex-1 place-items-center px-6 text-center">
                 <div className="max-w-sm">
@@ -617,6 +780,16 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
               </section>
             )}
           </main>
+          {canUseThreads &&
+          threadsOpen &&
+          selectedPlaceKey?.startsWith("channel:") ? (
+            <ThreadPanel
+              key={selectedPlaceKey}
+              parentKey={selectedPlaceKey}
+              onClose={() => setThreadsOpen(false)}
+              returnFocusRef={threadsToggleRef}
+            />
+          ) : null}
           {membersOpen && selectedPlaceIsLoaded ? <MemberList /> : null}
         </div>
       </div>

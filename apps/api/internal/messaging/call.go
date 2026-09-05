@@ -384,6 +384,12 @@ func (s *ScopedStore) withCallAdmission(
 	if _, err := s.placeAccessAfterAuthorization(ctx, tx, place, s.Scope.Actor); err != nil {
 		return err
 	}
+	// Threads are workspace-visible discussion places, but never voice rooms.
+	// Keep that boundary at admission so no caller can mint a LiveKit credential
+	// for a thread merely because the general place access contract admits it.
+	if place.Kind == PlaceThread {
+		return ErrForbidden
+	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
 		return err

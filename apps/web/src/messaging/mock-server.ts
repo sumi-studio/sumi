@@ -27,6 +27,7 @@ import type {
   ServerEvent,
   StatusCleared,
   StatusKind,
+  ThreadSummary,
   UnreadSummary,
   UploadAttachmentInput,
   UploadAttachmentReceipt,
@@ -115,6 +116,16 @@ function copyDM(dm: DmSummary): DmSummary {
   return {
     ...dm,
     participants: dm.participants.map((participant) => ({ ...participant })),
+  };
+}
+
+function copyThread(thread: ThreadSummary): ThreadSummary {
+  return {
+    ...thread,
+    parentPlace: { ...thread.parentPlace },
+    participants: thread.participants.map((participant) => ({
+      ...participant,
+    })),
   };
 }
 
@@ -433,6 +444,7 @@ export class MockMessagingServer implements MessagingBackend {
     replyLater: true,
     reactions: true,
     notifications: true,
+    threads: true,
   } as const;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
   private readonly history = buildSeedHistory();
@@ -442,9 +454,10 @@ export class MockMessagingServer implements MessagingBackend {
   private readonly statusRevisions = new Map<string, number>();
   private readonly clearedStatuses = new Map<string, StatusCleared>();
   private readonly replyLaterMarkers = new Map<string, ReplyLaterMarker>();
+  private readonly threads = new Map<string, ThreadSummary>();
   private readonly placeCreationReceipts = new Map<
     string,
-    { digest: string; result: ChannelSummary | DmSummary }
+    { digest: string; result: ChannelSummary | DmSummary | ThreadSummary }
   >();
   /** モックもサーバー役なので、通知判定は送信時にこちら側で行う。 */
   private notificationSetting: NotificationSetting = {
@@ -506,6 +519,7 @@ export class MockMessagingServer implements MessagingBackend {
       workspaces: WORKSPACES.map((workspace) => ({ ...workspace })),
       channels: CHANNELS.map(copyChannel),
       dms: DMS.map(copyDM),
+      threads: [...this.threads.values()].map(copyThread),
       members: MEMBERS.map(copyMember),
       statuses: [...this.statuses.values()].map(copyStatus),
       clearedStatuses: [...this.clearedStatuses.values()].map((cleared) => ({
@@ -559,7 +573,8 @@ export class MockMessagingServer implements MessagingBackend {
     );
     const level = override?.level ?? this.notificationSetting.defaults.level;
     if (level === "mute") return null;
-    if (message.place.kind !== "channel") return { reason: "dm" };
+    if (message.place.kind === "dm" || message.place.kind === "group_dm")
+      return { reason: "dm" };
     if (message.mentions.some((ref) => sameParticipant(ref, SELF))) {
       return { reason: "mention" };
     }
@@ -784,6 +799,66 @@ export class MockMessagingServer implements MessagingBackend {
     return response;
   }
 
+  async fetchThreads(parent: Place): Promise<ThreadSummary[]> {
+    return [...this.threads.values()]
+      .filter((thread) => placeKey(thread.parentPlace) === placeKey(parent))
+      .map(copyThread);
+  }
+
+  async fetchThread(threadId: string): Promise<ThreadSummary> {
+    const thread = this.threads.get(threadId);
+    if (!thread) throw new Error("Thread not found");
+    return copyThread(thread);
+  }
+
+  async createThread(
+    parent: Place,
+    name: string,
+    originMessageId: string | null,
+    clientNonce: string,
+  ): Promise<ThreadSummary> {
+    if (parent.kind !== "channel")
+      throw new Error("threads require channel parent");
+    const receiptKey = `create_thread:${clientNonce}`;
+    const normalizedName = name.trim();
+    const digest = JSON.stringify([
+      parent.channelId,
+      normalizedName,
+      originMessageId ?? "",
+    ]);
+    const receipt = this.placeCreationReceipts.get(receiptKey);
+    if (receipt) {
+      if (receipt.digest !== digest || !("threadId" in receipt.result)) {
+        throw new Error("place creation idempotency conflict");
+      }
+      return copyThread(receipt.result);
+    }
+    const threadId = `thread-${secureRandomUUID().slice(0, 8)}`;
+    const thread: ThreadSummary = {
+      threadId,
+      revision: 1,
+      parentPlace: parent,
+      parentMessageId: originMessageId,
+      workspaceId:
+        CHANNELS.find((channel) => channel.channelId === parent.channelId)
+          ?.workspaceId ?? "",
+      name: normalizedName,
+      messageCount: 0,
+      lastMessageAt: null,
+      lastMessage: "",
+      participants: [SELF],
+      latestSeq: 0,
+    };
+    this.threads.set(threadId, thread);
+    this.placeCreationReceipts.set(receiptKey, {
+      digest,
+      result: copyThread(thread),
+    });
+    this.history.set(`thread:${threadId}`, []);
+    this.emit({ type: "place_created", thread: copyThread(thread) });
+    return copyThread(thread);
+  }
+
   sendMessage(input: SendMessageInput): Promise<SendReceipt> {
     // idempotency: 同じclientNonceの再送はcommit済みmessageのreceiptを返すだけ。
     const existing = (this.history.get(placeKey(input.place)) ?? []).find(
@@ -905,6 +980,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.editedAt = Date.now();
     message.revision = (message.revision ?? 1) + 1;
     const committed = copyMessage(message);
+    this.reprojectThread(place);
     this.emit({ type: "message_edited", message: committed });
     return committed;
   }
@@ -924,6 +1000,7 @@ export class MockMessagingServer implements MessagingBackend {
     message.attachments = [];
     message.revision = (message.revision ?? 1) + 1;
     const deleted = copyMessage(message);
+    this.reprojectThread(place);
     this.emit({
       type: "message_deleted",
       message: deleted,
@@ -1167,7 +1244,27 @@ export class MockMessagingServer implements MessagingBackend {
     };
     messages.push(message);
     this.history.set(key, messages);
+    this.reprojectThread(input.place);
     return message;
+  }
+
+  /**
+   * threadのsummaryは投稿から計算した集計で、実APIと同じ約束を持つ:
+   * messageCountはtombstoneを除いた件数、lastMessage/lastMessageAtは残って
+   * いる最新の投稿、latestSeqはtombstoneも含めたplaceのlast_seq。ここを
+   * 更新しないと、mockでは投稿しても一覧とchipが「0件」のままになる。
+   */
+  private reprojectThread(place: Place): void {
+    if (place.kind !== "thread") return;
+    const thread = this.threads.get(place.threadId);
+    if (!thread) return;
+    const messages = this.history.get(placeKey(place)) ?? [];
+    const live = messages.filter((message) => !message.deleted);
+    const latest = live[live.length - 1];
+    thread.messageCount = live.length;
+    thread.lastMessage = latest ? latest.content.slice(0, 120) : "";
+    thread.lastMessageAt = latest ? latest.createdAt : null;
+    thread.latestSeq = messages[messages.length - 1]?.seq ?? 0;
   }
 
   /**

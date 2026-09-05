@@ -131,6 +131,43 @@ describe("place creation logical-attempt nonces", () => {
     expect(laterGesture).not.toBe(reconciled);
   });
 
+  it("reconciles a committed thread after response loss across a remounted UI gesture", async () => {
+    const server = signIn();
+    const create = server.createThread.bind(server);
+    const nonces: string[] = [];
+    let committedThreadId = "";
+    vi.spyOn(server, "createThread").mockImplementation(async (...args) => {
+      nonces.push(args[3]);
+      const thread = await create(...args);
+      if (nonces.length === 1) {
+        committedThreadId = thread.threadId;
+        throw new TypeError("response lost after thread commit");
+      }
+      return thread;
+    });
+
+    const gesture = (name: string) =>
+      useMessaging.getState().createThread("channel:ch-general", name, null);
+    await expect(gesture("response-loss thread")).rejects.toThrow(
+      "response lost after thread commit",
+    );
+    const reconciled = await gesture("response-loss thread");
+    const changedInput = await gesture("different thread");
+    const listed = await server.fetchThreads({
+      kind: "channel",
+      channelId: "ch-general",
+    });
+
+    expect(reconciled).toBe(`thread:${committedThreadId}`);
+    expect(changedInput).not.toBe(reconciled);
+    expect(nonces[0]).toBeTruthy();
+    expect(nonces[1]).toBe(nonces[0]);
+    expect(nonces[2]).not.toBe(nonces[1]);
+    expect(
+      listed.filter((thread) => thread.threadId === committedThreadId),
+    ).toHaveLength(1);
+  });
+
   it("retires a stale group-DM tenure rejection instead of pinning its nonce", async () => {
     const server = signIn();
     const nonces: string[] = [];

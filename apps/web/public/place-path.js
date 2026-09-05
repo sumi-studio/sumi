@@ -11,6 +11,7 @@ export function messagingPlacePath(workspaceId, placeKind, placeId) {
   }
   const encoded = encodeURIComponent(placeId);
   if (placeKind === "channel") return `${base}/c/${encoded}`;
+  if (placeKind === "thread") return `${base}/t/${encoded}`;
   if (placeKind === "dm") return `${base}/dm/${encoded}`;
   if (placeKind === "group_dm") return `${base}/group/${encoded}`;
   return base;

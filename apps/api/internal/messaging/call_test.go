@@ -277,6 +277,15 @@ func TestCallTokenAdmissionTracksCurrentMessagingAuthority(t *testing.T) {
 		t.Fatalf("transport actor was not authoritative: claims=%+v body=%v", claims, body)
 	}
 
+	thread, created, err := ownerScope.CreateThread(ctx, channel.PlaceID, "通話ではない枝", "", "thread-call-token-1")
+	if err != nil || !created {
+		t.Fatalf("create thread: thread=%+v created=%v err=%v", thread, created, err)
+	}
+	response, body = issueCallToken(t, ts.URL, thread.Place.PlaceID, w.humanB.ID, memberScope.Scope)
+	if response.StatusCode != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("thread call token status=%d body=%v, want refusal", response.StatusCode, body)
+	}
+
 	nonVoice, err := ownerScope.CreateChannel(ctx, "general", "", false)
 	if err != nil {
 		t.Fatal(err)

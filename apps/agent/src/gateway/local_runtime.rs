@@ -48,11 +48,11 @@ use crate::apiclient::apps::{
     ResolveEnabledWorkspaceAppRequest, ResolvedAppInstallation,
 };
 use crate::apiclient::messaging::{
-    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest,
+    CreateMessagingChannelRequest, CreateMessagingReplyLaterRequest, CreateMessagingThreadRequest,
     DuplicateMessagingChannelRequest, ExactMessagingScope, GetMessagingCallStateRequest,
-    MessagingApi, MessagingApiFailure, MessagingApiFailureClass, MessagingAttachmentMetadata,
-    MessagingNotificationSettingsRequest, MessagingParticipant, MessagingWriteReceipt,
-    OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
+    ListMessagingThreadsRequest, MessagingApi, MessagingApiFailure, MessagingApiFailureClass,
+    MessagingAttachmentMetadata, MessagingNotificationSettingsRequest, MessagingParticipant,
+    MessagingWriteReceipt, OpenMessagingAttachmentMetadata, OpenMessagingAttachmentRequest,
     OpenMessagingAttachmentResponse, OpenMessagingPlaceRequest, ReactMessagingReactionRequest,
     ReadMessagingThroughRequest, ResolveMessagingReplyLaterRequest, SearchMessagingRequest,
     SetMessagingStatusRequest, StartMessagingDMRequest, UpdateMessagingChannelRequest,
@@ -1127,6 +1127,50 @@ impl MessagingApi for LocalControlHttpClient {
         .await
     }
 
+    async fn threads(
+        &self,
+        scope: &ExactMessagingScope,
+        request: ListMessagingThreadsRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        self.post_json_bounded(
+            "/local-control/v1/messaging:threads",
+            &ScopedMessagingRequest::new(scope, request),
+            MAX_MESSAGING_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    async fn create_thread(
+        &self,
+        scope: &ExactMessagingScope,
+        request: CreateMessagingThreadRequest<'_>,
+    ) -> Result<serde_json::Value> {
+        // The HTTP API canonicalizes surrounding whitespace before recording
+        // its idempotency digest. Send and validate that same canonical name so
+        // a committed response can never be misclassified as indeterminate.
+        let operation = CreateMessagingThreadRequest {
+            parent_place_id: request.parent_place_id,
+            name: request.name.trim(),
+            parent_message_id: request.parent_message_id,
+            client_nonce: request.client_nonce,
+        };
+        let request = ScopedMessagingRequest::new(scope, operation);
+        self.post_idempotent_messaging_json_validated(
+            "/local-control/v1/messaging:create-thread",
+            &request,
+            MAX_MESSAGING_RESPONSE_BYTES,
+            |status, response| {
+                validate_messaging_thread_creation_response(
+                    status,
+                    response,
+                    scope,
+                    &request.operation,
+                )
+            },
+        )
+        .await
+    }
+
     async fn write(
         &self,
         scope: &ExactMessagingScope,
@@ -1673,6 +1717,49 @@ fn validate_messaging_write_response(
         .into());
     }
     Ok(receipt)
+}
+
+fn validate_messaging_thread_creation_response(
+    status: reqwest::StatusCode,
+    response: &serde_json::Value,
+    scope: &ExactMessagingScope,
+    request: &CreateMessagingThreadRequest<'_>,
+) -> Result<()> {
+    if status != reqwest::StatusCode::CREATED && status != reqwest::StatusCode::OK {
+        bail!("Messaging thread creation returned an invalid success status");
+    }
+    let thread_id = response
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .context("Messaging thread creation omitted thread_id")?;
+    if !is_canonical_uuid_v7(thread_id)
+        || response
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(scope.workspace_id.as_str())
+        || response.get("name").and_then(serde_json::Value::as_str) != Some(request.name)
+        || response
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|revision| revision == 0 || revision > i64::MAX as u64)
+        || response
+            .get("parent_place")
+            .and_then(|place| place.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("channel")
+        || response
+            .get("parent_place")
+            .and_then(|place| place.get("channel_id"))
+            .and_then(serde_json::Value::as_str)
+            != Some(request.parent_place_id)
+        || response
+            .get("parent_message_id")
+            .and_then(serde_json::Value::as_str)
+            != request.parent_message_id
+    {
+        bail!("Messaging thread creation response does not match its exact request scope");
+    }
+    Ok(())
 }
 
 fn is_indeterminate_messaging_failure(error: &anyhow::Error) -> bool {
@@ -4356,6 +4443,23 @@ mod tests {
         }))
     }
 
+    async fn oversized_thread_creation_fixture(
+        State(payload_bytes): State<usize>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "thread_id": "0198f0f4-9b72-7000-8000-000000000799",
+            "revision": 1,
+            "workspace_id": "0198f0f4-9b72-7000-8000-000000000201",
+            "name": "large participant list",
+            "parent_place": {
+                "kind": "channel",
+                "channel_id": "01900000-0000-7000-8000-000000000002"
+            },
+            "parent_message_id": null,
+            "participants": ["x".repeat(payload_bytes)]
+        }))
+    }
+
     #[derive(Clone, Default)]
     struct CompactWriteFixtureState {
         request_body: Arc<StdMutex<Option<Vec<u8>>>>,
@@ -4505,6 +4609,26 @@ mod tests {
     fn canonical_place_mutation_fixture_response(
         request: &serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        if let Some(parent_place_id) = request
+            .get("parent_place_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            return (
+                StatusCode::OK,
+                serde_json::json!({
+                    "thread_id": "0198f0f4-9b72-7000-8000-000000000703",
+                    "workspace_id": request["workspace_id"],
+                    "revision": 1,
+                    "name": request["name"],
+                    "parent_place": {
+                        "kind": "channel",
+                        "channel_id": parent_place_id
+                    },
+                    "parent_message_id": request.get("parent_message_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "created": false
+                }),
+            );
+        }
         if request.get("participants").is_some() {
             let actor = serde_json::json!({
                 "kind": "personality_agent",
@@ -5048,6 +5172,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let app = Router::new()
             .route(
+                "/local-control/v1/messaging:create-thread",
+                post(place_response_loss_then_replay_fixture),
+            )
+            .route(
                 "/local-control/v1/messaging:create-channel",
                 post(place_response_loss_then_replay_fixture),
             )
@@ -5076,6 +5204,19 @@ mod tests {
         .unwrap();
         let scope = messaging_scope();
 
+        let thread = client
+            .create_thread(
+                &scope,
+                CreateMessagingThreadRequest {
+                    parent_place_id: "01900000-0000-7000-8000-000000000002",
+                    name: "  foo  ",
+                    parent_message_id: None,
+                    client_nonce: "lost-thread",
+                },
+            )
+            .await
+            .expect("canonical thread response loss reconciles");
+        assert_eq!(thread["name"], "foo");
         client
             .create_channel(
                 &scope,
@@ -5133,13 +5274,17 @@ mod tests {
             .expect("group DM response loss reconciles");
 
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.len(), 10);
         for pair in requests.chunks_exact(2) {
             assert_eq!(
                 pair[0], pair[1],
                 "retry must preserve exact scope, digest inputs, and nonce"
             );
         }
+        let thread_request: serde_json::Value =
+            serde_json::from_slice(&requests[0].2).expect("canonical thread request");
+        assert_eq!(thread_request["name"], "foo");
+        assert_eq!(thread_request["client_nonce"], "lost-thread");
         server.abort();
     }
 
@@ -6331,6 +6476,10 @@ mod tests {
                 "/local-control/v1/messaging:open",
                 post(bounded_json_fixture),
             )
+            .route(
+                "/local-control/v1/messaging:create-thread",
+                post(oversized_thread_creation_fixture),
+            )
             .route("/default", post(bounded_json_fixture))
             .with_state(payload_bytes);
         let server = tokio::spawn(async move {
@@ -6578,6 +6727,34 @@ mod tests {
             .await
             .expect_err("non-messaging local control responses remain capped at 64 KiB");
         assert!(error.to_string().contains("exceeds bounded size"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messaging_thread_creation_uses_the_messaging_response_bound() {
+        let payload_bytes = MAX_LOCAL_CONTROL_RESPONSE_BYTES + 1024;
+        let (client, server) = response_limit_fixture(payload_bytes).await;
+
+        let response = client
+            .create_thread(
+                &messaging_scope(),
+                CreateMessagingThreadRequest {
+                    parent_place_id: "01900000-0000-7000-8000-000000000002",
+                    name: "large participant list",
+                    parent_message_id: None,
+                    client_nonce: "thread-large-response",
+                },
+            )
+            .await
+            .expect("a thread create response larger than 64 KiB remains readable");
+
+        assert_eq!(
+            response["thread_id"],
+            "0198f0f4-9b72-7000-8000-000000000799"
+        );
+        assert!(
+            response["participants"][0].as_str().unwrap().len() > MAX_LOCAL_CONTROL_RESPONSE_BYTES
+        );
         server.abort();
     }
 

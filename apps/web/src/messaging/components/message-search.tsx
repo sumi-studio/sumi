@@ -8,6 +8,7 @@ import type {
   ParticipantKey,
   Place,
   PlaceKey,
+  ThreadSummary,
 } from "../model";
 import { participantKey, placeKey } from "../model";
 import { useMessaging } from "../store";
@@ -39,11 +40,15 @@ function labelForPlace(
   place: Place,
   channels: ChannelSummary[],
   dms: DmSummary[],
+  threadsById: Record<string, ThreadSummary>,
   members: Record<ParticipantKey, MemberProfile>,
   selfKey: ParticipantKey,
 ): string {
   if (place.kind === "channel") {
     return `# ${channels.find((entry) => entry.channelId === place.channelId)?.name ?? "不明"}`;
+  }
+  if (place.kind === "thread") {
+    return threadsById[place.threadId]?.name ?? "スレッド";
   }
   const dm = dms.find(
     (entry) => entry.kind === place.kind && entry.dmId === place.dmId,
@@ -79,8 +84,12 @@ export function MessageSearch({
   }) => void;
 }) {
   const searchMessages = useMessaging((state) => state.searchMessages);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const channels = useMessaging((state) => state.channels);
   const dms = useMessaging((state) => state.dms);
+  const threadsById = useMessaging((state) => state.threadsById);
   const members = useMessaging((state) => state.membersByKey);
   const selfKey = useMessaging((state) => state.selfKey);
   const [query, setQuery] = useState("");
@@ -148,6 +157,22 @@ export function MessageSearch({
     },
     [],
   );
+
+  // Search results contain snippets and routes from one authorization
+  // session. Changing authority must synchronously make that state unusable,
+  // including any debounce or response still in flight.
+  useEffect(() => {
+    void transportGeneration;
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    requestID.current += 1;
+    composing.current = false;
+    setOpen(false);
+    setQuery("");
+    setResults(null);
+    setFailed(false);
+    setSearching(false);
+  }, [transportGeneration]);
 
   useEffect(() => {
     if (!open) return;
@@ -238,7 +263,14 @@ export function MessageSearch({
             >
               <span className="flex items-baseline gap-1.5">
                 <span className="max-w-[45%] truncate font-medium text-[11px] text-muted-foreground">
-                  {labelForPlace(result.place, channels, dms, members, selfKey)}
+                  {labelForPlace(
+                    result.place,
+                    channels,
+                    dms,
+                    threadsById,
+                    members,
+                    selfKey,
+                  )}
                 </span>
                 <span className="truncate text-[11px] text-muted-foreground/80">
                   {members[participantKey(result.author)]?.displayName ??
