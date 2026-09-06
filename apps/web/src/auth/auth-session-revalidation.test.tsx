@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearDirectChatAuthority } from "../agent/auth-authority";
 import { useConversation } from "../agent/store";
 import { Composer } from "../messaging/components/composer";
+import { EMPTY_COMPOSER_DRAFT } from "../messaging/composer-draft";
 import { bindMessagingSessionIdentity, useMessaging } from "../messaging/store";
 import { useParticipantApps } from "../participant/app-store";
 import { bindWorkspaceSessionIdentity } from "../workspace/store";
@@ -157,7 +158,9 @@ async function openWorkspaceWithDrafts() {
           voice: false,
         },
       ],
-      draftAttachmentsByPlace: { [placeKey]: [attachment] },
+      draftByPlace: {
+        [placeKey]: { ...EMPTY_COMPOSER_DRAFT, attachments: [attachment] },
+      },
     });
   });
   fireEvent.change(directDraft, { target: { value: "Private direct draft" } });
@@ -177,7 +180,7 @@ function expectDraftsPreserved(directDraft: HTMLElement) {
     screen.getByRole("textbox", { name: "#general へメッセージ" }),
   ).toHaveValue("Private workspace draft");
   expect(screen.getByText("draft.txt")).toBeInTheDocument();
-  expect(useMessaging.getState().draftAttachmentsByPlace[placeKey]?.[0]).toBe(
+  expect(useMessaging.getState().draftByPlace[placeKey].attachments?.[0]).toBe(
     attachment,
   );
   expect(mocks.releaseConnection).not.toHaveBeenCalled();
@@ -243,7 +246,6 @@ describe("authenticated session revalidation", () => {
     await screen.findByText("Signed out");
     expect(directDraft).not.toBeInTheDocument();
     expect(useMessaging.getState().draftByPlace).toEqual({});
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
     expect(mocks.releaseConnection).toHaveBeenCalledOnce();
   });
 
@@ -256,7 +258,6 @@ describe("authenticated session revalidation", () => {
     );
     expect(directDraft).not.toBeInTheDocument();
     expect(useMessaging.getState().draftByPlace).toEqual({});
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
     expect(screen.queryByText("draft.txt")).not.toBeInTheDocument();
   });
 
@@ -270,7 +271,7 @@ describe("authenticated session revalidation", () => {
     await screen.findByText("Sumiに接続できません");
     expect(directDraft).not.toBeInTheDocument();
     expect(screen.getByTestId("session-user")).toHaveTextContent("none");
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
+    expect(useMessaging.getState().draftByPlace).toEqual({});
   });
 
   it("does not let a late successful recheck restore a logged-out workspace", async () => {
@@ -286,6 +287,6 @@ describe("authenticated session revalidation", () => {
     await screen.findByText("Signed out");
     await act(async () => finishRead(sessionA));
     expect(screen.getByText("Signed out")).toBeInTheDocument();
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
+    expect(useMessaging.getState().draftByPlace).toEqual({});
   });
 });

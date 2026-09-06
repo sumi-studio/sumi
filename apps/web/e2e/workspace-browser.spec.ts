@@ -37,6 +37,7 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
   const liveMessagingScopes = new Set<string>();
   const malformedMessagingSocketScopes: string[] = [];
   const liveMessageContents = new Set<string>();
+  const liveMessages = new Map<string, Record<string, unknown>>();
   const websocketErrors: string[] = [];
   const expectedRejectedWebSocketURLs = new Set<string>();
   let primaryError: Error | undefined;
@@ -75,6 +76,7 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
             if (event.type === "message_created") {
               const message = asRecord(event.message);
               liveMessageContents.add(asString(message.content));
+              liveMessages.set(asString(message.content), message);
             }
           }
         } catch {
@@ -414,6 +416,102 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
       page.getByText("alpha-only-message", { exact: true }),
     ).toHaveCount(0);
     expect(beta.workspaceID).not.toBe(alpha.workspaceID);
+
+    // Authored work survives a Workspace round trip, then reaches the real
+    // server with its original reply target and uploaded bytes intact.
+    const betaComposer = page.getByRole("textbox", {
+      name: "#beta-general へメッセージ",
+    });
+    await betaComposer.fill("Betaの書きかけ");
+    await switchWorkspace(page, "Alpha Studio");
+    await page.getByRole("button", { name: "Messaging", exact: true }).click();
+    await page.getByText("alpha-general", { exact: true }).click();
+    await page.getByText("alpha-only-message", { exact: true }).hover();
+    await page.getByRole("button", { name: "返信", exact: true }).click();
+    const alphaComposer = page.getByRole("textbox", {
+      name: "#alpha-general へメッセージ",
+    });
+    const draftText = "会話を往復してから送る返信です。";
+    await alphaComposer.fill(draftText);
+    const filename = "round-trip.txt";
+    const fileContents = "Workspaceを往復しても、この添付を送れる。\n";
+    const uploaded = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        /\/messaging\/places\/[^/]+\/attachments$/.test(
+          new URL(response.url()).pathname,
+        ),
+    );
+    await page.getByTestId("composer-file-input").setInputFiles({
+      name: filename,
+      mimeType: "text/plain",
+      buffer: Buffer.from(fileContents),
+    });
+    expect((await uploaded).status()).toBe(201);
+    await expect(page.getByTestId("composer-attachments")).toContainText(
+      filename,
+    );
+    await alphaComposer.evaluate((element) => {
+      const input = element as HTMLTextAreaElement;
+      input.focus();
+      input.setSelectionRange(4, 9, "backward");
+      input.dispatchEvent(new Event("select", { bubbles: true }));
+    });
+
+    await switchWorkspace(page, "Beta Studio");
+    await page.getByRole("button", { name: "Messaging", exact: true }).click();
+    await page.getByText("beta-general", { exact: true }).click();
+    await expect(betaComposer).toHaveValue("Betaの書きかけ");
+    await expect(
+      page.getByRole("button", { name: "返信をキャンセル" }),
+    ).toHaveCount(0);
+    await expect(page.getByTestId("composer-attachments")).toHaveCount(0);
+
+    await switchWorkspace(page, "Alpha Studio");
+    await page.getByRole("button", { name: "Messaging", exact: true }).click();
+    await page.getByText("alpha-general", { exact: true }).click();
+    await expect(alphaComposer).toHaveValue(draftText);
+    await expect(
+      page.getByRole("button", { name: "返信をキャンセル" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "メッセージ入力" }),
+    ).toContainText("alpha-only-message");
+    await expect(page.getByTestId("composer-attachments")).toContainText(
+      filename,
+    );
+    expect(
+      await alphaComposer.evaluate((element) => {
+        const input = element as HTMLTextAreaElement;
+        return [
+          input.selectionStart,
+          input.selectionEnd,
+          input.selectionDirection,
+        ];
+      }),
+    ).toEqual([4, 9, "backward"]);
+
+    await page.getByRole("button", { name: "送信", exact: true }).click();
+    await expect.poll(() => liveMessages.has(draftText)).toBe(true);
+    expect(liveMessages.get(draftText)?.reply_to).toBe(
+      asString(liveMessages.get("alpha-only-message")?.message_id),
+    );
+    const download = page.locator(`a[download="${filename}"]`);
+    await expect(download).toBeVisible();
+    const href = await download.getAttribute("href");
+    if (!href) throw new Error("sent attachment has no download URL");
+    const attachment = await page.request.get(new URL(href, stack.webURL).href);
+    expect(attachment.status()).toBe(200);
+    expect(await attachment.text()).toBe(fileContents);
+    await expect(alphaComposer).toHaveValue("");
+    await expect(
+      page.getByRole("button", { name: "返信をキャンセル" }),
+    ).toHaveCount(0);
+    await expect(page.getByTestId("composer-attachments")).toHaveCount(0);
+    await switchWorkspace(page, "Beta Studio");
+    await page.getByRole("button", { name: "Messaging", exact: true }).click();
+    await page.getByText("beta-general", { exact: true }).click();
+    await expect(betaComposer).toHaveValue("Betaの書きかけ");
     expect(malformedMessagingSocketScopes).toEqual([]);
     expect(websocketErrors).toEqual([]);
   } catch (error) {

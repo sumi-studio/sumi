@@ -10,6 +10,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
 import type { PlaceKey } from "../model";
 import { bindMessagingSessionIdentity, useMessaging } from "../store";
 import { MessagingScreen } from "./messaging-screen";
@@ -69,7 +70,6 @@ function seedCurrentPlace() {
       useMessaging.setState({
         activePlaceKey: key,
         editingMessageId: null,
-        replyTargetId: null,
       }),
     ready: true,
     capabilities: {
@@ -118,7 +118,16 @@ function seedCurrentPlace() {
     },
     activePlaceKey: CHANNEL_A,
     editingMessageId: "editing-a",
-    replyTargetId: "reply-a",
+    draftByPlace: {
+      [CHANNEL_A]: {
+        ...EMPTY_COMPOSER_DRAFT,
+        replyTarget: {
+          messageId: "reply-a",
+          authorLabel: "Alice",
+          preview: "先ほどの相談",
+        },
+      },
+    },
     connection: "connected",
   });
 }
@@ -160,8 +169,10 @@ describe("MessagingScreen route-owned current place", () => {
     expect(useMessaging.getState()).toMatchObject({
       activePlaceKey: null,
       editingMessageId: null,
-      replyTargetId: null,
     });
+    expect(
+      useMessaging.getState().draftByPlace[CHANNEL_A].replyTarget?.messageId,
+    ).toBe("reply-a");
   });
 
   it("selects an explicit second place and clears a later unknown URL", () => {
@@ -174,14 +185,12 @@ describe("MessagingScreen route-owned current place", () => {
 
     useMessaging.setState({
       editingMessageId: "editing-b",
-      replyTargetId: "reply-b",
     });
     view.rerender(<MessagingScreen placeKey="channel:left-or-unknown" />);
 
     expect(useMessaging.getState()).toMatchObject({
       activePlaceKey: null,
       editingMessageId: null,
-      replyTargetId: null,
     });
     expect(screen.getByTestId("sidebar-selection")).toHaveTextContent(
       "unselected",

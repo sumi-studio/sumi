@@ -3,6 +3,11 @@ import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend, MessagingAPIError } from "./api-backend";
 import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
 import { useCall } from "./call/call-store";
+import {
+  type ComposerDraft,
+  type DraftSelection,
+  EMPTY_COMPOSER_DRAFT,
+} from "./composer-draft";
 import type { DraftAttachment } from "./draft-attachments";
 import { attachmentUploadFailureCode } from "./draft-attachments";
 import { hasDisplayMention } from "./mention";
@@ -282,7 +287,8 @@ function mergeMessagesWithOrphanPolls(
 
 /**
  * draft添付のbytesと進行中のupload。zustand stateにはメタデータだけを置き、
- * Fileと AbortController はここで持つ。resetで必ず全部止めて捨てる。
+ * Fileと AbortController はここで持つ。scopeを離れるとuploadだけを止め、
+ * Fileとpreviewは未送信の草稿を破棄するまで同じHumanが所有する。
  */
 const draftFiles = new Map<
   string,
@@ -318,6 +324,44 @@ function releaseDraftFile(clientNonce: string): void {
 function releaseAllDraftFiles(): void {
   for (const clientNonce of [...draftFiles.keys()])
     releaseDraftFile(clientNonce);
+}
+
+const draftsByOwner = new Map<string, Record<PlaceKey, ComposerDraft>>();
+
+function draftOwnerKey(scope: MessagingScope | null): string | null {
+  const identity = getMessagingSessionIdentity();
+  return identity && scope
+    ? JSON.stringify([identity, scope.workspaceId, scope.installationId])
+    : null;
+}
+
+function parkComposerDrafts(): void {
+  const owner = draftOwnerKey(getActiveMessagingScope());
+  const drafts = useMessaging.getState().draftByPlace;
+  const parked: Record<PlaceKey, ComposerDraft> = {};
+  for (const [key, draft] of Object.entries(drafts)) {
+    parked[key as PlaceKey] = {
+      ...draft,
+      attachments: draft.attachments.map((attachment) => {
+        const entry = draftFiles.get(attachment.clientNonce);
+        entry?.controller?.abort();
+        if (entry) entry.controller = null;
+        if (!owner) releaseDraftFile(attachment.clientNonce);
+        if (
+          attachment.status === "uploading" ||
+          attachment.status === "editing"
+        ) {
+          return {
+            ...attachment,
+            status: attachment.status === "editing" ? "edit_failed" : "failed",
+            errorCode: "attachment_upload_interrupted",
+          };
+        }
+        return attachment;
+      }),
+    };
+  }
+  if (owner) draftsByOwner.set(owner, parked);
 }
 
 /** Tests and explicit development harnesses may replace the transport before init. */
@@ -406,14 +450,8 @@ interface MessagingState {
   mentionCountByPlace: Record<PlaceKey, number>;
   /** placeへ入った時点のlastReadのスナップショット。離れるまで動かさない。 */
   unreadLineByPlace: Record<PlaceKey, number | null>;
-  draftByPlace: Record<PlaceKey, string>;
-  /**
-   * composerに積まれた添付。placeごと・現在のscopeとsessionだけに属し、
-   * scope/session切替のresetで消える。bytesはここではなくモジュール内に置く。
-   */
-  draftAttachmentsByPlace: Record<PlaceKey, DraftAttachment[]>;
-  /** 直近の追加操作で上限により受け付けられなかった件数。無言で捨てない。 */
-  draftAttachmentOverflowByPlace: Record<PlaceKey, number>;
+  /** Human + exact installationごとに退避できる、place単位の未送信文脈。 */
+  draftByPlace: Record<PlaceKey, ComposerDraft>;
   typingByPlace: Record<PlaceKey, Record<ParticipantKey, number>>;
   replyLaterById: Record<string, ReplyLaterMarker>;
   /** 自分の通知設定。正本はサーバーで、ここはその写し。 */
@@ -448,7 +486,6 @@ interface MessagingState {
    * 再試行の要求で外し、tombstone が届けば（誰の削除でも）外す。
    */
   deleteFailedMessageIds: ReadonlySet<string>;
-  replyTargetId: string | null;
   connection: ConnectionState;
   /**
    * True once this transport authority has been connected at least once, so an
@@ -485,7 +522,12 @@ interface MessagingState {
   duplicateChannel(channelId: string): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
   loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
-  setDraft(key: PlaceKey, draft: string): void;
+  setDraft(key: PlaceKey, draft: string, transportGeneration?: number): void;
+  setDraftSelection(
+    key: PlaceKey,
+    selection: DraftSelection,
+    transportGeneration: number,
+  ): void;
   /** 選択・貼り付け・ドロップされたファイルを現在のplaceのdraftへ積み、uploadを始める。 */
   addDraftAttachments(files: File[]): void;
   removeDraftAttachment(clientNonce: string): void;
@@ -530,6 +572,29 @@ interface MessagingState {
   loadOlder(key: PlaceKey): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
+}
+
+function updateComposerDraft(
+  state: MessagingState,
+  key: PlaceKey,
+  patch: Partial<ComposerDraft>,
+): Pick<MessagingState, "draftByPlace"> {
+  return {
+    draftByPlace: {
+      ...state.draftByPlace,
+      [key]: { ...(state.draftByPlace[key] ?? EMPTY_COMPOSER_DRAFT), ...patch },
+    },
+  };
+}
+
+function updateDraftAttachments(
+  state: MessagingState,
+  key: PlaceKey,
+  update: (attachments: DraftAttachment[]) => DraftAttachment[],
+): Pick<MessagingState, "draftByPlace"> {
+  return updateComposerDraft(state, key, {
+    attachments: update(state.draftByPlace[key]?.attachments ?? []),
+  });
 }
 
 export interface PollVoteState {
@@ -2556,21 +2621,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const stillLive = () =>
       backend === currentBackend &&
       messagingSessionGeneration === sessionGeneration &&
-      (get().draftAttachmentsByPlace[key] ?? []).some(
+      (get().draftByPlace[key]?.attachments ?? []).some(
         (candidate) => candidate.clientNonce === draft.clientNonce,
       );
     const apply = (next: Partial<DraftAttachment>) =>
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: (current.draftAttachmentsByPlace[key] ?? []).map(
-            (candidate) =>
-              candidate.clientNonce === draft.clientNonce
-                ? { ...candidate, ...next }
-                : candidate,
+      set((current) =>
+        updateDraftAttachments(current, key, (attachments) =>
+          attachments.map((candidate) =>
+            candidate.clientNonce === draft.clientNonce
+              ? { ...candidate, ...next }
+              : candidate,
           ),
-        },
-      }));
+        ),
+      );
     currentBackend
       .updateDraftAttachment(attachment.attachmentId, patch)
       .then((updated) => {
@@ -2609,21 +2672,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
     const request = beginMessagingBackendRequest();
     const stillLive = () =>
       request.isCurrent() &&
-      (get().draftAttachmentsByPlace[key] ?? []).some(
+      (get().draftByPlace[key]?.attachments ?? []).some(
         (candidate) => candidate.clientNonce === draft.clientNonce,
       );
     const patch = (next: Partial<DraftAttachment>) =>
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: (current.draftAttachmentsByPlace[key] ?? []).map(
-            (candidate) =>
-              candidate.clientNonce === draft.clientNonce
-                ? { ...candidate, ...next }
-                : candidate,
+      set((current) =>
+        updateDraftAttachments(current, key, (attachments) =>
+          attachments.map((candidate) =>
+            candidate.clientNonce === draft.clientNonce
+              ? { ...candidate, ...next }
+              : candidate,
           ),
-        },
-      }));
+        ),
+      );
     request
       .wait((backend) =>
         backend.uploadAttachment({
@@ -2745,8 +2806,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
     mentionCountByPlace: {},
     unreadLineByPlace: {},
     draftByPlace: {},
-    draftAttachmentsByPlace: {},
-    draftAttachmentOverflowByPlace: {},
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",
@@ -2765,7 +2824,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
     editFailure: null,
     editSavedWithPendingChanges: false,
     deleteFailedMessageIds: new Set(),
-    replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
     transportGeneration: 0,
@@ -2905,7 +2963,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
       set((state) => ({
         activePlaceKey: key,
         ...clearedEditSession(),
-        replyTargetId: null,
         unreadLineByPlace: {
           ...state.unreadLineByPlace,
           [key]: state.lastReadByPlace[key] ?? 0,
@@ -2931,22 +2988,22 @@ export const useMessaging = create<MessagingState>((set, get) => {
       // 選択は同期APIなので、取得失敗はloadPlace内で履歴/cursorを手放した後に
       // ここで消費する。未処理rejectionにして次の選択や再接続を妨げない。
       void loadPlace(place).catch(() => undefined);
+      for (const draft of get().draftByPlace[key]?.attachments ?? []) {
+        if (draft.errorCode === "attachment_upload_interrupted") {
+          get().retryDraftAttachment(draft.clientNonce);
+        }
+      }
     },
 
     clearPlaceSelection() {
       const state = get();
-      if (
-        state.activePlaceKey === null &&
-        state.editingMessageId === null &&
-        state.replyTargetId === null
-      ) {
+      if (state.activePlaceKey === null && state.editingMessageId === null) {
         return;
       }
       releaseWatchOnlyPlace(state.activePlaceKey);
       set({
         activePlaceKey: null,
         ...clearedEditSession(),
-        replyTargetId: null,
       });
       backend.openPlace?.(null);
     },
@@ -3392,10 +3449,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
       return messages.some((message) => message.seq === seq);
     },
 
-    setDraft(key, draft) {
-      set((state) => ({
-        draftByPlace: { ...state.draftByPlace, [key]: draft },
-      }));
+    setDraft(key, text, transportGeneration) {
+      if (
+        transportGeneration !== undefined &&
+        transportGeneration !== get().transportGeneration
+      )
+        return;
+      set((state) => updateComposerDraft(state, key, { text }));
+    },
+
+    setDraftSelection(key, selection, transportGeneration) {
+      const state = get();
+      if (transportGeneration !== state.transportGeneration) return;
+      const previous = state.draftByPlace[key]?.selection;
+      if (
+        previous &&
+        previous.start === selection.start &&
+        previous.end === selection.end &&
+        previous.direction === selection.direction &&
+        previous.scrollTop === selection.scrollTop
+      )
+        return;
+      set(updateComposerDraft(state, key, { selection }));
     },
 
     send(content, urgency, poll = null) {
@@ -3405,14 +3480,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const trimmed = content.trim();
       if (!key || !place || !state.self) return false;
       if (poll !== null && !state.capabilities.polls) return false;
-      const drafts = state.draftAttachmentsByPlace[key] ?? [];
-      // 添付が1件でも上がりきっていなければ送らない。半端な添付で送るくらいなら
-      // 送信ボタンを押せない方が正直である。
-      if (drafts.some((entry) => entry.status !== "ready")) return false;
-      // Poll+attachment is not a v0 message form. Keep both drafts untouched so
-      // the user can remove the attachment or close the poll dialog and resume.
-      if (poll !== null && drafts.length > 0) return false;
-      const attachments = drafts.flatMap((entry) =>
+      const draft = state.draftByPlace[key] ?? EMPTY_COMPOSER_DRAFT;
+      if (draft.attachments.some((entry) => entry.status !== "ready"))
+        return false;
+      if (poll !== null && draft.attachments.length > 0) return false;
+      const attachments = draft.attachments.flatMap((entry) =>
         entry.attachment ? [entry.attachment] : [],
       );
       if (!trimmed && attachments.length === 0 && poll === null) return false;
@@ -3421,27 +3493,19 @@ export const useMessaging = create<MessagingState>((set, get) => {
         content: trimmed,
         mentions: resolveMentions(trimmed, state.membersByKey, state.selfKey),
         urgency,
-        replyTo: state.replyTargetId,
+        replyTo: draft.replyTarget?.messageId ?? null,
         attachments,
         poll,
         createdAt: Date.now(),
       };
-      for (const entry of drafts) releaseDraftFile(entry.clientNonce);
+      for (const entry of draft.attachments)
+        releaseDraftFile(entry.clientNonce);
       set((current) => ({
         pendingByPlace: {
           ...current.pendingByPlace,
           [key]: [...(current.pendingByPlace[key] ?? []), pending],
         },
-        draftByPlace: { ...current.draftByPlace, [key]: "" },
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: [],
-        },
-        draftAttachmentOverflowByPlace: {
-          ...current.draftAttachmentOverflowByPlace,
-          [key]: 0,
-        },
-        replyTargetId: null,
+        ...updateComposerDraft(current, key, EMPTY_COMPOSER_DRAFT),
       }));
       dispatchSend(key, pending);
       return true;
@@ -3452,7 +3516,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const key = state.activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       if (!key || !place || files.length === 0) return;
-      const existing = state.draftAttachmentsByPlace[key] ?? [];
+      const existing = state.draftByPlace[key]?.attachments ?? [];
       const room = MAX_ATTACHMENTS_PER_MESSAGE - existing.length;
       const accepted = files.slice(0, Math.max(0, room));
       const overflow = files.length - accepted.length;
@@ -3465,32 +3529,27 @@ export const useMessaging = create<MessagingState>((set, get) => {
           contentType: file.type,
           status: "uploading",
         };
-        if (file.size <= 0) {
+        if (file.size <= 0)
           return { ...draft, status: "failed", errorCode: "attachment_empty" };
-        }
-        if (file.size > MAX_ATTACHMENT_BYTES) {
+        if (file.size > MAX_ATTACHMENT_BYTES)
           return {
             ...draft,
             status: "failed",
             errorCode: "attachment_too_large",
           };
-        }
-        // サムネイルは手元のFileから作る。uploadの完了を待たずに中身が見える
-        // ことが、送る前に確かめるという操作の全部なので。
         const previewUrl = createPreviewUrl(file);
         rememberDraftFile(clientNonce, file, previewUrl);
         return previewUrl ? { ...draft, previewUrl } : draft;
       });
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: [...(current.draftAttachmentsByPlace[key] ?? []), ...added],
-        },
-        draftAttachmentOverflowByPlace: {
-          ...current.draftAttachmentOverflowByPlace,
-          [key]: overflow,
-        },
-      }));
+      set((current) =>
+        updateComposerDraft(current, key, {
+          attachments: [
+            ...(current.draftByPlace[key]?.attachments ?? []),
+            ...added,
+          ],
+          attachmentOverflow: overflow,
+        }),
+      );
       for (const draft of added) {
         if (draft.status === "uploading") dispatchUpload(key, place, draft);
       }
@@ -3499,22 +3558,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
     removeDraftAttachment(clientNonce) {
       const key = get().activePlaceKey;
       if (!key) return;
+      const drafts = get().draftByPlace[key]?.attachments ?? [];
+      if (!drafts.some((draft) => draft.clientNonce === clientNonce)) return;
       releaseDraftFile(clientNonce);
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: (current.draftAttachmentsByPlace[key] ?? []).filter(
-            (entry) => entry.clientNonce !== clientNonce,
-          ),
-        },
-      }));
+      set((current) =>
+        updateDraftAttachments(current, key, (attachments) =>
+          attachments.filter((entry) => entry.clientNonce !== clientNonce),
+        ),
+      );
     },
 
     retryDraftAttachment(clientNonce) {
       const key = get().activePlaceKey;
       const place = key ? parsePlaceKey(key) : null;
       if (!key || !place) return;
-      const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
+      const draft = (get().draftByPlace[key]?.attachments ?? []).find(
         (entry) => entry.clientNonce === clientNonce,
       );
       if (!draft) return;
@@ -3528,68 +3586,59 @@ export const useMessaging = create<MessagingState>((set, get) => {
           status: "editing",
           errorCode: undefined,
         };
-        set((current) => ({
-          draftAttachmentsByPlace: {
-            ...current.draftAttachmentsByPlace,
-            [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+        set((current) =>
+          updateDraftAttachments(current, key, (attachments) =>
+            attachments.map((entry) =>
               entry.clientNonce === clientNonce ? retried : entry,
             ),
-          },
-        }));
+          ),
+        );
         dispatchDraftEdit(key, retried, draft.attachment, draft.editPatch);
         return;
       }
-      if (draft.status !== "failed" || !draftFiles.has(clientNonce)) {
-        return;
-      }
+      if (draft.status !== "failed" || !draftFiles.has(clientNonce)) return;
       const retried: DraftAttachment = {
         ...draft,
         status: "uploading",
         errorCode: undefined,
       };
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+      set((current) =>
+        updateDraftAttachments(current, key, (attachments) =>
+          attachments.map((entry) =>
             entry.clientNonce === clientNonce ? retried : entry,
           ),
-        },
-      }));
+        ),
+      );
       dispatchUpload(key, place, retried);
     },
 
     editDraftAttachment(clientNonce, patch) {
       const key = get().activePlaceKey;
       if (!key) return;
-      const draft = (get().draftAttachmentsByPlace[key] ?? []).find(
+      const draft = (get().draftByPlace[key]?.attachments ?? []).find(
         (entry) => entry.clientNonce === clientNonce,
       );
       const attachment = draft?.attachment;
-      // 預かりが済んでいない添付には宣言を付けられない。"editing" を先に置く
-      // ことが二重送信の関門でもある（zustandのsetは同期的なので、次の呼び
-      // 出しはもう ready ではない）。編集失敗後は、同じ入口から宣言を直して
-      // 新しいpatchへ置き換えられる。
       if (
         !draft ||
         !attachment ||
         (draft.status !== "ready" && draft.status !== "edit_failed")
       )
         return;
-      set((current) => ({
-        draftAttachmentsByPlace: {
-          ...current.draftAttachmentsByPlace,
-          [key]: (current.draftAttachmentsByPlace[key] ?? []).map((entry) =>
+      set((current) =>
+        updateDraftAttachments(current, key, (attachments) =>
+          attachments.map((entry) =>
             entry.clientNonce === clientNonce
               ? {
                   ...entry,
-                  status: "editing" as const,
+                  status: "editing",
                   errorCode: undefined,
                   editPatch: patch,
                 }
               : entry,
           ),
-        },
-      }));
+        ),
+      );
       dispatchDraftEdit(key, draft, attachment, patch);
     },
 
@@ -3643,7 +3692,6 @@ export const useMessaging = create<MessagingState>((set, get) => {
         editConflict: null,
         editFailure: null,
         editSavedWithPendingChanges: false,
-        replyTargetId: null,
       });
     },
 
@@ -3858,8 +3906,28 @@ export const useMessaging = create<MessagingState>((set, get) => {
     },
 
     setReplyTarget(messageId) {
+      const state = get();
+      const key = state.activePlaceKey;
+      if (!key) return;
+      const message = (state.messagesByPlace[key] ?? []).find(
+        (entry) => entry.messageId === messageId,
+      );
+      const author = message
+        ? state.membersByKey[participantKey(message.author)]
+        : undefined;
+      const replyTarget =
+        messageId === null
+          ? null
+          : {
+              messageId,
+              authorLabel: author?.displayName ?? "返信先",
+              preview:
+                message?.content ||
+                message?.poll?.question ||
+                (message?.attachments.length ? "添付ファイル" : "メッセージ"),
+            };
       set({
-        replyTargetId: messageId,
+        ...updateComposerDraft(state, key, { replyTarget }),
         ...clearedEditSession(),
       });
     },
@@ -4260,9 +4328,11 @@ export async function refreshMessagingMemberProfiles(): Promise<void> {
 
 export function bindMessagingSessionIdentity(identity: string | null): void {
   if (identity === messagingSessionIdentity) return;
+  draftsByOwner.clear();
+  releaseAllDraftFiles();
   messagingSessionIdentity = identity;
   setActiveMessagingScope(null);
-  resetMessagingRuntime(unboundMessagingBackend());
+  resetMessagingRuntime(unboundMessagingBackend(), {});
 }
 
 /**
@@ -4276,19 +4346,24 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
   }
   const exact = scope === null ? null : validateMessagingScope(scope);
   if (sameMessagingScope(getActiveMessagingScope(), exact)) return;
+  parkComposerDrafts();
   setActiveMessagingScope(exact);
+  const owner = draftOwnerKey(exact);
   resetMessagingRuntime(
     exact === null ? unboundMessagingBackend() : new ApiMessagingBackend(exact),
+    (owner && draftsByOwner.get(owner)) || {},
   );
 }
 
-function resetMessagingRuntime(nextBackend: MessagingBackend): void {
+function resetMessagingRuntime(
+  nextBackend: MessagingBackend,
+  drafts: Record<PlaceKey, ComposerDraft>,
+): void {
   messagingSessionGeneration += 1;
   placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
   orphanPollProjections.clear();
   presentedMessageNotifications.clear();
-  releaseAllDraftFiles();
   backend.dispose();
   useCall.getState().reset();
   backend = nextBackend;
@@ -4323,9 +4398,7 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     unreadCountByPlace: {},
     mentionCountByPlace: {},
     unreadLineByPlace: {},
-    draftByPlace: {},
-    draftAttachmentsByPlace: {},
-    draftAttachmentOverflowByPlace: {},
+    draftByPlace: drafts,
     typingByPlace: {},
     replyLaterById: {},
     notificationDefaultLevel: "all",
@@ -4344,7 +4417,6 @@ function resetMessagingRuntime(nextBackend: MessagingBackend): void {
     editFailure: null,
     editSavedWithPendingChanges: false,
     deleteFailedMessageIds: new Set(),
-    replyTargetId: null,
     connection: "disconnected",
     everConnected: false,
     transportGeneration: messagingSessionGeneration,

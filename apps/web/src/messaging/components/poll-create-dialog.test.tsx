@@ -11,6 +11,7 @@ import {
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { codePointLength } from "../../lib/text-length";
+import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
 import type { PollInput } from "../model";
 import { useMessaging } from "../store";
 import { PollCreateDialog } from "./poll-create-dialog";
@@ -50,7 +51,7 @@ function DialogHarness({
 beforeEach(() => {
   useMessaging.setState((state) => ({
     activePlaceKey: placeKey,
-    draftAttachmentsByPlace: {},
+    draftByPlace: {},
     capabilities: { ...state.capabilities, polls: true },
   }));
 });
@@ -91,16 +92,19 @@ describe("PollCreateDialog", () => {
 
     act(() => {
       useMessaging.setState({
-        draftAttachmentsByPlace: {
-          [placeKey]: [
-            {
-              clientNonce: "attachment-1",
-              filename: "agenda.pdf",
-              sizeBytes: 1,
-              contentType: "application/pdf",
-              status: "uploading",
-            },
-          ],
+        draftByPlace: {
+          [placeKey]: {
+            ...EMPTY_COMPOSER_DRAFT,
+            attachments: [
+              {
+                clientNonce: "attachment-1",
+                filename: "agenda.pdf",
+                sizeBytes: 1,
+                contentType: "application/pdf",
+                status: "uploading",
+              },
+            ],
+          },
         },
       });
     });

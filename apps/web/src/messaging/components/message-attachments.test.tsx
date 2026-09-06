@@ -14,6 +14,7 @@ import {
   sanitizeAttachmentDisplayText,
   sanitizeAttachmentFilenameForDisplay,
 } from "../attachment-display";
+import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
 import type { DraftAttachment } from "../draft-attachments";
 import { MockMessagingServer } from "../mock-server";
 import type { Attachment, AttachmentDraftPatch } from "../model";
@@ -238,7 +239,7 @@ describe("Composer attachments", () => {
           tagline: "秘書",
         },
       },
-      draftByPlace: { "channel:ch-general": "" },
+      draftByPlace: { "channel:ch-general": EMPTY_COMPOSER_DRAFT },
       messagesByPlace: { "channel:ch-general": [] },
     });
     render(<Composer />);
@@ -496,8 +497,8 @@ describe("Composer attachment cards", () => {
       });
       expect(marked).toHaveAttribute("aria-pressed", "true");
       expect(
-        useMessaging.getState().draftAttachmentsByPlace["channel:ch-general"][0]
-          .attachment?.spoiler,
+        useMessaging.getState().draftByPlace["channel:ch-general"]
+          .attachments[0].attachment?.spoiler,
       ).toBe(true);
       expect(preview.className).toContain("blur");
     } finally {

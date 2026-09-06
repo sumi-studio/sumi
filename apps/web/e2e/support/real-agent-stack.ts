@@ -868,13 +868,19 @@ export async function startWorkspaceBrowserStack(
   try {
     const commandLog = join(runtimeDirectory, "command-log");
     const gatewayState = join(runtimeDirectory, "gateway-state");
+    const messagingAttachmentRoot = join(
+      runtimeDirectory,
+      "messaging-attachments",
+    );
     await Promise.all(
-      [commandLog, gatewayState].map((path) =>
+      [commandLog, gatewayState, messagingAttachmentRoot].map((path) =>
         mkdir(path, { recursive: true, mode: 0o700 }),
       ),
     );
     await Promise.all(
-      [commandLog, gatewayState].map((path) => chmod(path, 0o700)),
+      [commandLog, gatewayState, messagingAttachmentRoot].map((path) =>
+        chmod(path, 0o700),
+      ),
     );
 
     const [publicPort, webPort] = await Promise.all([
@@ -905,6 +911,11 @@ export async function startWorkspaceBrowserStack(
           SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
           SUMI_BROWSER_WS_ALLOWED_ORIGINS: webURL,
           SUMI_DB_URL: databaseURL,
+          SUMI_MESSAGING_ATTACHMENT_ROOT: messagingAttachmentRoot,
+          SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES: "20971520",
+          SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS: "10",
+          SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES: "41943040",
+          SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS: "100",
         },
         redactions,
       },

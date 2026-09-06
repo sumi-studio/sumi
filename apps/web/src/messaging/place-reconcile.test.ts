@@ -1066,7 +1066,7 @@ describe("place lifecycleの再接続突き合わせ", () => {
     expect(state.lastReadByPlace[CHANNEL_1]).toBe(5);
     expect(state.unreadCountByPlace[CHANNEL_1]).toBe(0);
     expect(state.mentionCountByPlace[CHANNEL_1]).toBe(0);
-    expect(state.draftByPlace[CHANNEL_1]).toBe("書きかけ");
+    expect(state.draftByPlace[CHANNEL_1].text).toBe("書きかけ");
     expect(state.activePlaceKey).toBe(CHANNEL_1);
     expect(state.unreadLineByPlace[CHANNEL_1]).toBe(0);
     expect(state.messagesByPlace[CHANNEL_1]).toEqual([]);

@@ -9,6 +9,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
 import type {
   ChannelSummary,
   MemberProfile,
@@ -109,15 +110,13 @@ beforeEach(() => {
     dms: [],
     draftByPlace: {},
     messagesByPlace: {},
-    draftAttachmentsByPlace: {},
-    draftAttachmentOverflowByPlace: {},
+
     capabilities: {
       ...useMessaging.getState().capabilities,
       polls: true,
     },
     pollVoteByMessage: {},
     editingMessageId: null,
-    replyTargetId: null,
     membersByKey: Object.fromEntries(
       members.map((member) => [participantKey(member.participant), member]),
     ),
@@ -127,8 +126,10 @@ beforeEach(() => {
       if (poll) mocks.send(content, urgency, poll);
       else mocks.send(content, urgency);
       useMessaging.setState((state) => ({
-        draftByPlace: { ...state.draftByPlace, [placeKey]: "" },
-        replyTargetId: null,
+        draftByPlace: {
+          ...state.draftByPlace,
+          [placeKey]: EMPTY_COMPOSER_DRAFT,
+        },
       }));
       return true;
     },
@@ -140,6 +141,71 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("Composer 草稿の場所", () => {
+  it.each([
+    "button",
+    "Escape",
+  ])("明示した %s で返信だけを取り消す", (cancel) => {
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [ownMessage("返信する相談")] },
+    });
+    useMessaging.getState().setDraft(placeKey, "書きかけの本文");
+    useMessaging.getState().setReplyTarget("m1");
+    render(<Composer />);
+    if (cancel === "button")
+      fireEvent.click(screen.getByRole("button", { name: "返信をキャンセル" }));
+    else fireEvent.keyDown(composer(), { key: "Escape" });
+    expect(
+      useMessaging.getState().draftByPlace[placeKey].replyTarget,
+    ).toBeNull();
+    expect(composer()).toHaveValue("書きかけの本文");
+    expect(
+      screen.queryByRole("button", { name: "返信をキャンセル" }),
+    ).toBeNull();
+  });
+
+  it("会話を往復して再マウントしても日本語の選択範囲と入力欄内スクロールを戻す", () => {
+    useMessaging.setState({
+      channels: [channel, { ...channel, channelId: "c2", name: "other" }],
+    });
+    useMessaging.setState({
+      messagesByPlace: { [placeKey]: [ownMessage("案内のもとの相談")] },
+    });
+    useMessaging.getState().setReplyTarget("m1");
+    const view = render(<Composer />);
+    const input = composer();
+    const text = "展示について書きかけのご案内\n".repeat(25);
+    fireEvent.change(input, { target: { value: text } });
+    input.setSelectionRange(2, 8, "backward");
+    fireEvent.select(input);
+    input.scrollTop = 90;
+    fireEvent.scroll(input);
+    act(() => useMessaging.getState().selectPlace("channel:c2"));
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "別の話の草稿" },
+    });
+    act(() => {
+      useMessaging.setState({ messagesByPlace: {} });
+      useMessaging.getState().selectPlace(placeKey);
+    });
+    expect(screen.getByText("案内のもとの相談")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "返信をキャンセル" }),
+    ).toBeVisible();
+    expect(composer()).toHaveValue(text);
+    expect(composer().selectionStart).toBe(2);
+    expect(composer().selectionEnd).toBe(8);
+    expect(composer().selectionDirection).toBe("backward");
+    expect(composer().scrollTop).toBe(90);
+    view.unmount();
+    render(<Composer />);
+    expect(composer().selectionStart).toBe(2);
+    expect(composer().selectionEnd).toBe(8);
+    expect(composer().scrollTop).toBe(90);
+  });
 });
 
 describe("Composer 送信ボタン", () => {
@@ -338,16 +404,19 @@ describe("Composer 送信ボタン", () => {
 
   it("添付の準備が終わるまで押せない（Enter送信と同じ判定）", () => {
     useMessaging.setState({
-      draftAttachmentsByPlace: {
-        [placeKey]: [
-          {
-            clientNonce: "n1",
-            filename: "a.png",
-            contentType: "image/png",
-            sizeBytes: 10,
-            status: "uploading",
-          },
-        ],
+      draftByPlace: {
+        [placeKey]: {
+          ...EMPTY_COMPOSER_DRAFT,
+          attachments: [
+            {
+              clientNonce: "n1",
+              filename: "a.png",
+              contentType: "image/png",
+              sizeBytes: 10,
+              status: "uploading",
+            },
+          ],
+        },
       },
     });
     render(<Composer />);
@@ -403,14 +472,17 @@ describe("Composer ＋メニュー", () => {
 
   it("添付が上限に達していると添付の項目を選べない", () => {
     useMessaging.setState({
-      draftAttachmentsByPlace: {
-        [placeKey]: Array.from({ length: 10 }, (_unused, index) => ({
-          clientNonce: `n${index}`,
-          filename: `a${index}.png`,
-          contentType: "image/png",
-          sizeBytes: 10,
-          status: "ready" as const,
-        })),
+      draftByPlace: {
+        [placeKey]: {
+          ...EMPTY_COMPOSER_DRAFT,
+          attachments: Array.from({ length: 10 }, (_unused, index) => ({
+            clientNonce: `n${index}`,
+            filename: `a${index}.png`,
+            contentType: "image/png",
+            sizeBytes: 10,
+            status: "ready" as const,
+          })),
+        },
       },
     });
     render(<Composer />);
@@ -560,9 +632,11 @@ describe("Composer 投票", () => {
     };
     useMessaging.setState({
       messagesByPlace: { [placeKey]: [replied] },
-      replyTargetId: replied.messageId,
-      draftByPlace: { [placeKey]: "日程を決めます" },
+      draftByPlace: {
+        [placeKey]: { ...EMPTY_COMPOSER_DRAFT, text: "日程を決めます" },
+      },
     });
+    useMessaging.getState().setReplyTarget(replied.messageId);
     render(<Composer />);
 
     expect(screen.getByText("親投票の質問")).toBeInTheDocument();
@@ -586,22 +660,27 @@ describe("Composer 投票", () => {
       "aria-pressed",
       "true",
     );
-    expect(useMessaging.getState().replyTargetId).toBeNull();
+    expect(
+      useMessaging.getState().draftByPlace[placeKey].replyTarget,
+    ).toBeNull();
   });
 
   it("capability または添付がある間は理由を示して投票下書きを開かない", () => {
     useMessaging.setState({
-      draftByPlace: { [placeKey]: "残す本文" },
-      draftAttachmentsByPlace: {
-        [placeKey]: [
-          {
-            clientNonce: "attachment-1",
-            filename: "agenda.pdf",
-            contentType: "application/pdf",
-            sizeBytes: 1,
-            status: "ready",
-          },
-        ],
+      draftByPlace: {
+        [placeKey]: {
+          ...EMPTY_COMPOSER_DRAFT,
+          text: "残す本文",
+          attachments: [
+            {
+              clientNonce: "attachment-1",
+              filename: "agenda.pdf",
+              contentType: "application/pdf",
+              sizeBytes: 1,
+              status: "ready",
+            },
+          ],
+        },
       },
     });
     const { unmount } = render(<Composer />);
@@ -611,12 +690,16 @@ describe("Composer 投票", () => {
     expect(attached).toHaveTextContent("添付を外すと作成できます");
     fireEvent.click(attached);
     expect(screen.queryByRole("dialog", { name: "投票を作成" })).toBeNull();
-    expect(useMessaging.getState().draftByPlace[placeKey]).toBe("残す本文");
+    expect(useMessaging.getState().draftByPlace[placeKey].text).toBe(
+      "残す本文",
+    );
 
     unmount();
     useMessaging.setState((state) => ({
       capabilities: { ...state.capabilities, polls: false },
-      draftAttachmentsByPlace: {},
+      draftByPlace: {
+        [placeKey]: { ...state.draftByPlace[placeKey], attachments: [] },
+      },
     }));
     render(<Composer />);
     openPlusMenu();
@@ -628,7 +711,7 @@ describe("Composer 投票", () => {
   it("enqueue が拒否したときは緊急度と投票ダイアログを保つ", () => {
     useMessaging.setState({
       send: () => false,
-      draftByPlace: { [placeKey]: "本文" },
+      draftByPlace: { [placeKey]: { ...EMPTY_COMPOSER_DRAFT, text: "本文" } },
     });
     render(<Composer />);
     fireEvent.click(screen.getByRole("button", { name: "急ぎ" }));
@@ -642,6 +725,6 @@ describe("Composer 投票", () => {
       "aria-pressed",
       "true",
     );
-    expect(useMessaging.getState().draftByPlace[placeKey]).toBe("本文");
+    expect(useMessaging.getState().draftByPlace[placeKey].text).toBe("本文");
   });
 });
