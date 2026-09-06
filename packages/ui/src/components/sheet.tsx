@@ -3,6 +3,7 @@ import { XIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { cn } from "../lib/utils";
 import { Button } from "./button";
+import { ScopedPortal } from "./portal-container";
 
 export function Sheet(props: SheetPrimitive.Root.Props) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />;
@@ -40,7 +41,7 @@ export function SheetContent({
   showCloseButton?: boolean;
 }) {
   return (
-    <SheetPrimitive.Portal>
+    <ScopedPortal component={SheetPrimitive.Portal}>
       <SheetOverlay />
       <SheetPrimitive.Popup
         data-slot="sheet-content"
@@ -67,7 +68,7 @@ export function SheetContent({
           </SheetPrimitive.Close>
         )}
       </SheetPrimitive.Popup>
-    </SheetPrimitive.Portal>
+    </ScopedPortal>
   );
 }
 

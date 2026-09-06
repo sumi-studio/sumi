@@ -4,6 +4,7 @@ import { type MessagingScope, sameMessagingScope } from "../../messaging/scope";
 import {
   bindMessagingScope,
   getMessagingScope,
+  resumeMessagingTransport,
   useMessaging,
 } from "../../messaging/store";
 import { messagingScopeForWorkspace } from "../messaging-scope";
@@ -47,7 +48,10 @@ export function MessagingTransport() {
     if (!sameMessagingScope(getMessagingScope(), next)) {
       bindMessagingScope(next);
     }
-    if (next) useMessaging.getState().init();
+    if (next) {
+      resumeMessagingTransport();
+      useMessaging.getState().init();
+    }
   }, [desiredAuthorityEpoch, desiredInstallationId, desiredWorkspaceId]);
 
   // Deliberately no unmount cleanup: AppShell persists across in-app routes.

@@ -360,6 +360,7 @@ function ReplyLaterKnock({
 
 export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const ready = useMessaging((state) => state.ready);
+  const bootstrapFailed = useMessaging((state) => state.bootstrapFailed);
   const canReplyLater = useMessaging((state) => state.capabilities.replyLater);
   const canUseThreads = useMessaging((state) => state.capabilities.threads);
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
@@ -604,7 +605,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   if (!ready) {
     return (
       <div className="flex h-full items-center justify-center bg-background text-muted-foreground text-sm">
-        読み込み中…
+        {bootstrapFailed ? <ConnectionBanner /> : "読み込み中…"}
       </div>
     );
   }

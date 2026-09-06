@@ -491,11 +491,97 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
       }),
     ).toEqual([4, 9, "backward"]);
 
+    // The logout request can fail while the server still recognizes this
+    // Human. Re-enter through the real AuthProvider before sending this draft.
+    await page.getByRole("button", { name: "急ぎ", exact: true }).click();
+    let releaseLogout!: () => void;
+    const pendingLogout = new Promise<void>((resolve) => {
+      releaseLogout = resolve;
+    });
+    await page.route("**/auth/logout", async (route) => {
+      await pendingLogout;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "temporary logout failure" }),
+      });
+    });
+    let checkedSession!: ReturnType<typeof page.waitForResponse>;
+    let interruptedBootstrap = false;
+    await page.getByRole("button", { name: "設定", exact: true }).click();
+    await page.getByRole("button", { name: "ログアウト", exact: true }).click();
+    try {
+      await expect(
+        page.getByRole("heading", { name: "ログイン状態を確認しています…" }),
+      ).toBeVisible();
+      await expect(alphaComposer).toBeHidden();
+      await expect(
+        page.getByRole("textbox", { name: "表示名", exact: true }),
+      ).toBeHidden();
+      await expect(
+        page.getByRole("button", { name: "ログアウト", exact: true }),
+      ).toBeHidden();
+      // Session verification can succeed before Messaging itself recovers.
+      // Fail its first resumed bootstrap, then let the explicit retry succeed.
+      await page.route("**/messaging/bootstrap**", async (route) => {
+        if (!interruptedBootstrap) {
+          interruptedBootstrap = true;
+          await route.fulfill({
+            status: 503,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "temporary bootstrap failure" }),
+          });
+          return;
+        }
+        await route.continue();
+      });
+      checkedSession = page.waitForResponse(
+        (response) =>
+          response.request().method() === "GET" &&
+          new URL(response.url()).pathname === "/auth/session",
+      );
+    } finally {
+      releaseLogout();
+    }
+    expect(await (await checkedSession).json()).toMatchObject({
+      authenticated: true,
+    });
+    await expect(alphaComposer).toBeVisible();
+    await expect(alphaComposer).toHaveValue(draftText);
+    await expect(
+      page.getByRole("button", { name: "返信をキャンセル" }),
+    ).toBeVisible();
+    await expect(page.getByTestId("composer-attachments")).toContainText(
+      filename,
+    );
+    await expect(
+      page.getByRole("button", { name: "急ぎ", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+    await expect(
+      page.getByRole("alert").filter({
+        hasText: "ログアウトを完了できませんでした。",
+      }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
+    const bootstrapped = page.waitForResponse(
+      (response) =>
+        response.request().method() === "GET" &&
+        new URL(response.url()).pathname === "/messaging/bootstrap" &&
+        response.ok(),
+    );
+    await page.getByRole("button", { name: "再試行", exact: true }).click();
+    await bootstrapped;
+    expect(interruptedBootstrap).toBe(true);
+    await expect(alphaComposer).toHaveValue(draftText);
+    await page.unroute("**/messaging/bootstrap**");
+    await page.unroute("**/auth/logout");
+
     await page.getByRole("button", { name: "送信", exact: true }).click();
     await expect.poll(() => liveMessages.has(draftText)).toBe(true);
     expect(liveMessages.get(draftText)?.reply_to).toBe(
       asString(liveMessages.get("alpha-only-message")?.message_id),
     );
+    expect(liveMessages.get(draftText)?.urgency).toBe("urgent");
     const download = page.locator(`a[download="${filename}"]`);
     await expect(download).toBeVisible();
     const href = await download.getAttribute("href");
@@ -512,6 +598,20 @@ test("Human with membership 0 creates isolated Workspaces and uses installed Mes
     await page.getByRole("button", { name: "Messaging", exact: true }).click();
     await page.getByText("beta-general", { exact: true }).click();
     await expect(betaComposer).toHaveValue("Betaの書きかけ");
+
+    // Retrying logout reaches the actual server, clears the session, and
+    // removes authored work from the authenticated UI.
+    const loggedOut = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === "/auth/logout",
+    );
+    await page.getByRole("button", { name: "設定", exact: true }).click();
+    await page.getByRole("button", { name: "ログアウト", exact: true }).click();
+    expect((await loggedOut).ok()).toBe(true);
+    await expect(betaComposer).toHaveCount(0);
+    const endedSession = await page.request.get(`${stack.webURL}/auth/session`);
+    expect(await endedSession.json()).toMatchObject({ authenticated: false });
     expect(malformedMessagingSocketScopes).toEqual([]);
     expect(websocketErrors).toEqual([]);
   } catch (error) {

@@ -1,27 +1,40 @@
 import { Button } from "@sumi/ui/components/button";
-import { type ReactNode, useLayoutEffect, useReducer } from "react";
+import { PortalContainerBoundary } from "@sumi/ui/components/portal-container";
+import {
+  Activity,
+  type ReactNode,
+  useLayoutEffect,
+  useReducer,
+  useRef,
+} from "react";
 import {
   bindMessagingSessionIdentity,
   getMessagingSessionIdentity,
+  suspendMessagingTransport,
 } from "../messaging/store";
+import { useParticipantApps } from "../participant/app-store";
 import {
   bindWorkspaceSessionIdentity,
   getWorkspaceSessionIdentity,
   getWorkspaceSessionScopeKey,
 } from "../workspace/store";
-import { useAuth } from "./auth-context";
+import { AuthContext, type AuthContextValue, useAuth } from "./auth-context";
 import { LoginScreen } from "./login-screen";
 
 export function AuthGate({ children }: { children: ReactNode }) {
+  const auth = useAuth();
+  const retainedAuth = useRef<AuthContextValue | null>(null);
   const {
-    authorityBindingId,
-    canUseDirectChat,
+    sessionSuspended,
     emailLinkCallbackPending,
     loading,
     sessionState,
     refreshSession,
-    user,
-  } = useAuth();
+  } = auth;
+  // Hidden children keep their last verified context: an inner auth gate must
+  // not replace a form while Activity has paused its effects.
+  const protectedAuth = sessionSuspended ? retainedAuth.current : auth;
+  const { authorityBindingId, canUseDirectChat, user } = protectedAuth ?? auth;
   const identity = canUseDirectChat
     ? (user?.id ?? (sessionState === "preissued" ? "preissued" : null))
     : null;
@@ -39,37 +52,66 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const [, rerender] = useReducer((value: number) => value + 1, 0);
 
   useLayoutEffect(() => {
+    if (sessionSuspended) {
+      suspendMessagingTransport();
+      return;
+    }
     if (identityMatches) return;
     bindWorkspaceSessionIdentity(identity, workspaceScopeKey);
     bindMessagingSessionIdentity(identity);
+    if (identity === null) {
+      void useParticipantApps.getState().bindParticipant(null);
+    }
     rerender();
-  }, [identity, identityMatches, workspaceScopeKey]);
+  }, [identity, identityMatches, sessionSuspended, workspaceScopeKey]);
+
+  useLayoutEffect(() => {
+    if (!sessionSuspended)
+      retainedAuth.current = canUseDirectChat ? auth : null;
+  }, [auth, canUseDirectChat, sessionSuspended]);
 
   if (emailLinkCallbackPending) {
     return <LoginScreen />;
   }
-  if (canUseDirectChat) {
-    if (!sessionScopeReady || !identityMatches) {
-      return <AuthStatus title="セッションを切り替えています…" />;
-    }
-    return children;
-  }
+  const ready = canUseDirectChat && sessionScopeReady && identityMatches;
+  let status: ReactNode = null;
   if (loading || sessionState === "checking") {
-    return <AuthStatus title="ログイン状態を確認しています…" />;
-  }
-  if (sessionState === "unauthenticated") {
-    return <LoginScreen />;
+    status = <AuthStatus title="ログイン状態を確認しています…" />;
+  } else if (canUseDirectChat && !sessionSuspended && !ready) {
+    status = <AuthStatus title="セッションを切り替えています…" />;
+  } else if (sessionState === "unauthenticated") {
+    status = <LoginScreen />;
+  } else if (!ready || sessionSuspended) {
+    status = (
+      <AuthStatus
+        title="Sumiに接続できません"
+        detail={
+          sessionSuspended
+            ? "ログアウトの結果を確認できませんでした。編集中の内容を保持して、操作を一時停止しています。"
+            : "ログイン状態を確認できませんでした。"
+        }
+        action={
+          <Button type="button" onClick={() => void refreshSession()}>
+            再試行
+          </Button>
+        }
+      />
+    );
   }
   return (
-    <AuthStatus
-      title="Sumiに接続できません"
-      detail="ログイン状態を確認できませんでした。"
-      action={
-        <Button type="button" onClick={() => void refreshSession()}>
-          再試行
-        </Button>
-      }
-    />
+    <>
+      {canUseDirectChat && protectedAuth && (
+        <AuthContext value={protectedAuth}>
+          <Activity
+            key={identity}
+            mode={ready && !sessionSuspended ? "visible" : "hidden"}
+          >
+            <PortalContainerBoundary>{children}</PortalContainerBoundary>
+          </Activity>
+        </AuthContext>
+      )}
+      {status}
+    </>
   );
 }
 

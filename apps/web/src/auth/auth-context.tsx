@@ -135,6 +135,7 @@ export interface AuthContextValue {
   configured: boolean;
   loading: boolean;
   sessionState: AuthSessionState;
+  sessionSuspended: boolean;
   authenticated: boolean;
   canUseDirectChat: boolean;
   authorityBindingId: string | null;
@@ -158,7 +159,7 @@ export interface AuthContextValue {
   refreshSession: () => Promise<AuthSessionState>;
 }
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<SumiSessionStatus>({
@@ -171,6 +172,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         ? "checking"
         : "unavailable",
   );
+  const [sessionSuspended, setSessionSuspended] = useState(false);
+  const logoutPending = useRef(false);
+  const sessionRevalidationRequired = useRef(false);
   const [confirmation, setConfirmation] =
     useState<PendingAuthConfirmation | null>(() => loadPendingConfirmation());
   const [outcomeNotice, setOutcomeNotice] = useState<AuthOutcomeNotice | null>(
@@ -278,12 +282,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     // Firebase popups can remain open while a component effect runs. A server
     // read during that interval must not cancel the popup's eventual exchange.
-    if (signInPending.current) return "checking";
+    if (signInPending.current || logoutPending.current) return "checking";
     const generation = nextGeneration();
     // A dropped socket does not end the authenticated session. Keep the
     // workspace mounted while checking it so drafts and uploads survive a
     // temporary network failure. Initial authentication still blocks the UI.
-    if (!serverSession.current.authenticated) setSessionState("checking");
+    if (
+      !serverSession.current.authenticated ||
+      sessionRevalidationRequired.current
+    ) {
+      setSessionState("checking");
+    }
     let nextSession: SumiSessionStatus;
     try {
       nextSession = await getSumiSession();
@@ -291,6 +300,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!isCurrentGeneration(generation)) return "checking";
       let nextState = classifySessionFailure(error);
       if (nextState === "unavailable" && serverSession.current.authenticated) {
+        // A failed logout may already have cleared the cookie. Keep the work
+        // paused until a fresh server read establishes who is authenticated.
+        if (sessionRevalidationRequired.current) {
+          setSessionState("unavailable");
+          return "unavailable";
+        }
         return "authenticated";
       }
       const sessionRejected = nextState === "unauthenticated";
@@ -298,6 +313,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (sessionRejected && !clearDirectChatAuthority()) {
           nextState = "unavailable";
         }
+        sessionRevalidationRequired.current = false;
+        setSessionSuspended(false);
         serverSession.current = { authenticated: false };
         setSession({ authenticated: false });
         setSessionState(nextState);
@@ -321,6 +338,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } else if (!clearDirectChatAuthority()) {
           nextState = "unavailable";
         }
+        sessionRevalidationRequired.current = false;
+        setSessionSuspended(false);
         serverSession.current = nextSession;
         setSession(nextSession);
         setSessionState(nextState);
@@ -336,6 +355,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // not a transient session read that can retain the previous workspace.
       flushSync(() => {
         clearDirectChatAuthority();
+        sessionRevalidationRequired.current = false;
+        setSessionSuspended(false);
         serverSession.current = { authenticated: false };
         setSession({ authenticated: false });
         setSessionState("unavailable");
@@ -909,28 +930,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    // AuthGate unmounts ChatScreen as soon as this enters checking, closing
-    // the already-upgraded socket before the cookie is cleared server-side.
+    if (logoutPending.current) return;
     const generation = nextGeneration();
     clearAuthOutcomeNotice();
     setOutcomeNotice(null);
-    // Commit AuthGate's unmount before the first await below. ChatScreen's
-    // cleanup then closes its upgraded socket before this request clears the
-    // cookie that authorized it.
-    flushSync(() => setSessionState("checking"));
+    logoutPending.current = true;
+    sessionRevalidationRequired.current = true;
+    // Pause authenticated effects and dispose Messaging before the request can
+    // clear its cookie. Local forms remain mounted inside the hidden Activity.
+    flushSync(() => {
+      setSessionSuspended(true);
+      setSessionState("checking");
+    });
     try {
       await serializeSessionMutation(async () => {
         await logoutSumiSession();
       });
     } catch (error) {
+      logoutPending.current = false;
       if (!isCurrentGeneration(generation)) return;
-      const retainedSession = serverSession.current;
-      setSession(retainedSession);
-      setSessionState(
-        retainedSession.authenticated ? "authenticated" : "unauthenticated",
-      );
+      await refreshSession();
       throw error;
     }
+    logoutPending.current = false;
     startPushSubscriptionLogoutCleanup();
     let authorityCleared = true;
     if (isCurrentGeneration(generation)) {
@@ -939,6 +961,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // synchronously during setup.
       flushSync(() => {
         authorityCleared = clearDirectChatAuthority();
+        sessionRevalidationRequired.current = false;
+        setSessionSuspended(false);
         serverSession.current = { authenticated: false };
         setSession({ authenticated: false });
         setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
@@ -948,7 +972,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!authorityCleared) {
       throw new Error("Direct-chat private state could not be cleared");
     }
-  }, [isCurrentGeneration, nextGeneration, serializeSessionMutation]);
+  }, [
+    isCurrentGeneration,
+    nextGeneration,
+    refreshSession,
+    serializeSessionMutation,
+  ]);
 
   const user = useMemo<AuthUser | null>(() => {
     if (sessionState === "preissued" && preissuedUserID) {
@@ -980,6 +1009,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       configured: isFirebaseConfigured,
       loading: sessionState === "checking",
       sessionState,
+      sessionSuspended,
       authenticated: sessionState === "authenticated" && session.authenticated,
       canUseDirectChat:
         sessionState === "authenticated" || sessionState === "preissued",
@@ -1015,6 +1045,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refreshSession,
       session.authenticated,
       sessionState,
+      sessionSuspended,
       sendEmailLink,
       signIn,
       outcomeNotice,

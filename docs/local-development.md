@@ -384,3 +384,23 @@ the socket, agent identity, generation, nonce, and application permissions still
 bound each request. Gateway tokens minted through this connection retain their
 short expiry and must be refreshed on reconnect. See
 [issue #354](https://github.com/sumi-studio/sumi/issues/354).
+
+## Workspace browser regression
+
+From `apps/web`, run the Workspace journey against a disposable, empty Postgres
+database and an already-running local Firebase Auth emulator:
+
+```sh
+SUMI_WORKSPACE_E2E_DB_URL='postgres://user:password@127.0.0.1:5432/disposable_e2e?sslmode=disable' \
+FIREBASE_AUTH_EMULATOR_HOST='127.0.0.1:9099' \
+pnpm test:e2e:workspace
+```
+
+The fixture applies migrations and creates its own Human and Workspaces in that
+database. Dispose of the database afterward; do not point this command at a
+working Sumi database. It starts and stops its own Go API and Vite processes.
+A seeded browser cookie goes through the production session and logout routes,
+including failed logout, draft recovery, a failed Messaging bootstrap and
+successful retries. Google/GitHub
+sign-in itself is not exercised, and no PersonalityAgent or model provider is
+required for this journey.

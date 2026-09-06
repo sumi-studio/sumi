@@ -18,7 +18,8 @@ const gateMocks = vi.hoisted(() => ({
   useAuth: vi.fn(),
 }));
 
-vi.mock("./auth-context", () => ({
+vi.mock("./auth-context", async (original) => ({
+  ...(await original<typeof import("./auth-context")>()),
   useAuth: gateMocks.useAuth,
 }));
 

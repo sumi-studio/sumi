@@ -8,7 +8,6 @@ import "gen-interface-jp/600.css";
 import "@sumi/ui/globals.css";
 import { AuthProvider } from "./auth/auth-context";
 import { AuthOutcomeNoticeHost } from "./auth/auth-outcome-notice-host";
-import { ParticipantAppBinding } from "./participant/app-binding";
 import { initializeTheme, ThemeProvider } from "./theme/theme-provider";
 
 const router = createRouter({ routeTree });
@@ -30,12 +29,10 @@ createRoot(rootElement).render(
   <StrictMode>
     <ThemeProvider>
       <AuthProvider>
-        <ParticipantAppBinding>
-          <AuthOutcomeNoticeHost />
-          <TooltipProvider>
-            <RouterProvider router={router} />
-          </TooltipProvider>
-        </ParticipantAppBinding>
+        <AuthOutcomeNoticeHost />
+        <TooltipProvider>
+          <RouterProvider router={router} />
+        </TooltipProvider>
       </AuthProvider>
     </ThemeProvider>
   </StrictMode>,

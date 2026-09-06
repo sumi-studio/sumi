@@ -1,6 +1,7 @@
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import type { ComponentProps } from "react";
 import { cn } from "../lib/utils";
+import { ScopedPortal } from "./portal-container";
 
 export function Popover(props: PopoverPrimitive.Root.Props) {
   return <PopoverPrimitive.Root {...props} />;
@@ -22,7 +23,7 @@ export function PopoverContent({
   sideOffset?: number;
 }) {
   return (
-    <PopoverPrimitive.Portal>
+    <ScopedPortal component={PopoverPrimitive.Portal}>
       <PopoverPrimitive.Positioner
         side={side}
         align={align}
@@ -37,6 +38,6 @@ export function PopoverContent({
           {...props}
         />
       </PopoverPrimitive.Positioner>
-    </PopoverPrimitive.Portal>
+    </ScopedPortal>
   );
 }
