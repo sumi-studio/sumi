@@ -6,10 +6,17 @@ import {
   SendHorizontal,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { isImeComposing } from "../../lib/ime";
 import { isInsideUnclosedCodeFence } from "../compose-fence";
-import type { DraftAttachment } from "../draft-attachments";
+import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
 import type { Message, PollInput, Urgency } from "../model";
 import { MAX_ATTACHMENTS_PER_MESSAGE, participantKey } from "../model";
 import { useMessaging } from "../store";
@@ -29,7 +36,6 @@ const TYPING_THROTTLE_MS = 2_000;
 
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
 const NO_MESSAGES: Message[] = [];
-const NO_DRAFT_ATTACHMENTS: DraftAttachment[] = [];
 
 const URGENCIES: { value: Urgency; label: string; hint: string }[] = [
   { value: "normal", label: "普通", hint: "通常の通知" },
@@ -41,10 +47,14 @@ export function Composer() {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const draft = useMessaging((state) =>
     state.activePlaceKey
-      ? (state.draftByPlace[state.activePlaceKey] ?? "")
-      : "",
+      ? (state.draftByPlace[state.activePlaceKey] ?? EMPTY_COMPOSER_DRAFT)
+      : EMPTY_COMPOSER_DRAFT,
   );
   const setDraft = useMessaging((state) => state.setDraft);
+  const setDraftSelection = useMessaging((state) => state.setDraftSelection);
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const send = useMessaging((state) => state.send);
   const sendTyping = useMessaging((state) => state.sendTyping);
   const selfKey = useMessaging((state) => state.selfKey);
@@ -58,19 +68,10 @@ export function Composer() {
   // composerは編集を預からず、↑キーの入り口だけを持つ。
   const editingMessageId = useMessaging((state) => state.editingMessageId);
   const startEdit = useMessaging((state) => state.startEdit);
-  const replyTargetId = useMessaging((state) => state.replyTargetId);
+  const replyTargetId = draft.replyTarget?.messageId ?? null;
   const setReplyTarget = useMessaging((state) => state.setReplyTarget);
-  const draftAttachments = useMessaging((state) =>
-    state.activePlaceKey
-      ? (state.draftAttachmentsByPlace[state.activePlaceKey] ??
-        NO_DRAFT_ATTACHMENTS)
-      : NO_DRAFT_ATTACHMENTS,
-  );
-  const attachmentOverflow = useMessaging((state) =>
-    state.activePlaceKey
-      ? (state.draftAttachmentOverflowByPlace[state.activePlaceKey] ?? 0)
-      : 0,
-  );
+  const draftAttachments = draft.attachments;
+  const attachmentOverflow = draft.attachmentOverflow;
   const addDraftAttachments = useMessaging(
     (state) => state.addDraftAttachments,
   );
@@ -103,31 +104,71 @@ export function Composer() {
     ? membersByKey[participantKey(replyTarget.author)]
     : undefined;
 
-  const value = draft;
+  const value = draft.text;
+  const restoredOwner = useRef<{
+    key: string | null;
+    generation: number;
+  } | null>(null);
+  const rememberSelection = useCallback(
+    (textarea: HTMLTextAreaElement) => {
+      if (!activePlaceKey) return;
+      setDraftSelection(
+        activePlaceKey,
+        {
+          start: textarea.selectionStart,
+          end: textarea.selectionEnd,
+          direction: textarea.selectionDirection,
+          scrollTop: textarea.scrollTop,
+        },
+        transportGeneration,
+      );
+    },
+    [activePlaceKey, setDraftSelection, transportGeneration],
+  );
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始・編集終了をフォーカスのトリガーにする
   useEffect(() => {
     // インライン編集中はキャレットが編集欄にある。奪い返さない。
     if (editingMessageId) return;
-    textareaRef.current?.focus();
+    textareaRef.current?.focus({ preventScroll: true });
   }, [activePlaceKey, editingMessageId, replyTargetId]);
 
-  // autogrow: 内容に合わせて高さを伸ばし、上限でスクロールへ切り替える。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 入力値の変化を高さ再計算のトリガーにする
-  useEffect(() => {
+  // Restore the caret after assigning the new value and resizing this same textarea.
+  useLayoutEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
+    const changed =
+      restoredOwner.current?.key !== activePlaceKey ||
+      restoredOwner.current?.generation !== transportGeneration;
+    const previousScrollTop = textarea.scrollTop;
     textarea.style.height = "auto";
-    const next = Math.min(textarea.scrollHeight, MAX_HEIGHT_PX);
-    textarea.style.height = `${next}px`;
+    textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_HEIGHT_PX)}px`;
     textarea.style.overflowY =
       textarea.scrollHeight > MAX_HEIGHT_PX ? "auto" : "hidden";
-  }, [value]);
+    if (changed) {
+      const selection = activePlaceKey
+        ? useMessaging.getState().draftByPlace[activePlaceKey]?.selection
+        : null;
+      if (!editingMessageId) textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(
+        selection?.start ?? value.length,
+        selection?.end ?? value.length,
+        selection?.direction ?? "none",
+      );
+      textarea.scrollTop = selection?.scrollTop ?? 0;
+      restoredOwner.current = {
+        key: activePlaceKey,
+        generation: transportGeneration,
+      };
+    } else {
+      textarea.scrollTop = previousScrollTop;
+    }
+  }, [activePlaceKey, editingMessageId, transportGeneration, value]);
 
   const updateValue = useCallback(
     (next: string) => {
       if (activePlaceKey) {
-        setDraft(activePlaceKey, next);
+        setDraft(activePlaceKey, next, transportGeneration);
         const now = Date.now();
         if (next.trim() && now - lastTypingAt.current > TYPING_THROTTLE_MS) {
           lastTypingAt.current = now;
@@ -135,7 +176,7 @@ export function Composer() {
         }
       }
     },
-    [activePlaceKey, setDraft, sendTyping],
+    [activePlaceKey, setDraft, sendTyping, transportGeneration],
   );
   const mentionAutocomplete = useMentionAutocomplete({
     value,
@@ -334,18 +375,20 @@ export function Composer() {
         autocomplete={mentionAutocomplete}
         className="absolute bottom-full left-4 z-10 mb-1 w-64 overflow-hidden rounded-lg border border-border bg-background shadow-md sm:left-6"
       />
-      {replyTarget && replyAuthor ? (
+      {draft.replyTarget ? (
         <div className="mb-1 flex items-center gap-2 text-muted-foreground text-xs">
           <CornerUpLeft className="size-3" />
           <span className="font-medium text-foreground">
-            {replyAuthor.displayName}
+            {replyAuthor?.displayName ?? draft.replyTarget.authorLabel}
           </span>
           <span className="truncate">
-            {replyTarget.content ||
-              replyTarget.poll?.question ||
-              (replyTarget.attachments.length > 0
-                ? "添付ファイル"
-                : "メッセージ")}
+            {replyTarget
+              ? replyTarget.content ||
+                replyTarget.poll?.question ||
+                (replyTarget.attachments.length > 0
+                  ? "添付ファイル"
+                  : "メッセージ")
+              : draft.replyTarget.preview}
           </span>
           <button
             type="button"
@@ -371,9 +414,15 @@ export function Composer() {
         <textarea
           ref={textareaRef}
           value={value}
-          onChange={mentionAutocomplete.onInputChange}
+          onChange={(event) => {
+            mentionAutocomplete.onInputChange(event);
+            rememberSelection(event.currentTarget);
+          }}
           onKeyDown={onKeyDown}
-          onKeyUp={mentionAutocomplete.onKeyUp}
+          onKeyUp={(event) => {
+            mentionAutocomplete.onKeyUp(event);
+            rememberSelection(event.currentTarget);
+          }}
           onCompositionStart={ime.onCompositionStart}
           onCompositionEnd={(event) => {
             ime.onCompositionEnd();
@@ -381,7 +430,12 @@ export function Composer() {
           }}
           onPaste={onPaste}
           onClick={mentionAutocomplete.onInputClick}
-          onSelect={mentionAutocomplete.onSelectionChange}
+          onSelect={(event) => {
+            mentionAutocomplete.onSelectionChange(event);
+            rememberSelection(event.currentTarget);
+          }}
+          onScroll={(event) => rememberSelection(event.currentTarget)}
+          onBlur={(event) => rememberSelection(event.currentTarget)}
           rows={1}
           placeholder={placeholder}
           aria-label={placeholder}

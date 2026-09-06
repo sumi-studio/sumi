@@ -37,7 +37,7 @@ export function PollCreateDialog({
   );
   const hasDraftAttachments = useMessaging((state) =>
     state.activePlaceKey
-      ? (state.draftAttachmentsByPlace[state.activePlaceKey]?.length ?? 0) > 0
+      ? (state.draftByPlace[state.activePlaceKey]?.attachments.length ?? 0) > 0
       : false,
   );
   const [question, setQuestion] = useState("");

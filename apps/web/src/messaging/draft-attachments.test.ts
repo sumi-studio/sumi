@@ -9,6 +9,8 @@ import type {
   UploadAttachmentInput,
   UploadAttachmentReceipt,
 } from "./model";
+import { participantKey } from "./model";
+import type { MessagingScope } from "./scope";
 import {
   expectScopedMessagingPath,
   MESSAGING_SCOPE,
@@ -38,7 +40,7 @@ class UploadControlledServer extends MockMessagingServer {
     input: UploadAttachmentInput;
     deferred: Deferred<UploadAttachmentReceipt>;
   }[] = [];
-  readonly sent: { content: string; attachments: string[] }[] = [];
+  readonly sent: Parameters<MockMessagingServer["sendMessage"]>[0][] = [];
   readonly pendingEdits: {
     attachmentId: string;
     patch: AttachmentDraftPatch;
@@ -56,7 +58,7 @@ class UploadControlledServer extends MockMessagingServer {
   override sendMessage(
     input: Parameters<MockMessagingServer["sendMessage"]>[0],
   ) {
-    this.sent.push({ content: input.content, attachments: input.attachments });
+    this.sent.push(input);
     return super.sendMessage(input);
   }
 
@@ -119,7 +121,7 @@ describe("composer draft attachments", () => {
     const second = new File(["bbb"], "two.png", { type: "image/png" });
     useMessaging.getState().addDraftAttachments([first, second]);
 
-    let drafts = useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY];
+    let drafts = useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments;
     expect(drafts.map((entry) => entry.status)).toEqual([
       "uploading",
       "uploading",
@@ -148,15 +150,15 @@ describe("composer draft attachments", () => {
     expect(server.sent).toHaveLength(0);
     server.pendingUploads[0]?.deferred.resolve(receipt("att-1", "one.txt"));
     await settle();
-    drafts = useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY];
+    drafts = useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments;
     expect(drafts.map((entry) => entry.status)).toEqual(["ready", "ready"]);
 
     useMessaging.getState().send("with files", "normal");
-    expect(server.sent).toEqual([
+    expect(server.sent).toMatchObject([
       { content: "with files", attachments: ["att-1", "att-2"] },
     ]);
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments,
     ).toEqual([]);
     const pending = useMessaging.getState().pendingByPlace[CHANNEL_KEY];
     expect(
@@ -177,7 +179,9 @@ describe("composer draft attachments", () => {
     server.pendingUploads[0]?.deferred.resolve(receipt("att-only", "only.txt"));
     await settle();
     useMessaging.getState().send("", "normal");
-    expect(server.sent).toEqual([{ content: "", attachments: ["att-only"] }]);
+    expect(server.sent).toMatchObject([
+      { content: "", attachments: ["att-only"] },
+    ]);
   });
 
   it("shows the server-canonical filename after upload", async () => {
@@ -191,7 +195,7 @@ describe("composer draft attachments", () => {
     server.pendingUploads[0]?.deferred.resolve(receipt("att-name", "name.txt"));
     await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0],
     ).toMatchObject({ filename: "name.txt", status: "ready" });
   });
 
@@ -204,14 +208,14 @@ describe("composer draft attachments", () => {
         new File(["x"], "flaky.txt", { type: "text/plain" }),
       ]);
     const nonce =
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0]
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0]
         ?.clientNonce;
     server.pendingUploads[0]?.deferred.reject(
       new MessagingAPIError("attachment_quota_exceeded", 507),
     );
     await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0],
     ).toMatchObject({
       status: "failed",
       errorCode: "attachment_quota_exceeded",
@@ -227,15 +231,15 @@ describe("composer draft attachments", () => {
     );
     await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0]?.status,
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0]?.status,
     ).toBe("ready");
 
     useMessaging.getState().removeDraftAttachment(nonce ?? "");
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments,
     ).toEqual([]);
     useMessaging.getState().send("text", "normal");
-    expect(server.sent).toEqual([{ content: "text", attachments: [] }]);
+    expect(server.sent).toMatchObject([{ content: "text", attachments: [] }]);
   });
 
   it("keeps a rejected attachment edit visible and unsendable until its PATCH succeeds", async () => {
@@ -251,7 +255,7 @@ describe("composer draft attachments", () => {
     );
     await settle();
     const nonce =
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0]
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0]
         ?.clientNonce ?? "";
     const patch = {
       filename: "after.txt",
@@ -266,7 +270,7 @@ describe("composer draft attachments", () => {
     );
     await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0],
     ).toMatchObject({
       status: "edit_failed",
       errorCode: "invalid_request",
@@ -288,7 +292,7 @@ describe("composer draft attachments", () => {
     });
     await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY][0],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0],
     ).toMatchObject({
       status: "ready",
       filename: "after.txt",
@@ -301,7 +305,7 @@ describe("composer draft attachments", () => {
       },
     });
     useMessaging.getState().send("saved", "normal");
-    expect(server.sent).toEqual([
+    expect(server.sent).toMatchObject([
       { content: "saved", attachments: ["att-edit"] },
     ]);
   });
@@ -313,7 +317,8 @@ describe("composer draft attachments", () => {
     Object.defineProperty(big, "size", { value: 20 * 1024 * 1024 + 1 });
     const empty = new File([], "empty.txt");
     useMessaging.getState().addDraftAttachments([big, empty]);
-    const drafts = useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY];
+    const drafts =
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments;
     expect(drafts.map((entry) => entry.errorCode)).toEqual([
       "attachment_too_large",
       "attachment_empty",
@@ -328,14 +333,14 @@ describe("composer draft attachments", () => {
         ),
       );
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments,
     ).toHaveLength(10);
     expect(
-      useMessaging.getState().draftAttachmentOverflowByPlace[CHANNEL_KEY],
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachmentOverflow,
     ).toBe(4);
   });
 
-  it("aborts and forgets drafts when the session or scope changes, ignoring late receipts", async () => {
+  it("aborts and forgets drafts when the signed-in Human changes, ignoring late receipts", async () => {
     const server = new UploadControlledServer();
     bootstrapStore(server);
     useMessaging
@@ -348,37 +353,259 @@ describe("composer draft attachments", () => {
 
     bindMessagingSessionIdentity("someone-else");
     expect(upload?.input.signal?.aborted).toBe(true);
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
+    expect(useMessaging.getState().draftByPlace).toEqual({});
 
     // A receipt arriving for the old session cannot resurrect a draft.
     upload?.deferred.resolve(receipt("att-late", "late.txt"));
     await settle();
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
+    expect(useMessaging.getState().draftByPlace).toEqual({});
   });
 
-  it("scope switches clear drafts too", () => {
-    bindMessagingSessionIdentity("human-self");
-    bindMessagingScope(MESSAGING_SCOPE);
+  async function enterWorkspace(
+    server: UploadControlledServer,
+    scope: MessagingScope = MESSAGING_SCOPE,
+  ) {
+    bindMessagingScope(scope);
+    installMessagingBackend(server);
+    const snapshot = await server.bootstrap();
     useMessaging.setState({
       ready: true,
-      self: { kind: "human", humanId: "self" },
+      self: snapshot.self,
       selfKey: "human:self",
-      activePlaceKey: CHANNEL_KEY,
+      channels: snapshot.channels,
+      membersByKey: Object.fromEntries(
+        snapshot.members.map((member) => [
+          participantKey(member.participant),
+          member,
+        ]),
+      ),
     });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Promise<Response>(() => {})),
+    useMessaging.getState().selectPlace(CHANNEL_KEY);
+  }
+
+  it("restores each conversation's text and reply target and sends to the selected conversation", async () => {
+    bindMessagingSessionIdentity("human-self");
+    const server = new UploadControlledServer();
+    await enterWorkspace(server);
+    const other = {
+      ...useMessaging.getState().channels[0],
+      channelId: "other",
+      name: "other",
+    };
+    useMessaging.setState((state) => ({
+      channels: [...state.channels, other],
+    }));
+    useMessaging.getState().setDraft(CHANNEL_KEY, "日本語の返信を書きかけです");
+    useMessaging.getState().setReplyTarget("reply-in-general");
+    useMessaging.getState().selectPlace("channel:other");
+    useMessaging.getState().setDraft("channel:other", "別の相談");
+    useMessaging.getState().setReplyTarget("reply-in-other");
+    useMessaging.getState().selectPlace(CHANNEL_KEY);
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY].text).toBe(
+      "日本語の返信を書きかけです",
     );
+    expect(
+      useMessaging
+        .getState()
+        .send(useMessaging.getState().draftByPlace[CHANNEL_KEY].text, "normal"),
+    ).toBe(true);
+    expect(server.sent[0]).toMatchObject({
+      place: CHANNEL,
+      content: "日本語の返信を書きかけです",
+      replyTo: "reply-in-general",
+    });
+    useMessaging.getState().selectPlace("channel:other");
+    expect(useMessaging.getState().draftByPlace["channel:other"]).toMatchObject(
+      { text: "別の相談", replyTarget: { messageId: "reply-in-other" } },
+    );
+  });
+
+  it("parks workspace drafts through the picker, resumes original Files, and fences late uploads even after returning", async () => {
+    const createPreview = vi.fn(() => "blob:draft-preview");
+    const revokePreview = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      class extends URL {
+        static createObjectURL = createPreview;
+        static revokeObjectURL = revokePreview;
+      },
+    );
+    bindMessagingSessionIdentity("human-self");
+    const first = new UploadControlledServer();
+    await enterWorkspace(first);
+    const file = new File(["image"], "案内.png", { type: "image/png" });
+    useMessaging.getState().setDraft(CHANNEL_KEY, "展示のご案内を書きかけです");
+    useMessaging.getState().setReplyTarget("invitation-question");
+    useMessaging
+      .getState()
+      .setDraftSelection(
+        CHANNEL_KEY,
+        { start: 2, end: 5, direction: "backward", scrollTop: 70 },
+        useMessaging.getState().transportGeneration,
+      );
     useMessaging
       .getState()
       .addDraftAttachments([
-        new File(["x"], "scoped.txt", { type: "text/plain" }),
+        file,
+        new File(["doc"], "会期.txt", { type: "text/plain" }),
       ]);
+    const oldUpload = first.pendingUploads[0];
+    first.pendingUploads[1].deferred.resolve(receipt("att-ready", "会期.txt"));
+    await settle();
+    const oldGeneration = useMessaging.getState().transportGeneration;
+    bindMessagingScope(null); // The actual Workspace picker unbinds first.
+    expect(oldUpload.input.signal?.aborted).toBe(true);
+    expect(useMessaging.getState().draftByPlace).toEqual({});
+    expect(revokePreview).not.toHaveBeenCalled();
+    const otherScope = {
+      ...MESSAGING_SCOPE,
+      workspaceId: "workspace-other",
+      installationId: "installation-other",
+    };
+    const second = new UploadControlledServer();
+    await enterWorkspace(second, otherScope);
+    useMessaging.getState().setDraft(CHANNEL_KEY, "もう一つのWorkspaceの草稿");
+    // A late component callback is as stale as its upload, even with the same place id.
+    useMessaging.getState().setDraft(CHANNEL_KEY, "stale text", oldGeneration);
+    useMessaging
+      .getState()
+      .setDraftSelection(
+        CHANNEL_KEY,
+        { start: 0, end: 0, direction: "none", scrollTop: 0 },
+        oldGeneration,
+      );
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY].text).toBe(
+      "もう一つのWorkspaceの草稿",
+    );
+    expect(second.pendingUploads).toHaveLength(0);
+    bindMessagingScope(null);
+    const returned = new UploadControlledServer();
+    await enterWorkspace(returned);
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY]).toMatchObject({
+      text: "展示のご案内を書きかけです",
+      replyTarget: { messageId: "invitation-question" },
+      selection: { start: 2, end: 5, direction: "backward", scrollTop: 70 },
+    });
+    expect(returned.pendingUploads).toHaveLength(1);
+    expect(returned.pendingUploads[0].input).toMatchObject({
+      clientNonce: oldUpload.input.clientNonce,
+    });
+    expect(returned.pendingUploads[0].input.body).toBe(file);
+    expect(revokePreview).not.toHaveBeenCalled();
+    oldUpload.deferred.resolve(receipt("att-stale", "案内.png", "image/png"));
+    await settle();
     expect(
-      useMessaging.getState().draftAttachmentsByPlace[CHANNEL_KEY],
-    ).toHaveLength(1);
-    bindMessagingScope({ ...MESSAGING_SCOPE, authorityEpoch: "2" });
-    expect(useMessaging.getState().draftAttachmentsByPlace).toEqual({});
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[0].status,
+    ).toBe("uploading");
+    returned.pendingUploads[0].deferred.resolve(
+      receipt("att-current", "案内.png", "image/png"),
+    );
+    await settle();
+    // Keep the send unresolved to distinguish submitted work from a new unsent draft.
+    vi.spyOn(returned, "sendMessage").mockImplementation((input) => {
+      returned.sent.push(input);
+      return new Promise(() => {});
+    });
+    useMessaging
+      .getState()
+      .send(useMessaging.getState().draftByPlace[CHANNEL_KEY].text, "normal");
+    expect(returned.sent[0]).toMatchObject({
+      attachments: ["att-current", "att-ready"],
+      replyTo: "invitation-question",
+    });
+    expect(useMessaging.getState().pendingByPlace[CHANNEL_KEY]).toHaveLength(1);
+    expect(revokePreview).toHaveBeenCalledWith("blob:draft-preview");
+    useMessaging.getState().setDraft(CHANNEL_KEY, "送信後の新しい草稿");
+    await enterWorkspace(new UploadControlledServer(), otherScope);
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY].text).toBe(
+      "もう一つのWorkspaceの草稿",
+    );
+    await enterWorkspace(new UploadControlledServer());
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY]).toMatchObject({
+      text: "送信後の新しい草稿",
+      replyTarget: null,
+      attachments: [],
+    });
+  });
+
+  it("keeps authored drafts across authority epochs but separates a new installation", async () => {
+    bindMessagingSessionIdentity("human-self");
+    const first = new UploadControlledServer();
+    await enterWorkspace(first);
+    const file = new File(["x"], "scoped.txt", { type: "text/plain" });
+    useMessaging.getState().setDraft(CHANNEL_KEY, "同じ設置先の草稿");
+    useMessaging.getState().setReplyTarget("reply-old-epoch");
+    useMessaging
+      .getState()
+      .addDraftAttachments([
+        file,
+        new File(["ready"], "ready.txt", { type: "text/plain" }),
+      ]);
+    first.pendingUploads[1].deferred.resolve(
+      receipt("att-previous-epoch", "ready.txt"),
+    );
+    await settle();
+    const next = new UploadControlledServer();
+    await enterWorkspace(next, { ...MESSAGING_SCOPE, authorityEpoch: "2" });
+    expect(first.pendingUploads[0].input.signal?.aborted).toBe(true);
+    expect(next.pendingUploads).toHaveLength(1);
+    expect(next.pendingUploads[0].input.body).toBe(file);
+    expect(
+      useMessaging.getState().draftByPlace[CHANNEL_KEY].attachments[1],
+    ).toMatchObject({
+      status: "ready",
+      attachment: { attachmentId: "att-previous-epoch" },
+    });
+    expect(useMessaging.getState().draftByPlace[CHANNEL_KEY]).toMatchObject({
+      text: "同じ設置先の草稿",
+      replyTarget: { messageId: "reply-old-epoch" },
+    });
+    await enterWorkspace(new UploadControlledServer(), {
+      ...MESSAGING_SCOPE,
+      installationId: "new-installation",
+    });
+    expect(useMessaging.getState().draftByPlace).toEqual({});
+  });
+
+  it.each([
+    "logout",
+    "human-switch",
+  ])("discards both parked and active drafts on %s", async (change) => {
+    const revoke = vi.fn();
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, {
+        createObjectURL: () => "blob:private",
+        revokeObjectURL: revoke,
+      }),
+    );
+    bindMessagingSessionIdentity("human-self");
+    const first = new UploadControlledServer();
+    await enterWorkspace(first);
+    useMessaging.getState().setDraft(CHANNEL_KEY, "private A");
+    useMessaging.getState().setReplyTarget("private-parent");
+    useMessaging
+      .getState()
+      .addDraftAttachments([new File(["a"], "a.png", { type: "image/png" })]);
+    const second = new UploadControlledServer();
+    await enterWorkspace(second, { ...MESSAGING_SCOPE, workspaceId: "other" });
+    useMessaging.getState().setDraft(CHANNEL_KEY, "private B");
+    useMessaging
+      .getState()
+      .addDraftAttachments([new File(["b"], "b.png", { type: "image/png" })]);
+    bindMessagingSessionIdentity(change === "logout" ? null : "human-other");
+    expect(revoke).toHaveBeenCalledTimes(2);
+    expect(second.pendingUploads[0].input.signal?.aborted).toBe(true);
+    first.pendingUploads[0].deferred.resolve(
+      receipt("private-late", "a.png", "image/png"),
+    );
+    await settle();
+    expect(useMessaging.getState().draftByPlace).toEqual({});
+    bindMessagingSessionIdentity("human-self");
+    const fresh = new UploadControlledServer();
+    await enterWorkspace(fresh);
+    expect(useMessaging.getState().draftByPlace).toEqual({});
+    expect(fresh.pendingUploads).toHaveLength(0);
   });
 });
 

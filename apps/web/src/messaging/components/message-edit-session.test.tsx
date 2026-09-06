@@ -112,9 +112,9 @@ function seedStore(messages: Message[]) {
     unreadLineByPlace: {},
     hasMoreByPlace: { [PLACE]: false },
     replyLaterById: {},
+    draftByPlace: {},
     editingMessageId: null,
     editDraft: "",
-    replyTargetId: null,
     capabilities: {
       status: false,
       replyLater: false,
@@ -419,6 +419,66 @@ describe("編集セッションのタイムライン整合性", () => {
     );
     return backend;
   }
+
+  it.each([
+    "cancel",
+    "save",
+  ])("inline edit %s leaves the queued composer reply, text and attachment intact", async (finish) => {
+    const backend = await bootStore();
+    const key = "channel:ch-general";
+    const messages = useMessaging.getState().messagesByPlace[key];
+    const target = messages.find(
+      (message) =>
+        message.author.kind === "human" &&
+        message.author.humanId === "h-yohaku",
+    );
+    const reply = messages.find(
+      (message) => message.messageId !== target?.messageId,
+    );
+    if (!target || !reply) throw new Error("test messages were not loaded");
+    useMessaging.getState().setDraft(key, "案内への返信を書きかけです");
+    useMessaging.getState().setReplyTarget(reply.messageId);
+    useMessaging
+      .getState()
+      .addDraftAttachments([
+        new File(["invitation"], "案内.txt", { type: "text/plain" }),
+      ]);
+    await waitFor(() =>
+      expect(
+        useMessaging.getState().draftByPlace[key].attachments[0].status,
+      ).toBe("ready"),
+    );
+    const draft = useMessaging.getState().draftByPlace[key];
+
+    useMessaging.getState().startEdit(target.messageId);
+    expect(useMessaging.getState().draftByPlace[key]).toEqual(draft);
+    useMessaging.getState().setEditDraft("以前の投稿の誤字を直しました");
+    if (finish === "cancel") useMessaging.getState().cancelEdit();
+    else useMessaging.getState().submitEdit();
+    await waitFor(() =>
+      expect(useMessaging.getState().editingMessageId).toBeNull(),
+    );
+    expect(
+      useMessaging
+        .getState()
+        .messagesByPlace[key].find(
+          (message) => message.messageId === target.messageId,
+        )?.content,
+    ).toBe(finish === "save" ? "以前の投稿の誤字を直しました" : target.content);
+    expect(useMessaging.getState().draftByPlace[key]).toEqual(draft);
+
+    const send = vi.spyOn(backend, "sendMessage");
+    useMessaging
+      .getState()
+      .send(useMessaging.getState().draftByPlace[key].text, "normal");
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: "案内への返信を書きかけです",
+        replyTo: reply.messageId,
+        attachments: [draft.attachments[0].attachment?.attachmentId],
+      }),
+    );
+  });
 
   it("編集中の対象が message_deleted で消えると composer を通常状態へ戻す", async () => {
     const backend = await bootStore();

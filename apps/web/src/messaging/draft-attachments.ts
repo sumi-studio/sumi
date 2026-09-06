@@ -47,6 +47,7 @@ export function attachmentUploadFailureCode(error: unknown): string {
 }
 
 const FAILURE_LABELS: Record<string, string> = {
+  attachment_upload_interrupted: "アップロードを中断しました。再試行できます",
   attachment_too_large: "20 MiBを超えています",
   attachment_empty: "空のファイルは送れません",
   attachment_quota_exceeded: "ワークスペースの添付容量が上限です",

@@ -598,7 +598,6 @@ describe("presenting an incoming message", () => {
     useMessaging.setState({
       activePlaceKey: CHANNEL_KEY,
       editingMessageId: "editing-in-channel",
-      replyTargetId: "replying-in-channel",
     });
 
     useMessaging.getState().clearPlaceSelection();
@@ -611,7 +610,6 @@ describe("presenting an incoming message", () => {
     expect(useMessaging.getState()).toMatchObject({
       activePlaceKey: null,
       editingMessageId: null,
-      replyTargetId: null,
     });
     expect(startTone).toHaveBeenCalledTimes(2);
     expect(FakeNotification.constructed).toHaveLength(0);
