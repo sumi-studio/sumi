@@ -335,7 +335,7 @@ function draftOwnerKey(scope: MessagingScope | null): string | null {
     : null;
 }
 
-function parkComposerDrafts(): void {
+function parkComposerDrafts(): Record<PlaceKey, ComposerDraft> {
   const owner = draftOwnerKey(getActiveMessagingScope());
   const drafts = useMessaging.getState().draftByPlace;
   const parked: Record<PlaceKey, ComposerDraft> = {};
@@ -362,6 +362,7 @@ function parkComposerDrafts(): void {
     };
   }
   if (owner) draftsByOwner.set(owner, parked);
+  return parked;
 }
 
 /** Tests and explicit development harnesses may replace the transport before init. */
@@ -422,6 +423,7 @@ function editResponseDisposition(error: unknown): EditResponseDisposition {
 interface MessagingState {
   capabilities: MessagingCapabilities;
   ready: boolean;
+  bootstrapFailed: boolean;
   self: ParticipantRef | null;
   selfKey: ParticipantKey;
   workspaces: WorkspaceSummary[];
@@ -904,6 +906,7 @@ function unreadContribution(
 }
 
 let initialized = false;
+let messagingTransportSuspended = false;
 let messagingSessionGeneration = 0;
 
 function isCurrentMessagingSession(
@@ -2786,6 +2789,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
   return {
     capabilities: backend.capabilities,
     ready: false,
+    bootstrapFailed: false,
     self: null,
     selfKey: "",
     workspaces: [],
@@ -2829,12 +2833,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
     transportGeneration: 0,
 
     init() {
-      if (initialized) return;
+      if (initialized || messagingTransportSuspended) return;
       initialized = true;
+      set({ bootstrapFailed: false });
       threadProjectionVersions.clear();
       threadSummaryRefreshes.clear();
       threadListLoads.clear();
-      pollVoteQueues.clear();
+      // Retrying bootstrap does not end votes already sent on this backend.
+      for (const [messageId, coordinator] of pollVoteQueues) {
+        if (
+          !isCurrentMessagingSession(
+            coordinator.backend,
+            coordinator.sessionGeneration,
+          )
+        ) {
+          pollVoteQueues.delete(messageId);
+        }
+      }
       orphanPollProjections.clear();
       heldPlaces.clear();
       placeHoldGenerations.clear();
@@ -2934,11 +2949,23 @@ export const useMessaging = create<MessagingState>((set, get) => {
             void reconcilePlaces().catch(() => undefined);
             void resyncPresence().catch(() => undefined);
           });
+          const activeKey = get().activePlaceKey;
+          const activePlace = activeKey ? parsePlaceKey(activeKey) : null;
+          if (activeKey && activePlace) {
+            request.backend.openPlace?.(activePlace);
+            void loadPlace(activePlace).catch(() => undefined);
+            for (const draft of get().draftByPlace[activeKey]?.attachments ??
+              []) {
+              if (draft.errorCode === "attachment_upload_interrupted") {
+                get().retryDraftAttachment(draft.clientNonce);
+              }
+            }
+          }
         })
         .catch(() => {
           if (!request.isCurrent()) return;
           initialized = false;
-          set({ connection: "disconnected" });
+          set({ connection: "disconnected", bootstrapFailed: true });
         });
     },
 
@@ -4355,10 +4382,69 @@ export function bindMessagingScope(scope: MessagingScope | null): void {
   );
 }
 
+/** Pause requests without changing the owner or replacing their open forms. */
+export function suspendMessagingTransport(): void {
+  if (messagingTransportSuspended || getActiveMessagingScope() === null) return;
+  messagingTransportSuspended = true;
+  messagingSessionGeneration += 1;
+  backend.dispose();
+  backend = unboundMessagingBackend();
+  initialized = false;
+  useCall.getState().reset();
+  presenceResyncGeneration += 1;
+  pendingPresenceResync = null;
+  if (statusExpiryTimer !== null) clearTimeout(statusExpiryTimer);
+  statusExpiryTimer = null;
+  notificationWriteChain = Promise.resolve();
+  notificationWriteGeneration += 1;
+  const drafts = parkComposerDrafts();
+  useMessaging.setState((state) => ({
+    draftByPlace: drafts,
+    connection: "disconnected",
+    transportGeneration: messagingSessionGeneration,
+    startingDM: null,
+    loadingOlderByPlace: {},
+    // A request may have committed before its response was lost. Keep its
+    // nonce/intent for the existing explicit retry instead of dropping it.
+    pendingByPlace: Object.fromEntries(
+      Object.entries(state.pendingByPlace).map(([key, messages]) => [
+        key,
+        messages.map((message) => ({ ...message, failed: true })),
+      ]),
+    ),
+    pollVoteByMessage: Object.fromEntries(
+      Object.entries(state.pollVoteByMessage).map(([messageId, vote]) => [
+        messageId,
+        vote.pending ? { ...vote, pending: false, failed: true } : vote,
+      ]),
+    ),
+    ...(state.editSession?.submittedDraft !== null && state.editSession
+      ? {
+          editSession: {
+            ...state.editSession,
+            submittedDraft: null,
+            token: ++nextEditSessionToken,
+          },
+          editFailure:
+            "保存結果を確認できませんでした。内容を確認して再試行してください。",
+        }
+      : {}),
+  }));
+}
+
+/** Called by the authenticated shell only after session verification resumes it. */
+export function resumeMessagingTransport(): void {
+  if (!messagingTransportSuspended) return;
+  messagingTransportSuspended = false;
+  const scope = getActiveMessagingScope();
+  if (scope) backend = new ApiMessagingBackend(scope);
+}
+
 function resetMessagingRuntime(
   nextBackend: MessagingBackend,
   drafts: Record<PlaceKey, ComposerDraft>,
 ): void {
+  messagingTransportSuspended = false;
   messagingSessionGeneration += 1;
   placeCreationAttempts.authorityReplaced();
   reactionProjectionByPlace.clear();
@@ -4379,6 +4465,7 @@ function resetMessagingRuntime(
   useMessaging.setState({
     capabilities: backend.capabilities,
     ready: false,
+    bootstrapFailed: false,
     self: null,
     selfKey: "",
     workspaces: [],

@@ -43,6 +43,15 @@ const URGENCIES: { value: Urgency; label: string; hint: string }[] = [
   { value: "fyi", label: "FYI", hint: "返信不要。手すきで見て" },
 ];
 
+function dialogOwnsFocus(): boolean {
+  return Boolean(
+    document.activeElement?.closest('[role="dialog"]') ||
+      document.querySelector(
+        '[role="dialog"][data-open], [role="dialog"][aria-modal="true"]',
+      ),
+  );
+}
+
 export function Composer() {
   const activePlaceKey = useMessaging((state) => state.activePlaceKey);
   const draft = useMessaging((state) =>
@@ -129,7 +138,7 @@ export function Composer() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: place切替・返信開始・編集終了をフォーカスのトリガーにする
   useEffect(() => {
     // インライン編集中はキャレットが編集欄にある。奪い返さない。
-    if (editingMessageId) return;
+    if (editingMessageId || dialogOwnsFocus()) return;
     textareaRef.current?.focus({ preventScroll: true });
   }, [activePlaceKey, editingMessageId, replyTargetId]);
 
@@ -149,7 +158,9 @@ export function Composer() {
       const selection = activePlaceKey
         ? useMessaging.getState().draftByPlace[activePlaceKey]?.selection
         : null;
-      if (!editingMessageId) textarea.focus({ preventScroll: true });
+      if (!editingMessageId && !dialogOwnsFocus()) {
+        textarea.focus({ preventScroll: true });
+      }
       textarea.setSelectionRange(
         selection?.start ?? value.length,
         selection?.end ?? value.length,

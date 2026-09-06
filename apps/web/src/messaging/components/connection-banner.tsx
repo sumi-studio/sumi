@@ -11,6 +11,8 @@ const RECONNECTING_DELAY_MS = 1_500;
  */
 export function ConnectionBanner() {
   const connection = useMessaging((state) => state.connection);
+  const bootstrapFailed = useMessaging((state) => state.bootstrapFailed);
+  const retryBootstrap = useMessaging((state) => state.init);
   // Transport-level fact, not component-local: the shell keeps the transport
   // alive across app routes, so this banner can mount while an interruption is
   // already in progress and must still treat it as one.
@@ -57,7 +59,7 @@ export function ConnectionBanner() {
   }, [connection, everConnected]);
 
   if (connection === "connected" && !flash) return null;
-  if (!interruptionVisible && !flash) return null;
+  if (!interruptionVisible && !flash && !bootstrapFailed) return null;
 
   if (connection === "connected") {
     return (
@@ -78,6 +80,15 @@ export function ConnectionBanner() {
       {connection === "reconnecting"
         ? "再接続中… 新しいメッセージが届いていない可能性があります"
         : "サーバーに接続できません"}
+      {bootstrapFailed && (
+        <button
+          type="button"
+          onClick={retryBootstrap}
+          className="ml-2 rounded border border-current px-2 py-0.5 font-medium hover:bg-amber-500/10 focus-visible:outline-2 focus-visible:outline-offset-2"
+        >
+          再試行
+        </button>
+      )}
     </div>
   );
 }

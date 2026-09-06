@@ -10,8 +10,11 @@ import type {
   ThreadSummary,
 } from "./model";
 import {
+  bindMessagingScope,
   bindMessagingSessionIdentity,
   installMessagingBackend,
+  resumeMessagingTransport,
+  suspendMessagingTransport,
   useMessaging,
 } from "./store";
 
@@ -1517,6 +1520,158 @@ describe("poll convergence in the messaging store", () => {
     expect(
       useMessaging.getState().pollVoteByMessage[initial.messageId],
     ).toBeUndefined();
+  });
+
+  it("makes an interrupted latest poll selection retryable and fences the old queue after transport resume", async () => {
+    bindMessagingScope({
+      workspaceId: "workspace-1",
+      installationId: "messaging-1",
+      authorityEpoch: "1",
+    });
+    const oldHarness = new StubBackend();
+    const oldResponse = deferred<Message>();
+    oldHarness.pollVoteResults.push(oldResponse.promise);
+    installMessagingBackend(oldHarness);
+    useMessaging.getState().init();
+    await oldHarness.bootstrapped;
+    const initial = pollMessage();
+    await holdLoaded(oldHarness, [initial]);
+    const first = useMessaging.getState().votePoll(initial, ["a"]);
+    const queued = useMessaging.getState().votePoll(initial, ["a", "b"]);
+    await oldHarness.settle();
+    expect(oldHarness.votePoll).toHaveBeenCalledTimes(1);
+    const unrelatedFailure = {
+      optionIds: ["other-option"],
+      intent: 1,
+      pending: false,
+      failed: true,
+    };
+    useMessaging.setState((state) => ({
+      pollVoteByMessage: {
+        ...state.pollVoteByMessage,
+        unrelated: unrelatedFailure,
+      },
+    }));
+
+    suspendMessagingTransport();
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toMatchObject({
+      optionIds: ["a", "b"],
+      pending: false,
+      failed: true,
+    });
+    expect(useMessaging.getState().pollVoteByMessage.unrelated).toBe(
+      unrelatedFailure,
+    );
+    resumeMessagingTransport();
+    const newHarness = new StubBackend();
+    newHarness.history = [initial];
+    installMessagingBackend(newHarness);
+    useMessaging.getState().init();
+    await newHarness.bootstrapped;
+    oldResponse.resolve({
+      ...initial,
+      poll: { ...requiredPoll(initial), revision: 5 },
+    });
+    await Promise.all([first, queued]);
+    expect(oldHarness.votePoll).toHaveBeenCalledTimes(1);
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toMatchObject({
+      optionIds: ["a", "b"],
+      pending: false,
+      failed: true,
+    });
+    expect(
+      useMessaging.getState().messagesByPlace[placeKey][0].poll?.revision,
+    ).toBe(0);
+
+    const committed = {
+      ...initial,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 1,
+        options: requiredPoll(initial).options.map((option) => ({
+          ...option,
+          voters: [self],
+        })),
+      },
+    };
+    newHarness.pollVoteResults.push(committed);
+    await useMessaging
+      .getState()
+      .votePoll(
+        initial,
+        useMessaging.getState().pollVoteByMessage[initial.messageId].optionIds,
+      );
+    expect(newHarness.votePoll).toHaveBeenCalledWith(place, initial.messageId, [
+      "a",
+      "b",
+    ]);
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toBeUndefined();
+    expect(useMessaging.getState().messagesByPlace[placeKey][0].poll).toEqual(
+      committed.poll,
+    );
+    expect(useMessaging.getState().pollVoteByMessage.unrelated).toBe(
+      unrelatedFailure,
+    );
+  });
+
+  it("lets a vote started after failed resume bootstrap settle through bootstrap retry on the same backend", async () => {
+    bindMessagingScope({
+      workspaceId: "workspace-1",
+      installationId: "messaging-1",
+      authorityEpoch: "1",
+    });
+    const firstHarness = new StubBackend();
+    installMessagingBackend(firstHarness);
+    useMessaging.getState().init();
+    await firstHarness.bootstrapped;
+    const initial = pollMessage();
+    await holdLoaded(firstHarness, [initial]);
+    suspendMessagingTransport();
+    resumeMessagingTransport();
+    const resumed = new StubBackend();
+    resumed.history = [initial];
+    vi.spyOn(resumed, "bootstrap").mockRejectedValueOnce(
+      new Error("unavailable"),
+    );
+    installMessagingBackend(resumed);
+    useMessaging.getState().init();
+    await resumed.settle();
+    expect(useMessaging.getState().bootstrapFailed).toBe(true);
+
+    const response = deferred<Message>();
+    resumed.pollVoteResults.push(response.promise);
+    const vote = useMessaging.getState().votePoll(initial, ["b"]);
+    await resumed.settle();
+    expect(resumed.votePoll).toHaveBeenCalledTimes(1);
+    useMessaging.getState().init();
+    await resumed.bootstrapped;
+    expect(useMessaging.getState().bootstrapFailed).toBe(false);
+    const committed = {
+      ...initial,
+      poll: {
+        ...requiredPoll(initial),
+        revision: 1,
+        options: [
+          { optionId: "a", text: "A", voters: [] },
+          { optionId: "b", text: "B", voters: [self] },
+        ],
+      },
+    };
+    response.resolve(committed);
+    await vote;
+    expect(
+      useMessaging.getState().pollVoteByMessage[initial.messageId],
+    ).toBeUndefined();
+    expect(useMessaging.getState().messagesByPlace[placeKey][0].poll).toEqual(
+      committed.poll,
+    );
+    expect(resumed.votePoll).toHaveBeenCalledTimes(1);
   });
 
   it("fences old-session acknowledgements and queued intents", async () => {

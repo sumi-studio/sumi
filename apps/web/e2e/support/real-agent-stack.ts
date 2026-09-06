@@ -737,6 +737,8 @@ export class RealAgentStack {
 
 /**
  * Production API + Postgres + Vite boundary for Human Workspace journeys.
+ * A seeded cookie is checked by the production session and logout routes;
+ * Firebase Admin uses the explicitly configured local Auth emulator.
  *
  * This deliberately does not start a PersonalityAgent. Workspace and
  * Messaging Human operations do not require one, and keeping this fixture
@@ -895,6 +897,8 @@ export async function startWorkspaceBrowserStack(
     redactions.push(browserSessionSecret);
 
     const baseEnvironment = environmentWithoutSumiConfiguration();
+    const firebaseAuthEmulator = requiredFirebaseAuthEmulator();
+    await assertFirebaseAuthEmulator(firebaseAuthEmulator);
     const api = ManagedProcess.start(
       "Go production Workspace API",
       build.apiServer,
@@ -910,6 +914,11 @@ export async function startWorkspaceBrowserStack(
           SUMI_BROWSER_SESSION_SECRET: browserSessionSecret,
           SUMI_BROWSER_SESSION_AUDIENCE: browserSessionAudience,
           SUMI_BROWSER_WS_ALLOWED_ORIGINS: webURL,
+          FIREBASE_AUTH_EMULATOR_HOST: firebaseAuthEmulator.host,
+          SUMI_AUTH_FIREBASE_PROJECT_ID: firebaseProjectID,
+          SUMI_AUTH_TENANT_ID: tenantID,
+          SUMI_AUTH_ALLOW_INSECURE_COOKIES: "true",
+          SUMI_AGENT_WRAPPING_KEY_ID: `e2e-${randomIdentifier()}`,
           SUMI_DB_URL: databaseURL,
           SUMI_MESSAGING_ATTACHMENT_ROOT: messagingAttachmentRoot,
           SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES: "20971520",
@@ -971,8 +980,6 @@ export async function startWorkspaceBrowserStack(
         cwd: webDirectory,
         env: {
           ...baseEnvironment,
-          VITE_SUMI_AUTH_MODE: "preissued",
-          VITE_SUMI_PREISSUED_USER_ID: userID,
           SUMI_DEV_API_ORIGIN: apiURL,
         },
         redactions,

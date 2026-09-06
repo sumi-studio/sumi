@@ -21,7 +21,7 @@ import {
   UserRound,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/auth-context";
 import { ProviderSettings } from "../auth/provider-settings";
 import {
@@ -78,8 +78,10 @@ export function SettingsPopover() {
   const [savingProfile, setSavingProfile] = useState(false);
   const humanID = authenticated ? (user?.id ?? null) : null;
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: changing Human identity must reset Human-owned form state.
+  const profileOwner = useRef(humanID);
   useEffect(() => {
+    if (profileOwner.current === humanID) return;
+    profileOwner.current = humanID;
     setProfileForm({
       baseline: null,
       values: { displayName: "", tagline: "" },

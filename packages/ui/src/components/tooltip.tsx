@@ -1,5 +1,6 @@
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 import { cn } from "../lib/utils";
+import { ScopedPortal } from "./portal-container";
 
 export function TooltipProvider({
   delay = 350,
@@ -30,7 +31,7 @@ export function TooltipContent({
     "align" | "alignOffset" | "side" | "sideOffset"
   >) {
   return (
-    <TooltipPrimitive.Portal>
+    <ScopedPortal component={TooltipPrimitive.Portal}>
       <TooltipPrimitive.Positioner
         align={align}
         alignOffset={alignOffset}
@@ -49,6 +50,6 @@ export function TooltipContent({
           {children}
         </TooltipPrimitive.Popup>
       </TooltipPrimitive.Positioner>
-    </TooltipPrimitive.Portal>
+    </ScopedPortal>
   );
 }

@@ -2,6 +2,7 @@ import { AlertDialog as AlertDialogPrimitive } from "@base-ui/react/alert-dialog
 import type { ComponentProps } from "react";
 import { cn } from "../lib/utils";
 import { Button } from "./button";
+import { ScopedPortal } from "./portal-container";
 
 export function AlertDialog(props: AlertDialogPrimitive.Root.Props) {
   return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />;
@@ -18,7 +19,7 @@ export function AlertDialogContent({
   ...props
 }: AlertDialogPrimitive.Popup.Props) {
   return (
-    <AlertDialogPrimitive.Portal>
+    <ScopedPortal component={AlertDialogPrimitive.Portal}>
       <AlertDialogPrimitive.Backdrop className="fixed inset-0 z-50 bg-black/20 transition-opacity duration-150 data-ending-style:opacity-0 data-starting-style:opacity-0" />
       <AlertDialogPrimitive.Popup
         data-slot="alert-dialog-content"
@@ -28,7 +29,7 @@ export function AlertDialogContent({
         )}
         {...props}
       />
-    </AlertDialogPrimitive.Portal>
+    </ScopedPortal>
   );
 }
 

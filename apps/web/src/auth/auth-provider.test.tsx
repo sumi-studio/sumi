@@ -1408,6 +1408,13 @@ describe("logout authority transition", () => {
       expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
     });
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
+    // The failed logout is ambiguous: the subsequent server read, not the
+    // previously exchanged cached identity, must establish who remains signed in.
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b" },
+    });
     resolveEstablishment({
       authenticated: true,
       authorityBindingId: authorityBindingB,
