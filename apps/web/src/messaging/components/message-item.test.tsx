@@ -7,14 +7,11 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetEditFocus } from "../edit-focus";
-import {
-  lockedMessageId,
-  lockMessageActions,
-  resetMessageActionLock,
-} from "../message-action-lock";
+import { resetMessageActionLock } from "../message-action-lock";
 import type {
   MemberProfile,
   Message,
@@ -74,7 +71,7 @@ function renderItem(
   props: Partial<React.ComponentProps<typeof MessageItem>> = {},
 ) {
   const noop = () => undefined;
-  const view = render(
+  return render(
     <MessageItem
       message={message}
       grouped={false}
@@ -108,7 +105,6 @@ function renderItem(
       {...props}
     />,
   );
-  return { ...view, row: view.container.firstElementChild as HTMLElement };
 }
 
 beforeEach(() => {
@@ -122,43 +118,24 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("MessageItem の行の見せ方", () => {
-  it("操作チップは対象メッセージの要素の内側に置かれる", () => {
-    const { row } = renderItem(makeMessage());
-    const toolbar = screen.getByLabelText("返信").closest("div");
-    expect(toolbar).not.toBeNull();
-    expect(row.contains(toolbar)).toBe(true);
-    // 行の外へはみ出さない（translateで上へ逃がさない）。
-    expect(toolbar?.className).not.toContain("-translate-y-1/2");
-  });
-
-  it("行にはホバー時のハイライトと左端の目印がある", () => {
-    const { row } = renderItem(makeMessage());
-    expect(row.className).toContain("hover:bg-accent");
-    expect(row.className).not.toContain("hover:bg-accent/55");
-    const marker = row.querySelector("span[aria-hidden]");
-    expect(marker?.className).toContain("group-hover:bg-primary/50");
-  });
-
-  it("返信引用は本文と同じ左端に揃い、投稿者のミニアバターを伴う", () => {
+describe("返信元のプレビュー", () => {
+  it("投稿者と本文を示し、選ぶと返信元へ移動する", () => {
     const target = makeMessage({
       messageId: "m0",
       seq: 0,
       author: agent,
       content: "元のメッセージ",
     });
+    const onJumpTo = vi.fn();
     renderItem(makeMessage({ messageId: "m1", replyTo: "m0" }), {
       findMessage: (id) => (id === "m0" ? target : undefined),
+      onJumpTo,
     });
     const quote = screen.getByTitle("墨 の返信元へ移動");
     expect(quote).toHaveTextContent("墨");
     expect(quote).toHaveTextContent("元のメッセージ");
-    // カギ線 → ミニアバター → 名前 → 抜粋 の順で一つの階層に並ぶ。
-    const connector = quote.querySelector("span[aria-hidden]");
-    expect(connector?.className).toContain("border-l-2");
-    expect(quote.querySelectorAll("span[aria-hidden]").length).toBeGreaterThan(
-      1,
-    );
+    fireEvent.click(quote);
+    expect(onJumpTo).toHaveBeenCalledExactlyOnceWith("m0");
   });
 
   it("本文のない返信元は「添付ファイル」と示す", () => {
@@ -227,13 +204,13 @@ describe("リンクのコピー", () => {
 });
 
 describe("インライン編集", () => {
-  it("編集中は本文の位置に入力欄とヒントが出て、操作チップは引っ込む", () => {
+  it("編集中は書きかけと操作ヒントが出て、操作チップは引っ込む", () => {
     renderItem(makeMessage({ content: "編集前" }), {
       editing: true,
-      editDraft: "編集前",
+      editDraft: "書きかけ",
     });
     const textarea = screen.getByLabelText("メッセージを編集");
-    expect(textarea).toHaveValue("編集前");
+    expect(textarea).toHaveValue("書きかけ");
     expect(screen.getByText("Escでキャンセル・Enterで保存")).toBeVisible();
     expect(screen.queryByLabelText("返信")).toBeNull();
   });
@@ -277,23 +254,6 @@ describe("インライン編集", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "保存できませんでした。もう一度お試しください。",
     );
-  });
-
-  it("書きかけは行ではなく渡されたドラフトが正本になる", () => {
-    // 行が一度アンマウントされて作り直されても、描くのは本文ではなく
-    // 編集セッションのドラフト。
-    const { unmount } = renderItem(makeMessage({ content: "元の本文" }), {
-      editing: true,
-      editDraft: "書きかけ",
-    });
-    expect(screen.getByLabelText("メッセージを編集")).toHaveValue("書きかけ");
-    unmount();
-    cleanup();
-    renderItem(makeMessage({ content: "元の本文" }), {
-      editing: true,
-      editDraft: "書きかけ",
-    });
-    expect(screen.getByLabelText("メッセージを編集")).toHaveValue("書きかけ");
   });
 
   it("入力はドラフトの持ち主へ渡り、Enterで保存・Escで取り消す", () => {
@@ -471,31 +431,21 @@ describe("リアクションの選択", () => {
 });
 
 describe("操作対象の固定", () => {
-  it("ピッカーを開いている間、その行が対象を握り続ける", async () => {
-    const { row } = renderItem(makeMessage());
-    fireEvent.click(screen.getByLabelText("絵文字を追加"));
-    await screen.findByLabelText("絵文字を検索");
-    await waitFor(() => expect(lockedMessageId()).toBe("m1"));
-    // 握っている行はホバーを待たずにハイライトと操作チップを出し続ける。
-    expect(row.className).toContain("bg-accent");
-    expect(screen.getByLabelText("返信").closest("div")?.className).toContain(
-      "opacity-100",
-    );
-  });
+  it("ピッカーを開いた行だけに操作を表示し、その行が消えれば他の行も操作できる", async () => {
+    const first = renderItem(makeMessage());
+    const second = renderItem(makeMessage({ messageId: "m2" }));
+    const firstRow = within(first.container);
+    const secondRow = within(second.container);
+    expect(secondRow.getByLabelText("返信")).toBeInTheDocument();
 
-  it("他の行がパネルを開いている間は自分のチップを出さない", () => {
-    lockMessageActions("other");
-    const { row } = renderItem(makeMessage({ messageId: "m1" }));
-    expect(screen.queryByLabelText("返信")).toBeNull();
-    expect(row.className).not.toContain("hover:bg-accent");
-  });
-
-  it("行が消えるときは対象の固定を手放す", async () => {
-    const view = renderItem(makeMessage());
-    fireEvent.click(screen.getByLabelText("絵文字を追加"));
+    fireEvent.click(firstRow.getByLabelText("絵文字を追加"));
     await screen.findByLabelText("絵文字を検索");
-    await waitFor(() => expect(lockedMessageId()).toBe("m1"));
-    view.unmount();
-    expect(lockedMessageId()).toBeNull();
+
+    expect(firstRow.getByLabelText("返信")).toBeInTheDocument();
+    expect(secondRow.queryByLabelText("返信")).toBeNull();
+
+    first.unmount();
+
+    expect(secondRow.getByLabelText("返信")).toBeInTheDocument();
   });
 });

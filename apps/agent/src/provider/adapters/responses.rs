@@ -5760,51 +5760,49 @@ mod tests {
 
     #[test]
     fn duplicate_output_item_ids_are_rejected_across_variants_transactionally() {
-        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
-        state
-            .push_json(
-                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"same","type":"message","role":"assistant","content":[]}}"#,
-            )
-            .unwrap();
-        let before = (
-            state.output_item_ids.len(),
-            state.output_identities.len(),
-            state.next_output_index,
-        );
-        let err = state
-            .push_json(
-                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
-            )
-            .expect_err("duplicate id across variants");
-        assert!(err.to_string().contains("duplicate output item id"));
-        assert_eq!(
-            (
+        for item in [
+            json!({"id":"same","type":"message","role":"assistant","content":[]}),
+            json!({"id":"same","type":"reasoning","summary":[]}),
+        ] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            state
+                .push_json(
+                    r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"same","type":"message","role":"assistant","content":[]}}"#,
+                )
+                .unwrap();
+            let before = (
                 state.output_item_ids.len(),
                 state.output_identities.len(),
-                state.next_output_index
-            ),
-            before
-        );
-        state
-            .push_json(
-                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"different","type":"reasoning","summary":[]}}"#,
-            )
-            .expect("retry under same sequence number");
-    }
-
-    #[test]
-    fn duplicate_message_output_item_id_is_rejected() {
-        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
-        state
-            .push_json(
-                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"m","type":"message","role":"assistant","content":[]}}"#,
-            )
-            .unwrap();
-        assert!(state
-            .push_json(
-                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"m","type":"message","role":"assistant","content":[]}}"#,
-            )
-            .is_err());
+                state.next_output_index,
+            );
+            let mut event = json!({
+                "type":"response.output_item.added",
+                "sequence_number":1,
+                "output_index":1,
+                "item":item,
+            });
+            let err = state
+                .push_json(&event.to_string())
+                .expect_err("duplicate output item id");
+            assert!(
+                err.to_string().contains("duplicate output item id"),
+                "{item}"
+            );
+            assert_eq!(
+                (
+                    state.output_item_ids.len(),
+                    state.output_identities.len(),
+                    state.next_output_index
+                ),
+                before,
+                "{item}"
+            );
+            event["item"]["id"] = json!("different");
+            state
+                .push_json(&event.to_string())
+                .expect("retry under same sequence number");
+        }
     }
 
     #[test]
