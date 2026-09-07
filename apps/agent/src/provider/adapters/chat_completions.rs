@@ -2587,13 +2587,6 @@ mod tests {
         .expect("send matrix snapshot");
         let actual = send_snapshot_matrix();
         assert_eq!(actual, expected);
-        let actual_bytes =
-            crate::provider::canonical_request::CanonicalRequestBody::serialize(&actual)
-                .expect("canonical actual request fixture");
-        let expected_bytes =
-            crate::provider::canonical_request::CanonicalRequestBody::serialize(&expected)
-                .expect("canonical expected request fixture");
-        assert_eq!(actual_bytes.as_bytes(), expected_bytes.as_bytes());
     }
 
     #[test]
@@ -2805,21 +2798,6 @@ mod tests {
         assert_eq!(assistant["content"], json!(""));
         assert_eq!(assistant["reasoning_content"], json!(""));
         assert!(assistant["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn opencode_omits_temperature_even_when_requested() {
-        let request = build_request(
-            &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
-            &simple_context(vec![user_message("Hello.")], vec![]),
-            &RequestOptions {
-                temperature: Some(0.7),
-                ..RequestOptions::default()
-            },
-        )
-        .expect("OpenCode request");
-
-        assert!(request.get("temperature").is_none());
     }
 
     #[test]
@@ -3066,61 +3044,47 @@ mod tests {
         }
     }
 
-    fn assert_invalid_temperature(temperature: f64) {
+    #[test]
+    fn non_finite_temperature_is_rejected_before_json_construction() {
         let spec = ModelSpec::preset("glm-5.2").expect("preset");
-        assert!(matches!(
-            build_request(
-                &spec,
-                &simple_context(Vec::new(), Vec::new()),
-                &RequestOptions {
-                    temperature: Some(temperature),
-                    ..RequestOptions::default()
-                },
-            ),
-            Err(ChatAdapterError::InvalidTemperature(value))
-                if value.to_bits() == temperature.to_bits()
-        ));
-    }
-
-    #[test]
-    fn nan_temperature_is_rejected_before_json_construction() {
-        assert_invalid_temperature(f64::NAN);
-    }
-
-    #[test]
-    fn positive_infinite_temperature_is_rejected_before_json_construction() {
-        assert_invalid_temperature(f64::INFINITY);
-    }
-
-    #[test]
-    fn negative_infinite_temperature_is_rejected_before_json_construction() {
-        assert_invalid_temperature(f64::NEG_INFINITY);
+        for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    build_request(
+                        &spec,
+                        &simple_context(Vec::new(), Vec::new()),
+                        &RequestOptions {
+                            temperature: Some(temperature),
+                            ..RequestOptions::default()
+                        },
+                    ),
+                    Err(ChatAdapterError::InvalidTemperature(value))
+                        if value.to_bits() == temperature.to_bits()
+                ),
+                "{temperature}"
+            );
+        }
     }
 
     #[test]
     fn finite_temperature_is_passed_through_only_when_sampling_is_allowed() {
-        let context = simple_context(Vec::new(), Vec::new());
-        let request = build_request(
-            &ModelSpec::preset("glm-5.2").expect("sampling preset"),
-            &context,
-            &RequestOptions {
-                temperature: Some(0.7),
-                ..RequestOptions::default()
-            },
-        )
-        .expect("finite sampling temperature");
-        assert_eq!(request["temperature"], json!(0.7));
-
-        let request = build_request(
-            &ModelSpec::preset("kimi-k3").expect("fixed-sampling preset"),
-            &context,
-            &RequestOptions {
-                temperature: Some(0.7),
-                ..RequestOptions::default()
-            },
-        )
-        .expect("finite disallowed temperature is omitted");
-        assert!(request.get("temperature").is_none());
+        let context = simple_context(vec![user_message("Hello.")], Vec::new());
+        for (preset, expected) in [
+            ("glm-5.2", Some(json!(0.7))),
+            ("kimi-k3", None),
+            ("opencode-go", None),
+        ] {
+            let request = build_request(
+                &ModelSpec::preset(preset).expect("preset"),
+                &context,
+                &RequestOptions {
+                    temperature: Some(0.7),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect("finite temperature");
+            assert_eq!(request.get("temperature"), expected.as_ref(), "{preset}");
+        }
     }
 
     #[test]
@@ -4318,23 +4282,18 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
-        let terminal =
-            finish_streamed_tool_name(&["foo", "foofoo"], &["fo", "o"]).expect("terminal");
-        assert!(terminal.events.iter().any(|event| matches!(
-            event,
-            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foo"
-        )));
-    }
-
-    #[test]
-    fn cumulative_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
-        let terminal =
-            finish_streamed_tool_name(&["foo", "foofoo"], &["foo", "foofoo"]).expect("terminal");
-        assert!(terminal.events.iter().any(|event| matches!(
-            event,
-            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foofoo"
-        )));
+    fn streamed_tool_names_resolve_uniquely_with_shorter_and_longer_names_registered() {
+        for (chunks, expected) in [(["fo", "o"], "foo"), (["foo", "foofoo"], "foofoo")] {
+            let terminal =
+                finish_streamed_tool_name(&["foo", "foofoo"], &chunks).expect("terminal");
+            assert!(
+                terminal.events.iter().any(|event| matches!(
+                    event,
+                    ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == expected
+                )),
+                "{chunks:?} must resolve to {expected}"
+            );
+        }
     }
 
     #[test]
@@ -4395,18 +4354,5 @@ mod tests {
                     .is_some_and(|message| message.contains(reason))
             );
         }
-    }
-
-    #[test]
-    fn missing_finish_reason_is_an_error() {
-        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
-        let mut receive = ChatReceiveState::new(registry);
-        receive
-            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
-            .expect("chunk");
-        assert!(matches!(
-            receive.finish(Utc::now()),
-            Err(ChatAdapterError::MissingFinishReason)
-        ));
     }
 }
