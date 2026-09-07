@@ -1,6 +1,7 @@
-//! Assemble a `PromptContext` from runtime state, applying overflow fallback,
-//! replay normalization (transform), 50KB user attachment truncation, and the
-//! provider-native vs Sumi three-layer mode decision.
+//! Assemble a `PromptContext` from runtime state, applying replay normalization,
+//! 50KB user attachment truncation, and the provider-native vs Sumi three-layer
+//! mode decision. Sumi assembly retains active experience until durable memory
+//! replacement; explicit overflow recovery is a separate operation.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -26,7 +27,7 @@ use crate::provider::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryBlock, MemoryLayer,
         Message, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderOrigin, ToolDefinition, UserContent,
-        VerifiedReplayProvenance,
+        UserMessage, VerifiedReplayProvenance,
     },
 };
 use crate::tools::executor::ArtifactBrokerClient;
@@ -45,6 +46,9 @@ pub struct ContextAssembler {
     // from different messages cannot reuse the wrong handle.
     attachment_handles: Mutex<HashMap<String, ([u8; 32], String)>>,
     hydrated_three_layer: Mutex<Option<HydratedThreeLayer>>,
+    // Armed only after the provider rejects an actual request for capacity.
+    // This changes the working view, never durable L0 membership.
+    recovery_budget: Mutex<Option<u64>>,
 }
 
 struct HydratedThreeLayer {
@@ -107,6 +111,29 @@ impl ReplayProvenance {
                 canonical_suffix_through_seq: *canonical_suffix_through_seq,
             },
         })
+    }
+}
+
+impl PromptContext {
+    /// Extend a validated send view without normalizing or rebuilding its
+    /// prefix. A synthetic user directive cannot change the persisted history
+    /// covered by either form of replay provenance.
+    pub(crate) fn with_appended_user_directive(
+        &self,
+        directive: UserMessage,
+    ) -> Result<Self, String> {
+        self.verified_replay_provenance()?;
+        let mut fork = self.clone();
+        fork.messages.push(ContextMessage::Synthetic {
+            message: Message::User(directive),
+        });
+        if let Some(provenance) = &self.replay_provenance {
+            fork.replay_provenance = Some(ReplayProvenance {
+                kind: provenance.kind.clone(),
+                seal: replay_binding_seal(&provenance.kind, fork.replay_send_view_digest()?)?,
+            });
+        }
+        Ok(fork)
     }
 }
 
@@ -213,6 +240,7 @@ impl ContextAssembler {
             attachment_handles: Mutex::new(HashMap::new()),
             spec,
             hydrated_three_layer: Mutex::new(None),
+            recovery_budget: Mutex::new(None),
         })
     }
 
@@ -335,11 +363,22 @@ impl ContextAssembler {
         let provider_context = self.bind_provider_context(&destination)?;
         let active_view =
             self.send_source_messages(context, provider_context.native_window.as_ref())?;
-        let mut messages = overflow.recover_context_with_provider_context(
-            active_view,
-            is_first_user_call,
-            &provider_context.items,
-        )?;
+        let recovery_budget = *self.recovery_budget.lock().expect("recovery budget lock");
+        let mut messages = match (self.mode, recovery_budget) {
+            (_, Some(budget)) => {
+                overflow.recover_context_to_budget(active_view, budget, &provider_context.items)?
+            }
+            // Active membership already accounts for durable memory replacements.
+            // Trimming here would erase the raw target from both the parent and
+            // its memory fork before either could decide what to retain.
+            (AssemblyMode::SumiThreeLayer, None) => active_view,
+            (AssemblyMode::ProviderNative, None) => overflow
+                .recover_context_with_provider_context(
+                    active_view,
+                    is_first_user_call,
+                    &provider_context.items,
+                )?,
+        };
         let canonical_through_seq = normalized_replay_through(&messages)?;
         messages = transform::transform(&messages, &destination);
 
@@ -384,6 +423,14 @@ impl ContextAssembler {
         &self,
         active_context: &[ContextMessage],
     ) -> Result<Vec<ContextMessage>> {
+        self.recover_overflow_with_output_reserve(active_context, self.spec.default_output_tokens)
+    }
+
+    pub(crate) fn recover_overflow_with_output_reserve(
+        &self,
+        active_context: &[ContextMessage],
+        output_reserve: u64,
+    ) -> Result<Vec<ContextMessage>> {
         let overflow = Overflow::new(self.calibration(), self.mode);
         let provider_context = self.bind_provider_context(&self.spec.origin())?;
 
@@ -399,7 +446,36 @@ impl ContextAssembler {
         // durable membership nor tries to imitate promotion in process memory.
         let active_view =
             self.send_source_messages(active_context, provider_context.native_window.as_ref())?;
-        overflow.recover_context_with_provider_context(active_view, false, &provider_context.items)
+        let (blocks, fixed_provider_context, _) =
+            self.assemble_provider_view(Vec::new(), &self.spec.origin(), &provider_context);
+        let overhead = self.calibration().effective_tokens(
+            self.compute_uncalibrated_estimate(&blocks, &[], &fixed_provider_context)?,
+            0,
+        )?;
+        let public = active_view
+            .iter()
+            .map(context_message_to_public)
+            .collect::<Vec<_>>();
+        let current = self.calibration().effective_tokens(
+            estimate_public_messages(&public)?,
+            provider_context_footprint_for_messages(&active_view, &provider_context.items)?,
+        )?;
+        // Leave headroom for request framing and calibration error, and shrink
+        // relative to the rejected view even if the provider's true limit is
+        // lower than its configured model window.
+        let model_budget = self
+            .spec
+            .context_window
+            .saturating_sub(output_reserve)
+            .saturating_sub(overhead)
+            .saturating_mul(3)
+            / 4;
+        let mut recovery_budget = self.recovery_budget.lock().expect("recovery budget lock");
+        let previous = recovery_budget.unwrap_or(current);
+        let budget = model_budget.min(previous.min(current).saturating_mul(3) / 4);
+        *recovery_budget = Some(budget);
+        drop(recovery_budget);
+        overflow.recover_context_to_budget(active_view, budget, &provider_context.items)
     }
 
     /// Install the exact calibration value returned by a committed
@@ -1016,9 +1092,22 @@ fn memory_blocks_from_three_layer(memory: &ThreeLayerMemory) -> Vec<MemoryBlock>
         });
     }
     for entry in memory.l1() {
+        // Adapters render memory text before live messages and do not expose
+        // time_range. An independently replaced batch may be newer than raw
+        // L0 that remains, so make the source and chronology visible in text.
+        let source = serde_json::json!({
+            "operation": "read",
+            "batch_id": entry.source_batch,
+            "limit": 5,
+        });
         blocks.push(MemoryBlock {
             layer: MemoryLayer::L1,
-            text: entry.summary.expose().to_owned(),
+            text: format!(
+                "[Memory fragment recorded {} through {}. Its position before live messages does not indicate chronology.]\nSource: memory_recall({source}). For further pages, pass next_after_seq as after_seq.\n{}",
+                entry.time_range.0.to_rfc3339(),
+                entry.time_range.1.to_rfc3339(),
+                entry.summary.expose(),
+            ),
             time_range: Some(entry.time_range),
         });
     }
@@ -1248,8 +1337,8 @@ mod tests {
     use crate::provider::{
         RequestOptions,
         types::{
-            RejectedToolCall, StopReason, ToolArgumentError, ToolResultMessage, UserMessage,
-            ValidatedToolArguments,
+            ParentContextSnapshot, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
+            ToolInvocationRoute, ToolResultMessage, UserMessage, ValidatedToolArguments,
         },
     };
     use chrono::Utc;
@@ -1316,6 +1405,70 @@ mod tests {
                 timestamp: Utc::now(),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_overflow_uses_a_recoverable_working_view_and_keeps_later_input() {
+        let mut spec = model_spec();
+        spec.context_window = 4_096;
+        spec.default_output_tokens = 512;
+        let assembler =
+            ContextAssembler::from_prompt_with_spec(simple_prompt(), spec).expect("assembler");
+        let old = user(&"original experience ".repeat(1_500), 1);
+        let correction = user(
+            "Correction: the updated explanation supersedes my first claim.",
+            2,
+        );
+        let mut canonical = vec![old.clone(), correction.clone()];
+        let first = assembler
+            .assemble(&canonical, 0)
+            .await
+            .expect("full first request");
+        assert!(
+            first.messages.contains(&old),
+            "no projection before actual overflow"
+        );
+
+        let preview = assembler
+            .recover_overflow(&canonical)
+            .expect("overflow projection");
+        assert!(!preview.contains(&old));
+        assert!(preview.contains(&correction));
+        let recovered = assembler
+            .assemble(&canonical, 1)
+            .await
+            .expect("retry request");
+        assert_eq!(recovered.messages, preview);
+        let ContextMessage::Synthetic {
+            message: Message::User(notice),
+        } = &preview[0]
+        else {
+            panic!("capacity notice is distinct from original history");
+        };
+        let UserContent::Text { text } = &notice.content[0] else {
+            panic!("text notice");
+        };
+        assert!(text.contains("sequence range 1..=1"));
+        assert!(text.contains("not been summarized or deleted"));
+        assert!(text.contains("\"operation\":\"read\",\"from_seq\":1"));
+        assert!(
+            canonical.contains(&old),
+            "canonical experience remains intact"
+        );
+
+        let later = user("Here is the next thing we need to discuss.", 3);
+        canonical.push(later.clone());
+        let next = assembler
+            .assemble(&canonical, 0)
+            .await
+            .expect("next user remains usable");
+        assert!(next.messages.contains(&correction));
+        assert!(next.messages.contains(&later));
+        assert!(!next.messages.contains(&old));
+        assert!(
+            next.replay_provenance.is_some(),
+            "recovery is a valid provider send view"
+        );
     }
 
     fn rejected_assistant(spec: &ModelSpec, seq: u64, id: &str) -> ContextMessage {
@@ -2167,6 +2320,369 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("引数検証に失敗"))
         );
+    }
+
+    #[test]
+    fn l1_fragment_exposes_original_batch_and_recorded_time_range() {
+        let source_batch = uuid::Uuid::now_v7();
+        let from = chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00.123456789Z")
+            .expect("start timestamp")
+            .with_timezone(&Utc);
+        let through = from + chrono::Duration::minutes(5);
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        memory.l1.push_back(crate::memory::L1Entry {
+            source_batch,
+            summary: crate::memory::DecryptedMemorySummary::new(
+                "Original fragment meaning.".into(),
+            ),
+            est_tokens: 5,
+            time_range: (from, through),
+        });
+        let blocks = memory_blocks_from_three_layer(&memory);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].time_range, Some((from, through)));
+        assert!(blocks[0].text.contains(&from.to_rfc3339()));
+        assert!(blocks[0].text.contains(&through.to_rfc3339()));
+        assert!(blocks[0].text.contains("does not indicate chronology"));
+        let read_args = blocks[0]
+            .text
+            .split("memory_recall(")
+            .nth(1)
+            .expect("actionable source read")
+            .split(").")
+            .next()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(read_args).expect("source read arguments"),
+            serde_json::json!({"operation": "read", "batch_id": source_batch, "limit": 5}),
+        );
+        assert!(blocks[0].text.contains("next_after_seq as after_seq"));
+        assert!(blocks[0].text.ends_with("Original fragment meaning."));
+    }
+
+    #[test]
+    fn parent_snapshot_fork_preserves_full_context_and_rendered_prefix() {
+        use crate::provider::adapters::{anthropic, chat_completions, responses};
+        use serde_json::{Value, json};
+
+        fn remove_cache_control(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("cache_control");
+                    for value in object.values_mut() {
+                        remove_cache_control(value);
+                    }
+                }
+                Value::Array(array) => array.iter_mut().for_each(remove_cache_control),
+                _ => {}
+            }
+        }
+
+        for mut spec in [model_spec(), responses_spec(), anthropic_spec()] {
+            let timestamp = chrono::DateTime::parse_from_rfc3339("2026-09-07T23:40:12.123456789Z")
+                .expect("precise timestamp")
+                .with_timezone(&Utc);
+            let mut prompt = simple_prompt();
+            prompt.system_prompt =
+                "The actual parent instructions, including current permissions.".into();
+            prompt.memory_blocks.push(MemoryBlock {
+                layer: MemoryLayer::L1,
+                text: "An earlier interpretation, since corrected by the latest message.".into(),
+                time_range: Some((timestamp, timestamp)),
+            });
+            prompt.tools.push(ToolDefinition {
+                name: "fixture".into(),
+                description: "Read a precise source.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}},
+                    "required": ["path"],
+                    "$defs": {"path": {"type": "string"}}
+                }),
+            });
+            let mut observation = user("Original observation", 1);
+            if let ContextMessage::Persisted {
+                message: Message::User(user),
+                ..
+            } = &mut observation
+            {
+                user.timestamp = timestamp;
+                user.content.push(UserContent::Image {
+                    data: "cGFyZW50LXVzZXItaW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                });
+            }
+            let mut assistant = assistant_with_thinking_for(&spec, 2, "parent reasoning", 1);
+            if let ContextMessage::Persisted {
+                message: Message::Assistant(assistant),
+                ..
+            } = &mut assistant
+            {
+                assistant.timestamp = timestamp;
+                assistant.stop_reason = StopReason::ToolUse;
+                assistant.content.push(AssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "call-with-stable-id".into(),
+                        name: "fixture".into(),
+                        route: ToolInvocationRoute::Elevated,
+                        arguments: serde_json::from_value(json!({"path": "/workspace/notes"}))
+                            .expect("tool arguments"),
+                    },
+                    wire_item_index: 2,
+                });
+            }
+            let mut result = tool_result(3, "call-with-stable-id");
+            if let ContextMessage::Persisted {
+                message: Message::ToolResult(result),
+                ..
+            } = &mut result
+            {
+                result.timestamp = timestamp;
+                result.details = json!({"line": 17, "complete": false, "observed": null});
+                result.content.push(UserContent::Image {
+                    data: "cGFyZW50LXRvb2wtaW1hZ2U=".into(),
+                    mime_type: "image/png".into(),
+                });
+            }
+            prompt.messages = vec![
+                observation,
+                assistant,
+                result,
+                user("Latest correction outside target", 4),
+            ];
+            let opaque_payload = match spec.protocol {
+                ApiProtocol::OpenAiChatCompletions => None,
+                ApiProtocol::OpenAiResponses => {
+                    Some(responses_reasoning_payload("opaque-parent-state"))
+                }
+                ApiProtocol::AnthropicMessages => {
+                    Some(ProviderContextPayload::EncryptedReasoning {
+                        protocol: ApiProtocol::AnthropicMessages,
+                        item: json!({"type": "thinking_signature", "signature": "parent-signature"}),
+                    })
+                }
+            };
+            if let Some(payload) = opaque_payload {
+                prompt.provider_context.push(ProviderContextItem {
+                    retention_owner: provider_context_owner("assistant-2", 2),
+                    origin_message: Some(provider_context_owner("assistant-2", 2)),
+                    // Responses opaque items occupy their own output slot;
+                    // Anthropic signatures bind the existing thinking block.
+                    wire_item_index: Some(match spec.protocol {
+                        ApiProtocol::OpenAiResponses => 3,
+                        ApiProtocol::AnthropicMessages => 1,
+                        ApiProtocol::OpenAiChatCompletions => unreachable!("no opaque Chat item"),
+                    }),
+                    ordinal: 0,
+                    provider_origin: spec.origin(),
+                    payload,
+                });
+            }
+            bind_sumi_normalized_replay(&mut prompt, spec.origin(), Some(4)).expect("bind parent");
+            let mut options = RequestOptions {
+                max_tokens: Some(8192),
+                reasoning_effort: match spec.protocol {
+                    ApiProtocol::OpenAiChatCompletions => Some("max".into()),
+                    ApiProtocol::OpenAiResponses => Some("high".into()),
+                    ApiProtocol::AnthropicMessages => None,
+                },
+                ..RequestOptions::default()
+            };
+            let original_prompt = prompt.clone();
+            let original_spec = spec.clone();
+            let original_options = options.clone();
+            let snapshot = ParentContextSnapshot::capture(&prompt, &spec, &options);
+            prompt.messages.clear();
+            spec.account_scope.push_str("-changed");
+            options.max_tokens = Some(4096);
+            assert_eq!(snapshot.prompt(), &original_prompt);
+            assert_eq!(snapshot.spec(), &original_spec);
+            assert_eq!(snapshot.options(), &original_options);
+
+            let directive = UserMessage {
+                content: vec![UserContent::Text {
+                    text: "Reorganize messages 1–3 using the whole context.".into(),
+                }],
+                timestamp,
+            };
+            let fork = snapshot
+                .fork_with_directive(directive.clone())
+                .expect("fork exact parent");
+            let mut expected = original_prompt.clone();
+            expected.messages.push(ContextMessage::Synthetic {
+                message: Message::User(directive),
+            });
+            assert_eq!(
+                serde_json::to_value(&fork).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                fork.verified_replay_provenance().unwrap(),
+                original_prompt.verified_replay_provenance().unwrap()
+            );
+            assert_eq!(
+                snapshot.prompt(),
+                &original_prompt,
+                "fork must not change its parent"
+            );
+
+            let render = |context: &PromptContext| match original_spec.protocol {
+                ApiProtocol::OpenAiChatCompletions => {
+                    chat_completions::build_request(&original_spec, context, &original_options)
+                        .expect("render Chat")
+                }
+                ApiProtocol::OpenAiResponses => {
+                    responses::build_request(&original_spec, context, &original_options)
+                        .expect("render Responses")
+                }
+                ApiProtocol::AnthropicMessages => {
+                    anthropic::build_request(&original_spec, context, &original_options)
+                        .expect("render Anthropic")
+                }
+            };
+            let mut parent_request = render(snapshot.prompt());
+            let mut fork_request = render(&fork);
+            let field = if original_spec.protocol == ApiProtocol::OpenAiResponses {
+                "input"
+            } else {
+                "messages"
+            };
+            let mut parent_messages = parent_request
+                .as_object_mut()
+                .unwrap()
+                .remove(field)
+                .unwrap();
+            let mut fork_messages = fork_request.as_object_mut().unwrap().remove(field).unwrap();
+            assert_eq!(
+                fork_request, parent_request,
+                "system, tools and request settings must remain exact"
+            );
+            if original_spec.protocol == ApiProtocol::AnthropicMessages {
+                // Anthropic merges adjacent users and moves its cache breakpoint
+                // to the appended block. Compare model-visible content, not that
+                // transport hint; this does not assert a measured cache hit.
+                remove_cache_control(&mut parent_messages);
+                remove_cache_control(&mut fork_messages);
+                let parent = parent_messages.as_array().unwrap();
+                let fork = fork_messages.as_array().unwrap();
+                let last = parent.len() - 1;
+                assert_eq!(fork.len(), parent.len());
+                assert_eq!(&fork[..last], &parent[..last]);
+                assert_eq!(fork[last]["role"], parent[last]["role"]);
+                let parent_content = parent[last]["content"].as_array().unwrap();
+                let fork_content = fork[last]["content"].as_array().unwrap();
+                assert_eq!(&fork_content[..parent_content.len()], parent_content);
+                assert_eq!(fork_content.len(), parent_content.len() + 1);
+            } else {
+                let parent = parent_messages.as_array().unwrap();
+                let fork = fork_messages.as_array().unwrap();
+                assert_eq!(&fork[..parent.len()], parent);
+                assert_eq!(fork.len(), parent.len() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn parent_snapshot_fork_preserves_native_continuation_and_coverage() {
+        for spec in [responses_spec(), anthropic_spec()] {
+            let mut prompt = simple_prompt();
+            let coverage = crate::provider::types::NativeCompactionCoverage {
+                through_message_seq: 3,
+                context_fingerprint: "parent-fingerprint".into(),
+            };
+            let payload = match spec.protocol {
+                ApiProtocol::OpenAiResponses => ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![
+                        serde_json::json!({"type": "compaction", "encrypted_content": "parent-native-state"}),
+                    ],
+                    coverage,
+                },
+                ApiProtocol::AnthropicMessages => ProviderContextPayload::AnthropicCompaction {
+                    block: serde_json::json!({"type": "compaction", "content": "parent-native-state"}),
+                    coverage,
+                },
+                _ => unreachable!(),
+            };
+            prompt.provider_context.push(ProviderContextItem {
+                retention_owner: provider_context_owner("native-owner-3", 3),
+                origin_message: None,
+                wire_item_index: None,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload,
+            });
+            prompt
+                .messages
+                .push(user("Correction after native window", 4));
+            bind_provider_native_exact_replay(&mut prompt, spec.origin(), 3, Some(4))
+                .expect("bind native parent");
+            let snapshot = ParentContextSnapshot::capture(
+                &prompt,
+                &spec,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            );
+            let fork = snapshot
+                .fork_with_directive(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "Organize the target with this same context.".into(),
+                    }],
+                    timestamp: Utc::now(),
+                })
+                .expect("fork native parent");
+            assert_eq!(fork.provider_context, prompt.provider_context);
+            assert_eq!(fork.messages[..prompt.messages.len()], prompt.messages);
+            assert_eq!(
+                fork.verified_replay_provenance_for(&spec.origin()).unwrap(),
+                prompt
+                    .verified_replay_provenance_for(&spec.origin())
+                    .unwrap()
+            );
+            assert!(snapshot.options().native_compaction);
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_sumi_assembly_retains_uncompacted_target_and_latest_experience() {
+        let old = (1..=5)
+            .map(|seq| user(&"x".repeat(48_000), seq))
+            .collect::<Vec<_>>();
+        let mut life_log = old.clone();
+        life_log.push(user("Latest correction after the hydrated snapshot", 6));
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        let mut target = L0Batch::new(old, 1, 0, 60_000);
+        target.state = BatchState::Sealed;
+        memory.push_l0(target);
+        for assembler in [assembler(), assembler().with_three_layer_memory(memory, 5)] {
+            for trigger in [
+                ProviderCallTrigger::FirstAfterUser,
+                ProviderCallTrigger::Continuation,
+            ] {
+                let assembled = assembler
+                    .assemble_for_call_with_estimate(&life_log, trigger)
+                    .await
+                    .expect("assemble active context");
+                assert!(assembled.uncalibrated_prompt_estimate > crate::memory::L0_LIMIT);
+                assert_eq!(
+                    assembled.prompt.messages, life_log,
+                    "a target may only be replaced by applied memory, not silently dropped before the fork"
+                );
+            }
+        }
     }
 
     #[test]

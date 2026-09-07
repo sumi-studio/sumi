@@ -1014,11 +1014,6 @@ pub(crate) struct MemoryBatchMutation {
     pub summary: Option<CompactResult>,
     pub est_tokens: u64,
     pub footprint_delta: i64,
-    /// When true, `apply_memory_batch_mutation` deletes all
-    /// `memory_batch_messages` rows for this batch and zeroes its
-    /// `eviction_footprint_tokens`. This is used when an L0 source batch is
-    /// dropped during promotion.
-    pub delete_membership: bool,
 }
 
 #[allow(
@@ -1049,6 +1044,14 @@ pub(crate) enum MemoryJobMutation {
         expected_attempt: i64,
         lease_witness: Option<String>,
         result: CompactResult,
+    },
+    /// Finish successfully without replacing the original source memory.
+    /// The same transition restores the source shelf and drops the unused
+    /// target. The attempt and lease witnesses reject a stale worker.
+    RetainOriginal {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
     },
     /// Mark a `running` job as failed. `expected_attempt` and `lease_witness`
     /// must match the durable row at the time the job was claimed and started.
@@ -1370,7 +1373,7 @@ struct PreparedMemoryBatchMutation {
     summary: Option<MemoryBatchSummary>,
     est_tokens: i64,
     footprint_delta: i64,
-    delete_membership: bool,
+    retire_l0: bool,
 }
 
 #[derive(Clone)]
@@ -5080,7 +5083,7 @@ impl EventWriter {
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
         for batch in transition.batch_mutations {
             let row = sqlx::query(
-                "SELECT version, state, est_tokens, eviction_footprint_tokens
+                "SELECT layer, version, state, est_tokens, eviction_footprint_tokens
                  FROM memory_batches WHERE id = ?",
             )
             .bind(batch.batch_id.to_string())
@@ -5113,15 +5116,20 @@ impl EventWriter {
             };
             post_source_versions.insert(batch.batch_id.to_string(), new_version);
 
-            // State-only transitions must preserve the existing token estimate,
-            // and dropping an L0 source batch must zero its eviction footprint.
+            // Original memberships remain durable locators for recall. Retiring
+            // L0 only removes its provider context and active eviction footprint.
+            let retire_l0 = row.try_get::<i64, _>("layer")? == MemoryLayer::L0.as_i64()
+                && matches!(
+                    batch.new_state,
+                    MemoryBatchState::Dropped | MemoryBatchState::Promoted
+                );
             let has_summary = batch.summary.is_some();
             let est_tokens = if has_summary {
                 sqlite_i64(batch.est_tokens, "batch est_tokens")?
             } else {
                 old_est_tokens
             };
-            let footprint_delta = if batch.delete_membership {
+            let footprint_delta = if retire_l0 {
                 old_footprint
                     .checked_neg()
                     .ok_or_else(|| anyhow!("memory batch footprint overflow"))?
@@ -5156,7 +5164,7 @@ impl EventWriter {
                 summary,
                 est_tokens,
                 footprint_delta,
-                delete_membership: batch.delete_membership,
+                retire_l0,
             });
         }
 
@@ -5286,6 +5294,20 @@ impl EventWriter {
                 job_id,
                 "running",
                 "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::RetainOriginal {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "unchanged",
                 0,
                 Some(expected_attempt),
                 lease_witness,
@@ -8226,6 +8248,7 @@ fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
         MemoryJobMutation::Claim { job_id, .. }
         | MemoryJobMutation::Start { job_id, .. }
         | MemoryJobMutation::Complete { job_id, .. }
+        | MemoryJobMutation::RetainOriginal { job_id, .. }
         | MemoryJobMutation::Fail { job_id, .. }
         | MemoryJobMutation::Reclaim { job_id, .. }
         | MemoryJobMutation::Apply { job_id, .. }
@@ -8895,6 +8918,18 @@ fn memory_job_mutation_preflight_bytes(
                 job_id,
                 "running",
                 "failed",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::RetainOriginal {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "running",
+                "unchanged",
                 lease_witness.as_ref().map_or(0, String::len),
                 0,
                 0,
@@ -14673,7 +14708,7 @@ async fn apply_memory_batch_mutation(
             );
         }
     }
-    if batch.delete_membership {
+    if batch.retire_l0 {
         let owner_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT m.id, m.seq
              FROM memory_batch_messages mbm
@@ -14698,23 +14733,6 @@ async fn apply_memory_batch_mutation(
                 .erase_for_retention_owners(transaction, &dropped_owners),
         )
         .await?;
-
-        sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
-            .bind(&batch.batch_id)
-            .execute(&mut **transaction)
-            .await
-            .context("failed to delete memory batch membership")?;
-        let empty_membership = memory_membership_seed(store.scope(), &batch.batch_id);
-        sqlx::query(
-            "UPDATE memory_batches
-             SET membership_count = 0, membership_digest = ?
-             WHERE id = ?",
-        )
-        .bind(empty_membership.as_slice())
-        .bind(&batch.batch_id)
-        .execute(&mut **transaction)
-        .await
-        .context("failed to reset memory batch membership commitment")?;
     }
 
     let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
@@ -30589,7 +30607,6 @@ mod tests {
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
-                        delete_membership: false,
                     }],
                     job_mutations: Vec::new(),
                     cursor_advance: None,
@@ -32494,9 +32511,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_job_terminal_clears_lease_until() {
+    async fn memory_job_unchanged_clears_lease_without_result_or_new_attempt() {
         let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
         let lease = Utc::now().to_rfc3339();
+        let source_versions = serde_json::to_string(&BTreeMap::from([(Uuid::now_v7(), 2)]))
+            .expect("serialize post-transition source version");
+        let retained = writer
+            .prepare_memory_job_mutation(
+                &mut BTreeMap::new(),
+                MemoryJobMutation::RetainOriginal {
+                    job_id: "lease-job".to_owned(),
+                    expected_attempt: 1,
+                    lease_witness: Some(lease.clone()),
+                },
+                Some(source_versions.clone()),
+            )
+            .await
+            .expect("prepare retained-original outcome");
         let mut transaction = store.pool().begin().await.expect("begin transaction");
         sqlx::query(
             "INSERT INTO memory_jobs(
@@ -32514,30 +32546,29 @@ mod tests {
         .await
         .expect("insert running job with lease");
 
-        apply_memory_job_mutation(
-            &store,
-            &mut transaction,
-            PreparedMemoryJobMutation {
-                job_id: "lease-job".to_owned(),
-                expected_status: "running",
-                new_status: "failed",
-                attempts: 1,
-                attempts_delta: 0,
-                new_lease_until: None,
-                expected_lease_until: Some(lease.clone()),
-                source_versions: None,
-                result: None,
-            },
-        )
-        .await
-        .expect("terminal transition must clear lease");
-
-        let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
-            .bind("lease-job")
-            .fetch_one(&mut *transaction)
+        apply_memory_job_mutation(&store, &mut transaction, retained.clone())
             .await
-            .expect("load job");
-        assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
+            .expect("terminal transition must clear lease");
+
+        let row = sqlx::query(
+            "SELECT status, lease_until, attempts, source_versions, result_key_ref
+             FROM memory_jobs WHERE id = ?",
+        )
+        .bind("lease-job")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("load job");
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "unchanged");
+        assert_eq!(row.try_get::<i64, _>("attempts").unwrap(), 1);
+        assert_eq!(
+            row.try_get::<String, _>("source_versions").unwrap(),
+            source_versions
+        );
+        assert!(
+            row.try_get::<Option<String>, _>("result_key_ref")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             row.try_get::<Option<String>, _>("lease_until")
                 .unwrap()
@@ -32545,23 +32576,9 @@ mod tests {
             "terminal job must have NULL lease_until"
         );
 
-        let error = apply_memory_job_mutation(
-            &store,
-            &mut transaction,
-            PreparedMemoryJobMutation {
-                job_id: "lease-job".to_owned(),
-                expected_status: "failed",
-                new_status: "applied",
-                attempts: 1,
-                attempts_delta: 0,
-                new_lease_until: None,
-                expected_lease_until: Some(lease),
-                source_versions: None,
-                result: None,
-            },
-        )
-        .await
-        .expect_err("stale lease CAS must fail");
+        let error = apply_memory_job_mutation(&store, &mut transaction, retained)
+            .await
+            .expect_err("stale worker must not transition a terminal job again");
         assert!(
             error.to_string().contains("CAS expected one row"),
             "{error:#}"
@@ -32597,7 +32614,7 @@ mod tests {
                 }),
                 est_tokens: 0,
                 footprint_delta: 0,
-                delete_membership: false,
+                retire_l0: false,
             },
             &store,
         )
@@ -32670,7 +32687,7 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: 1,
-                delete_membership: false,
+                retire_l0: false,
             },
             &store,
         )
@@ -32704,7 +32721,7 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: -1,
-                delete_membership: false,
+                retire_l0: false,
             },
             &store,
         )
@@ -32728,7 +32745,7 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: -1,
-                delete_membership: false,
+                retire_l0: false,
             },
             &store,
         )

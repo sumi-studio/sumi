@@ -18,7 +18,7 @@ use crate::memory::{
 };
 use crate::provider::types::{
     AssistantContent, AssistantMessage, ContextMessage, Message, PublicAssistantContent,
-    PublicAssistantMessage, PublicMessage, ToolResultMessage, UserMessage,
+    PublicAssistantMessage, PublicMessage, ToolResultMessage, UserContent, UserMessage,
 };
 
 /// Hard-trigger multiplier for the first user call: 1.2x L0_LIMIT.
@@ -123,6 +123,41 @@ impl Overflow {
         is_first_user_call: bool,
         provider_context: &[ProviderContextItemWithFootprint],
     ) -> Result<Vec<ContextMessage>> {
+        let threshold = if is_first_user_call {
+            Self::l0_hard_limit()
+        } else {
+            L0_LIMIT
+        };
+        self.recover_context_with_limits(messages, threshold, L0_DROP_TO, provider_context, false)
+    }
+
+    /// A temporary working-view projection after an actual provider capacity
+    /// rejection. Original messages remain in the canonical private history;
+    /// the capacity notice provides stable reread coordinates, not a summary.
+    pub(crate) fn recover_context_to_budget(
+        &self,
+        messages: Vec<ContextMessage>,
+        budget: u64,
+        provider_context: &[ProviderContextItemWithFootprint],
+    ) -> Result<Vec<ContextMessage>> {
+        let notice_headroom = budget.min(512);
+        self.recover_context_with_limits(
+            messages,
+            budget,
+            budget.saturating_sub(notice_headroom),
+            provider_context,
+            true,
+        )
+    }
+
+    fn recover_context_with_limits(
+        &self,
+        messages: Vec<ContextMessage>,
+        action_threshold: u64,
+        target: u64,
+        provider_context: &[ProviderContextItemWithFootprint],
+        include_capacity_notice: bool,
+    ) -> Result<Vec<ContextMessage>> {
         if messages.is_empty() {
             return Ok(messages);
         }
@@ -149,11 +184,6 @@ impl Overflow {
         }
 
         let effective = Self::effective_l0(total_est, total_footprint, self.calib)?;
-        let action_threshold = if is_first_user_call {
-            Self::l0_hard_limit()
-        } else {
-            L0_LIMIT
-        };
         if effective <= action_threshold {
             return Ok(messages);
         }
@@ -185,7 +215,8 @@ impl Overflow {
             unit_costs.push_back(cost);
         }
 
-        while Self::effective_l0(total_est, total_footprint, self.calib)? > L0_DROP_TO {
+        let mut omitted = Vec::new();
+        while Self::effective_l0(total_est, total_footprint, self.calib)? > target {
             let can_drop_front = match last_user_unit {
                 Some(index) => index > 0,
                 None => !units.is_empty(),
@@ -198,7 +229,7 @@ impl Overflow {
                 .ok_or(OverflowError::ArithmeticOverflow)?;
             total_est = total_est.saturating_sub(dropped_est);
             total_footprint = total_footprint.saturating_sub(dropped_footprint);
-            units.pop_front();
+            omitted.extend(units.pop_front().expect("droppable unit exists"));
             if let Some(index) = last_user_unit.as_mut() {
                 // `*index > 0` was checked above; remaining units are now
                 // before the preserved latest user by one fewer position.
@@ -206,7 +237,11 @@ impl Overflow {
             }
         }
 
-        Ok(units.into_iter().flatten().collect())
+        let mut retained = units.into_iter().flatten().collect::<Vec<_>>();
+        if include_capacity_notice && let Some(notice) = capacity_notice(&omitted) {
+            retained.insert(0, notice);
+        }
+        Ok(retained)
     }
 
     /// Apply L0 overflow by FIFO-promoting the oldest non-open L0 batches that
@@ -277,6 +312,47 @@ impl Overflow {
         }
         Ok(report)
     }
+}
+
+fn capacity_notice(omitted: &[ContextMessage]) -> Option<ContextMessage> {
+    let persisted = omitted
+        .iter()
+        .filter_map(|message| match message {
+            ContextMessage::Persisted { seq, message, .. } => Some((*seq, message)),
+            ContextMessage::Synthetic { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let (first_seq, first) = persisted.first().copied()?;
+    let (last_seq, last) = persisted.last().copied()?;
+    let timestamp = |message: &Message| match message {
+        Message::User(message) => message.timestamp,
+        Message::Assistant(message) => message.timestamp,
+        Message::ToolResult(message) => message.timestamp,
+    };
+    let from = timestamp(first);
+    let to = timestamp(last);
+    Some(ContextMessage::Synthetic {
+        message: Message::User(UserMessage {
+            timestamp: to,
+            content: vec![UserContent::Text {
+                text: format!(
+                    "[Working-context capacity notice; not a new user message]\n\
+             {} earlier raw entries from private history, sequence range {}..={}, message timestamps {} through {}, \
+             are outside this working view because the provider rejected its size. They have not been summarized or deleted. \
+             Their contents and any uncertainty about them remain in your original private history. \
+             Reread with memory_recall({{\"operation\":\"read\",\"from_seq\":{},\"limit\":5}}), \
+             following next_after_seq while needed through sequence {}. Do not treat this omission as evidence that those experiences were unimportant.",
+                    persisted.len(),
+                    first_seq,
+                    last_seq,
+                    from.to_rfc3339(),
+                    to.to_rfc3339(),
+                    first_seq,
+                    last_seq,
+                ),
+            }],
+        }),
+    })
 }
 
 /// Partition the persisted runtime view at replay-safe boundaries. A tool

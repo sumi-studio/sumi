@@ -122,7 +122,9 @@ pub enum ApiProtocol {
 }
 
 /// Non-secret identity of the provider boundary that produced an assistant
-/// message. Plaintext reasoning may only be replayed to this exact origin.
+/// message. Native reasoning replay is restricted to this exact origin.
+/// Deliberately recalled public text is historical tool content, not native
+/// reasoning replay; opaque provider state is never exposed through recall.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderOrigin {
     pub provider_instance_id: String,
@@ -1106,6 +1108,53 @@ pub struct PromptContext {
     pub tools: Vec<ToolDefinition>,
     #[serde(skip)]
     pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
+}
+
+/// An immutable copy of one actual parent provider input. The memory target
+/// describes what a fork may reorganize; it does not narrow this input.
+///
+/// Capture after assembly and any per-attempt option changes. Keep the full
+/// prompt, including tool definitions, multimodal messages and provider
+/// continuation, together with the model and options used for that request.
+/// This is an in-process snapshot, not a reconstructed or serialized transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParentContextSnapshot {
+    prompt: PromptContext,
+    spec: super::model::ModelSpec,
+    options: super::model::RequestOptions,
+}
+
+impl ParentContextSnapshot {
+    pub fn capture(
+        prompt: &PromptContext,
+        spec: &super::model::ModelSpec,
+        options: &super::model::RequestOptions,
+    ) -> Self {
+        Self {
+            prompt: prompt.clone(),
+            spec: spec.clone(),
+            options: options.clone(),
+        }
+    }
+
+    pub fn prompt(&self) -> &PromptContext {
+        &self.prompt
+    }
+
+    pub fn spec(&self) -> &super::model::ModelSpec {
+        &self.spec
+    }
+
+    pub fn options(&self) -> &super::model::RequestOptions {
+        &self.options
+    }
+
+    /// Append the memory instruction after the unchanged parent prompt.
+    /// Provider replay provenance remains bound to the same origin and
+    /// persisted history while authenticating the additional synthetic turn.
+    pub fn fork_with_directive(&self, directive: UserMessage) -> Result<PromptContext, String> {
+        self.prompt.with_appended_user_directive(directive)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

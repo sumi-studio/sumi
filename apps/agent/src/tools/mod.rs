@@ -19,6 +19,7 @@ pub(crate) mod bound;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod fs;
+pub(crate) mod memory;
 pub(crate) mod messaging;
 pub mod shell_capture;
 pub mod truncate;

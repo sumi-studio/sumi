@@ -2,19 +2,57 @@
 //!
 //! This module owns the durable `messages` row shape and the single public
 //! constructor that turns a `PublicMessage` into an encrypted record plus a
-//! redacted projection.  It deliberately does not expose the plaintext after
-//! construction so that repair/provider-context plaintext cannot cross into
-//! transcript types.
+//! redacted projection. Private recall only opens authenticated PublicMessage
+//! rows; provider-context and repair plaintext never enter this boundary.
 
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use sqlx::Row;
+use zeroize::Zeroizing;
 
 use crate::provider::types::{PublicAssistantMessage, PublicMessage};
 
 use super::redactor::search_text_from_projection;
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, PublicProjectionBuilder, Redactor};
+
+/// Open an original transcript for the same individual who experienced it.
+/// Opaque provider continuation state has a separate type, table and key purpose.
+/// Persisted plain thinking remains part of that individual's readable history;
+/// this boundary does not construct a native provider reasoning replay block.
+pub(super) fn decrypt_transcript_row(
+    row: &sqlx::sqlite::SqliteRow,
+    key: &DataKeyMaterial,
+    scope: &AgentScope,
+    redactor: &Redactor,
+) -> Result<PublicMessage> {
+    if key.purpose != DataKeyPurpose::Transcript {
+        bail!("private recall requires a transcript data key");
+    }
+    let id: String = row.try_get("id")?;
+    let aad = scope.row_aad("messages", &id, DataKeyPurpose::Transcript);
+    let raw = Zeroizing::new(super::decrypt_content(
+        key,
+        &row.try_get::<Vec<u8>, _>("raw_ciphertext")?,
+        &aad,
+    )?);
+    let message: PublicMessage =
+        serde_json::from_slice(&raw).context("private transcript is not a PublicMessage")?;
+    if row.try_get::<String, _>("role")? != public_message_role(&message)
+        || (row.try_get::<i64, _>("interrupted")? != 0) != message_interrupted(&message)
+        || row.try_get::<i64, _>("redaction_version")? != i64::from(redactor.version())
+    {
+        bail!("private transcript metadata does not match its original");
+    }
+    let projection = redactor.redact_serialized(&raw)?;
+    if projection != row.try_get::<String, _>("payload")?
+        || search_text_from_projection(&projection)? != row.try_get::<String, _>("search_text")?
+    {
+        bail!("private transcript projection does not match its original");
+    }
+    Ok(message)
+}
 
 pub(crate) fn message_interrupted(message: &PublicMessage) -> bool {
     match message {

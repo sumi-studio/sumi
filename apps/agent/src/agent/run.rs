@@ -194,12 +194,18 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     /// This narrower check exists for unhydrated test fixtures only.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
-    /// T21 idle maintenance must return true only after its durable transition
+    /// Idle maintenance must return true only after its durable transition
     /// and ContextAssembler refresh have both completed.
     async fn apply_idle_memory_maintenance(&self, _core: &mut RunCore) -> Result<bool> {
         Err(anyhow::anyhow!(
             "idle memory maintenance is not wired to the authoritative Store/EventWriter path"
         ))
+    }
+
+    /// A completed background memory result wakes the Session without taking
+    /// ownership of its live RunCore. Implementations without memory stay idle.
+    async fn memory_maintenance_ready(&self) {
+        std::future::pending::<()>().await;
     }
 
     async fn start_provider_for_command(
@@ -358,6 +364,10 @@ impl RunWorker for SequentialRunWorker {
         core: &'a mut RunCore,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move { self.driver.apply_idle_memory_maintenance(core).await })
+    }
+
+    fn memory_maintenance_ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.driver.memory_maintenance_ready())
     }
 
     fn run(

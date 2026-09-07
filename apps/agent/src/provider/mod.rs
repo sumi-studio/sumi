@@ -14,6 +14,9 @@ pub mod retry;
 pub mod transport;
 pub mod types;
 
+#[cfg(test)]
+mod memory_fork_tests;
+
 use std::{
     env,
     future::Future,
