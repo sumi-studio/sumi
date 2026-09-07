@@ -576,30 +576,7 @@ func (s *WSServer) writeControlError(conn *websocket.Conn, code, clientNonce str
 	_ = conn.WriteMessage(websocket.TextMessage, frame)
 }
 
-// storeErrorCode mirrors writeStoreError for the WS error frame.
 func storeErrorCode(err error) string {
-	switch {
-	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
-		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound),
-		errors.Is(err, ErrMarkerNotFound):
-		return "not_found"
-	case errors.Is(err, ErrNotAMember):
-		return "not_a_member"
-	case errors.Is(err, ErrNotAuthor):
-		return "not_author"
-	case errors.Is(err, ErrForbidden):
-		return "forbidden"
-	case errors.Is(err, ErrNotReachable):
-		return "not_reachable"
-	case errors.Is(err, ErrMessageDeleted):
-		return "message_deleted"
-	case errors.Is(err, ErrSeqBeyondLatest):
-		return "seq_beyond_latest"
-	case errors.Is(err, ErrNotAChannel):
-		return "not_a_channel"
-	case errors.Is(err, ErrInvalidNotificationSetting):
-		return "invalid_notification_setting"
-	default:
-		return "internal"
-	}
+	_, code := storeErrorResponse(err)
+	return code
 }

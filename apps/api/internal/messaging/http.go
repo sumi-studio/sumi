@@ -1919,84 +1919,89 @@ func writeThreadCreateError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
-// writeStoreError maps store sentinels to transport codes. Unknown errors are
-// internal: the handlers validate request shape up front, so anything else is
-// a bug or an infrastructure failure.
 func writeStoreError(w http.ResponseWriter, err error) {
+	status, code := storeErrorResponse(err)
+	writeError(w, status, code)
+}
+
+// storeErrorResponse is shared by REST responses and WebSocket error frames.
+// Unknown failures remain internal; known request failures keep the same code
+// so clients can recover consistently across transports.
+func storeErrorResponse(err error) (int, string) {
 	switch {
 	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
 		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrParticipantNotFound),
 		errors.Is(err, ErrMarkerNotFound):
-		writeError(w, http.StatusNotFound, "not_found")
+		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrNotAMember):
-		writeError(w, http.StatusForbidden, "not_a_member")
+		return http.StatusForbidden, "not_a_member"
 	case errors.Is(err, ErrNotAuthor):
-		writeError(w, http.StatusForbidden, "not_author")
+		return http.StatusForbidden, "not_author"
 	case errors.Is(err, ErrForbidden):
-		writeError(w, http.StatusForbidden, "forbidden")
+		return http.StatusForbidden, "forbidden"
 	case errors.Is(err, ErrNotReachable):
-		writeError(w, http.StatusForbidden, "not_reachable")
+		return http.StatusForbidden, "not_reachable"
 	case errors.Is(err, ErrMessageDeleted):
-		writeError(w, http.StatusConflict, "message_deleted")
+		return http.StatusConflict, "message_deleted"
 	case errors.Is(err, ErrMessageRevisionConflict):
-		writeError(w, http.StatusConflict, "edit_conflict")
+		return http.StatusConflict, "edit_conflict"
 	case errors.Is(err, ErrIdempotencyConflict):
-		writeError(w, http.StatusConflict, "idempotency_conflict")
+		return http.StatusConflict, "idempotency_conflict"
 	case errors.Is(err, ErrAttachmentNotFound):
-		writeError(w, http.StatusNotFound, "not_found")
+		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrAttachmentTooLarge):
-		writeError(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return http.StatusRequestEntityTooLarge, "attachment_too_large"
 	case errors.Is(err, ErrAttachmentSizeMismatch):
-		writeError(w, http.StatusBadRequest, "attachment_size_mismatch")
+		return http.StatusBadRequest, "attachment_size_mismatch"
 	case errors.Is(err, ErrAttachmentQuotaExceeded):
-		writeError(w, http.StatusInsufficientStorage, "attachment_quota_exceeded")
+		return http.StatusInsufficientStorage, "attachment_quota_exceeded"
 	case errors.Is(err, ErrAttachmentDraftLimit):
-		writeError(w, http.StatusConflict, "attachment_draft_limit")
+		return http.StatusConflict, "attachment_draft_limit"
 	case errors.Is(err, ErrAttachmentUploadConflict):
-		writeError(w, http.StatusConflict, "attachment_upload_conflict")
+		return http.StatusConflict, "attachment_upload_conflict"
 	case errors.Is(err, ErrAttachmentUploadExpired):
-		writeError(w, http.StatusGone, "attachment_upload_expired")
+		return http.StatusGone, "attachment_upload_expired"
 	case errors.Is(err, ErrAttachmentUploadRetired):
-		writeError(w, http.StatusGone, "attachment_upload_retired")
+		return http.StatusGone, "attachment_upload_retired"
 	case errors.Is(err, ErrAttachmentAlreadySent):
-		writeError(w, http.StatusConflict, "attachment_already_sent")
+		return http.StatusConflict, "attachment_already_sent"
 	case errors.Is(err, ErrTooManyAttachments):
-		writeError(w, http.StatusBadRequest, "too_many_attachments")
+		return http.StatusBadRequest, "too_many_attachments"
 	case errors.Is(err, ErrAttachmentsUnavailable):
-		writeError(w, http.StatusServiceUnavailable, "attachments_unavailable")
+		return http.StatusServiceUnavailable, "attachments_unavailable"
 	case errors.Is(err, ErrSeqBeyondLatest):
-		writeError(w, http.StatusBadRequest, "seq_beyond_latest")
+		return http.StatusBadRequest, "seq_beyond_latest"
 	case errors.Is(err, ErrNotAChannel):
-		writeError(w, http.StatusBadRequest, "not_a_channel")
+		return http.StatusBadRequest, "not_a_channel"
 	case errors.Is(err, ErrNotThreadable):
-		writeError(w, http.StatusBadRequest, "not_threadable")
+		return http.StatusBadRequest, "not_threadable"
 	case errors.Is(err, ErrThreadExists):
-		writeError(w, http.StatusConflict, "thread_exists")
+		return http.StatusConflict, "thread_exists"
 	case errors.Is(err, ErrInvalidPoll), errors.Is(err, ErrPollSingleChoice):
-		writeError(w, http.StatusBadRequest, "invalid_poll")
+		return http.StatusBadRequest, "invalid_poll"
 	case errors.Is(err, ErrPollNotFound), errors.Is(err, ErrPollOptionNotFound):
-		writeError(w, http.StatusNotFound, "poll_not_found")
+		return http.StatusNotFound, "poll_not_found"
 	case errors.Is(err, ErrPollClosed):
-		writeError(w, http.StatusConflict, "poll_closed")
+		return http.StatusConflict, "poll_closed"
 	case errors.Is(err, ErrInvalidChannelName):
-		writeError(w, http.StatusBadRequest, "invalid_name")
+		return http.StatusBadRequest, "invalid_name"
 	case errors.Is(err, ErrEmptyChannelUpdate):
-		writeError(w, http.StatusBadRequest, "invalid_request")
+		return http.StatusBadRequest, "invalid_request"
 	case errors.Is(err, ErrInvalidNotificationSetting):
-		writeError(w, http.StatusBadRequest, "invalid_notification_setting")
+		return http.StatusBadRequest, "invalid_notification_setting"
 	case errors.Is(err, ErrInvalidPushSubscription):
-		writeError(w, http.StatusBadRequest, "invalid_push_subscription")
+		return http.StatusBadRequest, "invalid_push_subscription"
 	case errors.Is(err, ErrPushSubscriptionOwned):
-		writeError(w, http.StatusConflict, "push_subscription_owned")
+		return http.StatusConflict, "push_subscription_owned"
 	case errors.Is(err, ErrPushSubscriptionLimit):
-		writeError(w, http.StatusConflict, "push_subscription_limit")
+		return http.StatusConflict, "push_subscription_limit"
 	case errors.Is(err, ErrInvalidScope):
-		writeError(w, http.StatusBadRequest, "invalid_scope")
+		return http.StatusBadRequest, "invalid_scope"
 	case errors.Is(err, applicationapps.ErrInstallationNotFound):
-		writeError(w, http.StatusNotFound, "installation_not_found")
+		return http.StatusNotFound, "installation_not_found"
 	case errors.Is(err, applicationapps.ErrAppDisabled):
-		writeError(w, http.StatusForbidden, "app_disabled")
+		return http.StatusForbidden, "app_disabled"
 	default:
-		writeError(w, http.StatusInternalServerError, "internal")
+		return http.StatusInternalServerError, "internal"
 	}
 }
