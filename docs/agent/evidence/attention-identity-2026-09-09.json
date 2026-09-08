@@ -1,0 +1,149 @@
+{
+  "status": "PASSED",
+  "sha": "bc49022a7bfef70b659a5e6c6478ae165698ffa1",
+  "images": {
+    "api": "sha256:700bc88c24f9b9768c1c5fdb31cdcf4ef2fbb7ca9ab06a2d47ec173de37b2334",
+    "agent": "sha256:2466c492a5bc7814c4046aba9fa58e49b5b504a457b4b136b0e6a81534e0b6c4",
+    "provisioner": "sha256:afdff66717f5680c92036c1f575169658c056cc5d400a64f023c011a39cf6a0e",
+    "web": "sha256:b56f3d1f3b0a17d8e8b05d5e5e7def40abf3099090b1b3f70f60c2809de4824d"
+  },
+  "logReload": {
+    "matched": true,
+    "through_seq": 46,
+    "completed_summary_count": 0
+  },
+  "cleanup": {
+    "apps": [
+      {
+        "id": "01a0819b-aada-7947-ba3b-8946d326db5c",
+        "disabled": true
+      },
+      {
+        "id": "01a0819b-aacb-7881-965f-3b5000528a40",
+        "disabled": true
+      }
+    ],
+    "sessionRevoked": true,
+    "stoppedRuntime": [
+      "71f2a800441f18a709a2a2a82383c7a69240e92d988439130de0bdd0570e5bb6",
+      "110df462eab9cc180f6b1f0d2f4de97c01e1495ccc30cfcd23b9a8628bcba22f",
+      "dd6fb816ded83fa8b97966972c14fcb2469db68ea648435ba467ef82b39927ad",
+      "fe6069224c4eab0ba73f89a043de17abcc8ab4fe726237b76071c17805546cf0"
+    ],
+    "browserClosed": true,
+    "retainedIdentityAndHistory": true
+  },
+  "limitations": [
+    "Invitation acceptance uses a separate setup-only DirectChat turn.",
+    "No claim of native Astra, all concurrency cases, or rendered UI quality."
+  ],
+  "provider": "opencode-go/kimi-k2.7-code",
+  "original_reminder_marker": "01a0819d-9890-723c-a9bd-3cf613f6ea6a",
+  "matched_tool_events": [
+    {
+      "seq": 97,
+      "audience": "secretary",
+      "type": "tool_execution_start",
+      "tool_call_id": "462ada00-e8dc-5760-8f97-ea1920d75104",
+      "name": "messaging",
+      "args": {
+        "action": "write",
+        "content": "REMINDER_DUE_f10ae244cf60",
+        "workspace_id": "01a0819b-aaa1-7390-8163-105ef58eb16c"
+      }
+    },
+    {
+      "seq": 98,
+      "audience": "secretary",
+      "type": "tool_execution_end",
+      "tool_call_id": "462ada00-e8dc-5760-8f97-ea1920d75104",
+      "is_error": false,
+      "details": {
+        "client_nonce": "msg-438a14804e8cac23d9195dc02210d036ebfc1bc0a03c88424ce352152b998d02",
+        "created": true,
+        "message_id": "01a0819e-c4e1-7d9c-b97a-827f769c9a85",
+        "seq": 5
+      }
+    },
+    {
+      "seq": 105,
+      "audience": "secretary",
+      "type": "tool_execution_start",
+      "tool_call_id": "2437f2a1-8f36-5b9c-a9a9-a41087fb1463",
+      "name": "messaging",
+      "args": {
+        "action": "resolve_reply_later",
+        "marker_id": "01a0819d-9890-723c-a9bd-3cf613f6ea6a",
+        "workspace_id": "01a0819b-aaa1-7390-8163-105ef58eb16c"
+      }
+    },
+    {
+      "seq": 106,
+      "audience": "secretary",
+      "type": "tool_execution_end",
+      "tool_call_id": "2437f2a1-8f36-5b9c-a9a9-a41087fb1463",
+      "is_error": false,
+      "details": {
+        "marker": {
+          "marker_id": "01a0819d-9890-723c-a9bd-3cf613f6ea6a",
+          "message_id": "01a0819d-156e-7006-873e-a9681a57a32f",
+          "note": "REMINDER_DUE_f10ae244cf60",
+          "participant": {
+            "kind": "personality_agent",
+            "personality_agent_id": "01a0819b-a5f1-76cb-9e14-80848c5fd525"
+          },
+          "place": {
+            "dm_id": "01a0819c-1853-7956-9d08-f1f0c4d16208",
+            "kind": "dm"
+          },
+          "remind_at": "2026-09-08T15:24:04.201995Z",
+          "resolved": true
+        }
+      }
+    },
+    {
+      "seq": 137,
+      "audience": "secretary",
+      "type": "tool_execution_start",
+      "tool_call_id": "55f151d5-9e31-5b16-a34e-b130a655cb51",
+      "name": "messaging",
+      "args": {
+        "action": "resolve_reply_later",
+        "marker_id": "01a0819f-3f2d-7953-8231-6fabcc151001",
+        "workspace_id": "01a0819b-aaa1-7390-8163-105ef58eb16c"
+      }
+    },
+    {
+      "seq": 138,
+      "audience": "secretary",
+      "type": "tool_execution_end",
+      "tool_call_id": "55f151d5-9e31-5b16-a34e-b130a655cb51",
+      "is_error": false,
+      "details": {
+        "marker": {
+          "marker_id": "01a0819f-3f2d-7953-8231-6fabcc151001",
+          "message_id": "01a0819f-04f9-7b9b-844c-bcce1f358a4c",
+          "note": "CANCELLED_f10ae244cf60",
+          "participant": {
+            "kind": "personality_agent",
+            "personality_agent_id": "01a0819b-a5f1-76cb-9e14-80848c5fd525"
+          },
+          "place": {
+            "dm_id": "01a0819c-1853-7956-9d08-f1f0c4d16208",
+            "kind": "dm"
+          },
+          "remind_at": "2026-09-08T15:25:52.391363Z",
+          "resolved": true
+        }
+      }
+    }
+  ],
+  "cancel_delivery": {
+    "event_id": "01a0819f-3f2f-77a0-9d86-59a737ef8b2b",
+    "source_id": "01a0819f-3f2d-7953-8231-6fabcc151001",
+    "admitted_at": null,
+    "suppressed_at": "2026-09-08T15:25:07.553022+00:00",
+    "suppression_reason": "source_unavailable"
+  },
+  "source_evidence": "/tmp/sumi-attention-live-acceptance-1hDq1o/evidence.json"
+}
