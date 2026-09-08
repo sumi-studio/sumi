@@ -461,6 +461,19 @@ func TestWSSendReceiptAndFanOut(t *testing.T) {
 		t.Fatalf("message = %v", msg)
 	}
 
+	// A conflicting retry is a rejected request, not an infrastructure failure.
+	if err := sender.WriteJSON(map[string]any{
+		"type": "send", "place_id": ch.PlaceID,
+		"content": "changed retry", "client_nonce": "ws-nonce-1",
+	}); err != nil {
+		t.Fatalf("write conflicting retry: %v", err)
+	}
+	conflict := readFrame(t, sender)
+	if conflict["type"] != "error" || conflict["code"] != "idempotency_conflict" ||
+		conflict["client_nonce"] != "ws-nonce-1" {
+		t.Fatalf("conflicting retry = %v", conflict)
+	}
+
 	// A retry gets the original receipt and no second fan-out.
 	if err := sender.WriteJSON(map[string]any{
 		"type": "send", "place_id": ch.PlaceID,
@@ -469,8 +482,26 @@ func TestWSSendReceiptAndFanOut(t *testing.T) {
 		t.Fatalf("write retry: %v", err)
 	}
 	retry := readFrame(t, sender)
-	if retry["type"] != "receipt" || retry["created"] != false || retry["seq"].(float64) != 1 {
+	if retry["type"] != "receipt" || retry["created"] != false || retry["seq"].(float64) != 1 ||
+		retry["message_id"] != receipt["message_id"] {
 		t.Fatalf("retry receipt = %v", retry)
+	}
+
+	// The same connection remains usable for a new message after the conflict.
+	if err := sender.WriteJSON(map[string]any{
+		"type": "send", "place_id": ch.PlaceID,
+		"content": "next message", "client_nonce": "ws-nonce-2",
+	}); err != nil {
+		t.Fatalf("write next send: %v", err)
+	}
+	next := readFrame(t, sender)
+	if next["type"] != "receipt" || next["created"] != true || next["seq"].(float64) != 2 ||
+		next["client_nonce"] != "ws-nonce-2" {
+		t.Fatalf("next receipt = %v", next)
+	}
+	history, err := w.store.History(ctx, ch.PlaceID, w.humanA, HistoryOptions{})
+	if err != nil || len(history) != 2 {
+		t.Fatalf("history after retries and next send = %#v, err %v", history, err)
 	}
 }
 
