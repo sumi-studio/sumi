@@ -1,3 +1,4 @@
+import "./direct-chat.css";
 import { Button } from "@sumi/ui/components/button";
 import { ArrowDown, History } from "lucide-react";
 import {
@@ -165,7 +166,7 @@ function ChatScreenContent({
   };
 
   return (
-    <div className="flex h-full bg-background text-foreground">
+    <div className="direct-chat flex h-full bg-background text-foreground">
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-border/70 border-b px-3 sm:px-5">
           <div className="min-w-0 flex-1">

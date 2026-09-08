@@ -166,14 +166,18 @@ export function ConversationVirtualizer<
   // cancelled by clearing the reconcile target itself. Writes are never
   // dropped: dropped writes desynchronize the virtualizer's internal offset
   // from the real one, which later teleports the viewport.
-  const interruptProgrammaticScroll = useCallback(() => {
-    followRef.current = false;
-    lastGestureAtRef.current = performance.now();
+  const cancelProgrammaticScroll = useCallback(() => {
     flightRef.current = { active: false, startedAt: 0 };
     // virtual-core@3.17 exposes no public cancel; scrollState is the
     // documented-by-source reconcile target and clearing it ends the flight.
     (virtualizer as unknown as { scrollState: unknown }).scrollState = null;
   }, [virtualizer]);
+
+  const interruptProgrammaticScroll = useCallback(() => {
+    followRef.current = false;
+    lastGestureAtRef.current = performance.now();
+    cancelProgrammaticScroll();
+  }, [cancelProgrammaticScroll]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -197,6 +201,7 @@ export function ConversationVirtualizer<
         // not pull the view back to the end afterwards. It re-arms by
         // itself when the restored position is the end.
         followRef.current = false;
+        cancelProgrammaticScroll();
         viewportRef.current?.scrollTo({ top: offset, behavior: "auto" });
       },
       getScrollElement: () => viewportRef.current,
@@ -207,7 +212,7 @@ export function ConversationVirtualizer<
         return result ? result[0] : null;
       },
     }),
-    [scrollToEnd, scrollToMessage, virtualizer],
+    [cancelProgrammaticScroll, scrollToEnd, scrollToMessage, virtualizer],
   );
 
   useLayoutEffect(() => {

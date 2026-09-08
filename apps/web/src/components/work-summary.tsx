@@ -235,19 +235,16 @@ function ToolTraceRow({
           ? (event) => onOpenChange(event.currentTarget.open)
           : undefined
       }
-      className={cn(
-        "group/tool min-w-0 bg-background open:pb-3",
-        phase === "result" ? "border-border border-l-2 pl-1" : "",
-      )}
+      className="group/tool min-w-0 bg-background text-sm leading-6 open:pb-3"
     >
-      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1.5 [&::-webkit-details-marker]:hidden">
+      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 py-1.5 [&::-webkit-details-marker]:hidden">
         <Icon
           className={cn(
             "size-4 shrink-0 text-muted-foreground",
             event.status === "running" && "animate-pulse",
           )}
         />
-        <span className="min-w-0 flex-1 break-words font-medium text-foreground">
+        <span className="min-w-0 flex-1 break-words font-normal text-muted-foreground">
           {phase === "activity" ? event.name : event.label}
         </span>
         <span
@@ -276,7 +273,7 @@ function ToolTraceRow({
           </p>
         )}
       </summary>
-      <div className="space-y-3 px-3">
+      <div className="space-y-3 pl-6">
         <Payload label="入力" text={displayValue(event.args)} />
         {phase === "activity" && resultText !== null && (
           <Payload label="進行状況" text={resultText} />

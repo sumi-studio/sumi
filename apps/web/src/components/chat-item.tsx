@@ -72,7 +72,7 @@ export function ChatItemView({
               {`${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`}
             </div>
           )}
-          <MessageContent className="whitespace-pre-wrap break-words text-base leading-7">
+          <MessageContent className="whitespace-pre-wrap break-words text-base leading-relaxed">
             {item.text}
           </MessageContent>
           <MessageMetadata
@@ -95,7 +95,7 @@ export function ChatItemView({
     case "prose":
       return (
         <Message from="assistant" className="max-w-full py-3">
-          <MessageContent className="text-base leading-7">
+          <MessageContent className="text-base leading-relaxed">
             <MessageResponse
               mode={item.streaming ? "streaming" : "static"}
               onRenderSettled={
