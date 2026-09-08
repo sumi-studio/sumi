@@ -1144,29 +1144,32 @@ impl DurableBridge {
                 message_id,
                 message,
             } if !matches!(message.as_ref(), PublicMessage::Assistant(_)) => {
+                // Terminal commits can run inside a control handshake that is
+                // already persisting another event. Box each terminal branch so
+                // its state does not inflate the shared streaming dispatch frame.
                 if self.pending_steer_group.is_some() && self.pending_steer_collecting {
-                    self.collect_steer_group_message_end(
+                    Box::pin(self.collect_steer_group_message_end(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 } else if self.pending_hard_steer_inject_batch.is_some() {
-                    self.commit_hard_steer_user(
+                    Box::pin(self.commit_hard_steer_user(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 } else {
-                    self.commit_non_assistant(
+                    Box::pin(self.commit_non_assistant(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 }
             }
