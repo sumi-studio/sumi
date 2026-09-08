@@ -59,6 +59,8 @@ type fakeRuntimeProvisioner struct {
 	recovery        map[string]bool
 	reconcileReaps  map[string]bool
 	omitReapReceipt bool
+	stopErr         error
+	reconcileErr    error
 	inspectErr      error
 	inspectErrLimit int
 }
@@ -126,6 +128,9 @@ func (p *fakeRuntimeProvisioner) Abort(_ context.Context, request runtimeprovisi
 }
 
 func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovision.StopRequest) (runtimeprovision.Inspection, error) {
+	if p.stopErr != nil {
+		return runtimeprovision.Inspection{}, p.stopErr
+	}
 	p.recorder.add("stop:" + request.PersonalityAgentID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,6 +162,9 @@ func (p *fakeRuntimeProvisioner) reapInspection(epoch runtimeprovision.PreparedE
 }
 
 func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
+	if p.reconcileErr != nil {
+		return runtimeprovision.Inspection{}, p.reconcileErr
+	}
 	p.recorder.add("reconcile:" + request.PersonalityAgentID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1129,5 +1137,67 @@ func TestProvisionedRuntimeSelectsChatGPTWithoutFallbackConversationKey(t *testi
 				}
 			}
 		})
+	}
+}
+
+func TestProvisionedMonitorCleanupFailureCanBeRetriedByStop(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	failure := errors.New("temporary reconcile outage")
+	provisioner.reconcileErr = failure
+	p := process.(*provisionedProcess)
+	p.monitorInterval = time.Millisecond
+	if err := p.Wait(); !errors.Is(err, spawn.ErrCleanupIncomplete) || !errors.Is(err, failure) {
+		t.Fatalf("wait=%v", err)
+	}
+	if err := p.Stop(); !errors.Is(err, failure) {
+		t.Fatalf("persistent stop=%v", err)
+	}
+	provisioner.reconcileErr = nil
+	if err := p.Stop(); err != nil {
+		t.Fatalf("retry stop=%v", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("writer epoch not reaped")
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("idempotent stop=%v", err)
+	}
+}
+
+func TestProvisionedExplicitStopRetriesAfterPhysicalTeardownFailure(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("temporary stop outage")
+	provisioner.stopErr = failure
+	if err := process.Stop(); !errors.Is(err, failure) {
+		t.Fatalf("stop=%v", err)
+	}
+	if err := process.Wait(); !errors.Is(err, spawn.ErrCleanupIncomplete) {
+		t.Fatalf("wait=%v", err)
+	}
+	provisioner.stopErr = nil
+	if err := process.Stop(); err != nil {
+		t.Fatalf("retry=%v", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("writer remains")
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatalf("recovered wait=%v", err)
 	}
 }
