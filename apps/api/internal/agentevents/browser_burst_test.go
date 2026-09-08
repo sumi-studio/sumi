@@ -13,7 +13,7 @@ import (
 func TestBrowserMergedDeltaBoundIncludesJSONEscaping(t *testing.T) {
 	const id = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	raw := json.RawMessage(`{"type":"message_update","message_id":"a","event":{"type":"text_delta","content_index":0,"delta":"` + strings.Repeat("<", 2000) + `"}}`)
-	event := Envelope{PersonalityAgentID: id, Event: raw}
+	event := Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: raw}
 	var batch browserVolatileBatch
 	if !batch.append(event) || !batch.append(event) {
 		t.Fatal("separate bounded frames should fit")
@@ -31,7 +31,7 @@ func TestBrowserVolatileBurstKeepsEveryDelta(t *testing.T) {
 	defer unsubscribe()
 	const count = 1000
 	for i := 0; i < count; i++ {
-		if err := gateway.Receive(context.Background(), claims, Envelope{
+		if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 			PersonalityAgentID: id,
 			Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"あ"}}`),
 		}); err != nil {
@@ -65,15 +65,15 @@ func TestBrowserVolatileBatchPreservesInterleavedBoundaries(t *testing.T) {
 	const id = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	makeDelta := func(message, kind string, index int, delta string) Envelope {
 		raw := fmt.Sprintf(`{"type":"message_update","message_id":%q,"event":{"type":%q,"content_index":%d,"delta":%q}}`, message, kind, index, delta)
-		return Envelope{PersonalityAgentID: id, Event: json.RawMessage(raw)}
+		return Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: json.RawMessage(raw)}
 	}
 	first := makeDelta("a", "text_delta", 0, "a")
 	for _, boundary := range []Envelope{
 		makeDelta("b", "text_delta", 0, "b"),
 		makeDelta("a", "thinking_delta", 0, "b"),
 		makeDelta("a", "text_delta", 1, "b"),
-		{PersonalityAgentID: id, Event: json.RawMessage(`{"type":"message_update","message_id":"a","event":{"type":"text_end","content_index":0,"content":"a"}}`)},
-		{PersonalityAgentID: id, Event: json.RawMessage(`{"type":"error","message":"retained"}`)},
+		{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"message_update","message_id":"a","event":{"type":"text_end","content_index":0,"content":"a"}}`)},
+		{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"error","message":"retained"}`)},
 	} {
 		batch := browserVolatileBatch{}
 		for _, event := range []Envelope{first, boundary, first} {
@@ -108,7 +108,7 @@ func TestBrowserVolatileQueueBoundsIndependentEventsAndBytes(t *testing.T) {
 	const id = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	stream, unsubscribe := gateway.SubscribeBrowserVolatile(id)
 	defer unsubscribe()
-	event := Envelope{PersonalityAgentID: id, Event: json.RawMessage(`{"type":"error","message":"retained"}`)}
+	event := Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"error","message":"retained"}`)}
 	gateway.mu.Lock()
 	for i := 0; i <= maxBrowserVolatileEvents; i++ {
 		gateway.publishVolatileLocked(id, event)
@@ -135,11 +135,11 @@ func TestBrowserBurstPumpPreservesDurableCompletionAndPrefix(t *testing.T) {
 	stream, unsubscribe := gateway.SubscribeBrowserVolatile(id)
 	defer unsubscribe()
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 1000; i++ {
-		if err := gateway.Receive(context.Background(), claims, Envelope{PersonalityAgentID: id, Event: json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"x"}}`)}); err != nil {
+		if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"x"}}`)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -169,7 +169,7 @@ func TestBrowserBurstPumpPreservesDurableCompletionAndPrefix(t *testing.T) {
 			// Completion arrives while the consumer drains the burst.
 			if received.Len() == 1000 {
 				next := uint64(2)
-				return gateway.Receive(ctx, claims, Envelope{Seq: &next, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"agent_end"}`)})
+				return gateway.Receive(ctx, claims, Envelope{Audience: AudienceDirectChat, Seq: &next, PersonalityAgentID: id, Event: json.RawMessage(`{"type":"agent_end"}`)})
 			}
 		}
 		return nil

@@ -2602,3 +2602,47 @@ func (g *DurableGateway) ackPath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "acks-"+safeFileID(personalityAgentID)+".jsonl")
 }
 func safeFileID(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }
+
+// LookupAdmission reconciles an already fsynced command without requiring the
+// runtime to be Ready. Missing runtime state is not evidence of absent admission.
+func (g *DurableGateway) LookupAdmission(ctx context.Context, provenance IncomingProvenance, key string, command json.RawMessage) (CommandEnvelope, bool, error) {
+	return g.commands.Lookup(ctx, provenance, key, command)
+}
+
+// PrepareAttention restores the continuing PA and pins it against idle reaping
+// while its source authorization and final admission are checked by the caller.
+func (g *DurableGateway) PrepareAttention(ctx context.Context, spawner DirectChatSpawner, personalityAgentID string) (func(), error) {
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return nil, err
+	}
+	if spawner == nil {
+		return nil, errors.New("attention runtime spawner is unavailable")
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := spawner.EnsureRunning(readyCtx, personalityAgentID); err != nil {
+		return nil, err
+	}
+	release, err := holdRuntimeAdmission(spawner, personalityAgentID)
+	if err != nil {
+		return nil, err
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ready, err := g.IsPersonalityAgentReady(readyCtx, personalityAgentID)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if ready {
+			return release, nil
+		}
+		select {
+		case <-readyCtx.Done():
+			release()
+			return nil, readyCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}

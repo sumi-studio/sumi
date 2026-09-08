@@ -95,6 +95,7 @@ func run(ctx context.Context) (runErr error) {
 	}
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
+	app.startAgentAttention()
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()
@@ -224,16 +225,18 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux       *http.ServeMux
-	localMux        *http.ServeMux
-	localListener   *localControlListenerConfig
-	store           *agentevents.CommandStore
-	browser         *agentevents.BrowserServer
-	database        *db.Pool
-	spawnManager    *spawn.Manager
-	localRuntimes   *agentevents.LocalControlListenerRegistry
-	messagingServer *messaging.Server
-	backgroundCtx   context.Context
+	publicMux        *http.ServeMux
+	localMux         *http.ServeMux
+	localListener    *localControlListenerConfig
+	store            *agentevents.CommandStore
+	browser          *agentevents.BrowserServer
+	database         *db.Pool
+	spawnManager     *spawn.Manager
+	localRuntimes    *agentevents.LocalControlListenerRegistry
+	messagingServer  *messaging.Server
+	backgroundCtx    context.Context
+	deliverAttention func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	attentionWorkers sync.WaitGroup
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -259,6 +262,7 @@ func (a *application) Close() error {
 		if a.stopBackground != nil {
 			a.stopBackground()
 		}
+		a.attentionWorkers.Wait()
 		if a.browser != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
@@ -519,18 +523,29 @@ func newApplicationFromEnv() (*application, error) {
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
+	var deliverAttention func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	if messagingServer != nil && spawnManager != nil {
+		delivery := &messaging.AgentAttentionGateway{
+			Gateway: runtime, Spawner: spawnManager,
+			TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID")),
+		}
+		deliverAttention = func(ctx context.Context) (messaging.AgentAttentionDeliveryStats, error) {
+			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
+		}
+	}
 	return &application{
-		publicMux:       mux,
-		localMux:        localMux,
-		localListener:   localListener,
-		store:           store,
-		browser:         browser,
-		database:        database,
-		spawnManager:    spawnManager,
-		localRuntimes:   localRuntimes,
-		messagingServer: messagingServer,
-		backgroundCtx:   backgroundCtx,
-		stopBackground:  stopBackground,
+		deliverAttention: deliverAttention,
+		publicMux:        mux,
+		localMux:         localMux,
+		localListener:    localListener,
+		store:            store,
+		browser:          browser,
+		database:         database,
+		spawnManager:     spawnManager,
+		localRuntimes:    localRuntimes,
+		messagingServer:  messagingServer,
+		backgroundCtx:    backgroundCtx,
+		stopBackground:   stopBackground,
 	}, nil
 }
 

@@ -144,12 +144,20 @@ func TestCommandStoreIdempotencyBindsAuthenticatedEnvelopeAcrossTargets(t *testi
 	for name, mutate := range map[string]func(*DirectChatProvenance){
 		"tenant": func(p *DirectChatProvenance) { p.TenantID = "tenant-2" },
 		"actor":  func(p *DirectChatProvenance) { p.Actor.PrincipalID = "user-2" },
-		"source": func(p *DirectChatProvenance) { p.Source.Surface = "task" },
+		"source": func(p *DirectChatProvenance) {
+			external := attentionTestProvenance()
+			external.PersonalityAgentID = p.PersonalityAgentID
+			*p = external
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := winner
 			mutate(&changed)
-			if _, err := firstStore.Append(context.Background(), changed, "global-key", command); !errors.Is(err, errIdempotencyConflict) {
+			changedCommand := command
+			if name == "source" {
+				changedCommand = json.RawMessage(`{"type":"external_event","content":"hello"}`)
+			}
+			if _, err := firstStore.Append(context.Background(), changed, "global-key", changedCommand); !errors.Is(err, errIdempotencyConflict) {
 				t.Fatalf("expected provenance conflict, got %v", err)
 			}
 		})

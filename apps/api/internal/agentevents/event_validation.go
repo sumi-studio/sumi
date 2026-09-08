@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -249,7 +250,7 @@ func validatePublicMessage(raw json.RawMessage) error {
 
 	switch role {
 	case "user":
-		if err := requireAndAllow(obj, []string{"role", "content", "timestamp"}, []string{"role", "content", "timestamp", "incoming_timing"}); err != nil {
+		if err := requireAndAllow(obj, []string{"role", "content", "timestamp"}, []string{"role", "content", "timestamp", "incoming_timing", "incoming_source"}); err != nil {
 			return err
 		}
 		if err := validateArray(obj["content"], validateUserContent); err != nil {
@@ -257,6 +258,15 @@ func validatePublicMessage(raw json.RawMessage) error {
 		}
 		if err := validateDateTime(obj["timestamp"]); err != nil {
 			return fmt.Errorf("user message timestamp: %w", err)
+		}
+		if source, ok := obj["incoming_source"]; ok {
+			var provenance IncomingProvenance
+			if err := json.Unmarshal(source, &provenance); err != nil {
+				return fmt.Errorf("user message incoming_source: %w", err)
+			}
+			if provenance.Version != 2 {
+				return errors.New("user message incoming_source requires external provenance")
+			}
 		}
 		if timing, ok := obj["incoming_timing"]; ok {
 			if err := validateIncomingEventTiming(timing); err != nil {

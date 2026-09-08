@@ -157,7 +157,7 @@ func TestDurableGatewayFencesStaleAckDurableAndVolatileEvents(t *testing.T) {
 		t.Fatal("stale generation ACK reached the durable gateway")
 	}
 	seq := uint64(1)
-	durableEvent := Envelope{
+	durableEvent := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -165,7 +165,7 @@ func TestDurableGatewayFencesStaleAckDurableAndVolatileEvents(t *testing.T) {
 	if err := gateway.Receive(context.Background(), stale, durableEvent); err == nil {
 		t.Fatal("stale generation durable event reached the durable gateway")
 	}
-	volatileEvent := Envelope{
+	volatileEvent := Envelope{Audience: AudienceDirectChat,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stale"}}`),
 	}
@@ -844,7 +844,7 @@ func TestDurableGatewaySerializesEventSequenceAcrossInstances(t *testing.T) {
 	second.PollInterval = 5 * time.Millisecond
 	claims := currentRuntimeClaims(t, first, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	event := Envelope{
+	event := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1266,7 +1266,7 @@ func TestDurableGatewayReceiveRejectsPersonalityAgentClaimMismatch(t *testing.T)
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	err := gateway.Receive(context.Background(), claims, Envelope{
+	err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: "018f47a2-9b3c-7def-9abc-0123456789ac",
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1287,7 +1287,7 @@ func TestDurableGatewayDetectsSameSizeEventReplacement(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1355,7 +1355,7 @@ func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 	for _, personalityAgentID := range []string{"018f47a2-9b3c-7def-8abc-0123456789ab", "018f47a2-9b3c-7def-9abc-0123456789ac", "018f47a2-9b3c-7def-aabc-0123456789ad"} {
 		claims := currentRuntimeClaims(t, gateway, personalityAgentID)
 		seq := uint64(1)
-		if err := gateway.Receive(context.Background(), claims, Envelope{
+		if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: personalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1376,7 +1376,7 @@ func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
 		t.Fatalf("evicted event tail did not reload: last=%d err=%v", last, err)
 	}
 	seq := uint64(2)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_end"}`),
@@ -1433,7 +1433,7 @@ func TestDurableGatewayEventAppendRollsBackOnWriteFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	event := Envelope{
+	event := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1469,7 +1469,7 @@ func TestDurableGatewayEventAppendRollsBackOnSyncFailure(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	event := Envelope{
+	event := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1505,7 +1505,7 @@ func TestDurableGatewayEventRecoversFromIncompleteFinalRecord(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	event := Envelope{
+	event := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1546,7 +1546,7 @@ func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	claims := currentRuntimeClaims(t, gateway, "018f47a2-9b3c-7def-8abc-0123456789ab")
 	seq := uint64(1)
-	event := Envelope{
+	event := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: claims.PersonalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1556,9 +1556,9 @@ func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	}
 
 	corrupt := []string{
-		`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"seq":2}` + "\n",
-		`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"extra":true}` + "\n",
-		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}}}` + "\n",
+		`{"seq":2,"event":{"audience":"direct_chat","seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"seq":2}` + "\n",
+		`{"seq":2,"event":{"audience":"direct_chat","seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}},"extra":true}` + "\n",
+		`{"seq":9007199254740992,"event":{"audience":"direct_chat","seq":9007199254740992,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_end"}}}` + "\n",
 	}
 	for index, line := range corrupt {
 		if err := os.WriteFile(gateway.eventPath(claims.PersonalityAgentID), append([]byte(nil), []byte(line)...), 0o600); err != nil {
@@ -1756,7 +1756,7 @@ func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
 			run: func(t *testing.T, g *DurableGateway, claims TokenClaims) error {
 				t.Helper()
 				seq := uint64(1)
-				return g.Receive(context.Background(), claims, Envelope{
+				return g.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 					Seq:                &seq,
 					PersonalityAgentID: claims.PersonalityAgentID,
 					Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1857,22 +1857,22 @@ func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
 	}{
 		{
 			name:     "outer/inner seq mismatch",
-			contents: []byte(`{"seq":1,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"audience":"direct_chat","seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
 			wantErr:  "seq mismatch",
 		},
 		{
 			name:     "personality agent mismatch",
-			contents: []byte(`{"seq":1,"event":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-9abc-0123456789ac","event":{"type":"agent_start"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-9abc-0123456789ac","event":{"type":"agent_start"}}}` + "\n"),
 			wantErr:  "personality agent mismatch",
 		},
 		{
 			name:     "volatile event with seq",
-			contents: []byte(`{"seq":1,"event":{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_update"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_update"}}}` + "\n"),
 			wantErr:  "volatile event",
 		},
 		{
 			name:     "durable event missing inner seq",
-			contents: []byte(`{"seq":1,"event":{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
+			contents: []byte(`{"seq":1,"event":{"audience":"direct_chat","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}` + "\n"),
 			wantErr:  "requires seq",
 		},
 	}
@@ -1900,7 +1900,7 @@ func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
 	claims := currentRuntimeClaims(t, gateway, personalityAgentID)
 
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1929,7 +1929,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 	inner := uint64(2)
 	err := gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
-		Event: Envelope{
+		Event: Envelope{Audience: AudienceDirectChat,
 			Seq:                &inner,
 			PersonalityAgentID: personalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1944,7 +1944,7 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 
 	err = gateway.appendDurableEventLocked(context.Background(), personalityAgentID, durableEventRecord{
 		Seq: 1,
-		Event: Envelope{
+		Event: Envelope{Audience: AudienceDirectChat,
 			Seq:                nil,
 			PersonalityAgentID: personalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1969,7 +1969,7 @@ func TestDurableGatewayTracksRunLifecycleAcrossTurnBoundaries(t *testing.T) {
 	receive := func(raw string) {
 		t.Helper()
 		seq++
-		if err := gateway.Receive(context.Background(), claims, Envelope{
+		if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: personalityAgentID,
 			Event:              json.RawMessage(raw),
@@ -2026,7 +2026,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2035,7 +2035,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq = 2
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"turn_start"}`),
@@ -2044,7 +2044,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq = 3
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"user","content":[{"type":"text","text":"do not clear assistant state"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
@@ -2053,7 +2053,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq = 4
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
@@ -2062,7 +2062,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq = 5
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"approval_requested","request":{"id":"request-2","tool_call_id":"call-2","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
@@ -2071,7 +2071,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	}
 
 	seq = 6
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"approval_resolved","request_id":"request-2","resolution":{"decision":{"type":"approve_once"}}}`),
@@ -2132,7 +2132,7 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 	// defaulting to an empty "no run / no approval" state.
 	if err := os.WriteFile(
 		gateway.eventPath(personalityAgentID),
-		[]byte(`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}`+"\n"),
+		[]byte(`{"seq":2,"event":{"audience":"direct_chat","seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}`+"\n"),
 		0o600,
 	); err != nil {
 		t.Fatalf("write corrupt event log: %v", err)
@@ -2185,7 +2185,7 @@ func TestIdleRuntimeClaimProtectsAcceptedInputAndClosedTabRun(t *testing.T) {
 	}
 	checkIdle(false) // durable admission precedes agent_start
 	seq := uint64(1)
-	if err := gateway.Receive(ctx, claims, Envelope{PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+	if err := gateway.Receive(ctx, claims, Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := gateway.ApplyAck(ctx, claims, CommandAck{PersonalityAgentID: id, Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err != nil {
@@ -2193,7 +2193,7 @@ func TestIdleRuntimeClaimProtectsAcceptedInputAndClosedTabRun(t *testing.T) {
 	}
 	checkIdle(false) // no browser is required to keep actual work alive
 	seq = 2
-	if err := gateway.Receive(ctx, claims, Envelope{PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
+	if err := gateway.Receive(ctx, claims, Envelope{Audience: AudienceDirectChat, PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	checkIdle(true)

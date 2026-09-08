@@ -164,7 +164,7 @@ func (r *LogRecord) UnmarshalJSON(data []byte) error {
 	if *raw.PersonalityAgentID != raw.Provenance.PersonalityAgentID {
 		return errors.New("persisted command target does not match provenance target")
 	}
-	if err := ValidateCommand(raw.Command); err != nil {
+	if err := validateIncomingCommand(*raw.Provenance, raw.Command); err != nil {
 		return fmt.Errorf("invalid persisted command: %w", err)
 	}
 	*r = LogRecord{CommandEnvelope: CommandEnvelope{
@@ -353,7 +353,7 @@ func (s *CommandStore) append(
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, err
 	}
-	if err := ValidateCommand(command); err != nil {
+	if err := validateIncomingCommand(provenance, command); err != nil {
 		return CommandEnvelope{}, fmt.Errorf("validate command before append: %w", err)
 	}
 
@@ -383,8 +383,11 @@ func (s *CommandStore) append(
 			return CommandEnvelope{}, err
 		}
 		if found {
+			if err := s.verifyExistingAdmission(ctx, existing); err != nil {
+				return CommandEnvelope{}, err
+			}
 			if existing.PersonalityAgentID == provenance.PersonalityAgentID &&
-				existing.Provenance == provenance &&
+				existing.Provenance.Equal(provenance) &&
 				string(existing.Command) == string(command) {
 				if existingResult != nil {
 					*existingResult = true
@@ -959,4 +962,56 @@ func newCommandID() (string, error) {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// Lookup returns only an existing exact durable admission. It shares Append's
+// global idempotency lock and never starts a PA or allocates a sequence.
+func (s *CommandStore) Lookup(ctx context.Context, provenance IncomingProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, bool, error) {
+	if err := validateIncomingCommand(provenance, command); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	if idempotencyKey == "" {
+		return CommandEnvelope{}, false, errors.New("lookup requires an idempotency key")
+	}
+	if err := s.acquireIdempotencyGuard(ctx); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	defer s.releaseIdempotencyGuard()
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	if s.closed || s.idempotencyLock == nil {
+		s.mu.Unlock()
+		return CommandEnvelope{}, false, errors.New("command store is closed")
+	}
+	lock := s.idempotencyLock
+	s.mu.Unlock()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	existing, found, err := s.findIdempotencyRecord(ctx, idempotencyKey)
+	if err != nil || !found {
+		return existing, found, err
+	}
+	if err := s.verifyExistingAdmission(ctx, existing); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	if existing.PersonalityAgentID != provenance.PersonalityAgentID || !existing.Provenance.Equal(provenance) || string(existing.Command) != string(command) {
+		return CommandEnvelope{}, false, errIdempotencyConflict
+	}
+	return existing, true, nil
+}
+
+// A raw keyed record may remain after failed fsync and failed rollback. Never
+// turn those uncertain bytes into an admission receipt through the scan path.
+func (s *CommandStore) verifyExistingAdmission(ctx context.Context, candidate CommandEnvelope) error {
+	stored, found, err := s.GetCommand(ctx, candidate.PersonalityAgentID, candidate.Seq)
+	if err != nil {
+		return err
+	}
+	if !found || stored.CommandID != candidate.CommandID || !stored.Provenance.Equal(candidate.Provenance) || string(stored.Command) != string(candidate.Command) {
+		return errors.New("idempotency record does not match committed command state")
+	}
+	return nil
 }

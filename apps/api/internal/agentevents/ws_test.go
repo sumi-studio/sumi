@@ -460,7 +460,7 @@ func TestWebSocketHelloUsesDurableEventCursorNotAgentEcho(t *testing.T) {
 	srv, _, _, _, es, hl := newTestServer(t)
 	hl.setReady()
 	seq := uint64(3)
-	es.envelopes = []Envelope{{
+	es.envelopes = []Envelope{{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 		Event:              []byte(`{"type":"agent_start"}`),
@@ -729,7 +729,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 	seq := uint64(1)
 	if err := eventOffender.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -817,7 +817,7 @@ func TestWebSocketNotReadyHelloGatesTrafficUntilReadyAndShutdownFences(t *testin
 
 	if err := agent.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -936,7 +936,7 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	seq1 := uint64(1)
 	eventFrame := OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq1,
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 			Event:              []byte(`{"type":"agent_start"}`),
@@ -1009,7 +1009,7 @@ func TestWebSocketSameGenerationReconnectRevokesFirstAndNewEpochWorks(t *testing
 	seq := uint64(1)
 	if err := second.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              []byte(`{"type":"agent_start"}`),
@@ -1146,7 +1146,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	err = firstGateway.Receive(
 		contextWithConnectionLease(context.Background(), firstEpoch.lease),
 		firstEpoch.claims,
-		Envelope{
+		Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1157,7 +1157,7 @@ func TestWebSocketSharedLeaseRevokesConnectionAcrossServerInstances(t *testing.T
 	}
 	if err := second.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1296,7 +1296,7 @@ func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *test
 	seq := uint64(1)
 	if err := first.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1351,7 +1351,7 @@ func TestWebSocketReplacementClaimsLeaseBeforeSnapshottingDurableCursors(t *test
 	seq = 2
 	if err := second.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_end"}`),
@@ -1472,7 +1472,7 @@ func TestWebSocketSharedLeaseReconnectDrainsContextWaitingSinkWithinBound(t *tes
 	seq := uint64(1)
 	if err := first.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1750,7 +1750,7 @@ func TestWebSocketReplacementCancelsOldEpochSinkWithoutWaiting(t *testing.T) {
 	seq := uint64(1)
 	if err := first.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              []byte(`{"type":"agent_start"}`),
@@ -1798,7 +1798,7 @@ func TestWebSocketReplacementCancelsOldEpochSinkWithoutWaiting(t *testing.T) {
 	// current. Frames attempted through it cannot reach either synchronous sink.
 	_ = first.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              []byte(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stale"}}`),
 		},
@@ -1847,7 +1847,7 @@ func TestWebSocketRejectsEventForAnotherPersonalityAgent(t *testing.T) {
 	seq1 := uint64(1)
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq1,
 			PersonalityAgentID: "018f47a2-9b3c-7def-9abc-0123456789ac",
 			Event:              []byte(`{"type":"agent_start"}`),
@@ -2424,7 +2424,7 @@ func TestWebSocketAuthenticatedHeartbeatOutlivesHelloTimeoutBeforeReady(t *testi
 	seq := uint64(1)
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: testPersonalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2508,7 +2508,7 @@ func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
 	seq := uint64(1)
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
-		Envelope: &Envelope{
+		Envelope: &Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
 			Event:              []byte(`{"type":"agent_start"}`),

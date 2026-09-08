@@ -18,6 +18,7 @@ $comment: |
 
 $defs:
   OutputAudience:
+    description: Execution context recorded in the debugging log; not message delivery or visibility permission.
     type: string
     enum: [direct_chat, secretary]
 
@@ -829,7 +830,7 @@ $defs:
         properties:
           surface: { const: messaging }
           event_id: { $ref: '#/$defs/CanonicalUUID' }
-          kind: { const: messaging_mention }
+          kind: { enum: [messaging_mention, messaging_message] }
           workspace_id: { $ref: '#/$defs/CanonicalUUID' }
           installation_id: { $ref: '#/$defs/CanonicalUUID' }
           authority_epoch: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
@@ -968,15 +969,17 @@ $defs:
   BrowserEventEnvelope:
     oneOf:
       - type: object
-        required: [seq, event]
+        required: [seq, event, audience]
         additionalProperties: false
         properties:
+          audience: { $ref: '#/$defs/OutputAudience' }
           seq: { $ref: '#/$defs/JsonSafeInteger' }
           event: { $ref: '#/$defs/DurableAgentEvent' }
       - type: object
-        required: [event]
+        required: [event, audience]
         additionalProperties: false
         properties:
+          audience: { $ref: '#/$defs/OutputAudience' }
           event: { $ref: '#/$defs/VolatileAgentEvent' }
 
   BrowserEventFrame:
@@ -986,15 +989,6 @@ $defs:
     properties:
       type: { const: event }
       envelope: { $ref: '#/$defs/BrowserEventEnvelope' }
-
-  DirectChatCursorFrame:
-    type: object
-    description: Advances replay past omitted durable events without publishing their content.
-    required: [type, through_seq]
-    additionalProperties: false
-    properties:
-      type: { const: event_cursor }
-      through_seq: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
 
   BrowserCommandAcceptedFrame:
     type: object
@@ -1058,7 +1052,6 @@ $defs:
   BrowserServerFrame:
     oneOf:
       - { $ref: '#/$defs/BrowserEventFrame' }
-      - { $ref: '#/$defs/DirectChatCursorFrame' }
       - { $ref: '#/$defs/BrowserCommandAcceptedFrame' }
       - { $ref: '#/$defs/BrowserCommandRejectedFrame' }
       - { $ref: '#/$defs/DirectChatStatusFrame' }

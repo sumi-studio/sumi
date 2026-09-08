@@ -6,6 +6,8 @@
  */
 
 /**
+ * Execution context recorded in the debugging log; not message delivery or visibility permission.
+ *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "OutputAudience".
  */
@@ -84,7 +86,7 @@ export type MessagingEventSource =
   | {
       surface: "messaging";
       event_id: CanonicalUUID;
-      kind: "messaging_mention";
+      kind: "messaging_mention" | "messaging_message";
       workspace_id: CanonicalUUID;
       installation_id: CanonicalUUID;
       /**
@@ -464,10 +466,12 @@ export type BrowserClientFrame = BrowserHello | BrowserCommandFrame;
  */
 export type BrowserEventEnvelope =
   | {
+      audience: OutputAudience;
       seq: JsonSafeInteger;
       event: DurableAgentEvent;
     }
   | {
+      audience: OutputAudience;
       event: VolatileAgentEvent;
     };
 /**
@@ -489,11 +493,7 @@ export type DirectChatStatusFrame =
  * via the `definition` "BrowserServerFrame".
  */
 export type BrowserServerFrame =
-  | BrowserEventFrame
-  | DirectChatCursorFrame
-  | BrowserCommandAcceptedFrame
-  | BrowserCommandRejectedFrame
-  | DirectChatStatusFrame;
+  BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame | DirectChatStatusFrame;
 /**
  * canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
  *
@@ -896,19 +896,6 @@ export interface BrowserCommandFrame {
 export interface BrowserEventFrame {
   type: "event";
   envelope: BrowserEventEnvelope;
-}
-/**
- * Advances replay past omitted durable events without publishing their content.
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "DirectChatCursorFrame".
- */
-export interface DirectChatCursorFrame {
-  type: "event_cursor";
-  /**
-   * non-negative integer representable exactly by JavaScript number clients
-   */
-  through_seq: number;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

@@ -735,7 +735,7 @@ export interface components {
             ack: components["schemas"]["CommandAck"];
         };
         BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
-        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["DirectChatCursorFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
+        BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
         DirectChatUserMessageCommand: {
             /** @constant */
             type: "user_message";
@@ -799,6 +799,11 @@ export interface components {
             idempotency_key: string;
             command: components["schemas"]["Command"];
         };
+        /**
+         * @description Execution context recorded in the debugging log; not message delivery or visibility permission.
+         * @enum {string}
+         */
+        OutputAudience: "direct_chat" | "secretary";
         AgentStartEvent: {
             /** @constant */
             type: "agent_start";
@@ -839,8 +844,8 @@ export interface components {
             /** @constant */
             surface: "messaging";
             event_id: components["schemas"]["CanonicalUUID"];
-            /** @constant */
-            kind: "messaging_mention";
+            /** @enum {unknown} */
+            kind: "messaging_mention" | "messaging_message";
             workspace_id: components["schemas"]["CanonicalUUID"];
             installation_id: components["schemas"]["CanonicalUUID"];
             authority_epoch: components["schemas"]["JsonSafeInteger"];
@@ -1231,21 +1236,17 @@ export interface components {
         };
         VolatileAgentEvent: components["schemas"]["MessageUpdateEvent"] | components["schemas"]["ToolExecutionUpdateEvent"] | components["schemas"]["ErrorEvent"];
         BrowserEventEnvelope: {
+            audience: components["schemas"]["OutputAudience"];
             seq: components["schemas"]["JsonSafeInteger"];
             event: components["schemas"]["DurableAgentEvent"];
         } | {
+            audience: components["schemas"]["OutputAudience"];
             event: components["schemas"]["VolatileAgentEvent"];
         };
         BrowserEventFrame: {
             /** @constant */
             type: "event";
             envelope: components["schemas"]["BrowserEventEnvelope"];
-        };
-        /** @description Advances replay past omitted durable events without publishing their content. */
-        DirectChatCursorFrame: {
-            /** @constant */
-            type: "event_cursor";
-            through_seq: components["schemas"]["JsonSafeInteger"];
         };
         BrowserCommandAcceptedFrame: {
             /** @constant */
@@ -1283,8 +1284,6 @@ export interface components {
             content: string;
         };
         IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["MessagingProvenanceV2"];
-        /** @enum {string} */
-        OutputAudience: "direct_chat" | "secretary";
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             audience: components["schemas"]["OutputAudience"];

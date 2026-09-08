@@ -667,7 +667,7 @@ for (const [name, fixture] of Object.entries(fixtures)) {
   }
 }
 
-// Audience is internal; omitted private records become content-free browser cursors.
+// Execution context labels are visible in the debugging log; they are not delivery receipts.
 const mentionEnvelope = fixtures.external_mention.wire;
 const reminderEnvelope = fixtures.external_reminder.wire;
 const validateUserMessage = getValidator("UserMessage");
@@ -747,20 +747,6 @@ for (const invalid of [
   }),
 ])
   assert.equal(validateEnvelope(invalid), false);
-const validateCursor = getValidator("BrowserServerFrame");
-assert.ok(validateCursor({ type: "event_cursor", through_seq: 3 }));
-for (const through_seq of [0, -1, 1.5, "3", Number.MAX_SAFE_INTEGER + 1]) {
-  assert.equal(validateCursor({ type: "event_cursor", through_seq }), false);
-}
-assert.equal(
-  validateCursor({
-    type: "event_cursor",
-    through_seq: 3,
-    event: { type: "agent_start" },
-  }),
-  false,
-);
-
 const counterexamples = [
   {
     name: "applied command disposition rejects reject_reason",

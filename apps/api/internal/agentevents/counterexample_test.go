@@ -46,9 +46,9 @@ func TestOutboundFrameValidateCounterexamples(t *testing.T) {
 		{"ack_invalid_command_id", OutboundFrame{FrameType: "command_ack", Ack: &CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: 1, CommandID: "not-a-uuid", Status: "received"}}},
 		{"ack_non_rejected_with_reason", OutboundFrame{FrameType: "command_ack", Ack: &CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: 1, CommandID: "00000000-0000-4000-8000-000000000001", Status: "received", RejectReason: strPtr("oversized")}}},
 		{"ack_unknown_status", OutboundFrame{FrameType: "command_ack", Ack: &CommandAck{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Seq: 1, CommandID: "00000000-0000-4000-8000-000000000001", Status: "bogus"}}},
-		{"event_missing_fields", OutboundFrame{FrameType: "event", Envelope: &Envelope{}}},
-		{"volatile_event_with_seq", OutboundFrame{FrameType: "event", Envelope: &Envelope{Seq: u64Ptr(1), PersonalityAgentID: "c", Event: []byte(`{"type":"error","message":"x"}`)}}},
-		{"durable_event_without_seq", OutboundFrame{FrameType: "event", Envelope: &Envelope{PersonalityAgentID: "c", Event: []byte(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001"}`)}}},
+		{"event_missing_fields", OutboundFrame{FrameType: "event", Envelope: &Envelope{Audience: AudienceDirectChat}}},
+		{"volatile_event_with_seq", OutboundFrame{FrameType: "event", Envelope: &Envelope{Audience: AudienceDirectChat, Seq: u64Ptr(1), PersonalityAgentID: "c", Event: []byte(`{"type":"error","message":"x"}`)}}},
+		{"durable_event_without_seq", OutboundFrame{FrameType: "event", Envelope: &Envelope{Audience: AudienceDirectChat, PersonalityAgentID: "c", Event: []byte(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001"}`)}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,12 +173,12 @@ func TestDurableCommandLogRecordRejectsDuplicateAndUnknownFields(t *testing.T) {
 
 func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {
 	cases := []string{
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_end","message_id":"not-a-uuid","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"2026-07-25T20:00:00Z"}}}`,
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"not-a-date"}}}`,
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"retry_scheduled","attempt":1,"delay_ms":100,"retry_at":"tomorrow","error_message":"retry"}}`,
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":null}}`,
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_once","extra":1}}}}`,
-		`{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"rejected":{"decision":{"type":"deny_once"}}}}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_end","message_id":"not-a-uuid","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"2026-07-25T20:00:00Z"}}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"not-a-date"}}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"retry_scheduled","attempt":1,"delay_ms":100,"retry_at":"tomorrow","error_message":"retry"}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":null}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_once","extra":1}}}}`,
+		`{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"rejected":{"decision":{"type":"deny_once"}}}}}`,
 	}
 	for _, raw := range cases {
 		var env Envelope
@@ -204,7 +204,7 @@ func TestScalarValidatorsRejectNullCounterexample(t *testing.T) {
 }
 
 func TestEnvelopeRejectsSeqExceedsJSONSafeInteger(t *testing.T) {
-	raw := `{"seq":9007199254740992,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}`
+	raw := `{"audience":"direct_chat","seq":9007199254740992,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}`
 	var env Envelope
 	if err := json.Unmarshal([]byte(raw), &env); err == nil {
 		t.Fatal("envelope accepted out-of-range seq")
@@ -261,7 +261,7 @@ func TestAnyJSONRejectsUnsafeNestedIntegersButKeepsFractions(t *testing.T) {
 }
 
 func TestObjectValuedFieldsRejectUnsafeNestedIntegers(t *testing.T) {
-	toolStart := `{"seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{"overflow":9007199254740992}}}`
+	toolStart := `{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{"overflow":9007199254740992}}}`
 	var toolStartEnvelope Envelope
 	if err := json.Unmarshal([]byte(toolStart), &toolStartEnvelope); err == nil {
 		t.Fatal("tool_execution_start args accepted an unsafe nested integer")

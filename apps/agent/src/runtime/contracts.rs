@@ -310,6 +310,7 @@ pub struct MessagingSource {
 #[serde(rename_all = "snake_case")]
 pub enum MessagingEventKind {
     MessagingMention,
+    MessagingMessage,
     ReplyLaterDue,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,7 +358,7 @@ impl MessagingSource {
         }
         chrono::DateTime::parse_from_rfc3339(&self.occurred_at).map_err(|_| fail())?;
         match self.kind {
-            MessagingEventKind::MessagingMention
+            MessagingEventKind::MessagingMention | MessagingEventKind::MessagingMessage
                 if self.marker_id.is_none() && self.due_at.is_none() =>
             {
                 ()
@@ -843,6 +844,14 @@ mod tests {
                 "{pointer}"
             );
         }
+        let mut dm = raw.clone();
+        dm["source"]["kind"] = serde_json::json!("messaging_message");
+        dm["source"]["place"]["kind"] = serde_json::json!("dm");
+        let parsed = serde_json::from_value::<IncomingProvenance>(dm.clone()).unwrap();
+        assert_eq!(parsed.authenticated_direct_chat_human(), None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), dm);
+        dm["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
+        assert!(serde_json::from_value::<IncomingProvenance>(dm).is_err());
         let mut reminder = raw.clone();
         reminder["source"]["kind"] = serde_json::json!("reply_later_due");
         reminder["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
