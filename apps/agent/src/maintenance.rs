@@ -167,6 +167,34 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.through_seq, 0);
+        let replay = authorize_request(
+            PreExternalAuthorization {
+                personality_agent_id: paid(),
+                through_seq: 0,
+            },
+            &paid(),
+            &path,
+            Arc::new(TestKeys),
+        )
+        .await
+        .expect("same offline cutoff can be retried after a lost CLI response");
+        assert_eq!(replay.personality_agent_id, result.personality_agent_id);
+        assert_eq!(replay.through_seq, result.through_seq);
+        assert!(
+            authorize_request(
+                PreExternalAuthorization {
+                    personality_agent_id: paid(),
+                    through_seq: 1
+                },
+                &paid(),
+                &path,
+                Arc::new(TestKeys),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cutover head changed")
+        );
         let store = Store::open(&path, AgentScope::new(paid()), Arc::new(TestKeys))
             .await
             .unwrap();
@@ -176,6 +204,35 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+        // Even when the requested cutoff matches the current head, an existing
+        // different authorization must not be silently replaced.
+        sqlx::query("UPDATE legacy_event_audience SET through_seq=1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.pool().close().await;
+        let error = authorize_request(
+            PreExternalAuthorization {
+                personality_agent_id: paid(),
+                through_seq: 0,
+            },
+            &paid(),
+            &path,
+            Arc::new(TestKeys),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different cutoff"));
+        let store = Store::open(&path, AgentScope::new(paid()), Arc::new(TestKeys))
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT through_seq FROM legacy_event_audience")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            1
         );
         store.pool().close().await;
         tokio::fs::remove_dir_all(root).await.unwrap();

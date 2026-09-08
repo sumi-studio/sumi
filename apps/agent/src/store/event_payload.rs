@@ -150,6 +150,21 @@ impl Store {
         if external != 0 {
             bail!("legacy audience cutover contains non-direct command provenance");
         }
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT through_seq FROM legacy_event_audience WHERE personality_agent_id=?",
+        )
+        .bind(self.scope().personality_agent_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            if existing != head {
+                bail!("legacy audience boundary already exists at a different cutoff");
+            }
+            // A lost CLI response may be retried while the same offline state
+            // remains verified. Never extend or overwrite an existing boundary.
+            transaction.commit().await?;
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO legacy_event_audience(personality_agent_id,through_seq) VALUES(?,?)",
         )
