@@ -1,9 +1,11 @@
 //! Optional, individual-scoped access to persisted experience, including L0
 //! whose active context representation has been compacted or dropped.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use sqlx::{QueryBuilder, Row, Sqlite};
+use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 
 use crate::provider::types::PublicMessage;
 
@@ -79,6 +81,91 @@ pub(crate) struct RecallPage {
     pub next_after_seq: Option<u64>,
 }
 
+// Resolve only the requested ancestry. Metadata lives in the private SQLite
+// store; originals are still individually authenticated when read below.
+async fn original_batches(
+    transaction: &mut Transaction<'_, Sqlite>,
+    requested: &str,
+) -> Result<Vec<String>> {
+    let mut pending = vec![(requested.to_owned(), None, false)];
+    let mut visiting = HashSet::new();
+    let mut completed = HashSet::new();
+    let mut originals = Vec::new();
+    while let Some((id, expected_layer, exiting)) = pending.pop() {
+        if exiting {
+            visiting.remove(&id);
+            completed.insert(id);
+            continue;
+        }
+        if visiting.contains(&id) {
+            bail!("cyclic private recall batch lineage");
+        }
+        let row = sqlx::query("SELECT layer, batch_seq FROM memory_batches WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .context("missing private recall source batch")?;
+        let layer: i64 = row.try_get("layer")?;
+        if expected_layer.is_some_and(|expected| expected != layer) {
+            bail!("invalid private recall source layer");
+        }
+        if completed.contains(&id) {
+            continue;
+        }
+        if layer == 0 {
+            originals.push(id.clone());
+            completed.insert(id);
+            continue;
+        }
+        let kinds: &[&str] = match layer {
+            1 => &["compact_l0"],
+            2 => &["compact_l1", "consolidate_l2"],
+            _ => bail!("invalid private recall batch layer"),
+        };
+        let mut producers = Vec::new();
+        for kind in kinds {
+            if let Some(row) = sqlx::query(
+                "SELECT kind, source_ids FROM memory_jobs
+                 WHERE kind = ? AND batch_seq = ? AND status = 'applied'",
+            )
+            .bind(kind)
+            .bind(row.try_get::<i64, _>("batch_seq")?)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                producers.push(row);
+            }
+        }
+        if producers.len() != 1 {
+            bail!("missing or ambiguous private recall batch producer");
+        }
+        let producer = &producers[0];
+        let sources: Vec<String> =
+            serde_json::from_str(&producer.try_get::<String, _>("source_ids")?)
+                .context("invalid private recall source identities")?;
+        let mut unique = HashSet::new();
+        if sources.is_empty()
+            || sources
+                .iter()
+                .any(|source| uuid::Uuid::parse_str(source).is_err() || !unique.insert(source))
+        {
+            bail!("invalid private recall source identities");
+        }
+        let source_layer = match producer.try_get::<&str, _>("kind")? {
+            "compact_l0" => 0,
+            "compact_l1" => 1,
+            "consolidate_l2" => 2,
+            _ => unreachable!(),
+        };
+        visiting.insert(id.clone());
+        pending.push((id, expected_layer, true));
+        for source in sources.into_iter().rev() {
+            pending.push((source, Some(source_layer), false));
+        }
+    }
+    Ok(originals)
+}
+
 impl Store {
     /// Scope is the Store's authenticated individual, never a tool argument.
     /// This reads only transcripts, not shared workspace records or opaque
@@ -95,12 +182,11 @@ impl Store {
             query.push(" AND m.id = ").push_bind(id);
         }
         if let Some(id) = &request.batch_id {
+            let sources = original_batches(&mut transaction, id).await?;
             query
-                .push(
-                    " AND m.id IN (SELECT message_id FROM memory_batch_messages WHERE batch_id = ",
-                )
-                .push_bind(id)
-                .push(")");
+                .push(" AND m.id IN (SELECT message_id FROM memory_batch_messages WHERE batch_id IN (SELECT value FROM json_each(")
+                .push_bind(serde_json::to_string(&sources)?)
+                .push(")))");
         }
         if let Some(seq) = request.from_seq {
             query.push(" AND m.seq >= ").push_bind(seq as i64);
@@ -361,6 +447,150 @@ mod tests {
             .await
             .unwrap();
         (message_id, message)
+    }
+
+    async fn lineage_batch(store: &Store, layer: i64, seq: i64) -> String {
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance("lineage_fixture").unwrap()),
+                    projections: vec![],
+                }],
+                injected_commands: vec![],
+            })
+            .await
+            .unwrap();
+        let id = Uuid::now_v7().to_string();
+        // Lineage is trusted SQLite metadata, not a synthetic signed producer.
+        sqlx::query(
+            "INSERT INTO memory_batches
+             (id, layer, ord, batch_seq, state, est_tokens, updated_at,
+              projection_event_seq, projection_digest)
+             VALUES (?, ?, ?, ?, 'dropped', 0, '2026-09-08T00:00:00Z',
+                     (SELECT MAX(seq) FROM agent_events), zeroblob(32))",
+        )
+        .bind(&id)
+        .bind(layer)
+        .bind(seq)
+        .bind(seq)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn lineage_job(store: &Store, kind: &str, seq: i64, sources: &[&str]) {
+        sqlx::query(
+            "INSERT INTO memory_jobs
+             (id, kind, batch_seq, source_ids, source_versions, status,
+              created_at, updated_at, projection_event_seq, projection_digest)
+             VALUES (?, ?, ?, ?, '[]', 'applied', '2026-09-08T00:00:00Z',
+                     '2026-09-08T00:00:00Z', (SELECT MAX(seq) FROM agent_events), zeroblob(32))",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(kind)
+        .bind(seq)
+        .bind(serde_json::to_string(sources).unwrap())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upper_lineage_pages_actual_originals_without_including_gaps() {
+        let store = store().await;
+        let first = lineage_batch(&store, 0, 100).await;
+        let second = lineage_batch(&store, 0, 101).await;
+        for (seq, batch) in [(1, Some(&first)), (2, None), (3, Some(&second))] {
+            let id = format!("lineage-message-{seq}");
+            insert(&store, &id, seq, &original(&id)).await;
+            if let Some(batch) = batch {
+                sqlx::query(
+                    "INSERT INTO memory_batch_messages(batch_id, message_id, ord) VALUES (?, ?, 0)",
+                )
+                .bind(batch)
+                .bind(&id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            }
+        }
+        let l1a = lineage_batch(&store, 1, 100).await;
+        let l1b = lineage_batch(&store, 1, 101).await;
+        lineage_job(&store, "compact_l0", 100, &[&first]).await;
+        lineage_job(&store, "compact_l0", 101, &[&second]).await;
+        let l2 = lineage_batch(&store, 2, 200).await;
+        lineage_job(&store, "compact_l1", 200, &[&l1a, &l1b]).await;
+        let deep = lineage_batch(&store, 2, 201).await;
+        lineage_job(&store, "consolidate_l2", 201, &[&l2]).await;
+        // A malformed unrelated graph must not affect this read.
+        let unrelated = lineage_batch(&store, 2, 202).await;
+        lineage_job(&store, "consolidate_l2", 202, &[&unrelated]).await;
+        let first_page = store
+            .recall_messages(&RecallRequest {
+                batch_id: Some(deep.clone()),
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page.messages[0].message,
+            original("lineage-message-1")
+        );
+        assert_eq!(
+            first_page.messages[0].source.batch_id.as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(first_page.next_after_seq, Some(1));
+        let next = store
+            .recall_messages(&RecallRequest {
+                batch_id: Some(deep),
+                after_seq: first_page.next_after_seq,
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.messages[0].message, original("lineage-message-3"));
+        assert_eq!(next.next_after_seq, None);
+    }
+
+    #[tokio::test]
+    async fn invalid_requested_lineage_is_reported_instead_of_partial_history() {
+        let store = store().await;
+        let missing = lineage_batch(&store, 1, 301).await;
+        let empty = lineage_batch(&store, 1, 302).await;
+        lineage_job(&store, "compact_l0", 302, &[]).await;
+        let absent_source = lineage_batch(&store, 1, 303).await;
+        lineage_job(&store, "compact_l0", 303, &[&Uuid::now_v7().to_string()]).await;
+        let invalid_source = lineage_batch(&store, 1, 304).await;
+        lineage_job(&store, "compact_l0", 304, &["not-an-id"]).await;
+        let ambiguous = lineage_batch(&store, 2, 305).await;
+        lineage_job(&store, "compact_l1", 305, &[&missing]).await;
+        lineage_job(&store, "consolidate_l2", 305, &[&ambiguous]).await;
+        let cycle_a = lineage_batch(&store, 2, 306).await;
+        let cycle_b = lineage_batch(&store, 2, 307).await;
+        lineage_job(&store, "consolidate_l2", 306, &[&cycle_b]).await;
+        lineage_job(&store, "consolidate_l2", 307, &[&cycle_a]).await;
+        for (batch, error) in [
+            (missing, "producer"),
+            (empty, "identities"),
+            (absent_source, "source batch"),
+            (invalid_source, "identities"),
+            (ambiguous, "ambiguous"),
+            (cycle_a, "cyclic"),
+        ] {
+            let result = store
+                .recall_messages(&RecallRequest {
+                    batch_id: Some(batch),
+                    limit: 5,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(result.to_string().contains(error), "{result:#}");
+        }
     }
 
     #[tokio::test]

@@ -6,16 +6,14 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::memory::estimate::{
     EstimateError, ProviderContextItemWithFootprint, TokenCalibration, estimate_public_message,
 };
 #[cfg(test)]
-use crate::memory::{BatchId, ConsolidatedMemory, DecryptedMemorySummary, L0Batch};
-use crate::memory::{
-    BatchState, CompactResult, L0_DROP_TO, L0_LIMIT, L1_LIMIT, L2_LIMIT, ThreeLayerMemory,
-};
+use crate::memory::{BatchId, L0Batch};
+use crate::memory::{BatchState, L0_DROP_TO, L0_LIMIT, ThreeLayerMemory};
 use crate::provider::types::{
     AssistantContent, AssistantMessage, ContextMessage, Message, PublicAssistantContent,
     PublicAssistantMessage, PublicMessage, ToolResultMessage, UserContent, UserMessage,
@@ -270,45 +268,6 @@ impl Overflow {
             }
             memory.promote_l0_to_l1(front.id)?;
             report.l0_promoted += 1;
-        }
-        Ok(report)
-    }
-
-    /// If L1 has overflowed, replace the whole L1 queue with the supplied L2
-    /// compact result.  Callers are responsible for producing a compact summary
-    /// that covers the oldest L1 entries.
-    pub fn apply_l1(
-        &self,
-        memory: &mut ThreeLayerMemory,
-        compact: Option<CompactResult>,
-    ) -> Result<OverflowReport> {
-        let mut report = OverflowReport::default();
-        if memory.l1_total()? > L1_LIMIT {
-            if let Some(result) = compact {
-                memory.compact_l1_to_l2(result);
-                report.l1_compacted = true;
-            } else {
-                bail!("L1 overflow requires a compact result");
-            }
-        }
-        Ok(report)
-    }
-
-    /// If the single L2 summary exceeds its limit, replace it with a freshly
-    /// consolidated summary.
-    pub fn apply_l2(
-        &self,
-        memory: &mut ThreeLayerMemory,
-        compact: Option<CompactResult>,
-    ) -> Result<OverflowReport> {
-        let mut report = OverflowReport::default();
-        if memory.l2().est_tokens > L2_LIMIT {
-            if let Some(result) = compact {
-                memory.consolidate_l2(result);
-                report.l2_consolidated = true;
-            } else {
-                bail!("L2 overflow requires a compact result");
-            }
         }
         Ok(report)
     }
@@ -663,13 +622,7 @@ mod tests {
     fn l0_promotion_never_moves_open_batch() {
         let calib = TokenCalibration::new(1.0).unwrap();
         let overflow = Overflow::new(calib, AssemblyMode::SumiThreeLayer);
-        let mut memory = ThreeLayerMemory::new(
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new("summary".to_owned()),
-                est_tokens: 1_000,
-            },
-            calib,
-        );
+        let mut memory = ThreeLayerMemory::new(std::collections::VecDeque::new(), calib);
 
         let open_batch = L0Batch {
             id: BatchId::now_v7(),
