@@ -224,7 +224,7 @@ services:
       - type: volume
         source: workspace
         target: /workspace
-        read_only: true
+        read_only: false
         volume:
           nocopy: true
       - type: volume

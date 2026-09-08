@@ -48,7 +48,9 @@ web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ PersonalityAgentIdご
 2. **OS 層**: `sumi-agent`、`sumi-tool`、`sumi-artifact` を別UID・別 filesystem/PID/network sandbox にし、executor とそのbash子にだけ `/workspace`、artifact brokerにだけ専用artifact volumeをread/writeで見せる。runtimeからは両volume、bash子からはartifact volumeとbroker IPCを外す。Docker では両sidecarを `network_mode=none`、read-only rootfs、capability drop all、no-new-privileges で起動する。単一コンテナ内の `unshare(CLONE_NEWNET)` は Docker 既定 seccomp/capability では成立しないためリリース構成に使わない。microVM 内でも mount namespace + `pivot_root`/chroot 相当で同じ可視範囲を強制する。workspaceの`read_file`等はexecutorが workspace dirfd を起点に `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` 相当で行い、artifact操作はbrokerが専用root dirfdを起点に通常symlinkも禁止して、canonicalize→open の TOCTOU を許さない。外向き通信は egress プロキシを設計するまで非対応 (実装計画 §8.3)
 3. **人格agent VM層**: Sumi Cloud は`PersonalityAgentId`ごとのdedicated microVM (Firecracker 系)でagent/host間とagent/agent間を分離する。microVM は同一ゲスト内の runtime/executor/broker 分離の代替にはしない。tenant/Workspace/org単位のaggregate policyはcontrol planeが複数agent VMを横断してmeter/enforceする
 
-current direct productionのcritical executor RPCは、workspace限定の`read_file`、`list_dir`、`glob`、`grep`だけを公開する。これらは全てdirfd起点かつboundedなread-only操作であり、artifact handle、file mutation、bash、broader fixture serviceへ到達できない。各read actionの通常許可・internal state配下での追加承認はアプリ層のcanonical action policyが決め、executor endpointがそのpolicyを迂回して能力を広げない。
+現在の本番executorは、workspace限定の`read_file`、`list_dir`、`glob`、`grep`に加え、UTF-8ファイルを作成・置換する`write_file`と、一意に一致する文字列を置換する`edit_file`を公開する。書き込みは本人が任意に使える道具であり、メモや振り返りを必須にする指示は加えない。親ディレクトリは既存である必要がある。引数は既存の共通上限（文字列ごと256 KiB、全体1 MiB）、編集対象は10 MiBまでである。
+
+書き込みでは正規化したパス・本文・置換文字列を`Mutate`の実行内容へ固定し、通常／追加承認の既存経路と、実行時の署名・有効期限の確認を通す。操作はdirfd起点で本人のworkspace内に限定し、read/write mountを持つのはexecutorだけとする。runtimeやbrokerへworkspaceの直接アクセスを追加しない。削除、bash、artifact handleを使う操作はこの本番RPCの公開対象には含めない。送信後の処理をキャンセルできたと偽らず、実行結果が確定するか不明なままかを既存の結果契約で扱う。
 
 ## 配置形態
 

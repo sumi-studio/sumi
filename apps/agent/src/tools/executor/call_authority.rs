@@ -181,7 +181,7 @@ impl Ed25519CallAuthorityIssuer {
         permit: CallAuthorityPermitClaims,
     ) -> Result<SignedCallAuthority, CallAuthorityError> {
         permit.validate()?;
-        if !is_production_read_operation(&operation) {
+        if !is_production_workspace_operation(&operation) {
             return Err(CallAuthorityError::UnsupportedOperation);
         }
         validate_bounded_text(&request_id)?;
@@ -352,7 +352,7 @@ impl ExecutorCallAuthorityVerifier {
                 Err(CallAuthorityError::UnsupportedOperation)
             };
         }
-        if !is_production_read_operation(operation) {
+        if !is_production_workspace_operation(operation) {
             return Err(CallAuthorityError::UnsupportedOperation);
         }
         let authority = authority.ok_or(CallAuthorityError::Missing)?;
@@ -628,10 +628,12 @@ pub(crate) const fn call_authority_key_id() -> &'static str {
     EXECUTOR_CALL_AUTHORITY_KEY_ID
 }
 
-pub(crate) fn is_production_read_operation(operation: &ExecutorOperation) -> bool {
+pub(crate) fn is_production_workspace_operation(operation: &ExecutorOperation) -> bool {
     matches!(
         operation,
         ExecutorOperation::ReadFile { .. }
+            | ExecutorOperation::WriteFile { .. }
+            | ExecutorOperation::EditFile { .. }
             | ExecutorOperation::ListDir { .. }
             | ExecutorOperation::Glob { .. }
             | ExecutorOperation::Grep { .. }
@@ -805,6 +807,82 @@ mod tests {
             nonce_fence.verify(Some(&token), "request-1", &operation),
             Err(CallAuthorityError::WrongBootNonce)
         );
+    }
+
+    #[test]
+    fn workspace_mutation_authority_binds_content_replacements_and_personality() {
+        let rpc = identity(7, "nonce-a");
+        let issuer = Ed25519CallAuthorityIssuer::new(
+            call_authority_key_id(),
+            SigningKey::from_bytes(&[7; 32]),
+            rpc.clone(),
+        )
+        .unwrap()
+        .with_clock(Arc::new(FixedClock(1_000)));
+        let verifier = ExecutorCallAuthorityVerifier::new(
+            call_authority_key_id(),
+            issuer.verifying_key(),
+            rpc,
+        )
+        .unwrap()
+        .with_clock(Arc::new(FixedClock(1_001)));
+        let other_pa =
+            RpcIdentity::from_wire("018f47a2-9b3c-7def-8abc-0123456789ac", 7, "nonce-a").unwrap();
+        let other_verifier = ExecutorCallAuthorityVerifier::new(
+            call_authority_key_id(),
+            issuer.verifying_key(),
+            other_pa,
+        )
+        .unwrap()
+        .with_clock(Arc::new(FixedClock(1_001)));
+        for operation in [
+            ExecutorOperation::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "original".to_owned(),
+                execution_id: "write".to_owned(),
+            },
+            ExecutorOperation::EditFile {
+                path: "note.txt".to_owned(),
+                old_string: "original".to_owned(),
+                new_string: "updated".to_owned(),
+                execution_id: "edit".to_owned(),
+            },
+        ] {
+            let token = issuer
+                .issue_for_test("mutation".to_owned(), operation.clone(), permit())
+                .unwrap();
+            assert!(
+                verifier
+                    .verify(Some(&token), "mutation", &operation)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                other_verifier
+                    .verify(Some(&token), "mutation", &operation)
+                    .is_err()
+            );
+            let mut changed = operation.clone();
+            match &mut changed {
+                ExecutorOperation::WriteFile { content, .. } => *content = "tampered".to_owned(),
+                ExecutorOperation::EditFile { new_string, .. } => {
+                    *new_string = "tampered".to_owned()
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verifier.verify(Some(&token), "mutation", &changed),
+                Err(CallAuthorityError::WrongOperation)
+            );
+            let mut changed = operation.clone();
+            if let ExecutorOperation::EditFile { old_string, .. } = &mut changed {
+                *old_string = "different match".to_owned();
+                assert_eq!(
+                    verifier.verify(Some(&token), "mutation", &changed),
+                    Err(CallAuthorityError::WrongOperation)
+                );
+            }
+        }
     }
 
     #[test]
