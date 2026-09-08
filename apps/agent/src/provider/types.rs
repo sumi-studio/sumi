@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -805,6 +805,7 @@ impl SuccessTerminalCommit {
 }
 
 pub struct ProviderEventStream {
+    retry_after: Arc<OnceLock<super::retry::RetryAfter>>,
     rx: Option<mpsc::Receiver<ProviderEvent>>,
     priority_terminal_rx: Option<mpsc::Receiver<ProviderEvent>>,
     ordered_prefix_drain_rx: Option<mpsc::Receiver<()>>,
@@ -830,6 +831,7 @@ impl ProviderEventStream {
         origin: ProviderOrigin,
     ) -> Self {
         Self {
+            retry_after: Arc::new(OnceLock::new()),
             rx: Some(rx),
             priority_terminal_rx: None,
             ordered_prefix_drain_rx: None,
@@ -855,6 +857,7 @@ impl ProviderEventStream {
         success_terminal_committed: Arc<SuccessTerminalCommit>,
     ) -> Self {
         Self {
+            retry_after: Arc::new(OnceLock::new()),
             rx: Some(rx),
             priority_terminal_rx: Some(priority_terminal_rx),
             ordered_prefix_drain_rx: None,
@@ -883,6 +886,18 @@ impl ProviderEventStream {
     pub(crate) fn with_ordered_prefix_drain(mut self, rx: mpsc::Receiver<()>) -> Self {
         self.ordered_prefix_drain_rx = Some(rx);
         self
+    }
+
+    pub(crate) fn with_retry_after(
+        mut self,
+        hint: Arc<OnceLock<super::retry::RetryAfter>>,
+    ) -> Self {
+        self.retry_after = hint;
+        self
+    }
+
+    pub(crate) fn retry_after(&self) -> Option<super::retry::RetryAfter> {
+        self.retry_after.get().copied()
     }
 
     pub async fn recv(&mut self) -> Option<ProviderEvent> {

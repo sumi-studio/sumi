@@ -579,20 +579,38 @@ fn authenticated_dependency_monitor(
     let task_cancel = cancel.clone();
     let (termination_tx, termination) = watch::channel(None);
     let task = tokio::spawn(async move {
+        let mut unavailable = false;
         loop {
             let health = executor
-                .health_with_cancellation(task_cancel.clone(), policy.probe_timeout)
+                .probe_health(task_cancel.clone(), policy.probe_timeout)
                 .await;
             if task_cancel.is_cancelled() {
                 return;
             }
-            if let Err(error) = health {
-                termination_tx.send_replace(Some(DependencyMonitorFailure {
-                    description: format!(
-                        "authenticated executor Health failed for the exact runtime identity: {error}"
-                    ),
-                }));
-                return;
+            match health {
+                Ok(()) => {
+                    if unavailable {
+                        tracing::info!("authenticated executor Health recovered");
+                    }
+                    unavailable = false;
+                }
+                Err(error) if error.is_unavailable() => {
+                    if !unavailable {
+                        tracing::warn!(
+                            "executor Health temporarily unavailable; retaining runtime identity and retrying"
+                        );
+                    }
+                    unavailable = true;
+                }
+                Err(error) => {
+                    let error = error.into_tool_error();
+                    termination_tx.send_replace(Some(DependencyMonitorFailure {
+                        description: format!(
+                            "authenticated executor Health failed for the exact runtime identity: {error}"
+                        ),
+                    }));
+                    return;
+                }
             }
             tokio::select! {
                 biased;
@@ -2201,11 +2219,15 @@ async fn wait_for_authenticated_executor_ready(
         }
         let probe_timeout = policy.probe_timeout.min(remaining);
         match client
-            .health_with_cancellation(CancellationToken::new(), probe_timeout)
+            .probe_health(CancellationToken::new(), probe_timeout)
             .await
         {
             Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
+            Err(error) if error.is_unavailable() => last_error = Some(error.into_tool_error()),
+            Err(error) => {
+                return Err(error.into_tool_error())
+                    .context("executor authenticated Health response was invalid");
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -2291,7 +2313,16 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create executor Health fixture root");
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).expect("bind executor Health fixture");
-        let task = tokio::spawn(async move {
+        let task = spawn_executor_health_listener(listener, identity, connections);
+        (socket, task, root)
+    }
+
+    fn spawn_executor_health_listener(
+        listener: UnixListener,
+        identity: RpcIdentity,
+        connections: usize,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
             for _ in 0..connections {
                 let (stream, _) = listener.accept().await.expect("accept Health client");
                 let (read, mut write) = stream.into_split();
@@ -2319,8 +2350,7 @@ mod tests {
                     .await
                     .expect("write Health terminal");
             }
-        });
-        (socket, task, root)
+        })
     }
 
     fn valid_env() -> HashMap<String, OsString> {
@@ -3924,7 +3954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dependency_monitor_uses_fresh_health_and_is_explicitly_joined() {
+    async fn dependency_monitor_survives_socket_loss_recovers_and_still_fences_wrong_identity() {
         let context = parse(&valid_env()).unwrap();
         let (socket, service, root) =
             spawn_executor_health_service(context.authority.rpc_identity().clone(), 1);
@@ -3938,10 +3968,37 @@ mod tests {
         service
             .await
             .expect("the immediate fresh Health must complete");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), monitor.termination())
+                .await
+                .is_err(),
+            "temporary socket loss must not terminate an otherwise usable runtime"
+        );
+        std::fs::remove_file(&socket).unwrap();
+        let healthy_again = spawn_executor_health_listener(
+            UnixListener::bind(&socket).unwrap(),
+            context.authority.rpc_identity().clone(),
+            1,
+        );
+        tokio::time::timeout(Duration::from_secs(1), healthy_again)
+            .await
+            .expect("monitor must reconnect after the transport recovers")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), monitor.termination())
+                .await
+                .is_err(),
+            "a successful re-probe must retain the existing runtime"
+        );
+        std::fs::remove_file(&socket).unwrap();
+        let wrong_identity = RpcIdentity::from_wire(PAID, 7, "another-boot").unwrap();
+        let wrong_service =
+            spawn_executor_health_listener(UnixListener::bind(&socket).unwrap(), wrong_identity, 1);
         let error = tokio::time::timeout(Duration::from_secs(1), monitor.termination())
             .await
-            .expect("the next fresh connection failure is bounded")
-            .expect_err("socket loss must terminate the required dependency");
+            .expect("authenticated identity mismatch must fence promptly")
+            .expect_err("a different executor cannot be treated as unavailable");
+        wrong_service.await.unwrap();
         assert!(
             error
                 .to_string()
@@ -3952,6 +4009,29 @@ mod tests {
             .await
             .expect("failed monitor task is still explicitly joined");
         std::fs::remove_dir_all(root).expect("remove monitor fixture");
+    }
+
+    #[tokio::test]
+    async fn unavailable_dependency_monitor_cancels_and_joins_without_a_terminal_failure() {
+        let context = parse(&valid_env()).unwrap();
+        let socket =
+            std::env::temp_dir().join(format!("missing-executor-{}", uuid::Uuid::now_v7()));
+        let executor = Arc::new(ExecutorClient::new(
+            socket,
+            context.authority.rpc_identity().clone(),
+        ));
+        let mut monitor =
+            authenticated_dependency_monitor(executor, &context.authority, test_health_policy())
+                .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), monitor.termination())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), monitor.cancel_and_join())
+            .await
+            .expect("unavailable probe loop must cancel promptly")
+            .unwrap();
     }
 
     fn blocked_dependency_monitor_owner() -> ExecutorDependencyMonitor {

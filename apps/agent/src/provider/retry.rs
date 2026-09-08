@@ -13,6 +13,29 @@ use super::types::{AssistantMessage, StopReason};
 
 pub const MAX_RETRIES: usize = 3;
 
+/// Request-local scheduling information, never part of the assistant transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryAfter {
+    NotBefore(tokio::time::Instant),
+    BeyondAutomaticWait,
+}
+
+pub(crate) const MAX_SERVER_RETRY_WAIT: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) fn retry_delay_with_server(
+    attempt: usize,
+    server: Option<RetryAfter>,
+) -> Option<Duration> {
+    let backoff = retry_delay(attempt)?;
+    match server {
+        Some(RetryAfter::BeyondAutomaticWait) => None,
+        Some(RetryAfter::NotBefore(deadline)) => {
+            Some(backoff.max(deadline.saturating_duration_since(tokio::time::Instant::now())))
+        }
+        None => Some(backoff),
+    }
+}
+
 pub fn is_retryable(message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         return false;
@@ -267,6 +290,31 @@ mod tests {
         for text in terminal {
             assert!(!is_retryable(&error(text)), "{text}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_retry_deadline_is_not_shortened_and_automatic_wait_is_bounded() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let hint = Some(RetryAfter::NotBefore(deadline));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let delay = retry_delay_with_server(0, hint).unwrap();
+        assert_eq!(delay, Duration::from_secs(100));
+        let cancel = CancellationToken::new();
+        let waiting = tokio::spawn(async move { sleep_or_cancel(delay, &cancel).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(99)).await;
+        assert!(!waiting.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(waiting.await.unwrap());
+        assert_eq!(
+            retry_delay_with_server(0, None),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay_with_server(0, Some(RetryAfter::BeyondAutomaticWait)),
+            None
+        );
+        assert_eq!(retry_delay_with_server(MAX_RETRIES, hint), None);
     }
 
     #[test]

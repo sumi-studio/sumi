@@ -1440,8 +1440,9 @@ impl ResponsesReceiveState {
     }
 
     pub fn push_json(&mut self, payload: &str) -> Result<ResponsesPush, ResponsesAdapterError> {
-        let value: Value = serde_json::from_str(payload)
+        let mut value: Value = serde_json::from_str(payload)
             .map_err(|error| ResponsesAdapterError::InvalidEvent(error.to_string()))?;
+        normalize_incoming_reasoning(&mut value);
         let object = value
             .as_object()
             .ok_or_else(|| ResponsesAdapterError::InvalidEvent("event is not an object".into()))?;
@@ -2760,6 +2761,51 @@ fn nested_index(object: &Map<String, Value>, field: &str) -> Result<u32, Respons
     })?;
     u32::try_from(value)
         .map_err(|_| ResponsesAdapterError::InvalidEvent(format!("{field} exceeds u32")))
+}
+
+// Provider response objects may gain informational fields independently of the
+// request schema. Project known reasoning objects at ingestion so metadata does
+// not abort a usable stream or leak into the next request. Do not repair missing
+// fields, invalid values, or unknown variants: the normal validators still own
+// those checks. Opaque encrypted_content remains byte-for-byte unchanged.
+fn normalize_incoming_reasoning(event: &mut Value) {
+    fn item(value: &mut Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return;
+        }
+        object.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "id" | "summary" | "type" | "content" | "encrypted_content" | "status"
+            )
+        });
+        for (field, kind) in [("summary", "summary_text"), ("content", "reasoning_text")] {
+            if let Some(parts) = object.get_mut(field).and_then(Value::as_array_mut) {
+                for part in parts {
+                    if let Some(part) = part.as_object_mut()
+                        && part.get("type").and_then(Value::as_str) == Some(kind)
+                    {
+                        part.retain(|key, _| matches!(key.as_str(), "type" | "text"));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(value) = event.get_mut("item") {
+        item(value);
+    }
+    if let Some(output) = event
+        .get_mut("response")
+        .and_then(|response| response.get_mut("output"))
+        .and_then(Value::as_array_mut)
+    {
+        for value in output {
+            item(value);
+        }
+    }
 }
 
 fn terminal_item_matches_completed(
@@ -5193,6 +5239,121 @@ mod tests {
     }
 
     #[test]
+    fn incoming_reasoning_metadata_does_not_break_completion_or_replay() {
+        for terminal_backfill in [false, true] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            let mut done = json!({
+                "id":"r", "type":"reasoning", "summary":[{"type":"summary_text","text":"Checking.","future":true}],
+                "content":[{"type":"reasoning_text","text":"provider context","future":{"trace":1}}],
+                "future":{"trace":"item-done"}
+            });
+            if !terminal_backfill {
+                done["encrypted_content"] = json!("opaque-byte-for-byte");
+            }
+            let mut terminal_item = done.clone();
+            terminal_item["encrypted_content"] = json!("opaque-byte-for-byte");
+            terminal_item["future"] = json!({"trace":"terminal-only metadata"});
+            for event in [
+                json!({"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"","future":true}],"future":true}}),
+                json!({"type":"response.reasoning_summary_part.added","sequence_number":1,"output_index":0,"item_id":"r","summary_index":0,"part":{"type":"summary_text","text":"","future":true}}),
+                json!({"type":"response.reasoning_summary_text.delta","sequence_number":2,"output_index":0,"item_id":"r","summary_index":0,"delta":"Checking."}),
+                json!({"type":"response.reasoning_summary_text.done","sequence_number":3,"output_index":0,"item_id":"r","summary_index":0,"text":"Checking."}),
+                json!({"type":"response.reasoning_summary_part.done","sequence_number":4,"output_index":0,"item_id":"r","summary_index":0,"part":{"type":"summary_text","text":"Checking.","future":true}}),
+                json!({"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":done}),
+            ] {
+                state
+                    .push_json(&event.to_string())
+                    .expect("incremental event with additive metadata");
+            }
+            let terminal = state.push_json(&json!({
+                "type":"response.completed","sequence_number":6,
+                "response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[terminal_item]}
+            }).to_string()).expect("terminal metadata can differ").terminal.expect("terminal");
+            assert_eq!(terminal.reason, StopReason::Stop);
+            let expected = json!({
+                "id":"r", "type":"reasoning", "summary":[{"type":"summary_text","text":"Checking."}],
+                "content":[{"type":"reasoning_text","text":"provider context"}],
+                "encrypted_content":"opaque-byte-for-byte"
+            });
+            let spec = spec();
+            let anchor = ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            };
+            let bound = crate::provider::types::bind_provider_context_fragments(
+                terminal.provider_context,
+                anchor.clone(),
+                spec.origin(),
+            )
+            .expect("bind durable anchor");
+            // Exercise the durable payload's serialization contract before replay.
+            // Actual database/session restart coverage lives in session_tests.
+            let restored: Vec<ProviderContextItem> =
+                serde_json::from_slice(&serde_json::to_vec(&bound).expect("serialize context"))
+                    .expect("restore context");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(
+                restored[0].payload,
+                ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: expected.clone(),
+                }
+            );
+            let request = build_request(
+                &spec,
+                &PromptContext {
+                    system_prompt: "system".into(),
+                    memory_blocks: vec![],
+                    messages: vec![
+                        ContextMessage::Persisted {
+                            id: anchor.message_id,
+                            seq: anchor.message_seq,
+                            message: Message::Assistant(AssistantMessage {
+                                content: vec![],
+                                model: spec.id.clone(),
+                                provider: spec.provider.clone(),
+                                origin: spec.origin(),
+                                usage: Usage::default(),
+                                stop_reason: StopReason::Stop,
+                                error_message: None,
+                                provider_code: None,
+                                interrupted: false,
+                                timestamp: Utc::now(),
+                            }),
+                        },
+                        persisted_user(2),
+                    ],
+                    provider_context: restored,
+                    tools: vec![],
+                    replay_provenance: None,
+                },
+                &RequestOptions::default(),
+            )
+            .expect("next request");
+            assert_eq!(request["input"][0], expected);
+            assert_eq!(request["input"][1]["role"], "user");
+        }
+    }
+
+    #[test]
+    fn incoming_reasoning_metadata_does_not_hide_invalid_known_fields() {
+        for invalid in [
+            json!({"id":"r","type":"reasoning","summary":null,"future":true}),
+            json!({"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":7,"future":true}]}),
+            json!({"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":null,"future":true}]}),
+            json!({"id":"r","type":"reasoning","summary":[],"encrypted_content":7,"future":true}),
+            json!({"id":"other","type":"reasoning","summary":[],"future":true}),
+        ] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            state.push_json(r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#).unwrap();
+            assert!(state.push_json(&json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":invalid}).to_string()).is_err(), "{invalid}");
+            assert!(state.provider_context().is_empty());
+        }
+    }
+
+    #[test]
     fn encrypted_reasoning_ids_types_and_budget_are_transactional() {
         for malformed in ["\"\"", "7"] {
             let mut state =
@@ -5915,21 +6076,6 @@ mod tests {
         );
         assert!(state
             .push_json(
-                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"future_provider_field":"not canonical","encrypted_content":"opaque"}}"#,
-            )
-            .is_err());
-        assert_eq!(
-            (
-                state.next_sequence_number,
-                state.content_bytes,
-                state.event_count,
-                state.completed_items.len(),
-                state.reasoning_fragments.len(),
-            ),
-            before_done
-        );
-        assert!(state
-            .push_json(
                 r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"future_reasoning","text":"x"}],"encrypted_content":"opaque"}}"#,
             )
             .is_err());
@@ -5945,11 +6091,20 @@ mod tests {
         );
         state
             .push_json(
-                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x"}],"encrypted_content":"opaque"}}"#,
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x","future_provider_field":true}],"future_provider_field":"metadata","encrypted_content":"opaque"}}"#,
             )
             .expect("valid done retry at the same sequence");
         assert_eq!(state.completed_items.len(), 1);
         assert_eq!(state.reasoning_fragments.len(), 1);
+        let canonical = json!({"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x"}],"encrypted_content":"opaque"});
+        assert_eq!(state.completed_items[&0], canonical);
+        assert_eq!(
+            state.provider_context()[0].payload,
+            ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: canonical,
+            }
+        );
     }
 
     #[test]
@@ -6032,7 +6187,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_variants_reject_unknown_fields_recursively() {
+    fn outgoing_canonical_variants_reject_unknown_fields_recursively() {
         for item in [
             json!({"id":"r","type":"reasoning","summary":[],"future":true}),
             json!({"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"x","future":true}]}),

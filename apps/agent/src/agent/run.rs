@@ -45,7 +45,7 @@ use crate::{
     provider::{
         model::ModelSpec,
         overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
-        retry::{is_retryable, retry_delay, sleep_or_cancel},
+        retry::{RetryAfter, is_retryable, retry_delay_with_server, sleep_or_cancel},
         types::{
             AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextFragment,
             ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
@@ -642,6 +642,7 @@ impl Runner {
             self.user_turn_attempt = self.user_turn_attempt.saturating_add(1);
             match outcome {
                 AttemptOutcome::Retry {
+                    retry_after,
                     assistant_message_id,
                     message,
                     receipt,
@@ -653,7 +654,8 @@ impl Runner {
                     self.retain_tool_results(&receipts, &rejected_results)?;
                     self.await_message_receipt(receipt).await?;
                     self.consecutive_length_batches = 0;
-                    let Some(delay) = retry_delay(self.ordinary_retries) else {
+                    let Some(delay) = retry_delay_with_server(self.ordinary_retries, retry_after)
+                    else {
                         self.close_turn(message, Vec::new()).await?;
                         break;
                     };
@@ -670,7 +672,7 @@ impl Runner {
                         let _ = self.phase.send(WorkerPhase::Active);
                         return Err(failure);
                     }
-                    let injected = match self.wait_retry_or_control(delay).await {
+                    let injected = match self.wait_retry_or_control(delay, retry_after).await {
                         Ok(injected) => injected,
                         Err(WorkerFailure::Cancelled) if self.abort_requested => {
                             self.in_flight_controls.clear();
@@ -1242,6 +1244,7 @@ impl Runner {
                                 // Error assistants remain observable but never enter L0/context.
                                 if internal.stop_reason == StopReason::Error && is_retryable(&internal) {
                                     return Ok(AttemptOutcome::Retry {
+                                        retry_after: attempt.events.retry_after(),
                                         assistant_message_id: attempt.message_id.clone(),
                                         message: public,
                                         receipt,
@@ -3788,17 +3791,28 @@ impl Runner {
         Ok(committed.await.is_ok())
     }
 
-    async fn wait_retry_or_control(&mut self, delay: Duration) -> Result<bool, WorkerFailure> {
-        if self.claim_pending_user()? {
+    async fn wait_retry_or_control(
+        &mut self,
+        delay: Duration,
+        retry_after: Option<RetryAfter>,
+    ) -> Result<bool, WorkerFailure> {
+        let minimum = match retry_after {
+            Some(RetryAfter::NotBefore(deadline)) => Some(deadline),
+            _ => None,
+        };
+        let can_resume = || minimum.is_none_or(|deadline| tokio::time::Instant::now() >= deadline);
+        let pending = self.claim_pending_user()?;
+        if pending && can_resume() {
             return Ok(true);
         }
         let cancel = self.cancel.child_token();
         let driver = self.driver.clone();
         let retry = driver.wait_retry(delay, &cancel);
         tokio::pin!(retry);
-        let mut collected = false;
+        let mut collected = pending;
         const COLLECT_GRACE: Duration = Duration::from_millis(50);
-        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> =
+            minimum.map(|deadline| Box::pin(tokio::time::sleep_until(deadline)));
         let runtime_cancel = self.cancel.clone();
         loop {
             let control = tokio::select! {
@@ -3839,7 +3853,10 @@ impl Runner {
                         .queue_followup(command)
                         .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                     if self.claim_pending_user()? {
-                        return Ok(true);
+                        if can_resume() {
+                            return Ok(true);
+                        }
+                        collected = true;
                     }
                     continue;
                 }
@@ -3847,7 +3864,10 @@ impl Runner {
                     if accepted.send(true).is_ok() {
                         self.cancel_provider();
                         self.claim_control(command)?;
-                        return Ok(true);
+                        if can_resume() {
+                            return Ok(true);
+                        }
+                        collected = true;
                     }
                 }
                 RunControl::Abort {
@@ -3876,7 +3896,8 @@ impl Runner {
                         .await?
                     {
                         collected = true;
-                        let deadline = tokio::time::Instant::now() + COLLECT_GRACE;
+                        let deadline = (tokio::time::Instant::now() + COLLECT_GRACE)
+                            .max(minimum.unwrap_or_else(tokio::time::Instant::now));
                         grace = Some(Box::pin(tokio::time::sleep_until(deadline)));
                     }
                     continue;
@@ -4201,6 +4222,7 @@ impl<F> Drop for CancelOnDrop<F> {
 #[allow(clippy::large_enum_variant)]
 enum AttemptOutcome {
     Retry {
+        retry_after: Option<RetryAfter>,
         assistant_message_id: String,
         message: PublicMessage,
         receipt: oneshot::Receiver<MessageCommitReceipt>,
