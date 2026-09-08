@@ -307,10 +307,26 @@ impl ContextAssembler {
         let calibration = memory.calibration();
         *self.calib.lock().expect("calibration lock") = calibration;
         *self.provider_context.lock().expect("provider context lock") = provider_context;
-        *self.hydrated_three_layer.lock().expect("memory lock") = Some(HydratedThreeLayer {
+        let mut hydrated = self.hydrated_three_layer.lock().expect("memory lock");
+        // This budget belongs to the membership rejected by the provider.
+        // A committed replacement invalidates it; ordinary appends, sealing
+        // and metadata refreshes do not. If the new view still exceeds the
+        // provider's capacity, the existing bounded recovery computes a new one.
+        let replaced_l0 = hydrated.as_ref().is_some_and(|previous| {
+            memory.l1().iter().any(|entry| {
+                previous.memory.l0().iter().any(|batch| {
+                    batch.id == entry.source_batch
+                        && !memory.l0().iter().any(|live| live.id == batch.id)
+                })
+            })
+        });
+        *hydrated = Some(HydratedThreeLayer {
             memory,
             transcript_through_seq,
         });
+        if replaced_l0 {
+            *self.recovery_budget.lock().expect("recovery budget lock") = None;
+        }
         Ok(())
     }
 
@@ -2442,6 +2458,108 @@ mod tests {
             if matches!(&fragment.content[0], UserContent::Text { text } if text.ends_with("B organized")))
         );
         assert_eq!(placed[3], tail);
+    }
+
+    #[tokio::test]
+    async fn durable_replacement_releases_recovery_budget_but_routine_hydration_does_not() {
+        for output_reserve in [0, 2_000] {
+            let raw = vec![
+                user(&"Large original observation. ".repeat(1_000), 10),
+                user("Earlier detail that should become available again.", 20),
+                user("Latest request.", 30),
+            ];
+            let mut batches: Vec<_> = raw
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    let mut batch = L0Batch::new(vec![message.clone()], index as u64 + 1, 0, 1_000);
+                    batch.state = BatchState::Sealed;
+                    batch
+                })
+                .collect();
+            let source_id = batches[0].id;
+            let make_memory = |batches: &[L0Batch]| {
+                let mut memory = ThreeLayerMemory::new(
+                    ConsolidatedMemory {
+                        summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                        est_tokens: 0,
+                    },
+                    TokenCalibration::default(),
+                );
+                for batch in batches {
+                    memory.push_l0(batch.clone());
+                }
+                memory
+            };
+            let mut spec = model_spec();
+            spec.context_window = 2_000;
+            let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec).unwrap();
+            assembler
+                .install_hydrated_memory(make_memory(&batches), &raw, Vec::new())
+                .unwrap();
+            assembler
+                .recover_overflow_with_output_reserve(&raw, output_reserve)
+                .unwrap();
+            let budget = *assembler.recovery_budget.lock().unwrap();
+            assert!(budget.is_some());
+            if output_reserve == 2_000 {
+                assert_eq!(budget, Some(0));
+            }
+            let restricted = assembler.assemble(&raw, 1).await.unwrap();
+            assert!(!restricted.messages.contains(&raw[0]));
+            assert!(restricted.messages.contains(&raw[2]));
+
+            // Rehydrating the same snapshot, then sealing/appending a batch,
+            // must not silently undo recovery before any actual replacement.
+            assembler
+                .install_hydrated_memory(make_memory(&batches), &raw, Vec::new())
+                .unwrap();
+            assert_eq!(*assembler.recovery_budget.lock().unwrap(), budget);
+            batches[0].state = BatchState::Compacted;
+            let mut extended = raw.clone();
+            extended.push(user("New ordinary input.", 40));
+            batches.push(L0Batch::new(vec![extended[3].clone()], 4, 0, 10));
+            assembler
+                .install_hydrated_memory(make_memory(&batches), &extended, Vec::new())
+                .unwrap();
+            assert_eq!(*assembler.recovery_budget.lock().unwrap(), budget);
+            if output_reserve == 2_000 {
+                assert!(
+                    !assembler
+                        .assemble(&extended, 1)
+                        .await
+                        .unwrap()
+                        .messages
+                        .contains(&raw[1])
+                );
+            }
+
+            let mut replaced = make_memory(&batches);
+            let time = Utc::now();
+            replaced.store_compact_result(
+                source_id,
+                crate::memory::CompactResult {
+                    summary: crate::memory::DecryptedMemorySummary::new(
+                        "Observation organized.".into(),
+                    ),
+                    est_tokens: 5,
+                    time_range: (time, time),
+                },
+            );
+            replaced.promote_l0_to_l1(source_id).unwrap();
+            assembler
+                .install_hydrated_memory(replaced, &extended, Vec::new())
+                .unwrap();
+            assert_eq!(*assembler.recovery_budget.lock().unwrap(), None);
+            let restored = assembler.assemble(&extended, 1).await.unwrap();
+            assert!(restored.messages.contains(&raw[1]));
+            assert!(restored.messages.contains(&raw[2]));
+            assert!(restored.messages.contains(&extended[3]));
+            assert!(!restored.messages.contains(&raw[0]));
+            assert!(restored.messages.iter().any(|message| matches!(message,
+                ContextMessage::Synthetic { message: Message::User(fragment) }
+                    if matches!(&fragment.content[0], UserContent::Text { text } if text.ends_with("Observation organized.")))));
+        }
     }
 
     #[tokio::test]
