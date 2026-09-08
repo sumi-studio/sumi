@@ -4,6 +4,7 @@ mod active_memory;
 mod crypto;
 mod delivery;
 mod event_log;
+mod event_payload;
 mod event_writer;
 mod memory_state;
 mod physical_recovery;
@@ -881,7 +882,7 @@ impl Store {
         .ok_or_else(|| anyhow!("Human decision command is not durably authenticated"))?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
         let provenance_json: String = row.try_get("provenance_json")?;
-        let provenance: crate::runtime::contracts::DirectChatProvenanceV1 =
+        let provenance: crate::runtime::contracts::IncomingProvenance =
             serde_json::from_str(&provenance_json)
                 .context("Human decision command provenance is invalid")?;
         provenance
@@ -891,7 +892,8 @@ impl Store {
             || serde_json::to_string(&provenance)? != provenance_json
             || human.tenant_id != provenance.tenant_id()
             || human.personality_agent_id != provenance.personality_agent_id().as_str()
-            || human.human_principal_id != provenance.actor().principal_id()
+            || provenance.authenticated_direct_chat_human()
+                != Some(human.human_principal_id.as_str())
         {
             bail!("Human decision evidence disagrees with authenticated command provenance");
         }
@@ -942,7 +944,7 @@ impl Store {
         .ok_or_else(|| anyhow!("route approval has no originating authenticated command"))?;
         let personality_agent_id: String = row.try_get("personality_agent_id")?;
         let provenance_json: String = row.try_get("provenance_json")?;
-        let provenance: crate::runtime::contracts::DirectChatProvenanceV1 =
+        let provenance: crate::runtime::contracts::IncomingProvenance =
             serde_json::from_str(&provenance_json)
                 .context("route approval origin provenance is invalid")?;
         provenance
@@ -952,7 +954,8 @@ impl Store {
             || serde_json::to_string(&provenance)? != provenance_json
             || human.tenant_id != provenance.tenant_id()
             || human.personality_agent_id != provenance.personality_agent_id().as_str()
-            || human.human_principal_id != provenance.actor().principal_id()
+            || provenance.authenticated_direct_chat_human()
+                != Some(human.human_principal_id.as_str())
         {
             bail!("Human decision actor differs from the route approval origin actor");
         }
@@ -3648,7 +3651,7 @@ mod tests {
         StopReason, Usage, UserContent, UserMessage,
     };
     use crate::runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+        GenerationRecoveryFence, IncomingProvenance, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
     use crate::store::transcript::TranscriptRecord;
@@ -3681,8 +3684,8 @@ mod tests {
         }
     }
 
-    fn direct_chat_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+    fn direct_chat_provenance() -> IncomingProvenance {
+        IncomingProvenance::new("tenant-1", scope().personality_agent_id, "human-1")
             .expect("valid direct-chat provenance")
     }
 
@@ -5289,6 +5292,7 @@ mod tests {
             id: "user-2".to_owned(),
             seq: 2,
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "ack".to_owned(),
@@ -7160,6 +7164,7 @@ mod tests {
             .with_timezone(&Utc);
         let message_id = user_message_id(store.scope().personality_agent_id(), &command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: writer
                 .timing_for_command(command_id.as_str())
                 .await
@@ -7433,6 +7438,7 @@ mod tests {
             .await
             .expect("mint transcript key");
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -7485,6 +7491,7 @@ mod tests {
             .expect("load canonical message sequence");
         let message_seq = u64::try_from(message_seq).expect("message sequence is non-negative");
         let replacement = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "different but valid content".to_owned(),

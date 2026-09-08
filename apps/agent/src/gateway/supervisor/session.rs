@@ -27,6 +27,7 @@ pub(crate) trait SessionEventDelivery: Send + Sync + 'static {
     async fn on_volatile(
         &self,
         personality_agent_id: &PersonalityAgentId,
+        audience: crate::runtime::contracts::OutputAudience,
         event: AgentEvent,
     ) -> Result<()>;
 }
@@ -75,9 +76,12 @@ impl SessionEventSink {
     async fn on_volatile(
         &self,
         personality_agent_id: &PersonalityAgentId,
+        audience: crate::runtime::contracts::OutputAudience,
         event: AgentEvent,
     ) -> Result<()> {
-        self.delivery.on_volatile(personality_agent_id, event).await
+        self.delivery
+            .on_volatile(personality_agent_id, audience, event)
+            .await
     }
 }
 
@@ -291,7 +295,7 @@ impl GatewayWriter for SessionGatewayWriter {
                     }));
                 }
                 session_events
-                    .on_volatile(&envelope.personality_agent_id, event)
+                    .on_volatile(&envelope.personality_agent_id, envelope.audience, event)
                     .await
                     .map_err(|source| anyhow!(SessionGatewayError::VolatileEvent { source }))
             }
@@ -404,6 +408,7 @@ mod tests {
         async fn on_volatile(
             &self,
             personality_agent_id: &PersonalityAgentId,
+            _audience: crate::runtime::contracts::OutputAudience,
             event: AgentEvent,
         ) -> Result<()> {
             self.volatile
@@ -430,6 +435,7 @@ mod tests {
         async fn on_volatile(
             &self,
             _personality_agent_id: &PersonalityAgentId,
+            _audience: crate::runtime::contracts::OutputAudience,
             _event: AgentEvent,
         ) -> Result<()> {
             anyhow::bail!("authorization corruption")
@@ -452,6 +458,7 @@ mod tests {
         async fn on_volatile(
             &self,
             _personality_agent_id: &PersonalityAgentId,
+            _audience: crate::runtime::contracts::OutputAudience,
             _event: AgentEvent,
         ) -> Result<()> {
             Ok(())
@@ -480,6 +487,7 @@ mod tests {
         async fn on_volatile(
             &self,
             _personality_agent_id: &PersonalityAgentId,
+            _audience: crate::runtime::contracts::OutputAudience,
             _event: AgentEvent,
         ) -> Result<()> {
             Ok(())
@@ -511,6 +519,7 @@ mod tests {
     fn output(seq: u64) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(seq),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "turn_start"}),
@@ -521,6 +530,7 @@ mod tests {
     fn volatile_output(message: &str) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "error", "message": message}),
@@ -771,6 +781,7 @@ mod tests {
 
         let malformed = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "not_an_agent_event"}),
@@ -788,6 +799,7 @@ mod tests {
         let error = writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: None,
                     personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "turn_start"}),

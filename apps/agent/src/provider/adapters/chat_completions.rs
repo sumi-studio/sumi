@@ -2081,6 +2081,7 @@ mod tests {
             ],
             messages: vec![
                 synthetic(Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "read it".to_owned(),
@@ -2280,6 +2281,7 @@ mod tests {
 
     fn user_message(text: &str) -> Message {
         Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
@@ -2487,6 +2489,7 @@ mod tests {
         let spec = ModelSpec::preset("kimi-k3").expect("preset");
         let opencode = ModelSpec::preset("opencode-go").expect("preset");
         let user = Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hello".to_owned(),
@@ -2529,6 +2532,7 @@ mod tests {
             timestamp: Utc::now(),
         });
         let image_user = Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![
                 UserContent::Text {
@@ -2578,6 +2582,7 @@ mod tests {
                            system_prompt: String::new(),
                            memory_blocks: vec![],
                            messages: vec![synthetic(Message::User(UserMessage {
+        incoming_source: None,
         incoming_timing: None,
                                content: vec![UserContent::Text {
                                    text: "Reply with exactly fixture-ok".to_owned(),
@@ -2599,6 +2604,7 @@ mod tests {
                            system_prompt: "Use the requested tool exactly once.".to_owned(),
                            memory_blocks: vec![],
                            messages: vec![synthetic(Message::User(UserMessage {
+        incoming_source: None,
         incoming_timing: None,
                                content: vec![UserContent::Text {
                                    text: "Call echo_value once with value live-smoke-ok.".to_owned(),
@@ -2851,6 +2857,7 @@ mod tests {
     fn opencode_rejects_only_live_proven_unsupported_required_tool_choice() {
         let context = simple_context(
             vec![Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Call read_file.".to_owned(),

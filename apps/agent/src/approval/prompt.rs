@@ -473,6 +473,7 @@ mod tests {
 
     fn user_message(text: &str) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),

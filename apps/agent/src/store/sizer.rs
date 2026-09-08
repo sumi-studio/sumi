@@ -13,7 +13,7 @@ const ENVELOPE_OVERHEAD: usize = 1 + 24 + 16;
 use crate::{
     gateway::CommandId,
     provider::types::{IncomingEventTiming, PublicMessage, UserContent, UserMessage},
-    runtime::contracts::DirectChatProvenanceV1,
+    runtime::contracts::{IncomingProvenance, OutputAudience},
 };
 
 use super::{Redactor, event_writer::DurableEventMetadata, redactor::search_text_from_projection};
@@ -60,7 +60,7 @@ pub(crate) struct InjectionCommandSizeInput<'a> {
     pub message_id: &'a str,
     pub text: &'a str,
     pub timestamp: &'a DateTime<Utc>,
-    pub provenance: &'a DirectChatProvenanceV1,
+    pub provenance: &'a IncomingProvenance,
     pub incoming_timing: Option<&'a IncomingEventTiming>,
 }
 
@@ -78,6 +78,7 @@ pub(crate) fn canonical_user_message(
     text: &str,
     timestamp: DateTime<Utc>,
     incoming_timing: Option<IncomingEventTiming>,
+    incoming_source: Option<IncomingProvenance>,
 ) -> PublicMessage {
     PublicMessage::User(UserMessage {
         content: vec![UserContent::Text {
@@ -85,6 +86,7 @@ pub(crate) fn canonical_user_message(
         }],
         timestamp,
         incoming_timing,
+        incoming_source,
     })
 }
 
@@ -129,15 +131,20 @@ impl EventBatchSizer {
                         timestamp: command.timestamp,
                     },
                     command.incoming_timing,
+                    Some(command.provenance),
                 )
             }),
         )?;
-        let empty_metadata_bytes = serde_json::to_vec(&DurableEventMetadata::default())
-            .map_err(|error| anyhow::anyhow!("failed to size empty user event metadata: {error}"))?
-            .len();
         for command in input.commands {
+            let audience = command.provenance.output_audience();
+            let empty_metadata_bytes = serde_json::to_vec(&DurableEventMetadata {
+                audience: Some(audience),
+                ..DurableEventMetadata::default()
+            })?
+            .len();
             let authenticated_metadata_bytes = serde_json::to_vec(&DurableEventMetadata {
                 direct_chat_provenance: Some(command.provenance.clone()),
+                audience: Some(audience),
                 ..DurableEventMetadata::default()
             })
             .map_err(|error| {
@@ -155,7 +162,9 @@ impl EventBatchSizer {
         }
 
         let event_bytes =
-            |value: serde_json::Value, metadata: serde_json::Value| -> Result<usize> {
+            |value: serde_json::Value, mut metadata: serde_json::Value| -> Result<usize> {
+                let audience = input.commands[0].provenance.output_audience();
+                metadata["audience"] = serde_json::to_value(audience)?;
                 let event_type = value
                     .get("type")
                     .and_then(serde_json::Value::as_str)
@@ -163,8 +172,9 @@ impl EventBatchSizer {
                 let raw = Zeroizing::new(serde_json::to_vec(&value)?);
                 let projected = redactor.redact_serialized(&raw)?;
                 let metadata = serde_json::to_vec(&metadata)?;
-                Ok(raw
-                    .len()
+                let wrapped_bytes =
+                    serde_json::to_vec(&json!({"event":value,"audience":audience}))?.len();
+                Ok(wrapped_bytes
                     .saturating_add(ENVELOPE_OVERHEAD)
                     .saturating_add(projected.len())
                     .saturating_add(event_type.len())
@@ -278,27 +288,41 @@ impl EventBatchSizer {
     ) -> Result<BatchSize> {
         Self::command_window_with_timing(
             redactor,
-            commands.into_iter().map(|command| (command, None)),
+            commands.into_iter().map(|command| (command, None, None)),
         )
     }
 
     fn command_window_with_timing<'a>(
         redactor: &Redactor,
-        commands: impl IntoIterator<Item = (CommandSizeInput<'a>, Option<&'a IncomingEventTiming>)>,
+        commands: impl IntoIterator<
+            Item = (
+                CommandSizeInput<'a>,
+                Option<&'a IncomingEventTiming>,
+                Option<&'a IncomingProvenance>,
+            ),
+        >,
     ) -> Result<BatchSize> {
         let mut size = BatchSize {
             command_count: 0,
             command_plaintext_bytes: 0,
             transaction_bytes: 0,
         };
-        for (command, incoming_timing) in commands {
+        for (command, incoming_timing, provenance) in commands {
+            let audience = provenance.map_or(
+                OutputAudience::DirectChat,
+                IncomingProvenance::output_audience,
+            );
             size.command_count = size.command_count.saturating_add(1);
             size.command_plaintext_bytes = size
                 .command_plaintext_bytes
                 .saturating_add(command.canonical_payload.len());
 
-            let message =
-                canonical_user_message(command.text, *command.timestamp, incoming_timing.cloned());
+            let message = canonical_user_message(
+                command.text,
+                *command.timestamp,
+                incoming_timing.cloned(),
+                provenance.filter(|source| source.is_external()).cloned(),
+            );
             let raw_message = Zeroizing::new(
                 serde_json::to_vec(&message)
                     .map_err(|error| anyhow::anyhow!("failed to size user message: {error}"))?,
@@ -320,13 +344,17 @@ impl EventBatchSizer {
                     &message,
                 )?);
                 let event_projection = redactor.redact_serialized(&raw_event)?;
+                let event: serde_json::Value = serde_json::from_slice(&raw_event)?;
+                let wrapped_bytes =
+                    serde_json::to_vec(&json!({"event":event,"audience":audience}))?.len();
+                let metadata_bytes = serde_json::to_vec(&json!({"audience":audience}))?.len();
                 size.transaction_bytes = size
                     .transaction_bytes
-                    .saturating_add(raw_event.len())
+                    .saturating_add(wrapped_bytes)
                     .saturating_add(ENVELOPE_OVERHEAD)
                     .saturating_add(event_projection.len())
                     .saturating_add(event_type.len())
-                    .saturating_add(2)
+                    .saturating_add(metadata_bytes)
                     .saturating_add(DURABLE_ROW_OVERHEAD_BYTES);
             }
         }
@@ -414,6 +442,7 @@ mod tests {
     ) -> usize {
         let redactor = Redactor::v1();
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -438,14 +467,21 @@ mod tests {
                 "message":message.clone(),
             }))
             .expect("serialize event");
-            bytes += raw_event.len()
+            let event: crate::agent::AgentEvent =
+                serde_json::from_slice(&raw_event).expect("typed event");
+            let persisted =
+                crate::store::event_payload::encode_event(&event, OutputAudience::DirectChat)
+                    .expect("production encrypted envelope plaintext");
+            let metadata = serde_json::to_vec(&json!({"audience":"direct_chat"}))
+                .expect("persisted audience metadata");
+            bytes += persisted.len()
                 + ENVELOPE_OVERHEAD
                 + redactor
                     .redact_serialized(&raw_event)
                     .expect("redact event")
                     .len()
                 + event_type.len()
-                + 2
+                + metadata.len()
                 + DURABLE_ROW_OVERHEAD_BYTES;
         }
         bytes

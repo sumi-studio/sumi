@@ -49,7 +49,7 @@ use crate::{
         types::{
             AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextFragment,
             ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
-            ToolCall, ToolResultMessage, UserContent, UserMessage,
+            ToolCall, ToolResultMessage, UserContent,
         },
     },
     runtime::contracts::{ProcessGeneration, RpcIdentity},
@@ -618,7 +618,10 @@ impl Runner {
             .core
             .next_followup()
             .expect("newly queued initial makes pending controls non-empty");
-        if matches!(oldest.envelope().command, Command::UserMessage { .. }) {
+        if matches!(
+            oldest.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             self.claim_control(oldest)
         } else {
             self.core
@@ -1843,7 +1846,10 @@ impl Runner {
         let scope = ApprovalPrincipalScope {
             tenant_id: binding.provenance.tenant_id().to_owned(),
             personality_agent_id: binding.provenance.personality_agent_id().to_string(),
-            human_principal_id: binding.provenance.actor().principal_id().to_owned(),
+            human_principal_id: binding
+                .provenance
+                .authenticated_direct_chat_human()
+                .map(str::to_owned),
         };
         let mut transcript = self
             .context
@@ -1970,6 +1976,9 @@ impl Runner {
                                         }
                                     };
                                     let provenance = &command.envelope().provenance;
+                                    let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
+                                        continue;
+                                    };
                                     let authenticated = AuthenticatedCurrentCallDecision {
                                         command_id: command.envelope().command_id.to_string(),
                                         command_seq: command.envelope().seq,
@@ -1977,10 +1986,7 @@ impl Runner {
                                         personality_agent_id: provenance
                                             .personality_agent_id()
                                             .to_string(),
-                                        human_principal_id: provenance
-                                            .actor()
-                                            .principal_id()
-                                            .to_owned(),
+                                        human_principal_id: human_principal_id.to_owned(),
                                         decision: current,
                                         received_at: command.received_at(),
                                     };
@@ -2034,6 +2040,9 @@ impl Runner {
                                     };
                                     if let Some(current) = current {
                                         let provenance = &command.envelope().provenance;
+                                        let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
+                                            continue;
+                                        };
                                         let authenticated = AuthenticatedCurrentCallDecision {
                                             command_id: command.envelope().command_id.to_string(),
                                             command_seq: command.envelope().seq,
@@ -2041,15 +2050,18 @@ impl Runner {
                                             personality_agent_id: provenance
                                                 .personality_agent_id()
                                                 .to_string(),
-                                            human_principal_id: provenance
-                                                .actor()
-                                                .principal_id()
-                                                .to_owned(),
+                                            human_principal_id: human_principal_id.to_owned(),
                                             decision: current,
                                             received_at: command.received_at(),
                                         };
                                         let _ = broker.resolve(rid, authenticated).await;
                                     }
+                                    continue;
+                                }
+                                Command::ExternalEvent { .. } => {
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
                                     continue;
                                 }
                                 Command::UserMessage { .. } | Command::Abort {} => {
@@ -2787,6 +2799,12 @@ impl Runner {
                                     }
                                     continue;
                                 }
+                                Command::ExternalEvent { .. } => {
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
+                                    continue;
+                                }
                                 Command::UserMessage { .. } | Command::Abort {} => {
                                     if let Some(broker) = self
                                         .core
@@ -3380,17 +3398,8 @@ impl Runner {
     }
 
     async fn inject_user(&mut self, command: &AdmittedCommand) -> Result<(), WorkerFailure> {
-        let Command::UserMessage { text, attachments } = &command.envelope().command else {
-            return Err(WorkerFailure::Error(
-                "non-user command reached a user injection boundary".to_owned(),
-            ));
-        };
-        debug_assert!(attachments.is_empty());
-        let message = PublicMessage::User(UserMessage {
-            incoming_timing: command.incoming_timing(),
-            content: vec![UserContent::Text { text: text.clone() }],
-            timestamp: command.received_at(),
-        });
+        let message = super::steer::build_user_message(command)
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         let message_id = user_message_id(
             &command.envelope().personality_agent_id,
             &command.envelope().command_id,
@@ -3526,7 +3535,10 @@ impl Runner {
         let Some(command) = self.core.next_followup() else {
             return Ok(false);
         };
-        if matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             self.claim_control(command)?;
             Ok(true)
         } else {

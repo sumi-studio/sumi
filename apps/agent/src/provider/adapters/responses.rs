@@ -261,6 +261,7 @@ fn build_replay_probe_request_with_usage(
                 id: "replay-probe-v1-user".into(),
                 seq: 2,
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "replay-probe-v1-user".into(),
@@ -3769,6 +3770,7 @@ mod tests {
             id: format!("user-{seq}"),
             seq,
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!("message-{seq}"),
@@ -3797,6 +3799,7 @@ mod tests {
             }],
             messages: vec![ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "hello".into(),
@@ -3837,6 +3840,7 @@ mod tests {
             Vec::new(),
             vec![ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text { text: "act".into() }],
                     timestamp: Utc::now(),
@@ -3875,6 +3879,7 @@ mod tests {
             memory_blocks: vec![],
             messages: vec![ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "hello".into(),
@@ -4099,6 +4104,7 @@ mod tests {
                     memory_blocks: vec![],
                     messages: vec![ContextMessage::Synthetic {
                         message: Message::User(UserMessage {
+                            incoming_source: None,
                             incoming_timing: None,
                             content: vec![UserContent::Text {
                                 text: "hello".into(),
@@ -4128,6 +4134,7 @@ mod tests {
                 memory_blocks: vec![],
                 messages: vec![ContextMessage::Synthetic {
                     message: Message::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: None,
                         content: vec![UserContent::Text {
                             text: "hello".into(),
@@ -4376,6 +4383,7 @@ mod tests {
             0,
             ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![],
                     timestamp: Utc::now(),
@@ -4410,6 +4418,7 @@ mod tests {
             vec![],
             vec![ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![],
                     timestamp: Utc::now(),
@@ -4422,6 +4431,7 @@ mod tests {
                 persisted_user(7),
                 ContextMessage::Synthetic {
                     message: Message::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: None,
                         content: vec![],
                         timestamp: Utc::now(),
@@ -4794,6 +4804,7 @@ mod tests {
             messages: vec![
                 ContextMessage::Synthetic {
                     message: Message::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: None,
                         content: vec![UserContent::Text {
                             text: "leading-synthetic".into(),

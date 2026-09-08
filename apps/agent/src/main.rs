@@ -4,6 +4,7 @@ mod approval;
 mod bootstrap;
 mod config;
 mod gateway;
+mod maintenance;
 mod memory;
 mod prompts;
 pub mod provider;
@@ -69,6 +70,9 @@ async fn async_main(mode: Option<String>) -> Result<()> {
         )
         .init();
     match mode.as_deref() {
+        Some("--authorize-pre-external-events") => {
+            return maintenance::run_authorize_pre_external_events().await;
+        }
         Some("--tool-executor") => {
             tracing::warn!(
                 service = "tool-executor",
@@ -166,6 +170,7 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                         envelope: Envelope {
                             seq: None,
                             personality_agent_id: personality_agent_id.clone(),
+                            audience: runtime::contracts::OutputAudience::Secretary,
                             event: serde_json::json!({
                                 "type": "error",
                                 "message": "invalid command envelope",
@@ -195,6 +200,7 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                     envelope: gateway::Envelope {
                         seq: Some(seq),
                         personality_agent_id: personality_agent_id.clone(),
+                        audience: store.authenticated_event_audience(seq).await?,
                         event: serde_json::to_value(event)?,
                     },
                 })
@@ -228,6 +234,7 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                             envelope: gateway::Envelope {
                                 seq: Some(seq),
                                 personality_agent_id: personality_agent_id.clone(),
+                                audience: store.authenticated_event_audience(seq).await?,
                                 event: serde_json::to_value(event)?,
                             },
                         })

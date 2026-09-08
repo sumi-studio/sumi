@@ -333,6 +333,7 @@ fn capacity_notice(omitted: &[ContextMessage]) -> Option<ContextMessage> {
     let to = timestamp(last);
     Some(ContextMessage::Synthetic {
         message: Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             timestamp: to,
             content: vec![UserContent::Text {
@@ -465,15 +466,7 @@ pub(crate) fn context_message_to_public(message: &ContextMessage) -> PublicMessa
 
 fn message_to_public(message: &Message) -> PublicMessage {
     match message {
-        Message::User(UserMessage {
-            content,
-            timestamp,
-            incoming_timing,
-        }) => PublicMessage::User(UserMessage {
-            incoming_timing: incoming_timing.clone(),
-            content: content.clone(),
-            timestamp: *timestamp,
-        }),
+        Message::User(user) => PublicMessage::User(user.clone()),
         Message::ToolResult(ToolResultMessage {
             tool_call_id,
             tool_name,
@@ -567,6 +560,7 @@ mod tests {
     fn user(text: &str) -> ContextMessage {
         ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: text.to_owned(),

@@ -42,7 +42,7 @@ use crate::provider::types::{
     RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolInvocationRoute,
     ToolResultMessage, Usage, UserContent, UserMessage,
 };
-use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{IncomingProvenance, OutputAudience, PersonalityAgentId};
 
 /// UUIDv5 namespace for deriving a user `message_id` from a canonical
 /// `command_id`. API and web consumers must use the same namespace so they can
@@ -159,6 +159,8 @@ pub enum WireError {
     SeqOutOfRange(u64),
     #[error("command provenance target does not match personality_agent_id")]
     ProvenanceTargetMismatch,
+    #[error("command type does not match incoming provenance source")]
+    ProvenanceCommandMismatch,
     #[error("user message attachments must be empty")]
     NonEmptyAttachments,
 }
@@ -286,6 +288,9 @@ where
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireCommand {
+    ExternalEvent {
+        content: String,
+    },
     UserMessage {
         text: String,
         #[serde(deserialize_with = "deserialize_empty_attachments")]
@@ -304,7 +309,7 @@ pub struct WireCommandEnvelope {
     seq: u64,
     command_id: String,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: IncomingProvenance,
     command: WireCommand,
 }
 
@@ -321,7 +326,7 @@ impl WireCommandEnvelope {
         &self.personality_agent_id
     }
 
-    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+    pub fn provenance(&self) -> &IncomingProvenance {
         &self.provenance
     }
 
@@ -336,7 +341,7 @@ struct WireCommandEnvelopeInput {
     seq: u64,
     command_id: String,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: IncomingProvenance,
     command: WireCommand,
 }
 
@@ -351,6 +356,11 @@ impl TryFrom<WireCommandEnvelopeInput> for WireCommandEnvelope {
             .provenance
             .validate(&input.personality_agent_id)
             .map_err(|_| WireError::ProvenanceTargetMismatch)?;
+        if matches!(input.command, WireCommand::ExternalEvent { .. })
+            != input.provenance.is_external()
+        {
+            return Err(WireError::ProvenanceCommandMismatch);
+        }
         Ok(Self {
             seq: input.seq,
             command_id: canonical_command_id(&input.command_id)?,
@@ -508,6 +518,7 @@ pub struct WireEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     seq: Option<u64>,
     personality_agent_id: PersonalityAgentId,
+    audience: OutputAudience,
     event: WireAgentEvent,
 }
 
@@ -517,6 +528,7 @@ impl WireEnvelope {
     pub(crate) fn try_new(
         seq: Option<u64>,
         personality_agent_id: PersonalityAgentId,
+        audience: OutputAudience,
         event: AgentEvent,
     ) -> Result<Self, WireError> {
         let event: WireAgentEvent = event.try_into()?;
@@ -524,6 +536,7 @@ impl WireEnvelope {
         Ok(Self {
             seq,
             personality_agent_id,
+            audience,
             event,
         })
     }
@@ -534,6 +547,10 @@ impl WireEnvelope {
 
     pub fn personality_agent_id(&self) -> &PersonalityAgentId {
         &self.personality_agent_id
+    }
+
+    pub fn audience(&self) -> OutputAudience {
+        self.audience
     }
 
     pub fn event(&self) -> &WireAgentEvent {
@@ -550,6 +567,7 @@ struct WireEnvelopeInput {
     #[serde(default, deserialize_with = "present_or_error_on_null")]
     seq: Option<u64>,
     personality_agent_id: PersonalityAgentId,
+    audience: OutputAudience,
     event: WireAgentEvent,
 }
 
@@ -560,6 +578,7 @@ impl TryFrom<WireEnvelopeInput> for WireEnvelope {
         Ok(Self {
             seq: input.seq,
             personality_agent_id: input.personality_agent_id,
+            audience: input.audience,
             event: input.event,
         })
     }
@@ -784,6 +803,18 @@ where
     WireIncomingEventTiming::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_incoming_source<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<IncomingProvenance>, D::Error> {
+    let source = IncomingProvenance::deserialize(deserializer)?;
+    if !source.is_external() {
+        return Err(serde::de::Error::custom(
+            "incoming_source requires external provenance",
+        ));
+    }
+    Ok(Some(source))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireIncomingEventReceipt {
@@ -796,6 +827,12 @@ pub struct WireIncomingEventReceipt {
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WirePublicMessage {
     User {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_incoming_source"
+        )]
+        incoming_source: Option<IncomingProvenance>,
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
@@ -1264,7 +1301,19 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                 content,
                 timestamp,
                 incoming_timing,
+                incoming_source,
             }) => Self::User {
+                incoming_source: incoming_source
+                    .map(|source| {
+                        source
+                            .validate(source.personality_agent_id())
+                            .map_err(|_| WireError::ProvenanceTargetMismatch)?;
+                        if !source.is_external() {
+                            return Err(WireError::ProvenanceCommandMismatch);
+                        }
+                        Ok(source)
+                    })
+                    .transpose()?,
                 incoming_timing: incoming_timing
                     .map(|timing| {
                         let previous = timing
@@ -1627,6 +1676,7 @@ impl TryFrom<Command> for WireCommand {
                     attachments: vec![],
                 }
             }
+            Command::ExternalEvent { content } => Self::ExternalEvent { content },
             Command::Abort {} => Self::Abort {},
             Command::ApprovalDecision {
                 request_id,
@@ -1644,6 +1694,15 @@ impl TryFrom<CommandEnvelope> for WireCommandEnvelope {
     fn try_from(envelope: CommandEnvelope) -> Result<Self, WireError> {
         if envelope.seq > MAX_JSON_SAFE_INTEGER {
             return Err(WireError::SeqOutOfRange(envelope.seq));
+        }
+        envelope
+            .provenance
+            .validate(&envelope.personality_agent_id)
+            .map_err(|_| WireError::ProvenanceTargetMismatch)?;
+        if matches!(envelope.command, Command::ExternalEvent { .. })
+            != envelope.provenance.is_external()
+        {
+            return Err(WireError::ProvenanceCommandMismatch);
         }
         Ok(Self {
             seq: envelope.seq,
@@ -1697,6 +1756,7 @@ impl TryFrom<Envelope> for WireEnvelope {
         Ok(Self {
             seq: envelope.seq,
             personality_agent_id: envelope.personality_agent_id,
+            audience: envelope.audience,
             event,
         })
     }
@@ -1835,6 +1895,7 @@ mod tests {
     #[test]
     fn incoming_timing_wire_keeps_receipt_metadata_and_rejects_malformed_shapes() {
         let message = crate::provider::types::UserMessage {
+            incoming_source: None,
             content: vec![crate::provider::types::UserContent::Text {
                 text: "human text".into(),
             }],
@@ -1938,6 +1999,7 @@ mod tests {
     fn object_valued_wire_fields_reject_unsafe_nested_numbers() {
         let tool_start = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({
@@ -1955,6 +2017,7 @@ mod tests {
 
         let tool_call_end = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({
@@ -2042,12 +2105,85 @@ mod tests {
     }
 
     #[test]
+    fn external_command_correlation_and_outbound_audience_are_explicit() {
+        let original = json!({"seq":1,"command_id":"00000000-0000-4000-8000-000000000001",
+            "personality_agent_id":crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "provenance":crate::gateway::test_messaging_provenance(),
+            "command":{"type":"external_event","content":"original source text"}});
+        let external = serde_json::from_value::<WireCommandEnvelope>(original.clone()).unwrap();
+        assert!(
+            matches!(external.command(), WireCommand::ExternalEvent{content} if content=="original source text")
+        );
+        assert_eq!(serde_json::to_value(external).unwrap(), original);
+        for command in [
+            json!({"type":"abort"}),
+            json!({"type":"user_message","text":"forged","attachments":[]}),
+            json!({"type":"approval_decision","request_id":"request-1","decision":{"type":"approve_once"}}),
+        ] {
+            let mut invalid = original.clone();
+            invalid["command"] = command;
+            assert!(serde_json::from_value::<WireCommandEnvelope>(invalid.clone()).is_err());
+            assert!(serde_json::from_value::<CommandEnvelope>(invalid).is_err());
+        }
+        let mut invalid = original;
+        invalid["provenance"] =
+            serde_json::to_value(crate::gateway::test_direct_chat_provenance()).unwrap();
+        assert!(serde_json::from_value::<WireCommandEnvelope>(invalid).is_err());
+        let envelope = json!({"seq":1,"personality_agent_id":crate::gateway::TEST_PERSONALITY_AGENT_ID,
+            "audience":"secretary","event":{"type":"agent_start"}});
+        let parsed = serde_json::from_value::<WireEnvelope>(envelope.clone()).unwrap();
+        assert_eq!(parsed.audience(), OutputAudience::Secretary);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), envelope);
+        for audience in [None, Some(json!(null)), Some(json!("all"))] {
+            let mut invalid = envelope.clone();
+            match audience {
+                Some(value) => {
+                    invalid["audience"] = value;
+                }
+                None => {
+                    invalid.as_object_mut().unwrap().remove("audience");
+                }
+            }
+            assert!(serde_json::from_value::<WireEnvelope>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn external_input_source_survives_public_message_conversion() {
+        let source = crate::gateway::test_messaging_provenance();
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "original".to_owned(),
+            }],
+            timestamp: Utc::now(),
+            incoming_timing: None,
+            incoming_source: Some(source.clone()),
+        });
+        let wire = WirePublicMessage::try_from(message).unwrap();
+        let value = serde_json::to_value(wire).unwrap();
+        assert_eq!(
+            value["incoming_source"],
+            serde_json::to_value(source).unwrap()
+        );
+        assert!(serde_json::from_value::<WirePublicMessage>(value.clone()).is_ok());
+        for invalid_source in [
+            Value::Null,
+            serde_json::to_value(crate::gateway::test_direct_chat_provenance()).unwrap(),
+        ] {
+            let mut invalid = value.clone();
+            invalid["incoming_source"] = invalid_source;
+            assert!(serde_json::from_value::<WirePublicMessage>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn durable_event_requires_seq_and_volatile_forbids_it() {
         let durable = AgentEvent::AgentStart;
         assert!(
             WireEnvelope::try_new(
                 Some(1),
                 crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
                 durable
             )
             .is_ok()
@@ -2056,6 +2192,7 @@ mod tests {
             WireEnvelope::try_new(
                 None,
                 crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
                 AgentEvent::AgentStart
             )
             .is_err()
@@ -2068,6 +2205,7 @@ mod tests {
             WireEnvelope::try_new(
                 None,
                 crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
                 volatile.clone()
             )
             .is_ok()
@@ -2076,6 +2214,7 @@ mod tests {
             WireEnvelope::try_new(
                 Some(1),
                 crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
                 volatile
             )
             .is_err()
@@ -2092,13 +2231,19 @@ mod tests {
             WireEnvelope::try_new(
                 None,
                 crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
                 update.clone()
             )
             .is_ok()
         );
         assert!(
-            WireEnvelope::try_new(Some(1), crate::gateway::test_personality_agent_id(), update)
-                .is_err()
+            WireEnvelope::try_new(
+                Some(1),
+                crate::gateway::test_personality_agent_id(),
+                OutputAudience::DirectChat,
+                update
+            )
+            .is_err()
         );
     }
 
@@ -2258,6 +2403,7 @@ mod tests {
     fn outbound_event_frame_enforces_seq_rules() {
         let durable = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "agent_start"}),
@@ -2269,6 +2415,7 @@ mod tests {
 
         let durable_missing_seq = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "agent_start"}),
@@ -2278,6 +2425,7 @@ mod tests {
 
         let volatile_with_seq = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "error", "message": "x"}),
@@ -2287,6 +2435,7 @@ mod tests {
 
         let volatile_ok = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: json!({"type": "error", "message": "x"}),
@@ -2360,6 +2509,7 @@ mod tests {
     fn wire_envelope_rejects_invalid_input() {
         let durable_missing_seq = json!({
             "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+            "audience": "direct_chat",
             "event": {"type": "agent_start"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(durable_missing_seq).is_err());
@@ -2367,6 +2517,7 @@ mod tests {
         let durable_null_seq = json!({
             "seq": null,
             "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+            "audience": "direct_chat",
             "event": {"type": "agent_start"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(durable_null_seq).is_err());
@@ -2374,6 +2525,7 @@ mod tests {
         let volatile_with_seq = json!({
             "seq": 1,
             "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+            "audience": "direct_chat",
             "event": {"type": "error", "message": "x"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(volatile_with_seq).is_err());
@@ -2381,6 +2533,7 @@ mod tests {
         let volatile_null_seq = json!({
             "seq": null,
             "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+            "audience": "direct_chat",
             "event": {"type": "error", "message": "x"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(volatile_null_seq).is_err());
@@ -2389,6 +2542,7 @@ mod tests {
     #[test]
     fn agent_event_round_trips() {
         let user_message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hello".to_owned(),
@@ -2529,6 +2683,7 @@ mod tests {
         };
         let turn_end = AgentEvent::TurnEnd {
             message: Some(Box::new(PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "assistant context".to_owned(),
@@ -2756,6 +2911,7 @@ mod tests {
     #[test]
     fn public_message_round_trips() {
         let user = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hi".to_owned(),
@@ -2765,6 +2921,7 @@ mod tests {
         round_trip_public_message(user);
 
         let user_with_image = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Image {
                 data: "aGVsbG8=".to_owned(),
@@ -2902,6 +3059,7 @@ mod tests {
     fn message_event_message_id_is_canonical_uuid() {
         let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let user_message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hi".to_owned(),
@@ -3431,6 +3589,7 @@ mod tests {
         let event = json!({
             "seq": MAX_JSON_SAFE_INTEGER + 1,
             "personality_agent_id": "018f3f8d-7b2c-7a10-8f9e-123456789abc",
+            "audience": "direct_chat",
             "event": { "type": "agent_start" }
         });
         assert!(

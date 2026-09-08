@@ -1192,6 +1192,7 @@ fn l1_fragment(entry: &crate::memory::L1Entry) -> ContextMessage {
     });
     ContextMessage::Synthetic {
         message: Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             timestamp: entry.time_range.1,
             content: vec![UserContent::Text {
@@ -1494,6 +1495,7 @@ mod tests {
             id: format!("msg-{seq}"),
             seq,
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: text.to_owned(),
@@ -1660,6 +1662,7 @@ mod tests {
     fn synthetic_attachment_identity_is_content_addressed() {
         let first = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "first".to_owned(),
@@ -1669,6 +1672,7 @@ mod tests {
         };
         let second = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "second".to_owned(),
@@ -2451,6 +2455,7 @@ mod tests {
         let assembler = assembler().with_three_layer_memory(memory, 20);
         let synthetic = |text: &str| ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 timestamp: time,
                 content: vec![UserContent::Text { text: text.into() }],
@@ -3039,6 +3044,7 @@ mod tests {
             assert_eq!(snapshot.options(), &original_options);
 
             let directive = UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Reorganize messages 1–3 using the whole context.".into(),
@@ -3166,6 +3172,7 @@ mod tests {
             );
             let fork = snapshot
                 .fork_with_directive(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "Organize the target with this same context.".into(),
@@ -3396,6 +3403,7 @@ mod tests {
         };
         let synthetic = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "authorized diagnostic".to_owned(),

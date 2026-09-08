@@ -444,6 +444,7 @@ mod tests {
     #[test]
     fn incoming_receipt_metadata_contributes_to_prompt_budget() {
         let mut message = crate::provider::types::UserMessage {
+            incoming_source: None,
             content: vec![UserContent::Text {
                 text: "hello".into(),
             }],

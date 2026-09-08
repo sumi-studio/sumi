@@ -21,7 +21,7 @@ use super::{
     MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
     SensitiveCommandPayload,
 };
-use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{IncomingProvenance, PersonalityAgentId};
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
@@ -245,7 +245,7 @@ struct RawCommandIdentityEnvelope {
     seq: u64,
     command_id: CommandId,
     personality_agent_id: PersonalityAgentId,
-    provenance: DirectChatProvenanceV1,
+    provenance: IncomingProvenance,
     #[serde(default)]
     command: CommandFieldPresence,
 }
@@ -350,10 +350,15 @@ fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
             .is_some_and(|attachments| !attachments.is_empty())
     {
         Some(CommandRejectReason::AttachmentsNotEmpty)
-    } else if command_type
-        .is_some_and(|kind| !matches!(kind, "user_message" | "abort" | "approval_decision"))
-    {
+    } else if command_type.is_some_and(|kind| {
+        !matches!(
+            kind,
+            "user_message" | "external_event" | "abort" | "approval_decision"
+        )
+    }) {
         Some(CommandRejectReason::UnknownCommand)
+    } else if (command_type == Some("external_event")) != raw.provenance.is_external() {
+        Some(CommandRejectReason::SchemaViolation)
     } else {
         None
     };
@@ -1067,9 +1072,7 @@ mod tests {
     use crate::gateway::{
         AgentHello, Command, ConnectorError, DeliveryAuthorization, GatewayCredential,
     };
-    use crate::runtime::contracts::{
-        DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration,
-    };
+    use crate::runtime::contracts::{IncomingProvenance, PersonalityAgentId, ProcessGeneration};
 
     const TEST_PERSONALITY_AGENT_ID: &str = "018f3f8d-7b2c-7a10-8f9e-123456789abc";
 
@@ -1077,8 +1080,8 @@ mod tests {
         PersonalityAgentId::parse(TEST_PERSONALITY_AGENT_ID).expect("canonical UUIDv7")
     }
 
-    fn test_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+    fn test_provenance() -> IncomingProvenance {
+        IncomingProvenance::new("tenant-test", test_personality_agent_id(), "human-test")
             .expect("valid direct-chat provenance")
     }
 
@@ -1118,6 +1121,7 @@ mod tests {
         let mut output = sink();
         let invalid = OutboundFrame::Event {
             envelope: super::super::Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "error", "message": "volatile"}),
@@ -1133,6 +1137,7 @@ mod tests {
     fn retry_frame_with_error_len(error_message_len: usize) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: super::super::Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({
@@ -1338,6 +1343,46 @@ mod tests {
                 command: Command::Abort {},
             })
         );
+    }
+
+    #[tokio::test]
+    async fn external_event_uses_its_source_and_cannot_become_a_human_control() {
+        let mut frame = serde_json::json!({"seq":1,"command_id":"00000000-0000-4000-8000-000000000001",
+            "personality_agent_id":TEST_PERSONALITY_AGENT_ID,"provenance":crate::gateway::test_messaging_provenance(),
+            "command":{"type":"external_event","content":"Original source text"}});
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        let mut input = BufReader::with_capacity(7, bytes.as_slice());
+        let inbound = read_test_command(&mut input).await.unwrap();
+        assert!(
+            matches!(inbound,InboundCommand::Valid(CommandEnvelope{command:Command::ExternalEvent{content},..}) if content=="Original source text")
+        );
+        for command in [
+            serde_json::json!({"type":"abort"}),
+            serde_json::json!({"type":"user_message","text":"forged","attachments":[]}),
+            serde_json::json!({"type":"approval_decision","request_id":"request-1","decision":{"type":"approve_once"}}),
+        ] {
+            frame["command"] = command;
+            let bytes = serde_json::to_vec(&frame).unwrap();
+            let mut input = BufReader::new(bytes.as_slice());
+            assert!(matches!(
+                read_test_command(&mut input).await.unwrap(),
+                InboundCommand::Invalid {
+                    reason: CommandRejectReason::SchemaViolation,
+                    ..
+                }
+            ));
+        }
+        frame["command"] = serde_json::json!({"type":"external_event","content":"forged"});
+        frame["provenance"] = serde_json::to_value(test_provenance()).unwrap();
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        let mut input = BufReader::new(bytes.as_slice());
+        assert!(matches!(
+            read_test_command(&mut input).await.unwrap(),
+            InboundCommand::Invalid {
+                reason: CommandRejectReason::SchemaViolation,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

@@ -3085,6 +3085,7 @@ fi
                 id: format!("message-{seq}"),
                 seq,
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "compact this".into(),
@@ -3894,6 +3895,7 @@ fi
                 PromptContext {
                     messages: vec![ContextMessage::Synthetic {
                         message: Message::User(UserMessage {
+                            incoming_source: None,
                             incoming_timing: None,
                             content: vec![UserContent::Text {
                                 text: "pre-cancel".into(),
@@ -5818,6 +5820,7 @@ fi
             }),
         };
         let user = types::UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![types::UserContent::Text {
                 text: "Call echo_value once with value live-smoke-ok.".to_owned(),
@@ -6065,6 +6068,7 @@ fi
                 vec![],
                 vec![ContextMessage::Synthetic {
                     message: Message::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: None,
                         content: vec![UserContent::Text {
                             text: "Hello".to_owned(),
@@ -6082,6 +6086,7 @@ fi
             let snapshot = types::ParentContextSnapshot::capture(&prompt, &spec, &options);
             let fork = snapshot
                 .fork_with_directive(types::UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![types::UserContent::Text {
                         text: "Maintain your memory.".to_owned(),
@@ -6658,6 +6663,7 @@ fi
             0,
             ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "leading synthetic compact input".into(),

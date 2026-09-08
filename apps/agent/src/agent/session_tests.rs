@@ -545,6 +545,7 @@ async fn emit_idle_injection(events: &mpsc::Sender<AgentEvent>, initial: &Admitt
         panic!("idle fixture requires user command")
     };
     let message = PublicMessage::User(UserMessage {
+        incoming_source: None,
         incoming_timing: initial.incoming_timing(),
         content: vec![UserContent::Text { text: text.clone() }],
         timestamp: initial.received_at(),
@@ -896,6 +897,7 @@ impl RunWorker for StaleBindingWorker {
                 }
                 StaleBinding::PriorTurn => {
                     let user = PublicMessage::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: initial.incoming_timing(),
                         content: vec![UserContent::Text {
                             text: "message 1".to_owned(),
@@ -1331,6 +1333,202 @@ async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window
 }
 
 #[tokio::test]
+async fn cross_audience_input_waits_for_current_run_and_keeps_each_output_audience() {
+    use crate::runtime::contracts::OutputAudience;
+
+    // Exercise both directions using the actual Session routing and bridge,
+    // with a worker that refuses any early control while its first run is live.
+    for external_first in [true, false] {
+        let (gateway, _commands, frames) = gateway();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let worker: Arc<dyn RunWorker> = Arc::new({
+            let starts = starts.clone();
+            let release = release.clone();
+            move |mut core: RunCore,
+                  initial: AdmittedCommand,
+                  mut controls: mpsc::Receiver<RunControl>,
+                  events: mpsc::Sender<AgentEvent>| {
+                let ordinal = starts.fetch_add(1, Ordering::SeqCst);
+                let release = release.clone();
+                async move {
+                    let input = super::steer::build_user_message(&initial).expect("input message");
+                    let input_id = user_message_id(&initial.envelope().command_id);
+                    for event in [
+                        AgentEvent::AgentStart,
+                        AgentEvent::TurnStart,
+                        AgentEvent::MessageStart {
+                            message_id: input_id.clone(),
+                            message: Box::new(input.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id: input_id,
+                            message: Box::new(input.clone()),
+                        },
+                    ] {
+                        events.send(event).await.expect("session input event");
+                    }
+                    if ordinal == 0 {
+                        tokio::select! {
+                            biased;
+                            control = controls.recv() => panic!("cross-audience input reached the active worker: received control={}", control.is_some()),
+                            _ = release.notified() => {}
+                        }
+                        assert!(
+                            matches!(controls.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                            "a different output audience must remain in the Session queue"
+                        );
+                    }
+                    let assistant = bridge_assistant(StopReason::Stop);
+                    let assistant_id = format!("audience-assistant-{}", initial.envelope().seq);
+                    for event in [
+                        AgentEvent::MessageStart {
+                            message_id: assistant_id.clone(),
+                            message: Box::new(assistant.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id: assistant_id,
+                            message: Box::new(assistant.clone()),
+                        },
+                        AgentEvent::TurnEnd {
+                            message: Some(Box::new(assistant.clone())),
+                            tool_results: Vec::new(),
+                        },
+                        AgentEvent::AgentEnd,
+                    ] {
+                        events.send(event).await.expect("session output event");
+                    }
+                    core.runtime_context
+                        .extend(synthetic_runtime_context(vec![input, assistant]));
+                    core.mark_mutated();
+                    RunCompletion::Completed(core)
+                }
+            }
+        });
+        let mut session = session(gateway, worker).await;
+        let input = |seq, external| {
+            let InboundCommand::Valid(mut envelope) = user(seq) else {
+                unreachable!()
+            };
+            if external {
+                envelope.provenance = crate::gateway::test_messaging_provenance();
+                envelope.command = Command::ExternalEvent {
+                    content: "A shared conversation mentioned you.".into(),
+                };
+            }
+            InboundCommand::Valid(envelope)
+        };
+        session
+            .admit_and_route(input(1, external_first))
+            .await
+            .expect("first input");
+        // Persist the real startup and input so this is an active run, not
+        // merely two commands arriving before the first worker starts.
+        for _ in 0..4 {
+            let output = session
+                .active
+                .as_mut()
+                .unwrap()
+                .events_rx
+                .recv()
+                .await
+                .unwrap();
+            session
+                .persist_active_event(output)
+                .await
+                .expect("first run startup");
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.admit_and_route(input(2, !external_first)),
+        )
+        .await
+        .expect("cross-audience admission does not wait on a steer handshake")
+        .expect("second input is accepted and queued");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "first run still owns the worker"
+        );
+        assert_eq!(
+            session
+                .deferred_commands
+                .iter()
+                .map(|command| command.envelope().seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_active_to_completion(&mut session),
+        )
+        .await
+        .expect("first run completes")
+        .expect("first run persists");
+        assert!(
+            session.active.is_some(),
+            "queued input starts after the prior run completes"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_active_to_completion(&mut session),
+        )
+        .await
+        .expect("second run completes")
+        .expect("second run persists");
+        session.wait_outbound_idle().await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(applied_acks(&frames).len(), 2);
+
+        let expected = if external_first {
+            [OutputAudience::Secretary, OutputAudience::DirectChat]
+        } else {
+            [OutputAudience::DirectChat, OutputAudience::Secretary]
+        };
+        let frames = frames.lock().unwrap();
+        let mut run_index = 0;
+        let mut in_run = false;
+        let mut assistant_ends = 0;
+        for frame in frames.iter() {
+            let OutboundFrame::Event { envelope } = frame else {
+                continue;
+            };
+            if envelope.event["type"] == "agent_start" {
+                assert!(!in_run, "runs must not overlap");
+                in_run = true;
+            }
+            if in_run {
+                assert_eq!(
+                    envelope.audience, expected[run_index],
+                    "every emitted event retains its run's destination: {}",
+                    envelope.event["type"]
+                );
+                if envelope.event["type"] == "message_end"
+                    && envelope.event["message_id"]
+                        == format!("audience-assistant-{}", run_index + 1)
+                {
+                    assistant_ends += 1;
+                }
+                if envelope.event["type"] == "agent_end" {
+                    in_run = false;
+                    run_index += 1;
+                }
+            }
+        }
+        assert_eq!(
+            run_index, 2,
+            "both complete run event sequences were published"
+        );
+        assert_eq!(
+            assistant_ends, 2,
+            "both worker responses reached their own audience"
+        );
+        assert!(!in_run);
+    }
+}
+
+#[tokio::test]
 async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
     let (gateway, commands, frames) = gateway();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -1717,6 +1915,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
                     panic!("idle fixture requires user command")
                 };
                 let user_context = PublicMessage::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: initial.incoming_timing(),
                     content: vec![UserContent::Text { text: text.clone() }],
                     timestamp: initial.received_at(),
@@ -1865,6 +2064,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
                 panic!("idle fixture requires user command")
             };
             let user_context = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text { text: text.clone() }],
                 timestamp: initial.received_at(),
@@ -2253,6 +2453,7 @@ async fn fixture_bridge_after_assistant_in_store(
         .expect("classify approval fixture owner");
     let mut bridge = DurableBridge::new(binding.clone());
     let user_message = PublicMessage::User(UserMessage {
+        incoming_source: None,
         incoming_timing: initial.incoming_timing(),
         content: vec![UserContent::Text {
             text: "message 1".to_owned(),
@@ -5097,6 +5298,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
@@ -5209,6 +5411,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
@@ -5728,6 +5931,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let invalid = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
@@ -5797,6 +6001,7 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
@@ -6121,6 +6326,7 @@ impl RunDriver for SessionImmediateOverflowDriver {
         let mut replacement = active_context.to_vec();
         replacement.push(ContextMessage::Synthetic {
             message: super::run::public_to_message(PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "recovered context".to_owned(),
@@ -10106,6 +10312,7 @@ impl RunWorker for SaturatedActiveControlWorker {
                 panic!("saturation fixture requires an initial user command")
             };
             let user_message = PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text { text: text.clone() }],
                 timestamp: initial.received_at(),

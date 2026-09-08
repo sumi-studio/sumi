@@ -973,10 +973,13 @@ mod tests {
                     .await
                     .unwrap();
                 adapter
-                    .on_volatile(crate::agent::AgentEvent::ToolExecutionUpdate {
-                        tool_call_id: "phase-blocker".to_owned(),
-                        partial: serde_json::json!({"stdout": "must-not-forward"}),
-                    })
+                    .on_volatile(
+                        crate::runtime::contracts::OutputAudience::DirectChat,
+                        crate::agent::AgentEvent::ToolExecutionUpdate {
+                            tool_call_id: "phase-blocker".to_owned(),
+                            partial: serde_json::json!({"stdout": "must-not-forward"}),
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -1514,6 +1517,7 @@ mod tests {
                 delivery_epoch,
                 OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: None,
                         personality_agent_id: store.scope().personality_agent_id.clone(),
                         event: serde_json::json!({
@@ -2471,6 +2475,7 @@ mod tests {
                 delivery_epoch,
                 OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: None,
                         personality_agent_id: paid.clone(),
                         event: serde_json::json!({"type": "error", "message": "lane blocker"}),

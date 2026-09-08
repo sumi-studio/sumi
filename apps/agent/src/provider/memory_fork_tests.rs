@@ -53,6 +53,7 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
     });
     let messages = [
         Message::User(UserMessage {
+            incoming_source: Some(super::incoming_timing_tests::external_source_fixture(false)),
             incoming_timing: Some(IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -90,6 +91,7 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
             timestamp,
         }),
         Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: Some(IncomingEventTiming {
                 previous_receipt: Some(IncomingEventReceipt {
                     received_at: timestamp,
@@ -345,6 +347,7 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         let snapshot = ParentContextSnapshot::capture(&prompt, &spec, &options);
         let fork = snapshot
             .fork_with_directive(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: DIRECTIVE.into(),
@@ -435,6 +438,8 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         assert!(encoded.contains(IMAGE), "parent image must reach the wire");
         assert!(encoded.contains("Latest correction outside the edit target"));
         assert_eq!(encoded.matches("[Received ").count(), 2);
+        assert_eq!(encoded.matches("[Source ").count(), 1);
+        assert!(encoded.contains("messaging_mention"));
         assert!(encoded.contains("Received 2026-09-07 23:40:12 UTC"));
         assert!(encoded.contains("2 minutes 5 seconds since the previous incoming message"));
         assert_eq!(encoded.contains("opaque-parent-window"), native);

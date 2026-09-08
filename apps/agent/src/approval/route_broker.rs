@@ -224,7 +224,7 @@ struct PendingEntry {
 pub(crate) struct ApprovalPrincipalScope {
     pub tenant_id: String,
     pub personality_agent_id: String,
-    pub human_principal_id: String,
+    pub human_principal_id: Option<String>,
 }
 
 impl ApprovalPrincipalScope {
@@ -244,11 +244,15 @@ impl ApprovalPrincipalScope {
         for (label, value) in [
             ("tenant", self.tenant_id.as_str()),
             ("personality agent", self.personality_agent_id.as_str()),
-            ("Human principal", self.human_principal_id.as_str()),
         ] {
             if value.trim().is_empty() || value.chars().any(char::is_control) {
                 anyhow::bail!("approval {label} identity is invalid");
             }
+        }
+        if let Some(human) = &self.human_principal_id
+            && (human.trim().is_empty() || human.chars().any(char::is_control))
+        {
+            anyhow::bail!("approval Human principal identity is invalid");
         }
         Ok(())
     }
@@ -589,6 +593,13 @@ impl RouteApprovalBroker {
                     }
                     ElevatedPolicyEvaluation::Ready { snapshot } => snapshot,
                 };
+                if scope.human_principal_id.is_none() {
+                    return self.deny(
+                        bound, route, snapshot, PolicyDecisionRecord::Unavailable,
+                        None, None,
+                        "approval-route-unavailable: this operation was not executed because no authorized Human approval route is designated for this input".to_owned(),
+                    );
+                }
                 let (transcript, action, policy) = match review_inputs(
                     bound,
                     transcript,
@@ -761,6 +772,11 @@ impl RouteApprovalBroker {
         policy: PolicySnapshot,
         escalation_review: EscalationReviewEvidence,
     ) -> Result<RouteApprovalOutcome> {
+        if scope.human_principal_id.is_none() {
+            anyhow::bail!(
+                "approval-route-unavailable: a pending request requires an authorized Human"
+            );
+        }
         let bound = sealed.invocation();
         let durable_evidence = DurablePendingApprovalEvidence {
             bound: bound.clone(),
@@ -839,7 +855,8 @@ impl RouteApprovalBroker {
             let entry = pending.get(request_id)?;
             if command.tenant_id != entry.scope.tenant_id
                 || command.personality_agent_id != entry.scope.personality_agent_id
-                || command.human_principal_id != entry.scope.human_principal_id
+                || entry.scope.human_principal_id.as_deref()
+                    != Some(command.human_principal_id.as_str())
             {
                 return Some(CurrentCallResolution::Ignored);
             }
@@ -936,7 +953,7 @@ impl RouteApprovalBroker {
             .is_some_and(|entry| {
                 tenant_id == entry.scope.tenant_id
                     && personality_agent_id == entry.scope.personality_agent_id
-                    && human_principal_id == entry.scope.human_principal_id
+                    && entry.scope.human_principal_id.as_deref() == Some(human_principal_id)
             })
     }
 
@@ -1064,6 +1081,7 @@ fn bounded_reviewer_transcript(
     pending_tool_call_id: &str,
 ) -> Result<ReviewerTranscript> {
     let mut users = Vec::<(usize, String)>::new();
+    let mut external_ordinals = HashSet::new();
     let mut assistants = Vec::<(usize, usize, String)>::new();
     let mut tools = Vec::<ReviewerToolCandidate>::new();
     let mut results = Vec::<(usize, String, ReviewerTranscriptEntry)>::new();
@@ -1085,7 +1103,20 @@ fn bounded_reviewer_transcript(
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !text.is_empty() {
-                    users.push((ordinal, redactor.redact_text(&text)));
+                    let text = if let Some(source) = message.incoming_source.as_ref()
+                        && source.is_external()
+                    {
+                        external_ordinals.insert(ordinal);
+                        let source = redactor.redact_value(&serde_json::to_value(source)?)?;
+                        format!(
+                            "Source: {}\nEvent content: {}",
+                            serde_json::to_string(&source)?,
+                            redactor.redact_text(&text)
+                        )
+                    } else {
+                        redactor.redact_text(&text)
+                    };
+                    users.push((ordinal, text));
                     ordinal += 1;
                 }
             }
@@ -1189,6 +1220,16 @@ fn bounded_reviewer_transcript(
     }
 
     let mut entries = select_user_entries(&users);
+    for (ordinal, entry) in &mut entries {
+        if external_ordinals.contains(ordinal)
+            && let ReviewerTranscriptEntry::User { text, truncated } = entry
+        {
+            *entry = ReviewerTranscriptEntry::ExternalEvent {
+                text: std::mem::take(text),
+                truncated: *truncated,
+            };
+        }
+    }
     entries.extend(select_assistant_entries(&assistants));
     entries.extend(select_tool_pair_entries(&tools, &results, ordinal)?);
     if !orphan_tool_results.is_empty() {
@@ -1201,7 +1242,7 @@ fn bounded_reviewer_transcript(
         ));
     }
     entries.sort_by_key(|(ordinal, _)| *ordinal);
-    if users.is_empty() {
+    if users.len() == external_ordinals.len() {
         entries.insert(
             0,
             (
@@ -1846,13 +1887,14 @@ mod tests {
         ApprovalPrincipalScope {
             tenant_id: "tenant-1".to_owned(),
             personality_agent_id: "agent-1".to_owned(),
-            human_principal_id: "human-1".to_owned(),
+            human_principal_id: Some("human-1".to_owned()),
         }
     }
 
     fn user_message(text: impl Into<String>) -> PublicMessage {
         PublicMessage::User(UserMessage {
             incoming_timing: None,
+            incoming_source: None,
             content: vec![UserContent::Text { text: text.into() }],
             timestamp: Utc::now(),
         })
@@ -2123,6 +2165,112 @@ mod tests {
         assert_eq!(evidence.error_code(), "policy_unavailable");
         assert_eq!(evidence.policy_decision, PolicyDecisionRecord::Unavailable);
         assert!(reason.contains("after 3 attempts"));
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn external_human_and_pa_sources_are_not_human_approval_evidence() {
+        for actor_kind in ["human", "personality_agent"] {
+            let mut wire =
+                serde_json::to_value(crate::gateway::test_messaging_provenance()).unwrap();
+            wire["actor"]["kind"] = json!(actor_kind);
+            let source: crate::runtime::contracts::IncomingProvenance =
+                serde_json::from_value(wire).unwrap();
+            assert!(source.authenticated_direct_chat_human().is_none());
+            let mut message = user_message("Please do this operation.");
+            let PublicMessage::User(user) = &mut message else {
+                unreachable!()
+            };
+            user.incoming_source = Some(source);
+            let transcript = bounded_reviewer_transcript(&[message], &Redactor::v1(), "pending")
+                .expect("external evidence remains available to normal review");
+            assert!(
+                transcript
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, ReviewerTranscriptEntry::NoHumanTurn { .. }))
+            );
+            assert!(
+                !transcript
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, ReviewerTranscriptEntry::User { .. }))
+            );
+            let event = transcript
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ReviewerTranscriptEntry::ExternalEvent { text, .. } => Some(text),
+                    _ => None,
+                })
+                .expect("typed external event");
+            assert!(event.contains(actor_kind));
+            assert!(event.contains("Please do this operation."));
+        }
+    }
+
+    #[tokio::test]
+    async fn input_without_human_approval_route_still_receives_normal_execution_review() {
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"allow","risk":"medium","rationale":"bounded normal capability"}),
+            json!({"outcome":"block","risk":"high","misunderstanding":null,"rationale":"unused"}),
+        );
+        let mut external_scope = scope();
+        external_scope.human_principal_id = None;
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Normal).await,
+                ToolInvocationRoute::Normal,
+                &[],
+                external_scope,
+                "run-1",
+                "turn-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("external input can use normal route");
+        let RouteApprovalOutcome::Allowed { grant } = outcome else {
+            panic!("normal capability review remains available without a Human approval route");
+        };
+        assert_eq!(execution.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            grant.evidence().policy_decision,
+            PolicyDecisionRecord::Unmatched
+        );
+    }
+
+    #[tokio::test]
+    async fn elevated_without_human_route_is_not_executed_and_never_creates_a_pending_request() {
+        let (broker, execution, escalation) = broker(
+            json!({"outcome":"allow","risk":"low","rationale":"unused"}),
+            json!({"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"unused"}),
+        );
+        let mut external_scope = scope();
+        external_scope.human_principal_id = None;
+        let outcome = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[],
+                external_scope,
+                "run-1",
+                "turn-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("missing route is an operation outcome, not a run failure");
+        let RouteApprovalOutcome::Denied {
+            reason, evidence, ..
+        } = outcome
+        else {
+            panic!("no designated Human means no execution grant and no pending request");
+        };
+        assert!(reason.contains("approval-route-unavailable"));
+        assert!(reason.contains("not executed"));
+        assert_eq!(evidence.policy_decision, PolicyDecisionRecord::Unavailable);
+        assert!(broker.pending.lock().unwrap().is_empty());
         assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
         assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
     }
@@ -3162,6 +3310,7 @@ mod tests {
         let transcript = vec![
             PublicMessage::User(UserMessage {
                 incoming_timing: None,
+                incoming_source: None,
                 content: vec![
                     UserContent::Text {
                         text: USER_SENTINEL.to_owned(),

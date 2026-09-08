@@ -179,6 +179,7 @@ impl CompactionInput {
         }
         self.parent
             .fork_with_directive(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content,
                 timestamp: Utc::now(),
@@ -1325,7 +1326,7 @@ mod tests {
         ToolCall, ToolDefinition, ToolInvocationRoute, ToolResultMessage, Usage,
     };
     use crate::runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+        GenerationRecoveryFence, IncomingProvenance, ProcessGeneration, ProcessGenerationLease,
     };
     use crate::store::{
         ApplicationKind, DataKeyPurpose, HydrationOutcome, InjectedCommand,
@@ -1351,6 +1352,7 @@ mod tests {
 
     fn user(text: &str) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text { text: text.into() }],
             timestamp: timestamp(),
@@ -1899,8 +1901,8 @@ mod tests {
         .await;
     }
 
-    fn provenance(store: &Store) -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new(
+    fn provenance(store: &Store) -> IncomingProvenance {
+        IncomingProvenance::new(
             "tenant-1",
             store.scope().personality_agent_id.clone(),
             "human-1",
@@ -1980,6 +1982,7 @@ mod tests {
         .await
         .expect("fixture timing");
         let user = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: timing_json
                 .map(|json| serde_json::from_str(&json).expect("fixture timing json")),
             content: vec![UserContent::Text {
