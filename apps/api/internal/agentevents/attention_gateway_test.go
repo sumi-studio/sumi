@@ -217,7 +217,14 @@ func TestAttentionPrepareHoldsReadyRuntimeAndReleasesOnCancellation(t *testing.T
 	for _, ready := range []bool{true, false} {
 		gateway := openRuntimeGateway(t)
 		spawner := &attentionTestSpawner{gateway: gateway, ready: ready}
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		var ctx context.Context
+		var cancel context.CancelFunc
+		if ready {
+			// Readiness and append exercise the hold, not a startup deadline.
+			ctx, cancel = context.WithCancel(context.Background())
+		} else {
+			ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+		}
 		release, err := gateway.PrepareAttention(ctx, spawner, attentionTestProvenance().PersonalityAgentID)
 		cancel()
 		if !spawner.held {
