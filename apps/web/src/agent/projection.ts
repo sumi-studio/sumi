@@ -26,19 +26,36 @@ export function projectConversation(model: ConversationModel): ChatItem[] {
         insertedRuns.add(runId);
       }
     }
-    projected.push(
-      entry.kind === "prose"
-        ? {
-            ...entry,
-            agentMessageFinal:
-              finalProseByRun.get(
-                entry.runId ?? `message:${entry.messageId}`,
-              ) === entry.id,
-          }
-        : entry,
-    );
+    if (entry.kind === "trace") {
+      const trace = model.runs[entry.runId]?.trace.find(
+        (trace) => trace.id === entry.traceId,
+      );
+      if (trace && (trace.type !== "reasoning" || trace.text.trim()))
+        projected.push({
+          ...entry,
+          trace:
+            trace.type === "tool" && entry.phase === "activity"
+              ? {
+                  ...trace,
+                  args: entry.inputArgs ?? trace.args,
+                  result: undefined,
+                }
+              : trace,
+        });
+    } else {
+      projected.push(
+        entry.kind === "prose"
+          ? {
+              ...entry,
+              agentMessageFinal:
+                finalProseByRun.get(
+                  entry.runId ?? `message:${entry.messageId}`,
+                ) === entry.id,
+            }
+          : entry,
+      );
+    }
   }
-
   for (const runId of model.runOrder) {
     if (insertedRuns.has(runId)) continue;
     const run = model.runs[runId];

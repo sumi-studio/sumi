@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod assembler;
 pub(crate) mod canonical_request;
+pub mod chatgpt;
 pub(crate) mod context_fingerprint;
 pub mod model;
 pub mod overflow;
@@ -47,7 +48,8 @@ use canonical_request::CanonicalRequestBody;
 use chrono::Utc;
 use futures_util::StreamExt;
 pub use model::{
-    AnthropicCompat, ChatCompat, ModelSpec, ProtocolCompat, RequestOptions, ResponsesCompat,
+    AnthropicCompat, ChatCompat, ModelSpec, ProtocolCompat, ProviderBackend, RequestOptions,
+    ResponsesCompat, ResponsesDialect,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -262,15 +264,11 @@ pub async fn compact_native(
 ) -> Result<NativeCompactionResult, NativeCompactionError> {
     responses_compaction_coverage(&spec, &context)
         .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
-    let api_key = env::var(&spec.api_key_env)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| {
-            NativeCompactionError::InvalidRequest(format!(
-                "missing API key environment variable {}",
-                spec.api_key_env
-            ))
-        })?;
+    let api_key = if spec.backend == ProviderBackend::ChatGpt {
+        String::new()
+    } else {
+        env::var(&spec.api_key_env).unwrap_or_default()
+    };
     compact_native_with_api_key(spec, context, cancel, api_key).await
 }
 
@@ -287,10 +285,18 @@ async fn compact_native_with_api_key(
     let client = http_client().map_err(NativeCompactionError::Transport)?;
     let body = CanonicalRequestBody::serialize(&body)
         .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
-    let request = body
-        .apply(client.post(spec.compact_endpoint()).bearer_auth(api_key))
-        .send();
-    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {}).await {
+    let response = match chatgpt::send(
+        client,
+        &spec,
+        &body,
+        &RequestOptions::default(),
+        &cancel,
+        Some(&api_key),
+        true,
+        |_| {},
+    )
+    .await
+    {
         RequestWait::Cancelled => return Err(NativeCompactionError::Cancelled),
         RequestWait::TimedOut => return Err(NativeCompactionError::HeaderTimeout),
         RequestWait::Response {
@@ -1073,19 +1079,6 @@ async fn run_responses_stream(
         }
     };
     let mut receive = ResponsesReceiveState::with_budget(schemas, budget);
-    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
-        finish_failure(
-            &priority_terminal_tx,
-            &mut assembler,
-            &spec,
-            Usage::default(),
-            format!("missing API key environment variable {}", spec.api_key_env),
-            "missing_api_key",
-            cancel.is_cancelled(),
-        )
-        .await;
-        return;
-    };
     let body = match build_responses_request(&spec, &context, &options) {
         Ok(body) => body,
         Err(error) => {
@@ -1134,72 +1127,71 @@ async fn run_responses_stream(
             return;
         }
     };
-    let request = body
-        .apply(session_request(
-            client.post(spec.endpoint()).bearer_auth(api_key),
-            &spec,
-            &options,
-        ))
-        .send();
-    let (response, request_sent_at) =
-        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |at| {
-            TtftObservation::observe_request_sent(&timing, at)
-        })
-        .await
-        {
-            RequestWait::Cancelled => {
-                finish_failure_with_context(
-                    &priority_terminal_tx,
-                    &mut assembler,
-                    &spec,
-                    receive.usage().clone(),
-                    "provider request cancelled".to_owned(),
-                    "cancelled",
-                    true,
-                    receive.provider_context(),
-                )
-                .await;
-                return;
-            }
-            RequestWait::TimedOut => {
-                finish_failure_with_context(
-                    &priority_terminal_tx,
-                    &mut assembler,
-                    &spec,
-                    receive.usage().clone(),
-                    format!(
-                        "provider response headers timed out after {} seconds",
-                        RESPONSE_HEADER_TIMEOUT.as_secs()
-                    ),
-                    "response_header_timeout",
-                    cancel.is_cancelled(),
-                    receive.provider_context(),
-                )
-                .await;
-                return;
-            }
-            RequestWait::Response {
-                response: Ok(response),
-                request_sent_at,
-            } => (response, request_sent_at),
-            RequestWait::Response {
-                response: Err(error),
-                ..
-            } => {
-                finish_failure_with_context(
-                    &priority_terminal_tx,
-                    &mut assembler,
-                    &spec,
-                    receive.usage().clone(),
-                    error.to_string(),
-                    "request_error",
-                    cancel.is_cancelled(),
-                    receive.provider_context(),
-                )
-                .await;
-                return;
-            }
-        };
+    let (response, request_sent_at) = match chatgpt::send(
+        client,
+        &spec,
+        &body,
+        &options,
+        &cancel,
+        api_key.as_deref(),
+        false,
+        |at| TtftObservation::observe_request_sent(&timing, at),
+    )
+    .await
+    {
+        RequestWait::Cancelled => {
+            finish_failure_with_context(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                "provider request cancelled".to_owned(),
+                "cancelled",
+                true,
+                receive.provider_context(),
+            )
+            .await;
+            return;
+        }
+        RequestWait::TimedOut => {
+            finish_failure_with_context(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                format!(
+                    "provider response headers timed out after {} seconds",
+                    RESPONSE_HEADER_TIMEOUT.as_secs()
+                ),
+                "response_header_timeout",
+                cancel.is_cancelled(),
+                receive.provider_context(),
+            )
+            .await;
+            return;
+        }
+        RequestWait::Response {
+            response: Ok(response),
+            request_sent_at,
+        } => (response, request_sent_at),
+        RequestWait::Response {
+            response: Err(error),
+            ..
+        } => {
+            finish_failure_with_context(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error.to_string(),
+                error.code(),
+                cancel.is_cancelled(),
+                receive.provider_context(),
+            )
+            .await;
+            return;
+        }
+    };
     let mut transport =
         match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
             Ok(transport) => transport,
@@ -2572,6 +2564,7 @@ fn responses_adapter_error(error: &ResponsesAdapterError) -> (String, String) {
         ResponsesAdapterError::UnsupportedProtocol
         | ResponsesAdapterError::InvalidMaxTokens { .. }
         | ResponsesAdapterError::InvalidTemperature(_)
+        | ResponsesAdapterError::UnsupportedTemperature
         | ResponsesAdapterError::InvalidContext(_) => {
             (error.to_string(), "invalid_provider_request".to_owned())
         }
@@ -3085,6 +3078,7 @@ fi
                 id: format!("message-{seq}"),
                 seq,
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "compact this".into(),
@@ -3894,6 +3888,7 @@ fi
                 PromptContext {
                     messages: vec![ContextMessage::Synthetic {
                         message: Message::User(UserMessage {
+                            incoming_source: None,
                             incoming_timing: None,
                             content: vec![UserContent::Text {
                                 text: "pre-cancel".into(),
@@ -5818,6 +5813,7 @@ fi
             }),
         };
         let user = types::UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![types::UserContent::Text {
                 text: "Call echo_value once with value live-smoke-ok.".to_owned(),
@@ -6065,6 +6061,7 @@ fi
                 vec![],
                 vec![ContextMessage::Synthetic {
                     message: Message::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: None,
                         content: vec![UserContent::Text {
                             text: "Hello".to_owned(),
@@ -6082,6 +6079,7 @@ fi
             let snapshot = types::ParentContextSnapshot::capture(&prompt, &spec, &options);
             let fork = snapshot
                 .fork_with_directive(types::UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![types::UserContent::Text {
                         text: "Maintain your memory.".to_owned(),
@@ -6658,6 +6656,7 @@ fi
             0,
             ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "leading synthetic compact input".into(),

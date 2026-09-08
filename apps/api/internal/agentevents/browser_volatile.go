@@ -47,7 +47,7 @@ func (b *browserVolatileBatch) append(envelope Envelope) bool {
 }
 
 func mergeBrowserDelta(previous, next Envelope) (Envelope, bool) {
-	if previous.Seq != nil || next.Seq != nil || previous.PersonalityAgentID != next.PersonalityAgentID ||
+	if previous.Audience != next.Audience || previous.Seq != nil || next.Seq != nil || previous.PersonalityAgentID != next.PersonalityAgentID ||
 		len(previous.Event)+len(next.Event) > maxBrowserMergedDeltaBytes {
 		return Envelope{}, false
 	}

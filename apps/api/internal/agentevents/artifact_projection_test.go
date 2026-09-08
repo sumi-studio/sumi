@@ -18,7 +18,7 @@ const (
 
 func TestProjectBrowserEventRewritesNestedOwnedArtifactHandles(t *testing.T) {
 	seq := uint64(7)
-	envelope := Envelope{
+	envelope := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
@@ -92,7 +92,7 @@ func TestProjectBrowserEventRewritesNestedOwnedArtifactHandles(t *testing.T) {
 
 func TestProjectBrowserEventRewritesOwnedArtifactHandleKeys(t *testing.T) {
 	seq := uint64(1)
-	envelope := Envelope{
+	envelope := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
@@ -136,7 +136,7 @@ func TestArtifactHandleKeysRejectCrossOwnerAndTargetlessInternalRefs(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			envelope := Envelope{
+			envelope := Envelope{Audience: AudienceDirectChat,
 				Seq:                &seq,
 				PersonalityAgentID: artifactOwner,
 				Event:              event,
@@ -176,7 +176,7 @@ func TestArtifactProjectionRejectsKeyCollisionDeterministically(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			envelope := Envelope{
+			envelope := Envelope{Audience: AudienceDirectChat,
 				Seq:                &seq,
 				PersonalityAgentID: test.owner,
 				Event:              event,
@@ -202,7 +202,7 @@ func TestArtifactProjectionRejectsKeyCollisionDeterministically(t *testing.T) {
 }
 
 func TestProjectBrowserEventRewritesToolResultMessageButPreservesUserMessage(t *testing.T) {
-	toolResult := Envelope{
+	toolResult := Envelope{Audience: AudienceDirectChat,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
 			"type":"message_end",
@@ -233,7 +233,7 @@ func TestProjectBrowserEventRewritesToolResultMessageButPreservesUserMessage(t *
 	}
 
 	literal := "literal artifact://" + artifactOwner + "/tool-output/pasted and artifact://tool-output/browser-pasted"
-	user := Envelope{
+	user := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
@@ -259,7 +259,7 @@ func TestProjectBrowserEventRewritesToolResultMessageButPreservesUserMessage(t *
 }
 
 func TestArtifactProjectionRejectsCrossOwnerAndInternalBrowserReferences(t *testing.T) {
-	crossOwner := Envelope{
+	crossOwner := Envelope{Audience: AudienceDirectChat,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
 			"type":"tool_execution_end",
@@ -277,7 +277,7 @@ func TestArtifactProjectionRejectsCrossOwnerAndInternalBrowserReferences(t *test
 		t.Fatal("cross-owner canonical artifact handle passed internal validation")
 	}
 
-	browserRef := Envelope{
+	browserRef := Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
@@ -324,7 +324,7 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 		t.Fatal(err)
 	}
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
@@ -343,7 +343,7 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 		t.Fatalf("durable artifact projection mismatch: %+v", durable)
 	}
 
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		PersonalityAgentID: artifactOwner,
 		Event: json.RawMessage(`{
 			"type":"tool_execution_update",

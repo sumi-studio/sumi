@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"net"
 	"os"
 	"path/filepath"
@@ -58,6 +59,8 @@ type fakeRuntimeProvisioner struct {
 	recovery        map[string]bool
 	reconcileReaps  map[string]bool
 	omitReapReceipt bool
+	stopErr         error
+	reconcileErr    error
 	inspectErr      error
 	inspectErrLimit int
 }
@@ -125,6 +128,9 @@ func (p *fakeRuntimeProvisioner) Abort(_ context.Context, request runtimeprovisi
 }
 
 func (p *fakeRuntimeProvisioner) Stop(_ context.Context, request runtimeprovision.StopRequest) (runtimeprovision.Inspection, error) {
+	if p.stopErr != nil {
+		return runtimeprovision.Inspection{}, p.stopErr
+	}
 	p.recorder.add("stop:" + request.PersonalityAgentID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -156,6 +162,9 @@ func (p *fakeRuntimeProvisioner) reapInspection(epoch runtimeprovision.PreparedE
 }
 
 func (p *fakeRuntimeProvisioner) Reconcile(_ context.Context, request runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
+	if p.reconcileErr != nil {
+		return runtimeprovision.Inspection{}, p.reconcileErr
+	}
 	p.recorder.add("reconcile:" + request.PersonalityAgentID)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1088,4 +1097,107 @@ func containsOrdered(haystack, needles []string) bool {
 		}
 	}
 	return next == len(needles)
+}
+
+type validatingRuntimeProvisioner struct{ *fakeRuntimeProvisioner }
+
+func (p validatingRuntimeProvisioner) Activate(ctx context.Context, request runtimeprovision.ActivateRequest) (runtimeprovision.Inspection, error) {
+	if err := request.Activation.Validate(); err != nil {
+		return runtimeprovision.Inspection{}, err
+	}
+	return p.fakeRuntimeProvisioner.Activate(ctx, request)
+}
+func TestProvisionedRuntimeSelectsChatGPTWithoutFallbackConversationKey(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		connected, reviewer bool
+		pass                bool
+	}{
+		{"connected native", true, true, true},
+		{"unconnected API fallback lacks key", false, true, false},
+		{"native still requires reviewer", true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+			spawner.config.Provisioner = validatingRuntimeProvisioner{provisioner}
+			spawner.config.Activation.ProviderAPIKey = ""
+			if !tc.reviewer {
+				spawner.config.Activation.ExecutionReviewerAPIKey = ""
+			}
+			connection := &chatGPTTestStore{status: chatgpt.Status{Connected: tc.connected, ConnectionID: "connection", AccountID: "account", Selection: chatgpt.Selection{Model: "gpt-6-astra", Effort: "medium"}}}
+			native := &chatGPTRuntime{connections: connection, employers: &chatGPTTestEmployer{kind: "human"}}
+			spawner.config.ResolveActivation = native.activation
+			process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{AgentID: provisionedTestPAIDs[0], WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws"})
+			if (err == nil) != tc.pass {
+				t.Fatalf("unexpected selected activation result: %v", err)
+			}
+			if process != nil {
+				if err := process.Stop(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestProvisionedMonitorCleanupFailureCanBeRetriedByStop(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
+	failure := errors.New("temporary reconcile outage")
+	provisioner.reconcileErr = failure
+	p := process.(*provisionedProcess)
+	p.monitorInterval = time.Millisecond
+	if err := p.Wait(); !errors.Is(err, spawn.ErrCleanupIncomplete) || !errors.Is(err, failure) {
+		t.Fatalf("wait=%v", err)
+	}
+	if err := p.Stop(); !errors.Is(err, failure) {
+		t.Fatalf("persistent stop=%v", err)
+	}
+	provisioner.reconcileErr = nil
+	if err := p.Stop(); err != nil {
+		t.Fatalf("retry stop=%v", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("writer epoch not reaped")
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("idempotent stop=%v", err)
+	}
+}
+
+func TestProvisionedExplicitStopRetriesAfterPhysicalTeardownFailure(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[0]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("temporary stop outage")
+	provisioner.stopErr = failure
+	if err := process.Stop(); !errors.Is(err, failure) {
+		t.Fatalf("stop=%v", err)
+	}
+	if err := process.Wait(); !errors.Is(err, spawn.ErrCleanupIncomplete) {
+		t.Fatalf("wait=%v", err)
+	}
+	provisioner.stopErr = nil
+	if err := process.Stop(); err != nil {
+		t.Fatalf("retry=%v", err)
+	}
+	if _, exists := provisioner.epochs[paid]; exists {
+		t.Fatal("writer remains")
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatalf("recovered wait=%v", err)
+	}
 }

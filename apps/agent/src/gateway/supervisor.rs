@@ -2640,7 +2640,7 @@ mod tests {
         ValidatedToolArguments,
     };
     use crate::runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGenerationLease,
+        GenerationRecoveryFence, IncomingProvenance, PersonalityAgentId, ProcessGenerationLease,
     };
     use crate::store::{
         DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, DurableEvent,
@@ -3673,6 +3673,7 @@ mod tests {
     fn event_frame(seq: u64) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(seq),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "agent_start"}),
@@ -3709,7 +3710,7 @@ mod tests {
         principal_id: &str,
     ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
-            provenance: DirectChatProvenanceV1::new(
+            provenance: IncomingProvenance::new(
                 tenant_id,
                 personality_agent_id.clone(),
                 principal_id,
@@ -5010,6 +5011,7 @@ mod tests {
         };
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "delta"}),
@@ -6755,6 +6757,7 @@ mod tests {
         // A volatile/delta Event (seq: None) sent before Online must also be dropped.
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
@@ -6901,9 +6904,13 @@ mod tests {
                             None => break,
                         }
                     };
-                    let (epoch, seq, event) = match frame {
+                    let (audience, epoch, seq, event) = match frame {
                         DeliveryFrame::Durable { .. } => continue,
-                        DeliveryFrame::Volatile { epoch, event } => {
+                        DeliveryFrame::Volatile {
+                            audience,
+                            epoch,
+                            event,
+                        } => {
                             let event = match serde_json::to_value(event) {
                                 Ok(event) => event,
                                 Err(error) => {
@@ -6913,11 +6920,12 @@ mod tests {
                                     break;
                                 }
                             };
-                            (epoch, None, event)
+                            (audience, epoch, None, event)
                         }
                     };
                     let outbound = OutboundFrame::Event {
                         envelope: Envelope {
+                            audience,
                             seq,
                             personality_agent_id: personality_agent_id.clone(),
                             event,
@@ -7022,13 +7030,16 @@ mod tests {
         // A volatile sent while the pump is still CatchingUp must be dropped.
         source
             .pump()
-            .on_volatile(AgentEvent::MessageUpdate {
-                message_id: "pre-online".to_owned(),
-                event: PublicStreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "drop".to_owned(),
+            .on_volatile(
+                crate::runtime::contracts::OutputAudience::DirectChat,
+                AgentEvent::MessageUpdate {
+                    message_id: "pre-online".to_owned(),
+                    event: PublicStreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "drop".to_owned(),
+                    },
                 },
-            })
+            )
             .await
             .unwrap();
 
@@ -7052,13 +7063,16 @@ mod tests {
         // The pump is still CatchingUp here, so this volatile must be dropped.
         source
             .pump()
-            .on_volatile(AgentEvent::MessageUpdate {
-                message_id: "during-mark-online".to_owned(),
-                event: PublicStreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "drop".to_owned(),
+            .on_volatile(
+                crate::runtime::contracts::OutputAudience::DirectChat,
+                AgentEvent::MessageUpdate {
+                    message_id: "during-mark-online".to_owned(),
+                    event: PublicStreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "drop".to_owned(),
+                    },
                 },
-            })
+            )
             .await
             .unwrap();
 
@@ -7079,13 +7093,16 @@ mod tests {
         // though the public watch is intentionally still false.
         source
             .pump()
-            .on_volatile(AgentEvent::MessageUpdate {
-                message_id: "boundary".to_owned(),
-                event: PublicStreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "forward".to_owned(),
+            .on_volatile(
+                crate::runtime::contracts::OutputAudience::DirectChat,
+                AgentEvent::MessageUpdate {
+                    message_id: "boundary".to_owned(),
+                    event: PublicStreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "forward".to_owned(),
+                    },
                 },
-            })
+            )
             .await
             .unwrap();
 
@@ -7176,6 +7193,7 @@ mod tests {
         classify_frame(
             OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: None,
                     personality_agent_id: crate::gateway::test_personality_agent_id(),
                     event: serde_json::json!({"type": "message_update"}),
@@ -7432,6 +7450,7 @@ mod tests {
         // Volatile pre-online events must be dropped.
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "typing"}),
@@ -8396,13 +8415,16 @@ mod tests {
             .await
             .expect("writer must be blocked in catch-up");
 
-        pump.on_volatile(crate::agent::AgentEvent::MessageUpdate {
-            message_id: "pre-online".to_owned(),
-            event: crate::agent::PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "must-drop".to_owned(),
+        pump.on_volatile(
+            crate::runtime::contracts::OutputAudience::DirectChat,
+            crate::agent::AgentEvent::MessageUpdate {
+                message_id: "pre-online".to_owned(),
+                event: crate::agent::PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "must-drop".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
         assert!(
@@ -8419,13 +8441,16 @@ mod tests {
         })
         .await
         .expect("writer must open the online barrier after durable replay");
-        pump.on_volatile(crate::agent::AgentEvent::MessageUpdate {
-            message_id: "online".to_owned(),
-            event: crate::agent::PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "deliver".to_owned(),
+        pump.on_volatile(
+            crate::runtime::contracts::OutputAudience::DirectChat,
+            crate::agent::AgentEvent::MessageUpdate {
+                message_id: "online".to_owned(),
+                event: crate::agent::PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "deliver".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
         assert!(matches!(
@@ -9252,6 +9277,7 @@ mod tests {
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: Some(2),
                     personality_agent_id: store.scope().personality_agent_id.clone(),
                     // This Session-carried payload is intentionally raw and
@@ -9268,6 +9294,7 @@ mod tests {
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: None,
                     personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
@@ -9411,6 +9438,7 @@ mod tests {
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: Some(1),
                     personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::json!({
@@ -9428,6 +9456,7 @@ mod tests {
         session_writer
             .send(OutboundFrame::Event {
                 envelope: Envelope {
+                    audience: crate::runtime::contracts::OutputAudience::DirectChat,
                     seq: None,
                     personality_agent_id: store.scope().personality_agent_id.clone(),
                     event: serde_json::to_value(crate::agent::AgentEvent::ToolExecutionUpdate {
@@ -9556,6 +9585,7 @@ mod tests {
             session_writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: Some(seq),
                         personality_agent_id: store.scope().personality_agent_id.clone(),
                         event: serde_json::json!({
@@ -9699,6 +9729,7 @@ mod tests {
             session_writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: Some(2),
                         personality_agent_id: personality_agent_id.clone(),
                         event: serde_json::json!({
@@ -9909,6 +9940,7 @@ mod tests {
             writer
                 .send(OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: Some(2),
                         personality_agent_id: personality_agent_id.clone(),
                         event: serde_json::json!({
@@ -10034,6 +10066,7 @@ mod tests {
                 epoch,
                 OutboundFrame::Event {
                     envelope: Envelope {
+                        audience: crate::runtime::contracts::OutputAudience::DirectChat,
                         seq: None,
                         personality_agent_id: store.scope().personality_agent_id.clone(),
                         event: serde_json::json!({
@@ -10119,7 +10152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_projection_corruption_is_typed_fatal_without_reconnect() {
+    async fn store_ciphertext_corruption_is_typed_fatal_without_reconnect() {
         let store = Arc::new(
             Store::session_test_store("t17-t24-forwarder-failure")
                 .await
@@ -10127,8 +10160,13 @@ mod tests {
         );
         let adapter = seams::T17StoreAdapter::new(store.clone());
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let responses = (0..5)
-            .map(|_| Ok(MockGateway::new(VecDeque::new())))
+            .map(|_| {
+                let mut gateway = MockGateway::new(VecDeque::new());
+                gateway.writer.sent = sent.clone();
+                Ok(gateway)
+            })
             .collect();
         let connector = MockConnector::new(sent_hellos.clone(), responses);
         let mut config = make_config();
@@ -10147,45 +10185,49 @@ mod tests {
         );
         let handle = supervisor.start();
         let mut online = handle.online.clone();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !*online.borrow() {
-                online.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("first delivery epoch must become Online");
-
-        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE agent_events SET envelope = 'not-json' WHERE seq = 1")
-            .execute(store.pool())
-            .await
-            .unwrap();
-        let post_commit_epoch = PostCommitEpochCapability::unbound_test(CancellationToken::new());
-        let error = adapter
-            .admit_ordered_commit(&post_commit_epoch, 1)
-            .await
-            .expect_err("invalid durable projection must fail synchronously");
+        let outcome = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !*online.borrow() {
+                    online.changed().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart).await?;
+            sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=1")
+                .execute(store.pool())
+                .await?;
+            let capability = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+            Ok::<_, anyhow::Error>(adapter.admit_ordered_commit(&capability, 1).await)
+        }
+        .await;
+        // Always settle ownership before assertions; a regression must report
+        // its test failure instead of triggering the owner's fail-stop Drop.
+        handle.abort();
+        let joined = handle.join().await;
+        let error = outcome
+            .expect("fixture reaches selected-event admission")
+            .expect_err("invalid authenticated ciphertext must fail");
         assert!(
-            error
-                .downcast_ref::<seams::DeliveryProjectionError>()
-                .is_some(),
-            "projection corruption must preserve its typed permanent boundary: {error:#}"
+            format!("{error:#}").contains("failed to decrypt durable event"),
+            "{error:#}"
         );
-
-        let supervisor_error = tokio::time::timeout(Duration::from_secs(1), handle.join())
-            .await
-            .expect("permanent delivery failure must terminate promptly")
-            .expect_err("projection corruption must be fatal");
+        assert!(
+            !sent.lock().unwrap().iter().any(
+                |frame| matches!(frame,OutboundFrame::Event{envelope} if envelope.seq==Some(1))
+            ),
+            "unauthenticated content must not reach delivery"
+        );
+        let supervisor_error =
+            joined.expect_err("selected-event authentication failure must stay fatal");
         assert!(
             format!("{supervisor_error:#}").contains("failed permanently"),
-            "unexpected supervisor error: {supervisor_error:#}"
+            "{supervisor_error:#}"
         );
         assert_eq!(
             sent_hellos.lock().unwrap().len(),
             1,
-            "permanent projection corruption must not reconnect against the same row"
+            "permanent ciphertext corruption must not reconnect against the same row"
         );
         assert_eq!(
             adapter.active_delivery_epoch().await,
@@ -10195,7 +10237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_redaction_backlog_is_fatal_before_online_without_reconnect() {
+    async fn corrupt_redaction_cache_is_regenerated_before_online_without_reconnect() {
         let store = Arc::new(
             Store::session_test_store("t17-t24-corrupt-redaction-backlog")
                 .await
@@ -10211,9 +10253,10 @@ mod tests {
 
         let adapter = seams::T17StoreAdapter::new(store);
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
-        let responses = (0..5)
-            .map(|_| Ok(MockGateway::new(VecDeque::new())))
-            .collect();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::new());
+        gateway.writer.sent = sent.clone();
+        let responses = VecDeque::from([Ok(gateway)]);
         let mut config = make_config();
         config.initial_backoff = Duration::ZERO;
         config.max_backoff = Duration::ZERO;
@@ -10229,18 +10272,34 @@ mod tests {
             config,
         );
 
-        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
-            .await
-            .expect("permanent backlog projection failure must terminate promptly")
-            .expect_err("corrupt retained projection cannot be repaired by reconnect");
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        let reached_online = tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online.borrow() {
+                online.changed().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        handle.abort();
+        let joined = handle.join().await;
+        reached_online
+            .expect("regenerated backlog becomes Online")
+            .expect("online signal stays available");
+        joined.expect("planned shutdown joins successfully");
+        let sent = sent.lock().unwrap();
         assert!(
-            format!("{error:#}").contains("redaction-only projection"),
-            "typed projection failure must remain visible: {error:#}"
+            sent.iter().any(
+                |frame| matches!(frame,OutboundFrame::Event{envelope} if envelope.seq==Some(1)
+            && envelope.audience==crate::runtime::contracts::OutputAudience::DirectChat
+            && envelope.event==serde_json::json!({"type":"agent_start"}))
+            ),
+            "authenticated source must regenerate the corrupt cache"
         );
         assert_eq!(
             sent_hellos.lock().unwrap().len(),
             1,
-            "the same corrupt retained row must not be retried on a new connection"
+            "repairable cache must not reconnect"
         );
     }
 
@@ -10562,6 +10621,7 @@ mod tests {
                         panic!("active reconnect fixture requires a user message");
                     };
                     let user = PublicMessage::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: initial.incoming_timing(),
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
@@ -10748,6 +10808,7 @@ mod tests {
                         panic!("fixture requires user message");
                     };
                     let user = PublicMessage::User(UserMessage {
+                        incoming_source: None,
                         incoming_timing: initial.incoming_timing(),
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),

@@ -34,7 +34,10 @@
       "envelope": {
         "seq": 1,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "event": { "type": "agent_start" }
+        "audience": "direct_chat",
+        "event": {
+          "type": "agent_start"
+        }
       }
     }
   },
@@ -45,6 +48,7 @@
       "envelope": {
         "seq": 2,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -60,12 +64,18 @@
       "envelope": {
         "seq": 3,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_start",
           "message_id": "00000000-0000-4000-8000-000000000002",
           "message": {
             "role": "user",
-            "content": [{ "type": "text", "text": "hello" }],
+            "content": [
+              {
+                "type": "text",
+                "text": "hello"
+              }
+            ],
             "timestamp": "2026-07-25T20:00:00Z"
           }
         }
@@ -79,6 +89,7 @@
       "envelope": {
         "seq": 4,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_end",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -102,7 +113,9 @@
                   "id": "call-1",
                   "name": "read_file",
                   "route": "normal",
-                  "arguments": { "path": "notes.txt" }
+                  "arguments": {
+                    "path": "notes.txt"
+                  }
                 },
                 "wire_item_index": 2
               },
@@ -147,6 +160,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -165,6 +179,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "error",
           "message": "bad"
@@ -207,8 +222,13 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": { "kind": "human", "principal_id": "alice@example.com" },
-        "source": { "surface": "direct_chat" }
+        "actor": {
+          "kind": "human",
+          "principal_id": "alice@example.com"
+        },
+        "source": {
+          "surface": "direct_chat"
+        }
       },
       "command": {
         "type": "user_message",
@@ -227,10 +247,17 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": { "kind": "human", "principal_id": "bob@example.com" },
-        "source": { "surface": "direct_chat" }
+        "actor": {
+          "kind": "human",
+          "principal_id": "bob@example.com"
+        },
+        "source": {
+          "surface": "direct_chat"
+        }
       },
-      "command": { "type": "abort" }
+      "command": {
+        "type": "abort"
+      }
     }
   },
   "approval_decision_command": {
@@ -243,13 +270,20 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": { "kind": "human", "principal_id": "alice@example.com" },
-        "source": { "surface": "direct_chat" }
+        "actor": {
+          "kind": "human",
+          "principal_id": "alice@example.com"
+        },
+        "source": {
+          "surface": "direct_chat"
+        }
       },
       "command": {
         "type": "approval_decision",
         "request_id": "req-1",
-        "decision": { "type": "approve_once" }
+        "decision": {
+          "type": "approve_once"
+        }
       }
     }
   },
@@ -263,13 +297,20 @@
         "version": 1,
         "tenant_id": "tenant-1",
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "actor": { "kind": "human", "principal_id": "bob@example.com" },
-        "source": { "surface": "direct_chat" }
+        "actor": {
+          "kind": "human",
+          "principal_id": "bob@example.com"
+        },
+        "source": {
+          "surface": "direct_chat"
+        }
       },
       "command": {
         "type": "approval_decision",
         "request_id": "req-2",
-        "decision": { "type": "deny_once" }
+        "decision": {
+          "type": "deny_once"
+        }
       }
     }
   },
@@ -281,8 +322,14 @@
         "id": "req-1",
         "tool_call_id": "call-1",
         "tool_name": "bash",
-        "action": { "reviewable": { "cmd": "ls" } },
-        "args_summary": { "cmd": "ls" },
+        "action": {
+          "reviewable": {
+            "cmd": "ls"
+          }
+        },
+        "args_summary": {
+          "cmd": "ls"
+        },
         "reason": null,
         "audit": null
       }
@@ -293,7 +340,11 @@
     "wire": {
       "type": "approval_resolved",
       "request_id": "req-1",
-      "resolution": { "decision": { "type": "approve_once" } }
+      "resolution": {
+        "decision": {
+          "type": "approve_once"
+        }
+      }
     }
   },
   "approval_execution_rejected_event": {
@@ -302,7 +353,11 @@
       "type": "approval_resolved",
       "request_id": "req-1",
       "resolution": {
-        "rejected": { "decision": { "type": "approve_once" } }
+        "rejected": {
+          "decision": {
+            "type": "approve_once"
+          }
+        }
       }
     }
   },
@@ -313,7 +368,7 @@
       "content": [
         {
           "type": "text",
-          "text": "朝9時にお願いします。"
+          "text": "\u671d9\u6642\u306b\u304a\u9858\u3044\u3057\u307e\u3059\u3002"
         }
       ],
       "timestamp": "2026-07-25T20:00:00Z",
@@ -329,7 +384,7 @@
       "content": [
         {
           "type": "text",
-          "text": "朝9時にお願いします。"
+          "text": "\u671d9\u6642\u306b\u304a\u9858\u3044\u3057\u307e\u3059\u3002"
         }
       ],
       "timestamp": "2026-07-25T20:00:00Z",
@@ -346,7 +401,10 @@
     "wire": {
       "role": "user",
       "content": [
-        { "type": "text", "text": "hi" },
+        {
+          "type": "text",
+          "text": "hi"
+        },
         {
           "type": "image",
           "data": "aGVsbG8=",
@@ -362,8 +420,15 @@
       "role": "tool_result",
       "tool_call_id": "call-1",
       "tool_name": "read_file",
-      "content": [{ "type": "text", "text": "contents" }],
-      "details": { "exit": 0 },
+      "content": [
+        {
+          "type": "text",
+          "text": "contents"
+        }
+      ],
+      "details": {
+        "exit": 0
+      },
       "is_error": false,
       "timestamp": "2026-07-25T20:00:00Z"
     }
@@ -398,7 +463,9 @@
       "type": "tool_execution_start",
       "tool_call_id": "call-1",
       "tool_name": "read_file",
-      "args": { "path": "notes.txt" }
+      "args": {
+        "path": "notes.txt"
+      }
     }
   },
   "tool_execution_update_event": {
@@ -406,7 +473,9 @@
     "wire": {
       "type": "tool_execution_update",
       "tool_call_id": "call-1",
-      "partial": { "chunk": "x" }
+      "partial": {
+        "chunk": "x"
+      }
     }
   },
   "tool_execution_end_event": {
@@ -414,7 +483,9 @@
     "wire": {
       "type": "tool_execution_end",
       "tool_call_id": "call-1",
-      "result": { "ok": true },
+      "result": {
+        "ok": true
+      },
       "is_error": false
     }
   },
@@ -425,7 +496,10 @@
       "envelope": {
         "seq": 9007199254740991,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "event": { "type": "agent_start" }
+        "audience": "direct_chat",
+        "event": {
+          "type": "agent_start"
+        }
       }
     }
   },
@@ -442,7 +516,11 @@
     "wire": {
       "type": "tool_execution_end",
       "tool_call_id": "call-1",
-      "result": [1, 2, 3],
+      "result": [
+        1,
+        2,
+        3
+      ],
       "is_error": false
     }
   },
@@ -455,7 +533,11 @@
         "minimum": -9007199254740991,
         "maximum": 9007199254740991,
         "fraction": 0.5,
-        "nested": [{ "fraction": -1.25 }]
+        "nested": [
+          {
+            "fraction": -1.25
+          }
+        ]
       }
     }
   },
@@ -465,6 +547,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -483,7 +566,12 @@
       "role": "tool_result",
       "tool_call_id": "call-1",
       "tool_name": "read_file",
-      "content": [{ "type": "text", "text": "contents" }],
+      "content": [
+        {
+          "type": "text",
+          "text": "contents"
+        }
+      ],
       "details": 42,
       "is_error": false,
       "timestamp": "2026-07-25T20:00:00Z"
@@ -495,7 +583,12 @@
       "role": "tool_result",
       "tool_call_id": "call-1",
       "tool_name": "read_file",
-      "content": [{ "type": "text", "text": "contents" }],
+      "content": [
+        {
+          "type": "text",
+          "text": "contents"
+        }
+      ],
       "details": -0.5,
       "is_error": false,
       "timestamp": "2026-07-25T20:00:00Z"
@@ -508,6 +601,7 @@
       "envelope": {
         "seq": 10,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -515,7 +609,12 @@
             {
               "tool_call_id": "call-1",
               "tool_name": "read_file",
-              "content": [{ "type": "text", "text": "contents" }],
+              "content": [
+                {
+                  "type": "text",
+                  "text": "contents"
+                }
+              ],
               "details": true,
               "is_error": false,
               "timestamp": "2026-07-25T20:00:00Z"
@@ -533,7 +632,12 @@
         "id": "req-2",
         "tool_call_id": "call-2",
         "tool_name": "bash",
-        "action": { "reviewable": ["arg1", "arg2"] },
+        "action": {
+          "reviewable": [
+            "arg1",
+            "arg2"
+          ]
+        },
         "args_summary": "string summary",
         "reason": null,
         "audit": null
@@ -621,7 +725,9 @@
     "wire": {
       "type": "command",
       "idempotency_key": "00000000-0000-4000-8000-000000000002",
-      "command": { "type": "abort" }
+      "command": {
+        "type": "abort"
+      }
     }
   },
   "browser_command_frame_approval": {
@@ -632,7 +738,9 @@
       "command": {
         "type": "approval_decision",
         "request_id": "00000000-0000-4000-8000-000000000004",
-        "decision": { "type": "approve_once" }
+        "decision": {
+          "type": "approve_once"
+        }
       }
     }
   },
@@ -642,7 +750,10 @@
       "type": "event",
       "envelope": {
         "seq": 1,
-        "event": { "type": "agent_start" }
+        "event": {
+          "type": "agent_start"
+        },
+        "audience": "direct_chat"
       }
     }
   },
@@ -732,6 +843,149 @@
       "type": "command_rejected",
       "idempotency_key": "00000000-0000-4000-8000-000000000004",
       "reject_reason": "unavailable"
+    }
+  },
+  "external_mention": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_mention",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original source text"
+      }
+    }
+  },
+  "external_reminder": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "personality_agent",
+          "principal_id": "01992000-0000-7000-8000-000000000001",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "reply_later_due",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z",
+          "marker_id": "01992000-0000-7000-8000-000000000008",
+          "due_at": "2026-09-08T13:00:00Z"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original reminder note"
+      }
+    }
+  },
+  "secretary_agent_start": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 1,
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "audience": "secretary",
+        "event": {
+          "type": "agent_start"
+        }
+      }
+    }
+  },
+  "external_dm": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_message",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "dm",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original source text"
+      }
+    }
+  },
+  "completed_reasoning_summary": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "reasoning_summary",
+      "message_id": "00000000-0000-4000-8000-000000000001",
+      "content_index": 0,
+      "content": "Provider-authored display summary.",
+      "wire_item_index": 1
     }
   }
 }

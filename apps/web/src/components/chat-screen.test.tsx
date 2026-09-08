@@ -167,7 +167,7 @@ describe("SDUI action boundary", () => {
   it("renders conversation items through the virtualized log", () => {
     render(<ChatScreen installationId="installation-1" authorityEpoch="1" />);
 
-    expect(screen.getByRole("log", { name: "Sumiとの会話" })).toHaveAttribute(
+    expect(screen.getByRole("log", { name: "Sumiの活動記録" })).toHaveAttribute(
       "aria-busy",
       "false",
     );

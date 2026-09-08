@@ -25,7 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId};
+use crate::runtime::contracts::{IncomingProvenance, OutputAudience, PersonalityAgentId};
 
 #[cfg(test)]
 pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
@@ -33,8 +33,8 @@ pub(crate) fn test_personality_agent_id() -> PersonalityAgentId {
 }
 
 #[cfg(test)]
-pub(crate) fn test_direct_chat_provenance() -> DirectChatProvenanceV1 {
-    DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+pub(crate) fn test_direct_chat_provenance() -> IncomingProvenance {
+    IncomingProvenance::new("tenant-test", test_personality_agent_id(), "human-test")
         .expect("valid direct-chat provenance")
 }
 
@@ -48,9 +48,27 @@ pub(crate) use stdio::{InjectedStdioGateway, read_command};
 pub use supervisor::DeliveryAuthorization;
 pub use supervisor::{AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential};
 
+#[cfg(test)]
+pub(crate) fn test_messaging_provenance() -> IncomingProvenance {
+    serde_json::from_value(serde_json::json!({
+        "version":2,"tenant_id":"tenant-test","personality_agent_id":TEST_PERSONALITY_AGENT_ID,
+        "actor":{"kind":"human","principal_id":"human-test","display_name":"Example Human"},
+        "source":{"surface":"messaging","event_id":"01992000-0000-7000-8000-000000000003",
+          "kind":"messaging_mention","workspace_id":"01992000-0000-7000-8000-000000000004",
+          "installation_id":"01992000-0000-7000-8000-000000000005","authority_epoch":1,
+          "place":{"id":"01992000-0000-7000-8000-000000000006","kind":"channel","name":"General"},
+          "message_id":"01992000-0000-7000-8000-000000000007","message_revision":1,"message_seq":1,
+          "occurred_at":"2026-09-08T12:00:00Z"}
+    }))
+    .expect("valid messaging provenance")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    ExternalEvent {
+        content: String,
+    },
     UserMessage {
         text: String,
         #[serde(deserialize_with = "deserialize_empty_attachments")]
@@ -116,13 +134,43 @@ where
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "CommandEnvelopeInput")]
 pub struct CommandEnvelope {
     pub seq: u64,
     pub command_id: CommandId,
     pub personality_agent_id: PersonalityAgentId,
-    pub provenance: DirectChatProvenanceV1,
+    pub provenance: IncomingProvenance,
     pub command: Command,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandEnvelopeInput {
+    seq: u64,
+    command_id: CommandId,
+    personality_agent_id: PersonalityAgentId,
+    provenance: IncomingProvenance,
+    command: Command,
+}
+impl TryFrom<CommandEnvelopeInput> for CommandEnvelope {
+    type Error = String;
+    fn try_from(input: CommandEnvelopeInput) -> Result<Self, Self::Error> {
+        input
+            .provenance
+            .validate(&input.personality_agent_id)
+            .map_err(|error| error.to_string())?;
+        if matches!(input.command, Command::ExternalEvent { .. }) != input.provenance.is_external()
+        {
+            return Err("command type does not match incoming provenance source".to_owned());
+        }
+        Ok(Self {
+            seq: input.seq,
+            command_id: input.command_id,
+            personality_agent_id: input.personality_agent_id,
+            provenance: input.provenance,
+            command: input.command,
+        })
+    }
 }
 
 /// Canonical external command identity. Only lower-case hyphenated UUID text is
@@ -187,7 +235,7 @@ pub enum InboundCommand {
         seq: u64,
         command_id: CommandId,
         personality_agent_id: PersonalityAgentId,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
         reason: CommandRejectReason,
         /// Transient bytes used only to authenticate the durable receipt. The
         /// EventWriter encrypts valid-size rejects and discards oversized bytes
@@ -221,7 +269,7 @@ impl InboundCommand {
         }
     }
 
-    pub fn provenance(&self) -> &DirectChatProvenanceV1 {
+    pub fn provenance(&self) -> &IncomingProvenance {
         match self {
             Self::Valid(envelope) => &envelope.provenance,
             Self::Invalid { provenance, .. } => provenance,
@@ -368,6 +416,7 @@ pub struct CommandAck {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Envelope {
+    pub audience: OutputAudience,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
     pub personality_agent_id: PersonalityAgentId,
@@ -538,6 +587,7 @@ mod tests {
     fn transient_envelope_omits_null_sequence() {
         let encoded = serde_json::to_value(OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: None,
                 personality_agent_id: "018f3f8d-7b2c-7a10-8f9e-123456789abc"
                     .parse()

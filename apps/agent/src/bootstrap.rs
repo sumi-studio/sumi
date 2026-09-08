@@ -61,7 +61,12 @@ use crate::{
         },
         ws::WebSocketConnector,
     },
-    provider::{RequestOptions, types::PromptContext},
+    provider::{
+        ModelSpec, RequestOptions,
+        chatgpt::{ChatGptCredentialResolver, ChatGptCredentialSource},
+        model::ProviderBackend,
+        types::PromptContext,
+    },
     runtime::{allocator::SupervisorAllocation, authority::RuntimeEpochAuthority},
     store::{
         AgentScope, EnvironmentKeyProvider, HydratedRunState, HydrationOutcome,
@@ -1063,7 +1068,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
     let workspace_invitation_api: Arc<dyn WorkspaceInvitationApi> =
         Arc::new(control_client.clone());
     let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> =
-        Arc::new(control_client);
+        Arc::new(control_client.clone());
     let publisher = LocalRuntimePublisher::new(context.authority.clone(), control.clone());
     publisher
         .publish_not_ready()
@@ -1081,6 +1086,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         messaging_api,
         workspace_api,
         workspace_invitation_api,
+        Arc::new(control_client),
         executor_call_authority_private_key,
         &publisher,
     )
@@ -1093,6 +1099,7 @@ async fn run_after_not_ready(
     messaging_api: Arc<dyn MessagingApi>,
     workspace_api: Arc<dyn WorkspaceApi>,
     workspace_invitation_api: Arc<dyn WorkspaceInvitationApi>,
+    chatgpt_resolver: Arc<dyn ChatGptCredentialResolver>,
     executor_call_authority_private_key: Zeroizing<[u8; 32]>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
@@ -1113,13 +1120,17 @@ async fn run_after_not_ready(
         if config.database_path != context.state_dir.join("agent.db") {
             bail!("config state directory does not match SUMI_STATE_DIR");
         }
-        let model_spec = config.model_spec().context("resolve production provider")?;
+        let mut model_spec = config.model_spec().context("resolve production provider")?;
         validate_production_provider_endpoint(&model_spec.base_url)?;
-        validate_provider_credential(&model_spec.api_key_env)?;
-        let execution_reviewer_spec = config
+        configure_provider_credentials(
+            &mut model_spec,
+            config.chatgpt_connection_id.as_deref(),
+            chatgpt_resolver.clone(),
+        )?;
+        let mut execution_reviewer_spec = config
             .execution_reviewer_model_spec()
             .context("resolve Execution reviewer provider")?;
-        let escalation_reviewer_spec = config
+        let mut escalation_reviewer_spec = config
             .escalation_reviewer_model_spec()
             .context("resolve Escalation reviewer provider")?;
         for (reviewer, spec) in [
@@ -1138,13 +1149,17 @@ async fn run_after_not_ready(
             }
         }
         for (label, spec) in [
-            ("Execution reviewer", &execution_reviewer_spec),
-            ("Escalation reviewer", &escalation_reviewer_spec),
+            ("Execution reviewer", &mut execution_reviewer_spec),
+            ("Escalation reviewer", &mut escalation_reviewer_spec),
         ] {
             validate_production_provider_endpoint(&spec.base_url)
                 .with_context(|| format!("validate {label} provider endpoint"))?;
-            validate_provider_credential(&spec.api_key_env)
-                .with_context(|| format!("validate {label} provider credential"))?;
+            configure_provider_credentials(
+                spec,
+                config.chatgpt_connection_id.as_deref(),
+                chatgpt_resolver.clone(),
+            )
+            .with_context(|| format!("validate {label} provider credential"))?;
         }
         let reviewer_models =
             ReviewerModels::new(execution_reviewer_spec, escalation_reviewer_spec)
@@ -1224,15 +1239,27 @@ async fn run_after_not_ready(
             RouteReviewerModelSpec::from_provider(&execution_reviewer_spec);
         let escalation_reviewer_model =
             RouteReviewerModelSpec::from_provider(&escalation_reviewer_spec);
+        let conversation_effort = config
+            .reasoning_effort()
+            .context("resolve conversation reasoning effort")?;
+        let execution_effort = config
+            .execution_reviewer_reasoning_effort()
+            .context("resolve Execution reasoning effort")?;
+        let escalation_effort = config
+            .escalation_reviewer_reasoning_effort()
+            .context("resolve Escalation reasoning effort")?;
         let execution_reviewer = Arc::new(
             ExecutionReviewer::new(
                 execution_reviewer_model,
                 reviewer_trust.clone(),
-                Arc::new(ProviderExecutionReviewerTransport::new(
-                    execution_reviewer_spec,
-                    reviewer_tools.clone(),
-                    context.authority.personality_agent_id().to_string(),
-                )),
+                Arc::new(
+                    ProviderExecutionReviewerTransport::new(
+                        execution_reviewer_spec,
+                        reviewer_tools.clone(),
+                        context.authority.personality_agent_id().to_string(),
+                    )
+                    .with_reasoning_effort(execution_effort),
+                ),
                 ReviewerBudgetV1::execution(),
             )
             .context("construct fail-closed Execution AutoReview")?,
@@ -1241,11 +1268,14 @@ async fn run_after_not_ready(
             EscalationReviewer::new(
                 escalation_reviewer_model,
                 reviewer_trust,
-                Arc::new(ProviderEscalationReviewerTransport::new(
-                    escalation_reviewer_spec,
-                    reviewer_tools,
-                    context.authority.personality_agent_id().to_string(),
-                )),
+                Arc::new(
+                    ProviderEscalationReviewerTransport::new(
+                        escalation_reviewer_spec,
+                        reviewer_tools,
+                        context.authority.personality_agent_id().to_string(),
+                    )
+                    .with_reasoning_effort(escalation_effort),
+                ),
                 ReviewerBudgetV1::escalation(),
             )
             .context("construct advisory Escalation AutoReview")?,
@@ -1267,10 +1297,13 @@ async fn run_after_not_ready(
         let escalation_objection_responder = Arc::new(
             EscalationObjectionResponder::new(
                 escalation_objection_model,
-                Arc::new(ProviderEscalationObjectionResponderTransport::new(
-                    model_spec.clone(),
-                    context.authority.personality_agent_id().to_string(),
-                )),
+                Arc::new(
+                    ProviderEscalationObjectionResponderTransport::new(
+                        model_spec.clone(),
+                        context.authority.personality_agent_id().to_string(),
+                    )
+                    .with_reasoning_effort(conversation_effort.clone()),
+                ),
                 ReviewerBudgetV1::escalation(),
                 personality_agent_context.clone(),
             )
@@ -1289,6 +1322,7 @@ async fn run_after_not_ready(
             model_spec,
             RequestOptions {
                 session_id: Some(context.authority.personality_agent_id().to_string()),
+                reasoning_effort: conversation_effort,
                 ..RequestOptions::default()
             },
             Some(prompt),
@@ -2154,6 +2188,27 @@ fn validate_provider_credential(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn configure_provider_credentials(
+    spec: &mut ModelSpec,
+    connection_id: Option<&str>,
+    resolver: Arc<dyn ChatGptCredentialResolver>,
+) -> Result<()> {
+    if spec.backend == ProviderBackend::ApiKey {
+        return validate_provider_credential(&spec.api_key_env);
+    }
+    let connection_id = connection_id
+        .filter(|id| !id.trim().is_empty())
+        .context("ChatGPT backend requires SUMI_CHATGPT_CONNECTION_ID")?;
+    if spec.account_scope.trim().is_empty() {
+        bail!("ChatGPT backend requires the actual ChatGPT account ID as account_scope");
+    }
+    spec.chatgpt_credentials = Some(ChatGptCredentialSource::new(
+        connection_id.to_owned(),
+        resolver,
+    ));
+    Ok(())
+}
+
 fn validate_production_provider_endpoint(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value).context("invalid production provider base URL")?;
     if url.scheme() == "https" {
@@ -2995,6 +3050,39 @@ mod tests {
             .err()
             .expect("malformed socket GID must fail");
         assert!(error.to_string().contains("decimal GID"));
+    }
+
+    #[test]
+    fn chatgpt_bootstrap_attaches_resolver_without_reading_api_key_credentials() {
+        struct UnusedResolver;
+        #[async_trait::async_trait]
+        impl ChatGptCredentialResolver for UnusedResolver {
+            async fn resolve(
+                &self,
+                _: &str,
+                _: Option<&str>,
+            ) -> std::result::Result<
+                crate::provider::chatgpt::ChatGptAccess,
+                crate::provider::chatgpt::ChatGptAuthError,
+            > {
+                panic!("bootstrap must not fetch account credentials");
+            }
+        }
+        let resolver: Arc<dyn ChatGptCredentialResolver> = Arc::new(UnusedResolver);
+        let mut native = ModelSpec::preset("chatgpt-responses").unwrap();
+        assert!(configure_provider_credentials(&mut native, None, resolver.clone()).is_err());
+        assert!(
+            configure_provider_credentials(&mut native, Some("connection"), resolver.clone())
+                .is_err()
+        );
+        native.account_scope = "actual-account".into();
+        configure_provider_credentials(&mut native, Some("connection"), resolver.clone()).unwrap();
+        assert!(native.chatgpt_credentials.is_some());
+        assert_eq!(native.account_scope, "actual-account");
+        let mut api = ModelSpec::preset("kimi-k3").unwrap();
+        api.api_key_env = "SUMI_TEST_INTENTIONALLY_ABSENT_NATIVE_BOOTSTRAP_KEY".into();
+        assert!(configure_provider_credentials(&mut api, Some("connection"), resolver).is_err());
+        assert!(api.chatgpt_credentials.is_none());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::supervisor::{DeliveryEpoch, DeliveryEpochFailure};
+use crate::runtime::contracts::OutputAudience;
 
 use super::{DataKeyPurpose, Store, crypto::decrypt_content};
 
@@ -42,12 +43,14 @@ pub(crate) enum DeliveryMode {
 #[derive(Clone, Debug)]
 pub(crate) enum DeliveryFrame {
     Durable {
+        audience: OutputAudience,
         seq: u64,
         epoch: DeliveryEpoch,
         raw: Option<AgentEvent>,
         projection: Option<String>,
     },
     Volatile {
+        audience: OutputAudience,
         epoch: DeliveryEpoch,
         event: AgentEvent,
     },
@@ -424,7 +427,11 @@ impl DeliveryPump {
         Ok(())
     }
 
-    pub(crate) async fn on_volatile(&self, event: AgentEvent) -> Result<()> {
+    pub(crate) async fn on_volatile(
+        &self,
+        audience: OutputAudience,
+        event: AgentEvent,
+    ) -> Result<()> {
         if let Some(kind) = event.durable_kind() {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
@@ -440,11 +447,11 @@ impl DeliveryPump {
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
             return Ok(());
         }
-        match self
-            .channel
-            .sender
-            .try_send(DeliveryFrame::Volatile { epoch, event })
-        {
+        match self.channel.sender.try_send(DeliveryFrame::Volatile {
+            audience,
+            epoch,
+            event,
+        }) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 let mut state = self.lock_state();
@@ -481,7 +488,7 @@ pub(crate) async fn raw_events_after(
         bail!("delivery event page size must be positive");
     }
     let rows = sqlx::query(
-        "SELECT seq, raw_key_ref, raw_ciphertext
+        "SELECT seq, internal_metadata, raw_key_ref, raw_ciphertext
          FROM agent_events
          WHERE seq > ?
          ORDER BY seq
@@ -499,7 +506,8 @@ pub(crate) async fn raw_events_after(
         let seq = u64::try_from(seq).context("stored event seq is negative")?;
         let key_ref: String = row.try_get("raw_key_ref")?;
         let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
-        let event = decrypt_event(store, seq, &key_ref, &ciphertext)
+        let metadata: String = row.try_get("internal_metadata")?;
+        let (event, _) = decrypt_event(store, seq, &key_ref, &ciphertext, &metadata)
             .await
             .context("failed to decrypt durable event page row")?;
         events.push((seq, event));
@@ -520,7 +528,7 @@ async fn send_event_range(
         return Ok(true);
     }
     let rows = sqlx::query(
-        "SELECT seq, raw_key_ref, raw_ciphertext, envelope, redaction_version
+        "SELECT seq, internal_metadata, raw_key_ref, raw_ciphertext
              FROM agent_events
              WHERE seq >= ? AND seq <= ?
              ORDER BY seq",
@@ -540,26 +548,31 @@ async fn send_event_range(
         let seq = u64::try_from(seq).context("stored event seq is negative")?;
         let key_ref: String = row.try_get("raw_key_ref")?;
         let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
-        let envelope: String = row.try_get("envelope")?;
-        let _redaction_version: i64 = row.try_get("redaction_version")?;
 
+        let metadata: String = row.try_get("internal_metadata")?;
+        // Even redacted delivery authenticates the audience stored with this
+        // exact event; the currently running command is not its owner.
+        let Some(decoded) = await_unless_cancelled(
+            cancel,
+            decrypt_event(store, seq, &key_ref, &ciphertext, &metadata),
+        )
+        .await
+        else {
+            return Ok(false);
+        };
+        let (event, audience) = decoded.context("failed to authenticate durable delivery")?;
         let (raw, projection) = match channel.mode {
-            DeliveryMode::RedactionOnly => (None, Some(envelope)),
-            DeliveryMode::Raw => {
-                let Some(raw) = await_unless_cancelled(
-                    cancel,
-                    decrypt_event(store, seq, &key_ref, &ciphertext),
-                )
-                .await
-                else {
-                    return Ok(false);
-                };
-                let raw = raw.context("failed to decrypt durable event for raw delivery")?;
-                (Some(raw), None)
+            DeliveryMode::RedactionOnly => {
+                let derived = store
+                    .redactor()
+                    .redact_serialized(&serde_json::to_vec(&event)?)?;
+                (None, Some(derived))
             }
+            DeliveryMode::Raw => (Some(event), None),
         };
 
         let sent = channel.send(DeliveryFrame::Durable {
+            audience,
             seq,
             epoch: *epoch,
             raw,
@@ -619,7 +632,8 @@ async fn decrypt_event(
     seq: u64,
     key_ref: &str,
     ciphertext: &[u8],
-) -> Result<AgentEvent> {
+    metadata: &str,
+) -> Result<(AgentEvent, OutputAudience)> {
     let key = store.data_key_by_ref(key_ref).await?;
     if key.purpose != DataKeyPurpose::Event {
         bail!("event key {key_ref} has wrong purpose");
@@ -631,7 +645,12 @@ async fn decrypt_event(
         decrypt_content(&key, ciphertext, &aad)
             .context("failed to decrypt durable event for delivery")?,
     );
-    serde_json::from_slice(&plaintext).context("durable event plaintext is not a valid AgentEvent")
+    let mut transaction = store.pool().begin().await?;
+    let decoded =
+        super::event_payload::decode_event(store, &mut transaction, seq, &plaintext, metadata)
+            .await?;
+    transaction.commit().await?;
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -639,6 +658,16 @@ pub(crate) async fn insert_test_durable_event(
     store: &Store,
     seq: u64,
     event: &AgentEvent,
+) -> Result<String> {
+    insert_test_durable_event_with_audience(store, seq, event, OutputAudience::DirectChat).await
+}
+
+#[cfg(test)]
+async fn insert_test_durable_event_with_audience(
+    store: &Store,
+    seq: u64,
+    event: &AgentEvent,
+    audience: OutputAudience,
 ) -> Result<String> {
     let key = store.private_key(DataKeyPurpose::Event).await?;
     let raw = serde_json::to_vec(event).context("failed to serialize test event")?;
@@ -649,6 +678,11 @@ pub(crate) async fn insert_test_durable_event(
         .build_serialized(&raw, &aad)
         .context("failed to protect test durable event")?;
 
+    let wrapped = Zeroizing::new(serde_json::to_vec(
+        &serde_json::json!({"event":event,"audience":audience}),
+    )?);
+    let ciphertext = super::crypto::encrypt_content(&key, &wrapped, &aad)?;
+    let metadata = serde_json::to_string(&serde_json::json!({"audience":audience}))?;
     sqlx::query(
         "INSERT INTO agent_events(
             seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
@@ -657,9 +691,9 @@ pub(crate) async fn insert_test_durable_event(
     )
     .bind(i64::try_from(seq).unwrap_or(i64::MAX))
     .bind(event.durable_kind().unwrap_or("volatile"))
-    .bind("{}")
+    .bind(metadata)
     .bind(&key.key_ref)
-    .bind(&protected.ciphertext)
+    .bind(ciphertext)
     .bind(&protected.projection)
     .bind(i64::from(protected.redaction_version))
     .bind(chrono::Utc::now().to_rfc3339())
@@ -746,6 +780,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_preserves_each_encrypted_audience_in_raw_and_redacted_delivery() {
+        for mode in [DeliveryMode::Raw, DeliveryMode::RedactionOnly] {
+            let store = store().await;
+            let first = assistant_event("msg-1", "direct conversation");
+            let second = assistant_event("msg-2", "shared workspace event");
+            insert_test_durable_event_with_audience(&store, 1, &first, OutputAudience::DirectChat)
+                .await
+                .unwrap();
+            insert_test_durable_event_with_audience(&store, 2, &second, OutputAudience::Secretary)
+                .await
+                .unwrap();
+            let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(mode).build();
+            let pump = DeliveryPump::new(store.clone(), channel);
+            pump.install_epoch(DeliveryEpoch::for_test("mixed-audience-replay"));
+            // A live receipt is an exact sequence, not a catch-up watermark.
+            pump.on_durable_committed(1).await.unwrap();
+            pump.on_durable_committed(2).await.unwrap();
+            for (expected_seq, expected_audience) in [
+                (1, OutputAudience::DirectChat),
+                (2, OutputAudience::Secretary),
+            ] {
+                let frame = receiver.recv().await.unwrap();
+                assert!(
+                    matches!(&frame,DeliveryFrame::Durable{seq,audience,..} if *seq==expected_seq && *audience==expected_audience),
+                    "unexpected persisted frame: {frame:?}"
+                );
+            }
+            let originals = raw_events_after(&store, 1, 1).await.unwrap();
+            assert_eq!(originals[0].0, 2);
+            assert_eq!(
+                serde_json::to_value(&originals[0].1).unwrap(),
+                serde_json::to_value(&second).unwrap(),
+                "original history exposes the plain event, not its encrypted wrapper"
+            );
+            sqlx::query("UPDATE agent_events SET internal_metadata=? WHERE seq=2")
+                .bind(r#"{"audience":"direct_chat"}"#)
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let (channel, _receiver) = DeliveryChannelBuilder::with_mode(mode).build();
+            let changed = DeliveryPump::new(store.clone(), channel);
+            changed.install_epoch(DeliveryEpoch::for_test("tampered-audience-replay"));
+            assert!(
+                changed.on_durable_committed(2).await.is_err(),
+                "neither delivery mode may trust a changed plaintext audience"
+            );
+            assert!(raw_events_after(&store, 1, 1).await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn raw_connection_receives_decrypted_durable_events() {
         let store = store().await;
         let event = assistant_event("msg-1", "hello");
@@ -777,6 +862,13 @@ mod tests {
         let store = store().await;
         let event = assistant_event("msg-1", "use sk-abcdefghijklmnop");
         let projection = insert_test_durable_event(&store, 1, &event).await.unwrap();
+
+        sqlx::query(
+            "UPDATE agent_events SET envelope='not-json', redaction_version=999 WHERE seq=1",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
 
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
@@ -812,13 +904,16 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let pump = DeliveryPump::new(store.clone(), channel);
 
-        pump.on_volatile(AgentEvent::MessageUpdate {
-            message_id: "msg-1".to_owned(),
-            event: PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "delta".to_owned(),
+        pump.on_volatile(
+            OutputAudience::DirectChat,
+            AgentEvent::MessageUpdate {
+                message_id: "msg-1".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "delta".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
 
@@ -910,13 +1005,16 @@ mod tests {
 
         let volatile = tokio::time::timeout(
             Duration::from_millis(100),
-            pump.on_volatile(AgentEvent::MessageUpdate {
-                message_id: "msg-1".to_owned(),
-                event: PublicStreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "typing".to_owned(),
+            pump.on_volatile(
+                OutputAudience::DirectChat,
+                AgentEvent::MessageUpdate {
+                    message_id: "msg-1".to_owned(),
+                    event: PublicStreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "typing".to_owned(),
+                    },
                 },
-            }),
+            ),
         )
         .await
         .expect("volatile try_send must not wait for durable backpressure");
@@ -945,13 +1043,16 @@ mod tests {
         let epoch = DeliveryEpoch::for_test("catching-up");
         pump.install_supervised_epoch(epoch, failure_tx);
 
-        pump.on_volatile(AgentEvent::MessageUpdate {
-            message_id: "pre-online".to_owned(),
-            event: PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "must-drop".to_owned(),
+        pump.on_volatile(
+            OutputAudience::Secretary,
+            AgentEvent::MessageUpdate {
+                message_id: "pre-online".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "must-drop".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
         assert!(!pump.is_online());
@@ -962,18 +1063,22 @@ mod tests {
         );
 
         pump.mark_online(epoch).unwrap();
-        pump.on_volatile(AgentEvent::MessageUpdate {
-            message_id: "online".to_owned(),
-            event: PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "deliver".to_owned(),
+        pump.on_volatile(
+            OutputAudience::Secretary,
+            AgentEvent::MessageUpdate {
+                message_id: "online".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "deliver".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
         assert!(matches!(
             receiver.recv().await,
             Some(DeliveryFrame::Volatile {
+                audience: OutputAudience::Secretary,
                 event: AgentEvent::MessageUpdate { message_id, .. },
                 ..
             }) if message_id == "online"
@@ -1005,13 +1110,16 @@ mod tests {
 
         timeout(
             Duration::from_millis(100),
-            pump.on_volatile(AgentEvent::MessageUpdate {
-                message_id: "msg-1".to_owned(),
-                event: PublicStreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "must-drop".to_owned(),
+            pump.on_volatile(
+                OutputAudience::DirectChat,
+                AgentEvent::MessageUpdate {
+                    message_id: "msg-1".to_owned(),
+                    event: PublicStreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "must-drop".to_owned(),
+                    },
                 },
-            }),
+            ),
         )
         .await
         .expect("volatile delivery must not wait on durable preparation")
@@ -1139,10 +1247,13 @@ mod tests {
         drop(receiver);
 
         let error = pump
-            .on_volatile(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: "tool-1".to_owned(),
-                partial: serde_json::json!({"stdout": "partial"}),
-            })
+            .on_volatile(
+                OutputAudience::DirectChat,
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: "tool-1".to_owned(),
+                    partial: serde_json::json!({"stdout": "partial"}),
+                },
+            )
             .await
             .expect_err("volatile send on a closed delivery channel must fail");
         assert!(
@@ -1173,10 +1284,12 @@ mod tests {
             tool_call_id: format!("tool-{suffix}"),
             partial: serde_json::json!({"stdout": suffix}),
         };
-        pump.on_volatile(volatile("first")).await.unwrap();
+        pump.on_volatile(OutputAudience::DirectChat, volatile("first"))
+            .await
+            .unwrap();
         timeout(
             Duration::from_millis(50),
-            pump.on_volatile(volatile("dropped")),
+            pump.on_volatile(OutputAudience::DirectChat, volatile("dropped")),
         )
         .await
         .expect("full volatile queue must not block")
@@ -1238,13 +1351,16 @@ mod tests {
         let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
 
-        pump.on_volatile(AgentEvent::MessageUpdate {
-            message_id: "msg-1".to_owned(),
-            event: PublicStreamEvent::TextDelta {
-                content_index: 0,
-                delta: "x".to_owned(),
+        pump.on_volatile(
+            OutputAudience::DirectChat,
+            AgentEvent::MessageUpdate {
+                message_id: "msg-1".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "x".to_owned(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
 
@@ -1254,7 +1370,9 @@ mod tests {
                 .is_err()
         );
 
-        let result = pump.on_volatile(assistant_event("msg-x", "x")).await;
+        let result = pump
+            .on_volatile(OutputAudience::DirectChat, assistant_event("msg-x", "x"))
+            .await;
         match result {
             Err(error) => {
                 let message = format!("{error:#}");
@@ -1287,7 +1405,9 @@ mod tests {
                 delta: "a".to_owned(),
             },
         };
-        pump.on_volatile(volatile_a).await.unwrap();
+        pump.on_volatile(OutputAudience::DirectChat, volatile_a)
+            .await
+            .unwrap();
 
         assert!(pump.invalidate_epoch(epoch_a));
 
@@ -1307,7 +1427,9 @@ mod tests {
                 delta: "b".to_owned(),
             },
         };
-        pump.on_volatile(volatile_b).await.unwrap();
+        pump.on_volatile(OutputAudience::DirectChat, volatile_b)
+            .await
+            .unwrap();
 
         // Volatile enqueued under epoch A must still carry A after invalidation.
         let frame = receiver.recv().await.unwrap();
@@ -1335,6 +1457,27 @@ mod tests {
             }
             other => panic!("expected volatile frame from epoch B: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn redacted_delivery_rejects_corrupt_ciphertext_without_sending_cached_content() {
+        let store = store().await;
+        insert_test_durable_event(&store, 1, &assistant_event("msg-1", "cached content"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let (channel, mut receiver) =
+            DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
+        let pump = DeliveryPump::new(store, channel);
+        pump.install_epoch(DeliveryEpoch::for_test("corrupt-ciphertext"));
+        assert!(pump.on_durable_committed(1).await.is_err());
+        assert!(
+            receiver.try_recv().is_err(),
+            "cached projection must not bypass selected-event authentication"
+        );
     }
 
     #[tokio::test]

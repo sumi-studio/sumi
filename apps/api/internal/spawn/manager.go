@@ -52,6 +52,10 @@ type WrappingKeyMaterial struct {
 	Bytes string
 }
 
+// ErrCleanupIncomplete means Wait ended without proving physical teardown.
+// Ordinary process exit errors do not carry this marker.
+var ErrCleanupIncomplete = errors.New("runtime cleanup incomplete")
+
 // Process represents a running agent process.
 type Process interface {
 	Wait() error
@@ -111,6 +115,7 @@ type Manager struct {
 
 type agentRuntime struct {
 	process          Process
+	cleanupPending   bool
 	lastActive       time.Time
 	warmth           string
 	activityRevision uint64
@@ -187,6 +192,13 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 			}
 		}
 		if rt, ok := m.running[agentID]; ok {
+			if rt.cleanupPending {
+				m.mu.Unlock()
+				if err := m.Stop(agentID); err != nil {
+					return err
+				}
+				continue
+			}
 			rt.lastActive = m.now()
 			rt.activityRevision++
 			m.mu.Unlock()
@@ -228,13 +240,17 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 		m.mu.Unlock()
 
 		// StopAll won the publication race. A spawner that returned success after
-		// manager cancellation must not escape shutdown or enter the running map.
+		// manager cancellation must not escape shutdown or become available for work.
 		if runtime != nil {
 			if stopErr := runtime.process.Stop(); stopErr != nil {
 				attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
 			}
 		}
 		m.mu.Lock()
+		if runtime != nil && attempt.cleanupErr != nil {
+			runtime.cleanupPending = true
+			m.running[agentID] = runtime
+		}
 		attempt.err = errors.Join(ErrManagerClosed, attempt.cleanupErr)
 		delete(m.starting, agentID)
 		close(attempt.done)
@@ -277,13 +293,18 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRunti
 	return &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}, nil
 }
 
-// watchRuntime evicts only the exact process instance whose Wait completed.
+// watchRuntime evicts only an exited instance; incomplete cleanup remains owned
+// but cannot admit work until a later lifecycle request finishes cleanup.
 // A prior epoch may finish after a replacement has already been published.
 func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
-	_ = runtime.process.Wait()
+	err := runtime.process.Wait()
 	m.mu.Lock()
 	if m.running[agentID] == runtime {
-		delete(m.running, agentID)
+		if errors.Is(err, ErrCleanupIncomplete) {
+			runtime.cleanupPending = true
+		} else {
+			delete(m.running, agentID)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -302,8 +323,8 @@ func (m *Manager) Touch(agentID string) {
 func (m *Manager) Running(agentID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.running[agentID]
-	return ok
+	rt := m.running[agentID]
+	return rt != nil && !rt.cleanupPending
 }
 
 // HoldAdmission protects an already-running generation across durable command
@@ -315,7 +336,7 @@ func (m *Manager) HoldAdmission(agentID string) (func(), error) {
 		return func() {}, nil
 	}
 	rt := m.running[agentID]
-	if m.closing || rt == nil || m.stopping[agentID] != nil {
+	if m.closing || rt == nil || rt.cleanupPending || m.stopping[agentID] != nil {
 		return nil, errors.New("runtime is not available for admission")
 	}
 	rt.admissions++
@@ -360,7 +381,11 @@ func (m *Manager) Stop(agentID string) error {
 		m.mu.Lock()
 		attempt.err = err
 		if m.running[agentID] == rt {
-			delete(m.running, agentID)
+			if err == nil {
+				delete(m.running, agentID)
+			} else {
+				rt.cleanupPending = true
+			}
 		}
 		delete(m.stopping, agentID)
 		close(attempt.done)
@@ -390,51 +415,84 @@ func (m *Manager) StopIdleCold() ([]string, error) {
 	var stopped []string
 	var failures []error
 	for id, selected := range candidates {
-		rt := selected.runtime
-		var attempt *stopAttempt
-		claim := func() bool {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			if m.closing || m.running[id] != rt || m.stopping[id] != nil || rt.admissions != 0 || rt.activityRevision != selected.revision ||
-				m.now().Sub(rt.lastActive) < m.idleStop {
-				return false
-			}
-			attempt = &stopAttempt{done: make(chan struct{})}
-			m.stopping[id] = attempt
-			return true
-		}
-		var claimed bool
-		var err error
-		if m.cfg.ClaimIdle != nil {
-			claimed, err = m.cfg.ClaimIdle(id, claim)
-		} else {
-			claimed = claim()
-		}
+		didStop, err := m.stopSelectedIdle(id, selected.runtime, selected.revision, true)
 		if err != nil {
-			failures = append(failures, fmt.Errorf("inspect idle agent %s: %w", id, err))
-			continue
-		}
-		if !claimed {
-			continue
-		}
-		err = rt.process.Stop()
-		m.mu.Lock()
-		attempt.err = err
-		// On failure, retain the runtime for a later stop/inspection. Its Wait
-		// watcher independently removes it if the process actually exited.
-		if err == nil && m.running[id] == rt {
-			delete(m.running, id)
-		}
-		delete(m.stopping, id)
-		close(attempt.done)
-		m.mu.Unlock()
-		if err != nil {
-			failures = append(failures, fmt.Errorf("stop idle agent %s: %w", id, err))
-		} else {
+			failures = append(failures, err)
+		} else if didStop {
 			stopped = append(stopped, id)
 		}
 	}
 	return stopped, errors.Join(failures...)
+}
+
+// StopIfIdle stops the current runtime only if no work or admission wins its
+// idle reservation. It ignores warmth and idle age, for explicit configuration
+// changes. True means the runtime stopped successfully or was already absent
+// with no start/stop in flight under the manager lock. Busy, closing, externally
+// managed, or starting/stopping runtimes return false. EnsureRunning waits for
+// a reserved stop; HoldAdmission rejects it.
+func (m *Manager) StopIfIdle(agentID string) (bool, error) {
+	m.mu.Lock()
+	if m.closing || m.skip[agentID] || m.starting[agentID] != nil || m.stopping[agentID] != nil {
+		m.mu.Unlock()
+		return false, nil
+	}
+	rt := m.running[agentID]
+	if rt == nil {
+		m.mu.Unlock()
+		return true, nil
+	}
+	revision := rt.activityRevision
+	m.mu.Unlock()
+	return m.stopSelectedIdle(agentID, rt, revision, false)
+}
+
+func (m *Manager) stopSelectedIdle(id string, rt *agentRuntime, revision uint64, coldOnly bool) (bool, error) {
+	var attempt *stopAttempt
+	claim := func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.closing || m.running[id] != rt || m.stopping[id] != nil || rt.admissions != 0 || rt.activityRevision != revision {
+			return false
+		}
+		if coldOnly && (rt.warmth == WarmthWarm || m.now().Sub(rt.lastActive) < m.idleStop) {
+			return false
+		}
+		attempt = &stopAttempt{done: make(chan struct{})}
+		m.stopping[id] = attempt
+		return true
+	}
+	var claimed bool
+	var err error
+	if m.cfg.ClaimIdle != nil {
+		claimed, err = m.cfg.ClaimIdle(id, claim)
+	} else {
+		claimed = claim()
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect idle agent %s: %w", id, err)
+	}
+	if !claimed {
+		return false, nil
+	}
+	err = rt.process.Stop()
+	m.mu.Lock()
+	attempt.err = err
+	// Failed cleanup stays owned and is unavailable for further admission.
+	if m.running[id] == rt {
+		if err == nil {
+			delete(m.running, id)
+		} else {
+			rt.cleanupPending = true
+		}
+	}
+	delete(m.stopping, id)
+	close(attempt.done)
+	m.mu.Unlock()
+	if err != nil {
+		return false, fmt.Errorf("stop idle agent %s: %w", id, err)
+	}
+	return true, nil
 }
 
 // Warmth returns the warmth setting of a running agent, or "" if not running.

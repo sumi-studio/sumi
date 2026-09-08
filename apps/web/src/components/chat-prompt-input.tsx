@@ -10,7 +10,7 @@ import type { KeyboardEvent } from "react";
 import { useEffect, useRef } from "react";
 import { isImeComposing } from "../lib/ime";
 
-const MIN_HEIGHT = 42;
+const MIN_HEIGHT = 54;
 const MAX_HEIGHT = 186;
 const isCoarsePointer =
   typeof window !== "undefined" &&
@@ -36,7 +36,7 @@ export function ChatPromptInput({
   onAbort,
   streaming,
   disabled = false,
-  placeholder = "メッセージを入力…",
+  placeholder = "Sumiへの診断用の指示…",
   className,
 }: ChatPromptInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -54,7 +54,12 @@ export function ChatPromptInput({
   }, [value]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey && !isImeComposing(event)) {
+    if (
+      !isCoarsePointer &&
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !isImeComposing(event)
+    ) {
       event.preventDefault();
       if (canSend) onSend();
     }
@@ -62,34 +67,25 @@ export function ChatPromptInput({
 
   return (
     <PromptInput
-      className={className}
+      className={["flex items-end", className].filter(Boolean).join(" ")}
       onSubmit={(event) => {
         event.preventDefault();
         if (canSend) onSend();
       }}
     >
       <PromptInputTextarea
+        className="m-0 min-w-0 flex-1 px-4 py-3.5 text-base"
         ref={textareaRef}
         rows={1}
         value={value}
         disabled={disabled}
-        aria-label="メッセージ"
+        aria-label="診断用の指示"
         placeholder={placeholder}
-        enterKeyHint={isCoarsePointer ? "send" : undefined}
+        enterKeyHint={isCoarsePointer ? "enter" : undefined}
         onChange={(event) => onValueChange(event.target.value)}
         onKeyDown={handleKeyDown}
-        onBeforeInput={(event) => {
-          if (
-            isCoarsePointer &&
-            (event.nativeEvent as InputEvent).inputType === "insertLineBreak"
-          ) {
-            event.preventDefault();
-            if (canSend) onSend();
-          }
-        }}
       />
-      <PromptInputFooter>
-        <div className="flex-1" />
+      <PromptInputFooter className="shrink-0 pl-0 pr-2 pb-2">
         <PromptInputTools>
           {streaming && (
             <PromptInputButton

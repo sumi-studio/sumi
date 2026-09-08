@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxJSONSafeInteger is the largest integer representable exactly by JavaScript's
@@ -218,9 +219,9 @@ func parseCanonicalDecimal(value string, max uint64) (uint64, error) {
 	return parsed, nil
 }
 
-// DirectChatProvenance is immutable server-authored admission metadata. It is
+// IncomingProvenance is immutable server-authored admission metadata. It is
 // kept separate from caller-authored Command bytes and persists with them.
-type DirectChatProvenance struct {
+type IncomingProvenance struct {
 	Version            uint8            `json:"version"`
 	TenantID           string           `json:"tenant_id"`
 	PersonalityAgentID string           `json:"personality_agent_id"`
@@ -228,37 +229,109 @@ type DirectChatProvenance struct {
 	Source             ProvenanceSource `json:"source"`
 }
 
+// DirectChatProvenance names the existing direct-chat call-site type. Both names
+// share one validator; external callers must use the authenticated internal lane.
+type DirectChatProvenance = IncomingProvenance
+
 type ProvenanceActor struct {
 	Kind        string `json:"kind"`
 	PrincipalID string `json:"principal_id"`
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 type ProvenanceSource struct {
-	Surface string `json:"surface"`
+	Surface         string           `json:"surface"`
+	EventID         string           `json:"event_id,omitempty"`
+	Kind            string           `json:"kind,omitempty"`
+	WorkspaceID     string           `json:"workspace_id,omitempty"`
+	InstallationID  string           `json:"installation_id,omitempty"`
+	AuthorityEpoch  uint64           `json:"authority_epoch,omitempty"`
+	Place           *ProvenancePlace `json:"place,omitempty"`
+	MessageID       string           `json:"message_id,omitempty"`
+	MessageRevision uint64           `json:"message_revision,omitempty"`
+	MessageSeq      uint64           `json:"message_seq,omitempty"`
+	OccurredAt      string           `json:"occurred_at,omitempty"`
+	MarkerID        string           `json:"marker_id,omitempty"`
+	DueAt           string           `json:"due_at,omitempty"`
 }
 
 var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
 
-func (p DirectChatProvenance) Validate() error {
-	if p.Version != 1 {
-		return errors.New("provenance version must be 1")
-	}
+type ProvenancePlace struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+func (p IncomingProvenance) Equal(other IncomingProvenance) bool {
+	a, b := p.Source.Place, other.Source.Place
+	p.Source.Place, other.Source.Place = nil, nil
+	return p == other && ((a == nil && b == nil) || (a != nil && b != nil && *a == *b))
+}
+
+func (p IncomingProvenance) Validate() error {
 	if !provenanceIDRegexp.MatchString(p.TenantID) {
 		return errors.New("provenance tenant_id must be 1..256 ASCII identifier bytes")
 	}
 	if err := ValidatePersonalityAgentID(p.PersonalityAgentID); err != nil {
-		return fmt.Errorf("provenance: %w", err)
+		return err
 	}
-	if p.Actor.Kind != "human" || !provenanceIDRegexp.MatchString(p.Actor.PrincipalID) {
-		return errors.New("provenance actor must be an authenticated human principal")
+	if !provenanceIDRegexp.MatchString(p.Actor.PrincipalID) {
+		return errors.New("invalid source actor principal")
 	}
-	if p.Source.Surface != "direct_chat" {
-		return errors.New("provenance source surface must be direct_chat")
+	if p.Version == 1 {
+		if p.Actor.Kind != "human" || p.Actor.DisplayName != "" || p.Source != (ProvenanceSource{Surface: "direct_chat"}) {
+			return errors.New("version 1 provenance requires direct-chat authenticated Human")
+		}
+		return nil
+	}
+	if p.Version != 2 || p.Source.Surface != "messaging" {
+		return errors.New("external provenance requires version 2 messaging source")
+	}
+	if p.Actor.Kind != "human" && p.Actor.Kind != "personality_agent" {
+		return errors.New("invalid external source actor kind")
+	}
+	source := p.Source
+	for _, id := range []string{source.EventID, source.WorkspaceID, source.InstallationID, source.MessageID} {
+		if !canonicalUUIDRegexp.MatchString(id) {
+			return errors.New("external source requires canonical UUID identifiers")
+		}
+	}
+	for _, n := range []uint64{source.AuthorityEpoch, source.MessageRevision, source.MessageSeq} {
+		if n == 0 || n > maxJSONSafeInteger {
+			return errors.New("external source sequence must be positive JSON-safe integer")
+		}
+	}
+	if source.Place == nil || !canonicalUUIDRegexp.MatchString(source.Place.ID) {
+		return errors.New("external source place is required")
+	}
+	switch source.Place.Kind {
+	case "channel", "thread", "dm", "group_dm":
+	default:
+		return errors.New("invalid external source place kind")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, source.OccurredAt); err != nil {
+		return errors.New("external source occurrence must be RFC3339")
+	}
+	switch source.Kind {
+	case "messaging_mention", "messaging_message":
+		if source.MarkerID != "" || source.DueAt != "" {
+			return errors.New("mention cannot carry reminder fields")
+		}
+	case "reply_later_due":
+		if p.Actor.Kind != "personality_agent" || p.Actor.PrincipalID != p.PersonalityAgentID || !canonicalUUIDRegexp.MatchString(source.MarkerID) {
+			return errors.New("reminder must originate with recipient PA and marker")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, source.DueAt); err != nil {
+			return errors.New("reminder due_at must be RFC3339")
+		}
+	default:
+		return errors.New("unknown external source kind")
 	}
 	return nil
 }
 
-func (p *DirectChatProvenance) UnmarshalJSON(data []byte) error {
+func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 	if err := checkDuplicateKeys(data); err != nil {
 		return fmt.Errorf("provenance json: %w", err)
 	}
@@ -268,6 +341,44 @@ func (p *DirectChatProvenance) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	value := DirectChatProvenance(decoded)
+	var fields struct {
+		Actor  map[string]json.RawMessage `json:"actor"`
+		Source map[string]json.RawMessage `json:"source"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if value.Version == 1 {
+		if len(fields.Actor) != 2 || len(fields.Source) != 1 {
+			return errors.New("version 1 provenance has external source fields")
+		}
+	} else if value.Version == 2 {
+		if raw, ok := fields.Actor["display_name"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("actor display_name must be a string")
+		}
+		for _, key := range []string{"surface", "event_id", "kind", "workspace_id", "installation_id", "authority_epoch", "place", "message_id", "message_revision", "message_seq", "occurred_at"} {
+			if raw, ok := fields.Source[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return fmt.Errorf("external source %s is required", key)
+			}
+		}
+		if value.Source.Kind == "messaging_mention" {
+			if _, ok := fields.Source["marker_id"]; ok {
+				return errors.New("mention cannot carry marker_id")
+			}
+			if _, ok := fields.Source["due_at"]; ok {
+				return errors.New("mention cannot carry due_at")
+			}
+		}
+		var place map[string]json.RawMessage
+		if err := json.Unmarshal(fields.Source["place"], &place); err != nil {
+			return err
+		}
+		for _, key := range []string{"id", "kind", "name"} {
+			if raw, ok := place[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return fmt.Errorf("external place %s is required", key)
+			}
+		}
+	}
 	if err := value.Validate(); err != nil {
 		return err
 	}
@@ -302,7 +413,7 @@ func (c CommandEnvelope) Validate() error {
 	if c.PersonalityAgentID != c.Provenance.PersonalityAgentID {
 		return errors.New("command target does not match provenance target")
 	}
-	if err := ValidateCommand(c.Command); err != nil {
+	if err := validateIncomingCommand(c.Provenance, c.Command); err != nil {
 		return fmt.Errorf("invalid command: %w", err)
 	}
 	return nil
@@ -419,6 +530,35 @@ func ValidateCommand(raw json.RawMessage) error {
 		}
 	default:
 		return fmt.Errorf("unknown command type: %q", d.Type)
+	}
+	return nil
+}
+
+// ExternalEventCommand is server-authored input, never accepted from a browser.
+type ExternalEventCommand struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
+}
+
+func validateIncomingCommand(provenance IncomingProvenance, raw json.RawMessage) error {
+	if err := provenance.Validate(); err != nil {
+		return err
+	}
+	if provenance.Version == 1 {
+		return ValidateCommand(raw)
+	}
+	if err := checkDuplicateKeys(raw); err != nil {
+		return err
+	}
+	var command struct {
+		Type    string  `json:"type"`
+		Content *string `json:"content"`
+	}
+	if err := unmarshalStrict(raw, &command); err != nil {
+		return err
+	}
+	if command.Type != "external_event" || command.Content == nil {
+		return errors.New("external provenance requires external_event content")
 	}
 	return nil
 }
@@ -686,13 +826,24 @@ func validateCommandAck(ack CommandAck) error {
 // Envelope wraps a public agent event. The Event body is kept as RawMessage so
 // the API can forward it without re-interpreting the event variant vocabulary;
 // T17 owns the authoritative event type system.
+type OutputAudience string
+
+const (
+	AudienceDirectChat OutputAudience = "direct_chat"
+	AudienceSecretary  OutputAudience = "secretary"
+)
+
 type Envelope struct {
+	Audience           OutputAudience  `json:"audience"`
 	Seq                *uint64         `json:"seq,omitempty"`
 	PersonalityAgentID string          `json:"personality_agent_id"`
 	Event              json.RawMessage `json:"event"`
 }
 
 func validateEnvelope(e Envelope) error {
+	if e.Audience != AudienceDirectChat && e.Audience != AudienceSecretary {
+		return errors.New("envelope requires explicit output audience")
+	}
 	if err := ValidatePersonalityAgentID(e.PersonalityAgentID); err != nil {
 		return fmt.Errorf("envelope: %w", err)
 	}
@@ -722,6 +873,23 @@ func validateEnvelope(e Envelope) error {
 	if err := validateEvent(e.Event); err != nil {
 		return err
 	}
+	// A source-bearing incoming experience can never be projected as a direct
+	// chat message, even if a sender accidentally labels its envelope public.
+	if d.Type == "message_start" || d.Type == "message_end" || d.Type == "turn_end" {
+		var projected struct {
+			Message struct {
+				IncomingSource *IncomingProvenance `json:"incoming_source"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(e.Event, &projected); err != nil {
+			return err
+		}
+		if source := projected.Message.IncomingSource; source != nil {
+			if source.Version != 2 || source.PersonalityAgentID != e.PersonalityAgentID || e.Audience != AudienceSecretary {
+				return errors.New("incoming source target or output audience mismatch")
+			}
+		}
+	}
 	return validateInternalEventArtifactReferences(e.Event, e.PersonalityAgentID)
 }
 
@@ -733,6 +901,7 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("envelope json: %w", err)
 	}
 	type envelopeRaw struct {
+		Audience           OutputAudience  `json:"audience"`
 		Seq                json.RawMessage `json:"seq"`
 		PersonalityAgentID string          `json:"personality_agent_id"`
 		Event              json.RawMessage `json:"event"`
@@ -777,6 +946,7 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 		e.Seq = &seq
 	}
 
+	e.Audience = raw.Audience
 	e.PersonalityAgentID = raw.PersonalityAgentID
 	e.Event = raw.Event
 	return validateEnvelope(*e)

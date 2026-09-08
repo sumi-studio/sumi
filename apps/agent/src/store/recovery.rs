@@ -1897,7 +1897,7 @@ fn validate_stored_command_variant(command_kind: &str, plaintext: &[u8]) -> Resu
     let command: Command =
         serde_json::from_slice(plaintext).context("stored pending command payload is invalid")?;
     let actual_kind = match command {
-        Command::UserMessage { .. } => "user_message",
+        Command::UserMessage { .. } | Command::ExternalEvent { .. } => "user_message",
         Command::Abort {} => "abort",
         Command::ApprovalDecision { .. } => "approval_decision",
     };
@@ -2152,16 +2152,24 @@ async fn durable_event_evidence(
             decrypt_content(&key, &ciphertext, &aad)
                 .with_context(|| format!("durable event {seq} failed authenticated recovery"))?,
         );
+        let internal_metadata: String = row.try_get("internal_metadata")?;
+        let (event, _) = super::event_payload::decode_event(
+            store,
+            &mut transaction,
+            u64::try_from(seq)?,
+            &raw,
+            &internal_metadata,
+        )
+        .await?;
+        let event_json = Zeroizing::new(serde_json::to_vec(&event)?);
         let regenerated = store
             .redactor()
-            .redact_serialized(&raw)
+            .redact_serialized(&event_json)
             .with_context(|| format!("durable event {seq} raw event is invalid"))?;
         let envelope: String = row.try_get("envelope")?;
         if regenerated != envelope {
             bail!("durable event {seq} redacted projection does not match authenticated raw event");
         }
-        let event: AgentEvent = serde_json::from_slice(&raw)
-            .with_context(|| format!("durable event {seq} is outside the closed T12 schema"))?;
         let event_type: String = row.try_get("event_type")?;
         if event.durable_kind() != Some(event_type.as_str())
             || matches!(
@@ -2198,7 +2206,7 @@ pub(crate) mod tests {
         provider::types::{
             ApiProtocol, ProviderOrigin, PublicAssistantMessage, Usage, UserMessage,
         },
-        runtime::contracts::{DirectChatProvenanceV1, PersonalityAgentId, ProcessGeneration},
+        runtime::contracts::{IncomingProvenance, PersonalityAgentId, ProcessGeneration},
         store::{
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand,
             Projection, ToolExecutionMutation,
@@ -2222,8 +2230,8 @@ pub(crate) mod tests {
             .expect("canonical test PAID")
     }
 
-    fn test_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-test", test_personality_agent_id(), "human-test")
+    fn test_provenance() -> IncomingProvenance {
+        IncomingProvenance::new("tenant-test", test_personality_agent_id(), "human-test")
             .expect("valid direct-chat provenance")
     }
 
@@ -2505,6 +2513,7 @@ pub(crate) mod tests {
                 .await
                 .expect("ToolUse recovery command timestamp");
         let user = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: writer
                 .timing_for_command(TOOL_USE_RECOVERY_COMMAND_ID)
                 .await

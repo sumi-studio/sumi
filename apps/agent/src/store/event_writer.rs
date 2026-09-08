@@ -58,8 +58,8 @@ use crate::{
         },
     },
     runtime::contracts::{
-        DirectChatProvenanceV1, GenerationRecoveryFence, PersonalityAgentId, ProcessGeneration,
-        ProcessGenerationLease,
+        GenerationRecoveryFence, IncomingProvenance, OutputAudience, PersonalityAgentId,
+        ProcessGeneration, ProcessGenerationLease,
     },
     tools::BoundToolInvocation,
 };
@@ -178,7 +178,9 @@ pub(crate) struct DurableEvent {
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) direct_chat_provenance: Option<DirectChatProvenanceV1>,
+    pub(super) audience: Option<OutputAudience>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) direct_chat_provenance: Option<IncomingProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +307,29 @@ impl DurableEvent {
                 disposition,
             }),
             DurableEventMetadata::default(),
+        )
+    }
+
+    pub(crate) fn reasoning_summary(
+        run_id: String,
+        turn_id: String,
+        message_id: String,
+        wire_item_index: u32,
+        content_index: usize,
+        content: String,
+    ) -> Result<Self> {
+        Self::from_parts(
+            AgentEvent::ReasoningSummary {
+                wire_item_index,
+                message_id,
+                content_index,
+                content,
+            },
+            DurableEventMetadata {
+                run_id: Some(run_id),
+                turn_id: Some(turn_id),
+                ..DurableEventMetadata::default()
+            },
         )
     }
 
@@ -721,6 +746,12 @@ impl DurableEvent {
                 command_id: Some(&event.command_id),
                 ..empty("command_disposition")
             },
+            AgentEvent::ReasoningSummary { message_id, .. } => DurableEventIdentity {
+                run_id: self.metadata.run_id.as_deref(),
+                turn_id: self.metadata.turn_id.as_deref(),
+                message_id: Some(message_id),
+                ..empty("reasoning_summary")
+            },
             AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
             AgentEvent::MessageUpdate { .. }
             | AgentEvent::ToolExecutionUpdate { .. }
@@ -767,7 +798,7 @@ pub(crate) struct InjectedCommand {
     seq: u64,
     command_id: CommandId,
     message_id: String,
-    provenance: DirectChatProvenanceV1,
+    provenance: IncomingProvenance,
 }
 
 /// Temporary local namespace for Error-context disposition identities.
@@ -859,7 +890,7 @@ impl InjectedCommand {
     pub(crate) fn new(
         seq: u64,
         command_id: impl IntoCanonicalCommandId,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
     ) -> Self {
         let command_id = command_id.into_canonical_command_id();
         let message_id = user_message_id(provenance.personality_agent_id(), &command_id);
@@ -890,7 +921,7 @@ impl InjectedCommand {
         dead_code,
         reason = "injected provenance inspection is retained for durable binding tests"
     )]
-    pub(crate) const fn provenance(&self) -> &DirectChatProvenanceV1 {
+    pub(crate) const fn provenance(&self) -> &IncomingProvenance {
         &self.provenance
     }
 
@@ -899,7 +930,7 @@ impl InjectedCommand {
         seq: u64,
         command_id: CommandId,
         message_id: impl Into<String>,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
     ) -> Self {
         Self {
             seq,
@@ -1164,7 +1195,7 @@ pub(crate) enum Projection {
         seq: u64,
         command_id: String,
         personality_agent_id: PersonalityAgentId,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
         reason: CommandRejectReason,
         raw_command: RejectedCommandPayload,
         payload_digest: Option<KeyedCommandDigest>,
@@ -1771,6 +1802,7 @@ fn prepared_write_has_physical_recovery(write: &PreparedWrite) -> bool {
 }
 
 struct ExpectedInjection {
+    incoming_source: Option<IncomingProvenance>,
     text: Zeroizing<String>,
     timestamp: DateTime<Utc>,
     incoming_timing: Option<IncomingEventTiming>,
@@ -1789,7 +1821,7 @@ struct CommandInsertInput<'a> {
     seq: u64,
     command_id: String,
     personality_agent_id: &'a PersonalityAgentId,
-    provenance: &'a DirectChatProvenanceV1,
+    provenance: &'a IncomingProvenance,
     command_kind: &'static str,
     canonical_payload: &'a [u8],
     rejection: Option<CommandRejectReason>,
@@ -2502,6 +2534,12 @@ impl EventWriter {
             .provenance()
             .validate(self.store.scope().personality_agent_id())
             .context("inbound command provenance does not match the private store")?;
+        if let InboundCommand::Valid(envelope) = inbound {
+            let external_payload = matches!(envelope.command, Command::ExternalEvent { .. });
+            if external_payload != envelope.provenance.is_external() {
+                bail!("inbound command payload and authenticated source disagree");
+            }
+        }
         if let InboundCommand::Invalid {
             reason,
             raw_command,
@@ -3652,6 +3690,91 @@ impl EventWriter {
         })
     }
 
+    async fn resolve_event_audience(
+        &self,
+        event: &DurableEvent,
+        batch_run: Option<&str>,
+        injected: Option<OutputAudience>,
+    ) -> Result<OutputAudience> {
+        let identity = event.identity();
+        let mut transaction = self.store.pool().begin().await?;
+        let command_ids: Vec<String> = if let Some(command_id) =
+            identity.command_id.or(event.metadata.command_id.as_deref())
+        {
+            vec![command_id.to_owned()]
+        } else if let Some(run_id) = identity.run_id.or(event.metadata.run_id.as_deref()) {
+            sqlx::query_scalar("SELECT command_id FROM inbound_commands WHERE run_id=? AND command_kind='user_message' ORDER BY seq LIMIT 1")
+                .bind(run_id).fetch_all(&mut *transaction).await?
+        } else {
+            let tool_call_id = match &event.value {
+                AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                | AgentEvent::ToolExecutionEnd { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                AgentEvent::MessageStart { message, .. }
+                | AgentEvent::MessageEnd { message, .. } => {
+                    if let PublicMessage::ToolResult(result) = message.as_ref() {
+                        Some(result.tool_call_id.as_str())
+                    } else {
+                        None
+                    }
+                }
+                AgentEvent::ApprovalRequested { request } => Some(request.tool_call_id.as_str()),
+                _ => None,
+            };
+            if let AgentEvent::ApprovalResolved { request_id, .. } = &event.value {
+                sqlx::query_scalar("SELECT t.command_id FROM approval_log a JOIN tool_executions t ON t.tool_call_id=a.tool_call_id WHERE a.id=?")
+                    .bind(request_id).fetch_all(&mut *transaction).await?
+            } else if let Some(tool_call_id) = tool_call_id {
+                sqlx::query_scalar("SELECT command_id FROM tool_executions WHERE tool_call_id=?")
+                    .bind(tool_call_id)
+                    .fetch_all(&mut *transaction)
+                    .await?
+            } else {
+                Vec::new()
+            }
+        };
+        let command_ids = if command_ids.is_empty() && batch_run.is_some() {
+            sqlx::query_scalar("SELECT command_id FROM inbound_commands WHERE run_id=? AND command_kind='user_message' ORDER BY seq LIMIT 1")
+                .bind(batch_run).fetch_all(&mut *transaction).await?
+        } else {
+            command_ids
+        };
+        let command_ids = if command_ids.is_empty()
+            && !matches!(event.value, AgentEvent::MemoryMaintenance { .. })
+        {
+            sqlx::query_scalar("SELECT command_id FROM inbound_commands WHERE command_kind='user_message' AND status='applying' AND run_phase IN ('user_started','user_committed','assistant_started','hard_steer_requested','cancel_requested') ORDER BY seq")
+                .fetch_all(&mut *transaction).await?
+        } else {
+            command_ids
+        };
+        let mut audience = None;
+        for command_id in command_ids {
+            let provenance = authenticated_command_provenance(
+                self.store.as_ref(),
+                &mut transaction,
+                &command_id,
+            )
+            .await?;
+            let current = provenance.output_audience();
+            if audience.is_some_and(|previous| previous != current) {
+                bail!("run mixes direct-chat and external command audiences");
+            }
+            audience = Some(current);
+        }
+        // A disposition belongs to its exact command, even when an Abort batch
+        // simultaneously closes a run belonging to a different audience.
+        if identity.command_id.is_none() {
+            if let Some(injected) = injected {
+                if audience.is_some_and(|current| current != injected) {
+                    bail!("injection changes the run output audience");
+                }
+                audience = Some(injected);
+            }
+        }
+        transaction.commit().await?;
+        // Maintenance with no conversation owner is private secretary activity.
+        Ok(audience.unwrap_or(OutputAudience::Secretary))
+    }
+
     async fn prepare_batch(
         &self,
         batch: EventBatch,
@@ -3663,11 +3786,58 @@ impl EventWriter {
             command_plaintext_bytes: 0,
         };
         EventBatchSizer::validate(bounds, 0)?;
-        let injected_provenance: HashMap<String, DirectChatProvenanceV1> = batch
+        // A newly rejected admission and its terminal disposition commit in
+        // this same batch. Its command row does not exist yet; bind the event
+        // to the exact validated admission projection instead of looking up an
+        // unrelated current run or choosing a default audience.
+        let mut rejected_admissions = HashMap::new();
+        for projection in batch.writes.iter().flat_map(|write| &write.projections) {
+            if let Projection::CommandRejected {
+                seq,
+                command_id,
+                personality_agent_id,
+                provenance,
+                ..
+            } = projection
+            {
+                provenance.validate(self.store.scope().personality_agent_id())?;
+                if personality_agent_id != self.store.scope().personality_agent_id() {
+                    bail!("rejected event admission targets a different Store");
+                }
+                if rejected_admissions
+                    .insert((command_id.clone(), *seq), provenance.output_audience())
+                    .is_some()
+                {
+                    bail!("duplicate rejected event admission identity");
+                }
+            }
+        }
+        let injected_provenance: HashMap<String, IncomingProvenance> = batch
             .injected_commands
             .iter()
             .map(|command| (command.message_id.clone(), command.provenance.clone()))
             .collect();
+        let batch_run = batch
+            .writes
+            .iter()
+            .filter_map(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.metadata.run_id.clone())
+            })
+            .next();
+        let batch_incoming_audience = batch
+            .injected_commands
+            .iter()
+            .map(|command| command.provenance.output_audience())
+            .reduce(|left, right| {
+                if left == right {
+                    left
+                } else {
+                    OutputAudience::Secretary
+                }
+            });
         let event_key = if batch.writes.iter().any(|write| write.event.is_some()) {
             Some(self.store.private_key(DataKeyPurpose::Event).await?)
         } else {
@@ -3768,15 +3938,48 @@ impl EventWriter {
                                 )
                             })?);
                     }
+                    if event.metadata.audience.is_some() {
+                        bail!("callers cannot supply durable event audience");
+                    }
+                    let admitted_audience = if let AgentEvent::CommandDisposition(disposition) =
+                        &event.value
+                    {
+                        if matches!(disposition.disposition, CommandDisposition::Rejected { .. }) {
+                            rejected_admissions
+                                .get(&(disposition.command_id.clone(), disposition.command_seq))
+                                .copied()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let audience = match admitted_audience {
+                        Some(audience) => audience,
+                        None => {
+                            // Keep the admission-authentication future out of
+                            // the already large write/recovery future frame.
+                            Box::pin(self.resolve_event_audience(
+                                &event,
+                                batch_run.as_deref(),
+                                batch_incoming_audience,
+                            ))
+                            .await?
+                        }
+                    };
+                    event.metadata.audience = Some(audience);
                     let key = event_key.as_ref().expect("event key was loaded");
                     let aad = self.store.scope().row_aad(
                         "agent_events",
                         seq.to_string(),
                         DataKeyPurpose::Event,
                     );
-                    let protected = PublicProjectionBuilder::new(self.store.redactor(), key)
+                    let mut protected = PublicProjectionBuilder::new(self.store.redactor(), key)
                         .build_serialized(&event.raw_json, &aad)
                         .context("failed to build raw/redacted durable event atomically")?;
+                    let payload =
+                        Zeroizing::new(super::event_payload::encode_event(&event.value, audience)?);
+                    protected.ciphertext = super::crypto::encrypt_content(key, &payload, &aad)?;
                     let identity = event.identity();
                     let kind = identity.kind.to_owned();
                     let command_id = identity.command_id.map(str::to_owned);
@@ -5591,7 +5794,7 @@ impl EventWriter {
             verify_command_payload_digest(&key, &plaintext, &digest)?;
             let stored_personality_agent_id: String = row.try_get("personality_agent_id")?;
             let provenance_json: String = row.try_get("provenance_json")?;
-            let persisted_provenance: DirectChatProvenanceV1 =
+            let persisted_provenance: IncomingProvenance =
                 serde_json::from_str(&provenance_json)
                     .context("durable injected command provenance is invalid")?;
             if stored_personality_agent_id != self.store.scope().personality_agent_id.as_str()
@@ -5642,8 +5845,16 @@ impl EventWriter {
                 .context("durable injected command payload is invalid")?;
             let matches_message = match &mut parsed {
                 Command::UserMessage { text, attachments } => {
-                    let matches = attachments.is_empty() && text.as_str() == expected.text.as_str();
+                    let matches = !command.provenance.is_external()
+                        && attachments.is_empty()
+                        && text.as_str() == expected.text.as_str();
                     text.zeroize();
+                    matches
+                }
+                Command::ExternalEvent { content } => {
+                    let matches = command.provenance.is_external()
+                        && content.as_str() == expected.text.as_str();
+                    content.zeroize();
                     matches
                 }
                 Command::Abort {} | Command::ApprovalDecision { .. } => false,
@@ -5667,6 +5878,13 @@ impl EventWriter {
                 .try_get::<Option<String>, _>("incoming_timing_json")?
                 .map(|json| serde_json::from_str(&json))
                 .transpose()?;
+            let expected_source = command
+                .provenance
+                .is_external()
+                .then(|| command.provenance.clone());
+            if expected.incoming_source != expected_source {
+                bail!("injected message source does not match authenticated command provenance");
+            }
             if expected.incoming_timing != durable_timing {
                 bail!("injected command timing does not match durable admission");
             }
@@ -5775,7 +5993,7 @@ impl EventWriter {
         command_id: &str,
         incoming_kind: &str,
         incoming_rejection: Option<&CommandRejectReason>,
-        incoming_provenance: &DirectChatProvenanceV1,
+        incoming_provenance: &IncomingProvenance,
         canonical_payload: &[u8],
         incoming_digest: Option<&KeyedCommandDigest>,
     ) -> Result<Option<CommandAck>> {
@@ -5841,7 +6059,7 @@ impl EventWriter {
             bail!("command replay personality-agent identity mismatch");
         }
         let provenance_json: String = row.try_get("provenance_json")?;
-        let stored_provenance: DirectChatProvenanceV1 = serde_json::from_str(&provenance_json)
+        let stored_provenance: IncomingProvenance = serde_json::from_str(&provenance_json)
             .context("persisted command provenance is invalid")?;
         let canonical_stored_provenance = serde_json::to_string(&stored_provenance)
             .context("failed to canonicalize persisted command provenance")?;
@@ -6156,6 +6374,99 @@ fn decrypt_replay_payload(
     Ok(Zeroizing::new(super::crypto::decrypt_content(
         key, ciphertext, aad,
     )?))
+}
+
+async fn validate_run_audience(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    command_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    let target = authenticated_command_provenance(store, transaction, command_id)
+        .await?
+        .output_audience();
+    let owners: Vec<String> = sqlx::query_scalar("SELECT command_id FROM inbound_commands WHERE run_id=? AND command_kind='user_message' AND command_id<>? ORDER BY seq LIMIT 1")
+        .bind(run_id).bind(command_id).fetch_all(&mut **transaction).await?;
+    for owner in owners {
+        if authenticated_command_provenance(store, transaction, &owner)
+            .await?
+            .output_audience()
+            != target
+        {
+            bail!("run ownership cannot cross output audiences");
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn authenticated_command_provenance(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    command_id: &str,
+) -> Result<IncomingProvenance> {
+    let row = sqlx::query(
+        "SELECT seq, personality_agent_id, provenance_json, command_kind, payload_key_ref,
+        payload_hmac, reject_reason, reject_actual_bytes, admission_record_version,
+        admission_record_hmac, received_at, incoming_timing_json
+        FROM inbound_commands WHERE command_id=?",
+    )
+    .bind(command_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| anyhow!("event owner command {command_id} is missing"))?;
+    let key_ref: String = row.try_get("payload_key_ref")?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await?;
+    if key.purpose != DataKeyPurpose::Command {
+        bail!("event owner uses non-command admission key");
+    }
+    let provenance_json: String = row.try_get("provenance_json")?;
+    let provenance: IncomingProvenance = serde_json::from_str(&provenance_json)?;
+    provenance.validate(&store.scope().personality_agent_id)?;
+    let paid: String = row.try_get("personality_agent_id")?;
+    if paid != store.scope().personality_agent_id.as_str()
+        || serde_json::to_string(&provenance)? != provenance_json
+    {
+        bail!("event owner provenance is not exactly bound to this Store");
+    }
+    if row.try_get::<i64, _>("admission_record_version")?
+        != i64::from(INBOUND_ADMISSION_RECORD_VERSION)
+    {
+        bail!("unsupported event owner admission version");
+    }
+    let seq = sqlite_u64(row.try_get("seq")?, "event owner command sequence")?;
+    let kind: String = row.try_get("command_kind")?;
+    let digest: Vec<u8> = row.try_get("payload_hmac")?;
+    let reason: Option<String> = row.try_get("reject_reason")?;
+    let bytes = row
+        .try_get::<Option<i64>, _>("reject_actual_bytes")?
+        .map(|v| sqlite_u64(v, "rejected bytes"))
+        .transpose()?;
+    let received_at: String = row.try_get("received_at")?;
+    let timing: Option<String> = row.try_get("incoming_timing_json")?;
+    let expected = admission_record_hmac(
+        &key,
+        &InboundAdmissionRecordV3 {
+            version: INBOUND_ADMISSION_RECORD_VERSION,
+            seq,
+            command_id,
+            personality_agent_id: &paid,
+            provenance_json: &provenance_json,
+            command_kind: &kind,
+            payload_key_ref: &key_ref,
+            payload_hmac: &digest,
+            reject_reason: reason.as_deref(),
+            reject_actual_bytes: bytes,
+            received_at: &received_at,
+            incoming_timing_json: timing.as_deref(),
+        },
+    )?;
+    let actual: Vec<u8> = row.try_get("admission_record_hmac")?;
+    if expected.as_slice().ct_eq(&actual).unwrap_u8() != 1 {
+        bail!("event owner admission record HMAC mismatch");
+    }
+    Ok(provenance)
 }
 
 pub(super) async fn load_authenticated_command(
@@ -7439,6 +7750,20 @@ fn validate_batch_shape_with_recovery(
                         );
                     }
                 }
+                AgentEvent::ReasoningSummary {
+                    message_id,
+                    content_index,
+                    ..
+                } => {
+                    uuid::Uuid::parse_str(message_id).context("summary message_id must be UUID")?;
+                    if event.metadata.run_id.as_deref().is_none_or(str::is_empty)
+                        || event.metadata.turn_id.as_deref().is_none_or(str::is_empty)
+                        || (*content_index as u128)
+                            > crate::gateway::wire::MAX_JSON_SAFE_INTEGER as u128
+                    {
+                        bail!("summary requires run/turn and JSON-safe index");
+                    }
+                }
                 AgentEvent::MemoryMaintenance { kind } => {
                     if kind.as_str().is_empty() {
                         bail!("durable MemoryMaintenance kind must not be empty");
@@ -7615,6 +7940,7 @@ fn validate_batch_shape_with_recovery(
                     expected_injections.push(ExpectedInjection {
                         text: Zeroizing::new(text.clone()),
                         timestamp: message.timestamp,
+                        incoming_source: message.incoming_source.clone(),
                         incoming_timing: message.incoming_timing.clone(),
                     });
                     injected_user_end_positions.push(write_position);
@@ -11751,17 +12077,24 @@ async fn load_authenticated_event(
         super::crypto::decrypt_content(&key, &ciphertext, &aad)
             .with_context(|| format!("durable lifecycle event {seq} failed authentication"))?,
     );
+    let internal_metadata: String = row.try_get("internal_metadata")?;
+    let (event, _) = super::event_payload::decode_event(
+        store,
+        transaction,
+        u64::try_from(seq)?,
+        &raw,
+        &internal_metadata,
+    )
+    .await?;
+    let event_json = Zeroizing::new(serde_json::to_vec(&event)?);
     let stored_envelope: String = row.try_get("envelope")?;
-    if store.redactor().redact_serialized(&raw)? != stored_envelope {
+    if store.redactor().redact_serialized(&event_json)? != stored_envelope {
         bail!("durable lifecycle event {seq} projection does not match authenticated raw event");
     }
-    let event: AgentEvent = serde_json::from_slice(&raw)
-        .with_context(|| format!("durable lifecycle event {seq} has invalid raw payload"))?;
     let kind: String = row.try_get("event_type")?;
     if event.durable_kind() != Some(kind.as_str()) {
         bail!("durable lifecycle event {seq} type disagrees with authenticated raw event");
     }
-    let internal_metadata: String = row.try_get("internal_metadata")?;
     Ok(AuthenticatedDurableEvent {
         event,
         kind,
@@ -12171,7 +12504,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
     }
 
     let writer = EventWriter::new(Arc::new(store.clone()));
-    let provenance = DirectChatProvenanceV1::new(
+    let provenance = IncomingProvenance::new(
         "tenant-test",
         store.scope().personality_agent_id.clone(),
         "human-test",
@@ -12300,7 +12633,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         .as_ref()
         .map_or([0_u8; EVENT_DIGEST_BYTES], |head| head.chain_digest);
     for seq in previous_last_seq.saturating_add(1)..=last_seq {
-        let event = if let Some(end_seq) = starts.get(&seq) {
+        let mut event = if let Some(end_seq) = starts.get(&seq) {
             let owner = by_end_seq
                 .get(end_seq)
                 .expect("start schedule references a known owner");
@@ -12325,8 +12658,14 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         let aad = store
             .scope()
             .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
-        let protected = PublicProjectionBuilder::new(store.redactor(), &event_key)
+        event.metadata.audience = Some(OutputAudience::DirectChat);
+        let mut protected = PublicProjectionBuilder::new(store.redactor(), &event_key)
             .build_serialized(&event.raw_json, &aad)?;
+        protected.ciphertext = super::crypto::encrypt_content(
+            &event_key,
+            &super::event_payload::encode_event(&event.value, OutputAudience::DirectChat)?,
+            &aad,
+        )?;
         let kind = event
             .value
             .durable_kind()
@@ -14359,6 +14698,7 @@ async fn apply_plain_projection(
             run_id,
             turn_id,
         } => {
+            validate_run_audience(store, transaction, &command_id, &run_id).await?;
             let result = sqlx::query(
                 "UPDATE inbound_commands
                  SET status = 'applying', application_kind = ?, run_id = ?, turn_id = ?,
@@ -14381,6 +14721,7 @@ async fn apply_plain_projection(
             expected,
             next,
         } => {
+            validate_run_audience(store, transaction, &command_id, &run_id).await?;
             let result = sqlx::query(
                 "UPDATE inbound_commands SET run_phase = ?
                  WHERE command_id = ? AND command_kind = 'user_message'
@@ -15079,7 +15420,7 @@ async fn apply_memory_job_mutation(
 
 fn command_kind(command: &Command) -> &'static str {
     match command {
-        Command::UserMessage { .. } => "user_message",
+        Command::UserMessage { .. } | Command::ExternalEvent { .. } => "user_message",
         Command::Abort {} => "abort",
         Command::ApprovalDecision { .. } => "approval_decision",
     }
@@ -15602,9 +15943,15 @@ mod tests {
         }
     }
 
-    fn test_provenance() -> DirectChatProvenanceV1 {
-        DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-1")
+    fn test_provenance() -> IncomingProvenance {
+        IncomingProvenance::new("tenant-1", scope().personality_agent_id, "human-1")
             .expect("valid direct-chat provenance")
+    }
+
+    fn test_external_provenance() -> IncomingProvenance {
+        let mut value = serde_json::to_value(crate::gateway::test_messaging_provenance()).unwrap();
+        value["personality_agent_id"] = serde_json::to_value(scope().personality_agent_id).unwrap();
+        serde_json::from_value(value).expect("external source bound to Store fixture")
     }
 
     fn test_user_message_id(command_id: &(impl CanonicalCommandIdentity + ?Sized)) -> String {
@@ -15767,7 +16114,7 @@ mod tests {
         seq: u64,
         command_id: &str,
         text: &str,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
     ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
@@ -15809,7 +16156,7 @@ mod tests {
         command_id: &str,
         request_id: &str,
         decision: ApprovalDecision,
-        provenance: DirectChatProvenanceV1,
+        provenance: IncomingProvenance,
     ) -> InboundCommand {
         InboundCommand::Valid(CommandEnvelope {
             seq,
@@ -16246,7 +16593,7 @@ mod tests {
             .expect("commit pending route operation");
 
         let decision_provenance =
-            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-2")
+            IncomingProvenance::new("tenant-1", scope().personality_agent_id, "human-2")
                 .expect("valid different decision actor");
         let decision_command_id = "00000000-0000-4000-8000-000000000023";
         writer
@@ -16966,6 +17313,14 @@ mod tests {
     }
 
     fn tool_start_write(tool_call_id: &str, run_id: &str) -> EventWrite {
+        tool_start_write_for_owner(tool_call_id, run_id, TOOL_OWNER_COMMAND_ID)
+    }
+
+    fn tool_start_write_for_owner(
+        tool_call_id: &str,
+        run_id: &str,
+        command_id: &str,
+    ) -> EventWrite {
         EventWrite {
             event: Some(
                 DurableEvent::new(&json!({
@@ -16973,7 +17328,7 @@ mod tests {
                     "tool_call_id":tool_call_id,
                     "tool_name":"test",
                     "args":{},
-                    "command_id":TOOL_OWNER_COMMAND_ID,
+                    "command_id":command_id,
                     "run_id":run_id,
                     "executor_generation":1,
                     "state":"running"
@@ -17117,6 +17472,7 @@ mod tests {
 
     fn user_message(text: &str) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: Some(IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -17139,6 +17495,7 @@ mod tests {
     ) -> Vec<EventWrite> {
         let message_id = test_user_message_id(command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: Some(IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -17572,7 +17929,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&first_event.get::<String, _>("internal_metadata"))
                 .expect("typed internal metadata"),
-            json!({"run_id":"run-00000000-0000-4000-8000-000000000001"})
+            json!({"run_id":"run-00000000-0000-4000-8000-000000000001","audience":"direct_chat"})
         );
     }
 
@@ -17647,6 +18004,18 @@ mod tests {
             CommandId::parse("00000000-0000-4000-8000-000000000033").expect("canonical UUID");
         let previous_owner =
             CommandId::parse("00000000-0000-4000-8000-000000000034").expect("canonical UUID");
+        writer
+            .persist_inbound(&user_command(1, previous_owner.as_str(), "previous owner"))
+            .await
+            .expect("persist sizing predecessor");
+        writer
+            .persist_inbound(&user_command(
+                2,
+                command_id.as_str(),
+                "application-specific write-set",
+            ))
+            .await
+            .expect("persist sizing admission");
         let message_id = test_user_message_id(&command_id);
         let run_id = "run-application-sizer";
         let turn_id = "turn-application-sizer";
@@ -17659,6 +18028,7 @@ mod tests {
             Some(IncomingEventTiming {
                 previous_receipt: None,
             }),
+            None,
         );
         let payload = serde_json::to_vec(&Command::UserMessage {
             text: text.to_owned(),
@@ -20761,9 +21131,9 @@ mod tests {
     async fn command_replay_authenticates_exact_persisted_provenance_and_admission_record() {
         let command_id = "00000000-0000-4000-8000-000000000031";
         for tampered_provenance in [
-            DirectChatProvenanceV1::new("tenant-tampered", scope().personality_agent_id, "human-1")
+            IncomingProvenance::new("tenant-tampered", scope().personality_agent_id, "human-1")
                 .unwrap(),
-            DirectChatProvenanceV1::new("tenant-1", scope().personality_agent_id, "human-tampered")
+            IncomingProvenance::new("tenant-1", scope().personality_agent_id, "human-tampered")
                 .unwrap(),
         ] {
             let store = test_store().await;
@@ -21483,6 +21853,7 @@ mod tests {
         let injection = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
         let mut writes = injection_writes(command_id, "ignored", "hello");
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             content: vec![UserContent::Text {
                 text: "hello".to_owned(),
             }],
@@ -23610,7 +23981,11 @@ mod tests {
             .expect("prepare handoff tool");
         handoff_writer
             .apply(EventBatch {
-                writes: vec![tool_start_write("tool-handoff", "run-handoff")],
+                writes: vec![tool_start_write_for_owner(
+                    "tool-handoff",
+                    "run-handoff",
+                    "00000000-0000-4000-8000-000000000019",
+                )],
                 injected_commands: Vec::new(),
             })
             .await
@@ -25298,14 +25673,22 @@ mod tests {
             .expect("same-batch MessageEnd may prepare every tool in the response");
         writer
             .apply(EventBatch {
-                writes: vec![tool_start_write("tool-origin-a", &run_id)],
+                writes: vec![tool_start_write_for_owner(
+                    "tool-origin-a",
+                    &run_id,
+                    command_id,
+                )],
                 injected_commands: Vec::new(),
             })
             .await
             .expect("recovery transaction may start first prepared tool");
         writer
             .apply(EventBatch {
-                writes: vec![tool_start_write("tool-origin-b", &run_id)],
+                writes: vec![tool_start_write_for_owner(
+                    "tool-origin-b",
+                    &run_id,
+                    command_id,
+                )],
                 injected_commands: Vec::new(),
             })
             .await
@@ -30100,6 +30483,7 @@ mod tests {
         let mut second_turn_messages = hydrated.messages.clone();
         second_turn_messages.push(ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "continue after restart".to_owned(),
@@ -30361,6 +30745,7 @@ mod tests {
         let mut durable_messages = hydrated_messages;
         durable_messages.push(ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "continue after error restart".to_owned(),
@@ -33288,5 +33673,208 @@ mod tests {
                 .expect("read batch footprint");
         assert_eq!(footprint, 42);
         transaction.rollback().await.expect("rollback test fixture");
+    }
+    #[tokio::test]
+    async fn durable_audience_is_bound_to_admitted_source_and_ciphertext() {
+        for external in [false, true] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let id = "00000000-0000-4000-8000-000000000077";
+            let provenance = if external {
+                test_external_provenance()
+            } else {
+                test_provenance()
+            };
+            let command = if external {
+                Command::ExternalEvent {
+                    content: "source message".to_owned(),
+                }
+            } else {
+                Command::UserMessage {
+                    text: "source message".to_owned(),
+                    attachments: vec![],
+                }
+            };
+            writer
+                .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                    seq: 1,
+                    command_id: CommandId::parse(id).unwrap(),
+                    personality_agent_id: store.scope().personality_agent_id.clone(),
+                    provenance,
+                    command,
+                }))
+                .await
+                .unwrap();
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: id.to_owned(),
+                            application_kind: ApplicationKind::IdleRun,
+                            run_id: "audience-run".to_owned(),
+                            turn_id: "audience-turn".to_owned(),
+                        }],
+                    }],
+                    injected_commands: vec![],
+                })
+                .await
+                .unwrap();
+            let seqs = writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::agent_start("audience-run").unwrap()),
+                        projections: vec![Projection::RunPhase {
+                            command_id: id.to_owned(),
+                            run_id: "audience-run".to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    }],
+                    injected_commands: vec![],
+                })
+                .await
+                .unwrap();
+            let expected = if external {
+                OutputAudience::Secretary
+            } else {
+                OutputAudience::DirectChat
+            };
+            assert_eq!(
+                store.authenticated_event_audience(seqs[0]).await.unwrap(),
+                expected
+            );
+            let opposite = if external { "direct_chat" } else { "secretary" };
+            sqlx::query("UPDATE agent_events SET internal_metadata=json_set(internal_metadata,'$.audience',?) WHERE seq=?").bind(opposite).bind(seqs[0] as i64).execute(store.pool()).await.unwrap();
+            assert!(
+                store
+                    .authenticated_event_audience(seqs[0])
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disagrees with authenticated payload")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn store_rejects_external_content_with_direct_provenance() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let error = writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000077").unwrap(),
+                personality_agent_id: store.scope().personality_agent_id.clone(),
+                provenance: test_provenance(),
+                command: Command::ExternalEvent {
+                    content: "unbound".to_owned(),
+                },
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("payload and authenticated source disagree"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn legacy_raw_audience_requires_explicit_bounded_cutover() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance("boundary-fixture").unwrap()),
+                    projections: vec![],
+                }],
+                injected_commands: vec![],
+            })
+            .await
+            .unwrap();
+        let raw = serde_json::to_vec(&AgentEvent::AgentStart).unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+        assert!(
+            super::super::event_payload::decode_event(&store, &mut transaction, 1, &raw, "{}")
+                .await
+                .is_err()
+        );
+        transaction.rollback().await.unwrap();
+        store
+            .authorize_pre_external_event_boundary(1)
+            .await
+            .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+        assert_eq!(
+            super::super::event_payload::decode_event(&store, &mut transaction, 1, &raw, "{}")
+                .await
+                .unwrap()
+                .1,
+            OutputAudience::DirectChat
+        );
+        assert!(
+            super::super::event_payload::decode_event(&store, &mut transaction, 2, &raw, "{}")
+                .await
+                .is_err()
+        );
+        let metadata =
+            serde_json::json!({"direct_chat_provenance":test_external_provenance()}).to_string();
+        assert!(
+            super::super::event_payload::decode_event(&store, &mut transaction, 1, &raw, &metadata)
+                .await
+                .is_err()
+        );
+        transaction.rollback().await.unwrap();
+    }
+    #[tokio::test]
+    async fn rejected_admission_disposition_keeps_its_exact_source_audience() {
+        for (provenance, audience) in [
+            (test_provenance(), OutputAudience::DirectChat),
+            (test_external_provenance(), OutputAudience::Secretary),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let command_id = CommandId::parse("00000000-0000-4000-8000-000000000091").unwrap();
+            let ack = writer
+                .persist_inbound(&InboundCommand::Invalid {
+                    seq: 1,
+                    command_id: command_id.clone(),
+                    personality_agent_id: scope().personality_agent_id,
+                    provenance,
+                    reason: CommandRejectReason::SchemaViolation,
+                    raw_command: RejectedCommandPayload::Present(
+                        crate::gateway::SensitiveCommandPayload::new(
+                            br#"{"type":"unknown"}"#.to_vec(),
+                        ),
+                    ),
+                    payload_digest: None,
+                })
+                .await
+                .expect("atomic rejected admission");
+            assert_eq!(ack.status, CommandAckStatus::Rejected);
+            let events = super::super::delivery::raw_events_after(&store, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(
+                matches!(&events[0].1, AgentEvent::CommandDisposition(disposition) if disposition.command_id==command_id.as_str() && disposition.command_seq==1)
+            );
+            assert_eq!(
+                store
+                    .authenticated_event_audience(events[0].0)
+                    .await
+                    .unwrap(),
+                audience
+            );
+        }
     }
 }

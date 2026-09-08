@@ -225,7 +225,10 @@ pub(crate) fn hard_steer_step_zero_batch(
     command: &AdmittedCommand,
     turn_id: impl Into<String>,
 ) -> Result<EventBatch> {
-    if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+    if !matches!(
+        command.envelope().command,
+        Command::UserMessage { .. } | Command::ExternalEvent { .. }
+    ) {
         bail!("only UserMessage may cross the hard-steer barrier");
     }
     let turn_id = turn_id.into();
@@ -273,7 +276,10 @@ pub(crate) fn finalize_hard_steer_batches(
     eviction_footprint_tokens: u64,
     new_turn_id: impl Into<String>,
 ) -> Result<Vec<EventBatch>> {
-    if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+    if !matches!(
+        command.envelope().command,
+        Command::UserMessage { .. } | Command::ExternalEvent { .. }
+    ) {
         bail!("only UserMessage may finalize a hard steer");
     }
     let new_turn_id = new_turn_id.into();
@@ -533,10 +539,16 @@ impl SteerGroup {
         turn_id: &str,
         application_kind: ApplicationKind,
     ) -> bool {
-        run_id == self.run_id
+        self.commands.first().is_some_and(|first| {
+            first.envelope().provenance.output_audience()
+                == command.envelope().provenance.output_audience()
+        }) && run_id == self.run_id
             && turn_id == self.turn_id
             && application_kind == self.application_kind
-            && matches!(command.envelope().command, Command::UserMessage { .. })
+            && matches!(
+                command.envelope().command,
+                Command::UserMessage { .. } | Command::ExternalEvent { .. }
+            )
     }
 
     /// Returns true if adding `command` would stay within the group bounds.
@@ -561,9 +573,15 @@ impl SteerGroup {
     }
 
     pub(crate) fn push(&mut self, command: AdmittedCommand, _redactor: &Redactor) -> Result<()> {
+        if self.commands.first().is_some_and(|first| {
+            first.envelope().provenance.output_audience()
+                != command.envelope().provenance.output_audience()
+        }) {
+            bail!("steer group cannot change its output audience");
+        }
         debug_assert!(matches!(
             command.envelope().command,
-            Command::UserMessage { .. }
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
         ));
         let Some(canonical) = command_plaintext_bytes(&command) else {
             bail!("SteerGroup only accepts UserMessage commands");
@@ -755,13 +773,21 @@ pub(crate) fn steer_group_injection_batch(snapshot: SteerGroupSnapshot) -> Resul
 }
 
 pub(crate) fn build_user_message(command: &AdmittedCommand) -> Result<PublicMessage> {
-    let Command::UserMessage { text, attachments } = &command.envelope().command else {
-        bail!("steer group member is not a UserMessage");
+    let provenance = &command.envelope().provenance;
+    let (text, incoming_source) = match &command.envelope().command {
+        Command::UserMessage { text, attachments } if !provenance.is_external() => {
+            if !attachments.is_empty() {
+                bail!("incoming message does not accept attachments");
+            }
+            (text, None)
+        }
+        Command::ExternalEvent { content } if provenance.is_external() => {
+            (content, Some(provenance.clone()))
+        }
+        _ => bail!("incoming message kind does not match authenticated source"),
     };
-    if !attachments.is_empty() {
-        bail!("T16 steer does not accept attachments");
-    }
     Ok(PublicMessage::User(crate::provider::types::UserMessage {
+        incoming_source,
         incoming_timing: command.incoming_timing(),
         content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
         timestamp: command.received_at(),
@@ -868,7 +894,7 @@ mod tests {
         let personality_agent_id = crate::gateway::test_personality_agent_id();
         AdmittedCommand::new(
             CommandEnvelope {
-                provenance: crate::runtime::contracts::DirectChatProvenanceV1::new(
+                provenance: crate::runtime::contracts::IncomingProvenance::new(
                     "tenant-test",
                     personality_agent_id.clone(),
                     principal_id,
@@ -956,6 +982,7 @@ mod tests {
         let message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: Some(crate::provider::types::IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -1080,6 +1107,121 @@ mod tests {
         }
 
         (binding, assistant_message)
+    }
+
+    fn external_admitted(seq: u64, principal: &str) -> AdmittedCommand {
+        let mut source = serde_json::to_value(crate::gateway::test_messaging_provenance()).unwrap();
+        source["actor"]["principal_id"] = serde_json::json!(principal);
+        source["source"]["occurred_at"] = serde_json::json!("2026-07-20T01:00:00Z");
+        source["source"]["event_id"] =
+            serde_json::json!(format!("01992000-0000-7000-8000-{seq:012}"));
+        AdmittedCommand::new(
+            CommandEnvelope {
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: serde_json::from_value(source).unwrap(),
+                seq,
+                command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
+                    .unwrap(),
+                command: Command::ExternalEvent {
+                    content: "Original source text\n  kept exactly".to_owned(),
+                },
+            },
+            test_timestamp(),
+        )
+        .with_incoming_timing(Some(crate::provider::types::IncomingEventTiming {
+            previous_receipt: Some(crate::provider::types::IncomingEventReceipt {
+                command_seq: seq - 1,
+                received_at: test_timestamp() - chrono::Duration::milliseconds(37),
+            }),
+        }))
+    }
+
+    #[test]
+    fn steer_groups_preserve_audience_boundary_in_both_directions() {
+        for application in [ApplicationKind::SoftSteer, ApplicationKind::RetrySteer] {
+            for external_first in [false, true] {
+                let make = |external, seq, principal| {
+                    if external {
+                        external_admitted(seq, principal)
+                    } else {
+                        test_admitted_by(
+                            seq,
+                            &format!("00000000-0000-4000-8000-{seq:012}"),
+                            "Direct input",
+                            principal,
+                        )
+                    }
+                };
+                let mut group =
+                    SteerGroup::new(application, "run-audience", "turn-audience").unwrap();
+                let redactor = Redactor::v1();
+                group
+                    .push(make(external_first, 2, "actor-a"), &redactor)
+                    .unwrap();
+                let opposite = make(!external_first, 3, "actor-b");
+                assert!(!group.can_accept(&opposite, "run-audience", "turn-audience", application));
+                assert!(!group.can_accept_with_size(
+                    &opposite,
+                    "run-audience",
+                    "turn-audience",
+                    application,
+                    &redactor
+                ));
+                let before_bytes = group.plaintext_bytes;
+                assert!(group.push(opposite, &redactor).is_err());
+                assert_eq!(
+                    group.len(),
+                    1,
+                    "rejected cross-audience input must not join the group"
+                );
+                assert_eq!(
+                    group.plaintext_bytes, before_bytes,
+                    "rejection must not consume group capacity"
+                );
+                let same = make(external_first, 4, "another-actor");
+                assert!(group.can_accept_with_size(
+                    &same,
+                    "run-audience",
+                    "turn-audience",
+                    application,
+                    &redactor
+                ));
+                group.push(same, &redactor).unwrap();
+                assert_eq!(
+                    group.len(),
+                    2,
+                    "different actors with the same output audience may join"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_user_message_preserves_original_source_and_durable_receipt() {
+        let admitted = external_admitted(7, "speaker-a");
+        let PublicMessage::User(message) = build_user_message(&admitted).unwrap() else {
+            panic!("expected model input");
+        };
+        assert_eq!(
+            message.incoming_source.as_ref(),
+            Some(&admitted.envelope().provenance)
+        );
+        assert_eq!(message.timestamp, admitted.received_at());
+        assert_eq!(message.incoming_timing, admitted.incoming_timing());
+        assert_eq!(
+            message.content,
+            vec![UserContent::Text {
+                text: "Original source text\n  kept exactly".to_owned()
+            }]
+        );
+        assert_eq!(
+            message
+                .incoming_source
+                .as_ref()
+                .unwrap()
+                .authenticated_direct_chat_human(),
+            None
+        );
     }
 
     #[test]

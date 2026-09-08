@@ -49,7 +49,7 @@ use crate::{
         types::{
             AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextFragment,
             ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
-            ToolCall, ToolResultMessage, UserContent, UserMessage,
+            ToolCall, ToolResultMessage, UserContent,
         },
     },
     runtime::contracts::{ProcessGeneration, RpcIdentity},
@@ -618,7 +618,10 @@ impl Runner {
             .core
             .next_followup()
             .expect("newly queued initial makes pending controls non-empty");
-        if matches!(oldest.envelope().command, Command::UserMessage { .. }) {
+        if matches!(
+            oldest.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             self.claim_control(oldest)
         } else {
             self.core
@@ -1546,13 +1549,19 @@ impl Runner {
                 continue;
             }
 
+            let bind_started = std::time::Instant::now();
+            tracing::info!(tool_call_id = %call.id, stage = "bind_start", "tool dispatch progress");
             let mut sealed = match self
                 .driver
                 .bind_tool_invocation(assistant_message_id, call)
                 .await
             {
-                Ok(sealed) => sealed,
+                Ok(sealed) => {
+                    tracing::info!(tool_call_id = %call.id, stage = "bind_end", outcome = "bound", elapsed_ms = bind_started.elapsed().as_millis() as u64, "tool dispatch progress");
+                    sealed
+                }
                 Err(error) => {
+                    tracing::info!(tool_call_id = %call.id, stage = "bind_end", outcome = "error", elapsed_ms = bind_started.elapsed().as_millis() as u64, "tool dispatch progress");
                     let result = error_tool_result(
                         call,
                         &format!("App could not bind this operation: {error}"),
@@ -1572,10 +1581,25 @@ impl Runner {
                 let mut current_turn = Vec::with_capacity(results.len() + 1);
                 current_turn.push(assistant_message.clone());
                 current_turn.extend(results.iter().cloned().map(PublicMessage::ToolResult));
-                match self
+                let review_started = std::time::Instant::now();
+                tracing::info!(tool_call_id = %call.id, stage = "review_start", "tool dispatch progress");
+                let review = self
                     .evaluate_route_call(broker.clone(), sealed, call.route, &current_turn)
-                    .await?
-                {
+                    .await;
+                tracing::info!(
+                    tool_call_id = %call.id,
+                    stage = "review_end",
+                    outcome = match &review {
+                        Ok(RouteCallDisposition::Allowed { .. }) => "allowed",
+                        Ok(RouteCallDisposition::Denied { .. }) => "denied",
+                        Ok(RouteCallDisposition::Pending { .. }) => "pending",
+                        Err(WorkerFailure::Cancelled) => "cancelled",
+                        Err(_) => "error",
+                    },
+                    elapsed_ms = review_started.elapsed().as_millis() as u64,
+                    "tool dispatch progress"
+                );
+                match review? {
                     RouteCallDisposition::Allowed { grant } => {
                         match self
                             .start_and_execute_route_call(assistant_message_id, call, grant)
@@ -1843,7 +1867,10 @@ impl Runner {
         let scope = ApprovalPrincipalScope {
             tenant_id: binding.provenance.tenant_id().to_owned(),
             personality_agent_id: binding.provenance.personality_agent_id().to_string(),
-            human_principal_id: binding.provenance.actor().principal_id().to_owned(),
+            human_principal_id: binding
+                .provenance
+                .authenticated_direct_chat_human()
+                .map(str::to_owned),
         };
         let mut transcript = self
             .context
@@ -1970,6 +1997,9 @@ impl Runner {
                                         }
                                     };
                                     let provenance = &command.envelope().provenance;
+                                    let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
+                                        continue;
+                                    };
                                     let authenticated = AuthenticatedCurrentCallDecision {
                                         command_id: command.envelope().command_id.to_string(),
                                         command_seq: command.envelope().seq,
@@ -1977,10 +2007,7 @@ impl Runner {
                                         personality_agent_id: provenance
                                             .personality_agent_id()
                                             .to_string(),
-                                        human_principal_id: provenance
-                                            .actor()
-                                            .principal_id()
-                                            .to_owned(),
+                                        human_principal_id: human_principal_id.to_owned(),
                                         decision: current,
                                         received_at: command.received_at(),
                                     };
@@ -2034,6 +2061,9 @@ impl Runner {
                                     };
                                     if let Some(current) = current {
                                         let provenance = &command.envelope().provenance;
+                                        let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
+                                            continue;
+                                        };
                                         let authenticated = AuthenticatedCurrentCallDecision {
                                             command_id: command.envelope().command_id.to_string(),
                                             command_seq: command.envelope().seq,
@@ -2041,15 +2071,18 @@ impl Runner {
                                             personality_agent_id: provenance
                                                 .personality_agent_id()
                                                 .to_string(),
-                                            human_principal_id: provenance
-                                                .actor()
-                                                .principal_id()
-                                                .to_owned(),
+                                            human_principal_id: human_principal_id.to_owned(),
                                             decision: current,
                                             received_at: command.received_at(),
                                         };
                                         let _ = broker.resolve(rid, authenticated).await;
                                     }
+                                    continue;
+                                }
+                                Command::ExternalEvent { .. } => {
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
                                     continue;
                                 }
                                 Command::UserMessage { .. } | Command::Abort {} => {
@@ -2161,11 +2194,14 @@ impl Runner {
         call: &ToolCall,
         grant: crate::approval::authority::ExecutableGrant,
     ) -> Result<RouteExecutionDisposition, WorkerFailure> {
+        let start_commit_started = std::time::Instant::now();
+        tracing::info!(tool_call_id = %call.id, stage = "execution_start_commit_wait", "tool dispatch progress");
         match self
             .emit_route_tool_start_and_wait_committed(call, grant)
             .await?
         {
             ToolStartOutcome::RouteStarted(authorized) => {
+                tracing::info!(tool_call_id = %call.id, stage = "execution_start", elapsed_ms = start_commit_started.elapsed().as_millis() as u64, "tool dispatch progress");
                 let (result, live_post_commit) = match self
                     .execute_bound_tool_with_updates(authorized)
                     .await
@@ -2200,10 +2236,22 @@ impl Runner {
                 };
                 let receipt = self.emit_tool_result(assistant_message_id, &result).await?;
                 if let Some(post_commit) = live_post_commit {
-                    match post_commit
+                    let maintenance_started = std::time::Instant::now();
+                    tracing::info!(tool_call_id = %call.id, stage = "post_result_maintenance_start", "tool dispatch progress");
+                    let maintenance = post_commit
                         .invoke_after_result_commit(self.cancel.child_token())
-                        .await
-                    {
+                        .await;
+                    tracing::info!(
+                        tool_call_id = %call.id,
+                        stage = "post_result_maintenance_end",
+                        outcome = match &maintenance {
+                            crate::tools::LiveAppPostCommitOutcome::Applied => "applied",
+                            crate::tools::LiveAppPostCommitOutcome::Deferred(_) => "deferred",
+                        },
+                        elapsed_ms = maintenance_started.elapsed().as_millis() as u64,
+                        "tool dispatch progress"
+                    );
+                    match maintenance {
                         crate::tools::LiveAppPostCommitOutcome::Applied => {}
                         crate::tools::LiveAppPostCommitOutcome::Deferred(error) => {
                             tracing::warn!(
@@ -2217,6 +2265,7 @@ impl Runner {
                 Ok(RouteExecutionDisposition::Completed { result, receipt })
             }
             ToolStartOutcome::RouteReauthorize(sealed) => {
+                tracing::info!(tool_call_id = %call.id, stage = "execution_start_deferred", outcome = "reauthorize", elapsed_ms = start_commit_started.elapsed().as_millis() as u64, "tool dispatch progress");
                 Ok(RouteExecutionDisposition::Reauthorize { sealed })
             }
             ToolStartOutcome::Preempted => Ok(RouteExecutionDisposition::Preempted {
@@ -2787,6 +2836,12 @@ impl Runner {
                                     }
                                     continue;
                                 }
+                                Command::ExternalEvent { .. } => {
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
+                                    continue;
+                                }
                                 Command::UserMessage { .. } | Command::Abort {} => {
                                     if let Some(broker) = self
                                         .core
@@ -3279,7 +3334,10 @@ impl Runner {
         let receipt = self
             .emit_result_message(assistant_message_id, result, None, None)
             .await?;
+        let commit_started = std::time::Instant::now();
+        tracing::info!(tool_call_id = %result.tool_call_id, stage = "result_commit_wait", "tool dispatch progress");
         let receipt = self.await_message_receipt(receipt).await?;
+        tracing::info!(tool_call_id = %result.tool_call_id, stage = "result_commit_ack", elapsed_ms = commit_started.elapsed().as_millis() as u64, "tool dispatch progress");
         Ok(receipt)
     }
 
@@ -3380,17 +3438,8 @@ impl Runner {
     }
 
     async fn inject_user(&mut self, command: &AdmittedCommand) -> Result<(), WorkerFailure> {
-        let Command::UserMessage { text, attachments } = &command.envelope().command else {
-            return Err(WorkerFailure::Error(
-                "non-user command reached a user injection boundary".to_owned(),
-            ));
-        };
-        debug_assert!(attachments.is_empty());
-        let message = PublicMessage::User(UserMessage {
-            incoming_timing: command.incoming_timing(),
-            content: vec![UserContent::Text { text: text.clone() }],
-            timestamp: command.received_at(),
-        });
+        let message = super::steer::build_user_message(command)
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         let message_id = user_message_id(
             &command.envelope().personality_agent_id,
             &command.envelope().command_id,
@@ -3526,7 +3575,10 @@ impl Runner {
         let Some(command) = self.core.next_followup() else {
             return Ok(false);
         };
-        if matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             self.claim_control(command)?;
             Ok(true)
         } else {

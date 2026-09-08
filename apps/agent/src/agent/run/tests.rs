@@ -811,6 +811,7 @@ fn admitted_approval(seq: u64, request_id: &str) -> AdmittedCommand {
 
 fn runtime_user(seq: u64) -> PublicMessage {
     PublicMessage::User(UserMessage {
+        incoming_source: None,
         incoming_timing: None,
         content: vec![UserContent::Text {
             text: format!("message {seq}"),
@@ -1042,6 +1043,7 @@ async fn route_run_loop_sends_human_and_current_assistant_pending_call_to_review
     let mut core = bound_core(1);
     core.runtime_context.push(ContextMessage::Synthetic {
         message: Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![UserContent::Text {
                 text: HUMAN_SENTINEL.to_owned(),
@@ -3598,6 +3600,7 @@ async fn initial_command_is_recovered_before_each_fallible_injection_boundary() 
             }
             3 => {
                 let message = PublicMessage::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "message 1".to_owned(),

@@ -25,8 +25,8 @@ pub enum RuntimeContractError {
     PersonalityAgentIdWrongVariant,
     #[error("personality agent id must use exact lowercase hyphenated UUID text")]
     PersonalityAgentIdNonCanonical,
-    #[error("direct-chat provenance version must be {DIRECT_CHAT_PROVENANCE_VERSION}")]
-    DirectChatProvenanceWrongVersion,
+    #[error("incoming provenance version, source, actor, or source fields are inconsistent")]
+    InvalidIncomingProvenance,
     #[error("{kind} must contain 1..={MAX_PROVENANCE_ID_BYTES} bytes")]
     InvalidProvenanceIdentity { kind: &'static str },
     #[error("direct-chat provenance target personality agent does not match the private store")]
@@ -114,164 +114,272 @@ impl<'de> Deserialize<'de> for PersonalityAgentId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputAudience {
+    DirectChat,
+    Secretary,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "DirectChatProvenanceWire")]
-pub struct DirectChatProvenanceV1 {
+#[serde(try_from = "IncomingProvenanceWire")]
+pub struct IncomingProvenance {
     version: u8,
     tenant_id: String,
     personality_agent_id: PersonalityAgentId,
-    actor: HumanActorProvenance,
-    source: DirectChatSource,
+    actor: IncomingActor,
+    source: IncomingSource,
 }
 
-impl DirectChatProvenanceV1 {
+impl IncomingProvenance {
     pub fn new(
         tenant_id: impl Into<String>,
         personality_agent_id: PersonalityAgentId,
         human_principal_id: impl Into<String>,
     ) -> Result<Self, RuntimeContractError> {
-        Ok(Self {
+        let value = Self {
             version: DIRECT_CHAT_PROVENANCE_VERSION,
-            tenant_id: validate_provenance_identity(tenant_id.into(), "tenant id")?,
+            tenant_id: tenant_id.into(),
             personality_agent_id,
-            actor: HumanActorProvenance::new(human_principal_id)?,
-            source: DirectChatSource::default(),
-        })
+            actor: IncomingActor {
+                kind: ActorKind::Human,
+                principal_id: human_principal_id.into(),
+                display_name: None,
+            },
+            source: IncomingSource::DirectChat {},
+        };
+        value.validate(&value.personality_agent_id)?;
+        Ok(value)
     }
-
     pub const fn version(&self) -> u8 {
         self.version
     }
-
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
     }
-
     pub const fn personality_agent_id(&self) -> &PersonalityAgentId {
         &self.personality_agent_id
     }
-
-    pub const fn actor(&self) -> &HumanActorProvenance {
+    pub const fn actor(&self) -> &IncomingActor {
         &self.actor
     }
-
-    pub const fn source(&self) -> &DirectChatSource {
+    pub const fn source(&self) -> &IncomingSource {
         &self.source
     }
-
+    pub fn messaging_source(&self) -> Option<&MessagingSource> {
+        match &self.source {
+            IncomingSource::Messaging(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+    pub fn is_external(&self) -> bool {
+        self.messaging_source().is_some()
+    }
+    pub fn output_audience(&self) -> OutputAudience {
+        if self.is_external() {
+            OutputAudience::Secretary
+        } else {
+            OutputAudience::DirectChat
+        }
+    }
+    pub fn authenticated_direct_chat_human(&self) -> Option<&str> {
+        if self.version == 1 && !self.is_external() && self.actor.kind == ActorKind::Human {
+            Some(&self.actor.principal_id)
+        } else {
+            None
+        }
+    }
     pub fn validate(
         &self,
         expected_target: &PersonalityAgentId,
     ) -> Result<(), RuntimeContractError> {
-        if self.version != DIRECT_CHAT_PROVENANCE_VERSION {
-            return Err(RuntimeContractError::DirectChatProvenanceWrongVersion);
-        }
         validate_provenance_identity(self.tenant_id.clone(), "tenant id")?;
-        self.actor.validate()?;
+        validate_provenance_identity(self.actor.principal_id.clone(), "actor principal id")?;
         if &self.personality_agent_id != expected_target {
             return Err(RuntimeContractError::DirectChatProvenanceTargetMismatch);
         }
-        Ok(())
+        match &self.source {
+            IncomingSource::DirectChat {}
+                if self.version == 1
+                    && self.actor.kind == ActorKind::Human
+                    && self.actor.display_name.is_none() =>
+            {
+                Ok(())
+            }
+            IncomingSource::Messaging(source) if self.version == 2 => {
+                source.validate()?;
+                if source.kind == MessagingEventKind::ReplyLaterDue
+                    && (self.actor.kind != ActorKind::PersonalityAgent
+                        || self.actor.principal_id != self.personality_agent_id.as_str())
+                {
+                    return Err(RuntimeContractError::InvalidIncomingProvenance);
+                }
+                Ok(())
+            }
+            _ => Err(RuntimeContractError::InvalidIncomingProvenance),
+        }
     }
 }
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DirectChatProvenanceWire {
+struct IncomingProvenanceWire {
     version: u8,
     tenant_id: String,
     personality_agent_id: PersonalityAgentId,
-    actor: HumanActorProvenance,
-    source: DirectChatSource,
+    actor: IncomingActor,
+    source: IncomingSource,
 }
-
-impl TryFrom<DirectChatProvenanceWire> for DirectChatProvenanceV1 {
+impl TryFrom<IncomingProvenanceWire> for IncomingProvenance {
     type Error = RuntimeContractError;
-
-    fn try_from(wire: DirectChatProvenanceWire) -> Result<Self, Self::Error> {
-        if wire.version != DIRECT_CHAT_PROVENANCE_VERSION {
-            return Err(RuntimeContractError::DirectChatProvenanceWrongVersion);
-        }
-        Ok(Self {
+    fn try_from(wire: IncomingProvenanceWire) -> Result<Self, Self::Error> {
+        let value = Self {
             version: wire.version,
-            tenant_id: validate_provenance_identity(wire.tenant_id, "tenant id")?,
+            tenant_id: wire.tenant_id,
             personality_agent_id: wire.personality_agent_id,
             actor: wire.actor,
             source: wire.source,
-        })
+        };
+        value.validate(&value.personality_agent_id)?;
+        Ok(value)
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "HumanActorProvenanceWire")]
-pub struct HumanActorProvenance {
-    kind: HumanActorKind,
-    principal_id: String,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HumanActorProvenanceWire {
-    kind: HumanActorKind,
+pub struct IncomingActor {
+    kind: ActorKind,
     principal_id: String,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    display_name: Option<String>,
 }
-
-impl TryFrom<HumanActorProvenanceWire> for HumanActorProvenance {
-    type Error = RuntimeContractError;
-
-    fn try_from(wire: HumanActorProvenanceWire) -> Result<Self, Self::Error> {
-        Ok(Self {
-            kind: wire.kind,
-            principal_id: validate_provenance_identity(wire.principal_id, "human principal id")?,
-        })
-    }
-}
-
-impl HumanActorProvenance {
-    fn new(principal_id: impl Into<String>) -> Result<Self, RuntimeContractError> {
-        Ok(Self {
-            kind: HumanActorKind::Human,
-            principal_id: validate_provenance_identity(principal_id.into(), "human principal id")?,
-        })
-    }
-
-    pub const fn kind(&self) -> HumanActorKind {
+impl IncomingActor {
+    pub const fn kind(&self) -> ActorKind {
         self.kind
     }
-
     pub fn principal_id(&self) -> &str {
         &self.principal_id
     }
-
-    fn validate(&self) -> Result<(), RuntimeContractError> {
-        validate_provenance_identity(self.principal_id.clone(), "human principal id")?;
-        Ok(())
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HumanActorKind {
+pub enum ActorKind {
     Human,
+    PersonalityAgent,
 }
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IncomingSource {
+    DirectChat {},
+    // Source details are uncommon but IncomingProvenance is carried through
+    // every command/message and their async futures, including DirectChat.
+    Messaging(Box<MessagingSource>),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DirectChatSource {
-    surface: DirectChatSurface,
+pub struct MessagingSource {
+    pub event_id: String,
+    pub kind: MessagingEventKind,
+    pub workspace_id: String,
+    pub installation_id: String,
+    pub authority_epoch: u64,
+    pub place: MessagingPlace,
+    pub message_id: String,
+    pub message_revision: u64,
+    pub message_seq: u64,
+    pub occurred_at: String,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub marker_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub due_at: Option<String>,
 }
-
-impl DirectChatSource {
-    pub const fn surface(&self) -> DirectChatSurface {
-        self.surface
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DirectChatSurface {
-    #[default]
-    DirectChat,
+pub enum MessagingEventKind {
+    MessagingMention,
+    MessagingMessage,
+    ReplyLaterDue,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagingPlace {
+    pub id: String,
+    pub kind: MessagingPlaceKind,
+    pub name: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagingPlaceKind {
+    Channel,
+    Thread,
+    Dm,
+    GroupDm,
+}
+fn present_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+impl MessagingSource {
+    fn validate(&self) -> Result<(), RuntimeContractError> {
+        let fail = || RuntimeContractError::InvalidIncomingProvenance;
+        for id in [
+            &self.event_id,
+            &self.workspace_id,
+            &self.installation_id,
+            &self.place.id,
+            &self.message_id,
+        ] {
+            let uuid = Uuid::parse_str(id).map_err(|_| fail())?;
+            if uuid.hyphenated().to_string() != *id {
+                return Err(fail());
+            }
+        }
+        if [
+            self.authority_epoch,
+            self.message_revision,
+            self.message_seq,
+        ]
+        .iter()
+        .any(|n| *n == 0 || *n > 9_007_199_254_740_991)
+        {
+            return Err(fail());
+        }
+        chrono::DateTime::parse_from_rfc3339(&self.occurred_at).map_err(|_| fail())?;
+        match self.kind {
+            MessagingEventKind::MessagingMention | MessagingEventKind::MessagingMessage
+                if self.marker_id.is_none() && self.due_at.is_none() =>
+            {
+                ()
+            }
+            MessagingEventKind::ReplyLaterDue => {
+                let id = self.marker_id.as_deref().ok_or_else(fail)?;
+                if Uuid::parse_str(id)
+                    .map_err(|_| fail())?
+                    .hyphenated()
+                    .to_string()
+                    != id
+                {
+                    return Err(fail());
+                }
+                chrono::DateTime::parse_from_rfc3339(self.due_at.as_deref().ok_or_else(fail)?)
+                    .map_err(|_| fail())?;
+            }
+            _ => return Err(fail()),
+        }
+        Ok(())
+    }
 }
 
 fn validate_provenance_identity(
@@ -624,14 +732,14 @@ mod tests {
     fn direct_chat_provenance_is_closed_and_binds_authenticated_dimensions() {
         let paid = PersonalityAgentId::parse(PAID).unwrap();
         let provenance =
-            DirectChatProvenanceV1::new("tenant-at-admission", paid.clone(), "human-123").unwrap();
+            IncomingProvenance::new("tenant-at-admission", paid.clone(), "human-123").unwrap();
         provenance.validate(&paid).unwrap();
         assert_eq!(provenance.version(), 1);
         assert_eq!(provenance.tenant_id(), "tenant-at-admission");
         assert_eq!(provenance.personality_agent_id(), &paid);
-        assert_eq!(provenance.actor().kind(), HumanActorKind::Human);
+        assert_eq!(provenance.actor().kind(), ActorKind::Human);
         assert_eq!(provenance.actor().principal_id(), "human-123");
-        assert_eq!(provenance.source().surface(), DirectChatSurface::DirectChat);
+        assert!(matches!(provenance.source(), IncomingSource::DirectChat {}));
         assert_eq!(
             serde_json::to_value(&provenance).unwrap(),
             serde_json::json!({
@@ -648,7 +756,7 @@ mod tests {
     fn direct_chat_provenance_rejects_unknown_shape_and_target_mismatch() {
         let wrong_target =
             PersonalityAgentId::parse("0198f0f4-9b72-7000-8000-000000000002").unwrap();
-        let provenance = DirectChatProvenanceV1::new(
+        let provenance = IncomingProvenance::new(
             "tenant-at-admission",
             PersonalityAgentId::parse(PAID).unwrap(),
             "human-123",
@@ -666,7 +774,7 @@ mod tests {
                 r#"{{"version":1,"tenant_id":"tenant","personality_agent_id":"{PAID}","actor":{{"kind":"human","principal_id":"human"}},"source":{{"surface":"direct_chat"}},"unknown":true}}"#
             ),
         ] {
-            let parsed = serde_json::from_str::<DirectChatProvenanceV1>(&raw);
+            let parsed = serde_json::from_str::<IncomingProvenance>(&raw);
             assert!(parsed.is_err());
         }
     }
@@ -689,10 +797,76 @@ mod tests {
                 "source": {"surface": "direct_chat"}
             });
             assert!(
-                serde_json::from_value::<DirectChatProvenanceV1>(raw).is_err(),
+                serde_json::from_value::<IncomingProvenance>(raw).is_err(),
                 "unexpectedly accepted tenant={tenant_id:?}, principal={principal_id:?}"
             );
         }
+    }
+
+    #[test]
+    fn external_provenance_is_typed_and_never_grants_direct_human_authority() {
+        let provenance = crate::gateway::test_messaging_provenance();
+        assert!(provenance.is_external());
+        assert_eq!(provenance.output_audience(), OutputAudience::Secretary);
+        assert_eq!(provenance.authenticated_direct_chat_human(), None);
+        assert_eq!(provenance.actor().display_name(), Some("Example Human"));
+        let raw = serde_json::to_value(&provenance).unwrap();
+        for (pointer, value) in [
+            ("/version", serde_json::json!(1)),
+            ("/actor/kind", serde_json::json!("system")),
+            ("/actor/display_name", serde_json::Value::Null),
+            ("/source/event_id", serde_json::json!("not-a-uuid")),
+            ("/source/authority_epoch", serde_json::json!(0)),
+            (
+                "/source/message_seq",
+                serde_json::json!(9_007_199_254_740_992u64),
+            ),
+            ("/source/occurred_at", serde_json::json!("yesterday")),
+            ("/source/place/kind", serde_json::json!("unknown")),
+        ] {
+            let mut invalid = raw.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                serde_json::from_value::<IncomingProvenance>(invalid).is_err(),
+                "{pointer}"
+            );
+        }
+        for pointer in ["", "/actor", "/source", "/source/place"] {
+            let mut invalid = raw.clone();
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<IncomingProvenance>(invalid).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut dm = raw.clone();
+        dm["source"]["kind"] = serde_json::json!("messaging_message");
+        dm["source"]["place"]["kind"] = serde_json::json!("dm");
+        let parsed = serde_json::from_value::<IncomingProvenance>(dm.clone()).unwrap();
+        assert_eq!(parsed.authenticated_direct_chat_human(), None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), dm);
+        dm["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
+        assert!(serde_json::from_value::<IncomingProvenance>(dm).is_err());
+        let mut reminder = raw.clone();
+        reminder["source"]["kind"] = serde_json::json!("reply_later_due");
+        reminder["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
+        reminder["source"]["due_at"] = serde_json::json!("2026-09-08T13:00:00Z");
+        assert!(serde_json::from_value::<IncomingProvenance>(reminder.clone()).is_err());
+        reminder["actor"]["kind"] = serde_json::json!("personality_agent");
+        reminder["actor"]["principal_id"] = reminder["personality_agent_id"].clone();
+        let parsed = serde_json::from_value::<IncomingProvenance>(reminder.clone()).unwrap();
+        assert_eq!(parsed.authenticated_direct_chat_human(), None);
+        reminder["source"]["kind"] = serde_json::json!("messaging_mention");
+        assert!(serde_json::from_value::<IncomingProvenance>(reminder).is_err());
+        let mut direct =
+            serde_json::to_value(crate::gateway::test_direct_chat_provenance()).unwrap();
+        direct["source"]["event_id"] = raw["source"]["event_id"].clone();
+        assert!(serde_json::from_value::<IncomingProvenance>(direct).is_err());
     }
 
     #[test]

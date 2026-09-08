@@ -359,13 +359,17 @@ export function ConversationVirtualizer<
           height: "100%",
           overflowX: "hidden",
           overflowY: "auto",
+          // Virtualizer measurements own anchoring; native anchoring would apply
+          // a second correction when a mounted row changes height.
+          overflowAnchor: "none",
         }}
       >
         <div
           className={contentClassName}
           style={{
             height: virtualizer.getTotalSize(),
-            position: "relative",
+            paddingTop: virtualItems[0]?.start ?? 0,
+            boxSizing: "border-box",
             width: "100%",
           }}
         >
@@ -380,10 +384,10 @@ export function ConversationVirtualizer<
                 data-index={virtualItem.index}
                 data-message-id={item.id}
                 style={{
-                  left: 0,
-                  position: "absolute",
-                  top: 0,
-                  transform: `translateY(${virtualItem.start}px)`,
+                  // Keep the mounted, contiguous window in document flow.
+                  // A suspended row can measure zero before its content loads;
+                  // stale cached offsets must not stack newly visible rows.
+                  display: "flow-root",
                   width: "100%",
                 }}
               >

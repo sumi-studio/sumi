@@ -686,9 +686,15 @@ export interface components {
              */
             command_id: string;
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            provenance: components["schemas"]["DirectChatProvenanceV1"];
-            command: components["schemas"]["Command"];
-        };
+            provenance: components["schemas"]["IncomingProvenance"];
+            command: components["schemas"]["Command"] | components["schemas"]["ExternalEventCommand"];
+        } & ({
+            provenance?: components["schemas"]["DirectChatProvenanceV1"];
+            command?: components["schemas"]["Command"];
+        } | {
+            provenance?: components["schemas"]["MessagingProvenanceV2"];
+            command?: components["schemas"]["ExternalEventCommand"];
+        });
         /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
         PersonalityAgentId: string;
         DirectChatProvenanceV1: {
@@ -793,6 +799,11 @@ export interface components {
             idempotency_key: string;
             command: components["schemas"]["Command"];
         };
+        /**
+         * @description Execution context recorded in the debugging log; not message delivery or visibility permission.
+         * @enum {string}
+         */
+        OutputAudience: "direct_chat" | "secretary";
         AgentStartEvent: {
             /** @constant */
             type: "agent_start";
@@ -823,6 +834,69 @@ export interface components {
                 received_at: string;
             };
         };
+        /** @description opaque ASCII tenant identity */
+        TenantId: string;
+        /** @description opaque ASCII principal identity */
+        PrincipalId: string;
+        /** Format: uuid */
+        CanonicalUUID: string;
+        MessagingEventSource: {
+            /** @constant */
+            surface: "messaging";
+            event_id: components["schemas"]["CanonicalUUID"];
+            /** @enum {unknown} */
+            kind: "messaging_mention" | "messaging_message";
+            workspace_id: components["schemas"]["CanonicalUUID"];
+            installation_id: components["schemas"]["CanonicalUUID"];
+            authority_epoch: components["schemas"]["JsonSafeInteger"];
+            place: {
+                id: components["schemas"]["CanonicalUUID"];
+                /** @enum {unknown} */
+                kind: "channel" | "thread" | "dm" | "group_dm";
+                name: string;
+            };
+            message_id: components["schemas"]["CanonicalUUID"];
+            message_revision: components["schemas"]["JsonSafeInteger"];
+            message_seq: components["schemas"]["JsonSafeInteger"];
+            /** Format: date-time */
+            occurred_at: string;
+        } | {
+            /** @constant */
+            surface: "messaging";
+            event_id: components["schemas"]["CanonicalUUID"];
+            /** @constant */
+            kind: "reply_later_due";
+            workspace_id: components["schemas"]["CanonicalUUID"];
+            installation_id: components["schemas"]["CanonicalUUID"];
+            authority_epoch: components["schemas"]["JsonSafeInteger"];
+            place: {
+                id: components["schemas"]["CanonicalUUID"];
+                /** @enum {unknown} */
+                kind: "channel" | "thread" | "dm" | "group_dm";
+                name: string;
+            };
+            message_id: components["schemas"]["CanonicalUUID"];
+            message_revision: components["schemas"]["JsonSafeInteger"];
+            message_seq: components["schemas"]["JsonSafeInteger"];
+            /** Format: date-time */
+            occurred_at: string;
+            marker_id: components["schemas"]["CanonicalUUID"];
+            /** Format: date-time */
+            due_at: string;
+        };
+        MessagingProvenanceV2: {
+            /** @constant */
+            version: 2;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @enum {unknown} */
+                kind: "human" | "personality_agent";
+                principal_id: components["schemas"]["PrincipalId"];
+                display_name?: string;
+            };
+            source: components["schemas"]["MessagingEventSource"];
+        };
         UserMessage: {
             /** @constant */
             role: "user";
@@ -830,6 +904,7 @@ export interface components {
             /** Format: date-time */
             timestamp: string;
             incoming_timing?: components["schemas"]["IncomingEventTiming"];
+            incoming_source?: components["schemas"]["MessagingProvenanceV2"];
         };
         /** @description any JSON value */
         AnyJSON: {
@@ -954,6 +1029,15 @@ export interface components {
             message_id: string;
             message: components["schemas"]["PublicMessage"];
         };
+        /** @description Completed provider-authored display summary. Not raw reasoning or model replay content. */
+        ReasoningSummaryEvent: {
+            /** @constant */
+            type: "reasoning_summary";
+            message_id: components["schemas"]["CanonicalUUID"];
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+            content_index: components["schemas"]["JsonSafeInteger"];
+            content: string;
+        };
         /** @description any JSON object whose property values are JSON-safe AnyJSON values */
         AnyJSONObject: {
             [key: string]: components["schemas"]["AnyJSON"];
@@ -1071,7 +1155,7 @@ export interface components {
             status: "rejected";
             reject_reason: components["schemas"]["CommandRejectReason"];
         };
-        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ReasoningSummaryEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {
@@ -1161,9 +1245,11 @@ export interface components {
         };
         VolatileAgentEvent: components["schemas"]["MessageUpdateEvent"] | components["schemas"]["ToolExecutionUpdateEvent"] | components["schemas"]["ErrorEvent"];
         BrowserEventEnvelope: {
+            audience: components["schemas"]["OutputAudience"];
             seq: components["schemas"]["JsonSafeInteger"];
             event: components["schemas"]["DurableAgentEvent"];
         } | {
+            audience: components["schemas"]["OutputAudience"];
             event: components["schemas"]["VolatileAgentEvent"];
         };
         BrowserEventFrame: {
@@ -1201,17 +1287,21 @@ export interface components {
             /** @enum {string} */
             reason: "rehydrating" | "stopped" | "unavailable";
         };
-        /** @description opaque ASCII tenant identity */
-        TenantId: string;
-        /** @description opaque ASCII principal identity */
-        PrincipalId: string;
+        ExternalEventCommand: {
+            /** @constant */
+            type: "external_event";
+            content: string;
+        };
+        IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["MessagingProvenanceV2"];
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            audience: components["schemas"]["OutputAudience"];
             event: components["schemas"]["DurableAgentEvent"];
             seq: components["schemas"]["JsonSafeInteger"];
         };
         VolatileEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            audience: components["schemas"]["OutputAudience"];
             event: components["schemas"]["VolatileAgentEvent"];
         };
         Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];

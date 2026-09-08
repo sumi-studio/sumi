@@ -53,6 +53,7 @@ type provisionedRuntimeSpawnerConfig struct {
 	TeardownTimeout     time.Duration
 	StartupReadyTimeout time.Duration
 	Activation          runtimeprovision.ActivationConfig
+	ResolveActivation   runtimeActivationResolver
 }
 
 // provisionedRuntimeSpawner is the only production lazy-spawn implementation.
@@ -195,6 +196,12 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	}
 
 	activation := s.config.Activation
+	if s.config.ResolveActivation != nil {
+		activation, err = s.config.ResolveActivation(ctx, config.AgentID, activation)
+		if err != nil {
+			return nil, cleanup(errors.New("resolve PA model connection failed"))
+		}
+	}
 	activation.GatewayURL = config.GatewayURL
 	activation.LocalControlBearer = bearer
 	activation.AgentWrappingKey = config.WrappingKey.Bytes
@@ -438,9 +445,14 @@ type provisionedProcess struct {
 	timeout         time.Duration
 	teardownTimeout time.Duration
 	monitorInterval time.Duration
-	done            chan struct{}
-	stopOnce        sync.Once
-	stopErr         error
+	// done wakes Wait after a teardown attempt; stopErr distinguishes incomplete
+	// cleanup from physical completion. Failures can be retried under stopMu.
+	done     chan struct{}
+	stopMu   sync.Mutex
+	doneOnce sync.Once
+	stopped  bool
+	retiring bool
+	stopErr  error
 }
 
 func (p *provisionedProcess) Wait() error {
@@ -462,7 +474,13 @@ func (p *provisionedProcess) Wait() error {
 	for {
 		select {
 		case <-p.done:
-			return p.stopErr
+			p.stopMu.Lock()
+			err := p.stopErr
+			p.stopMu.Unlock()
+			if err != nil {
+				return errors.Join(spawn.ErrCleanupIncomplete, err)
+			}
+			return nil
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 			inspection, err := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
@@ -492,8 +510,14 @@ func (p *provisionedProcess) Wait() error {
 // does not call Stop after Wait, so returning would strand a surviving local
 // runtime outside lifecycle ownership.
 func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
-	p.stopOnce.Do(func() {
-		defer close(p.done)
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	if p.stopped {
+		return cause
+	}
+	p.retiring = true
+	p.stopErr = nil
+	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), p.teardownTimeout)
 		defer cancel()
 
@@ -556,13 +580,27 @@ func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
 			*teardown.ReapedThroughGeneration != p.epoch.Generation {
 			p.stopErr = errors.New("monitored runtime teardown did not return an exact observed-empty reap receipt")
 		}
-	})
-	return errors.Join(cause, p.stopErr)
+	}()
+	p.stopped = p.stopErr == nil
+	p.doneOnce.Do(func() { close(p.done) })
+	if p.stopErr != nil {
+		return errors.Join(spawn.ErrCleanupIncomplete, cause, p.stopErr)
+	}
+	return cause
 }
 
 func (p *provisionedProcess) Stop() error {
-	p.stopOnce.Do(func() {
-		defer close(p.done)
+	p.stopMu.Lock()
+	if p.retiring {
+		p.stopMu.Unlock()
+		return p.retireAfterMonitorFailure(nil)
+	}
+	defer p.stopMu.Unlock()
+	if p.stopped {
+		return nil
+	}
+	p.stopErr = nil
+	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), p.teardownTimeout)
 		defer cancel()
 		// Fence credentials and Ready before asking the privileged service to
@@ -595,7 +633,9 @@ func (p *provisionedProcess) Stop() error {
 		var listenerErr error
 		listenerErr = p.listeners.CloseLocalRuntime(ctx, p.epoch.PersonalityAgentID)
 		p.stopErr = errors.Join(fenceErr, stopErr, listenerErr)
-	})
+	}()
+	p.stopped = p.stopErr == nil
+	p.doneOnce.Do(func() { close(p.done) })
 	return p.stopErr
 }
 

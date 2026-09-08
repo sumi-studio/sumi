@@ -17,21 +17,28 @@ $comment: |
   context) so they can be updated once T17 lands without a compatibility break.
 
 $defs:
+  OutputAudience:
+    description: Execution context recorded in the debugging log; not message delivery or visibility permission.
+    type: string
+    enum: [direct_chat, secretary]
+
   DurableEnvelope:
     type: object
-    required: [personality_agent_id, event, seq]
+    required: [personality_agent_id, audience, event, seq]
     additionalProperties: false
     properties:
       personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      audience: { $ref: '#/$defs/OutputAudience' }
       event: { $ref: '#/$defs/DurableAgentEvent' }
       seq: { $ref: '#/$defs/JsonSafeInteger' }
 
   VolatileEnvelope:
     type: object
-    required: [personality_agent_id, event]
+    required: [personality_agent_id, audience, event]
     additionalProperties: false
     properties:
       personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      audience: { $ref: '#/$defs/OutputAudience' }
       event: { $ref: '#/$defs/VolatileAgentEvent' }
 
   Envelope:
@@ -86,6 +93,18 @@ $defs:
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         description: durable messages.id; user messages are UUIDv5(command_id, namespace)
       message: { $ref: '#/$defs/PublicMessage' }
+
+  ReasoningSummaryEvent:
+    type: object
+    description: Completed provider-authored display summary. Not raw reasoning or model replay content.
+    required: [type, message_id, content_index, wire_item_index, content]
+    additionalProperties: false
+    properties:
+      type: { const: reasoning_summary }
+      message_id: { $ref: '#/$defs/CanonicalUUID' }
+      wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+      content_index: { $ref: '#/$defs/JsonSafeInteger' }
+      content: { type: string }
 
   MessageUpdateEvent:
     type: object
@@ -241,6 +260,7 @@ $defs:
       - { $ref: '#/$defs/MessageStartEvent' }
       - { $ref: '#/$defs/MessageUpdateEvent' }
       - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ReasoningSummaryEvent' }
       - { $ref: '#/$defs/ToolExecutionStartEvent' }
       - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
@@ -260,6 +280,7 @@ $defs:
       - { $ref: '#/$defs/TurnEndEvent' }
       - { $ref: '#/$defs/MessageStartEvent' }
       - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ReasoningSummaryEvent' }
       - { $ref: '#/$defs/ToolExecutionStartEvent' }
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
       - { $ref: '#/$defs/ApprovalRequestedEvent' }
@@ -389,6 +410,7 @@ $defs:
         items: { $ref: '#/$defs/UserContent' }
       timestamp: { type: string, format: date-time }
       incoming_timing: { $ref: '#/$defs/IncomingEventTiming' }
+      incoming_source: { $ref: '#/$defs/MessagingProvenanceV2' }
 
   IncomingEventTiming:
     description: Server-authored receipt timing; absent for messages without an incoming event.
@@ -767,6 +789,102 @@ $defs:
         properties:
           surface: { const: direct_chat }
 
+  CanonicalUUID:
+    type: string
+    format: uuid
+    pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+  ExternalEventCommand:
+    type: object
+    required: [type, content]
+    additionalProperties: false
+    properties:
+      type: { const: external_event }
+      content: { type: string }
+
+  IncomingProvenance:
+    oneOf:
+      - { $ref: '#/$defs/DirectChatProvenanceV1' }
+      - { $ref: '#/$defs/MessagingProvenanceV2' }
+
+  MessagingProvenanceV2:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 2 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { enum: [human, personality_agent] }
+          principal_id: { $ref: '#/$defs/PrincipalId' }
+          display_name: { type: string }
+      source: { $ref: '#/$defs/MessagingEventSource' }
+    if:
+      properties:
+        source:
+          properties:
+            kind: { const: reply_later_due }
+    then:
+      properties:
+        actor:
+          properties:
+            kind: { const: personality_agent }
+    $comment: Reminder actor.principal_id must equal personality_agent_id; enforce at runtime.
+
+  MessagingEventSource:
+    oneOf:
+      - type: object
+        required: [surface, event_id, kind, workspace_id, installation_id, authority_epoch, place, message_id, message_revision, message_seq, occurred_at]
+        additionalProperties: false
+        properties:
+          surface: { const: messaging }
+          event_id: { $ref: '#/$defs/CanonicalUUID' }
+          kind: { enum: [messaging_mention, messaging_message] }
+          workspace_id: { $ref: '#/$defs/CanonicalUUID' }
+          installation_id: { $ref: '#/$defs/CanonicalUUID' }
+          authority_epoch: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          place:
+            type: object
+            required: [id, kind, name]
+            additionalProperties: false
+            properties:
+              id: { $ref: '#/$defs/CanonicalUUID' }
+              kind: { enum: [channel, thread, dm, group_dm] }
+              name: { type: string }
+          message_id: { $ref: '#/$defs/CanonicalUUID' }
+          message_revision: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          message_seq: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          occurred_at: { type: string, format: date-time }
+      - type: object
+        required: [surface, event_id, kind, workspace_id, installation_id, authority_epoch, place, message_id, message_revision, message_seq, occurred_at, marker_id, due_at]
+        additionalProperties: false
+        properties:
+          surface: { const: messaging }
+          event_id: { $ref: '#/$defs/CanonicalUUID' }
+          kind: { const: reply_later_due }
+          workspace_id: { $ref: '#/$defs/CanonicalUUID' }
+          installation_id: { $ref: '#/$defs/CanonicalUUID' }
+          authority_epoch: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          place:
+            type: object
+            required: [id, kind, name]
+            additionalProperties: false
+            properties:
+              id: { $ref: '#/$defs/CanonicalUUID' }
+              kind: { enum: [channel, thread, dm, group_dm] }
+              name: { type: string }
+          message_id: { $ref: '#/$defs/CanonicalUUID' }
+          message_revision: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          message_seq: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          occurred_at: { type: string, format: date-time }
+          marker_id: { $ref: '#/$defs/CanonicalUUID' }
+          due_at: { type: string, format: date-time }
+
   CommandEnvelope:
     type: object
     required: [seq, command_id, personality_agent_id, provenance, command]
@@ -779,8 +897,18 @@ $defs:
         pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         description: canonical lower-case hyphenated UUID
       personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
-      provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
-      command: { $ref: '#/$defs/Command' }
+      provenance: { $ref: '#/$defs/IncomingProvenance' }
+      command:
+        oneOf:
+          - { $ref: '#/$defs/Command' }
+          - { $ref: '#/$defs/ExternalEventCommand' }
+    oneOf:
+      - properties:
+          provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
+          command: { $ref: '#/$defs/Command' }
+      - properties:
+          provenance: { $ref: '#/$defs/MessagingProvenanceV2' }
+          command: { $ref: '#/$defs/ExternalEventCommand' }
     $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
 
   CommandRejectReason:
@@ -855,15 +983,17 @@ $defs:
   BrowserEventEnvelope:
     oneOf:
       - type: object
-        required: [seq, event]
+        required: [seq, event, audience]
         additionalProperties: false
         properties:
+          audience: { $ref: '#/$defs/OutputAudience' }
           seq: { $ref: '#/$defs/JsonSafeInteger' }
           event: { $ref: '#/$defs/DurableAgentEvent' }
       - type: object
-        required: [event]
+        required: [event, audience]
         additionalProperties: false
         properties:
+          audience: { $ref: '#/$defs/OutputAudience' }
           event: { $ref: '#/$defs/VolatileAgentEvent' }
 
   BrowserEventFrame:

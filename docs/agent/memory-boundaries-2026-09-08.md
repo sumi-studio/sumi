@@ -33,3 +33,11 @@ provenance and chronological scope of the text actually substituted. Do not
 replace the full-parent fork with an isolated summarizer to enforce this rule.
 This boundary does not require compulsory reflection, notes, or a personality
 ritual.
+
+The user approved trying the comparison, while emphasizing that useful evidence
+requires a long run resembling real operation. Short probes establish mechanics
+and obvious failures, not long-term superiority. Compare initial changed-prefix
+cost with subsequent reuse of that same prefix; a speculative promoted prefix
+may itself receive cache hits while retained. Record actual reported cache usage
+and elapsed intervals, rather than assuming every such fork is a cache miss.
+Preparing this experiment does not switch production to speculative promotion.

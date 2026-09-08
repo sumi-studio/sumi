@@ -81,12 +81,17 @@ export class SumiSessionCompensationFailedError extends AggregateError {
   }
 }
 
-async function fetchCSRFToken(): Promise<string> {
-  const response = await fetch("/auth/csrf", {
+export async function fetchCSRFToken(
+  options: { fetcher?: typeof fetch; signal?: AbortSignal } = {},
+): Promise<string> {
+  const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+  const response = await fetcher("/auth/csrf", {
     credentials: "include",
     cache: "no-store",
     headers: { Accept: "application/json" },
-    signal: authRequestSignal(),
+    signal: options.signal
+      ? AbortSignal.any([options.signal, authRequestSignal()])
+      : authRequestSignal(),
   });
   if (!response.ok) {
     throw await authAPIError(response);

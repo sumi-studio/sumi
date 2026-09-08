@@ -1270,6 +1270,7 @@ mod tests {
         });
         let first = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "The comparison uses the earlier draft.".to_owned(),
@@ -1288,6 +1289,7 @@ mod tests {
 
         let correction = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Correction: use the updated draft instead.".to_owned(),
@@ -1498,6 +1500,7 @@ mod tests {
             },
             ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_source: None,
                     incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "latest active user".to_owned(),
@@ -3067,6 +3070,7 @@ mod tests {
             id: "u1".to_owned(),
             seq: 1,
             message: Message::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "hello".to_owned(),

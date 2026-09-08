@@ -318,12 +318,13 @@ impl T17StoreAdapter {
                         }
                     }
                 };
-                let (epoch, seq, event, mut durable_fence) = match (mode, frame) {
+                let (epoch, seq, audience, event, mut durable_fence) = match (mode, frame) {
                     (
                         DeliveryMode::Raw,
                         DeliveryFrame::Durable {
                             seq,
                             epoch,
+                            audience,
                             raw: Some(event),
                             projection: None,
                         },
@@ -335,6 +336,7 @@ impl T17StoreAdapter {
                         (
                             epoch,
                             Some(seq),
+                            audience,
                             serde_json::to_value(event).context("serialize raw T17 delivery event"),
                             fence,
                         )
@@ -344,6 +346,7 @@ impl T17StoreAdapter {
                         DeliveryFrame::Durable {
                             seq,
                             epoch,
+                            audience,
                             raw: None,
                             projection: Some(projection),
                         },
@@ -353,11 +356,19 @@ impl T17StoreAdapter {
                             .unwrap()
                             .remove(&(epoch.as_u64(), seq));
                         let event = parse_projected_event(seq, &projection);
-                        (epoch, Some(seq), event, fence)
+                        (epoch, Some(seq), audience, event, fence)
                     }
-                    (DeliveryMode::Raw, DeliveryFrame::Volatile { epoch, event }) => (
+                    (
+                        DeliveryMode::Raw,
+                        DeliveryFrame::Volatile {
+                            epoch,
+                            audience,
+                            event,
+                        },
+                    ) => (
                         epoch,
                         None,
+                        audience,
                         serde_json::to_value(event)
                             .context("serialize volatile T17 delivery event"),
                         None,
@@ -401,6 +412,7 @@ impl T17StoreAdapter {
                     envelope: Envelope {
                         seq,
                         personality_agent_id: personality_agent_id.clone(),
+                        audience,
                         event,
                     },
                 };
@@ -641,7 +653,11 @@ impl T17StoreAdapter {
 
     /// Deliver an Online-only delta through the same pump/FIFO as durable
     /// notifications. Redaction-only authorization suppresses it in the pump.
-    pub(crate) async fn on_volatile(&self, event: crate::agent::AgentEvent) -> Result<()> {
+    pub(crate) async fn on_volatile(
+        &self,
+        audience: crate::runtime::contracts::OutputAudience,
+        event: crate::agent::AgentEvent,
+    ) -> Result<()> {
         let pump = self
             .pump
             .lock()
@@ -651,7 +667,7 @@ impl T17StoreAdapter {
         let Some(pump) = pump else {
             return Ok(());
         };
-        pump.on_volatile(event).await
+        pump.on_volatile(audience, event).await
     }
 
     #[cfg(test)]
@@ -724,6 +740,7 @@ impl SessionEventDelivery for T17StoreAdapter {
     async fn on_volatile(
         &self,
         personality_agent_id: &crate::runtime::contracts::PersonalityAgentId,
+        audience: crate::runtime::contracts::OutputAudience,
         event: crate::agent::AgentEvent,
     ) -> Result<()> {
         if personality_agent_id != &self.store.scope().personality_agent_id {
@@ -732,7 +749,7 @@ impl SessionEventDelivery for T17StoreAdapter {
                 self.store.scope().personality_agent_id
             );
         }
-        match T17StoreAdapter::on_volatile(self, event).await {
+        match T17StoreAdapter::on_volatile(self, audience, event).await {
             Err(error) if error.is::<DeliveryTransportError>() => {
                 // Volatile transport output has no replay obligation. T24
                 // reconnects the epoch; Session continues.
@@ -775,37 +792,6 @@ impl PostCommitAdmissionTarget for T17StoreAdapter {
     }
 }
 
-async fn projected_events_after(
-    store: &Store,
-    after_seq: u64,
-    limit: usize,
-) -> Result<Vec<(u64, String)>> {
-    if limit == 0 {
-        bail!("delivery event page size must be positive");
-    }
-    let rows = sqlx::query(
-        "SELECT seq, envelope
-         FROM agent_events
-         WHERE seq > ?
-         ORDER BY seq
-         LIMIT ?",
-    )
-    .bind(i64::try_from(after_seq).context("after_seq exceeds SQLite INTEGER range")?)
-    .bind(i64::try_from(limit).context("event page size exceeds SQLite INTEGER range")?)
-    .fetch_all(store.pool())
-    .await
-    .context("failed to fetch projected durable event page")?;
-
-    rows.into_iter()
-        .map(|row| {
-            let seq: i64 = row.try_get("seq")?;
-            let seq = u64::try_from(seq).context("stored event seq is negative")?;
-            let projection: String = row.try_get("envelope")?;
-            Ok((seq, projection))
-        })
-        .collect()
-}
-
 #[async_trait]
 impl DurableSource for T17StoreAdapter {
     fn bind_delivery_authorization(&self, authorization: DeliveryAuthorization) -> Result<Self> {
@@ -830,41 +816,30 @@ impl DurableSource for T17StoreAdapter {
         let authorization = self
             .authorization
             .context("delivery source used before authenticated authorization was bound")?;
-        let page: Vec<_> = match authorization {
-            DeliveryAuthorization::Raw => raw_events_after(&self.store, after_seq, limit)
-                .await?
-                .into_iter()
-                .map(|(seq, event)| {
-                    Ok(OutboundFrame::Event {
-                        envelope: Envelope {
-                            seq: Some(seq),
-                            personality_agent_id: self.store.scope().personality_agent_id.clone(),
-                            event: serde_json::to_value(event)
-                                .context("serialize durable T17 event for gateway")?,
-                        },
-                    })
-                })
-                .collect::<Result<_>>()?,
-            DeliveryAuthorization::RedactionOnly => {
-                projected_events_after(&self.store, after_seq, limit)
-                    .await?
-                    .into_iter()
-                    .map(|(seq, projection)| {
-                        Ok(OutboundFrame::Event {
-                            envelope: Envelope {
-                                seq: Some(seq),
-                                personality_agent_id: self
-                                    .store
-                                    .scope()
-                                    .personality_agent_id
-                                    .clone(),
-                                event: parse_projected_event(seq, &projection)?,
-                            },
-                        })
-                    })
-                    .collect::<Result<_>>()?
-            }
-        };
+        let events = raw_events_after(&self.store, after_seq, limit).await?;
+        let mut page = Vec::with_capacity(events.len());
+        for (seq, event) in events {
+            let audience = self.store.authenticated_event_audience(seq).await?;
+            let event = match authorization {
+                DeliveryAuthorization::Raw => serde_json::to_value(event)
+                    .context("serialize durable T17 event for gateway")?,
+                DeliveryAuthorization::RedactionOnly => {
+                    let projection = self
+                        .store
+                        .redactor()
+                        .redact_serialized(&serde_json::to_vec(&event)?)?;
+                    parse_projected_event(seq, &projection)?
+                }
+            };
+            page.push(OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: Some(seq),
+                    personality_agent_id: self.store.scope().personality_agent_id.clone(),
+                    audience,
+                    event,
+                },
+            });
+        }
         #[cfg(test)]
         self.replay_page_lengths.lock().unwrap().push(page.len());
         Ok(page)

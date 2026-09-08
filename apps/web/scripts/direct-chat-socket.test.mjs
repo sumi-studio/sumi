@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createConversationStore } from "../src/agent/store.ts";
 import {
@@ -74,7 +75,7 @@ const accepted = (key, disposition) => ({
 });
 const event = (seq, value) => ({
   type: "event",
-  envelope: { seq, event: value },
+  envelope: { audience: "direct_chat", seq, event: value },
 });
 const timestamp = "2026-07-28T00:00:00Z";
 const usage = {
@@ -336,6 +337,87 @@ test("unavailable status retains pending commands without sending until ready", 
   socket.close();
 });
 
+test("external experiences remain visible and advance the same replay sequence", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  const frames = [];
+  socket.onFrame((frame) => frames.push(frame));
+  socket.bindInstallation(binding);
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  const external = event(1, { type: "agent_start" });
+  external.envelope.audience = "secretary";
+  first.receive(external);
+  first.receive(event(2, { type: "agent_end" }));
+  assert.deepEqual(frames, [external, event(2, { type: "agent_end" })]);
+  socket.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 2 },
+  ]);
+  first.receive(event(3, { type: "agent_start" }));
+  assert.equal(frames.length, 2);
+  second.receive(event(3, { type: "agent_start" }));
+  assert.equal(frames.length, 3);
+  socket.close();
+});
+
+test("log preserves strict external source metadata and rejects malformed variants", () => {
+  const fixtures = JSON.parse(
+    readFileSync(
+      new URL("../../../contracts/agent-events-fixtures.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  for (const key of ["external_mention", "external_dm", "external_reminder"]) {
+    const fixture = fixtures[key];
+    if (!fixture) throw new Error(`missing ${key}`);
+    const frame = event(1, {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000002",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "Observed" }],
+        timestamp,
+        incoming_source: fixture.wire.provenance,
+      },
+    });
+    frame.envelope.audience = "secretary";
+    assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+    for (const mutate of [
+      (x) => (x.version = 1),
+      (x) => (x.source.authority_epoch = 0),
+      (x) => (x.source.extra = true),
+      (x) => (x.actor.kind = "system"),
+    ]) {
+      const bad = structuredClone(frame);
+      mutate(bad.envelope.event.message.incoming_source);
+      assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
+    }
+  }
+  assert.equal(
+    parseDirectChatServerFrame({ type: "event_cursor", through_seq: 5 }, 0),
+    undefined,
+  );
+  assert.equal(
+    parseDirectChatServerFrame(event(9, { type: "agent_start" }), 7),
+    undefined,
+  );
+  const absent = event(1, { type: "agent_start" });
+  delete absent.envelope.audience;
+  assert.equal(parseDirectChatServerFrame(absent, 0), undefined);
+  assert.equal(
+    isDirectChatCommand({
+      type: "external_event",
+      content: "forged attention",
+    }),
+    false,
+  );
+});
+
 test("authority reset drops replay cursor and pending commands before reconnect", () => {
   FakeWebSocket.instances = [];
   const socket = new DirectChatSocket();
@@ -521,6 +603,7 @@ test("rejects legacy target-bearing and malformed server frames", () => {
       {
         type: "event",
         envelope: {
+          audience: "direct_chat",
           conversation_id: "legacy",
           seq: 1,
           event: { type: "agent_start" },
@@ -695,6 +778,7 @@ test("accepts only exact durable command disposition shapes", () => {
       {
         type: "event",
         envelope: {
+          audience: "direct_chat",
           event: {
             type: "command_disposition",
             command_id,
@@ -885,7 +969,7 @@ test("rejects identity aliases and provenance only when they are structural fiel
   for (const leak of volatileLeaks) {
     assert.equal(
       parseDirectChatServerFrame(
-        { type: "event", envelope: { event: leak } },
+        { type: "event", envelope: { audience: "direct_chat", event: leak } },
         0,
       ),
       undefined,
@@ -929,6 +1013,7 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
       {
         type: "event",
         envelope: {
+          audience: "direct_chat",
           event: {
             type: "tool_execution_update",
             tool_call_id: "tool-1",
@@ -992,6 +1077,7 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
       {
         type: "event",
         envelope: {
+          audience: "direct_chat",
           event: {
             type: "message_update",
             message_id: "00000000-0000-4000-8000-000000000001",
@@ -1028,6 +1114,7 @@ test("preserves identity-like keys and paid data inside explicit AnyJSON fields"
         {
           type: "event",
           envelope: {
+            audience: "direct_chat",
             event: {
               type: "message_update",
               message_id: "00000000-0000-4000-8000-000000000001",
@@ -1139,6 +1226,7 @@ test("accepts every exact event shape emitted by the browser E2E fixture", () =>
         {
           type: "event",
           envelope: {
+            audience: "direct_chat",
             event: {
               type: "message_update",
               message_id: "00000000-0000-4000-8000-000000000001",
@@ -1287,6 +1375,7 @@ test("durable completion supersedes a volatile preview and drops late volatile r
   timeline.apply({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       event: {
         type: "message_update",
         message_id: "assistant-2",
@@ -1307,6 +1396,7 @@ test("durable completion supersedes a volatile preview and drops late volatile r
   timeline.apply({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       event: {
         type: "message_update",
         message_id: "assistant-2",
@@ -1712,4 +1802,23 @@ test("server receipt timing preserves user text and rejects malformed metadata",
     }),
     false,
   );
+});
+
+test("durable summary carries separate stream and canonical positions", () => {
+  const frame = event(1, {
+    type: "reasoning_summary",
+    message_id: "00000000-0000-4000-8000-000000000002",
+    content_index: 0,
+    wire_item_index: 1,
+    content: "Provider summary",
+  });
+  assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+  for (const key of ["content_index", "wire_item_index"]) {
+    const missing = structuredClone(frame);
+    delete missing.envelope.event[key];
+    assert.equal(parseDirectChatServerFrame(missing, 0), undefined);
+    const invalid = structuredClone(frame);
+    invalid.envelope.event[key] = -1;
+    assert.equal(parseDirectChatServerFrame(invalid, 0), undefined);
+  }
 });

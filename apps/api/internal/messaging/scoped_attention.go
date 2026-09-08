@@ -333,6 +333,9 @@ func (s *ScopedStore) CreateReplyLater(ctx context.Context, placeID, messageID, 
 		marker.MarkerID, s.Scope.Actor.Kind, s.Scope.Actor.ID, placeID, messageID, note, remindAt); err != nil {
 		return ReplyLaterMarker{}, false, fmt.Errorf("insert scoped reply-later: %w", err)
 	}
+	if err := s.issueAgentReminder(ctx, tx, place, message, marker, access); err != nil {
+		return ReplyLaterMarker{}, false, fmt.Errorf("issue PA reminder: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ReplyLaterMarker{}, false, err
 	}
@@ -372,6 +375,12 @@ func (s *ScopedStore) ResolveReplyLater(ctx context.Context, markerID string) (R
 		if _, err := tx.Exec(ctx, `UPDATE reply_later_markers SET resolved_at = now() WHERE marker_id = $1`, markerID); err != nil {
 			return ReplyLaterMarker{}, err
 		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_attention_deliveries
+		SET cancellation_requested_at=COALESCE(cancellation_requested_at,now()), next_attempt_at=now()
+		WHERE source_kind='reply_later_due' AND source_id=$1
+		  AND admitted_at IS NULL AND suppressed_at IS NULL`, markerID); err != nil {
+		return ReplyLaterMarker{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ReplyLaterMarker{}, err
@@ -481,6 +490,9 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 			decision.Participant.Kind, decision.Participant.ID, decision.Reason,
 			decision.workspaceMemberID, decision.placeMemberID); err != nil {
 			return fmt.Errorf("issue scoped notification intent: %w", err)
+		}
+		if err := s.issueAgentMessage(ctx, tx, place, message, members, decision); err != nil {
+			return fmt.Errorf("issue PA attention: %w", err)
 		}
 	}
 	return nil

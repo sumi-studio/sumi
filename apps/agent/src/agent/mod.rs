@@ -1504,13 +1504,16 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         command: &AdmittedCommand,
     ) -> Result<bool, SessionFailure> {
-        if !matches!(command.envelope().command, Command::UserMessage { .. })
-            || !self.deferred_commands.is_empty()
+        if !matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) || !self.deferred_commands.is_empty()
         {
             return Ok(false);
         }
         let eligible = self.active.as_ref().is_some_and(|active| {
-            *active.phase_rx.borrow() == WorkerPhase::RetryWait
+            active.bridge.same_output_audience(command)
+                && *active.phase_rx.borrow() == WorkerPhase::RetryWait
                 && active.bridge.can_bind_retry_steer(&self.writer, command)
         });
         if !eligible {
@@ -1579,12 +1582,18 @@ impl<G: Gateway + 'static> Session<G> {
         if matches!(command.envelope().command, Command::Abort {}) {
             return self.route_active_abort(command).await;
         }
-        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if !matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             return Ok(false);
         }
         let Some(active) = self.active.as_ref() else {
             return Ok(false);
         };
+        if !active.bridge.same_output_audience(&command) {
+            return Ok(false);
+        }
         let stage = active.bridge.steer_stage();
         let Some(application_kind) = stage.classify_user_command() else {
             return Ok(false);
@@ -1828,14 +1837,19 @@ impl<G: Gateway + 'static> Session<G> {
             return Ok(true);
         }
         let provenance = &command.envelope().provenance;
-        if !active.approval.as_ref().is_some_and(|broker| {
-            broker.pending_scope_matches(
-                request_id,
-                provenance.tenant_id(),
-                provenance.personality_agent_id().as_str(),
-                provenance.actor().principal_id(),
-            )
-        }) {
+        if !provenance
+            .authenticated_direct_chat_human()
+            .is_some_and(|human| {
+                active.approval.as_ref().is_some_and(|broker| {
+                    broker.pending_scope_matches(
+                        request_id,
+                        provenance.tenant_id(),
+                        provenance.personality_agent_id().as_str(),
+                        human,
+                    )
+                })
+            })
+        {
             // The command remains durably received, but it does not become the
             // in-flight resolver for a pending approval owned by another
             // Human. In particular, it must not block the owning Human's later
@@ -1895,10 +1909,12 @@ impl<G: Gateway + 'static> Session<G> {
     /// overtake an earlier deferred one.
     async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
         while let Some(command) = self.deferred_commands.pop_one() {
-            let was_user_message =
-                matches!(command.envelope().command, Command::UserMessage { .. });
+            let was_user_message = matches!(
+                command.envelope().command,
+                Command::UserMessage { .. } | Command::ExternalEvent { .. }
+            );
             let routed = match &command.envelope().command {
-                Command::UserMessage { .. } => {
+                Command::UserMessage { .. } | Command::ExternalEvent { .. } => {
                     if self.route_retry_wait_command(&command).await? {
                         true
                     } else {
@@ -2097,7 +2113,10 @@ impl<G: Gateway + 'static> Session<G> {
         if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
             return self.apply_idle_approval_decision(command).await;
         }
-        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if !matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             return Err(SessionFailure::IdleControl);
         }
         self.spawn_worker(command).await
@@ -2352,17 +2371,21 @@ impl<G: Gateway + 'static> Session<G> {
         let Some(next) = self.deferred_commands.pop_one() else {
             return Ok(());
         };
-        if !matches!(next.envelope().command, Command::UserMessage { .. }) {
+        if !matches!(
+            next.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             self.deferred_commands
                 .push_front(next)
                 .map_err(anyhow::Error::from)?;
             return Err(SessionFailure::IdleControl);
         }
-        if self
-            .deferred_commands
-            .iter()
-            .any(|command| !matches!(command.envelope().command, Command::UserMessage { .. }))
-        {
+        if self.deferred_commands.iter().any(|command| {
+            !matches!(
+                command.envelope().command,
+                Command::UserMessage { .. } | Command::ExternalEvent { .. }
+            )
+        }) {
             self.deferred_commands
                 .push_front(next)
                 .map_err(anyhow::Error::from)?;
@@ -2689,10 +2712,25 @@ impl<G: Gateway + 'static> Session<G> {
             committed.len() + usize::from(applied_command) + terminal_command_ids.len(),
         );
         for output in committed {
+            let audience = match output.seq {
+                Some(seq) => {
+                    self.writer
+                        .store()
+                        .authenticated_event_audience(seq)
+                        .await?
+                }
+                None => self
+                    .active
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("volatile output has no bound active audience"))?
+                    .bridge
+                    .output_audience(),
+            };
             frames.push(OutboundFrame::Event {
                 envelope: crate::gateway::Envelope {
                     seq: output.seq,
                     personality_agent_id: self.personality_agent_id.clone(),
+                    audience,
                     event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
                 },
             });
@@ -2769,18 +2807,22 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         events: Vec<(u64, AgentEvent)>,
     ) -> Result<(), SessionFailure> {
-        let frames = events
-            .into_iter()
-            .map(|(seq, event)| {
-                Ok(OutboundFrame::Event {
-                    envelope: crate::gateway::Envelope {
-                        seq: Some(seq),
-                        personality_agent_id: self.personality_agent_id.clone(),
-                        event: serde_json::to_value(event).map_err(anyhow::Error::from)?,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        let mut frames = Vec::with_capacity(events.len());
+        for (seq, event) in events {
+            let audience = self
+                .writer
+                .store()
+                .authenticated_event_audience(seq)
+                .await?;
+            frames.push(OutboundFrame::Event {
+                envelope: crate::gateway::Envelope {
+                    seq: Some(seq),
+                    personality_agent_id: self.personality_agent_id.clone(),
+                    audience,
+                    event: serde_json::to_value(event).map_err(anyhow::Error::from)?,
+                },
+            });
+        }
         if !frames.is_empty() {
             self.enqueue_reliable(frames).await?;
         }

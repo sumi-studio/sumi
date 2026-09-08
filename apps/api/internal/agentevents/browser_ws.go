@@ -158,8 +158,9 @@ type browserCommandReceipt struct {
 }
 
 type browserEventEnvelope struct {
-	Seq   *uint64         `json:"seq,omitempty"`
-	Event json.RawMessage `json:"event"`
+	Audience OutputAudience  `json:"audience"`
+	Seq      *uint64         `json:"seq,omitempty"`
+	Event    json.RawMessage `json:"event"`
 }
 
 type directChatStatusFrame struct {
@@ -198,12 +199,16 @@ func (e *browserEventEnvelope) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("browser event envelope: %w", err)
 	}
 	type rawEnvelope struct {
-		Seq   json.RawMessage `json:"seq"`
-		Event json.RawMessage `json:"event"`
+		Audience OutputAudience  `json:"audience"`
+		Seq      json.RawMessage `json:"seq"`
+		Event    json.RawMessage `json:"event"`
 	}
 	var raw rawEnvelope
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
+	}
+	if raw.Audience != AudienceDirectChat && raw.Audience != AudienceSecretary {
+		return errors.New("invalid browser execution context")
 	}
 	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
 		return errors.New("browser event envelope requires a valid event")
@@ -233,7 +238,7 @@ func (e *browserEventEnvelope) UnmarshalJSON(data []byte) error {
 		}
 		parsedSeq = &seq
 	}
-	*e = browserEventEnvelope{Seq: parsedSeq, Event: raw.Event}
+	*e = browserEventEnvelope{Seq: parsedSeq, Event: raw.Event, Audience: raw.Audience}
 	return nil
 }
 
@@ -977,8 +982,8 @@ func (s *BrowserServer) browserDurableCatchUp(
 	}
 	next := lastConsumed
 	for _, envelope := range durable {
-		if envelope.Seq == nil {
-			return next, errors.New("durable replay returned a volatile event")
+		if envelope.Seq == nil || *envelope.Seq != next+1 {
+			return next, errors.New("durable replay is not contiguous")
 		}
 		if envelope.PersonalityAgentID != personalityAgentID {
 			return next, errors.New("browser event target mismatch")
@@ -992,6 +997,7 @@ func (s *BrowserServer) browserDurableCatchUp(
 		}
 		next = *envelope.Seq
 	}
+
 	return next, nil
 }
 
@@ -1139,6 +1145,9 @@ func (s *BrowserServer) browserReadPump(
 }
 
 func projectBrowserEvent(envelope Envelope) (browserEventEnvelope, error) {
+	if envelope.Audience != AudienceDirectChat && envelope.Audience != AudienceSecretary {
+		return browserEventEnvelope{}, errors.New("invalid event execution context")
+	}
 	if err := ValidatePersonalityAgentID(envelope.PersonalityAgentID); err != nil {
 		return browserEventEnvelope{}, err
 	}
@@ -1146,7 +1155,7 @@ func projectBrowserEvent(envelope Envelope) (browserEventEnvelope, error) {
 	if err != nil {
 		return browserEventEnvelope{}, err
 	}
-	return browserEventEnvelope{Seq: envelope.Seq, Event: event}, nil
+	return browserEventEnvelope{Seq: envelope.Seq, Event: event, Audience: envelope.Audience}, nil
 }
 
 func readinessStatus(ready bool) string {

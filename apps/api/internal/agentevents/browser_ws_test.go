@@ -263,7 +263,7 @@ func (a dispositionBeforeAppendReturn) Append(
 	if err != nil {
 		return CommandEnvelope{}, err
 	}
-	if err := a.gateway.Receive(ctx, a.claims, Envelope{
+	if err := a.gateway.Receive(ctx, a.claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: envelope.PersonalityAgentID,
 		Event:              disposition,
@@ -307,7 +307,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	agentClaims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 7}
 	// Drive the abort guard from the durable run lifecycle, not internal map
 	// mutation.
-	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatalf("persist durable agent_start: %v", err)
 	}
 	if replay, err := gateway.EventCatchUp(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab", 0); err != nil || len(replay) != 1 {
@@ -316,18 +316,18 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	assertBrowserEvent(t, conn, "agent_start", true)
 
 	seq = 2
-	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{}}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{}}`)}); err != nil {
 		t.Fatalf("persist durable tool event: %v", err)
 	}
 	assertBrowserEvent(t, conn, "tool_execution_start", true)
-	volatile := Envelope{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`)}
+	volatile := Envelope{Audience: AudienceDirectChat, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`)}
 	if err := gateway.Receive(context.Background(), agentClaims, volatile); err != nil {
 		t.Fatalf("publish volatile stream event: %v", err)
 	}
 	assertBrowserEvent(t, conn, "message_update", false)
 
 	seq = 3
-	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
 		t.Fatalf("publish durable approval_requested: %v", err)
 	}
 	assertBrowserEvent(t, conn, "approval_requested", true)
@@ -592,7 +592,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := gateway.Receive(context.Background(), claims, Envelope{
+			if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 				Seq:                &eventSeq,
 				PersonalityAgentID: personalityAgentID,
 				Event:              rawDisposition,
@@ -610,7 +610,7 @@ func TestBrowserWebSocketIdempotentAcceptanceCarriesAuthoritativeDispositionAfte
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := gateway.Receive(context.Background(), claims, Envelope{
+				if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 					Seq:                &eventSeq,
 					PersonalityAgentID: personalityAgentID,
 					Event:              raw,
@@ -725,7 +725,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 				t.Fatal(err)
 			}
 			seq := uint64(1)
-			if err := gateway.Receive(context.Background(), claims, Envelope{
+			if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 				Seq:                &seq,
 				PersonalityAgentID: personalityAgentID,
 				Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -749,7 +749,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 						next := uint64(2)
 						err := testCase.receiveError
 						if err == nil {
-							err = gateway.Receive(ctx, claims, Envelope{
+							err = gateway.Receive(ctx, claims, Envelope{Audience: AudienceDirectChat,
 								Seq:                &next,
 								PersonalityAgentID: personalityAgentID,
 								Event:              json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"assistant","content":[],"model":"fixture","provider":"fixture","origin":{"provider_instance_id":"fixture","protocol":"open_ai_responses","model":"fixture"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"stop","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`),
@@ -761,7 +761,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 							return
 						}
 						select {
-						case volatile <- browserVolatileBatch{events: []Envelope{{
+						case volatile <- browserVolatileBatch{events: []Envelope{{Audience: AudienceDirectChat,
 							PersonalityAgentID: personalityAgentID,
 							Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`),
 						}}}:
@@ -1407,7 +1407,7 @@ func TestBrowserWebSocketRevalidatesCurrentEmployerOnLiveBoundaries(t *testing.T
 			TenantID:           "tenant-1",
 			PersonalityAgentID: personalityAgentID,
 			Generation:         1,
-		}, Envelope{
+		}, Envelope{Audience: AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: personalityAgentID,
 			Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1784,7 +1784,7 @@ func TestBrowserWebSocketEmployerTransferSerializesPrivateWrite(t *testing.T) {
 		Generation:         1,
 	}
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -1818,7 +1818,7 @@ func TestBrowserWebSocketEmployerTransferSerializesPrivateWrite(t *testing.T) {
 	}
 
 	seq = 2
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_end"}`),
@@ -1847,7 +1847,7 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	first := dialBrowserWS(t, httpServer, cookie, "018f47a2-9b3c-7def-8abc-0123456789ab")
@@ -1860,7 +1860,7 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 	_ = first.Close()
 	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	seq = 2
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	second := dialBrowserWS(t, httpServer, cookie, "018f47a2-9b3c-7def-8abc-0123456789ab")
@@ -2065,7 +2065,7 @@ func TestBrowserSessionLineageLogoutStopsSuccessorOutboundFramesAcrossGateways(
 		TenantID:           "tenant-1",
 		PersonalityAgentID: personalityAgentID,
 		Generation:         1,
-	}, Envelope{
+	}, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2130,7 +2130,7 @@ func TestBrowserWebSocketExpiryStopsReplayWritesAndCommandAdmission(t *testing.T
 		t.Fatal(err)
 	}
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), agentClaims, Envelope{
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2414,7 +2414,7 @@ func TestBrowserWebSocketReplayFailureClosesBeforeStatusOrCommandAdmission(t *te
 		TenantID:           "tenant-1",
 		PersonalityAgentID: personalityAgentID,
 		Generation:         1,
-	}, Envelope{
+	}, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2484,7 +2484,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	}
 
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatalf("receive agent_start: %v", err)
 	}
 	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "abort"}); reject {
@@ -2492,7 +2492,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	}
 
 	seq = 2
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
 		t.Fatalf("receive approval_requested: %v", err)
 	}
 	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-1"}); reject {
@@ -2520,7 +2520,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	}
 
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"agent_start"}`),
@@ -2529,7 +2529,7 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	}
 
 	seq = 2
-	if err := gateway.Receive(context.Background(), claims, Envelope{
+	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,
 		PersonalityAgentID: personalityAgentID,
 		Event:              json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
@@ -2616,7 +2616,7 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
 	if err := os.WriteFile(
 		gateway.eventPath(personalityAgentID),
-		[]byte(`{"seq":2,"event":{"seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}`+"\n"),
+		[]byte(`{"seq":2,"event":{"audience":"direct_chat","seq":2,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}}`+"\n"),
 		0o600,
 	); err != nil {
 		t.Fatalf("write corrupt event log: %v", err)
@@ -2699,12 +2699,12 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 		},
 		{
 			name:   "browser event leaks internal target",
-			raw:    `{"type":"event","envelope":{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"x"}}}`,
+			raw:    `{"type":"event","envelope":{"audience":"direct_chat","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"error","message":"x"}}}`,
 			target: func() any { return &browserEventFrame{} },
 		},
 		{
 			name:   "browser event has null seq",
-			raw:    `{"type":"event","envelope":{"seq":null,"event":{"type":"error","message":"x"}}}`,
+			raw:    `{"type":"event","envelope":{"audience":"direct_chat","seq":null,"event":{"type":"error","message":"x"}}}`,
 			target: func() any { return &browserEventFrame{} },
 		},
 		{
@@ -2788,7 +2788,7 @@ func TestBrowserOutboundFramesRejectMalformedContractShapes(t *testing.T) {
 
 	var volatile browserEventFrame
 	if err := json.Unmarshal(
-		[]byte(`{"type":"event","envelope":{"event":{"type":"error","message":"x"}}}`),
+		[]byte(`{"type":"event","envelope":{"audience":"direct_chat","event":{"type":"error","message":"x"}}}`),
 		&volatile,
 	); err != nil {
 		t.Fatalf("valid target-free volatile browser event rejected: %v", err)

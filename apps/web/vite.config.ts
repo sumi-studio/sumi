@@ -74,6 +74,7 @@ export function createDevServerConfig(
     ...(allowedHosts.length > 0 ? { allowedHosts: [...allowedHosts] } : {}),
     proxy: {
       "/auth": apiProxy(target.origin),
+      "/api/model-connections": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
       "/workspaces": apiProxy(target.origin),

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -666,6 +667,86 @@ for (const [name, fixture] of Object.entries(fixtures)) {
   }
 }
 
+// Execution context labels are visible in the debugging log; they are not delivery receipts.
+const mentionEnvelope = fixtures.external_mention.wire;
+const reminderEnvelope = fixtures.external_reminder.wire;
+const validateUserMessage = getValidator("UserMessage");
+const externalUserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "Original source text" }],
+  timestamp: "2026-09-08T12:00:00Z",
+  incoming_source: mentionEnvelope.provenance,
+};
+assert.ok(validateUserMessage(externalUserMessage));
+for (const incoming_source of [
+  null,
+  {},
+  { ...mentionEnvelope.provenance, version: 1 },
+]) {
+  assert.equal(
+    validateUserMessage({ ...externalUserMessage, incoming_source }),
+    false,
+  );
+}
+const validateIngress = getValidator("CommandEnvelope");
+for (const envelope of [mentionEnvelope, reminderEnvelope]) {
+  assert.ok(
+    validateIngress(envelope),
+    describeErrors(validateIngress.errors ?? []),
+  );
+}
+const mutate = (value, change) => {
+  const copy = structuredClone(value);
+  change(copy);
+  return copy;
+};
+for (const invalid of [
+  mutate(mentionEnvelope, (e) => {
+    e.provenance.version = 1;
+  }),
+  mutate(mentionEnvelope, (e) => {
+    e.command = { type: "abort" };
+  }),
+  mutate(mentionEnvelope, (e) => {
+    e.command.attachments = [];
+  }),
+  mutate(mentionEnvelope, (e) => {
+    e.provenance.source.marker_id = e.command_id;
+  }),
+  mutate(mentionEnvelope, (e) => {
+    e.provenance.source.message_seq = Number.MAX_SAFE_INTEGER + 1;
+  }),
+  mutate(mentionEnvelope, (e) => {
+    e.provenance.source.authority_epoch = 0;
+  }),
+  mutate(reminderEnvelope, (e) => {
+    e.provenance.actor.kind = "human";
+  }),
+  mutate(reminderEnvelope, (e) => {
+    delete e.provenance.source.due_at;
+  }),
+])
+  assert.equal(validateIngress(invalid), false, JSON.stringify(invalid));
+assert.equal(
+  getValidator("BrowserCommandFrame")({
+    type: "command",
+    idempotency_key: "forged",
+    command: mentionEnvelope.command,
+  }),
+  false,
+);
+const envelope = fixtures.secretary_agent_start.wire.envelope;
+const validateEnvelope = getValidator("Envelope");
+assert.ok(validateEnvelope(envelope));
+for (const invalid of [
+  mutate(envelope, (e) => {
+    delete e.audience;
+  }),
+  mutate(envelope, (e) => {
+    e.audience = "shared_room";
+  }),
+])
+  assert.equal(validateEnvelope(invalid), false);
 const counterexamples = [
   {
     name: "applied command disposition rejects reject_reason",
@@ -723,6 +804,7 @@ const counterexamples = [
     name: "volatile envelope with disallowed seq",
     def: "Envelope",
     value: {
+      audience: "direct_chat",
       personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "error", message: "x" },
       seq: 1,
@@ -731,7 +813,7 @@ const counterexamples = [
   {
     name: "volatile envelope requires personality agent ID",
     def: "Envelope",
-    value: { event: { type: "error", message: "x" } },
+    value: { audience: "direct_chat", event: { type: "error", message: "x" } },
   },
   {
     name: "hello rejects noncanonical decimal",
@@ -768,6 +850,7 @@ const counterexamples = [
     name: "durable envelope missing seq",
     def: "Envelope",
     value: {
+      audience: "direct_chat",
       personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "agent_start" },
     },
@@ -776,6 +859,7 @@ const counterexamples = [
     name: "envelope with extra property",
     def: "Envelope",
     value: {
+      audience: "direct_chat",
       personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
       event: { type: "agent_start" },
       seq: 1,

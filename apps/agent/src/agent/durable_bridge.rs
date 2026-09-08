@@ -29,7 +29,7 @@ use crate::{
             ToolResultMessage,
         },
     },
-    runtime::contracts::{DirectChatProvenanceV1, ProcessGeneration},
+    runtime::contracts::{IncomingProvenance, ProcessGeneration},
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent,
         ErrorContextDisposition, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection,
@@ -60,7 +60,7 @@ use super::{AdmittedCommand, AgentEvent, ApprovalResolution, run::LENGTH_LOOP_CO
 pub(crate) struct DurableRunBinding {
     pub command_id: String,
     pub command_seq: u64,
-    pub provenance: DirectChatProvenanceV1,
+    pub provenance: IncomingProvenance,
     pub run_id: String,
     pub turn_id: String,
     pub executor_generation: ProcessGeneration,
@@ -518,6 +518,14 @@ pub(super) struct DurableBridge {
 }
 
 impl DurableBridge {
+    pub(super) fn output_audience(&self) -> crate::runtime::contracts::OutputAudience {
+        self.binding.provenance.output_audience()
+    }
+
+    pub(super) fn same_output_audience(&self, command: &AdmittedCommand) -> bool {
+        self.output_audience() == command.envelope().provenance.output_audience()
+    }
+
     pub(super) fn new(binding: DurableRunBinding) -> Self {
         let worker_command_id = binding.command_id.clone();
         let worker_command_seq = binding.command_seq;
@@ -662,10 +670,13 @@ impl DurableBridge {
         writer: &EventWriter,
         command: AdmittedCommand,
     ) -> Result<()> {
-        if !self.can_bind_hard_steer() {
+        if !self.can_bind_hard_steer() || !self.same_output_audience(&command) {
             bail!("hard steer no longer matches an observable assistant generation");
         }
-        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if !matches!(
+            command.envelope().command,
+            Command::UserMessage { .. } | Command::ExternalEvent { .. }
+        ) {
             bail!("hard steer requires a UserMessage");
         }
         let new_turn_id = Uuid::now_v7().to_string();
@@ -789,7 +800,13 @@ impl DurableBridge {
                     && self.assistant_open.is_none()
                     && !self.turn_open
                     && self.pending_tool_end.is_empty()));
-        if !stage_ok || !matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if !stage_ok
+            || !self.same_output_audience(command)
+            || !matches!(
+                command.envelope().command,
+                Command::UserMessage { .. } | Command::ExternalEvent { .. }
+            )
+        {
             return false;
         }
         let redactor = writer.store().redactor();
@@ -874,7 +891,12 @@ impl DurableBridge {
         writer: &EventWriter,
         command: &AdmittedCommand,
     ) -> bool {
-        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+        if !self.same_output_audience(command)
+            || !matches!(
+                command.envelope().command,
+                Command::UserMessage { .. } | Command::ExternalEvent { .. }
+            )
+        {
             return false;
         }
         if self.phase != RunPhase::AssistantStarted
@@ -1041,6 +1063,25 @@ impl DurableBridge {
         let event = output.event;
         let message_commit_barrier = output.message_commit_barrier;
         let outputs = match event {
+            AgentEvent::ReasoningSummary {
+                wire_item_index,
+                ref message_id,
+                content_index,
+                ref content,
+            } => {
+                if self.assistant_open.as_deref() != Some(message_id.as_str()) {
+                    bail!("reasoning summary has no prerequisite durable MessageStart");
+                }
+                let durable = DurableEvent::reasoning_summary(
+                    self.binding.run_id.clone(),
+                    self.binding.turn_id.clone(),
+                    message_id.clone(),
+                    wire_item_index,
+                    content_index,
+                    content.clone(),
+                )?;
+                self.commit_single(writer, durable, Vec::new(), event).await
+            }
             AgentEvent::MessageUpdate { ref message_id, .. } => {
                 if self.assistant_open.as_deref() != Some(message_id.as_str()) {
                     bail!("volatile message update has no prerequisite durable MessageStart");
@@ -1103,29 +1144,32 @@ impl DurableBridge {
                 message_id,
                 message,
             } if !matches!(message.as_ref(), PublicMessage::Assistant(_)) => {
+                // Terminal commits can run inside a control handshake that is
+                // already persisting another event. Box each terminal branch so
+                // its state does not inflate the shared streaming dispatch frame.
                 if self.pending_steer_group.is_some() && self.pending_steer_collecting {
-                    self.collect_steer_group_message_end(
+                    Box::pin(self.collect_steer_group_message_end(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 } else if self.pending_hard_steer_inject_batch.is_some() {
-                    self.commit_hard_steer_user(
+                    Box::pin(self.commit_hard_steer_user(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 } else {
-                    self.commit_non_assistant(
+                    Box::pin(self.commit_non_assistant(
                         writer,
                         message_id,
                         *message,
                         message_commit_barrier.expect("MessageEnd barrier checked"),
-                    )
+                    ))
                     .await
                 }
             }
@@ -1348,8 +1392,10 @@ impl DurableBridge {
                     let actor = command
                         .envelope()
                         .provenance
-                        .actor()
-                        .principal_id()
+                        .authenticated_direct_chat_human()
+                        .ok_or_else(|| {
+                            anyhow!("approval decision has no authenticated DirectChat Human")
+                        })?
                         .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
@@ -1887,8 +1933,10 @@ impl DurableBridge {
                     let actor = command
                         .envelope()
                         .provenance
-                        .actor()
-                        .principal_id()
+                        .authenticated_direct_chat_human()
+                        .ok_or_else(|| {
+                            anyhow!("approval decision has no authenticated DirectChat Human")
+                        })?
                         .to_owned();
                     let run_id = self.binding.run_id.clone();
                     let approval_projection = match human_decision {
@@ -2695,17 +2743,7 @@ impl DurableBridge {
             bail!("hard-steer user message id does not derive from the steering command");
         }
 
-        let Command::UserMessage { text, attachments } = &command.envelope().command else {
-            bail!("hard-steer command changed kind before user injection");
-        };
-        if !attachments.is_empty() {
-            bail!("T16 hard steer does not accept attachments");
-        }
-        let expected_message = PublicMessage::User(crate::provider::types::UserMessage {
-            incoming_timing: command.incoming_timing(),
-            content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
-            timestamp: command.received_at(),
-        });
+        let expected_message = super::steer::build_user_message(&command)?;
         if message != expected_message {
             bail!("hard-steer user message does not match durable command plaintext");
         }
@@ -3229,8 +3267,31 @@ mod tests {
         phase: RunPhase,
         assistant_origin: ProviderOrigin,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
+        owner_in_phase_with_origin_and_provenance(
+            store,
+            writer,
+            command_id,
+            run_id,
+            turn_id,
+            phase,
+            assistant_origin,
+            crate::gateway::test_direct_chat_provenance(),
+        )
+        .await
+    }
+
+    async fn owner_in_phase_with_origin_and_provenance(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        phase: RunPhase,
+        assistant_origin: ProviderOrigin,
+        provenance: crate::runtime::contracts::IncomingProvenance,
+    ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
-            provenance: crate::gateway::test_direct_chat_provenance(),
+            provenance: provenance.clone(),
             command_id: command_id.to_owned(),
             command_seq: 1,
             run_id: run_id.to_owned(),
@@ -3239,7 +3300,30 @@ mod tests {
         };
         let assistant_message_id = format!("{}-assistant", command_id);
 
-        let _ = persist_and_pin(store, writer, 1, command_id, "owner").await;
+        let _ = store;
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: CommandId::parse(command_id).unwrap(),
+                personality_agent_id: crate::gateway::test_personality_agent_id(),
+                provenance: provenance.clone(),
+                command: if provenance.is_external() {
+                    Command::ExternalEvent {
+                        content: "owner".to_owned(),
+                    }
+                } else {
+                    Command::UserMessage {
+                        text: "owner".to_owned(),
+                        attachments: Vec::new(),
+                    }
+                },
+            }))
+            .await
+            .expect("persist owner source");
+        writer
+            .pin_incoming_timing_for_test(command_id, test_timestamp())
+            .await
+            .expect("pin owner receipt");
 
         writer
             .apply(EventBatch {
@@ -3260,6 +3344,7 @@ mod tests {
         let message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_source: provenance.is_external().then(|| provenance.clone()),
             incoming_timing: Some(crate::provider::types::IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -3328,7 +3413,7 @@ mod tests {
                 injected_commands: vec![InjectedCommand::new(
                     1,
                     CommandId::parse(command_id).expect("canonical"),
-                    crate::gateway::test_direct_chat_provenance(),
+                    provenance.clone(),
                 )],
             })
             .await
@@ -3411,10 +3496,27 @@ mod tests {
         turn_id: &str,
         shape: ErrorContextShape,
     ) -> ErrorContextFixture {
+        error_context_fixture_with_provenance(
+            owner_id,
+            run_id,
+            turn_id,
+            shape,
+            crate::gateway::test_direct_chat_provenance(),
+        )
+        .await
+    }
+
+    async fn error_context_fixture_with_provenance(
+        owner_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        shape: ErrorContextShape,
+        provenance: crate::runtime::contracts::IncomingProvenance,
+    ) -> ErrorContextFixture {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
-        let (binding, owner_assistant) = owner_in_phase_with_origin(
+        let (binding, owner_assistant) = owner_in_phase_with_origin_and_provenance(
             &store,
             &writer,
             owner_id,
@@ -3422,6 +3524,7 @@ mod tests {
             turn_id,
             RunPhase::AssistantStarted,
             spec.origin(),
+            provenance,
         )
         .await;
         let (message_id, _) = owner_assistant.expect("owner assistant");
@@ -3638,6 +3741,145 @@ mod tests {
         assert!(
             (f64::from_bits(u64::from_be_bytes(receipt_bits)) - 1.3).abs() < 1.0e-12,
             "default 1.0 ratio updated from a 200/100 observation with alpha 0.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_completed_summary_is_durable_without_becoming_model_memory() {
+        use crate::agent::provider_projection::{ProjectedProviderEvent, ProviderEventProjector};
+        use crate::provider::{
+            adapters::responses::ResponsesReceiveState,
+            assembler::{FrozenToolSchemaRegistry, ResponseBudget},
+            types::ProviderEvent,
+        };
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000032",
+            "run-summary",
+            "turn-summary",
+            RunPhase::UserCommitted,
+        )
+        .await;
+        let message_id = "00000000-0000-4000-8000-000000000033".to_owned();
+        let spec = ModelSpec::preset("openai-responses").unwrap();
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &assistant,
+                            Some(binding.run_id.clone()),
+                            Some(binding.turn_id.clone()),
+                        )
+                        .unwrap(),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: binding.command_id.clone(),
+                        run_id: binding.run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(message_id.clone());
+        let mut projector = ProviderEventProjector::new(message_id.clone()).unwrap();
+        projector.project(ProviderEvent::Start).unwrap();
+        let mut state = ResponsesReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+        );
+        let mut committed_seq = None;
+        'stream: for line in
+            include_str!("../../tests/fixtures/openai_responses_official.sse").lines()
+        {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            for event in state.push_json(data).unwrap().events {
+                let projected = projector.project(event).unwrap();
+                if let ProjectedProviderEvent::Update(event) = projected {
+                    let summary = matches!(event, AgentEvent::ReasoningSummary { .. });
+                    let committed = bridge
+                        .commit(
+                            &writer,
+                            RunOutput {
+                                binding: binding.clone(),
+                                event,
+                                commit_barrier: None,
+                                message_commit_barrier: None,
+                                retry_wait_commit_barrier: None,
+                                approval_command: None,
+                                approval_not_started: None,
+                                approval_cancelled: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    if summary {
+                        committed_seq = committed.outputs.first().unwrap().seq;
+                        break 'stream;
+                    }
+                    assert!(committed.outputs.iter().all(|output| output.seq.is_none()));
+                }
+            }
+        }
+        let seq = committed_seq.expect("completed provider summary has durable sequence");
+        drop(bridge);
+        drop(projector);
+        drop(state);
+        let replay = crate::store::raw_events_after(&store, seq - 1, 16)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&replay[0], (actual, AgentEvent::ReasoningSummary { message_id: id, content_index: 0, wire_item_index: 1, content }) if *actual == seq && id == &message_id && content == "Checking.")
+        );
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(_, event)| matches!(event, AgentEvent::ReasoningSummary { .. }))
+                .count(),
+            1
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "display summary must not become model context"
+        );
+        let encoded = serde_json::to_string(&replay[0].1).unwrap();
+        assert!(
+            !encoded.contains("encrypted_content")
+                && !encoded.contains("signature_field")
+                && !encoded.contains("thinking")
         );
     }
 
@@ -4003,6 +4245,7 @@ mod tests {
             &steer_command.envelope().command_id,
         );
         let user_message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: steer_command.incoming_timing(),
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
@@ -4445,6 +4688,108 @@ mod tests {
                 .await
                 .expect("AgentEnd follows only after terminal Error context is applied");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_abort_does_not_retarget_external_run_error_or_terminal_events() {
+        use crate::runtime::contracts::OutputAudience;
+        let mut fixture = error_context_fixture_with_provenance(
+            "00000000-0000-4000-8000-000000000098",
+            "run-external-abort",
+            "turn-external-abort",
+            ErrorContextShape::Mixed,
+            crate::gateway::test_messaging_provenance(),
+        )
+        .await;
+        let abort_id = "00000000-0000-4000-8000-000000000099";
+        fixture
+            .writer
+            .persist_inbound(&test_abort_command(2, abort_id))
+            .await
+            .unwrap();
+        let (outputs, _) = fixture
+            .bridge
+            .bind_abort(&fixture.writer, test_admitted_abort(2, abort_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.bridge.binding.provenance.output_audience(),
+            OutputAudience::Secretary,
+            "Abort must not become the run's output owner"
+        );
+        assert_error_context_applied(&fixture).await;
+        assert!(outputs.iter().any(|output|matches!(&output.event,AgentEvent::CommandDisposition(disposition) if disposition.command_id==abort_id)));
+        for event in [
+            AgentEvent::Error {
+                message: "external run interrupted".to_owned(),
+            },
+            AgentEvent::TurnEnd {
+                message: Some(Box::new(fixture.message.clone())),
+                tool_results: Vec::new(),
+            },
+            AgentEvent::AgentEnd,
+        ] {
+            fixture
+                .bridge
+                .commit(
+                    &fixture.writer,
+                    RunOutput {
+                        binding: fixture.binding.clone(),
+                        event,
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: None,
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("external run closes through original binding");
+            assert_eq!(
+                fixture.bridge.binding.provenance.output_audience(),
+                OutputAudience::Secretary
+            );
+        }
+        let events = crate::store::raw_events_after(&fixture.store, 0, 128)
+            .await
+            .unwrap();
+        let mut saw_abort = false;
+        let mut saw_end = false;
+        let mut saw_error_message = false;
+        for (seq, event) in events {
+            let audience = fixture
+                .store
+                .authenticated_event_audience(seq)
+                .await
+                .unwrap();
+            match event {
+                AgentEvent::CommandDisposition(disposition)
+                    if disposition.command_id == abort_id =>
+                {
+                    assert_eq!(audience, OutputAudience::DirectChat);
+                    saw_abort = true;
+                }
+                AgentEvent::AgentEnd => {
+                    assert_eq!(audience, OutputAudience::Secretary);
+                    saw_end = true;
+                }
+                AgentEvent::MessageEnd { message, .. } if matches!(message.as_ref(),PublicMessage::Assistant(assistant) if assistant.stop_reason==StopReason::Error) =>
+                {
+                    assert_eq!(audience, OutputAudience::Secretary);
+                    saw_error_message = true;
+                }
+                _ => assert_eq!(
+                    audience,
+                    OutputAudience::Secretary,
+                    "all other events belong to external run"
+                ),
+            }
+        }
+        assert!(
+            saw_abort && saw_end && saw_error_message,
+            "test must observe Abort disposition, Error MessageEnd and AgentEnd"
+        );
     }
 
     #[tokio::test]
@@ -4956,6 +5301,7 @@ mod tests {
         let user_message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), steer_id);
         let user_message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: Some(crate::provider::types::IncomingEventTiming {
                 previous_receipt: None,
             }),
@@ -5436,6 +5782,7 @@ mod tests {
         bridge.pending_steer_messages.push(PendingSteerMessage {
             message_id: "pending-start".to_owned(),
             message: PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "pending".to_owned(),
@@ -5447,6 +5794,7 @@ mod tests {
         bridge.pending_steer_open_start = Some((
             "open-start".to_owned(),
             PublicMessage::User(UserMessage {
+                incoming_source: None,
                 incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "open".to_owned(),

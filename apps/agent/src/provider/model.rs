@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::provider::chatgpt::ChatGptCredentialSource;
 use crate::provider::types::{ApiProtocol, ProviderOrigin};
 
 pub(crate) const DEFAULT_OUTPUT_TOKENS: u64 = 16_384;
@@ -56,8 +57,23 @@ pub struct ChatCompat {
     pub infer_finish_reason_at_done: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderBackend {
+    #[default]
+    ApiKey,
+    ChatGpt,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponsesDialect {
+    #[default]
+    Standard,
+    CodexLite,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponsesCompat {
+    pub dialect: ResponsesDialect,
     pub supports_store: bool,
     pub supports_encrypted_reasoning: bool,
     pub supports_native_compact: bool,
@@ -81,6 +97,9 @@ pub enum ProtocolCompat {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelSpec {
+    pub backend: ProviderBackend,
+    /// Runtime-only account-scoped resolver. Contains no provider credentials.
+    pub chatgpt_credentials: Option<ChatGptCredentialSource>,
     pub id: String,
     pub provider: String,
     pub base_url: String,
@@ -97,8 +116,25 @@ pub struct ModelSpec {
 
 impl ModelSpec {
     pub fn preset(name: &str) -> Option<Self> {
+        if name == "chatgpt-responses" {
+            let mut spec = Self::preset("openai-responses")?;
+            spec.backend = ProviderBackend::ChatGpt;
+            spec.id = "gpt-6-astra".into();
+            spec.provider = "chatgpt".into();
+            spec.base_url = "https://chatgpt.com/backend-api/codex".into();
+            spec.account_scope.clear();
+            spec.api_key_env.clear();
+            spec.context_window = 272_000;
+            spec.max_output_tokens = 32_768;
+            if let ProtocolCompat::Responses(compat) = &mut spec.compat {
+                compat.dialect = ResponsesDialect::CodexLite;
+            }
+            return Some(spec);
+        }
         if name == "anthropic" {
             return Some(Self {
+                backend: ProviderBackend::ApiKey,
+                chatgpt_credentials: None,
                 id: "claude-sonnet-4-6".to_owned(),
                 provider: "anthropic".to_owned(),
                 base_url: "https://api.anthropic.com/v1".to_owned(),
@@ -123,6 +159,8 @@ impl ModelSpec {
         }
         if name == "openai-responses" {
             return Some(Self {
+                backend: ProviderBackend::ApiKey,
+                chatgpt_credentials: None,
                 id: "gpt-5.6".to_owned(),
                 provider: "openai".to_owned(),
                 base_url: "https://api.openai.com/v1".to_owned(),
@@ -135,6 +173,7 @@ impl ModelSpec {
                 supports_images: true,
                 protocol: ApiProtocol::OpenAiResponses,
                 compat: ProtocolCompat::Responses(ResponsesCompat {
+                    dialect: ResponsesDialect::Standard,
                     supports_store: true,
                     supports_encrypted_reasoning: true,
                     supports_native_compact: true,
@@ -260,6 +299,8 @@ impl ModelSpec {
         };
 
         Some(Self {
+            backend: ProviderBackend::ApiKey,
+            chatgpt_credentials: None,
             id: id.to_owned(),
             provider: provider.to_owned(),
             base_url: base_url.to_owned(),

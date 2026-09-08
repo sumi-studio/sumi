@@ -718,6 +718,7 @@ mod tests {
     fn test_event_frame() -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({"type": "agent_start"}),
@@ -1332,6 +1333,7 @@ mod tests {
     fn retry_frame_with_error_len(error_message_len: usize) -> OutboundFrame {
         OutboundFrame::Event {
             envelope: Envelope {
+                audience: crate::runtime::contracts::OutputAudience::DirectChat,
                 seq: Some(1),
                 personality_agent_id: crate::gateway::test_personality_agent_id(),
                 event: serde_json::json!({

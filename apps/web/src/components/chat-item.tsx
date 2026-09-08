@@ -10,10 +10,12 @@ import { Marker, MarkerContent } from "@sumi/ui/components/marker";
 import { useCallback } from "react";
 import type { ChatItem } from "../agent/model";
 import { ApprovalConfirmation } from "./approval-confirmation";
-import { WorkSummary } from "./work-summary";
+import { TraceRow, WorkSummary } from "./work-summary";
 
 interface ChatItemViewProps {
   item: ChatItem;
+  operationOpen?: boolean;
+  onOperationOpenChange?: (open: boolean) => void;
   copyAlwaysVisible?: boolean;
   agentMessageCopyText?: string;
   onApprovalDecision?: (requestId: string, decision: ApprovalDecision) => void;
@@ -25,6 +27,8 @@ interface ChatItemViewProps {
 /** Renders one derived item from the personality agent's canonical log. */
 export function ChatItemView({
   item,
+  operationOpen,
+  onOperationOpenChange,
   copyAlwaysVisible = false,
   agentMessageCopyText,
   onApprovalDecision,
@@ -41,20 +45,40 @@ export function ChatItemView({
     case "agent-run":
       return (
         <WorkSummary
+          headingOnly
           run={item}
           onOpenChange={(open) => open && onWorkSummaryOpen?.()}
         />
       );
+    case "trace":
+      return (
+        <div className="py-2">
+          <TraceRow
+            event={item.trace}
+            phase={item.phase}
+            open={operationOpen}
+            onOpenChange={onOperationOpenChange}
+          />
+        </div>
+      );
     case "user":
       return (
-        <Message from="user" className="py-3">
-          <MessageContent className="whitespace-pre-wrap">
+        <Message
+          from={item.source ? "assistant" : "user"}
+          className="max-w-full py-4"
+        >
+          <div className="text-muted-foreground text-xs leading-5">
+            {item.source
+              ? `${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`
+              : "診断用の入力"}
+          </div>
+          <MessageContent className="whitespace-pre-wrap break-words text-base leading-7">
             {item.text}
           </MessageContent>
           <MessageMetadata
             timestamp={item.timestamp}
             copyText={item.text}
-            align="right"
+            align={item.source ? "left" : "right"}
             className="pr-1"
           />
           {item.delivery === "pending" && (
@@ -70,8 +94,8 @@ export function ChatItemView({
       );
     case "prose":
       return (
-        <Message from="assistant" className="py-3">
-          <MessageContent>
+        <Message from="assistant" className="max-w-full py-4">
+          <MessageContent className="text-base leading-7">
             <MessageResponse
               mode={item.streaming ? "streaming" : "static"}
               onRenderSettled={

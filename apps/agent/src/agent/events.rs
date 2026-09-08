@@ -30,6 +30,12 @@ pub(crate) enum AgentEvent {
         message_id: String,
         event: PublicStreamEvent,
     },
+    ReasoningSummary {
+        wire_item_index: u32,
+        message_id: String,
+        content_index: usize,
+        content: String,
+    },
     MessageEnd {
         message_id: String,
         message: Box<PublicMessage>,
@@ -82,6 +88,7 @@ impl AgentEvent {
             Self::TurnEnd { .. } => "turn_end",
             Self::MessageStart { .. } => "message_start",
             Self::MessageEnd { .. } => "message_end",
+            Self::ReasoningSummary { .. } => "reasoning_summary",
             Self::ToolExecutionStart { .. } => "tool_execution_start",
             Self::ToolExecutionEnd { .. } => "tool_execution_end",
             Self::ApprovalRequested { .. } => "approval_requested",

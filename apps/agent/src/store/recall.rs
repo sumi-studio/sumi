@@ -239,13 +239,13 @@ mod tests {
     async fn admit_user_experience(store: &Store, text: &str) -> (String, PublicMessage) {
         use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
         use crate::provider::types::{UserContent, UserMessage};
-        use crate::runtime::contracts::DirectChatProvenanceV1;
+        use crate::runtime::contracts::IncomingProvenance;
         use crate::store::{ApplicationKind, InjectedCommand, RunPhase};
 
         let command_id = Uuid::now_v7().to_string();
         let run_id = format!("recall-run-{command_id}");
         let turn_id = format!("recall-turn-{command_id}");
-        let provenance = DirectChatProvenanceV1::new(
+        let provenance = IncomingProvenance::new(
             "recall-tenant",
             store.scope().personality_agent_id.clone(),
             "human-1",
@@ -287,6 +287,7 @@ mod tests {
                 .await
                 .unwrap();
         let message = PublicMessage::User(UserMessage {
+            incoming_source: None,
             incoming_timing: writer
                 .timing_for_command(&command_id)
                 .await

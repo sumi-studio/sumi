@@ -10,6 +10,7 @@ afterEach(cleanup);
 
 function makeRun(status: AgentRun["status"]): AgentRun {
   return {
+    audience: "direct_chat",
     kind: "agent-run",
     id: "run-1",
     startedSeq: 1,
@@ -31,14 +32,14 @@ function makeRun(status: AgentRun["status"]): AgentRun {
 }
 
 describe("WorkSummary", () => {
-  it("is expanded by default while the run is active and collapses when it ends", () => {
+  it("keeps inspected work visible when the run ends", () => {
     const view = render(<WorkSummary run={makeRun("running")} />);
     expect(screen.getByText("作業中")).toBeVisible();
     expect(screen.getByText("read_fileを完了")).toBeVisible();
 
     view.rerender(<WorkSummary run={makeRun("complete")} />);
     expect(screen.getByText("作業が終了しました")).toBeVisible();
-    expect(screen.queryByText("read_fileを完了")).toBeNull();
+    expect(screen.getByText("read_fileを完了")).toBeVisible();
   });
 
   it("lets an explicit user toggle win over the automatic state", () => {

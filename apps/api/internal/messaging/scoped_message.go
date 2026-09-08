@@ -390,7 +390,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	if err != nil {
 		return Message{}, err
 	}
-	place, err := s.loadScopedPlace(ctx, tx, placeID)
+	place, err := s.lockMessageMutationPlace(ctx, tx, placeID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -493,7 +493,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if err != nil {
 		return Message{}, err
 	}
-	place, err := s.loadScopedPlace(ctx, tx, placeID)
+	place, err := s.lockMessageMutationPlace(ctx, tx, placeID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -548,6 +548,18 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	}
 	message.Content, message.Mentions, message.Reactions, message.Attachments, message.Poll, message.Deleted = "", nil, nil, nil, nil, true
 	return message, nil
+}
+
+// Thread edit/delete also update the place projection. Take its no-key-update lock
+// before the message, matching append and attention delivery; a share-lock
+// upgrade after taking a message lock could deadlock with a delivery reader.
+// NO KEY UPDATE also preserves concurrent reminder/thread foreign-key checks.
+func (s *ScopedStore) lockMessageMutationPlace(ctx context.Context, tx pgx.Tx, placeID string) (Place, error) {
+	if _, err := tx.Exec(ctx, `SELECT place_id FROM places
+        WHERE workspace_id=$1 AND place_id=$2 FOR NO KEY UPDATE`, s.Scope.WorkspaceID, placeID); err != nil {
+		return Place{}, err
+	}
+	return s.loadScopedPlace(ctx, tx, placeID)
 }
 
 // Message append already advances a place by updating last_seq, whose trigger

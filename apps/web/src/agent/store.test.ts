@@ -289,6 +289,7 @@ test("admission is provisional and canonical user arrival replaces it", () => {
   if (entry?.kind === "user") assert.equal(entry.delivery, "admitted");
 
   const durable: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 2,
     event: {
       type: "message_end",
@@ -339,6 +340,7 @@ test("authority reset disposes conversation and private delivery state", () => {
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 1,
       event: { type: "agent_start" },
     },
@@ -370,7 +372,11 @@ test("authority reset releases approval latches from the previous principal", ()
   store.getState().connect();
   transport.emit({
     type: "event",
-    envelope: { seq: 1, event: { type: "approval_requested", request } },
+    envelope: {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "approval_requested", request },
+    },
   } as unknown as DirectChatServerFrame);
   assert.equal(
     store.getState().decideApproval(request.id, { type: "approve_once" }),
@@ -381,7 +387,11 @@ test("authority reset releases approval latches from the previous principal", ()
   store.getState().connect();
   transport.emit({
     type: "event",
-    envelope: { seq: 1, event: { type: "approval_requested", request } },
+    envelope: {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "approval_requested", request },
+    },
   } as unknown as DirectChatServerFrame);
   assert.equal(
     store.getState().decideApproval(request.id, { type: "deny_once" }),
@@ -530,6 +540,7 @@ test("canonical arrival before receipt removes the provisional row on later corr
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 1,
       event: {
         type: "message_start",
@@ -642,7 +653,7 @@ test("lost receipt after more than 32 unrelated dispositions reconciles authorit
     } as CommandDispositionEvent;
     transport.emit({
       type: "event",
-      envelope: { seq: 1, event: terminal },
+      envelope: { audience: "direct_chat", seq: 1, event: terminal },
     });
     for (let index = 0; index < 33; index++) {
       const unrelatedCommandId = `00000000-0000-4000-8000-${(index + 2)
@@ -742,6 +753,7 @@ test("admitted text survives reload for applied replay but never becomes canonic
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 2,
       event: {
         type: "message_end",
@@ -801,6 +813,7 @@ test("immediate rejection removes provisional history and supports restore/disca
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 1,
       event: {
         type: "message_end",
@@ -966,6 +979,7 @@ test("admission persistence failure remains provisional and is surfaced", () => 
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 2,
       event: {
         type: "message_end",
@@ -1156,7 +1170,11 @@ test("approval decision is synchronously latched until durable resolution", () =
   const request = approvalRequest("approval-latch");
   transport.emit({
     type: "event",
-    envelope: { seq: 1, event: { type: "approval_requested", request } },
+    envelope: {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "approval_requested", request },
+    },
   } as unknown as DirectChatServerFrame);
 
   assert.equal(
@@ -1182,6 +1200,7 @@ test("approval decision is synchronously latched until durable resolution", () =
   transport.emit({
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: 2,
       event: {
         type: "approval_resolved",
@@ -1205,7 +1224,11 @@ test("a local approval queue failure releases only that request latch", () => {
   const request = approvalRequest("approval-retry");
   transport.emit({
     type: "event",
-    envelope: { seq: 1, event: { type: "approval_requested", request } },
+    envelope: {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "approval_requested", request },
+    },
   } as unknown as DirectChatServerFrame);
 
   assert.equal(
@@ -1260,6 +1283,7 @@ function disposition(
   return {
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: eventSeq,
       event: {
         type: "command_disposition",
@@ -1288,6 +1312,7 @@ function canonicalFrame(
   return {
     type: "event",
     envelope: {
+      audience: "direct_chat",
       seq: eventSeq,
       event: {
         type: "message_end",

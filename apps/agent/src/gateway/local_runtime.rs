@@ -11,7 +11,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{Seek as _, SeekFrom};
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -27,10 +26,7 @@ use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{
-    io::AsyncReadExt,
-    sync::{Mutex, watch},
-};
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1446,16 +1442,12 @@ impl MessagingApi for LocalControlHttpClient {
             .unwrap_or("application/octet-stream");
         let mut first_indeterminate = None;
         for attempt in 0..MESSAGING_IDEMPOTENT_MUTATION_ATTEMPTS {
-            // Keep the executor-provided sealed descriptor alive, and only
-            // duplicate/rewind that immutable descriptor for a replay. This
-            // cannot re-open a Workspace path or consume a new executor grant.
+            // Retain the exact sealed executor source. Each replay has its own
+            // positional cursor, so an abandoned body read cannot move another
+            // attempt's cursor through the shared open file description.
             let result = async {
-                let mut std_file = std::fs::File::from(duplicate_owned_fd(&descriptor)?);
-                std_file
-                    .seek(SeekFrom::Start(0))
-                    .context("rewind sealed Messaging attachment source")?;
-                let body_stream =
-                    bounded_file_stream(tokio::fs::File::from_std(std_file), size_bytes);
+                let std_file = std::fs::File::from(duplicate_owned_fd(&descriptor)?);
+                let body_stream = bounded_file_stream(std_file, size_bytes);
                 let mut builder = http
                     .post(url.clone())
                     .bearer_auth(self.credential.token.as_str())
@@ -2321,24 +2313,44 @@ fn duplicate_owned_fd(descriptor: &OwnedFd) -> Result<OwnedFd> {
 }
 
 fn bounded_file_stream(
-    file: tokio::fs::File,
+    file: std::fs::File,
     size: u64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
-    futures_util::stream::try_unfold((file, size), |(mut file, remaining)| async move {
-        if remaining == 0 {
-            return Ok(None);
-        }
-        let mut chunk = vec![0u8; remaining.min(64 * 1024) as usize];
-        let read = file.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "sealed attachment source ended before its manifest size",
-            ));
-        }
-        chunk.truncate(read);
-        Ok(Some((chunk, (file, remaining - read as u64))))
-    })
+    futures_util::stream::try_unfold(
+        (file, size, 0_u64),
+        |(file, remaining, offset)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            // The task owns its FD until the read completes, even if HTTP cancels
+            // this stream. Positional reads never mutate the shared descriptor's
+            // cursor; only this stream's offset advances after a successful chunk.
+            let (file, chunk, read) = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt as _;
+                let mut chunk = vec![0u8; remaining.min(64 * 1024) as usize];
+                let read = loop {
+                    match file.read_at(&mut chunk, offset) {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => break result?,
+                    }
+                };
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "sealed attachment source ended before its manifest size",
+                    ));
+                }
+                chunk.truncate(read);
+                Ok((file, chunk, read))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok(Some((
+                chunk,
+                (file, remaining - read as u64, offset + read as u64),
+            )))
+        },
+    )
 }
 
 async fn read_response_bounded(
@@ -5528,7 +5540,13 @@ mod tests {
     }
 
     fn fixture_upload_request(client_nonce: &str) -> UploadMessagingAttachmentRequest {
-        let bytes = b"retry payload";
+        fixture_upload_request_with_bytes(client_nonce, b"retry payload")
+    }
+
+    fn fixture_upload_request_with_bytes(
+        client_nonce: &str,
+        bytes: &[u8],
+    ) -> UploadMessagingAttachmentRequest {
         let name = CString::new("sumi-local-control-retry").expect("static memfd name");
         // SAFETY: `name` is NUL-terminated and the result is owned below.
         let raw = unsafe {
@@ -7277,6 +7295,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_replay_streams_have_independent_offsets_on_the_same_sealed_source() {
+        use std::io::{Seek as _, SeekFrom};
+        let bytes = (0..(160 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let request = fixture_upload_request_with_bytes("independent-offsets", &bytes);
+        let descriptor = request.as_parts().6;
+        let mut shared_cursor = std::fs::File::from(duplicate_owned_fd(descriptor).unwrap());
+        shared_cursor.seek(SeekFrom::Start(17)).unwrap();
+        let first = bounded_file_stream(
+            std::fs::File::from(duplicate_owned_fd(descriptor).unwrap()),
+            bytes.len() as u64,
+        );
+        let second = bounded_file_stream(
+            std::fs::File::from(duplicate_owned_fd(descriptor).unwrap()),
+            bytes.len() as u64,
+        );
+        futures_util::pin_mut!(first, second);
+        let mut first_bytes = Vec::new();
+        let mut second_bytes = Vec::new();
+        loop {
+            let a = first.next().await;
+            let b = second.next().await;
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            for (chunk, output) in [(a, &mut first_bytes), (b, &mut second_bytes)] {
+                if let Some(chunk) = chunk {
+                    let chunk = chunk.unwrap();
+                    assert!(chunk.len() <= 64 * 1024);
+                    output.extend(chunk);
+                }
+            }
+        }
+        assert_eq!(first_bytes, bytes);
+        assert_eq!(second_bytes, bytes);
+        assert_eq!(shared_cursor.stream_position().unwrap(), 17);
+    }
+
+    #[tokio::test]
     async fn messaging_replay_cannot_turn_an_indeterminate_first_attempt_into_terminal_failure() {
         let write_attempts = Arc::new(StdMutex::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8673,5 +8731,83 @@ mod tests {
             ]
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn chatgpt_access_uses_pa_authorized_transport_and_strict_payload() {
+        use crate::provider::chatgpt::ChatGptCredentialResolver;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/providers/chatgpt/access", post(
+                |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer control-secret");
+                    assert_eq!(body, serde_json::json!({"connection_id":"owned-connection","rejected_access_token":"rejected-fixture"}));
+                    axum::Json(serde_json::json!({"connection_id":"owned-connection","account_id":"owned-account","access_token":"access-fixture","expires_at":"2099-01-01T00:00:00Z","model":"gpt-6-astra","effort":"medium"}))
+                }
+            ))).await.unwrap();
+        });
+        let expected = authority();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
+        let client =
+            LocalControlHttpClient::new_loopback(format!("http://{address}"), expected, credential)
+                .unwrap();
+        let access = client
+            .resolve("owned-connection", Some("rejected-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(access.connection_id, "owned-connection");
+        assert_eq!(access.account_id, "owned-account");
+        assert_eq!(access.access_token.as_str(), "access-fixture");
+        assert!(!format!("{access:?}").contains("access-fixture"));
+        server.abort();
+    }
+}
+
+#[async_trait]
+impl crate::provider::chatgpt::ChatGptCredentialResolver for LocalControlHttpClient {
+    async fn resolve(
+        &self,
+        connection_id: &str,
+        rejected_access_token: Option<&str>,
+    ) -> Result<crate::provider::chatgpt::ChatGptAccess, crate::provider::chatgpt::ChatGptAuthError>
+    {
+        #[derive(Serialize)]
+        struct AccessRequest<'a> {
+            connection_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rejected_access_token: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AccessResponse {
+            connection_id: String,
+            account_id: String,
+            access_token: String,
+            expires_at: chrono::DateTime<chrono::Utc>,
+            #[serde(rename = "model")]
+            _model: String,
+            #[serde(rename = "effort")]
+            _effort: String,
+        }
+        // The existing native transport binds this request to the PA, runtime
+        // generation and boot nonce. Never take a Human or workspace from callers.
+        let response: AccessResponse = self
+            .post_json_bounded(
+                "/internal/providers/chatgpt/access",
+                &AccessRequest {
+                    connection_id,
+                    rejected_access_token,
+                },
+                32 * 1024,
+            )
+            .await
+            .map_err(|_| crate::provider::chatgpt::ChatGptAuthError::Unavailable)?;
+        Ok(crate::provider::chatgpt::ChatGptAccess {
+            connection_id: response.connection_id,
+            account_id: response.account_id,
+            access_token: zeroize::Zeroizing::new(response.access_token),
+            expires_at: response.expires_at,
+        })
     }
 }

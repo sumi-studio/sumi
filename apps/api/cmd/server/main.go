@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
+	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
@@ -95,6 +96,8 @@ func run(ctx context.Context) (runErr error) {
 	}
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
+	app.startAgentAttention()
+	app.startChatGPTActivation()
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()
@@ -224,16 +227,20 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	publicMux       *http.ServeMux
-	localMux        *http.ServeMux
-	localListener   *localControlListenerConfig
-	store           *agentevents.CommandStore
-	browser         *agentevents.BrowserServer
-	database        *db.Pool
-	spawnManager    *spawn.Manager
-	localRuntimes   *agentevents.LocalControlListenerRegistry
-	messagingServer *messaging.Server
-	backgroundCtx   context.Context
+	chatGPTLogin      *chatgpt.LoginService
+	chatGPTActivation *chatGPTActivationWorker
+	publicMux         *http.ServeMux
+	localMux          *http.ServeMux
+	localListener     *localControlListenerConfig
+	store             *agentevents.CommandStore
+	browser           *agentevents.BrowserServer
+	database          *db.Pool
+	spawnManager      *spawn.Manager
+	localRuntimes     *agentevents.LocalControlListenerRegistry
+	messagingServer   *messaging.Server
+	backgroundCtx     context.Context
+	deliverAttention  func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	attentionWorkers  sync.WaitGroup
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -258,6 +265,10 @@ func (a *application) Close() error {
 	a.closeOnce.Do(func() {
 		if a.stopBackground != nil {
 			a.stopBackground()
+		}
+		a.attentionWorkers.Wait()
+		if a.chatGPTLogin != nil {
+			a.chatGPTLogin.Close()
 		}
 		if a.browser != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -340,6 +351,23 @@ func newApplicationFromEnv() (*application, error) {
 		if database != nil {
 			database.Close()
 		}
+	}
+
+	chatGPTConnections, err := chatGPTStoreFromEnv(databasePool)
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
+	var chatGPTLogin *chatgpt.LoginService
+	var chatGPTActivation *chatGPTActivationWorker
+	var chatGPTRuntimeAccess *chatGPTRuntime
+	var resolveModelActivation runtimeActivationResolver
+	if chatGPTConnections != nil {
+		oauth := chatgpt.NewOAuthClient()
+		chatGPTRuntimeAccess = &chatGPTRuntime{connections: chatGPTConnections, employers: koseki.New(databasePool, directChatLifecycle), refresh: oauth.Refresh}
+		resolveModelActivation = chatGPTRuntimeAccess.activation
+		chatGPTActivation = newChatGPTActivationWorker(koseki.New(databasePool, directChatLifecycle))
+		chatGPTLogin = chatgpt.NewLoginService(chatGPTConnections, oauth, chatGPTBrowserIdentity(sv, browserOrigins), chatGPTActivation.enqueue)
 	}
 
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
@@ -467,6 +495,12 @@ func newApplicationFromEnv() (*application, error) {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
 	}
+	if localControl != nil && chatGPTRuntimeAccess != nil {
+		if err := chatGPTRuntimeAccess.register(localControl); err != nil {
+			closeOnError()
+			return nil, err
+		}
+	}
 	if localControl != nil && messagingServer != nil {
 		if err := messagingServer.RegisterLocalControlRoutes(localControl); err != nil {
 			closeOnError()
@@ -503,7 +537,7 @@ func newApplicationFromEnv() (*application, error) {
 	if database != nil {
 		resolver = koseki.New(database.Pool)
 	}
-	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime)
+	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime, resolveModelActivation)
 	if err != nil {
 		if localRuntimes != nil {
 			_ = localRuntimes.Close(context.Background())
@@ -512,25 +546,44 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, fmt.Errorf("spawn manager: %w", err)
 	}
 	if spawnManager != nil {
+		if chatGPTActivation != nil {
+			chatGPTActivation.manager = spawnManager
+		}
 		browser.SetSpawner(spawnManager)
+	}
+	if chatGPTLogin != nil {
+		chatGPTLogin.RegisterRoutes(mux)
 	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
+	var deliverAttention func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	if messagingServer != nil && spawnManager != nil {
+		delivery := &messaging.AgentAttentionGateway{
+			Gateway: runtime, Spawner: spawnManager,
+			TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID")),
+		}
+		deliverAttention = func(ctx context.Context) (messaging.AgentAttentionDeliveryStats, error) {
+			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
+		}
+	}
 	return &application{
-		publicMux:       mux,
-		localMux:        localMux,
-		localListener:   localListener,
-		store:           store,
-		browser:         browser,
-		database:        database,
-		spawnManager:    spawnManager,
-		localRuntimes:   localRuntimes,
-		messagingServer: messagingServer,
-		backgroundCtx:   backgroundCtx,
-		stopBackground:  stopBackground,
+		chatGPTLogin:      chatGPTLogin,
+		chatGPTActivation: chatGPTActivation,
+		deliverAttention:  deliverAttention,
+		publicMux:         mux,
+		localMux:          localMux,
+		localListener:     localListener,
+		store:             store,
+		browser:           browser,
+		database:          database,
+		spawnManager:      spawnManager,
+		localRuntimes:     localRuntimes,
+		messagingServer:   messagingServer,
+		backgroundCtx:     backgroundCtx,
+		stopBackground:    stopBackground,
 	}, nil
 }
 
@@ -2195,6 +2248,7 @@ func spawnManagerFromEnv(
 	control *agentevents.LocalControlServer,
 	listeners *agentevents.LocalControlListenerRegistry,
 	readiness runtimeReadinessController,
+	resolveModelActivation runtimeActivationResolver,
 ) (*spawn.Manager, error) {
 	socketPath := strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET"))
 	if socketPath == "" {
@@ -2253,9 +2307,9 @@ func spawnManagerFromEnv(
 	if err := runtimeprovision.ValidateApprovalSecretDigestKey(approvalKey); err != nil {
 		return nil, fmt.Errorf("SUMI_APPROVAL_SECRET_DIGEST_KEY: %w", err)
 	}
-	providerKey, err := require("SUMI_PROVIDER_API_KEY")
-	if err != nil {
-		return nil, err
+	providerKey := strings.TrimSpace(os.Getenv("SUMI_PROVIDER_API_KEY"))
+	if providerKey == "" && resolveModelActivation == nil {
+		return nil, errors.New("SUMI_PROVIDER_API_KEY not set")
 	}
 	executionReviewerKey, err := require("SUMI_EXECUTION_REVIEWER_API_KEY")
 	if err != nil {
@@ -2281,13 +2335,14 @@ func spawnManagerFromEnv(
 		}
 	}
 	provisionedSpawner, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
-		Provisioner:    client,
-		Authorizations: control,
-		Listeners:      listeners,
-		Readiness:      readiness,
-		TenantID:       tenantID,
-		Audience:       audience,
-		Delivery:       delivery,
+		ResolveActivation: resolveModelActivation,
+		Provisioner:       client,
+		Authorizations:    control,
+		Listeners:         listeners,
+		Readiness:         readiness,
+		TenantID:          tenantID,
+		Audience:          audience,
+		Delivery:          delivery,
 		Activation: runtimeprovision.ActivationConfig{
 			LocalControlServerUID:        uint32(os.Geteuid()),
 			LocalControlSocketGID:        uint32(gid),

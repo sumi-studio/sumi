@@ -329,6 +329,8 @@ pub struct NativeCompactionCoverage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_source: Option<crate::runtime::contracts::IncomingProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_timing: Option<IncomingEventTiming>,
     pub content: Vec<UserContent>,
     pub timestamp: DateTime<Utc>,
@@ -351,10 +353,40 @@ impl UserMessage {
     /// The same non-instructional prefix is used by every provider send view.
     /// Raw content is kept separate, including images and user-authored text.
     pub fn incoming_timing_text(&self) -> Option<String> {
-        let timing = self.incoming_timing.as_ref()?;
+        let source = self
+            .incoming_source
+            .as_ref()
+            .filter(|source| source.messaging_source().is_some());
+        let source_text = source.map(|source| {
+            // JSON keeps names and other source-authored labels quoted. This is
+            // metadata in the user-message block, never a system instruction.
+            format!(
+                "[Source {}]",
+                serde_json::json!({
+                    "actor": source.actor(),
+                    "source": source.source(),
+                })
+            )
+        });
+        let receipt = self.receipt_timing_text(source.is_some());
+        match (source_text, receipt) {
+            (Some(source), Some(receipt)) => Some(format!("{source}\n{receipt}")),
+            (Some(source), None) => Some(source),
+            (None, receipt) => receipt,
+        }
+    }
+
+    fn receipt_timing_text(&self, require_receipt: bool) -> Option<String> {
+        if self.incoming_timing.is_none() && !require_receipt {
+            return None;
+        }
         let received = self.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
         let mut text = format!("[Received {received}");
-        if let Some(previous) = &timing.previous_receipt {
+        if let Some(previous) = self
+            .incoming_timing
+            .as_ref()
+            .and_then(|timing| timing.previous_receipt.as_ref())
+        {
             let delta = self.timestamp.signed_duration_since(previous.received_at);
             if delta.is_zero() {
                 text.push_str("; same receipt time as the previous incoming message");
@@ -746,6 +778,7 @@ pub enum ProviderEvent {
         delta: String,
     },
     ReasoningSummaryEnd {
+        wire_item_index: u32,
         content_index: usize,
         content: String,
     },
@@ -1604,6 +1637,7 @@ mod tests {
     #[test]
     fn message_types_round_trip_with_stable_tags() {
         let user = Message::User(UserMessage {
+            incoming_source: None,
             incoming_timing: None,
             content: vec![
                 UserContent::Text {
