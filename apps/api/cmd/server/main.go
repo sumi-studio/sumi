@@ -131,7 +131,11 @@ func runIdleReaper(ctx context.Context, mgr *spawn.Manager) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if stopped := mgr.StopIdleCold(); len(stopped) > 0 {
+			stopped, err := mgr.StopIdleCold()
+			if err != nil {
+				log.Printf("spawn: idle reclamation failed: %v", err)
+			}
+			if len(stopped) > 0 {
 				log.Printf("spawn: stopped idle cold agents: %v", stopped)
 			}
 		}
@@ -2328,11 +2332,22 @@ func spawnManagerFromEnv(
 		}
 		idleTimeout = d
 	}
+	idleGuard, ok := readiness.(interface {
+		ClaimIdleRuntime(context.Context, string, func() bool) (bool, error)
+	})
+	if !ok {
+		return nil, errors.New("runtime provisioning requires authoritative idle activity")
+	}
 	mgr, err := spawn.New(spawn.Config{
 		Spawner:     provisionedSpawner,
 		Resolver:    resolver,
 		GatewayURL:  gatewayURL,
 		IdleTimeout: idleTimeout,
+		ClaimIdle: func(agentID string, claim func() bool) (bool, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			return idleGuard.ClaimIdleRuntime(ctx, agentID, claim)
+		},
 	})
 	if err != nil {
 		return nil, err

@@ -2164,3 +2164,82 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 		t.Fatal("expected pending approvals to remain empty after failed reconstruction")
 	}
 }
+
+func TestIdleRuntimeClaimProtectsAcceptedInputAndClosedTabRun(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const id = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	claims := currentRuntimeClaims(t, gateway, id)
+	ctx := context.Background()
+	checkIdle := func(want bool) {
+		t.Helper()
+		called := false
+		got, err := gateway.ClaimIdleRuntime(ctx, id, func() bool { called = true; return true })
+		if err != nil || got != want || called != want {
+			t.Fatalf("idle got %v called %v error %v want %v", got, called, err, want)
+		}
+	}
+	checkIdle(true)
+	command, err := gateway.commands.Append(ctx, testDirectChatProvenance(id), "", json.RawMessage(`{"type":"user_message","text":"work","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkIdle(false) // durable admission precedes agent_start
+	seq := uint64(1)
+	if err := gateway.Receive(ctx, claims, Envelope{PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(ctx, claims, CommandAck{PersonalityAgentID: id, Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err != nil {
+		t.Fatal(err)
+	}
+	checkIdle(false) // no browser is required to keep actual work alive
+	seq = 2
+	if err := gateway.Receive(ctx, claims, Envelope{PersonalityAgentID: id, Seq: &seq, Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	checkIdle(true)
+}
+
+func TestIdleRuntimeClaimDoesNotHoldGatewayWhileWaitingForAckLock(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const id = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := gateway.EnsureAgentSessionStateRebuilt(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := gateway.newFile(gateway.ackPath(id), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ack.Close()
+	if err := syscall.Flock(int(ack.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(ack.Fd()), syscall.LOCK_UN)
+	opened := make(chan struct{})
+	original := gateway.newFile
+	gateway.newFile = func(path string, flags int, mode os.FileMode) (durableFileHandle, error) {
+		file, err := original(path, flags, mode)
+		if path == gateway.ackPath(id) {
+			close(opened)
+		}
+		return file, err
+	}
+	result := make(chan error, 1)
+	go func() { _, err := gateway.ClaimIdleRuntime(ctx, id, func() bool { return true }); result <- err }()
+	select {
+	case <-opened:
+	case <-ctx.Done():
+		t.Fatal("idle check did not reach ACK read")
+	}
+	if !gateway.mu.TryLock() {
+		t.Fatal("idle check holds gateway while waiting for ACK lock")
+	}
+	gateway.mu.Unlock()
+	if err := syscall.Flock(int(ack.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}

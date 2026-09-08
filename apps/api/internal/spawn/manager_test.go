@@ -548,7 +548,10 @@ func TestColdAgentStopsWhenIdle(t *testing.T) {
 	coldProc := spawner.processes["cold"]
 	// Advance past the idle timeout without activity.
 	base = base.Add(6 * time.Minute)
-	stopped := mgr.StopIdleCold()
+	stopped, err := mgr.StopIdleCold()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(stopped) != 1 || stopped[0] != "cold" {
 		t.Fatalf("expected cold agent stopped, got %v", stopped)
 	}
@@ -579,7 +582,10 @@ func TestWarmAgentNeverStopsIdle(t *testing.T) {
 	}
 	warmProc := spawner.processes["warm"]
 	base = base.Add(time.Hour)
-	stopped := mgr.StopIdleCold()
+	stopped, err := mgr.StopIdleCold()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(stopped) != 0 {
 		t.Fatalf("warm agent must not be idle-stopped, got %v", stopped)
 	}
@@ -613,12 +619,152 @@ func TestTouchKeepsColdAgentAlive(t *testing.T) {
 	base = base.Add(4 * time.Minute)
 	mgr.Touch("cold")
 	base = base.Add(4 * time.Minute)
-	if stopped := mgr.StopIdleCold(); len(stopped) != 0 {
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 0 {
 		t.Fatalf("touched cold agent should not be stopped, got %v", stopped)
 	}
 	// Advance past the timeout since the last touch.
 	base = base.Add(2 * time.Minute)
-	if stopped := mgr.StopIdleCold(); len(stopped) != 1 {
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 1 {
 		t.Fatalf("cold agent should stop after idle, got %v", stopped)
+	}
+}
+
+func TestIdleClaimKeepsClosedTabWorkAndRechecksConcurrentActivity(t *testing.T) {
+	spawner := newFakeSpawner()
+	now := time.Now()
+	busy := true
+	var beforeClaim func()
+	mgr, err := New(Config{
+		Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}},
+		IdleTimeout: time.Minute, Now: func() time.Time { return now },
+		ClaimIdle: func(_ string, claim func() bool) (bool, error) {
+			if busy {
+				return false, nil
+			}
+			if beforeClaim != nil {
+				beforeClaim()
+			}
+			return claim(), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 0 {
+		t.Fatalf("busy: %v %v", stopped, err)
+	}
+	if spawner.processes["agent"].isStopped() {
+		t.Fatal("closed-tab active work stopped")
+	}
+	busy = false
+	// Selection has already happened when a new admission touches the manager.
+	beforeClaim = func() {
+		if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 0 {
+		t.Fatalf("racing request: %v %v", stopped, err)
+	}
+	beforeClaim = nil
+	now = now.Add(2 * time.Minute)
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 1 {
+		t.Fatalf("completed idle: %v %v", stopped, err)
+	}
+}
+
+func TestIdleStopFailureIsReportedNotSuccessful(t *testing.T) {
+	spawner := newFakeSpawner()
+	now := time.Now()
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, IdleTimeout: time.Minute, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("stop failed")
+	spawner.processes["agent"].stopErr = failure
+	now = now.Add(2 * time.Minute)
+	stopped, err := mgr.StopIdleCold()
+	if len(stopped) != 0 || !errors.Is(err, failure) {
+		t.Fatalf("got %v %v", stopped, err)
+	}
+}
+
+func TestAdmissionHoldPreventsIdleStopEvenAfterTimeout(t *testing.T) {
+	spawner := newFakeSpawner()
+	now := time.Now()
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, IdleTimeout: time.Minute, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	release, err := mgr.HoldAdmission("agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 0 {
+		t.Fatalf("held admission: %v %v", stopped, err)
+	}
+	release()
+	release() // no underflow on repeated cleanup
+	now = now.Add(2 * time.Minute)
+	if stopped, err := mgr.StopIdleCold(); err != nil || len(stopped) != 1 {
+		t.Fatalf("released admission: %v %v", stopped, err)
+	}
+}
+
+func TestIdleClaimRejectsAdmissionUntilReplacementGeneration(t *testing.T) {
+	old := &blockingStopProcess{done: make(chan struct{}), stopEntered: make(chan struct{}), releaseStop: make(chan struct{})}
+	fresh := &fakeProcess{done: make(chan struct{})}
+	spawner := &sequenceSpawner{processes: []Process{old, fresh}}
+	now := time.Now()
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, IdleTimeout: time.Minute, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	reaped := make(chan error, 1)
+	go func() { _, err := mgr.StopIdleCold(); reaped <- err }()
+	<-old.stopEntered
+	if release, err := mgr.HoldAdmission("agent"); err == nil {
+		release()
+		t.Fatal("accepted input into stopping generation")
+	}
+	ready := make(chan error, 1)
+	go func() { ready <- mgr.EnsureRunning(context.Background(), "agent") }()
+	select {
+	case err := <-ready:
+		t.Fatalf("ensure returned before stop completed: %v", err)
+	default:
+	}
+	close(old.releaseStop)
+	if err := <-reaped; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
+	release, err := mgr.HoldAdmission("agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if fresh.isStopped() {
+		t.Fatal("old idle stop killed replacement")
+	}
+	if err := mgr.Stop("agent"); err != nil {
+		t.Fatal(err)
 	}
 }

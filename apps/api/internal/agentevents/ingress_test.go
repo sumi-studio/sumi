@@ -937,3 +937,26 @@ func assertRejectReason(t *testing.T, r io.Reader, want RejectReason) {
 		t.Fatalf("expected reject_reason %q, got %q", want, got.RejectReason)
 	}
 }
+
+type stoppingAdmissionSpawner struct{}
+
+func (stoppingAdmissionSpawner) EnsureRunning(context.Context, string) error { return nil }
+func (stoppingAdmissionSpawner) Touch(string)                                {}
+func (stoppingAdmissionSpawner) HoldAdmission(string) (func(), error) {
+	return nil, errors.New("idle stop claimed after EnsureRunning")
+}
+
+func TestUserCommandIngressRejectsIdleStopRaceBeforeDurableAppend(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	ingress.Spawner = stoppingAdmissionSpawner{}
+	server := httptest.NewServer(ingress)
+	defer server.Close()
+	response := postWithSessionCookie(t, server.URL, []byte(`{"type":"user_message","text":"continue","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", response.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatal("command accepted after idle stop claimed")
+	}
+}

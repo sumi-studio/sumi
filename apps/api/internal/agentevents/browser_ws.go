@@ -1053,6 +1053,11 @@ func (s *BrowserServer) browserReadPump(
 		writeErr := withExclusiveSocketWrite(func(writeSocketUnlocked func(any) error) error {
 			admissionErr = s.authorizeBrowserOperation(ctx, claims, scope, func() error {
 				appendCalled = true
+				release, err := holdRuntimeAdmission(s.Spawner, claims.PersonalityAgentID)
+				if err != nil {
+					return err
+				}
+				defer release()
 				var appendErr error
 				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
 					envelope, existingAcceptance, appendErr = appender.AppendWithIdempotencyStatus(

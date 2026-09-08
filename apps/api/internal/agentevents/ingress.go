@@ -227,6 +227,11 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		appendCalled = true
+		release, err := holdRuntimeAdmission(h.Spawner, claims.PersonalityAgentID)
+		if err != nil {
+			return err
+		}
+		defer release()
 		var appendErr error
 		env, appendErr = h.Appender.Append(
 			operationContext,
