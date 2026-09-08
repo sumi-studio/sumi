@@ -1,12 +1,14 @@
 /// <reference types="node" />
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import type {
   ApprovalRequest,
   BrowserEventEnvelope,
   PublicAssistantMessage,
   PublicMessage,
+  PublicStreamEvent,
 } from "@sumi/api-client";
 import { projectConversation } from "./projection";
 import { createAgentSession, reduceEnvelope } from "./reducer";
@@ -16,10 +18,12 @@ const id = () => "deterministic";
 test("durable message_end replaces volatile text and durable replay is ignored", () => {
   let session = createAgentSession();
   session = apply(session, {
+    audience: "direct_chat",
     seq: 1,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 2,
     event: {
       type: "message_start",
@@ -28,6 +32,7 @@ test("durable message_end replaces volatile text and durable replay is ignored",
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     event: {
       type: "message_update",
       message_id: AssistantMessageId,
@@ -35,6 +40,7 @@ test("durable message_end replaces volatile text and durable replay is ignored",
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     event: {
       type: "message_update",
       message_id: AssistantMessageId,
@@ -46,6 +52,7 @@ test("durable message_end replaces volatile text and durable replay is ignored",
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     event: {
       type: "message_update",
       message_id: AssistantMessageId,
@@ -58,6 +65,7 @@ test("durable message_end replaces volatile text and durable replay is ignored",
   });
 
   const completed: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 3,
     event: {
       type: "message_end",
@@ -70,7 +78,7 @@ test("durable message_end replaces volatile text and durable replay is ignored",
   session = apply(session, completed);
 
   assert.equal(session, afterFirstEnd);
-  const prose = session.conversation.entries[`message:${AssistantMessageId}`];
+  const prose = session.conversation.entries[`message:${AssistantMessageId}:0`];
   assert.equal(prose?.kind, "prose");
   if (prose?.kind === "prose") {
     assert.equal(prose.text, "durable truth");
@@ -92,17 +100,22 @@ test("durable message_end replaces volatile text and durable replay is ignored",
   );
   assert.deepEqual(
     projectConversation(session.conversation).map((item) => item.kind),
-    ["agent-run", "prose"],
+    ["agent-run", "prose", "trace"],
   );
 });
 
 test("tool call projections retain normal and elevated as distinct routes", () => {
   let session = createAgentSession();
-  session = apply(session, { seq: 1, event: { type: "agent_start" } });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
   for (const [contentIndex, route] of (
     ["normal", "elevated"] as const
   ).entries()) {
     session = apply(session, {
+      audience: "direct_chat",
       event: {
         type: "message_update",
         message_id: AssistantMessageId,
@@ -129,10 +142,12 @@ test("tool call projections retain normal and elevated as distinct routes", () =
 test("late empty message_start preserves update-before-start prose until authoritative end", () => {
   let session = createAgentSession();
   session = apply(session, {
+    audience: "direct_chat",
     seq: 1,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     event: {
       type: "message_update",
       message_id: AssistantMessageId,
@@ -140,6 +155,7 @@ test("late empty message_start preserves update-before-start prose until authori
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 2,
     event: {
       type: "message_start",
@@ -148,6 +164,7 @@ test("late empty message_start preserves update-before-start prose until authori
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 3,
     event: {
       type: "message_start",
@@ -156,6 +173,7 @@ test("late empty message_start preserves update-before-start prose until authori
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     event: {
       type: "message_update",
       message_id: AssistantMessageId,
@@ -164,7 +182,7 @@ test("late empty message_start preserves update-before-start prose until authori
   });
 
   const streaming =
-    session.conversation.entries[`message:${AssistantMessageId}`];
+    session.conversation.entries[`message:${AssistantMessageId}:0`];
   assert.equal(streaming?.kind, "prose");
   if (streaming?.kind === "prose") {
     assert.equal(streaming.text, "before start and after");
@@ -172,6 +190,7 @@ test("late empty message_start preserves update-before-start prose until authori
   }
 
   session = apply(session, {
+    audience: "direct_chat",
     seq: 4,
     event: {
       type: "message_end",
@@ -180,7 +199,7 @@ test("late empty message_start preserves update-before-start prose until authori
     },
   });
   assert.equal(
-    session.conversation.entries[`message:${AssistantMessageId}`],
+    session.conversation.entries[`message:${AssistantMessageId}:0`],
     undefined,
   );
 });
@@ -188,10 +207,12 @@ test("late empty message_start preserves update-before-start prose until authori
 test("durable empty provider failure is visible instead of disappearing", () => {
   let session = createAgentSession();
   session = apply(session, {
+    audience: "direct_chat",
     seq: 1,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 2,
     event: {
       type: "message_start",
@@ -200,6 +221,7 @@ test("durable empty provider failure is visible instead of disappearing", () => 
     },
   });
   const failed: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 3,
     event: {
       type: "message_end",
@@ -224,7 +246,7 @@ test("durable empty provider failure is visible instead of disappearing", () => 
 
   assert.equal(session, afterFirstEnd);
   assert.equal(
-    session.conversation.entries[`message:${AssistantMessageId}`],
+    session.conversation.entries[`message:${AssistantMessageId}:0`],
     undefined,
   );
   const error =
@@ -245,10 +267,12 @@ test("durable empty provider failure is visible instead of disappearing", () => 
 test("durable tool start and end upsert without volatile tool-call events", () => {
   let session = createAgentSession();
   session = apply(session, {
+    audience: "direct_chat",
     seq: 10,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 11,
     event: {
       type: "tool_execution_start",
@@ -258,6 +282,7 @@ test("durable tool start and end upsert without volatile tool-call events", () =
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 12,
     event: {
       type: "tool_execution_end",
@@ -267,6 +292,7 @@ test("durable tool start and end upsert without volatile tool-call events", () =
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 13,
     event: {
       type: "tool_execution_end",
@@ -360,11 +386,13 @@ test("valid SDUI materializes while adversarial SDUI validation stays inert", ()
   for (const { name, node, accepted } of payloads) {
     let session = createAgentSession();
     session = apply(session, {
+      audience: "direct_chat",
       seq: 60,
       event: { type: "agent_start" },
     });
     assert.doesNotThrow(() => {
       session = apply(session, {
+        audience: "direct_chat",
         seq: 61,
         event: {
           type: "tool_execution_end",
@@ -382,6 +410,7 @@ test("valid SDUI materializes while adversarial SDUI validation stays inert", ()
 test("approval request and resolution preserve structured decision", () => {
   let session = createAgentSession();
   session = apply(session, {
+    audience: "direct_chat",
     seq: 20,
     event: { type: "agent_start" },
   });
@@ -400,10 +429,12 @@ test("approval request and resolution preserve structured decision", () => {
     },
   };
   session = apply(session, {
+    audience: "direct_chat",
     seq: 21,
     event: { type: "approval_requested", request },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 22,
     event: {
       type: "approval_resolved",
@@ -426,14 +457,17 @@ test("execution rejection preserves the Human's exact approval decision", () => 
   let session = createAgentSession();
   const request = approvalRequest("approval-rejected", "call-rejected");
   session = apply(session, {
+    audience: "direct_chat",
     seq: 30,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 31,
     event: { type: "approval_requested", request },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 32,
     event: {
       type: "approval_resolved",
@@ -455,10 +489,12 @@ test("cancelled approval closes its linked pending tool trace and durable replay
   let session = createAgentSession();
   const request = approvalRequest("approval-cancelled", "call-cancelled");
   session = apply(session, {
+    audience: "direct_chat",
     seq: 40,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 41,
     event: {
       type: "message_end",
@@ -467,10 +503,12 @@ test("cancelled approval closes its linked pending tool trace and durable replay
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 42,
     event: { type: "approval_requested", request },
   });
   const resolution: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 43,
     event: {
       type: "approval_resolved",
@@ -497,10 +535,12 @@ test("denied approval closes its linked running tool trace", () => {
   let session = createAgentSession();
   const request = approvalRequest("approval-denied", "call-denied");
   session = apply(session, {
+    audience: "direct_chat",
     seq: 50,
     event: { type: "agent_start" },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 51,
     event: {
       type: "tool_execution_start",
@@ -510,10 +550,12 @@ test("denied approval closes its linked running tool trace", () => {
     },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 52,
     event: { type: "approval_requested", request },
   });
   session = apply(session, {
+    audience: "direct_chat",
     seq: 53,
     event: {
       type: "approval_resolved",
@@ -532,6 +574,7 @@ test("denied approval closes its linked running tool trace", () => {
 test("durable user messages materialize once under their server message id", () => {
   let session = createAgentSession();
   const envelope: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 30,
     event: {
       type: "message_end",
@@ -548,6 +591,7 @@ test("durable user messages materialize once under their server message id", () 
 test("durable command disposition advances the cursor without entering conversation", () => {
   let session = createAgentSession();
   const envelope: BrowserEventEnvelope = {
+    audience: "direct_chat",
     seq: 30,
     event: {
       type: "command_disposition",
@@ -571,6 +615,7 @@ test("lifetime command dispositions retain no reducer correlation history", () =
   let session = createAgentSession();
   for (let sequence = 1; sequence <= 10_000; sequence++) {
     session = apply(session, {
+      audience: "direct_chat",
       seq: sequence,
       event: {
         type: "command_disposition",
@@ -669,3 +714,278 @@ function userMessage(text: string): PublicMessage {
 const AssistantMessageId = "00000000-0000-4000-8000-000000000010";
 const UserMessageId = "00000000-0000-4000-8000-000000000011";
 const Timestamp = "2026-07-30T12:00:00Z";
+
+test("prose, public summary, tool operation, intervening prose and result retain their event positions", () => {
+  let session = createAgentSession();
+  const update = (event: PublicStreamEvent) => {
+    session = apply(session, {
+      audience: "secretary",
+      event: { type: "message_update", message_id: AssistantMessageId, event },
+    });
+  };
+  session = apply(session, {
+    audience: "secretary",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  update({ type: "text_delta", content_index: 0, delta: "First" });
+  update({
+    type: "reasoning_summary_end",
+    content_index: 1,
+    content: "Check the source",
+  });
+  update({
+    type: "tool_call_end",
+    content_index: 2,
+    tool_call: {
+      id: "read",
+      name: "read_file",
+      route: "normal",
+      arguments: { path: "note" },
+    },
+  });
+  update({ type: "text_delta", content_index: 3, delta: "While waiting" });
+  session = apply(session, {
+    audience: "secretary",
+    seq: 2,
+    event: {
+      type: "tool_execution_end",
+      tool_call_id: "read",
+      result: "Source result",
+      is_error: false,
+    },
+  });
+  update({ type: "text_delta", content_index: 4, delta: "After result" });
+  const labels = projectConversation(session.conversation)
+    .filter((row) => row.kind !== "agent-run")
+    .map((row) =>
+      row.kind === "prose"
+        ? row.text
+        : row.kind === "trace"
+          ? row.trace.type === "reasoning"
+            ? row.trace.text
+            : `${row.traceId}:${row.phase}`
+          : row.kind,
+    );
+  assert.deepEqual(labels, [
+    "First",
+    "Check the source",
+    "read:activity",
+    "While waiting",
+    "read:result",
+    "After result",
+  ]);
+  assert.equal(session.conversation.runs["run:1"].audience, "secretary");
+});
+
+test("canonical message replay preserves text/tool wire order without grouping all prose", () => {
+  let session = apply(createAgentSession(), {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  const message: PublicAssistantMessage = {
+    ...assistantMessage(""),
+    content: [
+      { type: "text", text: "Before", wire_item_index: 0 },
+      {
+        type: "tool_call",
+        wire_item_index: 1,
+        tool_call: {
+          id: "read",
+          name: "read_file",
+          route: "normal",
+          arguments: {},
+        },
+      },
+      { type: "text", text: "After", wire_item_index: 2 },
+    ],
+  };
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 2,
+    event: { type: "message_end", message_id: AssistantMessageId, message },
+  });
+  assert.deepEqual(
+    projectConversation(session.conversation)
+      .filter((row) => row.kind !== "agent-run")
+      .map((row) => (row.kind === "prose" ? row.text : row.kind)),
+    ["Before", "trace", "After"],
+  );
+});
+
+test("external source remains attached to its own log input across replay", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      new URL(
+        "../../../../contracts/agent-events-fixtures.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ).external_dm;
+  const message: PublicMessage = {
+    role: "user",
+    content: [{ type: "text", text: "External speaker" }],
+    timestamp: Timestamp,
+    incoming_source: fixture.wire.provenance,
+  };
+  const envelope: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 1,
+    event: { type: "message_end", message_id: AssistantMessageId, message },
+  };
+  const session = apply(createAgentSession(), envelope);
+  const entry = session.conversation.entries[AssistantMessageId];
+  assert.equal(entry.kind, "user");
+  if (entry.kind !== "user") throw new Error("missing input");
+  assert.deepEqual(entry.source, fixture.wire.provenance);
+  assert.equal(entry.idempotencyKey, undefined);
+  assert.equal(apply(session, envelope), session);
+});
+
+test("durable summary upgrades the live block and replay restores its position", () => {
+  const start: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 1,
+    event: { type: "agent_start" },
+  };
+  const summary: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 2,
+    event: {
+      type: "reasoning_summary",
+      message_id: AssistantMessageId,
+      content_index: 0,
+      wire_item_index: 1,
+      content: "Check first",
+    },
+  };
+  const operation: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 3,
+    event: {
+      type: "tool_execution_start",
+      tool_call_id: "check",
+      tool_name: "read_file",
+      args: { path: "note" },
+    },
+  };
+  let live = apply(createAgentSession(), start);
+  live = apply(live, {
+    audience: "secretary",
+    event: {
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: {
+        type: "reasoning_summary_delta",
+        content_index: 0,
+        delta: "Check",
+      },
+    },
+  });
+  const ids = live.conversation.entryOrder;
+  live = apply(live, summary);
+  assert.deepEqual(live.conversation.entryOrder, ids);
+  live = apply(live, operation);
+  let replay = createAgentSession();
+  for (const frame of [start, summary, operation])
+    replay = apply(replay, frame);
+  assert.deepEqual(
+    projectConversation(replay.conversation),
+    projectConversation(live.conversation),
+  );
+  assert.equal(apply(live, summary), live);
+});
+
+test("summary slot zero and text wire zero do not collide during canonical replay", () => {
+  const start: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 1,
+    event: { type: "agent_start" },
+  };
+  const summary: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 2,
+    event: {
+      type: "reasoning_summary",
+      message_id: AssistantMessageId,
+      content_index: 0,
+      wire_item_index: 1,
+      content: "Reason",
+    },
+  };
+  const end: BrowserEventEnvelope = {
+    audience: "secretary",
+    seq: 3,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: {
+        ...assistantMessage(""),
+        content: [
+          { type: "text", text: "Before", wire_item_index: 0 },
+          { type: "text", text: "After", wire_item_index: 2 },
+        ],
+      },
+    },
+  };
+  let live = apply(createAgentSession(), start);
+  live = apply(live, {
+    audience: "secretary",
+    event: {
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 0, delta: "Before" },
+    },
+  });
+  live = apply(live, summary);
+  live = apply(live, {
+    audience: "secretary",
+    event: {
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 2, delta: "After" },
+    },
+  });
+  const liveOrder = live.conversation.entryOrder;
+  live = apply(live, end);
+  assert.deepEqual(live.conversation.entryOrder, liveOrder);
+  let replay = createAgentSession();
+  for (const frame of [start, summary, end]) replay = apply(replay, frame);
+  assert.deepEqual(
+    projectConversation(replay.conversation),
+    projectConversation(live.conversation),
+  );
+});
+
+test("canonical rejected operation stays between its surrounding prose blocks", () => {
+  let session = apply(createAgentSession(), {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  const message: PublicAssistantMessage = {
+    ...assistantMessage(""),
+    content: [
+      { type: "text", text: "Before", wire_item_index: 0 },
+      {
+        type: "rejected_tool_call",
+        wire_item_index: 1,
+        rejected: { id: "bad", name: "read_file", error: "invalid_json" },
+      },
+      { type: "text", text: "After", wire_item_index: 2 },
+    ],
+  };
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 2,
+    event: { type: "message_end", message_id: AssistantMessageId, message },
+  });
+  assert.deepEqual(
+    projectConversation(session.conversation)
+      .filter((row) => row.kind !== "agent-run")
+      .map((row) => (row.kind === "prose" ? row.text : row.kind)),
+    ["Before", "trace", "After"],
+  );
+});

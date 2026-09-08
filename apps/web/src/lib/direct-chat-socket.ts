@@ -2,7 +2,6 @@ import type {
   DirectChatStatusFrame as APIClientDirectChatStatusFrame,
   BrowserEventEnvelope,
   CommandDispositionEvent,
-  DirectChatCursorFrame,
 } from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
@@ -62,7 +61,6 @@ export type DirectChatRejectedFrame = {
 };
 export type DirectChatServerFrame =
   | DirectChatEventFrame
-  | DirectChatCursorFrame
   | DirectChatStatusFrame
   | DirectChatAcceptedFrame
   | DirectChatRejectedFrame;
@@ -98,6 +96,7 @@ const DurableEventTypes = new Set([
   "turn_end",
   "message_start",
   "message_end",
+  "reasoning_summary",
   "tool_execution_start",
   "tool_execution_end",
   "approval_requested",
@@ -404,6 +403,107 @@ function isIncomingEventTiming(value: unknown): boolean {
   );
 }
 
+function isIncomingSource(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !hasRequiredAndOnlyKeys(value, [
+      "version",
+      "tenant_id",
+      "personality_agent_id",
+      "actor",
+      "source",
+    ]) ||
+    value.version !== 2 ||
+    !isUUID(value.personality_agent_id) ||
+    typeof value.tenant_id !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$/.test(value.tenant_id)
+  )
+    return false;
+  const actor = value.actor;
+  const source = value.source;
+  if (
+    !isRecord(actor) ||
+    !hasRequiredAndOnlyKeys(
+      actor,
+      ["kind", "principal_id"],
+      ["kind", "principal_id", "display_name"],
+    ) ||
+    (actor.kind !== "human" && actor.kind !== "personality_agent") ||
+    typeof actor.principal_id !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$/.test(actor.principal_id) ||
+    ("display_name" in actor && typeof actor.display_name !== "string")
+  )
+    return false;
+  if (
+    !isRecord(source) ||
+    !hasRequiredAndOnlyKeys(
+      source,
+      [
+        "surface",
+        "kind",
+        "event_id",
+        "workspace_id",
+        "installation_id",
+        "authority_epoch",
+        "message_id",
+        "message_revision",
+        "message_seq",
+        "place",
+        "occurred_at",
+      ],
+      [
+        "surface",
+        "kind",
+        "event_id",
+        "workspace_id",
+        "installation_id",
+        "authority_epoch",
+        "message_id",
+        "message_revision",
+        "message_seq",
+        "place",
+        "occurred_at",
+        "marker_id",
+        "due_at",
+      ],
+    )
+  )
+    return false;
+  if (
+    source.surface !== "messaging" ||
+    !["event_id", "workspace_id", "installation_id", "message_id"].every(
+      (key) => isUUID(source[key]),
+    ) ||
+    !["authority_epoch", "message_revision", "message_seq"].every(
+      (key) => isSafeSequence(source[key]) && (source[key] as number) > 0,
+    ) ||
+    !isDateTime(source.occurred_at)
+  )
+    return false;
+  const place = source.place;
+  if (
+    !isRecord(place) ||
+    !hasRequiredAndOnlyKeys(place, ["kind", "id", "name"]) ||
+    !["channel", "thread", "dm", "group_dm"].includes(String(place.kind)) ||
+    !isUUID(place.id) ||
+    typeof place.name !== "string"
+  )
+    return false;
+  if (source.kind === "reply_later_due")
+    return (
+      actor.kind === "personality_agent" &&
+      actor.principal_id === value.personality_agent_id &&
+      isUUID(source.marker_id) &&
+      isDateTime(source.due_at)
+    );
+  if ("marker_id" in source || "due_at" in source) return false;
+  return (
+    source.kind === "messaging_mention" ||
+    (source.kind === "messaging_message" &&
+      (place.kind === "dm" || place.kind === "group_dm"))
+  );
+}
+
 function isPublicMessage(value: unknown): boolean {
   if (!isRecord(value) || typeof value.role !== "string") return false;
   if (value.role === "user") {
@@ -411,10 +511,12 @@ function isPublicMessage(value: unknown): boolean {
       hasRequiredAndOnlyKeys(
         value,
         ["role", "content", "timestamp"],
-        ["role", "content", "timestamp", "incoming_timing"],
+        ["role", "content", "timestamp", "incoming_timing", "incoming_source"],
       ) &&
       (!("incoming_timing" in value) ||
         isIncomingEventTiming(value.incoming_timing)) &&
+      (!("incoming_source" in value) ||
+        isIncomingSource(value.incoming_source)) &&
       Array.isArray(value.content) &&
       value.content.every(isUserContent) &&
       isDateTime(value.timestamp)
@@ -462,6 +564,8 @@ function isPublicMessage(value: unknown): boolean {
       ]) &&
       typeof value.tool_call_id === "string" &&
       typeof value.tool_name === "string" &&
+      (!("incoming_source" in value) ||
+        isIncomingSource(value.incoming_source)) &&
       Array.isArray(value.content) &&
       value.content.every(isUserContent) &&
       isSafeAnyJSON(value.details) &&
@@ -683,6 +787,21 @@ function isSafeEventForUI(
       isPublicMessage(value.message)
     );
   }
+  if (value.type === "reasoning_summary") {
+    return (
+      hasRequiredAndOnlyKeys(value, [
+        "type",
+        "message_id",
+        "content_index",
+        "wire_item_index",
+        "content",
+      ]) &&
+      isUUID(value.message_id) &&
+      isSafeSequence(value.content_index) &&
+      isSafeSequence(value.wire_item_index) &&
+      typeof value.content === "string"
+    );
+  }
   if (value.type === "message_update") {
     return (
       hasRequiredAndOnlyKeys(value, ["type", "message_id", "event"]) &&
@@ -805,16 +924,6 @@ export function parseDirectChatServerFrame(
   lastEventSeq: number,
 ): DirectChatServerFrame | undefined {
   if (!isRecord(value)) return undefined;
-  if (value.type === "event_cursor") {
-    if (
-      hasRequiredAndOnlyKeys(value, ["type", "through_seq"]) &&
-      isSafeSequence(value.through_seq) &&
-      value.through_seq > lastEventSeq
-    ) {
-      return { type: "event_cursor", through_seq: value.through_seq };
-    }
-    return undefined;
-  }
   if (value.type === "direct_chat_status") {
     if (
       value.status === "ready" &&
@@ -838,7 +947,13 @@ export function parseDirectChatServerFrame(
   ) {
     const envelope = value.envelope;
     if (
-      !hasOnlyKeys(envelope, ["seq", "event"]) ||
+      !hasRequiredAndOnlyKeys(
+        envelope,
+        ["audience", "event"],
+        ["seq", "audience", "event"],
+      ) ||
+      (envelope.audience !== "direct_chat" &&
+        envelope.audience !== "secretary") ||
       !isSafeEventForUI(envelope.event)
     ) {
       return undefined;
@@ -1051,10 +1166,6 @@ export class DirectChatSocket {
       const frame = parseDirectChatServerFrame(raw, this.lastEventSeq);
       if (!frame) {
         socket.close();
-        return;
-      }
-      if (frame.type === "event_cursor") {
-        this.lastEventSeq = frame.through_seq;
         return;
       }
       if (frame.type === "event" && "seq" in frame.envelope) {

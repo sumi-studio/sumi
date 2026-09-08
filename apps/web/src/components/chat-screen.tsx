@@ -81,6 +81,9 @@ function ChatScreenContent({
   const [draft, setDraft] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [atEnd, setAtEnd] = useState(true);
+  const [expandedOperations, setExpandedOperations] = useState<
+    Record<string, boolean>
+  >({});
   const [visibleMessageIds, setVisibleMessageIds] = useState<string[]>([]);
   const conversationRef = useRef<ConversationVirtualizerHandle>(null);
   const items = useMemo(
@@ -99,6 +102,17 @@ function ChatScreenContent({
   useEffect(() => {
     return acquireConnection({ installationId, authorityEpoch });
   }, [acquireConnection, authorityEpoch, installationId]);
+
+  useEffect(() => {
+    setExpandedOperations((previous) => {
+      const retained = Object.entries(previous).filter(
+        ([id]) => conversation.entries[id],
+      );
+      return retained.length === Object.keys(previous).length
+        ? previous
+        : Object.fromEntries(retained);
+    });
+  }, [conversation.entries]);
 
   const available = connection === "connected" && ready === "ready";
   const send = () => {
@@ -153,7 +167,12 @@ function ChatScreenContent({
       <main className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-12 shrink-0 items-center gap-3 border-border/70 border-b px-3 sm:px-5">
           <div className="min-w-0 flex-1">
-            <h1 className="truncate font-semibold text-[15px]">Sumi</h1>
+            <h1 className="truncate font-semibold text-[15px]">
+              Sumi{" "}
+              <span className="ml-2 font-normal text-muted-foreground text-sm">
+                活動記録
+              </span>
+            </h1>
           </div>
           <span
             className="flex items-center gap-1.5 text-muted-foreground text-xs"
@@ -174,7 +193,7 @@ function ChatScreenContent({
             <Button
               variant="ghost"
               size="icon"
-              aria-label="会話タイムライン"
+              aria-label="記録の履歴"
               onClick={() => setTimelineOpen(true)}
               className="md:hidden"
             >
@@ -189,7 +208,7 @@ function ChatScreenContent({
             items={rows}
             busy={running}
             paddingEnd={CONVERSATION_BOTTOM_PADDING}
-            ariaLabel="Sumiとの会話"
+            ariaLabel="Sumiの活動記録"
             className="scroll-fade-b scrollbar-ui scrollbar-gutter-stable size-full min-h-0 min-w-0 overscroll-contain contain-content"
             onAtEndChange={setAtEnd}
             onVisibleMessageIdsChange={onVisibleRowsChange}
@@ -204,7 +223,7 @@ function ChatScreenContent({
                 return (
                   <div
                     role="status"
-                    className="mx-auto w-full max-w-2xl px-4 py-3 sm:px-6"
+                    className="mx-auto w-full max-w-3xl px-4 py-3 sm:px-6"
                   >
                     <span className="inline-block size-2.5 animate-pulse rounded-full bg-neutral-400" />
                     <span className="sr-only">Sumiが応答を考えています</span>
@@ -212,10 +231,18 @@ function ChatScreenContent({
                 );
               }
               return (
-                <div className="mx-auto w-full max-w-2xl px-4 sm:px-6">
+                <div className="mx-auto w-full max-w-3xl px-4 sm:px-6">
                   <Suspense fallback={null}>
                     <ChatItemView
                       item={row}
+                      operationOpen={expandedOperations[row.id] ?? false}
+                      onOperationOpenChange={(open) =>
+                        setExpandedOperations((previous) =>
+                          previous[row.id] === open
+                            ? previous
+                            : { ...previous, [row.id]: open },
+                        )
+                      }
                       copyAlwaysVisible={
                         row.kind === "prose" &&
                         row.id === lastAssistantMessage?.id &&
@@ -267,7 +294,7 @@ function ChatScreenContent({
           )}
         </div>
 
-        <div className="mx-auto w-full max-w-2xl shrink-0 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-4">
+        <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6 sm:pb-4">
           {recoverableDrafts.length > 0 && (
             <section
               aria-label="送信されなかったメッセージ"
@@ -383,8 +410,16 @@ function ChatScreenContent({
 function transcriptText(row: ConversationRow): string | null {
   if (row.kind === "waiting") return null;
   switch (row.kind) {
+    case "trace":
+      return row.trace.type === "reasoning"
+        ? `思考の要約: ${row.trace.text}`
+        : row.trace.type === "tool"
+          ? `${row.trace.name} (${row.phase === "result" ? row.trace.status : "操作"})\n${JSON.stringify(row.phase === "result" ? row.trace.result : row.trace.args, null, 2) ?? ""}`
+          : row.trace.type === "error"
+            ? row.trace.message
+            : null;
     case "user":
-      return `あなた: ${row.text}`;
+      return `${row.source ? `${row.source.actor.display_name || row.source.actor.principal_id} · ${row.source.source.place.name}` : "診断用の入力"}: ${row.text}`;
     case "prose":
       return `Sumi: ${row.text}`;
     case "approval":
@@ -402,34 +437,19 @@ function transcriptText(row: ConversationRow): string | null {
     case "card":
       return `カード:\n${JSON.stringify(row.node)}`;
     case "agent-run":
-      return [
-        "エージェントの作業:",
-        ...row.trace.map((trace) => {
-          switch (trace.type) {
-            case "reasoning":
-              return trace.text;
-            case "tool":
-              return `${trace.label} (${trace.status})`;
-            case "approval":
-              return `${trace.summary} (${trace.status})`;
-            case "artifact":
-              return trace.label;
-            case "error":
-              return `エラー: ${trace.message}`;
-          }
-          return "";
-        }),
-      ].join("\n");
+      return `Sumiの活動 (${row.status === "running" ? "実行中" : "終了"})`;
   }
 }
 
 function EmptyState({ available }: { available: boolean }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-      <h2 className="font-semibold text-2xl text-neutral-800">こんにちは</h2>
+      <h2 className="font-semibold text-2xl text-neutral-800">
+        Sumiの活動記録
+      </h2>
       <p className="max-w-sm text-neutral-500 text-sm leading-6">
         {available
-          ? "なんでも話しかけてください。"
+          ? "Sumiの経験や作業が、ここに記録されます。"
           : "あなたのエージェントへ接続しています。"}
       </p>
     </div>
@@ -475,7 +495,7 @@ function composerPlaceholder(
   if (ready === "not_ready" || ready === "stopped" || ready === "unavailable")
     return "現在エージェントを利用できません";
   if (ready === "unknown") return "エージェントを確認しています…";
-  return "メッセージを入力…";
+  return "Sumiへの診断用の指示…";
 }
 
 function unavailableMessage(ready: "stopped" | "unavailable" | "not_ready") {

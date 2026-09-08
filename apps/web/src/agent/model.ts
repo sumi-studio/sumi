@@ -2,6 +2,7 @@ import type {
   AnyJSON,
   ApprovalDecision,
   ApprovalRequest,
+  MessagingProvenanceV2,
   SteerMode,
   ToolCall,
 } from "@sumi/api-client";
@@ -25,6 +26,7 @@ export type AgentTraceEvent =
       label: string;
       args: Record<string, AnyJSON>;
       result: AnyJSON | undefined;
+      progress?: AnyJSON;
       status: "pending" | "running" | "done" | "error" | "cancelled";
     }
   | {
@@ -48,6 +50,7 @@ export interface AgentRun {
   kind: "agent-run";
   id: string;
   startedSeq: number;
+  audience: "direct_chat" | "secretary";
   endedSeq: number | null;
   status: "running" | "complete";
   trace: AgentTraceEvent[];
@@ -68,7 +71,18 @@ export interface RecoverableDraft {
 
 export type ConversationEntry =
   | {
+      kind: "trace";
+      id: string;
+      runId: string;
+      traceId: string;
+      phase: "activity" | "result";
+      inputArgs?: Record<string, AnyJSON>;
+      messageId?: string;
+      contentIndex?: number;
+    }
+  | {
       kind: "user";
+      source?: MessagingProvenanceV2;
       id: string;
       text: string;
       /** v1 direct chat accepts no attachments. */
@@ -83,6 +97,7 @@ export type ConversationEntry =
       id: string;
       runId: string | null;
       messageId: string;
+      contentIndex?: number;
       text: string;
       streaming: boolean;
       interrupted: boolean;
@@ -131,6 +146,7 @@ export interface ConversationModel {
 }
 
 export type ChatItem =
+  | (Extract<ConversationEntry, { kind: "trace" }> & { trace: AgentTraceEvent })
   | AgentRun
   | Extract<
       ConversationEntry,

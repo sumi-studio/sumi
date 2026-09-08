@@ -96,3 +96,48 @@ describe("ChatItemView", () => {
     expect(screen.queryByRole("button", { name: "今回のみ許可" })).toBeNull();
   });
 });
+
+it("keeps operation input and complete failed output inspectable in place", () => {
+  const item = {
+    kind: "trace" as const,
+    id: "result:read",
+    runId: "run:1",
+    traceId: "read",
+    phase: "result" as const,
+    trace: {
+      type: "tool" as const,
+      id: "read",
+      name: "read_file",
+      route: "normal" as const,
+      label: "read_fileでエラー",
+      args: { path: "notes/long.md", range: { from: 2, to: 8 } },
+      result: {
+        error: "Permission denied",
+        details: "The entire error remains available",
+      },
+      status: "error" as const,
+    },
+  };
+  const view = render(<ChatItemView item={item} />);
+  expect(screen.getByText("失敗")).toBeVisible();
+  const details = view.container.querySelector("details");
+  expect(details).not.toBeNull();
+  const summary = view.container.querySelector("summary");
+  if (!summary) throw new Error("missing operation summary");
+  fireEvent.click(summary);
+  expect(screen.getByRole("region", { name: "入力" })).toHaveTextContent(
+    '"from": 2',
+  );
+  expect(screen.getByRole("region", { name: "結果" })).toHaveTextContent(
+    "The entire error remains available",
+  );
+  view.rerender(
+    <ChatItemView
+      item={{ ...item, trace: { ...item.trace, label: "記録済みの失敗" } }}
+    />,
+  );
+  expect(details?.open).toBe(true);
+  expect(screen.getByRole("region", { name: "結果" })).toHaveTextContent(
+    "Permission denied",
+  );
+});

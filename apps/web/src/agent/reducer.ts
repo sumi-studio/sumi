@@ -3,7 +3,6 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   BrowserEventEnvelope,
-  PublicAssistantMessage,
   PublicMessage,
   PublicStreamEvent,
   ReviewProjection,
@@ -87,6 +86,7 @@ export function reduceEnvelope(
         kind: "agent-run",
         id: runId,
         startedSeq: envelope.seq,
+        audience: envelope.audience,
         endedSeq: null,
         status: "running",
         trace: [],
@@ -121,6 +121,30 @@ export function reduceEnvelope(
     case "message_start":
       session = applyMessage(session, event.message_id, event.message, false);
       break;
+    case "reasoning_summary": {
+      const runId =
+        session.messageRunIds[event.message_id] ?? session.activeRunId;
+      if (runId)
+        session = {
+          ...session,
+          conversation: upsertTrace(
+            session.conversation,
+            runId,
+            {
+              type: "reasoning",
+              id: `reasoning:${event.message_id}:${event.content_index}`,
+              contentIndex: event.content_index,
+              text: event.content,
+              status: "complete",
+            },
+            {
+              messageId: event.message_id,
+              contentIndex: event.wire_item_index,
+            },
+          ),
+        };
+      break;
+    }
     case "message_update":
       session = applyMessageUpdate(session, event.message_id, event.event);
       break;
@@ -135,10 +159,22 @@ export function reduceEnvelope(
         event.args,
       );
       break;
-    case "tool_execution_update":
-      // Partial tool output has no stable display semantics. The durable end
-      // event remains the source of truth.
+    case "tool_execution_update": {
+      const runId =
+        session.toolRunIds[event.tool_call_id] ?? session.activeRunId;
+      const tool = runId
+        ? findTrace(session.conversation, runId, event.tool_call_id)
+        : undefined;
+      if (runId && tool?.type === "tool" && tool.status === "running")
+        session = {
+          ...session,
+          conversation: upsertTrace(session.conversation, runId, {
+            ...tool,
+            progress: event.partial,
+          }),
+        };
       break;
+    }
     case "tool_execution_end":
       session = applyToolEnd(
         session,
@@ -222,6 +258,7 @@ function applyMessage(
       attachments: [],
       timestamp: message.timestamp,
       delivery: "durable",
+      ...(message.incoming_source ? { source: message.incoming_source } : {}),
     };
     return {
       ...session,
@@ -238,25 +275,72 @@ function applyMessage(
       ? session.activeRunId
       : session.messageRunIds[messageId];
   let conversation = session.conversation;
-  const finalText = assistantText(message);
-  const entryId = `message:${messageId}`;
-  if (
-    finalText.length > 0 ||
-    (complete && conversation.entries[entryId]?.kind === "prose")
-  ) {
-    conversation =
-      complete && finalText.length === 0
-        ? removeEntry(conversation, entryId)
-        : upsertEntry(conversation, {
-            kind: "prose",
-            id: entryId,
-            runId,
-            messageId,
-            text: finalText,
-            streaming: !complete,
-            interrupted: complete ? message.interrupted : false,
-            timestamp: message.timestamp,
-          });
+  // Each wire text block retains its own place among operations and summaries.
+  for (const content of [...message.content].sort(
+    (a, b) => a.wire_item_index - b.wire_item_index,
+  )) {
+    if (content.type === "tool_call") {
+      ({ conversation } = upsertToolCall(
+        conversation,
+        runId,
+        content.tool_call,
+        { messageId, contentIndex: content.wire_item_index },
+        true,
+      ));
+      if (runId)
+        session = {
+          ...session,
+          toolRunIds: { ...session.toolRunIds, [content.tool_call.id]: runId },
+        };
+      continue;
+    }
+    if (content.type === "rejected_tool_call" && runId) {
+      conversation = upsertTrace(
+        conversation,
+        runId,
+        {
+          type: "error",
+          id: `rejected-tool:${content.rejected.id}`,
+          message: `${content.rejected.name}: ${content.rejected.error}`,
+        },
+        { messageId, contentIndex: content.wire_item_index },
+        true,
+      );
+      continue;
+    }
+    if (content.type !== "text") continue;
+    const entryId = `message:${messageId}:${content.wire_item_index}`;
+    if (content.text.length === 0) {
+      if (complete) conversation = removeEntry(conversation, entryId);
+      continue;
+    }
+    conversation = upsertMessageEntry(conversation, {
+      kind: "prose",
+      id: entryId,
+      runId,
+      messageId,
+      contentIndex: content.wire_item_index,
+      text: content.text,
+      streaming: !complete,
+      interrupted: complete ? message.interrupted : false,
+      timestamp: message.timestamp,
+    });
+  }
+  if (complete) {
+    const canonicalIds = new Set(
+      message.content
+        .filter((item) => item.type === "text" && item.text.length > 0)
+        .map((item) => `message:${messageId}:${item.wire_item_index}`),
+    );
+    for (const id of conversation.entryOrder) {
+      const entry = conversation.entries[id];
+      if (
+        entry?.kind === "prose" &&
+        entry.messageId === messageId &&
+        !canonicalIds.has(id)
+      )
+        conversation = removeEntry(conversation, id);
+    }
   }
   if (complete && message.stop_reason === "error") {
     const detail = message.error_message?.trim() || "Provider request failed";
@@ -268,31 +352,6 @@ function applyMessage(
       message: providerCode ? `${detail} (${providerCode})` : detail,
       retryable: false,
     });
-  }
-
-  for (const content of message.content) {
-    if (content.type === "tool_call") {
-      ({ conversation } = upsertToolCall(
-        conversation,
-        runId,
-        content.tool_call,
-      ));
-      if (runId) {
-        session = {
-          ...session,
-          toolRunIds: {
-            ...session.toolRunIds,
-            [content.tool_call.id]: runId,
-          },
-        };
-      }
-    } else if (content.type === "rejected_tool_call" && runId) {
-      conversation = upsertTrace(conversation, runId, {
-        type: "error",
-        id: `rejected-tool:${content.rejected.id}`,
-        message: `${content.rejected.name}: ${content.rejected.error}`,
-      });
-    }
   }
 
   if (complete && runId) {
@@ -387,7 +446,10 @@ function applyMessageUpdate(
       break;
     }
     case "tool_call_end": {
-      ({ conversation } = upsertToolCall(conversation, runId, event.tool_call));
+      ({ conversation } = upsertToolCall(conversation, runId, event.tool_call, {
+        messageId,
+        contentIndex: event.content_index,
+      }));
       if (runId) {
         session = {
           ...session,
@@ -424,10 +486,11 @@ function applyMessageUpdate(
   ) {
     conversation = upsertEntry(conversation, {
       kind: "prose",
-      id: `message:${messageId}`,
+      id: `message:${messageId}:${event.content_index}`,
       runId,
       messageId,
-      text: joinedText(stream.textByIndex),
+      contentIndex: event.content_index,
+      text: stream.textByIndex[event.content_index] ?? "",
       streaming: true,
       interrupted: false,
       timestamp: null,
@@ -491,6 +554,7 @@ function applyToolEnd(
         };
   let conversation = upsertTrace(session.conversation, runId, {
     ...tool,
+    progress: undefined,
     result,
     label:
       resultLabel(result) ?? `${tool.name}${isError ? "でエラー" : "を完了"}`,
@@ -618,16 +682,21 @@ function applyApprovalResolved(
       decision,
     });
     if (status !== "allowed" && approvalEntry?.kind === "approval") {
-      conversation = patchRun(conversation, runId, (run) => ({
-        ...run,
-        trace: run.trace.map((entry) =>
-          entry.type === "tool" &&
-          entry.id === approvalEntry.request.tool_call_id &&
-          (entry.status === "pending" || entry.status === "running")
-            ? { ...entry, status: "cancelled" }
-            : entry,
-        ),
-      }));
+      const tool = findTrace(
+        conversation,
+        runId,
+        approvalEntry.request.tool_call_id,
+      );
+      if (
+        tool?.type === "tool" &&
+        (tool.status === "pending" || tool.status === "running")
+      ) {
+        conversation = upsertTrace(conversation, runId, {
+          ...tool,
+          status: "cancelled",
+          label: `${tool.name}を中止`,
+        });
+      }
     }
   }
   return {
@@ -644,40 +713,35 @@ function publicText(message: PublicMessage): string {
     .join("");
 }
 
-function assistantText(message: PublicAssistantMessage): string {
-  return message.content
-    .filter((content) => content.type === "text")
-    .sort((left, right) => left.wire_item_index - right.wire_item_index)
-    .map((content) => content.text)
-    .join("");
-}
-
-function joinedText(textByIndex: Record<number, string>): string {
-  return Object.entries(textByIndex)
-    .sort(([left], [right]) => Number(left) - Number(right))
-    .map(([, text]) => text)
-    .join("");
-}
-
 function upsertToolCall(
   conversation: ConversationModel,
   runId: string | null,
   toolCall: ToolCall,
+  position?: { messageId: string; contentIndex: number },
+  reconcile = false,
 ): { conversation: ConversationModel } {
   if (!runId) return { conversation };
   const existing = findTrace(conversation, runId, toolCall.id);
   return {
-    conversation: upsertTrace(conversation, runId, {
-      type: "tool",
-      id: toolCall.id,
-      name: toolCall.name,
-      route: toolCall.route,
-      label:
-        existing?.type === "tool" ? existing.label : `${toolCall.name}を準備中`,
-      args: toolCall.arguments,
-      result: existing?.type === "tool" ? existing.result : undefined,
-      status: existing?.type === "tool" ? existing.status : "pending",
-    }),
+    conversation: upsertTrace(
+      conversation,
+      runId,
+      {
+        type: "tool",
+        id: toolCall.id,
+        name: toolCall.name,
+        route: toolCall.route,
+        label:
+          existing?.type === "tool"
+            ? existing.label
+            : `${toolCall.name}を準備中`,
+        args: toolCall.arguments,
+        result: existing?.type === "tool" ? existing.result : undefined,
+        status: existing?.type === "tool" ? existing.status : "pending",
+      },
+      position,
+      reconcile,
+    ),
   };
 }
 
@@ -754,8 +818,10 @@ function upsertTrace(
   model: ConversationModel,
   runId: string,
   trace: AgentTraceEvent,
+  position?: { messageId: string; contentIndex: number },
+  reconcile = false,
 ): ConversationModel {
-  return patchRun(model, runId, (run) => {
+  let next = patchRun(model, runId, (run) => {
     const exists = run.trace.some((entry) => entry.id === trace.id);
     return {
       ...run,
@@ -764,6 +830,35 @@ function upsertTrace(
         : [...run.trace, trace],
     };
   });
+  if (trace.type !== "approval" && trace.type !== "artifact") {
+    const result =
+      trace.type === "tool" &&
+      (trace.status === "done" ||
+        trace.status === "error" ||
+        trace.status === "cancelled");
+    const phase = result ? "result" : "activity";
+    const existingEntry = next.entries[`trace:${runId}:${trace.id}:${phase}`];
+    next = (reconcile ? upsertMessageEntry : upsertEntry)(next, {
+      ...(existingEntry?.kind === "trace" ? existingEntry : {}),
+      ...(phase === "activity" ? position : {}),
+      kind: "trace",
+      id: `trace:${runId}:${trace.id}:${phase}`,
+      runId,
+      traceId: trace.id,
+      phase,
+      ...(trace.type === "tool" && phase === "activity"
+        ? {
+            inputArgs:
+              (
+                next.entries[`trace:${runId}:${trace.id}:${phase}`] as
+                  | Extract<ConversationEntry, { kind: "trace" }>
+                  | undefined
+              )?.inputArgs ?? trace.args,
+          }
+        : {}),
+    });
+  }
+  return next;
 }
 
 function findTrace(
@@ -772,6 +867,45 @@ function findTrace(
   traceId: string,
 ): AgentTraceEvent | undefined {
   return model.runs[runId]?.trace.find((entry) => entry.id === traceId);
+}
+
+// Replayed completed content can arrive after its durable summary. Insert a
+// newly materialized block beside its known message-content neighbors without
+// moving live rows or pulling tool execution outcomes across intervening text.
+function upsertMessageEntry(
+  model: ConversationModel,
+  entry: ConversationEntry,
+): ConversationModel {
+  const existed = !!model.entries[entry.id];
+  const next = upsertEntry(model, entry);
+  if (
+    existed ||
+    !("messageId" in entry) ||
+    entry.messageId === undefined ||
+    !("contentIndex" in entry) ||
+    entry.contentIndex === undefined
+  )
+    return next;
+  const contentIndex = entry.contentIndex;
+  const neighbors = model.entryOrder.flatMap((id, index) => {
+    const other = model.entries[id];
+    return other &&
+      "messageId" in other &&
+      other.messageId === entry.messageId &&
+      "contentIndex" in other &&
+      other.contentIndex !== undefined
+      ? [{ index, contentIndex: other.contentIndex }]
+      : [];
+  });
+  const after = neighbors.find((other) => other.contentIndex > contentIndex);
+  const before = neighbors.findLast(
+    (other) => other.contentIndex < contentIndex,
+  );
+  const at =
+    after?.index ?? (before ? before.index + 1 : model.entryOrder.length);
+  const order = [...model.entryOrder];
+  order.splice(at, 0, entry.id);
+  return { ...next, entryOrder: order };
 }
 
 export function upsertEntry(
