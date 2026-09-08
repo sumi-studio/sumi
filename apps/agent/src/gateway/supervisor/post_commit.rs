@@ -1874,81 +1874,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_close_authenticates_high_sequence_gap_and_head_metadata() {
-        for tamper in ["high-sequence", "gap", "head-metadata"] {
-            let store = Arc::new(
-                Store::session_test_store(&format!("post-commit-close-{tamper}"))
-                    .await
-                    .unwrap(),
-            );
-            let mut dispatcher = OrderedPostCommitDispatcher::start(
-                store.clone(),
-                ImmediateTarget::default(),
-                0,
-                CancellationToken::new(),
-            )
-            .unwrap();
-            let writer = EventWriter::new(store.clone());
-            assert_eq!(
-                writer.apply(maintenance("authenticated-1")).await.unwrap(),
-                vec![1]
-            );
-            if tamper == "gap" {
-                assert_eq!(
-                    writer.apply(maintenance("authenticated-2")).await.unwrap(),
-                    vec![2]
-                );
-            }
-
-            match tamper {
-                "high-sequence" => {
-                    sqlx::query(
-                        "INSERT INTO agent_events(
-                            seq, event_type, internal_metadata, raw_key_ref,
-                            raw_ciphertext, envelope, redaction_version, created_at
-                         )
-                         SELECT 99, event_type, internal_metadata, raw_key_ref,
-                                raw_ciphertext, envelope, redaction_version, created_at
-                         FROM agent_events WHERE seq = 1",
-                    )
-                    .execute(store.pool())
-                    .await
-                    .unwrap();
-                }
-                "gap" => {
-                    sqlx::query("DELETE FROM agent_events WHERE seq = 1")
-                        .execute(store.pool())
-                        .await
-                        .unwrap();
-                }
-                "head-metadata" => {
-                    sqlx::query("UPDATE event_log_heads SET chain_digest = zeroblob(32)")
-                        .execute(store.pool())
-                        .await
-                        .unwrap();
-                }
-                _ => unreachable!(),
-            }
-
-            let error = writer
-                .close_post_commit_admission(dispatcher.shutdown_owner())
+    async fn admission_close_authenticates_current_head_metadata() {
+        let store = Arc::new(
+            Store::session_test_store("post-commit-close-head-metadata")
                 .await
-                .unwrap_err();
-            let rendered = format!("{error:#}");
-            match tamper {
-                "high-sequence" | "gap" => {
-                    assert!(rendered.contains("not contiguous"), "{tamper}: {rendered}");
-                }
-                "head-metadata" => {
-                    assert!(
-                        rendered.contains("event-log head HMAC mismatch"),
-                        "{tamper}: {rendered}"
-                    );
-                }
-                _ => unreachable!(),
-            }
-            let _ = dispatcher.invalidate_and_join().await;
-        }
+                .unwrap(),
+        );
+        let mut dispatcher = OrderedPostCommitDispatcher::start(
+            store.clone(),
+            ImmediateTarget::default(),
+            0,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let writer = EventWriter::new(store.clone());
+        assert_eq!(
+            writer.apply(maintenance("authenticated-1")).await.unwrap(),
+            vec![1]
+        );
+        sqlx::query("UPDATE event_log_heads SET chain_digest = zeroblob(32)")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let result = writer
+            .close_post_commit_admission(dispatcher.shutdown_owner())
+            .await;
+        // Join before asserting so a failure reports the assertion instead of
+        // aborting the entire test process through the owned dispatcher Drop.
+        let _ = dispatcher.invalidate_and_join().await;
+        let error = result.unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("event-log head HMAC mismatch"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

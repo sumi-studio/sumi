@@ -23,14 +23,10 @@ use super::{
     ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
     HydrationReceiptIdentity, PhysicalReapAttestation, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt, Projection, RecoveryBatchWriter,
-    RunPhase, Store, ToolExecutionMutation,
-    crypto::decrypt_content,
-    event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
-    event_writer::DurableEventMetadata,
-    tool_result_message_id, verify_command_payload_digest,
+    RunPhase, Store, ToolExecutionMutation, crypto::decrypt_content,
+    event_writer::DurableEventMetadata, tool_result_message_id, verify_command_payload_digest,
 };
 
-const EVENT_EVIDENCE_PAGE_ROWS: i64 = 64;
 const PENDING_COMMAND_MAX_COUNT: usize = 32;
 const PENDING_COMMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
@@ -279,10 +275,61 @@ impl LogicalRecoveryExecutor {
         super::event_writer::authenticate_event_log_snapshot(store, &mut transaction)
             .await
             .context("failed to authenticate logical-recovery event snapshot")?;
-        let messages = store
-            .hydrate_messages(&mut transaction)
+        let message_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT m.id FROM agent_events e JOIN messages m ON m.seq=e.seq
+             WHERE e.event_type='message_end'
+               AND json_extract(e.internal_metadata, '$.run_id')=?
+               AND json_extract(e.internal_metadata, '$.turn_id')=?
+             ORDER BY e.seq",
+        )
+        .bind(run_id)
+        .bind(&active_turn_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .context("failed to select the logical-recovery turn transcript")?;
+        let mut messages = store
+            .hydrate_messages_for_ids(&mut transaction, &message_ids)
             .await
             .context("failed to authenticate logical-recovery transcript")?;
+        // Tool-result events do not carry lifecycle metadata. Select them by
+        // the exact result identities of authenticated calls in this turn.
+        let mut result_ids = Vec::new();
+        for message in &messages {
+            let ContextMessage::Persisted {
+                id,
+                message: Message::Assistant(_),
+                ..
+            } = message
+            else {
+                continue;
+            };
+            let PublicMessage::Assistant(assistant) =
+                crate::memory::overflow::context_message_to_public(message)
+            else {
+                continue;
+            };
+            for item in assistant.content {
+                if let PublicAssistantContent::ToolCall {
+                    tool_call: call, ..
+                } = item
+                {
+                    result_ids.push(tool_result_message_id(id, &call.id));
+                }
+            }
+        }
+        result_ids.retain(|result_id| {
+            !messages.iter().any(|message| {
+            matches!(message, ContextMessage::Persisted { id, .. } if id == result_id)
+        })
+        });
+        if !result_ids.is_empty() {
+            messages.extend(
+                store
+                    .hydrate_messages_for_ids(&mut transaction, &result_ids)
+                    .await
+                    .context("failed to authenticate logical-recovery tool results")?,
+            );
+        }
         let snapshot = AssistantRecoverySnapshot::load(
             &mut transaction,
             &messages,
@@ -881,6 +928,8 @@ pub(crate) struct HydratedRunState {
     pub fence: GenerationRecoveryFence,
     pub receipt: super::HydrationReceiptIdentity,
     pub messages: Vec<ContextMessage>,
+    /// Durable transcript tail, including archived messages outside this working set.
+    pub transcript_through_seq: u64,
     pub provider_context: Vec<ProviderContextItemWithFootprint>,
     /// Authenticated, ciphertext-free Store handoff. A future T26 consumer
     /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
@@ -1304,8 +1353,18 @@ impl SuffixRecovery {
     ) -> Result<Vec<RecoveryStep>> {
         validate_pending_window(store).await?;
         let commands = all_pending_commands(store).await?;
+        // A pending approval is unresolved work even if its command projection
+        // is missing. Do not silently admit a new session around an orphaned
+        // request; reuse the exact prepared-tool and authenticated-owner check.
+        let pending_approval_runs: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT run_id FROM approval_log WHERE state='pending'")
+                .fetch_all(store.pool())
+                .await
+                .context("failed to enumerate pending approval owners")?;
+        for run_id in pending_approval_runs {
+            pending_approval_for_recovery(store, recovery, &run_id).await?;
+        }
         if commands.is_empty() {
-            durable_event_evidence(store, EventEvidence::default()).await?;
             return Ok(Vec::new());
         }
         let mut events = EventEvidence::required_for(&commands)?;
@@ -1433,8 +1492,6 @@ impl SuffixRecovery {
         let Some(command) = next_pending_command(store).await? else {
             if let Some(writer) = writer {
                 writer.initialize_recovery_checkpoint().await?;
-            } else {
-                durable_event_evidence(store, EventEvidence::default()).await?;
             }
             return Ok(Vec::new());
         };
@@ -2056,164 +2113,70 @@ async fn durable_event_evidence(
     mut evidence: EventEvidence,
 ) -> Result<EventEvidence> {
     let mut transaction = store.pool().begin().await?;
-    let head_row = sqlx::query(
-        "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE personality_agent_id=?",
-    )
-    .bind(store.scope().personality_agent_id.as_str())
-    .fetch_optional(&mut *transaction)
-    .await
-    .context("failed to read authenticated event-log head")?;
-    let authenticated_head = if let Some(row) = head_row {
-        let last_seq = u64::try_from(row.try_get::<i64, _>("last_seq")?)
-            .context("event-log head last sequence is outside u64")?;
-        let event_count = u64::try_from(row.try_get::<i64, _>("event_count")?)
-            .context("event-log head event count is outside u64")?;
-        let key_ref: String = row.try_get("key_ref")?;
+    // The runtime owns this private SQL index. Authenticate only the evidence
+    // needed by pending commands; unrelated archived events are read on demand.
+    for predicate in evidence.required.clone() {
+        let row = sqlx::query(
+            "SELECT seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                    envelope, redaction_version FROM agent_events
+             WHERE event_type=? AND json_extract(internal_metadata, '$.run_id')=?
+               AND (? IS NULL OR json_extract(internal_metadata, '$.turn_id')=?)
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(predicate.event_type)
+        .bind(&predicate.run_id)
+        .bind(&predicate.turn_id)
+        .bind(&predicate.turn_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("failed to read selected recovery lifecycle evidence")?;
+        let Some(row) = row else { continue };
+        let seq: i64 = row.try_get("seq")?;
+        let redaction_version: i64 = row.try_get("redaction_version")?;
+        if redaction_version != i64::from(store.redactor().version()) {
+            bail!("durable event uses an unsupported redaction version");
+        }
+        let key_ref: String = row.try_get("raw_key_ref")?;
         let key = store
             .data_key_by_ref_in_transaction(&mut transaction, &key_ref)
             .await
-            .context("event-log head key is unavailable")?;
-        let chain_digest = verify_event_head(
-            store.scope(),
-            &key,
-            last_seq,
-            event_count,
-            row.try_get::<Vec<u8>, _>("chain_digest")?.as_slice(),
-            row.try_get::<Vec<u8>, _>("head_hmac")?.as_slice(),
-        )
-        .context("event-log head failed authenticated recovery")?;
-        Some((last_seq, event_count, chain_digest, key_ref))
-    } else {
-        None
-    };
-
-    let mut after_seq = -1_i64;
-    let mut expected_seq = 1_u64;
-    let mut observed_count = 0_u64;
-    let mut chain_digest = [0_u8; EVENT_DIGEST_BYTES];
-    loop {
-        // Page only fixed-size sequence metadata. Large event BLOBs are fetched
-        // one row at a time below, so recovery never retains 64 batch-sized
-        // ciphertexts at once.
-        let page: Vec<i64> = sqlx::query_scalar(
-            "SELECT seq FROM agent_events
-             WHERE seq > ?
-             ORDER BY seq
-             LIMIT ?",
-        )
-        .bind(after_seq)
-        .bind(EVENT_EVIDENCE_PAGE_ROWS)
-        .fetch_all(&mut *transaction)
-        .await
-        .context("failed to read durable event sequence page")?;
-        if page.is_empty() {
-            break;
+            .with_context(|| format!("durable event {seq} key is unavailable"))?;
+        if key.purpose != DataKeyPurpose::Event {
+            bail!("durable event {seq} references a non-event data key");
         }
-        for page_seq in page {
-            let page_seq =
-                u64::try_from(page_seq).context("durable event page sequence is outside u64")?;
-            if page_seq != expected_seq {
-                bail!("durable event sequence gap: expected {expected_seq}, found {page_seq}");
-            }
-            let row = sqlx::query(
-                "SELECT rowid AS physical_row_id, seq, event_type, internal_metadata,
-                        raw_key_ref, raw_ciphertext, envelope, redaction_version
-                 FROM agent_events WHERE seq=? LIMIT 1",
+        let aad = store
+            .scope()
+            .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
+        let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+        let raw = Zeroizing::new(
+            decrypt_content(&key, &ciphertext, &aad)
+                .with_context(|| format!("durable event {seq} failed authenticated recovery"))?,
+        );
+        let regenerated = store
+            .redactor()
+            .redact_serialized(&raw)
+            .with_context(|| format!("durable event {seq} raw event is invalid"))?;
+        let envelope: String = row.try_get("envelope")?;
+        if regenerated != envelope {
+            bail!("durable event {seq} redacted projection does not match authenticated raw event");
+        }
+        let event: AgentEvent = serde_json::from_slice(&raw)
+            .with_context(|| format!("durable event {seq} is outside the closed T12 schema"))?;
+        let event_type: String = row.try_get("event_type")?;
+        if event.durable_kind() != Some(event_type.as_str())
+            || matches!(
+                event,
+                AgentEvent::MessageUpdate { .. }
+                    | AgentEvent::ToolExecutionUpdate { .. }
+                    | AgentEvent::Error { .. }
             )
-            .bind(i64::try_from(page_seq).context("durable event sequence exceeds SQLite")?)
-            .fetch_optional(&mut *transaction)
-            .await
-            .context("failed to read authenticated durable event evidence row")?
-            .ok_or_else(|| {
-                anyhow::anyhow!("durable event {page_seq} disappeared during recovery")
-            })?;
-            let physical_row_id: i64 = row.try_get("physical_row_id")?;
-            let seq: i64 = row.try_get("seq")?;
-            if physical_row_id != seq || seq < 0 || seq <= after_seq {
-                bail!("durable event physical identity does not match its sequence");
-            }
-            let redaction_version: i64 = row.try_get("redaction_version")?;
-            if redaction_version != i64::from(store.redactor().version()) {
-                bail!("durable event uses an unsupported redaction version");
-            }
-            let key_ref: String = row.try_get("raw_key_ref")?;
-            let key = store
-                .data_key_by_ref_in_transaction(&mut transaction, &key_ref)
-                .await
-                .with_context(|| format!("durable event {seq} key is unavailable"))?;
-            if key.purpose != DataKeyPurpose::Event {
-                bail!("durable event {seq} references a non-event data key");
-            }
-            let aad = store
-                .scope()
-                .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
-            let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
-            let raw =
-                Zeroizing::new(decrypt_content(&key, &ciphertext, &aad).with_context(|| {
-                    format!("durable event {seq} failed authenticated recovery")
-                })?);
-            let regenerated = store
-                .redactor()
-                .redact_serialized(&raw)
-                .with_context(|| format!("durable event {seq} raw event is invalid"))?;
-            let envelope: String = row.try_get("envelope")?;
-            if regenerated != envelope {
-                bail!(
-                    "durable event {seq} redacted projection does not match authenticated raw event"
-                );
-            }
-            let event: AgentEvent = serde_json::from_slice(&raw)
-                .with_context(|| format!("durable event {seq} is outside the closed T12 schema"))?;
-            let event_type: String = row.try_get("event_type")?;
-            if event.durable_kind() != Some(event_type.as_str())
-                || matches!(
-                    event,
-                    AgentEvent::MessageUpdate { .. }
-                        | AgentEvent::ToolExecutionUpdate { .. }
-                        | AgentEvent::Error { .. }
-                )
-            {
-                bail!("durable event {seq} public type and internal event_type disagree");
-            }
-            let internal_metadata: String = row.try_get("internal_metadata")?;
-            let metadata: DurableEventMetadata = serde_json::from_str(&internal_metadata)
-                .with_context(|| format!("durable event {seq} internal metadata is invalid"))?;
-            evidence.observe(&event, &metadata);
-            chain_digest = extend_event_chain(
-                &chain_digest,
-                EventChainEntry {
-                    seq: page_seq,
-                    event_type: &event_type,
-                    internal_metadata: &internal_metadata,
-                    key_ref: &key_ref,
-                    ciphertext: &ciphertext,
-                    envelope: &envelope,
-                    redaction_version: u32::try_from(redaction_version)
-                        .context("durable event redaction version is outside u32")?,
-                },
-            );
-            observed_count = observed_count
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("durable event count overflow"))?;
-            expected_seq = expected_seq
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("durable event sequence overflow"))?;
-            after_seq = seq;
+        {
+            bail!("durable event {seq} public type and internal event_type disagree");
         }
-    }
-    match authenticated_head {
-        None if observed_count == 0 => {}
-        None => bail!("durable events exist without an authenticated event-log head"),
-        Some((last_seq, event_count, expected_digest, key_ref)) => {
-            let observed_last = expected_seq - 1;
-            if observed_last != last_seq
-                || observed_count != event_count
-                || chain_digest != expected_digest
-            {
-                bail!("durable event history does not match authenticated head for key {key_ref}");
-            }
-        }
+        let internal_metadata: String = row.try_get("internal_metadata")?;
+        let metadata: DurableEventMetadata = serde_json::from_str(&internal_metadata)
+            .with_context(|| format!("durable event {seq} internal metadata is invalid"))?;
+        evidence.observe(&event, &metadata);
     }
     transaction.commit().await?;
     Ok(evidence)
@@ -3209,8 +3172,20 @@ pub(crate) mod tests {
             panic!("recovery must reach a complete authenticated state")
         };
         assert_eq!(hydrated.resume, ResumeDirective::AdmitCommands);
+        let mut transaction = restarted.pool().begin().await.expect("read retained error");
+        let retained = restarted
+            .hydrate_messages_for_ids(
+                &mut transaction,
+                &[TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned()],
+            )
+            .await
+            .expect("authenticate original provider error on demand");
+        transaction
+            .commit()
+            .await
+            .expect("finish retained error read");
         assert!(
-            hydrated.messages.iter().any(|message| {
+            retained.iter().any(|message| {
                 matches!(message, ContextMessage::Persisted { id, .. }
                 if id == TOOL_USE_RECOVERY_ASSISTANT_ID)
                     && crate::memory::overflow::context_message_to_public(message) == assistant
@@ -3549,7 +3524,10 @@ pub(crate) mod tests {
         .await
         .expect("authenticate recovered event snapshot");
         let messages = first_restart
-            .hydrate_messages(&mut authentication)
+            .hydrate_messages_for_ids(
+                &mut authentication,
+                std::slice::from_ref(&synthetic_message_id),
+            )
             .await
             .expect("hydrate recovered transcript");
         authentication
@@ -4270,82 +4248,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_event_head_accepts_valid_history_across_page_boundary() {
-        let (store, writer) = setup().await;
-        let persisted =
-            persist_valid_history(&store, &writer, EVENT_EVIDENCE_PAGE_ROWS as usize + 1).await;
-
-        assert!(
-            SuffixRecovery::plan(&store)
-                .await
-                .expect("valid page-boundary history")
-                .is_empty()
-        );
-        let head: (i64, i64) = sqlx::query_as("SELECT last_seq,event_count FROM event_log_heads")
-            .fetch_one(store.pool())
-            .await
-            .expect("event-log head");
-        assert_eq!(
-            head,
-            (
-                i64::try_from(persisted).expect("persisted event count"),
-                i64::try_from(persisted).expect("persisted event count"),
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn authenticated_event_head_rejects_middle_and_tail_deletion() {
-        let (middle_store, middle_writer) = setup().await;
-        persist_valid_history(&middle_store, &middle_writer, 4).await;
-        sqlx::query("DELETE FROM agent_events WHERE seq=2")
-            .execute(middle_store.pool())
-            .await
-            .expect("delete middle event");
-        let error = SuffixRecovery::plan(&middle_store)
-            .await
-            .expect_err("middle deletion must fail");
-        assert!(
-            error.to_string().contains("durable event sequence gap"),
-            "{error:#}"
-        );
-
-        let (tail_store, tail_writer) = setup().await;
-        persist_valid_history(&tail_store, &tail_writer, 4).await;
-        sqlx::query("DELETE FROM agent_events WHERE seq=4")
-            .execute(tail_store.pool())
-            .await
-            .expect("delete tail event");
-        let error = SuffixRecovery::plan(&tail_store)
-            .await
-            .expect_err("tail deletion must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("does not match authenticated head"),
-            "{error:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn authenticated_event_head_rejects_head_metadata_mismatch() {
-        let (store, writer) = setup().await;
-        persist_valid_history(&store, &writer, 4).await;
-        sqlx::query("UPDATE event_log_heads SET chain_digest=zeroblob(32)")
-            .execute(store.pool())
-            .await
-            .expect("tamper event-log head");
-
-        let error = SuffixRecovery::plan(&store)
-            .await
-            .expect_err("head mismatch must fail");
-        assert!(
-            format!("{error:#}").contains("event-log head HMAC mismatch"),
-            "{error:#}"
-        );
-    }
-
-    #[tokio::test]
     async fn plans_only_the_next_missing_suffix_from_phase() {
         let (store, writer) = setup().await;
         persist_user(&writer, 1, "00000000-0000-4000-8000-000000000001").await;
@@ -4675,40 +4577,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn no_pending_commands_still_require_authenticated_event_history() {
+    async fn archived_event_corruption_does_not_block_pending_recovery() {
         let (store, writer) = setup().await;
         persist_valid_history(&store, &writer, 2).await;
         sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1)")
             .execute(store.pool())
             .await
-            .expect("corrupt history that recovery must not read");
-
-        let error = SuffixRecovery::plan(&store)
-            .await
-            .expect_err("history corruption is fatal even without pending commands");
+            .expect("corrupt inactive history");
         assert!(
-            format!("{error:#}").contains("failed authenticated recovery"),
-            "{error:#}"
+            SuffixRecovery::plan(&store)
+                .await
+                .expect("no pending work")
+                .is_empty()
         );
-    }
-
-    #[tokio::test]
-    async fn pending_recovery_authenticates_every_keyset_page_without_retaining_history() {
-        let (store, writer) = setup().await;
-        persist_valid_history(&store, &writer, EVENT_EVIDENCE_PAGE_ROWS as usize * 2 + 1).await;
         persist_run_started(&store, &writer).await;
-        sqlx::query(
-            "UPDATE agent_events SET raw_ciphertext=zeroblob(1)
-             WHERE seq=(SELECT MAX(seq) FROM agent_events)",
-        )
-        .execute(store.pool())
-        .await
-        .expect("corrupt the final keyset page");
-
+        assert!(matches!(
+            SuffixRecovery::plan(&store)
+                .await
+                .expect("selected current evidence")
+                .as_slice(),
+            [RecoveryStep::EmitTurnStart { .. }]
+        ));
+        sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=(SELECT MAX(seq) FROM agent_events)")
+            .execute(store.pool()).await.expect("corrupt current evidence");
         let error = SuffixRecovery::plan(&store)
             .await
-            .expect_err("pending recovery must authenticate the final page");
-        assert!(error.to_string().contains("failed authenticated recovery"));
+            .expect_err("current evidence must authenticate");
+        assert!(format!("{error:#}").contains("failed authenticated recovery"));
     }
 
     #[tokio::test]
@@ -4817,11 +4712,9 @@ pub(crate) mod tests {
 
         let error = SuffixRecovery::plan(&store)
             .await
-            .expect_err("internal metadata is part of the authenticated event chain");
+            .expect_err("recovery requires evidence for the exact current owner");
         assert!(
-            error
-                .to_string()
-                .contains("does not match authenticated head"),
+            error.to_string().contains("no durable AgentStart evidence"),
             "{error:#}"
         );
     }
@@ -4898,7 +4791,7 @@ pub(crate) mod tests {
             .expect("mint wrong-purpose key");
         sqlx::query("UPDATE agent_events SET raw_key_ref=? WHERE seq=?")
             .bind(&transcript.key_ref)
-            .bind(first_seq)
+            .bind(second_seq)
             .execute(store.pool())
             .await
             .expect("substitute key ref");
@@ -4924,7 +4817,7 @@ pub(crate) mod tests {
             .await
             .expect_err("AAD sequence substitution must not authenticate");
         assert!(
-            error.to_string().contains("durable event sequence gap"),
+            error.to_string().contains("failed authenticated recovery"),
             "{error:#}"
         );
     }
