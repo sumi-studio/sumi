@@ -2,6 +2,7 @@ import type {
   DirectChatStatusFrame as APIClientDirectChatStatusFrame,
   BrowserEventEnvelope,
   CommandDispositionEvent,
+  DirectChatCursorFrame,
 } from "@sumi/api-client";
 import { secureRandomUUID } from "./random-uuid";
 
@@ -61,6 +62,7 @@ export type DirectChatRejectedFrame = {
 };
 export type DirectChatServerFrame =
   | DirectChatEventFrame
+  | DirectChatCursorFrame
   | DirectChatStatusFrame
   | DirectChatAcceptedFrame
   | DirectChatRejectedFrame;
@@ -803,6 +805,16 @@ export function parseDirectChatServerFrame(
   lastEventSeq: number,
 ): DirectChatServerFrame | undefined {
   if (!isRecord(value)) return undefined;
+  if (value.type === "event_cursor") {
+    if (
+      hasRequiredAndOnlyKeys(value, ["type", "through_seq"]) &&
+      isSafeSequence(value.through_seq) &&
+      value.through_seq > lastEventSeq
+    ) {
+      return { type: "event_cursor", through_seq: value.through_seq };
+    }
+    return undefined;
+  }
   if (value.type === "direct_chat_status") {
     if (
       value.status === "ready" &&
@@ -1039,6 +1051,10 @@ export class DirectChatSocket {
       const frame = parseDirectChatServerFrame(raw, this.lastEventSeq);
       if (!frame) {
         socket.close();
+        return;
+      }
+      if (frame.type === "event_cursor") {
+        this.lastEventSeq = frame.through_seq;
         return;
       }
       if (frame.type === "event" && "seq" in frame.envelope) {

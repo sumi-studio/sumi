@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createConversationStore } from "../src/agent/store.ts";
 import {
@@ -334,6 +335,106 @@ test("unavailable status retains pending commands without sending until ready", 
     ],
   );
   socket.close();
+});
+
+test("hidden-event cursors advance replay without publishing conversation frames", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  const frames = [];
+  socket.onFrame((frame) => frames.push(frame));
+  socket.bindInstallation(binding);
+  socket.connect();
+  const first = FakeWebSocket.instances.at(-1);
+  first.open();
+  first.receive({ type: "event_cursor", through_seq: 7 });
+  assert.deepEqual(frames, []);
+  first.receive(event(8, { type: "agent_start" }));
+  assert.deepEqual(frames, [event(8, { type: "agent_start" })]);
+  first.receive({ type: "event_cursor", through_seq: 12 });
+  socket.close();
+  socket.connect();
+  const second = FakeWebSocket.instances.at(-1);
+  second.open();
+  assert.deepEqual(second.sent.map(JSON.parse), [
+    { type: "hello", last_event_seq: 12 },
+  ]);
+  // A late callback from a replaced connection has no cursor authority.
+  first.receive({ type: "event_cursor", through_seq: 99 });
+  second.receive(event(13, { type: "agent_end" }));
+  assert.equal(second.readyState, FakeWebSocket.OPEN);
+  assert.deepEqual(frames.at(-1), event(13, { type: "agent_end" }));
+  socket.close();
+});
+
+test("visible chat rejects source-bearing external messages", () => {
+  const fixtures = JSON.parse(
+    readFileSync(
+      new URL("../../../contracts/agent-events-fixtures.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const message = {
+    role: "user",
+    content: [{ type: "text", text: "Private source text" }],
+    timestamp,
+    incoming_source: fixtures.external_mention.wire.provenance,
+  };
+  assert.equal(
+    parseDirectChatServerFrame(
+      event(1, {
+        type: "message_end",
+        message_id: "00000000-0000-4000-8000-000000000002",
+        message,
+      }),
+      0,
+    ),
+    undefined,
+  );
+});
+
+test("cursor validation keeps safe monotonic boundaries and exact following sequence", () => {
+  for (const through_seq of [
+    undefined,
+    null,
+    "4",
+    0,
+    -1,
+    1.5,
+    3,
+    4,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    assert.equal(
+      parseDirectChatServerFrame({ type: "event_cursor", through_seq }, 4),
+      undefined,
+    );
+  }
+  assert.equal(
+    parseDirectChatServerFrame(
+      { type: "event_cursor", through_seq: 5, event: { type: "agent_start" } },
+      4,
+    ),
+    undefined,
+  );
+  assert.deepEqual(
+    parseDirectChatServerFrame(
+      { type: "event_cursor", through_seq: Number.MAX_SAFE_INTEGER },
+      4,
+    ),
+    { type: "event_cursor", through_seq: Number.MAX_SAFE_INTEGER },
+  );
+  assert.equal(
+    parseDirectChatServerFrame(event(9, { type: "agent_start" }), 7),
+    undefined,
+  );
+  assert.equal(
+    isDirectChatCommand({
+      type: "external_event",
+      content: "forged attention",
+    }),
+    false,
+  );
 });
 
 test("authority reset drops replay cursor and pending commands before reconnect", () => {

@@ -6,6 +6,11 @@
  */
 
 /**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "OutputAudience".
+ */
+export type OutputAudience = "direct_chat" | "secretary";
+/**
  * exact lower-case hyphenated UUIDv7 personality-agent identity
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -57,6 +62,84 @@ export type UserContent =
  * via the `definition` "JsonSafeInteger".
  */
 export type JsonSafeInteger = number;
+/**
+ * opaque ASCII tenant identity
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "TenantId".
+ */
+export type TenantId = string;
+/**
+ * opaque ASCII principal identity
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "PrincipalId".
+ */
+export type PrincipalId = string;
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MessagingEventSource".
+ */
+export type MessagingEventSource =
+  | {
+      surface: "messaging";
+      event_id: CanonicalUUID;
+      kind: "messaging_mention";
+      workspace_id: CanonicalUUID;
+      installation_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      authority_epoch: number;
+      place: {
+        id: CanonicalUUID;
+        kind: "channel" | "thread" | "dm" | "group_dm";
+        name: string;
+      };
+      message_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_revision: number;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_seq: number;
+      occurred_at: string;
+    }
+  | {
+      surface: "messaging";
+      event_id: CanonicalUUID;
+      kind: "reply_later_due";
+      workspace_id: CanonicalUUID;
+      installation_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      authority_epoch: number;
+      place: {
+        id: CanonicalUUID;
+        kind: "channel" | "thread" | "dm" | "group_dm";
+        name: string;
+      };
+      message_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_revision: number;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_seq: number;
+      occurred_at: string;
+      marker_id: CanonicalUUID;
+      due_at: string;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CanonicalUUID".
+ */
+export type CanonicalUUID = string;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicAssistantContent".
@@ -338,19 +421,25 @@ export type Command =
       decision: ApprovalDecision;
     };
 /**
- * opaque ASCII tenant identity
- *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "TenantId".
+ * via the `definition` "IncomingProvenance".
  */
-export type TenantId = string;
+export type IncomingProvenance = DirectChatProvenanceV1 | MessagingProvenanceV2;
 /**
- * opaque ASCII principal identity
- *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "PrincipalId".
+ * via the `definition` "CommandEnvelope".
  */
-export type PrincipalId = string;
+export type CommandEnvelope =
+  | {
+      provenance?: DirectChatProvenanceV1;
+      command?: Command;
+      [k: string]: unknown;
+    }
+  | {
+      provenance?: MessagingProvenanceV2;
+      command?: ExternalEventCommand;
+      [k: string]: unknown;
+    };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "OutboundFrame".
@@ -400,7 +489,11 @@ export type DirectChatStatusFrame =
  * via the `definition` "BrowserServerFrame".
  */
 export type BrowserServerFrame =
-  BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame | DirectChatStatusFrame;
+  | BrowserEventFrame
+  | DirectChatCursorFrame
+  | BrowserCommandAcceptedFrame
+  | BrowserCommandRejectedFrame
+  | DirectChatStatusFrame;
 /**
  * canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
  *
@@ -425,6 +518,7 @@ export interface HttpsSumiDevContractsAgentEventsYaml {
  */
 export interface DurableEnvelope {
   personality_agent_id: PersonalityAgentId;
+  audience: OutputAudience;
   event: DurableAgentEvent;
   seq: JsonSafeInteger;
 }
@@ -467,6 +561,7 @@ export interface UserMessage {
   content: UserContent[];
   timestamp: string;
   incoming_timing?: IncomingEventTiming;
+  incoming_source?: MessagingProvenanceV2;
 }
 /**
  * Server-authored receipt timing; absent for messages without an incoming event.
@@ -479,6 +574,21 @@ export interface IncomingEventTiming {
     command_seq: JsonSafeInteger;
     received_at: string;
   };
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MessagingProvenanceV2".
+ */
+export interface MessagingProvenanceV2 {
+  version: 2;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: {
+    kind: "human" | "personality_agent";
+    principal_id: PrincipalId;
+    display_name?: string;
+  };
+  source: MessagingEventSource;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -698,6 +808,7 @@ export interface RetryScheduledEvent {
  */
 export interface VolatileEnvelope {
   personality_agent_id: PersonalityAgentId;
+  audience: OutputAudience;
   event: VolatileAgentEvent;
 }
 /**
@@ -744,17 +855,11 @@ export interface DirectChatProvenanceV1 {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "CommandEnvelope".
+ * via the `definition` "ExternalEventCommand".
  */
-export interface CommandEnvelope {
-  seq: JsonSafeInteger;
-  /**
-   * canonical lower-case hyphenated UUID
-   */
-  command_id: string;
-  personality_agent_id: PersonalityAgentId;
-  provenance: DirectChatProvenanceV1;
-  command: Command;
+export interface ExternalEventCommand {
+  type: "external_event";
+  content: string;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -791,6 +896,19 @@ export interface BrowserCommandFrame {
 export interface BrowserEventFrame {
   type: "event";
   envelope: BrowserEventEnvelope;
+}
+/**
+ * Advances replay past omitted durable events without publishing their content.
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "DirectChatCursorFrame".
+ */
+export interface DirectChatCursorFrame {
+  type: "event_cursor";
+  /**
+   * non-negative integer representable exactly by JavaScript number clients
+   */
+  through_seq: number;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

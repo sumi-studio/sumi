@@ -34,6 +34,7 @@
       "envelope": {
         "seq": 1,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": { "type": "agent_start" }
       }
     }
@@ -45,6 +46,7 @@
       "envelope": {
         "seq": 2,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -60,6 +62,7 @@
       "envelope": {
         "seq": 3,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_start",
           "message_id": "00000000-0000-4000-8000-000000000002",
@@ -79,6 +82,7 @@
       "envelope": {
         "seq": 4,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_end",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -147,6 +151,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -165,6 +170,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "error",
           "message": "bad"
@@ -425,6 +431,7 @@
       "envelope": {
         "seq": 9007199254740991,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": { "type": "agent_start" }
       }
     }
@@ -465,6 +472,7 @@
       "frame_type": "event",
       "envelope": {
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "message_update",
           "message_id": "00000000-0000-4000-8000-000000000003",
@@ -508,6 +516,7 @@
       "envelope": {
         "seq": 10,
         "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
+        "audience": "direct_chat",
         "event": {
           "type": "turn_end",
           "message": null,
@@ -732,6 +741,100 @@
       "type": "command_rejected",
       "idempotency_key": "00000000-0000-4000-8000-000000000004",
       "reject_reason": "unavailable"
+    }
+  },
+  "external_mention": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_mention",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original source text"
+      }
+    }
+  },
+  "external_reminder": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "personality_agent",
+          "principal_id": "01992000-0000-7000-8000-000000000001",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "reply_later_due",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z",
+          "marker_id": "01992000-0000-7000-8000-000000000008",
+          "due_at": "2026-09-08T13:00:00Z"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original reminder note"
+      }
+    }
+  },
+  "secretary_agent_start": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 1,
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "audience": "secretary",
+        "event": {
+          "type": "agent_start"
+        }
+      }
     }
   }
 }
