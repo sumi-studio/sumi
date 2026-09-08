@@ -380,9 +380,11 @@ impl ContextAssembler {
                 )?,
         };
         let canonical_through_seq = normalized_replay_through(&messages)?;
-        messages = transform::transform(&messages, &destination);
-
         self.apply_user_attachment_truncation(&mut messages).await?;
+        if provider_context.native_window.is_none() {
+            messages = self.insert_l1_fragments(messages);
+        }
+        messages = transform::transform(&messages, &destination);
 
         let (memory_blocks, selected_context, messages) =
             self.assemble_provider_view(messages, &destination, &provider_context);
@@ -448,8 +450,13 @@ impl ContextAssembler {
             self.send_source_messages(active_context, provider_context.native_window.as_ref())?;
         let (blocks, fixed_provider_context, _) =
             self.assemble_provider_view(Vec::new(), &self.spec.origin(), &provider_context);
+        let fragments = if provider_context.native_window.is_none() {
+            self.insert_l1_fragments(Vec::new())
+        } else {
+            Vec::new()
+        };
         let overhead = self.calibration().effective_tokens(
-            self.compute_uncalibrated_estimate(&blocks, &[], &fixed_provider_context)?,
+            self.compute_uncalibrated_estimate(&blocks, &fragments, &fixed_provider_context)?,
             0,
         )?;
         let public = active_view
@@ -574,6 +581,66 @@ impl ContextAssembler {
             }
         }
         Ok(active)
+    }
+
+    /// Replace whole source batches in their durable order. The boundary is
+    /// the next live batch, never its timestamp or the order jobs completed.
+    /// Run before replay repair so a fragment cannot split a tool exchange,
+    /// and after attachment truncation so summaries remain memory, not uploads.
+    fn insert_l1_fragments(&self, messages: Vec<ContextMessage>) -> Vec<ContextMessage> {
+        let hydrated = self.hydrated_three_layer.lock().expect("memory lock");
+        let Some(hydrated) = hydrated.as_ref() else {
+            return messages;
+        };
+        let mut entries: Vec<_> = hydrated.memory.l1().iter().collect();
+        entries.sort_by_key(|entry| entry.source_batch_seq);
+        // A capacity-recovery notice may precede retained history. Synthetic
+        // messages do not identify the new tail; the durable cutoff does.
+        let after_history = messages
+            .iter()
+            .rposition(|message| {
+                matches!(message,
+                    ContextMessage::Persisted { seq, .. } if *seq <= hydrated.transcript_through_seq
+                )
+            })
+            .map_or(0, |index| index + 1);
+        let fragments: Vec<_> = entries
+            .into_iter()
+            .map(|entry| {
+                let before_seq = hydrated
+                    .memory
+                    .l0()
+                    .iter()
+                    .filter(|batch| batch.batch_seq > entry.source_batch_seq)
+                    .flat_map(|batch| batch.messages.iter())
+                    .filter_map(|message| match message {
+                        ContextMessage::Persisted { seq, .. } => Some(*seq),
+                        ContextMessage::Synthetic { .. } => None,
+                    })
+                    .min();
+                let position = before_seq
+                    .and_then(|boundary| {
+                        messages.iter().position(|message|
+                matches!(message, ContextMessage::Persisted { seq, .. } if *seq >= boundary)
+            )
+                    })
+                    .unwrap_or(after_history);
+                (position, l1_fragment(entry))
+            })
+            .collect();
+        let mut fragments = fragments.into_iter().peekable();
+        let mut result = Vec::with_capacity(messages.len() + fragments.len());
+        for (index, message) in messages.into_iter().enumerate() {
+            while fragments
+                .peek()
+                .is_some_and(|(position, _)| *position <= index)
+            {
+                result.push(fragments.next().expect("peeked fragment").1);
+            }
+            result.push(message);
+        }
+        result.extend(fragments.map(|(_, fragment)| fragment));
+        result
     }
 
     fn send_source_messages(
@@ -1091,27 +1158,27 @@ fn memory_blocks_from_three_layer(memory: &ThreeLayerMemory) -> Vec<MemoryBlock>
             time_range: None,
         });
     }
-    for entry in memory.l1() {
-        // Adapters render memory text before live messages and do not expose
-        // time_range. An independently replaced batch may be newer than raw
-        // L0 that remains, so make the source and chronology visible in text.
-        let source = serde_json::json!({
-            "operation": "read",
-            "batch_id": entry.source_batch,
-            "limit": 5,
-        });
-        blocks.push(MemoryBlock {
-            layer: MemoryLayer::L1,
-            text: format!(
-                "[Memory fragment recorded {} through {}. Its position before live messages does not indicate chronology.]\nSource: conversation_history({source}). For further pages, pass next_after_seq as after_seq.\n{}",
-                entry.time_range.0.to_rfc3339(),
-                entry.time_range.1.to_rfc3339(),
-                entry.summary.expose(),
-            ),
-            time_range: Some(entry.time_range),
-        });
-    }
     blocks
+}
+
+fn l1_fragment(entry: &crate::memory::L1Entry) -> ContextMessage {
+    let source = serde_json::json!({
+        "operation": "read", "batch_id": entry.source_batch, "limit": 5,
+    });
+    ContextMessage::Synthetic {
+        message: Message::User(UserMessage {
+            incoming_timing: None,
+            timestamp: entry.time_range.1,
+            content: vec![UserContent::Text {
+                text: format!(
+                    "[Memory fragment recorded {} through {}.]\nSource: conversation_history({source}). For further pages, pass next_after_seq as after_seq.\n{}",
+                    entry.time_range.0.to_rfc3339(),
+                    entry.time_range.1.to_rfc3339(),
+                    entry.summary.expose(),
+                ),
+            }],
+        }),
+    }
 }
 
 fn truncate_with_attachment_handle(full_text: &str, handle: &str) -> String {
@@ -1218,7 +1285,7 @@ fn matches_sumi_reasoning_with_anchor_check(
         ProviderContextPayload::EncryptedReasoning { protocol, .. } => *protocol,
         _ => return false,
     };
-    if protocol != destination.protocol {
+    if protocol != destination.protocol || item.provider_origin != *destination {
         return false;
     }
     let anchor = match &item.origin_message {
@@ -1234,12 +1301,10 @@ fn matches_sumi_reasoning_with_anchor_check(
     };
     let assistant = match message {
         ContextMessage::Persisted {
+            seq,
             message: Message::Assistant(assistant),
             ..
-        }
-        | ContextMessage::Synthetic {
-            message: Message::Assistant(assistant),
-        } => assistant,
+        } if *seq == anchor.message_seq => assistant,
         _ => return false,
     };
     if assistant.origin != *destination {
@@ -1252,6 +1317,11 @@ fn matches_sumi_reasoning_with_anchor_check(
         Some(wire) => wire,
         None => return false,
     };
+    // Responses reasoning is its own opaque wire item, not a public Thinking
+    // block. The adapter validates its payload and wire-slot uniqueness.
+    if protocol == ApiProtocol::OpenAiResponses {
+        return true;
+    }
     assistant.content.iter().any(|content| match content {
         AssistantContent::Thinking {
             wire_item_index, ..
@@ -2326,6 +2396,332 @@ mod tests {
     }
 
     #[test]
+    fn leading_recovery_notice_does_not_move_trailing_memory_before_older_raw() {
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        let a = user("Older A retained", 10);
+        let b = user("Newer B original", 20);
+        let mut batch_a = L0Batch::new(vec![a.clone()], 1, 0, 4);
+        batch_a.state = BatchState::Sealed;
+        memory.push_l0(batch_a);
+        let mut batch_b = L0Batch::new(vec![b], 2, 0, 4);
+        batch_b.state = BatchState::Sealed;
+        let id = batch_b.id;
+        memory.push_l0(batch_b);
+        let time = Utc::now();
+        memory.store_compact_result(
+            id,
+            crate::memory::CompactResult {
+                summary: crate::memory::DecryptedMemorySummary::new("B organized".into()),
+                est_tokens: 3,
+                time_range: (time, time),
+            },
+        );
+        memory.promote_l0_to_l1(id).unwrap();
+        let assembler = assembler().with_three_layer_memory(memory, 20);
+        let synthetic = |text: &str| ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                incoming_timing: None,
+                timestamp: time,
+                content: vec![UserContent::Text { text: text.into() }],
+            }),
+        };
+        let notice = synthetic("Earlier raw history was omitted for capacity.");
+        let tail = synthetic("Current internal instruction.");
+        let placed = assembler.insert_l1_fragments(vec![notice.clone(), a.clone(), tail.clone()]);
+        assert_eq!(placed.len(), 4);
+        assert_eq!(placed[0], notice);
+        assert_eq!(placed[1], a);
+        assert!(
+            matches!(&placed[2], ContextMessage::Synthetic { message: Message::User(fragment) }
+            if matches!(&fragment.content[0], UserContent::Text { text } if text.ends_with("B organized")))
+        );
+        assert_eq!(placed[3], tail);
+    }
+
+    #[tokio::test]
+    async fn overflow_recovery_reserves_space_for_positioned_l1() {
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        let raw = vec![
+            user(&"old detail ".repeat(800), 10),
+            user("B source", 20),
+            user(&"recent detail ".repeat(800), 30),
+            user("Continue.", 40),
+        ];
+        let mut ids = Vec::new();
+        for (index, message) in raw.iter().enumerate() {
+            let mut batch = L0Batch::new(vec![message.clone()], index as u64 + 1, 0, 10);
+            batch.state = BatchState::Sealed;
+            ids.push(batch.id);
+            memory.push_l0(batch);
+        }
+        let time = Utc::now();
+        memory.store_compact_result(
+            ids[1],
+            crate::memory::CompactResult {
+                summary: crate::memory::DecryptedMemorySummary::new("b".repeat(12_000)),
+                est_tokens: 3000,
+                time_range: (time, time),
+            },
+        );
+        memory.promote_l0_to_l1(ids[1]).unwrap();
+        let mut spec = model_spec();
+        spec.context_window = 5_000;
+        let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), spec)
+            .unwrap()
+            .with_three_layer_memory(memory, 40);
+        assembler
+            .recover_overflow_with_output_reserve(&raw, 500)
+            .unwrap();
+        let assembled = assembler.assemble_with_estimate(&raw, 1).await.unwrap();
+        assert!(
+            assembled.uncalibrated_prompt_estimate <= 4_500,
+            "retained L1 must consume the overflow recovery budget: {}",
+            assembled.uncalibrated_prompt_estimate
+        );
+        assert!(assembled.prompt.messages.contains(raw.last().unwrap()));
+        assert!(assembled.prompt.messages.iter().any(|message| matches!(message,
+            ContextMessage::Synthetic { message: Message::User(fragment) }
+                if matches!(&fragment.content[0], UserContent::Text { text } if text.ends_with(&"b".repeat(12_000))))));
+    }
+
+    #[tokio::test]
+    async fn hydration_uses_original_batch_order_not_summary_allocation_order() {
+        use crate::memory::{
+            HydratedMemoryBatch, HydratedMemoryJob, HydratedMemoryMembership,
+            HydratedMemoryRuntime, HydratedMemorySummary,
+        };
+        use crate::store::{
+            MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer as StoredLayer,
+        };
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+        let c = uuid::Uuid::now_v7();
+        let summary_id = uuid::Uuid::now_v7();
+        let unchanged_target = uuid::Uuid::now_v7();
+        let originals = vec![
+            user("A retained", 10),
+            user("B original", 20),
+            user("C retained", 30),
+        ];
+        let time = Utc::now();
+        let summary = HydratedMemorySummary::new("B organized".into(), 3, time, time).unwrap();
+        let hydrated = HydratedMemoryRuntime::new(
+            vec![
+                HydratedMemoryBatch::new(
+                    a,
+                    StoredLayer::L0,
+                    1,
+                    1,
+                    2,
+                    MemoryBatchState::Sealed,
+                    3,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    b,
+                    StoredLayer::L0,
+                    2,
+                    2,
+                    3,
+                    MemoryBatchState::Dropped,
+                    0,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    c,
+                    StoredLayer::L0,
+                    3,
+                    3,
+                    1,
+                    MemoryBatchState::Open,
+                    3,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    summary_id,
+                    StoredLayer::L1,
+                    1,
+                    1,
+                    2,
+                    MemoryBatchState::Promoted,
+                    3,
+                    0,
+                    Some(summary.clone()),
+                ),
+                HydratedMemoryBatch::new(
+                    unchanged_target,
+                    StoredLayer::L1,
+                    2,
+                    2,
+                    1,
+                    MemoryBatchState::Dropped,
+                    0,
+                    0,
+                    None,
+                ),
+            ],
+            vec![
+                HydratedMemoryMembership::new(a, 1, originals[0].clone()),
+                HydratedMemoryMembership::new(b, 1, originals[1].clone()),
+                HydratedMemoryMembership::new(c, 1, originals[2].clone()),
+            ],
+            vec![
+                HydratedMemoryJob::new(
+                    uuid::Uuid::now_v7(),
+                    MemoryJobKind::CompactL0,
+                    1,
+                    vec![b],
+                    std::collections::BTreeMap::from([(b, 3), (summary_id, 2)]),
+                    MemoryJobStatus::Applied,
+                    Some(summary),
+                ),
+                HydratedMemoryJob::new(
+                    uuid::Uuid::now_v7(),
+                    MemoryJobKind::CompactL0,
+                    2,
+                    vec![a],
+                    std::collections::BTreeMap::from([(a, 2), (unchanged_target, 1)]),
+                    MemoryJobStatus::Unchanged,
+                    None,
+                ),
+            ],
+            vec![],
+            HashMap::new(),
+        );
+        let memory = ThreeLayerMemory::from_hydrated(hydrated).unwrap();
+        assert_eq!(memory.l1()[0].source_batch_seq, 2);
+        let assembler = assembler().with_three_layer_memory(memory, 30);
+        let prompt = assembler.assemble(&originals, 0).await.unwrap();
+        assert_eq!(prompt.messages[0], originals[0]);
+        assert_eq!(prompt.messages[2], originals[2]);
+        assert!(
+            matches!(&prompt.messages[1], ContextMessage::Synthetic { message: Message::User(fragment) }
+            if matches!(&fragment.content[0], UserContent::Text { text } if text.ends_with("B organized")))
+        );
+    }
+
+    #[tokio::test]
+    async fn replacements_keep_source_order_and_leave_prepared_memory_off_context() {
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        let mut original = vec![user("A raw", 10), user("B raw", 20), user("C raw", 30)];
+        // Wall clocks can run backward. Source order must not depend on them.
+        let time = Utc::now();
+        for (index, message) in original.iter_mut().enumerate() {
+            let ContextMessage::Persisted {
+                message: Message::User(user),
+                ..
+            } = message
+            else {
+                unreachable!()
+            };
+            user.timestamp = time - chrono::Duration::days(index as i64);
+        }
+        let mut ids = Vec::new();
+        for (index, message) in original.iter().enumerate() {
+            let mut batch = L0Batch::new(vec![message.clone()], index as u64 + 1, 0, 10);
+            batch.state = BatchState::Sealed;
+            ids.push(batch.id);
+            memory.push_l0(batch);
+        }
+        let summary_b = "B organized detail. ".repeat(3000);
+        memory.store_compact_result(
+            ids[1],
+            crate::memory::CompactResult {
+                summary: crate::memory::DecryptedMemorySummary::new(summary_b.clone()),
+                est_tokens: 15_000,
+                time_range: (
+                    time - chrono::Duration::days(1),
+                    time - chrono::Duration::days(1),
+                ),
+            },
+        );
+        let assembler = assembler().with_three_layer_memory(memory, 30);
+        let prepared = assembler.assemble(&original, 0).await.unwrap();
+        assert_eq!(prepared.messages, original);
+        assert!(prepared.memory_blocks.is_empty());
+        {
+            let mut hydrated = assembler.hydrated_three_layer.lock().unwrap();
+            hydrated
+                .as_mut()
+                .unwrap()
+                .memory
+                .promote_l0_to_l1(ids[1])
+                .unwrap();
+        }
+        let placed = assembler.assemble(&original, 0).await.unwrap();
+        assert_eq!(placed.messages.len(), 3);
+        assert_eq!(placed.messages[0], original[0]);
+        assert_eq!(placed.messages[2], original[2]);
+        let ContextMessage::Synthetic {
+            message: Message::User(fragment),
+        } = &placed.messages[1]
+        else {
+            panic!("positioned L1");
+        };
+        assert!(fragment.incoming_timing.is_none());
+        let UserContent::Text { text } = &fragment.content[0] else {
+            panic!("summary text");
+        };
+        assert!(
+            text.ends_with(&summary_b),
+            "memory is not truncated into an uploaded attachment"
+        );
+        assert!(placed.memory_blocks.is_empty(), "no duplicated prefix L1");
+        {
+            let mut hydrated = assembler.hydrated_three_layer.lock().unwrap();
+            let memory = &mut hydrated.as_mut().unwrap().memory;
+            memory.store_compact_result(
+                ids[0],
+                crate::memory::CompactResult {
+                    summary: crate::memory::DecryptedMemorySummary::new("A organized".into()),
+                    est_tokens: 3,
+                    time_range: (time, time),
+                },
+            );
+            memory.promote_l0_to_l1(ids[0]).unwrap();
+        }
+        let placed = assembler.assemble(&original, 0).await.unwrap();
+        let text = |message: &ContextMessage| match message {
+            ContextMessage::Synthetic {
+                message: Message::User(user),
+            } => match &user.content[0] {
+                UserContent::Text { text } => text.clone(),
+                _ => panic!("text"),
+            },
+            _ => panic!("synthetic memory"),
+        };
+        assert!(text(&placed.messages[0]).ends_with("A organized"));
+        assert!(text(&placed.messages[1]).ends_with(&summary_b));
+        assert_eq!(placed.messages[2], original[2]);
+        assert_eq!(
+            assembler.assemble(&original, 0).await.unwrap(),
+            placed,
+            "reassembling does not refresh or reorder memory"
+        );
+    }
+
+    #[test]
     fn l1_fragment_exposes_original_batch_and_recorded_time_range() {
         let source_batch = uuid::Uuid::now_v7();
         let from = chrono::DateTime::parse_from_rfc3339("2026-09-07T10:00:00.123456789Z")
@@ -2341,20 +2737,27 @@ mod tests {
         );
         memory.l1.push_back(crate::memory::L1Entry {
             source_batch,
+            source_batch_seq: 2,
             summary: crate::memory::DecryptedMemorySummary::new(
                 "Original fragment meaning.".into(),
             ),
             est_tokens: 5,
             time_range: (from, through),
         });
-        let blocks = memory_blocks_from_three_layer(&memory);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].time_range, Some((from, through)));
-        assert!(blocks[0].text.contains(&from.to_rfc3339()));
-        assert!(blocks[0].text.contains(&through.to_rfc3339()));
-        assert!(blocks[0].text.contains("does not indicate chronology"));
-        let read_args = blocks[0]
-            .text
+        assert!(memory_blocks_from_three_layer(&memory).is_empty());
+        let ContextMessage::Synthetic {
+            message: Message::User(fragment),
+        } = l1_fragment(&memory.l1()[0])
+        else {
+            panic!("memory fragment");
+        };
+        assert!(fragment.incoming_timing.is_none());
+        let UserContent::Text { text } = &fragment.content[0] else {
+            panic!("text fragment");
+        };
+        assert!(text.contains(&from.to_rfc3339()));
+        assert!(text.contains(&through.to_rfc3339()));
+        let read_args = text
             .split("conversation_history(")
             .nth(1)
             .expect("actionable source read")
@@ -2365,8 +2768,8 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(read_args).expect("source read arguments"),
             serde_json::json!({"operation": "read", "batch_id": source_batch, "limit": 5}),
         );
-        assert!(blocks[0].text.contains("next_after_seq as after_seq"));
-        assert!(blocks[0].text.ends_with("Original fragment meaning."));
+        assert!(text.contains("next_after_seq as after_seq"));
+        assert!(text.ends_with("Original fragment meaning."));
     }
 
     #[test]
@@ -3008,8 +3411,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sumi_reasoning_requires_matching_thinking_block() {
-        let spec = responses_spec();
+    async fn anthropic_reasoning_requires_matching_thinking_block() {
+        let spec = anthropic_spec();
         let mut prompt = simple_prompt();
         prompt.provider_context = vec![ProviderContextItem {
             retention_owner: provider_context_owner("assistant-1", 1),
@@ -3020,7 +3423,10 @@ mod tests {
             wire_item_index: Some(5),
             ordinal: 0,
             provider_origin: spec.origin(),
-            payload: responses_reasoning_payload("opaque"),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: serde_json::json!({"type":"thinking_signature", "signature":"opaque"}),
+            },
         }];
         let assembler =
             ContextAssembler::from_prompt_with_spec(prompt, spec.clone()).expect("valid prompt");
@@ -3040,14 +3446,17 @@ mod tests {
             wire_item_index: Some(99),
             ordinal: 0,
             provider_origin: spec.origin(),
-            payload: responses_reasoning_payload("opaque"),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: serde_json::json!({"type":"thinking_signature", "signature":"opaque"}),
+            },
         }];
-        let assembler2 = ContextAssembler::from_prompt_with_spec(prompt2, responses_spec())
+        let assembler2 = ContextAssembler::from_prompt_with_spec(prompt2, anthropic_spec())
             .expect("valid prompt");
         let result2 = assembler2
             .assemble(
                 &[assistant_with_thinking_for(
-                    &responses_spec(),
+                    &anthropic_spec(),
                     1,
                     "private",
                     5,
