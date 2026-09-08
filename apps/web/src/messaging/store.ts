@@ -4198,39 +4198,50 @@ export const useMessaging = create<MessagingState>((set, get) => {
         loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: true },
       }));
       const request = beginMessagingBackendRequest();
-      const older = await request.wait((backend) =>
-        backend.fetchMessages(place, {
-          beforeSeq: current[0].seq,
-          limit: PAGE_SIZE,
-        }),
-      );
-      if (
-        !older ||
-        !request.isCurrent() ||
-        !holdsPlaceGeneration(key, holdGeneration)
-      ) {
-        return;
+      try {
+        // Keep the loaded page and retry button if the history request fails.
+        const older = await request
+          .wait((backend) =>
+            backend.fetchMessages(place, {
+              beforeSeq: current[0].seq,
+              limit: PAGE_SIZE,
+            }),
+          )
+          .catch(() => undefined);
+        if (
+          !older ||
+          !request.isCurrent() ||
+          !holdsPlaceGeneration(key, holdGeneration)
+        ) {
+          return;
+        }
+        rememberKnownMessages(key, older, get().lastReadByPlace[key] ?? 0);
+        set((entry) => {
+          const existing = entry.messagesByPlace[key] ?? [];
+          return {
+            messagesByPlace: {
+              ...entry.messagesByPlace,
+              [key]: mergeMessagesWithOrphanPolls(
+                key,
+                existing,
+                older,
+                "snapshot",
+              ),
+            },
+            hasMoreByPlace: {
+              ...entry.hasMoreByPlace,
+              [key]: older.length >= PAGE_SIZE,
+            },
+          };
+        });
+      } finally {
+        // A released place or replacement session may already have a new load.
+        if (request.isCurrent() && holdsPlaceGeneration(key, holdGeneration)) {
+          set((entry) => ({
+            loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: false },
+          }));
+        }
       }
-      rememberKnownMessages(key, older, get().lastReadByPlace[key] ?? 0);
-      set((entry) => {
-        const existing = entry.messagesByPlace[key] ?? [];
-        return {
-          messagesByPlace: {
-            ...entry.messagesByPlace,
-            [key]: mergeMessagesWithOrphanPolls(
-              key,
-              existing,
-              older,
-              "snapshot",
-            ),
-          },
-          hasMoreByPlace: {
-            ...entry.hasMoreByPlace,
-            [key]: older.length >= PAGE_SIZE,
-          },
-          loadingOlderByPlace: { ...entry.loadingOlderByPlace, [key]: false },
-        };
-      });
     },
 
     resolveReplyLater(markerId) {
