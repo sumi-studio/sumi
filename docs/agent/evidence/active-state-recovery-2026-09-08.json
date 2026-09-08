@@ -1,0 +1,55 @@
+{
+  "status": "PASSED",
+  "sha": "5f3fa8130775a359706ba055c7fda73f81b80f20",
+  "completedAt": "2026-09-08T09:23:54.051Z",
+  "agent": "01a0801c-d262-74e6-bb57-45747911b7b4",
+  "oldReplay": {
+    "id": "01a0801e-ec79-7820-b4fd-1b0f5637c71b",
+    "seq": 88,
+    "text": "DELIVERED 0a1818ed7f3e"
+  },
+  "toolOperations": [
+    {
+      "name": "read_file",
+      "call_id": "read_file_10",
+      "start_seq": 132,
+      "end_seq": 133,
+      "path": "report-0a1818ed7f3e.csv",
+      "bytes": 20,
+      "sha256": "2084259f7dba928b253e39b2ee476fd0662d44acba23df6b923816884c4ec02d"
+    }
+  ],
+  "newReply": {
+    "view": 0,
+    "id": "01a08054-b5c2-7d90-ae9b-7eeb8276adb0",
+    "seq": 139,
+    "text": "The current apples count is 3. RECOVERED 01fa4e202453",
+    "model": "kimi-k2.7-code",
+    "provider": "opencode-go"
+  },
+  "contextRecall": {
+    "filenameNotSuppliedInNewPrompt": true,
+    "correctFilenameUsedInRead": true,
+    "limit": "One prior report filename only; not a general memory-quality proof."
+  },
+  "reloadConfirmed": true,
+  "humanCommands": 1,
+  "cleanup": {
+    "installationDisabled": true,
+    "finalEpoch": "5",
+    "sessionRevoked": true,
+    "contextClosed": true,
+    "browserClosed": true
+  },
+  "migration": {
+    "before": 20,
+    "after": 21,
+    "new_indexes_verified": 15,
+    "prior_migration_checksums_unchanged": true
+  },
+  "limits": [
+    "One existing synthetic secretary and one remembered report; not general memory quality.",
+    "Initial post-cutover recall succeeded in native events, but two harness defects interrupted browser validation before the final passing run.",
+    "No physical iOS, existing Human Firebase login, or all failure-phase recovery claim."
+  ]
+}

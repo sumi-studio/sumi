@@ -13,7 +13,7 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment: `7d898b0d28c78a9e4d732890dd4a7c5a78d664f0` (PR #376).
+Current shared deployment: `5f3fa8130775a359706ba055c7fda73f81b80f20` (PR #377).
 The private-file acceptance below was performed on the preceding `8cbba0b8`
 milestone. A subsequent recipient-delivery run on #376 passed after repairing
 reviewer stream cancellation.
@@ -69,6 +69,27 @@ local evidence is `/tmp/sumi-artifact-delivery-acceptance-xT6mhc/evidence.json`.
 This scenario did not request additional Human approval and does not establish a
 generation restart, physical iOS behavior, or every existing-account login path.
 
+## Existing-person restart after active-state recovery
+
+PR #377 passed all three CI jobs and was deployed after graceful runtime shutdown
+and consistent private backups. Migration 21 was verified on an existing synthetic
+PA: all 15 indexes exist and earlier migration checksums are unchanged. The
+original volume and history remain in place.
+
+The configured real model identified the previously created report without the new
+prompt supplying its filename or corrected count, then read the exact 20-byte CSV.
+The old reply and new reply both survived browser reload; the one new command was
+not resubmitted. The owned installation was disabled and the session revoked.
+[Acceptance evidence](evidence/active-state-recovery-2026-09-08.json) records the
+bounded scenario. This is one remembered report, not a general memory-quality claim.
+
+Deployment preparation exposed a backup SQL UUID/domain mismatch, repaired before
+any volume archive or new runtime startup. Two browser probe failures were harness
+assumptions (volatile events omit sequence numbers; command IDs are not restricted
+to UUIDv7); native events showed both read operations completed. The final probe
+also verified reload and cleanup. These failed probes are not application failures
+or additional evidence of general recovery coverage.
+
 ## Audit items and remaining acceptance
 
 Status here describes capability, not whether a historical issue happens to
@@ -78,7 +99,7 @@ still needed to close each row.
 
 | ID | Current assessment | Remaining acceptance |
 | --- | --- | --- |
-| M01 | L0→L1 runs; upper layers incomplete | Agreed L1→L2/reintegration behavior must run through the same continuing person's context, not reconnect provisional prompts blindly. |
+| M01 | L0→L1 runs; upper-layer replacement boundary settled, implementation pending | Follow [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
 | M02 | Full-parent fork and chronological replacement repaired; semantic quality partial | Evaluate meaning, uncertainty, corrections and unfinished details against originals; do not equate compression ratio with fidelity. |
 | M03 | Ordinary silent trimming repaired; capacity boundary remains | Accumulated L1 must not eventually make every subsequent request unrecoverable. |
 | M04 | Original history read/search and optional files available | Establish voluntary revision/strategic forgetting and recoverable source references without imposing an automatic memory-rewriting ritual. |
@@ -97,7 +118,7 @@ still needed to close each row.
 | R02 | Transient health transport failures now retry | Implemented with real-socket regression coverage: transient transport failure retains the runtime, while identity/epoch/protocol failure remains fenced. Deployed in #375; shared fault-injection acceptance is not yet claimed. |
 | R03 | Active work and input admission protect cold-idle lifetime | Implemented and independently reviewed; focused Go race tests cover active work, accepted input, completed idle work and admission/reaping. Deployed in #375. |
 | R04 | Warm prevents idle stopping but does not restore | Explicit intended presence survives exit/reboot with bounded restoration and observable failure. |
-| R05 | Lifetime hydration row/byte ceilings remain | Load the active working set and page original history beyond existing ceilings; do not just raise constants. |
+| R05 | Active-state reconstruction deployed and verified on an existing PA in #377 | All three CI jobs passed; local suite 2,210 passed, 20 ignored. Native migration 21 added all 15 indexes with previous migration checksums intact. Existing conversation context identified the old report and read its corrected bytes; old/new replies survived reload. Large active suffixes remain proportional work. |
 | P01 | No provider-native steering/async path | Verify an actual documented supported provider contract before adopting it; internal async/steering is not evidence of native support. |
 | P02 | Model overrides partial; effort not wired | Explicit supported effort/budget reaches the provider; incompatible configuration is explained before sending. Model switching is a separate remaining path. |
 | P03 | Harmless incoming reasoning metadata projected to canonical fields | Implemented; incremental response, canonical context serialization and next-request tests pass. Required structure and outgoing rules remain checked. Deployed in #375. |
