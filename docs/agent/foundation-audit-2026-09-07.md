@@ -46,7 +46,7 @@
 
 **利用への影響：** 「以前そう言ったが、後で取り消した」の後半や、依頼した理由が圧縮で失われ得る。骨子の文字列が入っているテストでは判断できない。
 
-根拠：[L0→L1](../../apps/agent/prompts/compact-l0-to-l1.md)、[L1→L2](../../apps/agent/prompts/compact-l1-to-l2.md)、[L2統合](../../apps/agent/prompts/compact-l2-consolidation.md)、[compactor](../../apps/agent/src/memory/compactor.rs) L230・360・543・668・769・787・800・1062、[親の文脈](../../apps/agent/src/memory/context_assembler.rs) L326・355。
+根拠：[L0→L1](../../apps/agent/prompts/compact-l0-to-l1.md)、[監査時のL1→L2](https://github.com/sumi-studio/sumi/blob/2c674e26bfb9cf1f547fc9129389c0212d32aa5f/apps/agent/prompts/compact-l1-to-l2.md)、[監査時のL2統合](https://github.com/sumi-studio/sumi/blob/2c674e26bfb9cf1f547fc9129389c0212d32aa5f/apps/agent/prompts/compact-l2-consolidation.md)、[compactor](../../apps/agent/src/memory/compactor.rs) L230・360・543・668・769・787・800・1062、[親の文脈](../../apps/agent/src/memory/context_assembler.rs) L326・355。
 
 ### M03 — 現在動く長文対策は、要約を待たず古い文脈を外す【要修正／先行】
 
