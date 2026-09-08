@@ -256,3 +256,12 @@ the earlier trace recorded only the first recall page. The test now follows
 pagination and checks actual original facts and separation from later history;
 its focused offline validation passed (one scenario, no model calls). This does not retroactively
 strengthen the previous real-model trace.
+
+Correction after receipt-level review: `kk9dbT`'s runner status was PASSED,
+but it did not require resolving the original due reminder. The final tool
+sequence contains no such resolve receipt; only the separately created
+cancellation marker was resolved. The selected artifact now labels this
+PARTIAL_ACCEPTANCE. Delivery and separate cancellation are proven; completion
+of the original reminder workflow is not. The runner now requires both its
+write receipt and its matching resolve receipt before advancing. No fresh
+real run has yet validated that stronger condition.
