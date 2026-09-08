@@ -37,7 +37,9 @@ restart, physical iOS behavior, or the rest of #362. Existing-account startup
 was not exercised by the fresh identity. Earlier long-context evaluation also
 retains its documented semantic limitations.
 
-Local evidence for this milestone (contains only the owned synthetic test):
+A [checked-in evidence extract](evidence/workspace-text-2026-09-08.json) contains the synthetic tool sequence and acceptance boundaries.
+
+Local full evidence for this milestone (contains only the owned synthetic test):
 `/tmp/sumi-workspace-live-acceptance-4ZsvXt/evidence.json`.
 Cutover metadata is in
 `/tmp/sumi-workspace-cutover-8cbba0b8/cutover.json`; adjacent private resolved
@@ -68,20 +70,20 @@ still needed to close each row.
 | T05 | Helper delegation absent | One bounded attributable helper job supports message, result, cancellation and reconnect without cloning the secretary's continuation. |
 | T06 | Optional procedure files possible; extension lifecycle absent | Verify voluntary save/find/revise/reuse first; add discovery only for a demonstrated extension need. Never require reflection or skill use. |
 | R01 | Some restart phases supported | Recover additional ordinary durable phases from their actual evidence, without guessing outcomes of emitted effects. |
-| R02 | First dependency-health error still terminates runtime | Transient transport failure recovers without ending a text conversation; genuine identity/epoch failure remains fenced. In progress. |
-| R03 | Cold-idle reaper ignores active work | Closed browser plus active work survives idle timeout; completed idle work is reclaimed; admission/reaping race is safe. In progress. |
+| R02 | First dependency-health error still terminates runtime | Implemented with real-socket regression coverage: transient transport failure retains the runtime, while identity/epoch/protocol failure remains fenced. Shared deployment of this change is pending. |
+| R03 | Cold-idle reaper ignores active work | Implemented and independently reviewed; focused Go race tests cover active work, accepted input, completed idle work and admission/reaping. Shared deployment is pending. |
 | R04 | Warm prevents idle stopping but does not restore | Explicit intended presence survives exit/reboot with bounded restoration and observable failure. |
 | R05 | Lifetime hydration row/byte ceilings remain | Load the active working set and page original history beyond existing ceilings; do not just raise constants. |
 | P01 | No provider-native steering/async path | Verify an actual documented supported provider contract before adopting it; internal async/steering is not evidence of native support. |
 | P02 | Model overrides partial; effort not wired | Explicit supported effort/budget reaches the provider; incompatible configuration is explained before sending. Model switching is a separate remaining path. |
-| P03 | Harmless extra reasoning metadata rejected | Accept incoming additions while keeping required structure, identity and outgoing-wire rules correct. In progress. |
-| P04 | Retry ignores Retry-After | Respect valid server delay, remain cancelable and preserve partial-output constraints; malformed/missing delay falls back. In progress. |
+| P03 | Harmless extra reasoning metadata rejected | Implemented; incremental response, canonical context serialization and next-request tests pass. Required structure and outgoing rules remain checked. Shared deployment is pending. |
+| P04 | Retry ignores Retry-After | Implemented; loopback HTTP and controlled-time tests cover delay, steering, cancellation and fallback. Delays over five minutes end automatic retry instead of resending early. Shared deployment is pending. |
 | P05 | Per-response limits only | Account for an explicitly bounded undertaking/wake across restart, stop further admissions truthfully and support replenishment. |
 | U01 | Exact-call review exists; standing permission UI absent | Grant, view, narrow and revoke understandable scopes; recheck queued actions and retain effect truth. |
 | U02 | Cards render; shared action round trip absent | Human and PA act on the same authorized object/version with mobile/keyboard feedback and an attributable resulting event. |
 | U03 | Questions/polls exist without answer wake | An addressable question and later answer resume the originating context while unrelated activity remains possible. |
 | Q01 | Separate real-model evidence exists | Maintain a small reproducible opt-in set for correction, wait, interruption, actual artifacts and delivery; distinguish blocked/skipped/failed. |
-| Q02 | Useful local tests; Rust CI missing | Run meaningful Rust regressions in CI and review tests against behavior, not old architecture or arbitrary test counts. |
+| Q02 | Useful local tests; Rust CI missing | A Rust regression workflow is prepared; its first actual CI run is pending. Local suite: 2,213 passed, 20 ignored (includes subprocess entry points and opt-in live-provider/performance cases). Continue reviewing relevance and explicit non-run reporting. |
 
 ## Comparative items are reconciled, not multiplied into machinery
 

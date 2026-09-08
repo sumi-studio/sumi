@@ -1,0 +1,73 @@
+{
+  "status": "PASSED",
+  "sha": "8cbba0b8d93b7559d5293dc34c27277127694b20",
+  "marker": "ca78783863fa",
+  "toolOperations": [
+    {
+      "id": "write_file_0",
+      "name": "write_file",
+      "args": {
+        "path": "acceptance-ca78783863fa.txt",
+        "content": "workspace ca78783863fa: first\n"
+      },
+      "start_seq": 7,
+      "end_seq": 8,
+      "mutation_confirmed": true
+    },
+    {
+      "id": "read_file_1",
+      "name": "read_file",
+      "args": {
+        "path": "acceptance-ca78783863fa.txt",
+        "offset": 0,
+        "limit": 4096
+      },
+      "start_seq": 15,
+      "end_seq": 16,
+      "read_text": "workspace ca78783863fa: first\n"
+    },
+    {
+      "id": "edit_file_2",
+      "name": "edit_file",
+      "args": {
+        "path": "acceptance-ca78783863fa.txt",
+        "old_string": "first",
+        "new_string": "second"
+      },
+      "start_seq": 23,
+      "end_seq": 24,
+      "mutation_confirmed": true
+    },
+    {
+      "id": "read_file_3",
+      "name": "read_file",
+      "args": {
+        "path": "acceptance-ca78783863fa.txt",
+        "offset": 0,
+        "limit": 4096
+      },
+      "start_seq": 31,
+      "end_seq": 32,
+      "read_text": "workspace ca78783863fa: second\n"
+    }
+  ],
+  "reply": {
+    "epoch": 0,
+    "id": "01a07fcc-c70a-7592-8fc3-673635e92846",
+    "seq": 38,
+    "text": "ファイル更新確認 ca78783863fa",
+    "model": "kimi-k2.7-code",
+    "provider": "opencode-go"
+  },
+  "sentCommandsBeforeReload": 1,
+  "reloadConfirmed": true,
+  "sentCommandsAfterReload": 1,
+  "completedAt": "2026-09-08T06:55:25.962Z",
+  "cleanup": {
+    "installationDisabled": true,
+    "sessionRevoked": true,
+    "contextClosed": true,
+    "browserClosed": true
+  },
+  "scope": "One synthetic browser command through the shared deployment and real configured model; no generation restart or recipient artifact delivery."
+}
