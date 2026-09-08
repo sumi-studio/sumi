@@ -1,5 +1,5 @@
 {
-  "status": "PASSED",
+  "status": "PARTIAL_ACCEPTANCE",
   "sha": "0b88996acd46c76247d9cc9389d83af8fca501fe",
   "images": {
     "api": "sha256:7555b9da97fc90629c813dac7f634b245372505dbb3cd21bd6e16906838176bb",
@@ -69,5 +69,7 @@
     "suppressed_at": "2026-09-08T13:52:04.635731+00:00",
     "suppression_reason": "source_unavailable"
   },
-  "scope": "Owned synthetic shared-environment run; same image set throughout. Prior wt1r55 stalled and remains unexplained; this passing rerun does not prove that fault fixed."
+  "scope": "Owned synthetic shared-environment run; same image set throughout. Prior wt1r55 stalled and remains unexplained; this passing rerun does not prove that fault fixed.",
+  "runner_status": "PASSED",
+  "unverified_required_step": "No resolve_reply_later receipt for the original due reminder. The separate cancellation marker was resolved and suppressed. The old runner did not require original reminder resolution."
 }
