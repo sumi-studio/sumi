@@ -129,7 +129,9 @@ function ChatScreenContent({
       (lastItem.kind === "agent-run" && !hasInspectableTrace(lastItem.trace)));
   const rows = useMemo<ConversationRow[]>(() => {
     if (items.length === 0) return [];
-    const nextRows: ConversationRow[] = [...items];
+    const nextRows: ConversationRow[] = items.filter(
+      (item) => item.kind !== "agent-run",
+    );
     if (waitingForFirstToken) {
       nextRows.push({ id: WAITING_ROW_ID, kind: "waiting" });
     }
