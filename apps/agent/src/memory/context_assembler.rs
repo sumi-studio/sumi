@@ -1840,6 +1840,7 @@ mod tests {
         let mut spec = model_spec();
         spec.compat = crate::provider::model::ProtocolCompat::Responses(
             crate::provider::model::ResponsesCompat {
+                dialect: crate::provider::model::ResponsesDialect::Standard,
                 supports_store: false,
                 supports_encrypted_reasoning: false,
                 supports_native_compact: false,
@@ -1866,6 +1867,7 @@ mod tests {
         spec.protocol = ApiProtocol::OpenAiResponses;
         spec.compat = crate::provider::model::ProtocolCompat::Responses(
             crate::provider::model::ResponsesCompat {
+                dialect: crate::provider::model::ResponsesDialect::Standard,
                 supports_store: false,
                 supports_encrypted_reasoning: false,
                 supports_native_compact: true,

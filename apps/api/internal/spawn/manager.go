@@ -390,51 +390,80 @@ func (m *Manager) StopIdleCold() ([]string, error) {
 	var stopped []string
 	var failures []error
 	for id, selected := range candidates {
-		rt := selected.runtime
-		var attempt *stopAttempt
-		claim := func() bool {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			if m.closing || m.running[id] != rt || m.stopping[id] != nil || rt.admissions != 0 || rt.activityRevision != selected.revision ||
-				m.now().Sub(rt.lastActive) < m.idleStop {
-				return false
-			}
-			attempt = &stopAttempt{done: make(chan struct{})}
-			m.stopping[id] = attempt
-			return true
-		}
-		var claimed bool
-		var err error
-		if m.cfg.ClaimIdle != nil {
-			claimed, err = m.cfg.ClaimIdle(id, claim)
-		} else {
-			claimed = claim()
-		}
+		didStop, err := m.stopSelectedIdle(id, selected.runtime, selected.revision, true)
 		if err != nil {
-			failures = append(failures, fmt.Errorf("inspect idle agent %s: %w", id, err))
-			continue
-		}
-		if !claimed {
-			continue
-		}
-		err = rt.process.Stop()
-		m.mu.Lock()
-		attempt.err = err
-		// On failure, retain the runtime for a later stop/inspection. Its Wait
-		// watcher independently removes it if the process actually exited.
-		if err == nil && m.running[id] == rt {
-			delete(m.running, id)
-		}
-		delete(m.stopping, id)
-		close(attempt.done)
-		m.mu.Unlock()
-		if err != nil {
-			failures = append(failures, fmt.Errorf("stop idle agent %s: %w", id, err))
-		} else {
+			failures = append(failures, err)
+		} else if didStop {
 			stopped = append(stopped, id)
 		}
 	}
 	return stopped, errors.Join(failures...)
+}
+
+// StopIfIdle stops the current runtime only if no work or admission wins its
+// idle reservation. It ignores warmth and idle age, for explicit configuration
+// changes. True means the runtime stopped successfully or was already absent
+// with no start/stop in flight under the manager lock. Busy, closing, externally
+// managed, or starting/stopping runtimes return false. EnsureRunning waits for
+// a reserved stop; HoldAdmission rejects it.
+func (m *Manager) StopIfIdle(agentID string) (bool, error) {
+	m.mu.Lock()
+	if m.closing || m.skip[agentID] || m.starting[agentID] != nil || m.stopping[agentID] != nil {
+		m.mu.Unlock()
+		return false, nil
+	}
+	rt := m.running[agentID]
+	if rt == nil {
+		m.mu.Unlock()
+		return true, nil
+	}
+	revision := rt.activityRevision
+	m.mu.Unlock()
+	return m.stopSelectedIdle(agentID, rt, revision, false)
+}
+
+func (m *Manager) stopSelectedIdle(id string, rt *agentRuntime, revision uint64, coldOnly bool) (bool, error) {
+	var attempt *stopAttempt
+	claim := func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.closing || m.running[id] != rt || m.stopping[id] != nil || rt.admissions != 0 || rt.activityRevision != revision {
+			return false
+		}
+		if coldOnly && (rt.warmth == WarmthWarm || m.now().Sub(rt.lastActive) < m.idleStop) {
+			return false
+		}
+		attempt = &stopAttempt{done: make(chan struct{})}
+		m.stopping[id] = attempt
+		return true
+	}
+	var claimed bool
+	var err error
+	if m.cfg.ClaimIdle != nil {
+		claimed, err = m.cfg.ClaimIdle(id, claim)
+	} else {
+		claimed = claim()
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect idle agent %s: %w", id, err)
+	}
+	if !claimed {
+		return false, nil
+	}
+	err = rt.process.Stop()
+	m.mu.Lock()
+	attempt.err = err
+	// A failed stop stays tracked unless its Wait watcher observes exit.
+	if err == nil && m.running[id] == rt {
+		delete(m.running, id)
+	}
+	delete(m.stopping, id)
+	close(attempt.done)
+	m.mu.Unlock()
+	if err != nil {
+		return false, fmt.Errorf("stop idle agent %s: %w", id, err)
+	}
+	return true, nil
 }
 
 // Warmth returns the warmth setting of a running agent, or "" if not running.

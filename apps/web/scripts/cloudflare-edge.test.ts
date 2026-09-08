@@ -741,3 +741,10 @@ function assertWorkspaceIntegrationContract(discovery: RouteDiscovery): void {
     );
   }
 }
+
+test("model connection status and login route to the authenticated API", () => {
+  for (const path of ["/api/model-connections/chatgpt", "/api/model-connections/chatgpt/login", "/api/model-connections/chatgpt/login/flow"]) {
+    assert.equal(classifyPath(path), "origin");
+  }
+  assert.notEqual(classifyPath("/api/unrelated"), "origin");
+});

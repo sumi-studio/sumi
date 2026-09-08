@@ -106,6 +106,9 @@ services:
       # Null mapping means exact host pass-through when set and omission from
       # Config.Env when unset; the entrypoint does not invent a model ID.
       SUMI_MODEL_ID:
+      SUMI_MODEL_REASONING_EFFORT:
+      SUMI_MODEL_ACCOUNT_SCOPE:
+      SUMI_CHATGPT_CONNECTION_ID:
       SUMI_MODEL_API_KEY_ENV: SUMI_PROVIDER_API_KEY
       SUMI_EXECUTION_REVIEWER_MODEL_PRESET: ${SUMI_EXECUTION_REVIEWER_MODEL_PRESET:?SUMI_EXECUTION_REVIEWER_MODEL_PRESET is required}
       SUMI_EXECUTION_REVIEWER_MODEL_ID:

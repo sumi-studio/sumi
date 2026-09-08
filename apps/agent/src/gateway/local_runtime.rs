@@ -8732,4 +8732,82 @@ mod tests {
         );
         server.abort();
     }
+    #[tokio::test]
+    async fn chatgpt_access_uses_pa_authorized_transport_and_strict_payload() {
+        use crate::provider::chatgpt::ChatGptCredentialResolver;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/internal/providers/chatgpt/access", post(
+                |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer control-secret");
+                    assert_eq!(body, serde_json::json!({"connection_id":"owned-connection","rejected_access_token":"rejected-fixture"}));
+                    axum::Json(serde_json::json!({"connection_id":"owned-connection","account_id":"owned-account","access_token":"access-fixture","expires_at":"2099-01-01T00:00:00Z","model":"gpt-6-astra","effort":"medium"}))
+                }
+            ))).await.unwrap();
+        });
+        let expected = authority();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
+        let client =
+            LocalControlHttpClient::new_loopback(format!("http://{address}"), expected, credential)
+                .unwrap();
+        let access = client
+            .resolve("owned-connection", Some("rejected-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(access.connection_id, "owned-connection");
+        assert_eq!(access.account_id, "owned-account");
+        assert_eq!(access.access_token.as_str(), "access-fixture");
+        assert!(!format!("{access:?}").contains("access-fixture"));
+        server.abort();
+    }
+}
+
+#[async_trait]
+impl crate::provider::chatgpt::ChatGptCredentialResolver for LocalControlHttpClient {
+    async fn resolve(
+        &self,
+        connection_id: &str,
+        rejected_access_token: Option<&str>,
+    ) -> Result<crate::provider::chatgpt::ChatGptAccess, crate::provider::chatgpt::ChatGptAuthError>
+    {
+        #[derive(Serialize)]
+        struct AccessRequest<'a> {
+            connection_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rejected_access_token: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AccessResponse {
+            connection_id: String,
+            account_id: String,
+            access_token: String,
+            expires_at: chrono::DateTime<chrono::Utc>,
+            #[serde(rename = "model")]
+            _model: String,
+            #[serde(rename = "effort")]
+            _effort: String,
+        }
+        // The existing native transport binds this request to the PA, runtime
+        // generation and boot nonce. Never take a Human or workspace from callers.
+        let response: AccessResponse = self
+            .post_json_bounded(
+                "/internal/providers/chatgpt/access",
+                &AccessRequest {
+                    connection_id,
+                    rejected_access_token,
+                },
+                32 * 1024,
+            )
+            .await
+            .map_err(|_| crate::provider::chatgpt::ChatGptAuthError::Unavailable)?;
+        Ok(crate::provider::chatgpt::ChatGptAccess {
+            connection_id: response.connection_id,
+            account_id: response.account_id,
+            access_token: zeroize::Zeroizing::new(response.access_token),
+            expires_at: response.expires_at,
+        })
+    }
 }

@@ -130,3 +130,12 @@ test("extra allowed hosts front the dev server without loosening the host check 
     /plain hostname/,
   );
 });
+
+test("model connection login stays same-origin without proxying unrelated api routes", () => {
+  const server = createDevServerConfig(SUMI_DEV_API_ORIGIN);
+  assert.deepEqual(server.proxy?.["/api/model-connections"], {
+    target: SUMI_DEV_API_ORIGIN,
+    changeOrigin: false,
+  });
+  assert.equal(server.proxy?.["/api"], undefined);
+});

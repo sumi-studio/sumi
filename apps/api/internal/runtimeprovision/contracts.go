@@ -73,6 +73,9 @@ type ActivationConfig struct {
 	ProviderAPIKey                 string           `json:"provider_api_key"`
 	ModelPreset                    string           `json:"model_preset,omitempty"`
 	ModelID                        string           `json:"model_id,omitempty"`
+	ModelReasoningEffort           string           `json:"model_reasoning_effort,omitempty"`
+	ModelAccountScope              string           `json:"model_account_scope,omitempty"`
+	ChatGPTConnectionID            string           `json:"chatgpt_connection_id,omitempty"`
 	ExecutionReviewerAPIKey        string           `json:"execution_reviewer_api_key"`
 	ExecutionReviewerModelPreset   string           `json:"execution_reviewer_model_preset"`
 	ExecutionReviewerModelID       string           `json:"execution_reviewer_model_id,omitempty"`
@@ -257,13 +260,33 @@ func (request ActivateRequest) Validate() error {
 }
 
 func (config ActivationConfig) Validate() error {
+	if config.ModelPreset == "chatgpt-responses" {
+		if config.ProviderAPIKey != "" || config.ChatGPTConnectionID == "" || config.ModelAccountScope == "" || config.ModelID == "" {
+			return errors.New("ChatGPT activation requires account/connection/model and no provider API key")
+		}
+		switch config.ModelReasoningEffort {
+		case "low", "medium", "high", "xhigh", "max":
+		default:
+			return errors.New("invalid ChatGPT reasoning effort")
+		}
+	} else {
+		if config.ChatGPTConnectionID != "" {
+			return errors.New("ChatGPT connection requires native ChatGPT preset")
+		}
+		if err := validateOpaque("provider_api_key", config.ProviderAPIKey); err != nil {
+			return err
+		}
+		if strings.ContainsAny(config.ProviderAPIKey, "\x00\r\n") {
+			return errors.New("invalid provider API key")
+		}
+	}
+
 	for name, value := range map[string]string{
 		"gateway_url":                      config.GatewayURL,
 		"local_control_bearer":             config.LocalControlBearer,
 		"agent_wrapping_key":               config.AgentWrappingKey,
 		"agent_wrapping_key_id":            config.AgentWrappingKeyID,
 		"approval_secret_digest_key":       config.ApprovalSecretDigestKey,
-		"provider_api_key":                 config.ProviderAPIKey,
 		"execution_reviewer_api_key":       config.ExecutionReviewerAPIKey,
 		"escalation_reviewer_api_key":      config.EscalationReviewerAPIKey,
 		"execution_reviewer_model_preset":  config.ExecutionReviewerModelPreset,
@@ -294,6 +317,9 @@ func (config ActivationConfig) Validate() error {
 	for name, value := range map[string]string{
 		"model_preset":                       config.ModelPreset,
 		"model_id":                           config.ModelID,
+		"model_reasoning_effort":             config.ModelReasoningEffort,
+		"model_account_scope":                config.ModelAccountScope,
+		"chatgpt_connection_id":              config.ChatGPTConnectionID,
 		"execution_reviewer_model_id":        config.ExecutionReviewerModelID,
 		"execution_reviewer_model_base_url":  config.ExecutionReviewerModelBaseURL,
 		"execution_reviewer_account_scope":   config.ExecutionReviewerAccountScope,

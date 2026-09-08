@@ -12,6 +12,7 @@ import {
 import {
   Check,
   ChevronRight,
+  Link2,
   LogOut,
   Monitor,
   Moon,
@@ -38,6 +39,7 @@ import {
 import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { ParticipantAppsMenu } from "../participant/app-menu";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
+import { ModelProviderSettings } from "./model-provider-settings";
 
 const THEME_OPTIONS: Array<{
   id: ThemePreference;
@@ -65,6 +67,7 @@ interface ProfileFormState {
 export function SettingsPopover() {
   const { authenticated, user, logout, updateProfile } = useAuth();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
@@ -215,201 +218,230 @@ export function SettingsPopover() {
     loadingProfile || profileLoadError || profileForm.baseline === null;
 
   return (
-    <Popover open={settingsOpen} onOpenChange={setSettingsOpen}>
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <PopoverTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label="設定"
-                  className="size-8 shrink-0"
-                />
-              }
-            />
-          }
-        >
-          <Settings className="size-4" />
-        </TooltipTrigger>
-        <TooltipContent side="right">設定</TooltipContent>
-      </Tooltip>
-      <PopoverContent
-        side="top"
-        align="start"
-        aria-label="設定"
-        className="w-80"
-      >
-        {authenticated && (
-          <div className="mb-1 border-border border-b pb-1">
-            <div className="flex items-center gap-2 px-2.5 py-2 text-sm">
-              <UserRound className="size-4 shrink-0" />
-              <span className="max-w-44 truncate">
-                {user?.displayName ?? "アカウント"}
-              </span>
-            </div>
-            <form
-              onSubmit={(event) => void handleProfileSubmit(event)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && isImeComposing(event)) {
-                  event.preventDefault();
-                }
-              }}
-              className="px-2.5 pb-2"
-            >
-              <label
-                htmlFor="sumi-settings-display-name"
-                className="mb-1 block text-muted-foreground text-xs"
-              >
-                表示名
-              </label>
-              <input
-                id="sumi-settings-display-name"
-                value={profileForm.values.displayName}
-                onChange={(event) => {
-                  setProfileForm((current) => ({
-                    ...current,
-                    values: {
-                      ...current.values,
-                      displayName: clampCodePoints(
-                        event.target.value,
-                        MAX_DISPLAY_NAME_CODE_POINTS,
-                      ),
-                    },
-                  }));
-                  setProfileError(null);
-                  setProfileNotice(null);
-                }}
-                disabled={profileUnavailable || savingProfile}
-                aria-invalid={!displayNameValid || undefined}
-                aria-describedby="sumi-settings-display-name-hint"
-                autoComplete="name"
-                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-              />
-              <p
-                id="sumi-settings-display-name-hint"
-                className="mt-1 text-muted-foreground text-xs"
-              >
-                他の参加者に見える名前です（
-                {codePointLength(profileForm.values.displayName)} /{" "}
-                {MAX_DISPLAY_NAME_CODE_POINTS}）
-              </p>
-              <label
-                htmlFor="sumi-settings-tagline"
-                className="mt-2 mb-1 block text-muted-foreground text-xs"
-              >
-                ひとこと
-              </label>
-              <input
-                id="sumi-settings-tagline"
-                value={profileForm.values.tagline}
-                onChange={(event) => {
-                  setProfileForm((current) => ({
-                    ...current,
-                    values: {
-                      ...current.values,
-                      tagline: clampCodePoints(
-                        event.target.value,
-                        MAX_TAGLINE_CODE_POINTS,
-                      ),
-                    },
-                  }));
-                  setProfileError(null);
-                  setProfileNotice(null);
-                }}
-                disabled={profileUnavailable || savingProfile}
-                aria-invalid={!taglineValid || undefined}
-                aria-describedby="sumi-settings-tagline-hint"
-                placeholder="例: 開発"
-                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-              />
-              <p
-                id="sumi-settings-tagline-hint"
-                className="mt-1 text-muted-foreground text-xs"
-              >
-                担っていることを一行で。空でも構いません（
-                {codePointLength(profileForm.values.tagline)} /{" "}
-                {MAX_TAGLINE_CODE_POINTS}）
-              </p>
-              <div className="mt-2 flex items-center gap-2">
-                <Button
-                  type="submit"
-                  size="sm"
-                  disabled={
-                    savingProfile ||
-                    profileUnavailable ||
-                    !dirty ||
-                    !displayNameValid ||
-                    !taglineValid
-                  }
-                >
-                  {savingProfile ? "保存中" : "保存"}
-                </Button>
-                {loadingProfile ? (
-                  <span role="status" className="text-muted-foreground text-xs">
-                    読み込み中
-                  </span>
-                ) : null}
-                {profileLoadError ? (
+    <>
+      <Popover open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <PopoverTrigger
+                render={
                   <Button
-                    type="button"
-                    size="sm"
                     variant="ghost"
-                    onClick={() =>
-                      setProfileLoadAttempt((attempt) => attempt + 1)
+                    size="icon"
+                    aria-label="設定"
+                    className="size-8 shrink-0"
+                  />
+                }
+              />
+            }
+          >
+            <Settings className="size-4" />
+          </TooltipTrigger>
+          <TooltipContent side="right">設定</TooltipContent>
+        </Tooltip>
+        <PopoverContent
+          side="top"
+          align="start"
+          aria-label="設定"
+          className="w-80"
+        >
+          {authenticated && (
+            <div className="mb-1 border-border border-b pb-1">
+              <div className="flex items-center gap-2 px-2.5 py-2 text-sm">
+                <UserRound className="size-4 shrink-0" />
+                <span className="max-w-44 truncate">
+                  {user?.displayName ?? "アカウント"}
+                </span>
+              </div>
+              <form
+                onSubmit={(event) => void handleProfileSubmit(event)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && isImeComposing(event)) {
+                    event.preventDefault();
+                  }
+                }}
+                className="px-2.5 pb-2"
+              >
+                <label
+                  htmlFor="sumi-settings-display-name"
+                  className="mb-1 block text-muted-foreground text-xs"
+                >
+                  表示名
+                </label>
+                <input
+                  id="sumi-settings-display-name"
+                  value={profileForm.values.displayName}
+                  onChange={(event) => {
+                    setProfileForm((current) => ({
+                      ...current,
+                      values: {
+                        ...current.values,
+                        displayName: clampCodePoints(
+                          event.target.value,
+                          MAX_DISPLAY_NAME_CODE_POINTS,
+                        ),
+                      },
+                    }));
+                    setProfileError(null);
+                    setProfileNotice(null);
+                  }}
+                  disabled={profileUnavailable || savingProfile}
+                  aria-invalid={!displayNameValid || undefined}
+                  aria-describedby="sumi-settings-display-name-hint"
+                  autoComplete="name"
+                  className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                />
+                <p
+                  id="sumi-settings-display-name-hint"
+                  className="mt-1 text-muted-foreground text-xs"
+                >
+                  他の参加者に見える名前です（
+                  {codePointLength(profileForm.values.displayName)} /{" "}
+                  {MAX_DISPLAY_NAME_CODE_POINTS}）
+                </p>
+                <label
+                  htmlFor="sumi-settings-tagline"
+                  className="mt-2 mb-1 block text-muted-foreground text-xs"
+                >
+                  ひとこと
+                </label>
+                <input
+                  id="sumi-settings-tagline"
+                  value={profileForm.values.tagline}
+                  onChange={(event) => {
+                    setProfileForm((current) => ({
+                      ...current,
+                      values: {
+                        ...current.values,
+                        tagline: clampCodePoints(
+                          event.target.value,
+                          MAX_TAGLINE_CODE_POINTS,
+                        ),
+                      },
+                    }));
+                    setProfileError(null);
+                    setProfileNotice(null);
+                  }}
+                  disabled={profileUnavailable || savingProfile}
+                  aria-invalid={!taglineValid || undefined}
+                  aria-describedby="sumi-settings-tagline-hint"
+                  placeholder="例: 開発"
+                  className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                />
+                <p
+                  id="sumi-settings-tagline-hint"
+                  className="mt-1 text-muted-foreground text-xs"
+                >
+                  担っていることを一行で。空でも構いません（
+                  {codePointLength(profileForm.values.tagline)} /{" "}
+                  {MAX_TAGLINE_CODE_POINTS}）
+                </p>
+                <div className="mt-2 flex items-center gap-2">
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={
+                      savingProfile ||
+                      profileUnavailable ||
+                      !dirty ||
+                      !displayNameValid ||
+                      !taglineValid
                     }
                   >
-                    再試行
+                    {savingProfile ? "保存中" : "保存"}
                   </Button>
+                  {loadingProfile ? (
+                    <span
+                      role="status"
+                      className="text-muted-foreground text-xs"
+                    >
+                      読み込み中
+                    </span>
+                  ) : null}
+                  {profileLoadError ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        setProfileLoadAttempt((attempt) => attempt + 1)
+                      }
+                    >
+                      再試行
+                    </Button>
+                  ) : null}
+                </div>
+                {profileError ? (
+                  <p role="alert" className="mt-1 text-red-600 text-xs">
+                    {profileError}
+                  </p>
                 ) : null}
-              </div>
-              {profileError ? (
-                <p role="alert" className="mt-1 text-red-600 text-xs">
-                  {profileError}
-                </p>
-              ) : null}
-              {!displayNameValid && !profileUnavailable ? (
-                <p role="alert" className="mt-1 text-red-600 text-xs">
-                  表示名は1文字以上で入力してください。
-                </p>
-              ) : null}
-              {!taglineValid && !profileUnavailable ? (
-                <p role="alert" className="mt-1 text-red-600 text-xs">
-                  ひとことは改行や制御文字を含めず入力してください。
-                </p>
-              ) : null}
-              {profileLoadError ? (
-                <p role="alert" className="mt-1 text-red-600 text-xs">
-                  プロフィールを読み込めませんでした。
-                </p>
-              ) : null}
-              {profileNotice ? (
-                <p role="status" className="mt-1 text-muted-foreground text-xs">
-                  {profileNotice}
-                </p>
-              ) : null}
-            </form>
-            <ProviderSettings humanId={user?.id ?? ""} />
-            <Button
-              variant="ghost"
-              onClick={() => void handleLogout()}
-              className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
+                {!displayNameValid && !profileUnavailable ? (
+                  <p role="alert" className="mt-1 text-red-600 text-xs">
+                    表示名は1文字以上で入力してください。
+                  </p>
+                ) : null}
+                {!taglineValid && !profileUnavailable ? (
+                  <p role="alert" className="mt-1 text-red-600 text-xs">
+                    ひとことは改行や制御文字を含めず入力してください。
+                  </p>
+                ) : null}
+                {profileLoadError ? (
+                  <p role="alert" className="mt-1 text-red-600 text-xs">
+                    プロフィールを読み込めませんでした。
+                  </p>
+                ) : null}
+                {profileNotice ? (
+                  <p
+                    role="status"
+                    className="mt-1 text-muted-foreground text-xs"
+                  >
+                    {profileNotice}
+                  </p>
+                ) : null}
+              </form>
+              <ProviderSettings humanId={user?.id ?? ""} />
+              <Button
+                variant="ghost"
+                className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setModelSettingsOpen(true);
+                }}
+              >
+                <Link2 className="size-4" />
+                AIの接続
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => void handleLogout()}
+                className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
+              >
+                <LogOut className="size-4" />
+                ログアウト
+              </Button>
+            </div>
+          )}
+          {authenticated ? <ParticipantAppsMenu /> : null}
+          <ThemePicker />
+          {logoutError && (
+            <p
+              role="alert"
+              className="mt-1 max-w-56 px-2.5 text-red-600 text-xs"
             >
-              <LogOut className="size-4" />
-              ログアウト
-            </Button>
-          </div>
-        )}
-        {authenticated ? <ParticipantAppsMenu /> : null}
-        <ThemePicker />
-        {logoutError && (
-          <p role="alert" className="mt-1 max-w-56 px-2.5 text-red-600 text-xs">
-            {logoutError}
-          </p>
-        )}
-      </PopoverContent>
-    </Popover>
+              {logoutError}
+            </p>
+          )}
+        </PopoverContent>
+      </Popover>
+      {authenticated && user?.id ? (
+        <ModelProviderSettings
+          key={user.id}
+          open={modelSettingsOpen}
+          onOpenChange={setModelSettingsOpen}
+        />
+      ) : null}
+    </>
   );
 }
 

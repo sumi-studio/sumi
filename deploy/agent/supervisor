@@ -427,7 +427,6 @@ require_launch_environment() {
     SUMI_AGENT_WRAPPING_KEY \
     SUMI_AGENT_WRAPPING_KEY_ID \
     SUMI_APPROVAL_SECRET_DIGEST_KEY \
-    SUMI_PROVIDER_API_KEY \
     SUMI_EXECUTION_REVIEWER_API_KEY \
     SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
     SUMI_ESCALATION_REVIEWER_API_KEY \
@@ -435,6 +434,17 @@ require_launch_environment() {
   do
     [[ -n "${!name:-}" ]] || fail "${name} is required"
   done
+  if [[ "${SUMI_MODEL_PRESET:-}" == "chatgpt-responses" ]]; then
+    [[ -z "${SUMI_PROVIDER_API_KEY:-}" ]] || fail "ChatGPT runtime must not receive a provider API key"
+    # The fixed mount remains an empty file, never a substitute credential.
+    export SUMI_PROVIDER_API_KEY=""
+    for name in SUMI_CHATGPT_CONNECTION_ID SUMI_MODEL_ACCOUNT_SCOPE SUMI_MODEL_ID SUMI_MODEL_REASONING_EFFORT; do
+      [[ -n "${!name:-}" ]] || fail "${name} is required for ChatGPT"
+    done
+  else
+    [[ -n "${SUMI_PROVIDER_API_KEY:-}" ]] || fail "SUMI_PROVIDER_API_KEY is required"
+  fi
+
   for name in \
     SUMI_LOCAL_CONTROL_BEARER \
     SUMI_AGENT_WRAPPING_KEY \

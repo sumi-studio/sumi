@@ -1113,6 +1113,7 @@ pub trait EscalationObjectionResponderTransport: Send + Sync {
 /// separate from the escalation transport even when both use one provider.
 pub struct ProviderExecutionReviewerTransport {
     session_id: String,
+    reasoning_effort: Option<String>,
     spec: ModelSpec,
     model: ReviewerModelSpec,
     tools: Arc<ReviewerToolRuntime>,
@@ -1130,7 +1131,12 @@ impl ProviderExecutionReviewerTransport {
             model,
             tools,
             session_id,
+            reasoning_effort: None,
         }
+    }
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -1149,6 +1155,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
         complete_provider_review(
             &self.spec,
             &self.session_id,
+            self.reasoning_effort.as_deref(),
             ReviewerKind::Execution,
             Some(self.tools.as_ref()),
             prompt.system,
@@ -1164,6 +1171,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
 
 pub struct ProviderEscalationReviewerTransport {
     session_id: String,
+    reasoning_effort: Option<String>,
     spec: ModelSpec,
     model: ReviewerModelSpec,
     tools: Arc<ReviewerToolRuntime>,
@@ -1181,7 +1189,12 @@ impl ProviderEscalationReviewerTransport {
             model,
             tools,
             session_id,
+            reasoning_effort: None,
         }
+    }
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -1200,6 +1213,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
         complete_provider_review(
             &self.spec,
             &self.session_id,
+            self.reasoning_effort.as_deref(),
             ReviewerKind::Escalation,
             Some(self.tools.as_ref()),
             prompt.system,
@@ -1215,6 +1229,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
 
 pub struct ProviderEscalationObjectionResponderTransport {
     session_id: String,
+    reasoning_effort: Option<String>,
     spec: ModelSpec,
     model: ReviewerModelSpec,
 }
@@ -1226,7 +1241,12 @@ impl ProviderEscalationObjectionResponderTransport {
             spec,
             model,
             session_id,
+            reasoning_effort: None,
         }
+    }
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -1244,6 +1264,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
         complete_provider_review(
             &self.spec,
             &self.session_id,
+            self.reasoning_effort.as_deref(),
             ReviewerKind::Escalation,
             None,
             &prompt.system,
@@ -1268,6 +1289,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
 async fn complete_provider_review(
     spec: &ModelSpec,
     session_id: &str,
+    reasoning_effort: Option<&str>,
     reviewer: ReviewerKind,
     tools: Option<&ReviewerToolRuntime>,
     system: &str,
@@ -1297,6 +1319,7 @@ async fn complete_provider_review(
         structured_retry,
     )?;
     options.session_id = Some(session_id.to_owned());
+    options.reasoning_effort = reasoning_effort.map(str::to_owned);
     let mut trace = Vec::new();
     loop {
         // Each HTTP round owns its cancellation. Dropping a completed stream
@@ -3544,6 +3567,7 @@ mod tests {
             options: RequestOptions,
             cancel: CancellationToken,
         ) -> crate::provider::types::ProviderEventStream {
+            assert_eq!(options.reasoning_effort.as_deref(), Some("max"));
             crate::provider::stream_with_api_key_observed(
                 spec,
                 context,
@@ -3602,6 +3626,7 @@ mod tests {
                 complete_provider_review(
                     &spec,
                     "review-continuation",
+                    Some("max"),
                     ReviewerKind::Execution,
                     Some(&tools),
                     prompt.system,

@@ -1652,3 +1652,83 @@ func repositoryFilePath(parts ...string) string {
 	pathParts := append([]string{"..", "..", "..", ".."}, parts...)
 	return filepath.Join(pathParts...)
 }
+
+func TestSupervisorNativeChatGPTLaunchCredentialBoundary(t *testing.T) {
+	source := readDeploymentFile(t, "supervisor")
+	start := strings.Index(source, "require_launch_environment() {")
+	end := strings.Index(source[start:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("launch validator missing")
+	}
+	script := "set -eu\nfail() { exit 23; }\nvalidate_local_control_socket() { :; }\n" + source[start:start+end+3] + "\nrequire_launch_environment\n"
+	base := testActivationConfig()
+	base.ModelPreset = "chatgpt-responses"
+	base.ModelID = "gpt-6-astra"
+	base.ModelReasoningEffort = "medium"
+	base.ModelAccountScope = "account"
+	base.ChatGPTConnectionID = "connection"
+	base.ProviderAPIKey = ""
+	for _, tc := range []struct {
+		name            string
+		native          bool
+		badKey          bool
+		missingReviewer bool
+		pass            bool
+	}{
+		{"native without API credential", true, false, false, true},
+		{"native rejects unrelated credential", true, true, false, false},
+		{"native still requires reviewer", true, false, true, false},
+		{"default still requires conversation credential", false, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := activationEnvironment(base)
+			if !tc.native {
+				env["SUMI_MODEL_PRESET"] = "kimi-k3"
+			}
+			if tc.badKey {
+				env["SUMI_PROVIDER_API_KEY"] = "wrong-key"
+			}
+			if tc.missingReviewer {
+				delete(env, "SUMI_EXECUTION_REVIEWER_API_KEY")
+			}
+			command := exec.Command("bash", "-c", script)
+			command.Env = []string{"PATH=/usr/bin:/bin"}
+			for name, value := range env {
+				command.Env = append(command.Env, name+"="+value)
+			}
+			err := command.Run()
+			if (err == nil) != tc.pass {
+				t.Fatalf("unexpected launch validation outcome: %v", err)
+			}
+		})
+	}
+}
+
+func TestNativeChatGPTEntrypointForwardsIdentityWithoutProviderCredential(t *testing.T) {
+	source := readDeploymentFile(t, "container-entrypoint")
+	start := strings.Index(source, "    runtime_environment=(")
+	if start < 0 {
+		t.Fatal("runtime environment missing")
+	}
+	end := strings.Index(source[start:], "    close_unlisted_fds")
+	if end < 0 {
+		t.Fatal("runtime exec missing")
+	}
+	// Execute the shipped environment builder; other launch values are synthetic.
+	script := "set -e\nfail() { exit 23; }\n" + source[start:start+end] + "\nprintf '%s\\n' \"${runtime_environment[@]}\"\n"
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "SUMI_MODEL_PRESET=chatgpt-responses", "SUMI_MODEL_ID=gpt-6-astra", "SUMI_CHATGPT_CONNECTION_ID=connection", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account", "SUMI_MODEL_REASONING_EFFORT=medium", "SUMI_PROVIDER_API_KEY=must-not-forward", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer"}
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(output)
+	for _, expected := range []string{"SUMI_CHATGPT_CONNECTION_ID=connection\n", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account\n", "SUMI_MODEL_REASONING_EFFORT=medium\n", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer\n"} {
+		if !strings.Contains(text, expected) {
+			t.Fatal("native identity/reviewer environment lost")
+		}
+	}
+	if strings.Contains(text, "SUMI_PROVIDER_API_KEY=") || strings.Contains(text, "must-not-forward") {
+		t.Fatal("unrelated provider credential reached native runtime")
+	}
+}

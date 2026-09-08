@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::provider::{
     ModelSpec, ProtocolCompat,
     assembler::ResponseBudget,
-    model::{MaxTokensField, ThinkingFormat},
+    model::{MaxTokensField, ProviderBackend, ThinkingFormat},
     types::ApiProtocol,
 };
 use crate::runtime::contracts::PersonalityAgentId;
@@ -28,6 +28,7 @@ pub struct Config {
     pub system_prompt: String,
     pub model: ModelConfig,
     pub reviewers: ReviewerModelsConfig,
+    pub chatgpt_connection_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -60,6 +61,7 @@ pub struct ModelConfig {
     pub max_output_tokens: Option<u64>,
     pub default_output_tokens: Option<u64>,
     pub reasoning: Option<bool>,
+    pub reasoning_effort: Option<String>,
     pub supports_images: Option<bool>,
     pub compat: CompatConfig,
 }
@@ -89,6 +91,7 @@ struct FileConfig {
     system_prompt_file: Option<PathBuf>,
     model: ModelConfig,
     reviewers: ReviewerModelsConfig,
+    chatgpt_connection_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -102,12 +105,16 @@ struct EnvOverrides {
     model_id: Option<String>,
     model_base_url: Option<String>,
     model_api_key_env: Option<String>,
+    model_account_scope: Option<String>,
+    chatgpt_connection_id: Option<String>,
+    model_reasoning_effort: Option<String>,
     execution_reviewer: ModelEnvOverrides,
     escalation_reviewer: ModelEnvOverrides,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ModelEnvOverrides {
+    reasoning_effort: Option<String>,
     preset: Option<String>,
     id: Option<String>,
     base_url: Option<String>,
@@ -157,6 +164,38 @@ impl Config {
         self.reviewer_model_spec(self.reviewers.escalation.as_ref(), "Escalation reviewer")
     }
 
+    pub fn reasoning_effort(&self) -> Result<Option<String>> {
+        resolved_reasoning_effort(&self.model_spec()?, self.model.reasoning_effort.as_deref())
+    }
+
+    pub fn execution_reviewer_reasoning_effort(&self) -> Result<Option<String>> {
+        self.reviewer_reasoning_effort(
+            self.reviewers.execution.as_ref(),
+            self.execution_reviewer_model_spec()?,
+        )
+    }
+
+    pub fn escalation_reviewer_reasoning_effort(&self) -> Result<Option<String>> {
+        self.reviewer_reasoning_effort(
+            self.reviewers.escalation.as_ref(),
+            self.escalation_reviewer_model_spec()?,
+        )
+    }
+
+    fn reviewer_reasoning_effort(
+        &self,
+        reviewer: Option<&ModelConfig>,
+        spec: ModelSpec,
+    ) -> Result<Option<String>> {
+        let conversation = self.model_spec()?;
+        let explicit = reviewer.and_then(|model| model.reasoning_effort.as_deref());
+        let inherited = (spec.provider_instance_id() == conversation.provider_instance_id()
+            && spec.id == conversation.id)
+            .then_some(self.model.reasoning_effort.as_deref())
+            .flatten();
+        resolved_reasoning_effort(&spec, explicit.or(inherited))
+    }
+
     fn reviewer_model_spec(
         &self,
         reviewer: Option<&ModelConfig>,
@@ -197,6 +236,9 @@ impl Config {
         if same_preset {
             if reviewer.id.is_none() {
                 spec.set_model_id(&conversation.id);
+            }
+            if spec.backend == ProviderBackend::ChatGpt && reviewer.account_scope.is_none() {
+                spec.account_scope.clone_from(&conversation.account_scope);
             }
             if reviewer.api_key_env.is_none() {
                 spec.api_key_env.clone_from(&conversation.api_key_env);
@@ -240,8 +282,14 @@ impl Config {
         if let Some(value) = overrides.model_base_url {
             file.model.base_url = Some(value);
         }
+        if let Some(value) = overrides.model_account_scope {
+            file.model.account_scope = Some(value);
+        }
         if let Some(value) = overrides.model_api_key_env {
             file.model.api_key_env = Some(value);
+        }
+        if let Some(value) = overrides.model_reasoning_effort {
+            file.model.reasoning_effort = Some(value);
         }
         overrides
             .execution_reviewer
@@ -267,6 +315,9 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
             model: file.model,
             reviewers: file.reviewers,
+            chatgpt_connection_id: overrides
+                .chatgpt_connection_id
+                .or(file.chatgpt_connection_id),
         })
     }
 }
@@ -407,6 +458,7 @@ impl ModelEnvOverrides {
             base_url: optional("BASE_URL"),
             account_scope: optional("ACCOUNT_SCOPE"),
             api_key_env: optional("API_KEY_ENV"),
+            reasoning_effort: env::var(format!("{prefix}_REASONING_EFFORT")).ok(),
         }
     }
 
@@ -430,7 +482,39 @@ impl ModelEnvOverrides {
         if let Some(value) = self.api_key_env {
             target.api_key_env = Some(value);
         }
+        if let Some(value) = self.reasoning_effort {
+            target.reasoning_effort = Some(value);
+        }
     }
+}
+
+fn resolved_reasoning_effort(spec: &ModelSpec, effort: Option<&str>) -> Result<Option<String>> {
+    let effort = effort.or_else(|| {
+        (spec.backend == ProviderBackend::ChatGpt && spec.id == "gpt-6-astra").then_some("medium")
+    });
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    if !matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        bail!("unsupported reasoning_effort {effort:?}; use a provider effort, not a harness mode");
+    }
+    if !spec.reasoning {
+        bail!("reasoning_effort requires a reasoning-enabled model");
+    }
+    match &spec.compat {
+        ProtocolCompat::Responses(_) => {
+            if spec.id == "gpt-6-astra" && matches!(effort, "none" | "minimal") {
+                bail!("gpt-6-astra does not support reasoning_effort {effort}");
+            }
+        }
+        ProtocolCompat::Chat(compat)
+            if compat.thinking_format == ThinkingFormat::OpenAiEffort && effort == "max" => {}
+        _ => bail!("this provider adapter does not support reasoning_effort {effort}"),
+    }
+    Ok(Some(effort.to_owned()))
 }
 
 fn ensure_isolated_state_dir(workspace: &Path, state_dir: &Path) -> Result<()> {
@@ -581,6 +665,9 @@ impl EnvOverrides {
             model_id: env::var("SUMI_MODEL_ID").ok(),
             model_base_url: env::var("SUMI_MODEL_BASE_URL").ok(),
             model_api_key_env: env::var("SUMI_MODEL_API_KEY_ENV").ok(),
+            model_account_scope: env::var("SUMI_MODEL_ACCOUNT_SCOPE").ok(),
+            chatgpt_connection_id: env::var("SUMI_CHATGPT_CONNECTION_ID").ok(),
+            model_reasoning_effort: env::var("SUMI_MODEL_REASONING_EFFORT").ok(),
             execution_reviewer: ModelEnvOverrides::from_env("SUMI_EXECUTION_REVIEWER_MODEL"),
             escalation_reviewer: ModelEnvOverrides::from_env("SUMI_ESCALATION_REVIEWER_MODEL"),
         })
@@ -1471,6 +1558,7 @@ default_output_tokens = 16000
                     ..ModelConfig::default()
                 },
                 reviewers: ReviewerModelsConfig::default(),
+                chatgpt_connection_id: None,
             };
             assert!(config.model_spec().is_err(), "{base_url}");
         }
@@ -1487,5 +1575,179 @@ default_output_tokens = 16000
             .expect_err("zero context window must fail");
 
         assert!(error.to_string().contains("context_window"));
+    }
+    #[test]
+    fn reasoning_effort_env_overrides_and_reviewer_inheritance_are_explicit() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            [model]
+            preset = "openai-responses"
+            id = "gpt-6-astra"
+            reasoning_effort = "high"
+            [reviewers.execution]
+            preset = "openai-responses"
+            [reviewers.escalation]
+            reasoning_effort = "xhigh"
+        "#,
+        )
+        .expect("config");
+        let config = Config::resolve(
+            file,
+            EnvOverrides {
+                model_reasoning_effort: Some("medium".into()),
+                execution_reviewer: ModelEnvOverrides {
+                    reasoning_effort: Some("low".into()),
+                    ..ModelEnvOverrides::default()
+                },
+                ..identity_overrides()
+            },
+        )
+        .expect("resolve");
+        assert_eq!(
+            config.reasoning_effort().unwrap().as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            config
+                .execution_reviewer_reasoning_effort()
+                .unwrap()
+                .as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            config
+                .escalation_reviewer_reasoning_effort()
+                .unwrap()
+                .as_deref(),
+            Some("xhigh")
+        );
+        let mut inherited = config.clone();
+        inherited
+            .reviewers
+            .execution
+            .as_mut()
+            .unwrap()
+            .reasoning_effort = None;
+        assert_eq!(
+            inherited
+                .execution_reviewer_reasoning_effort()
+                .unwrap()
+                .as_deref(),
+            Some("medium")
+        );
+        inherited.reviewers.execution.as_mut().unwrap().preset = Some("kimi-k3".into());
+        assert_eq!(
+            inherited.execution_reviewer_reasoning_effort().unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn chatgpt_connection_env_preserves_native_account_and_distinct_reviewer_backend() {
+        let config = Config::resolve(
+            toml::from_str(
+                r#"
+                chatgpt_connection_id = "old-connection"
+                [model]
+                preset = "chatgpt-responses"
+                account_scope = "old-account"
+                [reviewers.execution]
+                preset = "chatgpt-responses"
+                [reviewers.escalation]
+                preset = "kimi-k3"
+            "#,
+            )
+            .unwrap(),
+            EnvOverrides {
+                chatgpt_connection_id: Some("selected-connection".into()),
+                model_account_scope: Some("actual-chatgpt-account".into()),
+                ..identity_overrides()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.chatgpt_connection_id.as_deref(),
+            Some("selected-connection")
+        );
+        for spec in [
+            config.model_spec().unwrap(),
+            config.execution_reviewer_model_spec().unwrap(),
+        ] {
+            assert_eq!(spec.backend, ProviderBackend::ChatGpt);
+            assert_eq!(spec.account_scope, "actual-chatgpt-account");
+        }
+        assert_eq!(
+            config.escalation_reviewer_model_spec().unwrap().backend,
+            ProviderBackend::ApiKey
+        );
+        assert_eq!(config.escalation_reviewer_reasoning_effort().unwrap(), None);
+    }
+
+    #[test]
+    fn reasoning_effort_chatgpt_astra_defaults_to_medium_without_changing_api_models() {
+        let mut config = Config::resolve(
+            toml::from_str("[model]\npreset = \"chatgpt-responses\"").unwrap(),
+            identity_overrides(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.reasoning_effort().unwrap().as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            config
+                .execution_reviewer_reasoning_effort()
+                .unwrap()
+                .as_deref(),
+            Some("medium")
+        );
+        config.model.reasoning_effort = Some("low".into());
+        assert_eq!(
+            config
+                .execution_reviewer_reasoning_effort()
+                .unwrap()
+                .as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            resolved_reasoning_effort(&ModelSpec::preset("openai-responses").unwrap(), None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_rejects_harness_values_and_unsupported_adapter_settings() {
+        let astra = ModelSpec {
+            id: "gpt-6-astra".into(),
+            ..ModelSpec::preset("openai-responses").unwrap()
+        };
+        for effort in ["", "ultra", "none", "minimal", "MEDIUM", " medium "] {
+            assert!(
+                resolved_reasoning_effort(&astra, Some(effort)).is_err(),
+                "{effort}"
+            );
+        }
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                resolved_reasoning_effort(&astra, Some(effort))
+                    .unwrap()
+                    .as_deref(),
+                Some(effort)
+            );
+        }
+        let kimi = ModelSpec::preset("kimi-k3").unwrap();
+        assert!(resolved_reasoning_effort(&kimi, Some("medium")).is_err());
+        assert_eq!(
+            resolved_reasoning_effort(&kimi, Some("max"))
+                .unwrap()
+                .as_deref(),
+            Some("max")
+        );
+        assert_eq!(resolved_reasoning_effort(&kimi, None).unwrap(), None);
+        assert!(
+            resolved_reasoning_effort(&ModelSpec::preset("anthropic").unwrap(), Some("high"))
+                .is_err()
+        );
     }
 }
