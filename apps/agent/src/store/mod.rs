@@ -3641,24 +3641,66 @@ async fn prepare_state_path(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 async fn secure_sqlite_files(path: &Path) -> Result<()> {
-    for candidate in [
-        path.to_owned(),
-        path.with_file_name(format!(
-            "{}-wal",
+    // The database is required; only SQLite's transient sidecars may be absent.
+    secure_path(path, 0o600, false).await?;
+    for suffix in ["-wal", "-shm"] {
+        let candidate = path.with_file_name(format!(
+            "{}{suffix}",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("")
-        )),
-        path.with_file_name(format!(
-            "{}-shm",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-        )),
-    ] {
-        if tokio::fs::try_exists(&candidate).await? {
-            secure_path(&candidate, 0o600, false).await?;
+        ));
+        tokio::task::spawn_blocking(move || secure_sqlite_sidecar(&candidate))
+            .await
+            .context("SQLite sidecar permission task failed")??;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_sqlite_sidecar(path: &Path) -> Result<()> {
+    // SQLite can unlink WAL/SHM while another connection closes. Keep the opened
+    // inode alive, and never follow a replacement symlink when setting its mode.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open SQLite sidecar {}", path.display()));
         }
+    };
+    secure_open_sqlite_sidecar(path, &file)
+}
+
+#[cfg(unix)]
+fn secure_open_sqlite_sidecar(path: &Path, file: &std::fs::File) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to read SQLite sidecar metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("SQLite sidecar {} must be a regular file", path.display());
+    }
+    validate_owned(path, &metadata)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "failed to set SQLite sidecar permissions {}",
+                path.display()
+            )
+        })?;
+    let secured = file.metadata().with_context(|| {
+        format!(
+            "failed to verify SQLite sidecar permissions {}",
+            path.display()
+        )
+    })?;
+    if secured.mode() & 0o777 != 0o600 {
+        bail!("SQLite sidecar {} permissions are not 600", path.display());
     }
     Ok(())
 }
@@ -3670,7 +3712,9 @@ async fn secure_sqlite_files(_path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 async fn secure_path(path: &Path, mode: u32, directory: bool) -> Result<()> {
-    let metadata = tokio::fs::symlink_metadata(path).await?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to read state path metadata {}", path.display()))?;
     let valid_type = if directory {
         metadata.file_type().is_dir()
     } else {
@@ -3683,8 +3727,12 @@ async fn secure_path(path: &Path, mode: u32, directory: bool) -> Result<()> {
         );
     }
     validate_owned(path, &metadata)?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
-    let secured = tokio::fs::symlink_metadata(path).await?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .with_context(|| format!("failed to set state path permissions {}", path.display()))?;
+    let secured = tokio::fs::symlink_metadata(path)
+        .await
+        .with_context(|| format!("failed to verify state path permissions {}", path.display()))?;
     if secured.mode() & 0o777 != mode {
         bail!(
             "state path {} permissions are {:o}, expected {:o}",
@@ -4798,6 +4846,73 @@ mod tests {
         }
         reopened.pool().close().await;
         std::fs::remove_dir_all(root).expect("remove mode fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_sidecar_unlink_keeps_permissions_on_the_opened_inode() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!("sumi-sidecar-unlink-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent.db-wal");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+
+        // Deterministically reproduce the old path-based failure after a
+        // successful existence check. FD-based securing survives the unlink.
+        let error = secure_path(&path, 0o600, false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("agent.db-wal"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        secure_open_sqlite_sidecar(&path, &file).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!path.exists());
+        secure_sqlite_sidecar(&path).unwrap();
+
+        let target = root.join("replacement-target");
+        std::fs::write(&target, []).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        secure_open_sqlite_sidecar(&path, &file).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+        assert!(secure_sqlite_sidecar(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_sidecars_reject_unsafe_paths_and_require_the_database() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("sumi-sidecar-types-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent.db");
+        assert!(secure_sqlite_files(&path).await.is_err());
+        std::fs::write(&path, []).unwrap();
+        secure_sqlite_files(&path).await.unwrap();
+
+        let wal = root.join("agent.db-wal");
+        symlink(&path, &wal).unwrap();
+        assert!(secure_sqlite_files(&path).await.is_err());
+        std::fs::remove_file(&wal).unwrap();
+        symlink(root.join("absent"), &wal).unwrap();
+        assert!(secure_sqlite_files(&path).await.is_err());
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::create_dir(&wal).unwrap();
+        assert!(secure_sqlite_files(&path).await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
