@@ -2202,12 +2202,6 @@ mod tests {
             memory_text,
             "<memory layer=\"l2\">ampersand &amp; opening &lt;memory&gt; closing &lt;/memory&gt; pseudo &lt;system&gt;attack&lt;/system&gt; greater &gt;</memory>"
         );
-        assert_eq!(memory_text.matches("<memory").count(), 1);
-        assert_eq!(memory_text.matches("</memory>").count(), 1);
-        assert!(!memory_text.contains("<system>"));
-        assert!(!memory_text.contains("</system>"));
-        assert!(!memory_text.contains("<memory>"));
-        assert!(!memory_text.contains("</memory>attack"));
     }
 
     #[test]
@@ -4375,68 +4369,46 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_stop_reason_remains_distinct_from_refusal() {
-        let mut state = AnthropicReceiveState::with_budget(
-            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
-            ResponseBudget::default(),
-            None,
-            "claude",
-        );
-        state
-            .push_named(
-                Some("message_start"),
-                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
-            )
-            .unwrap();
-        state
-            .push_named(
-                Some("message_delta"),
-                r#"{"type":"message_delta","delta":{"stop_reason":"sensitive"},"usage":{"output_tokens":0}}"#,
-            )
-            .unwrap();
-        let terminal = state
-            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
-            .unwrap()
-            .terminal
-            .unwrap();
-        assert_eq!(terminal.provider_code.as_deref(), Some("sensitive"));
-        assert_eq!(
-            terminal.error_message.as_deref(),
-            Some("Anthropic marked the response as sensitive")
-        );
-    }
-
-    #[test]
-    fn context_window_stop_reason_is_error_with_exact_provider_code() {
-        let mut state = AnthropicReceiveState::with_budget(
-            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
-            ResponseBudget::default(),
-            None,
-            "claude",
-        );
-        state
-            .push_named(
-                Some("message_start"),
-                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
-            )
-            .unwrap();
-        state
-            .push_named(
-                Some("message_delta"),
-                r#"{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":0}}"#,
-            )
-            .unwrap();
-        let terminal = state
-            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
-            .unwrap()
-            .terminal
-            .unwrap();
-        assert_eq!(terminal.reason, StopReason::Error);
-        assert_eq!(
-            terminal.provider_code.as_deref(),
-            Some("model_context_window_exceeded")
-        );
-        assert_eq!(terminal.error_message, None);
+    fn provider_specific_error_stops_preserve_exact_code_and_message() {
+        for (reason, message) in [
+            (
+                "sensitive",
+                Some("Anthropic marked the response as sensitive"),
+            ),
+            ("model_context_window_exceeded", None),
+        ] {
+            let mut state = AnthropicReceiveState::with_budget(
+                FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+                ResponseBudget::default(),
+                None,
+                "claude",
+            );
+            state
+                .push_named(
+                    Some("message_start"),
+                    r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+                )
+                .unwrap();
+            state
+                .push_named(
+                    Some("message_delta"),
+                    &json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":reason},
+                        "usage":{"output_tokens":0},
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            let terminal = state
+                .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
+                .unwrap()
+                .terminal
+                .unwrap();
+            assert_eq!(terminal.reason, StopReason::Error, "{reason}");
+            assert_eq!(terminal.provider_code.as_deref(), Some(reason), "{reason}");
+            assert_eq!(terminal.error_message.as_deref(), message, "{reason}");
+        }
     }
 
     #[test]

@@ -2607,6 +2607,21 @@ export const useMessaging = create<MessagingState>((set, get) => {
       });
   };
 
+  const patchDraftAttachment = (
+    key: PlaceKey,
+    clientNonce: string,
+    next: Partial<DraftAttachment>,
+  ) =>
+    set((current) =>
+      updateDraftAttachments(current, key, (attachments) =>
+        attachments.map((candidate) =>
+          candidate.clientNonce === clientNonce
+            ? { ...candidate, ...next }
+            : candidate,
+        ),
+      ),
+    );
+
   /**
    * 送信前の宣言（名前・説明・ネタバレ）の反映。uploadと同じ関門を通す:
    * backend世代・session世代・そのdraftがまだ積まれていることを確かめてから
@@ -2627,21 +2642,12 @@ export const useMessaging = create<MessagingState>((set, get) => {
       (get().draftByPlace[key]?.attachments ?? []).some(
         (candidate) => candidate.clientNonce === draft.clientNonce,
       );
-    const apply = (next: Partial<DraftAttachment>) =>
-      set((current) =>
-        updateDraftAttachments(current, key, (attachments) =>
-          attachments.map((candidate) =>
-            candidate.clientNonce === draft.clientNonce
-              ? { ...candidate, ...next }
-              : candidate,
-          ),
-        ),
-      );
+
     currentBackend
       .updateDraftAttachment(attachment.attachmentId, patch)
       .then((updated) => {
         if (!stillLive()) return;
-        apply({
+        patchDraftAttachment(key, draft.clientNonce, {
           status: "ready",
           attachment: updated,
           filename: updated.filename,
@@ -2653,7 +2659,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         if (!stillLive()) return;
         // bytesは預けたままだが、古い宣言で送れてしまうと保存済みと誤認する。
         // 直前のPATCHと理由を残し、再試行か破棄が済むまで送信を閉じる。
-        apply({
+        patchDraftAttachment(key, draft.clientNonce, {
           status: "edit_failed",
           errorCode: attachmentUploadFailureCode(error),
         });
@@ -2678,16 +2684,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       (get().draftByPlace[key]?.attachments ?? []).some(
         (candidate) => candidate.clientNonce === draft.clientNonce,
       );
-    const patch = (next: Partial<DraftAttachment>) =>
-      set((current) =>
-        updateDraftAttachments(current, key, (attachments) =>
-          attachments.map((candidate) =>
-            candidate.clientNonce === draft.clientNonce
-              ? { ...candidate, ...next }
-              : candidate,
-          ),
-        ),
-      );
+
     request
       .wait((backend) =>
         backend.uploadAttachment({
@@ -2701,7 +2698,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       )
       .then((receipt) => {
         if (!receipt || !stillLive()) return;
-        patch({
+        patchDraftAttachment(key, draft.clientNonce, {
           status: "ready",
           attachment: receipt.attachment,
           filename: receipt.attachment.filename,
@@ -2710,7 +2707,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted || !stillLive()) return;
-        patch({
+        patchDraftAttachment(key, draft.clientNonce, {
           status: "failed",
           errorCode: attachmentUploadFailureCode(error),
         });
@@ -3613,13 +3610,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           status: "editing",
           errorCode: undefined,
         };
-        set((current) =>
-          updateDraftAttachments(current, key, (attachments) =>
-            attachments.map((entry) =>
-              entry.clientNonce === clientNonce ? retried : entry,
-            ),
-          ),
-        );
+        patchDraftAttachment(key, clientNonce, retried);
         dispatchDraftEdit(key, retried, draft.attachment, draft.editPatch);
         return;
       }
@@ -3629,13 +3620,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         status: "uploading",
         errorCode: undefined,
       };
-      set((current) =>
-        updateDraftAttachments(current, key, (attachments) =>
-          attachments.map((entry) =>
-            entry.clientNonce === clientNonce ? retried : entry,
-          ),
-        ),
-      );
+      patchDraftAttachment(key, clientNonce, retried);
       dispatchUpload(key, place, retried);
     },
 
@@ -3652,20 +3637,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
         (draft.status !== "ready" && draft.status !== "edit_failed")
       )
         return;
-      set((current) =>
-        updateDraftAttachments(current, key, (attachments) =>
-          attachments.map((entry) =>
-            entry.clientNonce === clientNonce
-              ? {
-                  ...entry,
-                  status: "editing",
-                  errorCode: undefined,
-                  editPatch: patch,
-                }
-              : entry,
-          ),
-        ),
-      );
+      patchDraftAttachment(key, clientNonce, {
+        status: "editing",
+        errorCode: undefined,
+        editPatch: patch,
+      });
       dispatchDraftEdit(key, draft, attachment, patch);
     },
 
