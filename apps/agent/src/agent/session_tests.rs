@@ -545,6 +545,7 @@ async fn emit_idle_injection(events: &mpsc::Sender<AgentEvent>, initial: &Admitt
         panic!("idle fixture requires user command")
     };
     let message = PublicMessage::User(UserMessage {
+        incoming_timing: initial.incoming_timing(),
         content: vec![UserContent::Text { text: text.clone() }],
         timestamp: initial.received_at(),
     });
@@ -895,6 +896,7 @@ impl RunWorker for StaleBindingWorker {
                 }
                 StaleBinding::PriorTurn => {
                     let user = PublicMessage::User(UserMessage {
+                        incoming_timing: initial.incoming_timing(),
                         content: vec![UserContent::Text {
                             text: "message 1".to_owned(),
                         }],
@@ -1715,6 +1717,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
                     panic!("idle fixture requires user command")
                 };
                 let user_context = PublicMessage::User(UserMessage {
+                    incoming_timing: initial.incoming_timing(),
                     content: vec![UserContent::Text { text: text.clone() }],
                     timestamp: initial.received_at(),
                 });
@@ -1862,6 +1865,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
                 panic!("idle fixture requires user command")
             };
             let user_context = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text { text: text.clone() }],
                 timestamp: initial.received_at(),
             });
@@ -2226,7 +2230,11 @@ async fn fixture_bridge_after_assistant_in_store(
     let received_at = chrono::DateTime::parse_from_rfc3339(&received_at)
         .expect("valid durable received_at")
         .with_timezone(&Utc);
-    let initial = AdmittedCommand::new(envelope.clone(), received_at);
+    let initial = AdmittedCommand::new(envelope.clone(), received_at).with_incoming_timing(Some(
+        crate::provider::types::IncomingEventTiming {
+            previous_receipt: None,
+        },
+    ));
     let binding = DurableRunBinding::idle(&initial, test_executor_generation());
     writer
         .apply(crate::store::EventBatch {
@@ -2245,6 +2253,7 @@ async fn fixture_bridge_after_assistant_in_store(
         .expect("classify approval fixture owner");
     let mut bridge = DurableBridge::new(binding.clone());
     let user_message = PublicMessage::User(UserMessage {
+        incoming_timing: initial.incoming_timing(),
         content: vec![UserContent::Text {
             text: "message 1".to_owned(),
         }],
@@ -5088,6 +5097,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
                 }],
@@ -5199,6 +5209,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
                 }],
@@ -5717,6 +5728,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let invalid = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
                 }],
@@ -5785,6 +5797,7 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let user = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text {
                     text: "message 1".to_owned(),
                 }],
@@ -6108,6 +6121,7 @@ impl RunDriver for SessionImmediateOverflowDriver {
         let mut replacement = active_context.to_vec();
         replacement.push(ContextMessage::Synthetic {
             message: super::run::public_to_message(PublicMessage::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "recovered context".to_owned(),
                 }],
@@ -10092,6 +10106,7 @@ impl RunWorker for SaturatedActiveControlWorker {
                 panic!("saturation fixture requires an initial user command")
             };
             let user_message = PublicMessage::User(UserMessage {
+                incoming_timing: initial.incoming_timing(),
                 content: vec![UserContent::Text { text: text.clone() }],
                 timestamp: initial.received_at(),
             });
@@ -12125,6 +12140,12 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
         .fetch_all(store.pool())
         .await
         .expect("original receipt times");
+        let received_timing: Vec<String> = sqlx::query_scalar(
+            "SELECT incoming_timing_json FROM inbound_commands WHERE seq IN (2,3) ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("frozen incoming timing");
         let original_run_id: String =
             sqlx::query_scalar("SELECT run_id FROM inbound_commands WHERE seq=1")
                 .fetch_one(store.pool())
@@ -12292,6 +12313,11 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
                 chrono::DateTime::parse_from_rfc3339(&received_times[0])
                     .expect("receipt timestamp")
                     .with_timezone(&Utc)
+            );
+            assert_eq!(
+                users[0].incoming_timing,
+                Some(serde_json::from_str(&received_timing[0]).expect("original timing")),
+                "recovered provider input retains its original receipt predecessor"
             );
         }
         // The second recovered input and a fresh input arrive while the

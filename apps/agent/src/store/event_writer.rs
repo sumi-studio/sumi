@@ -51,9 +51,10 @@ use crate::{
     provider::{
         model::ModelSpec,
         types::{
-            ApiProtocol, ContextMessage, Message, ProviderContextAnchor, ProviderContextFragment,
-            ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-            StopReason, ToolInvocationRoute, ToolResultMessage,
+            ApiProtocol, ContextMessage, IncomingEventReceipt, IncomingEventTiming, Message,
+            ProviderContextAnchor, ProviderContextFragment, ProviderContextPayload,
+            PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason,
+            ToolInvocationRoute, ToolResultMessage,
         },
     },
     runtime::contracts::{
@@ -93,11 +94,11 @@ use super::{
 
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
-const INBOUND_ADMISSION_RECORD_VERSION: u8 = 2;
-const INBOUND_ADMISSION_RECORD_HMAC_DOMAIN: &[u8] = b"sumi-inbound-admission-record/v2";
+const INBOUND_ADMISSION_RECORD_VERSION: u8 = 3;
+const INBOUND_ADMISSION_RECORD_HMAC_DOMAIN: &[u8] = b"sumi-inbound-admission-record/v3";
 
 #[derive(Serialize)]
-struct InboundAdmissionRecordV2<'a> {
+struct InboundAdmissionRecordV3<'a> {
     version: u8,
     seq: u64,
     command_id: &'a str,
@@ -108,11 +109,13 @@ struct InboundAdmissionRecordV2<'a> {
     payload_hmac: &'a [u8],
     reject_reason: Option<&'a str>,
     reject_actual_bytes: Option<u64>,
+    received_at: &'a str,
+    incoming_timing_json: Option<&'a str>,
 }
 
 fn admission_record_hmac(
     key: &super::crypto::DataKeyMaterial,
-    record: &InboundAdmissionRecordV2<'_>,
+    record: &InboundAdmissionRecordV3<'_>,
 ) -> Result<Vec<u8>> {
     let canonical = serde_json::to_vec(record)
         .context("failed to serialize canonical inbound admission record")?;
@@ -1532,6 +1535,8 @@ enum PreparedProjection {
         reject_reason: Option<&'static str>,
         reject_actual_bytes: Option<u64>,
         admission_record_hmac: Vec<u8>,
+        received_at: String,
+        incoming_timing_json: Option<String>,
     },
     ProviderContextMutation {
         mutation_id: String,
@@ -1768,6 +1773,7 @@ fn prepared_write_has_physical_recovery(write: &PreparedWrite) -> bool {
 struct ExpectedInjection {
     text: Zeroizing<String>,
     timestamp: DateTime<Utc>,
+    incoming_timing: Option<IncomingEventTiming>,
 }
 
 struct InjectionSizing {
@@ -2073,6 +2079,7 @@ pub(crate) struct InboundReceipt {
     pub(crate) ack: CommandAck,
     pub(crate) origin: InboundReceiptOrigin,
     pub(crate) received_at: DateTime<Utc>,
+    pub(crate) incoming_timing: Option<IncomingEventTiming>,
     /// Exact writer-owned public events produced by a newly persisted
     /// admission. Received commands have none; terminal rejection carries its
     /// durable disposition. Replays rely on gateway catch-up and leave this
@@ -2569,11 +2576,12 @@ impl EventWriter {
             )
             .await?
         {
-            let received_at = self.received_at_for_command(command_id).await?;
+            let (received_at, incoming_timing) = self.timing_for_command(command_id).await?;
             return Ok(InboundReceipt {
                 ack,
                 origin: InboundReceiptOrigin::Replay,
                 received_at,
+                incoming_timing,
                 events: Vec::new(),
             });
         }
@@ -2628,11 +2636,12 @@ impl EventWriter {
             .ack_for_command(command_id)
             .await?
             .ok_or_else(|| anyhow!("committed command row is missing"))?;
-        let received_at = self.received_at_for_command(command_id).await?;
+        let (received_at, incoming_timing) = self.timing_for_command(command_id).await?;
         Ok(InboundReceipt {
             ack,
             origin: InboundReceiptOrigin::NewlyPersisted,
             received_at,
+            incoming_timing,
             events,
         })
     }
@@ -3993,17 +4002,19 @@ impl EventWriter {
                     }
                     Projection::CommandReceived { envelope } => {
                         let payload = Zeroizing::new(serde_json::to_vec(&envelope.command)?);
-                        let prepared = self.prepare_command_insert(CommandInsertInput {
-                            key: command_key.as_ref().expect("command key was loaded"),
-                            seq: envelope.seq,
-                            command_id: envelope.command_id.to_string(),
-                            personality_agent_id: &envelope.personality_agent_id,
-                            provenance: &envelope.provenance,
-                            command_kind: command_kind(&envelope.command),
-                            canonical_payload: &payload,
-                            rejection: None,
-                            provided_digest: None,
-                        })?;
+                        let prepared = self
+                            .prepare_command_insert(CommandInsertInput {
+                                key: command_key.as_ref().expect("command key was loaded"),
+                                seq: envelope.seq,
+                                command_id: envelope.command_id.to_string(),
+                                personality_agent_id: &envelope.personality_agent_id,
+                                provenance: &envelope.provenance,
+                                command_kind: command_kind(&envelope.command),
+                                canonical_payload: &payload,
+                                rejection: None,
+                                provided_digest: None,
+                            })
+                            .await?;
                         charge_transaction_bytes(
                             &mut transaction_bytes,
                             prepared_projection_size(&prepared),
@@ -4019,17 +4030,19 @@ impl EventWriter {
                         raw_command,
                         payload_digest,
                     } => {
-                        let prepared = self.prepare_command_insert(CommandInsertInput {
-                            key: command_key.as_ref().expect("command key was loaded"),
-                            seq,
-                            command_id,
-                            personality_agent_id: &personality_agent_id,
-                            provenance: &provenance,
-                            command_kind: "invalid",
-                            canonical_payload: raw_command.authenticated_bytes().unwrap_or(&[]),
-                            rejection: Some(reason),
-                            provided_digest: payload_digest.as_ref(),
-                        })?;
+                        let prepared = self
+                            .prepare_command_insert(CommandInsertInput {
+                                key: command_key.as_ref().expect("command key was loaded"),
+                                seq,
+                                command_id,
+                                personality_agent_id: &personality_agent_id,
+                                provenance: &provenance,
+                                command_kind: "invalid",
+                                canonical_payload: raw_command.authenticated_bytes().unwrap_or(&[]),
+                                rejection: Some(reason),
+                                provided_digest: payload_digest.as_ref(),
+                            })
+                            .await?;
                         charge_transaction_bytes(
                             &mut transaction_bytes,
                             prepared_projection_size(&prepared),
@@ -4395,7 +4408,10 @@ impl EventWriter {
         ))
     }
 
-    fn prepare_command_insert(&self, input: CommandInsertInput<'_>) -> Result<PreparedProjection> {
+    async fn prepare_command_insert(
+        &self,
+        input: CommandInsertInput<'_>,
+    ) -> Result<PreparedProjection> {
         let CommandInsertInput {
             key,
             seq,
@@ -4452,9 +4468,39 @@ impl EventWriter {
             ),
             None => ("received", None, None),
         };
+        let received_at = Utc::now();
+        let incoming_timing = if command_kind == "user_message" && status == "received" {
+            let previous_id: Option<String> = sqlx::query_scalar(
+                "SELECT command_id FROM inbound_commands WHERE command_kind='user_message'
+                 AND reject_reason IS NULL AND seq < ? ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(sqlite_i64(seq, "command sequence")?)
+            .fetch_optional(self.store.pool())
+            .await?;
+            let previous = match previous_id {
+                Some(id) => {
+                    let (previous_seq, time, _) = self.authenticated_command_timing(&id).await?;
+                    Some((previous_seq, time))
+                }
+                None => None,
+            };
+            Some(IncomingEventTiming {
+                previous_receipt: previous.map(|(seq, time)| IncomingEventReceipt {
+                    command_seq: seq,
+                    received_at: time,
+                }),
+            })
+        } else {
+            None
+        };
+        let received_at = received_at.to_rfc3339();
+        let incoming_timing_json = incoming_timing
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let admission_record_hmac = admission_record_hmac(
             key,
-            &InboundAdmissionRecordV2 {
+            &InboundAdmissionRecordV3 {
                 version: INBOUND_ADMISSION_RECORD_VERSION,
                 seq,
                 command_id: &command_id,
@@ -4465,6 +4511,8 @@ impl EventWriter {
                 payload_hmac: &payload_hmac,
                 reject_reason,
                 reject_actual_bytes,
+                received_at: &received_at,
+                incoming_timing_json: incoming_timing_json.as_deref(),
             },
         )?;
         Ok(PreparedProjection::CommandInsert {
@@ -4485,6 +4533,8 @@ impl EventWriter {
             reject_reason,
             reject_actual_bytes,
             admission_record_hmac,
+            received_at,
+            incoming_timing_json,
         })
     }
 
@@ -5475,7 +5525,7 @@ impl EventWriter {
             let row = sqlx::query(
                 "SELECT personality_agent_id, provenance_json, command_kind, payload_key_ref,
                         payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
-                        admission_record_version, admission_record_hmac,
+                        admission_record_version, admission_record_hmac, incoming_timing_json,
                         status, run_phase, application_kind, run_id, turn_id, received_at
                  FROM inbound_commands
                  WHERE seq = ? AND command_id = ?",
@@ -5566,7 +5616,7 @@ impl EventWriter {
                 .transpose()?;
             let expected_admission_hmac = admission_record_hmac(
                 &key,
-                &InboundAdmissionRecordV2 {
+                &InboundAdmissionRecordV3 {
                     version: INBOUND_ADMISSION_RECORD_VERSION,
                     seq: command.seq,
                     command_id: command.command_id.as_str(),
@@ -5577,6 +5627,10 @@ impl EventWriter {
                     payload_hmac: &digest,
                     reject_reason: reject_reason.as_deref(),
                     reject_actual_bytes,
+                    received_at: &row.try_get::<String, _>("received_at")?,
+                    incoming_timing_json: row
+                        .try_get::<Option<String>, _>("incoming_timing_json")?
+                        .as_deref(),
                 },
             )?;
             let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
@@ -5614,6 +5668,13 @@ impl EventWriter {
                     )
                 })?
                 .with_timezone(&Utc);
+            let durable_timing: Option<IncomingEventTiming> = row
+                .try_get::<Option<String>, _>("incoming_timing_json")?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?;
+            if expected.incoming_timing != durable_timing {
+                bail!("injected command timing does not match durable admission");
+            }
             if expected.timestamp != durable_timestamp {
                 bail!(
                     "injected command {} timestamp does not match durable received_at",
@@ -5670,6 +5731,7 @@ impl EventWriter {
                 message_id: &command.message_id,
                 text: &expected.text,
                 timestamp: &expected.timestamp,
+                incoming_timing: expected.incoming_timing.as_ref(),
                 provenance: &command.provenance,
             })
             .collect();
@@ -5725,7 +5787,7 @@ impl EventWriter {
         let by_id = sqlx::query(
             "SELECT seq, personality_agent_id, provenance_json, command_kind, payload_key_ref,
                     payload_ciphertext, payload_hmac, reject_reason, reject_actual_bytes,
-                    admission_record_version, admission_record_hmac
+                    admission_record_version, admission_record_hmac, received_at, incoming_timing_json
              FROM inbound_commands WHERE command_id = ?",
         )
         .bind(command_id)
@@ -5802,7 +5864,7 @@ impl EventWriter {
             .transpose()?;
         let expected_admission_hmac = admission_record_hmac(
             &key,
-            &InboundAdmissionRecordV2 {
+            &InboundAdmissionRecordV3 {
                 version: INBOUND_ADMISSION_RECORD_VERSION,
                 seq: stored_seq,
                 command_id,
@@ -5813,6 +5875,10 @@ impl EventWriter {
                 payload_hmac: &digest,
                 reject_reason: stored_reason.as_deref(),
                 reject_actual_bytes,
+                received_at: &row.try_get::<String, _>("received_at")?,
+                incoming_timing_json: row
+                    .try_get::<Option<String>, _>("incoming_timing_json")?
+                    .as_deref(),
             },
         )?;
         let stored_admission_hmac: Vec<u8> = row.try_get("admission_record_hmac")?;
@@ -5877,16 +5943,111 @@ impl EventWriter {
         }))
     }
 
-    async fn received_at_for_command(&self, command_id: &str) -> Result<DateTime<Utc>> {
-        let value: String =
-            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
-                .bind(command_id)
-                .fetch_optional(self.store.pool())
-                .await?
-                .ok_or_else(|| anyhow!("committed command row is missing"))?;
-        DateTime::parse_from_rfc3339(&value)
-            .map(|timestamp| timestamp.with_timezone(&Utc))
-            .map_err(|error| anyhow!("persisted command received_at is invalid: {error}"))
+    async fn authenticated_command_timing(
+        &self,
+        command_id: &str,
+    ) -> Result<(u64, DateTime<Utc>, Option<IncomingEventTiming>)> {
+        let row = sqlx::query("SELECT * FROM inbound_commands WHERE command_id=?")
+            .bind(command_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        let seq = sqlite_u64(row.try_get("seq")?, "command sequence")?;
+        let key_ref: String = row.try_get("payload_key_ref")?;
+        let key = self.store.data_key_by_ref(&key_ref).await?;
+        if key.purpose != DataKeyPurpose::Command {
+            bail!("inbound receipt references a non-command key");
+        }
+        let received_at: String = row.try_get("received_at")?;
+        let incoming_timing_json: Option<String> = row.try_get("incoming_timing_json")?;
+        let expected = self.command_row_admission_hmac(
+            &row,
+            &key,
+            &received_at,
+            incoming_timing_json.as_deref(),
+        )?;
+        let stored: Vec<u8> = row.try_get("admission_record_hmac")?;
+        if expected.as_slice().ct_eq(&stored).unwrap_u8() != 1 {
+            bail!("inbound admission record HMAC mismatch");
+        }
+        let received_at = DateTime::parse_from_rfc3339(&received_at)?.with_timezone(&Utc);
+        let timing: Option<IncomingEventTiming> = incoming_timing_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        Ok((seq, received_at, timing))
+    }
+
+    fn command_row_admission_hmac(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+        key: &super::crypto::DataKeyMaterial,
+        received_at: &str,
+        incoming_timing_json: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let version: i64 = row.try_get("admission_record_version")?;
+        let personality_agent_id: String = row.try_get("personality_agent_id")?;
+        if version != i64::from(INBOUND_ADMISSION_RECORD_VERSION)
+            || personality_agent_id != self.store.scope().personality_agent_id().as_str()
+        {
+            bail!("invalid inbound admission record identity or version");
+        }
+        admission_record_hmac(
+            key,
+            &InboundAdmissionRecordV3 {
+                version: INBOUND_ADMISSION_RECORD_VERSION,
+                seq: sqlite_u64(row.try_get("seq")?, "command sequence")?,
+                command_id: &row.try_get::<String, _>("command_id")?,
+                personality_agent_id: &personality_agent_id,
+                provenance_json: &row.try_get::<String, _>("provenance_json")?,
+                command_kind: &row.try_get::<String, _>("command_kind")?,
+                payload_key_ref: &row.try_get::<String, _>("payload_key_ref")?,
+                payload_hmac: &row.try_get::<Vec<u8>, _>("payload_hmac")?,
+                reject_reason: row
+                    .try_get::<Option<String>, _>("reject_reason")?
+                    .as_deref(),
+                reject_actual_bytes: row
+                    .try_get::<Option<i64>, _>("reject_actual_bytes")?
+                    .map(|value| sqlite_u64(value, "rejected command byte count"))
+                    .transpose()?,
+                received_at,
+                incoming_timing_json,
+            },
+        )
+    }
+
+    pub(in crate::store) async fn timing_for_command(
+        &self,
+        command_id: &str,
+    ) -> Result<(DateTime<Utc>, Option<IncomingEventTiming>)> {
+        let (_, time, timing) = self.authenticated_command_timing(command_id).await?;
+        Ok((time, timing))
+    }
+
+    /// Legacy deterministic fixtures use a fixed first-receipt time. Production
+    /// admission always derives its predecessor under the writer gate.
+    #[cfg(test)]
+    pub(crate) async fn pin_incoming_timing_for_test(
+        &self,
+        command_id: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<IncomingEventTiming>> {
+        let _guard = self.gate.lock().await;
+        self.authenticated_command_timing(command_id).await?;
+        let row = sqlx::query("SELECT * FROM inbound_commands WHERE command_id=?")
+            .bind(command_id)
+            .fetch_one(self.store.pool())
+            .await?;
+        let kind: String = row.try_get("command_kind")?;
+        let timing = (kind == "user_message").then_some(IncomingEventTiming {
+            previous_receipt: None,
+        });
+        let json = timing.as_ref().map(serde_json::to_string).transpose()?;
+        let time = timestamp.to_rfc3339();
+        let key_ref: String = row.try_get("payload_key_ref")?;
+        let key = self.store.data_key_by_ref(&key_ref).await?;
+        let hmac = self.command_row_admission_hmac(&row, &key, &time, json.as_deref())?;
+        sqlx::query("UPDATE inbound_commands SET received_at=?, incoming_timing_json=?, admission_record_hmac=? WHERE command_id=?")
+            .bind(time).bind(json).bind(hmac).bind(command_id).execute(self.store.pool()).await?;
+        Ok(timing)
     }
 }
 
@@ -7455,6 +7616,7 @@ fn validate_batch_shape_with_recovery(
                     expected_injections.push(ExpectedInjection {
                         text: Zeroizing::new(text.clone()),
                         timestamp: message.timestamp,
+                        incoming_timing: message.incoming_timing.clone(),
                     });
                     injected_user_end_positions.push(write_position);
                 }
@@ -9366,12 +9528,16 @@ fn prepared_projection_size(projection: &PreparedProjection) -> usize {
             payload_key_ref,
             payload_ciphertext,
             payload_hmac,
+            received_at,
+            incoming_timing_json,
             ..
         } => command_id
             .len()
             .saturating_add(payload_key_ref.len())
             .saturating_add(payload_ciphertext.as_ref().map_or(0, Vec::len))
             .saturating_add(payload_hmac.len())
+            .saturating_add(received_at.len())
+            .saturating_add(incoming_timing_json.as_ref().map_or(0, String::len))
             .saturating_add(512),
         _ => 0,
     }
@@ -12022,7 +12188,7 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
             .fetch_one(store.pool())
             .await?;
     let event_key = store.private_key(DataKeyPurpose::Event).await?;
-    let mut transaction = store.pool().begin().await?;
+    let mut prepared_commands = Vec::new();
     for (index, owner) in by_end_seq.values().enumerate() {
         let command_seq = command_seq_base
             .checked_add(i64::try_from(index + 1).context("fixture command sequence overflow")?)
@@ -12047,33 +12213,68 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
             reject_reason,
             reject_actual_bytes,
             admission_record_hmac,
-        } = writer.prepare_command_insert(CommandInsertInput {
-            key: &command_key,
-            seq: command_seq,
-            command_id,
-            personality_agent_id: store.scope().personality_agent_id(),
-            provenance: &provenance,
-            command_kind: "user_message",
-            canonical_payload: &payload,
-            rejection: None,
-            provided_digest: None,
-        })?
+            received_at,
+            incoming_timing_json,
+        } = writer
+            .prepare_command_insert(CommandInsertInput {
+                key: &command_key,
+                seq: command_seq,
+                command_id,
+                personality_agent_id: store.scope().personality_agent_id(),
+                provenance: &provenance,
+                command_kind: "user_message",
+                canonical_payload: &payload,
+                rejection: None,
+                provided_digest: None,
+            })
+            .await?
         else {
             unreachable!("command preparation returns a command insert");
         };
         if status != "received" || reject_reason.is_some() || reject_actual_bytes.is_some() {
             bail!("provider-context fixture command unexpectedly prepared as rejected");
         }
+        prepared_commands.push((
+            owner,
+            seq,
+            command_id,
+            personality_agent_id,
+            provenance_json,
+            command_kind,
+            payload_ciphertext,
+            payload_key_ref,
+            payload_hmac,
+            admission_record_hmac,
+            received_at,
+            incoming_timing_json,
+        ));
+    }
+    let mut transaction = store.pool().begin().await?;
+    for (
+        owner,
+        seq,
+        command_id,
+        personality_agent_id,
+        provenance_json,
+        command_kind,
+        payload_ciphertext,
+        payload_key_ref,
+        payload_hmac,
+        admission_record_hmac,
+        received_at,
+        incoming_timing_json,
+    ) in prepared_commands
+    {
         sqlx::query(
             "INSERT INTO inbound_commands(
                 seq, command_id, personality_agent_id, provenance_json,
                 command_kind, payload_ciphertext, payload_key_ref,
                 payload_hmac, status, reject_reason, reject_actual_bytes,
                 admission_record_version, admission_record_hmac,
-                application_kind, run_id, turn_id, run_phase, received_at, applied_at
+                application_kind, run_id, turn_id, run_phase, received_at, incoming_timing_json, applied_at
              ) VALUES(
                 ?, ?, ?, ?, ?, ?, ?, ?, 'applying', NULL, NULL, ?, ?,
-                'idle_run', ?, ?, 'assistant_started', ?, NULL
+                'idle_run', ?, ?, 'assistant_started', ?, ?, NULL
              )",
         )
         .bind(sqlite_i64(
@@ -12091,7 +12292,8 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
         .bind(admission_record_hmac)
         .bind(&owner.run_id)
         .bind(&owner.turn_id)
-        .bind(Utc::now().to_rfc3339())
+        .bind(received_at)
+        .bind(incoming_timing_json)
         .execute(&mut *transaction)
         .await?;
     }
@@ -13744,6 +13946,8 @@ async fn apply_projection(
             reject_reason,
             reject_actual_bytes,
             admission_record_hmac,
+            received_at,
+            incoming_timing_json,
         } => {
             sqlx::query(
                 "INSERT INTO inbound_commands(
@@ -13751,8 +13955,8 @@ async fn apply_projection(
                     command_kind, payload_ciphertext, payload_key_ref,
                     payload_hmac, status, reject_reason, reject_actual_bytes,
                     admission_record_version, admission_record_hmac,
-                    application_kind, run_id, turn_id, run_phase, received_at, applied_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?)",
+                    application_kind, run_id, turn_id, run_phase, received_at, incoming_timing_json, applied_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'received', ?, ?, ?)",
             )
             .bind(sqlite_i64(seq, "command sequence")?)
             .bind(command_id)
@@ -13771,7 +13975,8 @@ async fn apply_projection(
             )
             .bind(i64::from(INBOUND_ADMISSION_RECORD_VERSION))
             .bind(admission_record_hmac)
-            .bind(Utc::now().to_rfc3339())
+            .bind(received_at)
+            .bind(incoming_timing_json)
             .bind(if status == "rejected" {
                 Some(Utc::now().to_rfc3339())
             } else {
@@ -16918,6 +17123,9 @@ mod tests {
 
     fn user_message(text: &str) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_timing: Some(IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -16937,6 +17145,9 @@ mod tests {
     ) -> Vec<EventWrite> {
         let message_id = test_user_message_id(command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: Some(IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -17021,10 +17232,8 @@ mod tests {
             .persist_inbound(&user_command(seq, command_id, text))
             .await
             .expect("persist injected command");
-        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
-            .bind(durable_test_timestamp().to_rfc3339())
-            .bind(command_id)
-            .execute(writer.store.pool())
+        writer
+            .pin_incoming_timing_for_test(command_id, durable_test_timestamp())
             .await
             .expect("pin durable receipt timestamp");
         writer
@@ -17376,6 +17585,9 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            incoming_timing: Some(&IncomingEventTiming {
+                previous_receipt: None,
+            }),
             provenance: injected.provenance(),
         }];
         let predicted = EventBatchSizer::injection_batch(
@@ -17418,7 +17630,13 @@ mod tests {
         let text = "application-specific write-set";
         let timestamp = durable_test_timestamp();
         let provenance = test_provenance();
-        let message = canonical_user_message(text, timestamp);
+        let message = canonical_user_message(
+            text,
+            timestamp,
+            Some(IncomingEventTiming {
+                previous_receipt: None,
+            }),
+        );
         let payload = serde_json::to_vec(&Command::UserMessage {
             text: text.to_owned(),
             attachments: Vec::new(),
@@ -17430,6 +17648,9 @@ mod tests {
             message_id: &message_id,
             text,
             timestamp: &timestamp,
+            incoming_timing: Some(&IncomingEventTiming {
+                previous_receipt: None,
+            }),
             provenance: &provenance,
         }];
 
@@ -17913,7 +18134,7 @@ mod tests {
             })
             .await
             .expect_err("invalid received_at must fail closed");
-        assert!(error.to_string().contains("invalid durable received_at"));
+        assert!(error.to_string().contains("admission record HMAC mismatch"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
                 .fetch_one(store.pool())
@@ -18171,10 +18392,8 @@ mod tests {
                 .persist_inbound(&user_command(2, steer_id, "steer now"))
                 .await
                 .expect("persist steer command");
-            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
-                .bind(durable_test_timestamp().to_rfc3339())
-                .bind(steer_id)
-                .execute(store.pool())
+            writer
+                .pin_incoming_timing_for_test(steer_id, durable_test_timestamp())
                 .await
                 .expect("pin steer receipt timestamp");
             writer
@@ -18205,7 +18424,10 @@ mod tests {
                     },
                 },
                 durable_test_timestamp(),
-            );
+            )
+            .with_incoming_timing(Some(IncomingEventTiming {
+                previous_receipt: None,
+            }));
 
             let previous_owner = DurableRunBinding {
                 command_id: owner_id.to_owned(),
@@ -21122,6 +21344,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_timing_skips_controls_and_rejections_and_replays_after_restart() {
+        let root = std::env::temp_dir().join(format!("sumi-incoming-timing-{}", Uuid::now_v7()));
+        let path = root.join("agent.db");
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let first_command = user_command(1, "00000000-0000-4000-8000-000000000101", "first");
+        let first = admission
+            .receive_with_origin(&writer, &first_command)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.incoming_timing,
+            Some(IncomingEventTiming {
+                previous_receipt: None
+            })
+        );
+        for control in [
+            abort_command(2, "00000000-0000-4000-8000-000000000102"),
+            approval_command(3, "00000000-0000-4000-8000-000000000103", "unknown-request"),
+        ] {
+            assert!(
+                admission
+                    .receive_with_origin(&writer, &control)
+                    .await
+                    .unwrap()
+                    .incoming_timing
+                    .is_none()
+            );
+        }
+        let rejected = InboundCommand::Invalid {
+            seq: 4,
+            command_id: CommandId::parse("00000000-0000-4000-8000-000000000104").unwrap(),
+            personality_agent_id: scope().personality_agent_id,
+            provenance: test_provenance(),
+            reason: CommandRejectReason::SchemaViolation,
+            raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                b"{}".to_vec(),
+            )),
+            payload_digest: None,
+        };
+        assert!(
+            admission
+                .receive_with_origin(&writer, &rejected)
+                .await
+                .unwrap()
+                .incoming_timing
+                .is_none()
+        );
+        let second_command = user_command(5, "00000000-0000-4000-8000-000000000105", "second");
+        let second = admission
+            .receive_with_origin(&writer, &second_command)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.incoming_timing,
+            Some(IncomingEventTiming {
+                previous_receipt: Some(IncomingEventReceipt {
+                    command_seq: 1,
+                    received_at: first.received_at
+                }),
+            })
+        );
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let writer = EventWriter::new(reopened.clone());
+        let replay = admission
+            .receive_with_origin(&writer, &second_command)
+            .await
+            .unwrap();
+        assert_eq!(replay.origin, InboundReceiptOrigin::Replay);
+        assert_eq!(replay.received_at, second.received_at);
+        assert_eq!(replay.incoming_timing, second.incoming_timing);
+        // An old receipt replay does not become the next receipt's predecessor.
+        admission
+            .receive_with_origin(&writer, &first_command)
+            .await
+            .unwrap();
+        let third = admission
+            .receive_with_origin(
+                &writer,
+                &user_command(6, "00000000-0000-4000-8000-000000000106", "third"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            third.incoming_timing.unwrap().previous_receipt,
+            Some(IncomingEventReceipt {
+                command_seq: 5,
+                received_at: second.received_at,
+            })
+        );
+        reopened.pool().close().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_message_cannot_replace_its_authenticated_incoming_timing() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000101";
+        let injection = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        let mut writes = injection_writes(command_id, "ignored", "hello");
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "hello".to_owned(),
+            }],
+            timestamp: durable_test_timestamp(),
+            incoming_timing: Some(IncomingEventTiming {
+                previous_receipt: Some(IncomingEventReceipt {
+                    command_seq: 0,
+                    received_at: durable_test_timestamp() - chrono::Duration::hours(9),
+                }),
+            }),
+        });
+        let message_id = test_user_message_id(command_id);
+        writes[2].event =
+            Some(DurableEvent::message("message_start", &message_id, &message).unwrap());
+        writes[3].event =
+            Some(DurableEvent::message("message_end", &message_id, &message).unwrap());
+        for projection in &mut writes[3].projections {
+            if let Projection::MessageEnd {
+                message: projected, ..
+            } = projection
+            {
+                *projected = message.clone();
+            }
+        }
+        let error = writer
+            .apply(EventBatch {
+                writes,
+                injected_commands: vec![injection],
+            })
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timing does not match durable admission"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_timing_tampering_rejects_replay_and_next_admission() {
+        for change in [
+            "received_at='2020-01-01T00:00:00Z'",
+            "incoming_timing_json='{\"previous_receipt\":{\"command_seq\":0,\"received_at\":\"2020-01-01T00:00:00Z\"}}'",
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let first = user_command(1, "00000000-0000-4000-8000-000000000101", "first");
+            writer.persist_inbound(&first).await.unwrap();
+            sqlx::query(&format!("UPDATE inbound_commands SET {change} WHERE seq=1"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let replay = writer.persist_inbound(&first).await.unwrap_err();
+            assert!(format!("{replay:#}").contains("admission record HMAC mismatch"));
+            let next = writer
+                .persist_inbound(&user_command(
+                    2,
+                    "00000000-0000-4000-8000-000000000102",
+                    "second",
+                ))
+                .await
+                .unwrap_err();
+            assert!(format!("{next:#}").contains("admission record HMAC mismatch"));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn terminal_command_dispositions_are_public_exact_and_replay_safe() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -22466,9 +22871,11 @@ mod tests {
             ))
             .await
             .expect("persist command");
-        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id='00000000-0000-4000-8000-000000000001'")
-            .bind(durable_test_timestamp().to_rfc3339())
-            .execute(store.pool())
+        writer
+            .pin_incoming_timing_for_test(
+                "00000000-0000-4000-8000-000000000001",
+                durable_test_timestamp(),
+            )
             .await
             .expect("pin durable receipt timestamp");
         writer
@@ -22787,14 +23194,17 @@ mod tests {
             sqlx::query(
                 "UPDATE inbound_commands
                  SET status='applying', application_kind='soft_steer', run_id='run-phase',
-                     turn_id='turn-next', run_phase='classified', received_at=?
+                     turn_id='turn-next', run_phase='classified'
                  WHERE command_id=?",
             )
-            .bind(durable_test_timestamp().to_rfc3339())
             .bind(&next_id)
             .execute(store.pool())
             .await
             .expect("seed next owner");
+            writer
+                .pin_incoming_timing_for_test(&next_id, durable_test_timestamp())
+                .await
+                .expect("authenticated next receipt");
             let message = user_message("next");
             let message_id = test_user_message_id(next_id.as_str());
             let handoff_error = writer
@@ -23127,9 +23537,11 @@ mod tests {
             ))
             .await
             .expect("persist steer");
-        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id='00000000-0000-4000-8000-000000000018'")
-            .bind(durable_test_timestamp().to_rfc3339())
-            .execute(handoff_store.pool())
+        handoff_writer
+            .pin_incoming_timing_for_test(
+                "00000000-0000-4000-8000-000000000018",
+                durable_test_timestamp(),
+            )
             .await
             .expect("pin steer timestamp");
         handoff_writer
@@ -27289,7 +27701,13 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("load open L0 batch");
-        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        let bumped_est: i64 =
+            sqlx::query_scalar("SELECT est_tokens FROM memory_batches WHERE id=?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("estimate before seal");
+        assert!(bumped_est > L0_BATCH_MIN as i64);
 
         // Second user message should seal the first batch, reserve an L1
         // compaction job, and append to a fresh open L0 batch.
@@ -27361,8 +27779,10 @@ mod tests {
         let command_id = "00000000-0000-4000-8000-000000000001";
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
+        let receipt_tokens = estimate_public_message(&user_message("")).expect("receipt tokens");
         let first = "x".repeat(
-            usize::try_from((L0_BATCH_MIN - 1) * 4).expect("fixture length must fit usize"),
+            usize::try_from((L0_BATCH_MIN - 1 - receipt_tokens) * 4)
+                .expect("fixture length must fit usize"),
         );
         let injection = classified_injection(&writer, 1, command_id, "msg-1", &first).await;
         writer
@@ -27443,10 +27863,8 @@ mod tests {
                 .persist_inbound(&user_command(seq, steer_id, text))
                 .await
                 .expect("persist steer command");
-            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
-                .bind(durable_test_timestamp().to_rfc3339())
-                .bind(steer_id)
-                .execute(store.pool())
+            writer
+                .pin_incoming_timing_for_test(steer_id, durable_test_timestamp())
                 .await
                 .expect("pin steer receipt timestamp");
             writer
@@ -27478,7 +27896,10 @@ mod tests {
                 },
             },
             durable_test_timestamp(),
-        );
+        )
+        .with_incoming_timing(Some(IncomingEventTiming {
+            previous_receipt: None,
+        }));
         let steer_2 = AdmittedCommand::new(
             CommandEnvelope {
                 seq: 3,
@@ -27491,7 +27912,10 @@ mod tests {
                 },
             },
             durable_test_timestamp(),
-        );
+        )
+        .with_incoming_timing(Some(IncomingEventTiming {
+            previous_receipt: None,
+        }));
 
         let previous_owner = DurableRunBinding {
             command_id: command_id.to_owned(),
@@ -27658,7 +28082,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("load open L0 batch");
-        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        let bumped_est = (L0_BATCH_MIN + 1) as i64;
         sqlx::query("UPDATE memory_batches SET version = ?, est_tokens = ? WHERE id = ?")
             .bind(i64::MAX)
             .bind(bumped_est)
@@ -29643,6 +30067,7 @@ mod tests {
         let mut second_turn_messages = hydrated.messages.clone();
         second_turn_messages.push(ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "continue after restart".to_owned(),
                 }],
@@ -29903,6 +30328,7 @@ mod tests {
         let mut durable_messages = hydrated_messages;
         durable_messages.push(ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "continue after error restart".to_owned(),
                 }],

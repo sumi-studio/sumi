@@ -306,6 +306,41 @@
       }
     }
   },
+  "public_message_user_first_receipt": {
+    "kind": "public_message",
+    "wire": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "朝9時にお願いします。"
+        }
+      ],
+      "timestamp": "2026-07-25T20:00:00Z",
+      "incoming_timing": {
+        "previous_receipt": null
+      }
+    }
+  },
+  "public_message_user_previous_receipt": {
+    "kind": "public_message",
+    "wire": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "朝9時にお願いします。"
+        }
+      ],
+      "timestamp": "2026-07-25T20:00:00Z",
+      "incoming_timing": {
+        "previous_receipt": {
+          "command_seq": 7,
+          "received_at": "2026-07-25T19:00:00Z"
+        }
+      }
+    }
+  },
   "public_message_user_with_image": {
     "kind": "public_message",
     "wire": {

@@ -389,11 +389,30 @@ function isUsage(value: unknown): boolean {
   );
 }
 
+function isIncomingEventTiming(value: unknown): boolean {
+  if (!isRecord(value) || !hasRequiredAndOnlyKeys(value, ["previous_receipt"]))
+    return false;
+  const previous = value.previous_receipt;
+  return (
+    previous === null ||
+    (isRecord(previous) &&
+      hasRequiredAndOnlyKeys(previous, ["command_seq", "received_at"]) &&
+      isSafeSequence(previous.command_seq) &&
+      isDateTime(previous.received_at))
+  );
+}
+
 function isPublicMessage(value: unknown): boolean {
   if (!isRecord(value) || typeof value.role !== "string") return false;
   if (value.role === "user") {
     return (
-      hasRequiredAndOnlyKeys(value, ["role", "content", "timestamp"]) &&
+      hasRequiredAndOnlyKeys(
+        value,
+        ["role", "content", "timestamp"],
+        ["role", "content", "timestamp", "incoming_timing"],
+      ) &&
+      (!("incoming_timing" in value) ||
+        isIncomingEventTiming(value.incoming_timing)) &&
       Array.isArray(value.content) &&
       value.content.every(isUserContent) &&
       isDateTime(value.timestamp)

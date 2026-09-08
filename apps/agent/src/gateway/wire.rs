@@ -770,9 +770,38 @@ pub enum WirePublicStreamEvent {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireIncomingEventTiming {
+    previous_receipt: RequiredNullable<WireIncomingEventReceipt>,
+}
+
+fn deserialize_incoming_timing<'de, D>(
+    deserializer: D,
+) -> Result<Option<WireIncomingEventTiming>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    WireIncomingEventTiming::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireIncomingEventReceipt {
+    #[serde(deserialize_with = "deserialize_json_safe_index")]
+    command_seq: u64,
+    received_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WirePublicMessage {
     User {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_incoming_timing"
+        )]
+        incoming_timing: Option<WireIncomingEventTiming>,
         content: Vec<WireUserContent>,
         timestamp: DateTime<Utc>,
     },
@@ -1231,7 +1260,30 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
     type Error = WireError;
     fn try_from(message: PublicMessage) -> Result<Self, WireError> {
         Ok(match message {
-            PublicMessage::User(UserMessage { content, timestamp }) => Self::User {
+            PublicMessage::User(UserMessage {
+                content,
+                timestamp,
+                incoming_timing,
+            }) => Self::User {
+                incoming_timing: incoming_timing
+                    .map(|timing| {
+                        let previous = timing
+                            .previous_receipt
+                            .map(|receipt| {
+                                if receipt.command_seq > MAX_JSON_SAFE_INTEGER {
+                                    return Err(WireError::SeqOutOfRange(receipt.command_seq));
+                                }
+                                Ok(WireIncomingEventReceipt {
+                                    command_seq: receipt.command_seq,
+                                    received_at: receipt.received_at,
+                                })
+                            })
+                            .transpose()?;
+                        Ok::<_, WireError>(WireIncomingEventTiming {
+                            previous_receipt: RequiredNullable(previous),
+                        })
+                    })
+                    .transpose()?,
                 content: content
                     .into_iter()
                     .map(TryInto::try_into)
@@ -1780,6 +1832,46 @@ fn validate_seq(seq: Option<u64>, event: &WireAgentEvent) -> Result<(), WireErro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incoming_timing_wire_keeps_receipt_metadata_and_rejects_malformed_shapes() {
+        let message = crate::provider::types::UserMessage {
+            content: vec![crate::provider::types::UserContent::Text {
+                text: "human text".into(),
+            }],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-08T01:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            incoming_timing: Some(crate::provider::types::IncomingEventTiming {
+                previous_receipt: Some(crate::provider::types::IncomingEventReceipt {
+                    command_seq: 5,
+                    received_at: chrono::DateTime::parse_from_rfc3339("2026-09-08T00:59:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                }),
+            }),
+        };
+        let wire = WirePublicMessage::try_from(PublicMessage::User(message)).unwrap();
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value["incoming_timing"]["previous_receipt"]["command_seq"],
+            5
+        );
+        assert_eq!(value["content"][0]["text"], "human text");
+        assert_eq!(
+            serde_json::from_value::<WirePublicMessage>(value.clone()).unwrap(),
+            wire
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"previous_receipt": {"command_seq": MAX_JSON_SAFE_INTEGER + 1, "received_at": "2026-09-08T00:59:00Z"}}),
+        ] {
+            let mut malformed = value.clone();
+            malformed["incoming_timing"] = invalid;
+            assert!(serde_json::from_value::<WirePublicMessage>(malformed).is_err());
+        }
+    }
+
     use chrono::{DateTime, Utc};
     use serde_json::json;
 
@@ -2297,6 +2389,7 @@ mod tests {
     #[test]
     fn agent_event_round_trips() {
         let user_message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hello".to_owned(),
             }],
@@ -2436,6 +2529,7 @@ mod tests {
         };
         let turn_end = AgentEvent::TurnEnd {
             message: Some(Box::new(PublicMessage::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "assistant context".to_owned(),
                 }],
@@ -2662,6 +2756,7 @@ mod tests {
     #[test]
     fn public_message_round_trips() {
         let user = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hi".to_owned(),
             }],
@@ -2670,6 +2765,7 @@ mod tests {
         round_trip_public_message(user);
 
         let user_with_image = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Image {
                 data: "aGVsbG8=".to_owned(),
                 mime_type: "image/png".to_owned(),
@@ -2806,6 +2902,7 @@ mod tests {
     fn message_event_message_id_is_canonical_uuid() {
         let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let user_message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hi".to_owned(),
             }],

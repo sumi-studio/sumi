@@ -235,6 +235,7 @@ fn build_replay_probe_prompt(
                 id: "replay-probe-v1-user-prefix".into(),
                 seq: 1,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "replay-probe-v1-user-prefix".into(),
                     }],
@@ -261,6 +262,7 @@ fn build_replay_probe_prompt(
                 id: "replay-probe-v1-user".into(),
                 seq: 3,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "replay-probe-v1-user".into(),
                     }],
@@ -541,11 +543,14 @@ fn convert_messages(
                         "user turn interrupted an unresolved tool_use/tool_result pair".into(),
                     ));
                 }
-                let blocks = user
+                let mut blocks = user
                     .content
                     .iter()
                     .map(|content| anthropic_user_content(content, spec.supports_images))
-                    .collect();
+                    .collect::<Vec<_>>();
+                if let Some(timing) = user.incoming_timing_text() {
+                    blocks.insert(0, json!({"type":"text", "text":timing}));
+                }
                 push_turn(&mut messages, "user", blocks);
             }
             Message::ToolResult(result) => {
@@ -2111,6 +2116,7 @@ mod tests {
             id: format!("message-{seq}"),
             seq,
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!("message {seq}"),
                 }],
@@ -2181,6 +2187,7 @@ mod tests {
     #[test]
     fn memory_blocks_escape_markup_and_entities_before_request_serialization() {
         let mut context = context(vec![synthetic(Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "current turn".into(),
             }],
@@ -2233,10 +2240,12 @@ mod tests {
             &spec(),
             &context(vec![
                 synthetic(Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text { text: "a".into() }],
                     timestamp: timestamp(),
                 })),
                 synthetic(Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text { text: "b".into() }],
                     timestamp: timestamp(),
                 })),
@@ -2276,6 +2285,7 @@ mod tests {
         let request = build_request(
             &spec(),
             &context(vec![synthetic(Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text { text: "act".into() }],
                 timestamp: timestamp(),
             }))]),
@@ -2363,6 +2373,7 @@ mod tests {
         let request = build_request(
             &spec(),
             &context(vec![synthetic(Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "first turn".into(),
                 }],
@@ -2486,6 +2497,7 @@ mod tests {
     #[test]
     fn non_finite_temperature_is_rejected_before_anthropic_json_construction() {
         let context = context(vec![synthetic(Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hello".into(),
             }],
@@ -2553,6 +2565,7 @@ mod tests {
                 &model,
                 &context(vec![
                     synthetic(Message::User(UserMessage {
+                        incoming_timing: None,
                         content: vec![UserContent::Text {
                             text: "read image".into(),
                         }],
@@ -2595,6 +2608,7 @@ mod tests {
     fn thinking_rejects_forced_tool_choice() {
         for choice in [json!("any"), json!({"type":"tool","name":"read_file"})] {
             let prompt = synthetic(Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "use a tool".into(),
                 }],
@@ -2872,6 +2886,7 @@ mod tests {
                 id: "user-1".into(),
                 seq: 1,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "use the tool".into(),
                     }],
@@ -2967,6 +2982,7 @@ mod tests {
                 id: "user-1".into(),
                 seq: 1,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "public user".into(),
                     }],
@@ -3019,6 +3035,7 @@ mod tests {
         let spec = spec();
         let mut context = context(vec![
             synthetic(Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "leading-synthetic".into(),
                 }],
@@ -3047,6 +3064,7 @@ mod tests {
                 id: "new".into(),
                 seq: 3,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "suffix-marker".into(),
                     }],
@@ -3190,6 +3208,7 @@ mod tests {
                 id: "new".into(),
                 seq: 5,
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "suffix-marker".into(),
                     }],
@@ -3846,6 +3865,7 @@ mod tests {
         let spec = spec();
         let valid = context(vec![
             synthetic(Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![],
                 timestamp: timestamp(),
             })),
@@ -3867,6 +3887,7 @@ mod tests {
             vec![
                 persisted(1),
                 synthetic(Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![],
                     timestamp: timestamp(),
                 })),

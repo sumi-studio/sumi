@@ -12,7 +12,7 @@ const ENVELOPE_OVERHEAD: usize = 1 + 24 + 16;
 
 use crate::{
     gateway::CommandId,
-    provider::types::{PublicMessage, UserContent, UserMessage},
+    provider::types::{IncomingEventTiming, PublicMessage, UserContent, UserMessage},
     runtime::contracts::DirectChatProvenanceV1,
 };
 
@@ -61,6 +61,7 @@ pub(crate) struct InjectionCommandSizeInput<'a> {
     pub text: &'a str,
     pub timestamp: &'a DateTime<Utc>,
     pub provenance: &'a DirectChatProvenanceV1,
+    pub incoming_timing: Option<&'a IncomingEventTiming>,
 }
 
 #[allow(dead_code, reason = "T12 boundary is consumed by the T15 run loop")]
@@ -73,12 +74,17 @@ pub(crate) struct InjectionBatchSizeInput<'a> {
     pub commands: &'a [InjectionCommandSizeInput<'a>],
 }
 
-pub(crate) fn canonical_user_message(text: &str, timestamp: DateTime<Utc>) -> PublicMessage {
+pub(crate) fn canonical_user_message(
+    text: &str,
+    timestamp: DateTime<Utc>,
+    incoming_timing: Option<IncomingEventTiming>,
+) -> PublicMessage {
     PublicMessage::User(UserMessage {
         content: vec![UserContent::Text {
             text: text.to_owned(),
         }],
         timestamp,
+        incoming_timing,
     })
 }
 
@@ -112,13 +118,18 @@ impl EventBatchSizer {
         if input.application == InjectionApplication::IdleRun && input.commands.len() != 1 {
             bail!("idle_run injection must contain exactly one command");
         }
-        let mut size = Self::command_window(
+        let mut size = Self::command_window_with_timing(
             redactor,
-            input.commands.iter().map(|command| CommandSizeInput {
-                canonical_payload: command.canonical_payload,
-                message_id: command.message_id,
-                text: command.text,
-                timestamp: command.timestamp,
+            input.commands.iter().map(|command| {
+                (
+                    CommandSizeInput {
+                        canonical_payload: command.canonical_payload,
+                        message_id: command.message_id,
+                        text: command.text,
+                        timestamp: command.timestamp,
+                    },
+                    command.incoming_timing,
+                )
             }),
         )?;
         let empty_metadata_bytes = serde_json::to_vec(&DurableEventMetadata::default())
@@ -260,22 +271,34 @@ impl EventBatchSizer {
         Ok(size)
     }
 
+    #[cfg(test)]
     pub(crate) fn command_window<'a>(
         redactor: &Redactor,
         commands: impl IntoIterator<Item = CommandSizeInput<'a>>,
+    ) -> Result<BatchSize> {
+        Self::command_window_with_timing(
+            redactor,
+            commands.into_iter().map(|command| (command, None)),
+        )
+    }
+
+    fn command_window_with_timing<'a>(
+        redactor: &Redactor,
+        commands: impl IntoIterator<Item = (CommandSizeInput<'a>, Option<&'a IncomingEventTiming>)>,
     ) -> Result<BatchSize> {
         let mut size = BatchSize {
             command_count: 0,
             command_plaintext_bytes: 0,
             transaction_bytes: 0,
         };
-        for command in commands {
+        for (command, incoming_timing) in commands {
             size.command_count = size.command_count.saturating_add(1);
             size.command_plaintext_bytes = size
                 .command_plaintext_bytes
                 .saturating_add(command.canonical_payload.len());
 
-            let message = canonical_user_message(command.text, *command.timestamp);
+            let message =
+                canonical_user_message(command.text, *command.timestamp, incoming_timing.cloned());
             let raw_message = Zeroizing::new(
                 serde_json::to_vec(&message)
                     .map_err(|error| anyhow::anyhow!("failed to size user message: {error}"))?,
@@ -382,12 +405,20 @@ mod tests {
     }
 
     fn independent_transaction_bytes(text: &str) -> usize {
+        independent_transaction_bytes_with_timing(text, None)
+    }
+
+    fn independent_transaction_bytes_with_timing(
+        text: &str,
+        incoming_timing: Option<IncomingEventTiming>,
+    ) -> usize {
         let redactor = Redactor::v1();
         let message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
             timestamp: timestamp(),
+            incoming_timing,
         });
         let raw_message = serde_json::to_vec(&message).expect("serialize message");
         let message_projection = redactor
@@ -531,6 +562,7 @@ mod tests {
             text,
             timestamp: &timestamp,
             provenance: &crate::gateway::test_direct_chat_provenance(),
+            incoming_timing: None,
         }];
         let message_only = size_one(text);
         let idle = EventBatchSizer::injection_batch(
@@ -571,6 +603,56 @@ mod tests {
         assert!(soft.transaction_bytes > retry.transaction_bytes);
         assert_eq!(idle.command_count, 1);
         assert_eq!(idle.command_plaintext_bytes, payload.len());
+    }
+
+    #[test]
+    fn injection_timing_growth_matches_serialized_durable_rows() {
+        let text = "incoming event";
+        let payload = canonical_payload(text);
+        let timestamp = timestamp();
+        let timing = IncomingEventTiming {
+            previous_receipt: Some(crate::provider::types::IncomingEventReceipt {
+                command_seq: 41,
+                received_at: timestamp - chrono::Duration::seconds(90),
+            }),
+        };
+        let command_id =
+            CommandId::parse("00000000-0000-4000-8000-000000000001").expect("canonical UUID");
+        let provenance = crate::gateway::test_direct_chat_provenance();
+        let size = |incoming_timing| {
+            EventBatchSizer::injection_batch(
+                &Redactor::v1(),
+                InjectionBatchSizeInput {
+                    application: InjectionApplication::IdleRun,
+                    run_id: "run-1",
+                    turn_id: "turn-1",
+                    previous_owner_command_id: None,
+                    commands: &[InjectionCommandSizeInput {
+                        command_id: &command_id,
+                        canonical_payload: &payload,
+                        message_id: "018f0000-0000-7000-8000-000000000001",
+                        text,
+                        timestamp: &timestamp,
+                        provenance: &provenance,
+                        incoming_timing,
+                    }],
+                },
+            )
+            .expect("size injection")
+        };
+        let without_timing = size(None);
+        let with_timing = size(Some(&timing));
+        let expected_growth = independent_transaction_bytes_with_timing(text, Some(timing))
+            - independent_transaction_bytes(text);
+        assert!(expected_growth > 0);
+        assert_eq!(
+            with_timing.transaction_bytes - without_timing.transaction_bytes,
+            expected_growth
+        );
+        assert_eq!(
+            with_timing.command_plaintext_bytes,
+            without_timing.command_plaintext_bytes
+        );
     }
 
     #[test]

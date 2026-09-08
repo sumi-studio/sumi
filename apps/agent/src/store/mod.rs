@@ -5384,6 +5384,7 @@ mod tests {
             id: "user-2".to_owned(),
             seq: 2,
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "ack".to_owned(),
                 }],
@@ -5393,10 +5394,26 @@ mod tests {
         let recovered = assembler
             .recover_overflow(&[assistant, user])
             .expect("recover overflow");
-        assert_eq!(recovered.len(), 1);
+        let retained: Vec<_> = recovered
+            .iter()
+            .filter_map(|message| match message {
+                ContextMessage::Persisted { id, .. } => Some(id.as_str()),
+                ContextMessage::Synthetic { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            retained,
+            ["user-2"],
+            "saved footprint drops only the anchored assistant"
+        );
         assert!(
-            matches!(&recovered[0], ContextMessage::Persisted { id, .. } if id == "user-2"),
-            "saved footprint must drive overflow and drop the anchored assistant"
+            recovered.iter().any(|message| matches!(message,
+            ContextMessage::Synthetic { message: Message::User(user) }
+                if user.content.iter().any(|content| matches!(content, UserContent::Text { text }
+                    if text.contains("Working-context capacity notice")
+                        && text.contains("sequence range 1..=1")
+                        && text.contains("conversation_history"))))),
+            "temporary omission retains a path to reread the original assistant"
         );
     }
 
@@ -6799,6 +6816,11 @@ mod tests {
             .with_timezone(&Utc);
         let message_id = user_message_id(store.scope().personality_agent_id(), &command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: writer
+                .timing_for_command(command_id.as_str())
+                .await
+                .expect("fixture timing")
+                .1,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -7067,6 +7089,7 @@ mod tests {
             .await
             .expect("mint transcript key");
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -7136,6 +7159,7 @@ mod tests {
             .expect("load canonical message sequence");
         let message_seq = u64::try_from(message_seq).expect("message sequence is non-negative");
         let replacement = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "different but valid content".to_owned(),
             }],
@@ -7864,7 +7888,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0011");
+            .expect("apply all remaining embedded migrations");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -7872,7 +7896,25 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19]);
+        let expected: Vec<_> = MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        assert_eq!(
+            applied, expected,
+            "upgrade completes every embedded migration"
+        );
+        let memory_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_jobs'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("memory_jobs schema exists");
+        assert!(
+            memory_sql.contains("'unchanged'"),
+            "upgraded schema supports retaining original experience"
+        );
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",

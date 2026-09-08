@@ -328,8 +328,92 @@ pub struct NativeCompactionCoverage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_timing: Option<IncomingEventTiming>,
     pub content: Vec<UserContent>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Receipt timing is attached once at ingress, independently of any time mentioned
+/// in the event's content. Replaying the event does not refresh this metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingEventTiming {
+    pub previous_receipt: Option<IncomingEventReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingEventReceipt {
+    pub command_seq: u64,
+    pub received_at: DateTime<Utc>,
+}
+
+impl UserMessage {
+    /// The same non-instructional prefix is used by every provider send view.
+    /// Raw content is kept separate, including images and user-authored text.
+    pub fn incoming_timing_text(&self) -> Option<String> {
+        let timing = self.incoming_timing.as_ref()?;
+        let received = self.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
+        let mut text = format!("[Received {received}");
+        if let Some(previous) = &timing.previous_receipt {
+            let delta = self.timestamp.signed_duration_since(previous.received_at);
+            if delta.is_zero() {
+                text.push_str("; same receipt time as the previous incoming message");
+            } else {
+                let duration = readable_receipt_interval(delta.abs());
+                if delta < chrono::Duration::zero() {
+                    text.push_str(&format!(
+                        "; receipt clock is {duration} earlier than the previous receipt"
+                    ));
+                } else {
+                    text.push_str(&format!("; {duration} since the previous incoming message"));
+                }
+            }
+        }
+        text.push(']');
+        Some(text)
+    }
+}
+
+fn readable_receipt_interval(duration: chrono::Duration) -> String {
+    if duration < chrono::Duration::seconds(1) {
+        return "less than a second".into();
+    }
+    let seconds = duration.num_seconds();
+    let resolution = if seconds >= 86_400 {
+        3_600
+    } else if seconds >= 3_600 {
+        60
+    } else {
+        1
+    };
+    let rounded = (seconds
+        + resolution / 2
+        + i64::from(resolution == 1 && duration.subsec_nanos() >= 500_000_000))
+        / resolution
+        * resolution;
+    let approximate = duration != chrono::Duration::seconds(rounded);
+    let mut remaining = rounded;
+    let mut units = Vec::new();
+    for (size, name) in [
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ] {
+        let count = remaining / size;
+        if count > 0 {
+            units.push(format!(
+                "{count} {name}{}",
+                if count == 1 { "" } else { "s" }
+            ));
+            remaining %= size;
+        }
+    }
+    format!(
+        "{}{}",
+        if approximate { "approximately " } else { "" },
+        units.join(" ")
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1505,6 +1589,7 @@ mod tests {
     #[test]
     fn message_types_round_trip_with_stable_tags() {
         let user = Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![
                 UserContent::Text {
                     text: "hello".to_owned(),

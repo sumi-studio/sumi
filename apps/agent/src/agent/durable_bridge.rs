@@ -1241,12 +1241,15 @@ impl DurableBridge {
                 message_id,
                 message,
             } => {
-                self.commit_assistant_end(
+                // Control handshakes may persist another event while waiting.
+                // Keep this large terminal future off the shared dispatch frame;
+                // streaming updates do not need a heap allocation.
+                Box::pin(self.commit_assistant_end(
                     writer,
                     message_id,
                     *message,
                     message_commit_barrier.expect("MessageEnd barrier checked"),
-                )
+                ))
                 .await
             }
             AgentEvent::ToolExecutionStart {
@@ -2699,6 +2702,7 @@ impl DurableBridge {
             bail!("T16 hard steer does not accept attachments");
         }
         let expected_message = PublicMessage::User(crate::provider::types::UserMessage {
+            incoming_timing: command.incoming_timing(),
             content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
             timestamp: command.received_at(),
         });
@@ -3117,6 +3121,9 @@ mod tests {
             },
             test_timestamp(),
         )
+        .with_incoming_timing(Some(crate::provider::types::IncomingEventTiming {
+            previous_receipt: None,
+        }))
     }
 
     fn test_abort_command(seq: u64, command_id: &str) -> InboundCommand {
@@ -3171,7 +3178,7 @@ mod tests {
     }
 
     async fn persist_and_pin(
-        store: &Store,
+        _store: &Store,
         writer: &EventWriter,
         seq: u64,
         command_id: &str,
@@ -3182,12 +3189,10 @@ mod tests {
             .persist_inbound(&test_user_command(seq, command_id, text))
             .await
             .expect("persist command");
-        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
-            .bind(timestamp.to_rfc3339())
-            .bind(command_id)
-            .execute(store.pool())
+        writer
+            .pin_incoming_timing_for_test(command_id, timestamp)
             .await
-            .expect("pin durable timestamp");
+            .expect("pin authenticated fixture timing");
         timestamp
     }
 
@@ -3255,6 +3260,9 @@ mod tests {
         let message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: Some(crate::provider::types::IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![UserContent::Text {
                 text: "owner".to_owned(),
             }],
@@ -3995,6 +4003,7 @@ mod tests {
             &steer_command.envelope().command_id,
         );
         let user_message = PublicMessage::User(UserMessage {
+            incoming_timing: steer_command.incoming_timing(),
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
             }],
@@ -4947,6 +4956,9 @@ mod tests {
         let user_message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), steer_id);
         let user_message = PublicMessage::User(UserMessage {
+            incoming_timing: Some(crate::provider::types::IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![UserContent::Text {
                 text: "steer now".to_owned(),
             }],
@@ -5424,6 +5436,7 @@ mod tests {
         bridge.pending_steer_messages.push(PendingSteerMessage {
             message_id: "pending-start".to_owned(),
             message: PublicMessage::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "pending".to_owned(),
                 }],
@@ -5434,6 +5447,7 @@ mod tests {
         bridge.pending_steer_open_start = Some((
             "open-start".to_owned(),
             PublicMessage::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "open".to_owned(),
                 }],
