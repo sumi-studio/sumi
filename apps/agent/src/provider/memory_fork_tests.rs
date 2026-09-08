@@ -12,15 +12,15 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{ModelSpec, RequestOptions, model::StructuredOutputSchema, types::*};
-use crate::memory::context_assembler::{
-    bind_native_replay_for_test, bind_sumi_replay_for_origin_test,
-};
+use crate::memory::context_assembler::{ContextAssembler, bind_native_replay_for_test};
 
 const IMAGE: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2XcAAAAASUVORK5CYII=";
+const MIDDLE_SUMMARY: &str = "The intervening source was checked before the latest correction.";
+const MIDDLE_RAW: &str = "Intervening original observation replaced by its summary.";
 const DIRECTIVE: &str = "Reorganize the designated record using the complete preceding context.";
 
-fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
+async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
     let timestamp = DateTime::parse_from_rfc3339("2026-09-07T23:40:12.123456789Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -112,15 +112,7 @@ fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
     .collect();
     let mut prompt = PromptContext::new(
         "Parent instructions with current permissions.".into(),
-        if native {
-            vec![]
-        } else {
-            vec![MemoryBlock {
-                layer: MemoryLayer::L1,
-                text: "Earlier memory, interpreted using later corrections.".into(),
-                time_range: Some((timestamp, timestamp)),
-            }]
-        },
+        vec![],
         messages,
         vec![],
         vec![
@@ -193,7 +185,82 @@ fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
         });
         bind_native_replay_for_test(&mut prompt, spec.origin(), 3, Some(40)).unwrap();
     } else {
-        bind_sumi_replay_for_origin_test(&mut prompt, spec.origin(), Some(40)).unwrap();
+        // Build the parent through the production assembler, with B promoted
+        // between still-raw A and C. The summary has no fabricated transcript ID
+        // or sequence; only its original batch establishes its chronological slot.
+        use crate::memory::{
+            BatchState, CompactResult, ConsolidatedMemory, DecryptedMemorySummary, L0Batch,
+            ThreeLayerMemory,
+            estimate::{
+                ProviderContextItemWithFootprint, TokenCalibration, eviction_footprint_for_payload,
+            },
+        };
+        let middle = ContextMessage::Persisted {
+            id: "parent-35".into(),
+            seq: 35,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text {
+                    text: MIDDLE_RAW.into(),
+                    wire_item_index: 0,
+                }],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: timestamp + chrono::Duration::seconds(60),
+            }),
+        };
+        let mut life_log = prompt.messages.clone();
+        life_log.insert(3, middle.clone());
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        memory.push_l0(L0Batch::new(life_log[..3].to_vec(), 1, 0, 100));
+        let mut middle_batch = L0Batch::new(vec![middle], 2, 0, 30);
+        middle_batch.state = BatchState::Sealed;
+        let source_batch = middle_batch.id;
+        memory.push_l0(middle_batch);
+        memory.push_l0(L0Batch::new(life_log[4..].to_vec(), 3, 0, 30));
+        memory.store_compact_result(
+            source_batch,
+            CompactResult {
+                summary: DecryptedMemorySummary::new(MIDDLE_SUMMARY.into()),
+                est_tokens: 15,
+                time_range: (
+                    timestamp + chrono::Duration::seconds(60),
+                    timestamp + chrono::Duration::seconds(60),
+                ),
+            },
+        );
+        memory.promote_l0_to_l1(source_batch).unwrap();
+        let provider_context = prompt
+            .provider_context
+            .iter()
+            .map(|item| {
+                ProviderContextItemWithFootprint::new(
+                    item.clone(),
+                    eviction_footprint_for_payload(spec, &item.payload).unwrap(),
+                )
+            })
+            .collect();
+        let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone()).unwrap();
+        assembler
+            .install_hydrated_memory(memory, &life_log, provider_context)
+            .unwrap();
+        prompt = assembler.assemble(&life_log, 0).await.unwrap();
+        assert!(prompt.messages.iter().any(|message| matches!(message,
+            ContextMessage::Synthetic { message: Message::User(user) }
+                if user.incoming_timing.is_none() && user.content.iter().any(|content|
+                    matches!(content, UserContent::Text { text } if text.contains(MIDDLE_SUMMARY)))
+        )), "L1 must remain synthetic, not acquire a persisted transcript identity");
     }
     prompt
 }
@@ -274,7 +341,7 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
             }),
             native_compaction: native,
         };
-        let prompt = parent_prompt(&spec, native);
+        let prompt = parent_prompt(&spec, native).await;
         let snapshot = ParentContextSnapshot::capture(&prompt, &spec, &options);
         let fork = snapshot
             .fork_with_directive(UserMessage {
@@ -371,6 +438,32 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         assert!(encoded.contains("Received 2026-09-07 23:40:12 UTC"));
         assert!(encoded.contains("2 minutes 5 seconds since the previous incoming message"));
         assert_eq!(encoded.contains("opaque-parent-window"), native);
+        if !native {
+            let before = encoded.find("Original tool observation").unwrap();
+            let summary = encoded
+                .find(MIDDLE_SUMMARY)
+                .expect("assembled L1 reaches actual HTTP");
+            let after = encoded
+                .find("Latest correction outside the edit target")
+                .unwrap();
+            assert!(
+                before < summary && summary < after,
+                "{preset}: raw A → summary B → raw C order"
+            );
+            assert_eq!(
+                encoded.matches(MIDDLE_SUMMARY).count(),
+                1,
+                "summary must not also be prepended"
+            );
+            assert!(
+                !encoded.contains(MIDDLE_RAW),
+                "replaced B must not leak back into parent wire"
+            );
+        } else {
+            // Exact native replay owns its opaque prefix and canonical suffix;
+            // this branch is not evidence about ordering inside that prefix.
+            assert!(!encoded.contains(MIDDLE_SUMMARY));
+        }
         let (call_id, arguments) = match spec.protocol {
             ApiProtocol::OpenAiChatCompletions => {
                 let assistant = parent_items

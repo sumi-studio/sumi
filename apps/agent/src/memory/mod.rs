@@ -112,6 +112,7 @@ impl DecryptedMemorySummary {
 
 pub struct L1Entry {
     pub source_batch: BatchId,
+    pub source_batch_seq: u64,
     pub summary: DecryptedMemorySummary,
     pub est_tokens: u64,
     pub time_range: (DateTime<Utc>, DateTime<Utc>),
@@ -195,9 +196,10 @@ impl HydratedMemorySummary {
         }
     }
 
-    fn into_l1_entry(self, source_batch: BatchId) -> L1Entry {
+    fn into_l1_entry(self, source_batch: BatchId, source_batch_seq: u64) -> L1Entry {
         L1Entry {
             source_batch,
+            source_batch_seq,
             summary: self.summary,
             est_tokens: self.est_tokens,
             time_range: self.time_range,
@@ -643,7 +645,14 @@ impl ThreeLayerMemory {
                 .source_ids
                 .first()
                 .expect("validated CompactL0 job has one source");
-            if l1_sources.insert(target, source).is_some() {
+            let source_batch_seq = batches_by_id
+                .get(&source)
+                .expect("validated CompactL0 source batch must resolve")
+                .batch_seq;
+            if l1_sources
+                .insert(target, (source, source_batch_seq))
+                .is_some()
+            {
                 bail!("multiple applied CompactL0 jobs promote L1 batch {target}");
             }
         }
@@ -723,10 +732,11 @@ impl ThreeLayerMemory {
             let summary = batch.summary.ok_or_else(|| {
                 anyhow!("visible L1 batch {batch_id} is missing an authenticated summary")
             })?;
-            let source_batch = l1_sources.remove(&batch.id).ok_or_else(|| {
-                anyhow!("visible L1 batch {batch_id} has no applied CompactL0 source identity")
-            })?;
-            l1.push_back(summary.into_l1_entry(source_batch));
+            let (source_batch, source_batch_seq) =
+                l1_sources.remove(&batch.id).ok_or_else(|| {
+                    anyhow!("visible L1 batch {batch_id} has no applied CompactL0 source identity")
+                })?;
+            l1.push_back(summary.into_l1_entry(source_batch, source_batch_seq));
         }
 
         // Repeated CompactL1 applies append independently authenticated L2
@@ -881,6 +891,7 @@ impl ThreeLayerMemory {
         let time_range = result.time_range;
         self.l1.push_back(L1Entry {
             source_batch: batch_id,
+            source_batch_seq: batch.batch_seq,
             summary: result.summary,
             est_tokens: result.est_tokens,
             time_range,
@@ -1878,6 +1889,7 @@ mod tests {
         assert!(memory.l0().is_empty());
         assert_eq!(memory.l1().len(), 1);
         assert_eq!(memory.l1()[0].source_batch, source);
+        assert_eq!(memory.l1()[0].source_batch_seq, 1);
     }
 
     #[test]
