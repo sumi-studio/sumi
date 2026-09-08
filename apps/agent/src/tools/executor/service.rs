@@ -1419,7 +1419,7 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
 /// Serve the production Unix endpoint's deliberately narrow contract.
 ///
 /// This path has no artifact-broker capability and admits only exact-identity
-/// Health plus workspace-dirfd read and discovery operations. The broader
+/// Health plus workspace-dirfd read, discovery, write, and edit operations. The broader
 /// stdio fixture service remains separate and cannot be reached through
 /// production bootstrap.
 #[expect(
@@ -1535,6 +1535,8 @@ async fn run_critical_executor_exchange(
                 .await?;
         }
         operation @ (ExecutorOperation::ReadFile { .. }
+        | ExecutorOperation::WriteFile { .. }
+        | ExecutorOperation::EditFile { .. }
         | ExecutorOperation::ListDir { .. }
         | ExecutorOperation::Glob { .. }
         | ExecutorOperation::Grep { .. }) => {
@@ -1571,13 +1573,12 @@ async fn run_critical_executor_exchange(
                     pending.promote(permit)?
                 }
             };
-            let result =
-                start_critical_read_discovery_execution(execution, fs, blocking_fs, operation)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::error!(%error, "critical read/discovery ownership task stopped");
-                        Err(bounded_error("rpc_indeterminate"))
-                    });
+            let result = start_critical_workspace_execution(execution, fs, blocking_fs, operation)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "critical workspace ownership task stopped");
+                    Err(bounded_error("rpc_indeterminate"))
+                });
             writer.terminal(&identity, request_id, result).await?;
         }
         operation @ ExecutorOperation::OpenSourceFiles { .. } => {
@@ -1674,7 +1675,7 @@ async fn run_critical_executor_exchange(
     Ok(())
 }
 
-fn start_critical_read_discovery_execution(
+fn start_critical_workspace_execution(
     mut execution: ExecutionLease,
     fs: Arc<WorkspaceFs>,
     blocking_fs: BlockingFsRegistry,
@@ -1702,6 +1703,44 @@ fn start_critical_read_discovery_execution(
                 }
                 Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
                     "production executor does not expose artifact reads".to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+            (Some(expiry), ExecutorOperation::WriteFile { path, content, .. }) => {
+                match resolve_input("write_file", &path) {
+                    Ok(InputRoute::Workspace) => {
+                        blocking_fs
+                            .execute_authorized(expiry, move || {
+                                fs.write_file(Path::new(&path), content.as_bytes())?;
+                                Ok(ExecutorResponse::Written {})
+                            })
+                            .await
+                    }
+                    Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                        "production executor does not expose artifact writes".to_owned(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            (
+                Some(expiry),
+                ExecutorOperation::EditFile {
+                    path,
+                    old_string,
+                    new_string,
+                    ..
+                },
+            ) => match resolve_input("edit_file", &path) {
+                Ok(InputRoute::Workspace) => {
+                    blocking_fs
+                        .execute_authorized(expiry, move || {
+                            fs.edit_file(Path::new(&path), &old_string, &new_string)?;
+                            Ok(ExecutorResponse::Edited {})
+                        })
+                        .await
+                }
+                Ok(InputRoute::Artifact) => Err(ToolError::Protocol(
+                    "production executor does not expose artifact edits".to_owned(),
                 )),
                 Err(error) => Err(error),
             },
@@ -1769,7 +1808,7 @@ fn start_critical_read_discovery_execution(
         }
         .map_err(rpc_error);
         if let Err(error) = execution.complete(result.clone()) {
-            tracing::error!(%error, "failed to settle critical read/discovery ownership");
+            tracing::error!(%error, "failed to settle critical workspace ownership");
             return Err(bounded_error("rpc_indeterminate"));
         }
         result
@@ -3416,7 +3455,7 @@ mod tests {
 
         use crate::tools::executor::call_authority::{
             CallAuthorityPermitClaims, Ed25519CallAuthorityIssuer, ExecutorAuthorityProvenance,
-            ExecutorInvocationRoute, is_production_read_operation,
+            ExecutorInvocationRoute, is_production_workspace_operation,
         };
 
         let signing_key = SigningKey::from_bytes(&[7; 32]);
@@ -3430,7 +3469,7 @@ mod tests {
             Some(clock) => verifier.with_clock(clock),
             None => verifier,
         });
-        let call_authority = if is_production_read_operation(&operation) {
+        let call_authority = if is_production_workspace_operation(&operation) {
             let issuer = Ed25519CallAuthorityIssuer::new(
                 call_authority_key_id(),
                 signing_key,
@@ -3491,7 +3530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critical_endpoint_exposes_only_workspace_read_discovery_operations() {
+    async fn critical_endpoint_exposes_workspace_discovery_but_not_delete_or_artifacts() {
         let root = std::env::temp_dir().join(format!(
             "sumi-critical-read-discovery-{}",
             uuid::Uuid::now_v7()
@@ -3569,11 +3608,10 @@ mod tests {
                 },
             ),
             (
-                "critical-write",
-                ExecutorOperation::WriteFile {
-                    path: "must-not-write.txt".to_owned(),
-                    content: "forbidden".to_owned(),
-                    execution_id: "critical-write".to_owned(),
+                "critical-delete",
+                ExecutorOperation::RemoveFile {
+                    path: "note.txt".to_owned(),
+                    execution_id: "critical-delete".to_owned(),
                 },
             ),
         ] {
@@ -3592,10 +3630,148 @@ mod tests {
                 .expect("critical endpoint result");
         }
         assert!(
-            !workspace.join("must-not-write.txt").exists(),
-            "critical endpoint accepted a mutation"
+            workspace.join("note.txt").exists(),
+            "critical endpoint accepted deletion"
         );
         std::fs::remove_dir_all(root).expect("remove critical endpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn critical_workspace_write_read_edit_read_and_replay() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-critical-mutation-{}", uuid::Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let fs = Arc::new(WorkspaceFs::open(&workspace).unwrap());
+        let identity = test_identity();
+        let manager = ExecutorManager::new(EXECUTOR_OPERATION_CAPACITY);
+        let blocking_fs = BlockingFsRegistry::new(2, 4);
+        let read = |id: &str| ExecutorOperation::ReadFile {
+            path: "note.txt".to_owned(),
+            offset: 0,
+            limit: 100,
+            execution_id: id.to_owned(),
+        };
+        let edit = |id: &str| ExecutorOperation::EditFile {
+            path: "note.txt".to_owned(),
+            old_string: "a".to_owned(),
+            new_string: "ab".to_owned(),
+            execution_id: id.to_owned(),
+        };
+        for (id, operation, expected, content, grant) in [
+            (
+                "write",
+                ExecutorOperation::WriteFile {
+                    path: "note.txt".to_owned(),
+                    content: "a".to_owned(),
+                    execution_id: "write".to_owned(),
+                },
+                "written",
+                None,
+                "write-grant",
+            ),
+            (
+                "read-before",
+                read("read-before"),
+                "read_file",
+                Some("a"),
+                "read-before-grant",
+            ),
+            ("edit", edit("edit"), "edited", None, "edit-grant"),
+            (
+                "read-after",
+                read("read-after"),
+                "read_file",
+                Some("ab"),
+                "read-after-grant",
+            ),
+        ] {
+            let (mut client, task) = start_critical_test_session_with_authority(
+                identity.clone(),
+                fs.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                id,
+                operation,
+                None,
+                Some(grant),
+            );
+            let terminal = read_test_terminal(&mut client).await;
+            assert_eq!(terminal["result"]["Ok"]["type"], expected, "{terminal}");
+            if let Some(content) = content {
+                assert_eq!(terminal["result"]["Ok"]["result"]["content"], content);
+            }
+            task.await.unwrap().unwrap();
+        }
+        let (mut client, task) = start_critical_test_session_with_authority(
+            identity.clone(),
+            fs.clone(),
+            manager.clone(),
+            blocking_fs.clone(),
+            "edit-replay",
+            edit("edit-replay"),
+            None,
+            Some("edit-grant"),
+        );
+        let terminal = read_test_terminal(&mut client).await;
+        assert_eq!(
+            terminal["result"]["Err"]["code"],
+            RPC_CALL_AUTHORITY_REPLAY_CODE
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "ab"
+        );
+
+        std::fs::write(root.join("outside.txt"), "outside").unwrap();
+        for (id, path) in [
+            ("escape", "../outside.txt"),
+            ("artifact", "artifact://forbidden/file"),
+        ] {
+            let (mut client, task) = start_critical_test_session(
+                identity.clone(),
+                fs.clone(),
+                manager.clone(),
+                blocking_fs.clone(),
+                id,
+                ExecutorOperation::WriteFile {
+                    path: path.to_owned(),
+                    content: "changed".to_owned(),
+                    execution_id: id.to_owned(),
+                },
+            );
+            let terminal = read_test_terminal(&mut client).await;
+            assert!(terminal["result"]["Err"].is_object(), "{terminal}");
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("outside.txt")).unwrap(),
+            "outside"
+        );
+        // Failure remains local to the operation; a following valid write works.
+        let (mut client, task) = start_critical_test_session(
+            identity,
+            fs,
+            manager,
+            blocking_fs,
+            "recovery",
+            ExecutorOperation::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "recovered".to_owned(),
+                execution_id: "recovery".to_owned(),
+            },
+        );
+        assert_eq!(
+            read_test_terminal(&mut client).await["result"]["Ok"]["type"],
+            "written"
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "recovered"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -3633,8 +3809,9 @@ mod tests {
             manager.clone(),
             blocking_fs.clone(),
             "expiry-request",
-            ExecutorOperation::ListDir {
-                path: ".".to_owned(),
+            ExecutorOperation::WriteFile {
+                path: "sentinel.txt".to_owned(),
+                content: "changed".to_owned(),
                 execution_id: "expiry-execution".to_owned(),
             },
             Some(clock.clone()),
@@ -3674,8 +3851,9 @@ mod tests {
             manager,
             blocking_fs,
             "expiry-remint-request",
-            ExecutorOperation::ListDir {
-                path: ".".to_owned(),
+            ExecutorOperation::WriteFile {
+                path: "sentinel.txt".to_owned(),
+                content: "changed".to_owned(),
                 execution_id: "expiry-remint-execution".to_owned(),
             },
             Some(clock),
@@ -3692,6 +3870,10 @@ mod tests {
             .expect("remint rejection result");
         assert_eq!(effects.load(Ordering::SeqCst), 0);
 
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("sentinel.txt")).unwrap(),
+            "untouched"
+        );
         std::fs::remove_dir_all(root).expect("remove expiry fixture");
     }
 
@@ -3817,6 +3999,18 @@ mod tests {
 
     #[tokio::test]
     async fn bound_listener_detects_post_bind_ancestor_unlink_rename_and_entry_replacement() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        // Every positive fixture ancestor must be trusted even when the test
+        // process inherits a group-writable umask. Replacements stay private
+        // too, so revalidation fails on identity rather than permissions.
+        let create_private_chain = |path: &Path| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .expect("create private listener chain");
+        };
         let root = std::env::temp_dir().join(format!("sxr-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).expect("create socket revalidation root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
@@ -3824,14 +4018,14 @@ mod tests {
 
         let rename_ancestor = root.join("rename/ancestor");
         let rename_parent = rename_ancestor.join("parent");
-        std::fs::create_dir_all(&rename_parent).expect("create rename chain");
+        create_private_chain(&rename_parent);
         let rename_socket = rename_parent.join("executor.sock");
         let renamed_listener = bind_unix_listener(&rename_socket, "test")
             .await
             .expect("bind rename listener");
         let detached_ancestor = root.join("rename/detached");
         std::fs::rename(&rename_ancestor, &detached_ancestor).expect("rename pinned ancestor");
-        std::fs::create_dir_all(&rename_parent).expect("replace ancestor chain");
+        create_private_chain(&rename_parent);
         assert!(
             renamed_listener.verify("test").is_err(),
             "renamed and replaced ancestor chain remained trusted"
@@ -3840,7 +4034,7 @@ mod tests {
 
         let unlink_ancestor = root.join("unlink/ancestor");
         let unlink_parent = unlink_ancestor.join("parent");
-        std::fs::create_dir_all(&unlink_parent).expect("create unlink chain");
+        create_private_chain(&unlink_parent);
         let unlink_socket = unlink_parent.join("executor.sock");
         let unlinked_listener = bind_unix_listener(&unlink_socket, "test")
             .await
@@ -3857,7 +4051,7 @@ mod tests {
         drop(unlinked_listener);
 
         let replacement_parent = root.join("replacement");
-        std::fs::create_dir(&replacement_parent).expect("create replacement parent");
+        create_private_chain(&replacement_parent);
         let replacement_socket = replacement_parent.join("executor.sock");
         let original_listener = bind_unix_listener(&replacement_socket, "test")
             .await

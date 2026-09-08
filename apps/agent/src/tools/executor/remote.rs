@@ -87,7 +87,7 @@ impl ExecutorInvoker for ExecutorClient {
 
 /// Builds the production executor registry from one immutable,
 /// supervisor-issued client. The critical Unix endpoint exposes only bounded,
-/// workspace-confined read and discovery operations.
+/// workspace-confined text-file and discovery operations.
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
     remote_executor_registry_with_tools(client, std::iter::empty())
 }
@@ -168,8 +168,10 @@ enum RemoteToolKind {
     Bash,
 }
 
-const PRODUCTION_REMOTE_TOOL_KINDS: [RemoteToolKind; 4] = [
+const PRODUCTION_REMOTE_TOOL_KINDS: [RemoteToolKind; 6] = [
     RemoteToolKind::WorkspaceReadFile,
+    RemoteToolKind::WriteFile,
+    RemoteToolKind::EditFile,
     RemoteToolKind::ListDir,
     RemoteToolKind::Glob,
     RemoteToolKind::WorkspaceGrep,
@@ -198,7 +200,7 @@ impl Tool for RemoteTool {
             ),
             RemoteToolKind::WriteFile => definition::<WriteFileArgs>(
                 "write_file",
-                "Replace a workspace file with UTF-8 text.",
+                "Create or replace a UTF-8 workspace file. The parent directory must already exist.",
             ),
             RemoteToolKind::EditFile => definition::<EditFileArgs>(
                 "edit_file",
@@ -314,7 +316,12 @@ impl RemoteToolKind {
     fn supports_production_binding(self) -> bool {
         matches!(
             self,
-            Self::WorkspaceReadFile | Self::ListDir | Self::Glob | Self::WorkspaceGrep
+            Self::WorkspaceReadFile
+                | Self::WriteFile
+                | Self::EditFile
+                | Self::ListDir
+                | Self::Glob
+                | Self::WorkspaceGrep
         )
     }
 
@@ -345,6 +352,7 @@ impl RemoteToolKind {
                 };
                 workspace_binding(
                     "read_file",
+                    CapabilityClass::Read,
                     ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
                     &args,
                 )
@@ -356,6 +364,7 @@ impl RemoteToolKind {
                 };
                 workspace_binding(
                     "list_dir",
+                    CapabilityClass::Read,
                     ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
                     &args,
                 )
@@ -367,6 +376,7 @@ impl RemoteToolKind {
                 };
                 workspace_binding(
                     "glob",
+                    CapabilityClass::Read,
                     ResourceScope::resource(BINDING_ADAPTER_ID, "glob_selector", &args.pattern),
                     &args,
                 )
@@ -381,6 +391,27 @@ impl RemoteToolKind {
                 };
                 workspace_binding(
                     "grep",
+                    CapabilityClass::Read,
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
+                    &args,
+                )
+            }
+            Self::WriteFile => {
+                let mut args: WriteFileArgs = decode_for_binding(ctx.args)?;
+                args.path = normalize_workspace_path(&args.path, ctx.workspace)?;
+                workspace_binding(
+                    "write_file",
+                    CapabilityClass::Mutate,
+                    ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
+                    &args,
+                )
+            }
+            Self::EditFile => {
+                let mut args: EditFileArgs = decode_for_binding(ctx.args)?;
+                args.path = normalize_workspace_path(&args.path, ctx.workspace)?;
+                workspace_binding(
+                    "edit_file",
+                    CapabilityClass::Mutate,
                     ResourceScope::resource(BINDING_ADAPTER_ID, "path", &args.path),
                     &args,
                 )
@@ -425,6 +456,23 @@ impl RemoteToolKind {
                 ExecutorOperation::Grep {
                     path: args.path,
                     pattern: args.pattern,
+                    execution_id,
+                }
+            }
+            Self::WriteFile => {
+                let args: WriteFileArgs = decode_bound(args)?;
+                ExecutorOperation::WriteFile {
+                    path: args.path,
+                    content: args.content,
+                    execution_id,
+                }
+            }
+            Self::EditFile => {
+                let args: EditFileArgs = decode_bound(args)?;
+                ExecutorOperation::EditFile {
+                    path: args.path,
+                    old_string: args.old_string,
+                    new_string: args.new_string,
                     execution_id,
                 }
             }
@@ -645,6 +693,7 @@ fn decode_bound<P: DeserializeOwned>(args: &BoundExecutionArguments) -> Result<P
 
 fn workspace_binding<P: Serialize>(
     operation: &str,
+    capability: CapabilityClass,
     scope: ResourceScope,
     args: &P,
 ) -> Result<ToolBinding, DescribeError> {
@@ -660,7 +709,7 @@ fn workspace_binding<P: Serialize>(
     let mut review = execution_object.clone();
     review.insert("operation".to_owned(), Value::String(operation.to_owned()));
     Ok(ToolBinding::new(
-        AppActionDescriptor::new(operation, CapabilityClass::Read, vec![scope])?,
+        AppActionDescriptor::new(operation, capability, vec![scope])?,
         ReviewProjection::from_value(Value::Object(review))?,
         BoundExecutionArguments::from_value(Value::Object(execution_object))?,
     ))
@@ -1021,7 +1070,7 @@ struct ReadFileArgs {
     limit: usize,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteFileArgs {
     #[schemars(length(min = 1))]
@@ -1029,7 +1078,7 @@ struct WriteFileArgs {
     content: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct EditFileArgs {
     #[schemars(length(min = 1))]
@@ -2059,14 +2108,21 @@ mod tests {
             "an unbound fixture registry cannot satisfy production validation"
         );
 
-        assert_eq!(registry.len(), 4);
+        assert_eq!(registry.len(), 6);
         assert_eq!(
             registry
                 .definitions()
                 .into_iter()
                 .map(|definition| definition.name)
                 .collect::<Vec<_>>(),
-            vec!["glob", "grep", "list_dir", "read_file"]
+            vec![
+                "edit_file",
+                "glob",
+                "grep",
+                "list_dir",
+                "read_file",
+                "write_file"
+            ]
         );
         let definition = registry.get("read_file").unwrap().def();
         assert_eq!(
@@ -2077,7 +2133,7 @@ mod tests {
             definition.parameters["properties"]["path"]["description"],
             "A workspace path. `artifact://` handles are not accepted."
         );
-        for forbidden in ["bash", "write_file", "edit_file", "delete"] {
+        for forbidden in ["bash", "delete"] {
             assert!(
                 registry.get(forbidden).is_none(),
                 "{forbidden} leaked into the production registry"
@@ -2085,6 +2141,15 @@ mod tests {
         }
         for allowed in ["read_file", "list_dir", "glob", "grep"] {
             assert_eq!(registry.get(allowed).unwrap().risk(), ToolRisk::ReadOnly);
+        }
+        for name in ["write_file", "edit_file"] {
+            assert_eq!(registry.get(name).unwrap().risk(), ToolRisk::Mutating);
+            assert!(
+                registry
+                    .reviewer_read_definitions()
+                    .iter()
+                    .all(|definition| definition.name != name)
+            );
         }
         let grep = registry.get("grep").unwrap().def();
         assert_eq!(
@@ -2142,6 +2207,8 @@ mod tests {
                 paths: vec!["src/lib.rs".to_owned()],
             }),
             Ok(ExecutorResponse::Grepped { matches: vec![] }),
+            Ok(ExecutorResponse::Written {}),
+            Ok(ExecutorResponse::Edited {}),
         ]);
         let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
         let workspace = WorkspacePaths::new("/workspace").unwrap();
@@ -2165,6 +2232,16 @@ mod tests {
                 "grep",
                 json!({"path":"/workspace/src","pattern":"foo|bar"}),
                 json!({"path":"src","pattern":"foo|bar"}),
+            ),
+            (
+                "write_file",
+                json!({"path":"/workspace/./note.txt","content":"覚えておきたいこと\nsecond line"}),
+                json!({"path":"note.txt","content":"覚えておきたいこと\nsecond line"}),
+            ),
+            (
+                "edit_file",
+                json!({"path":"./note.txt","old_string":"second line","new_string":"訂正\n"}),
+                json!({"path":"note.txt","old_string":"second line","new_string":"訂正\n"}),
             ),
         ];
 
@@ -2194,7 +2271,11 @@ mod tests {
             );
             assert_eq!(
                 sealed.invocation().descriptor.capability,
-                CapabilityClass::Read
+                if matches!(name, "write_file" | "edit_file") {
+                    CapabilityClass::Mutate
+                } else {
+                    CapabilityClass::Read
+                }
             );
             let (scope_kind, scope_id) = if name == "glob" {
                 (
@@ -2225,7 +2306,7 @@ mod tests {
                 .unwrap();
             assert!(
                 outcome.live_post_commit.is_none(),
-                "foundation reads must not produce process-local post-commit work"
+                "foundation operations must not produce process-local post-commit work"
             );
             assert_eq!(
                 fake.operations.lock().unwrap().len(),
@@ -2259,6 +2340,14 @@ mod tests {
             ExecutorOperation::Grep { path, pattern, .. }
                 if path == "src" && pattern == "foo|bar"
         ));
+        assert!(
+            matches!(&operations[4], ExecutorOperation::WriteFile { path, content, .. }
+            if path == "note.txt" && content == "覚えておきたいこと\nsecond line")
+        );
+        assert!(
+            matches!(&operations[5], ExecutorOperation::EditFile { path, old_string, new_string, .. }
+            if path == "note.txt" && old_string == "second line" && new_string == "訂正\n")
+        );
     }
 
     #[tokio::test]
@@ -2291,6 +2380,16 @@ mod tests {
                     "path": format!("grep/{PATH_SENTINEL}.txt"),
                     "pattern": PATTERN_SENTINEL,
                 }),
+                true,
+            ),
+            (
+                "write_file",
+                json!({"path":format!("write/{PATH_SENTINEL}.txt"),"content":PATTERN_SENTINEL}),
+                true,
+            ),
+            (
+                "edit_file",
+                json!({"path":format!("edit/{PATH_SENTINEL}.txt"),"old_string":PATTERN_SENTINEL,"new_string":format!("changed {PATTERN_SENTINEL}")}),
                 true,
             ),
         ];
@@ -2434,6 +2533,39 @@ mod tests {
         ));
         assert_eq!(fake.authorized_calls.load(Ordering::Relaxed), 0);
         assert!(fake.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_mutations_reject_outside_paths_without_executor_calls() {
+        let fake = Arc::new(FakeInvoker::default());
+        let registry = bound_test_registry_from_invoker(fake.clone()).unwrap();
+        let workspace = WorkspacePaths::new("/workspace").unwrap();
+        for path in [
+            "../outside",
+            "/elsewhere/note.txt",
+            "artifact://owner/tool-output/id",
+        ] {
+            for (name, arguments) in [
+                ("write_file", json!({"path":path,"content":"note"})),
+                (
+                    "edit_file",
+                    json!({"path":path,"old_string":"old","new_string":"new"}),
+                ),
+            ] {
+                assert!(
+                    registry
+                        .bind(
+                            &tool_call("outside", name, arguments),
+                            "flow-outside",
+                            &workspace
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert!(fake.operations.lock().unwrap().is_empty());
+        assert_eq!(fake.authorized_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2643,11 +2775,6 @@ mod tests {
         let workspace = WorkspacePaths::new("/workspace").unwrap();
         for (name, args) in [
             ("bash", json!({"command":"pwd"})),
-            ("write_file", json!({"path":"a","content":"b"})),
-            (
-                "edit_file",
-                json!({"path":"a","old_string":"b","new_string":"c"}),
-            ),
             ("delete", json!({"path":"a"})),
             (
                 "read_file",
@@ -2675,7 +2802,7 @@ mod tests {
             RpcIdentity::from_wire(PAID, 7, "current-nonce").unwrap(),
         )))
         .unwrap();
-        for name in ["bash", "write_file", "edit_file", "delete"] {
+        for name in ["bash", "delete"] {
             assert!(production.get(name).is_none());
         }
         for (name, arguments) in [

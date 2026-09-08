@@ -531,11 +531,11 @@ impl ExecutorClient {
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ExecutorResponse, ToolError> {
         // The production critical endpoint is a single-frame synchronous
-        // exchange. Once an authorized read is emitted it returns the exact
+        // exchange. Once an authorized workspace operation is emitted it returns the exact
         // primary terminal; it cannot truthfully acknowledge a second-frame
         // Cancel. Cancellation therefore remains prompt only before emission.
         let cancellation_mode = if permit.is_some()
-            && super::call_authority::is_production_read_operation(&operation)
+            && super::call_authority::is_production_workspace_operation(&operation)
         {
             CancellationMode::None
         } else {
@@ -772,7 +772,7 @@ enum CancelTerminal {
 
 #[derive(Clone, Copy)]
 enum CancellationMode {
-    /// Health and production single-frame reads are cancellable only before
+    /// Health and production single-frame workspace operations are cancellable only before
     /// request emission. After emission their primary terminal is truth.
     None,
     /// Synchronous executor operations cannot be actively stopped, but a
@@ -1761,78 +1761,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_read_post_emission_cancel_preserves_primary_without_cancel_frame() {
-        let root = temp_root("prd-cancel");
+    async fn production_unix_workspace_write_read_edit_read() {
+        let root = temp_root("workspace-roundtrip");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("visible.txt"), "visible").unwrap();
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let cancel = CancellationToken::new();
-        let cancel_server = cancel.clone();
-        let service_identity = identity();
+        let server_workspace = workspace.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, write) = stream.into_split();
-            let mut read = BufReader::new(read);
-            let mut first_line = Vec::new();
-            let count = read.read_until(b'\n', &mut first_line).await.unwrap();
-            assert!(count > 0, "authorized request must reach production socket");
-            assert_eq!(first_line.pop(), Some(b'\n'));
-            let request: Value = serde_json::from_slice(&first_line).unwrap();
-            assert_eq!(request["operation"]["type"], "list_dir");
-            assert!(request["call_authority"].is_object());
-
-            // The primary request is now emitted. The production endpoint owns
-            // a single synchronous exchange, so cancellation cannot become an
-            // unverified second tool operation on this connection.
-            cancel_server.cancel();
-            let mut second_line = Vec::new();
-            assert!(
-                timeout(
-                    Duration::from_millis(100),
-                    read.read_until(b'\n', &mut second_line),
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, write) = stream.into_split();
+                let mut line = Vec::new();
+                BufReader::new(read)
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .unwrap();
+                assert_eq!(line.pop(), Some(b'\n'));
+                run_critical_executor_test_service(
+                    line,
+                    write,
+                    identity(),
+                    server_workspace.clone(),
                 )
                 .await
-                .is_err(),
-                "authorized production read must not emit a follow-up Cancel frame"
-            );
-            assert!(second_line.is_empty());
-
-            run_critical_executor_test_service(first_line, write, service_identity, workspace)
-                .await
                 .unwrap();
+            }
         });
-
-        let operation = ExecutorOperation::ListDir {
-            path: ".".to_owned(),
-            execution_id: "production-read-cancel".to_owned(),
-        };
-        let response = ExecutorClient::new(&socket, identity())
+        let client = ExecutorClient::new(&socket, identity())
             .with_call_authority_signing_key(Zeroizing::new([7; 32]))
             .unwrap()
-            .with_deadlines(test_deadlines())
-            .execute_authorized(
-                operation,
-                CommittedExecutionPermit::executor_fixture(
-                    "grant-production-read-cancel",
-                    ToolInvocationRoute::Normal,
-                    ExecutionAuthorityProvenance::AgentOwn,
-                ),
-                cancel,
-                Arc::new(|_| {}),
-            )
-            .await
-            .expect("post-emission cancellation must preserve the production primary terminal")
-            .into_inner();
-        assert_eq!(
-            response,
-            ExecutorResponse::Listed {
-                entries: vec!["visible.txt".to_owned()],
+            .with_deadlines(test_deadlines());
+        let operations = [
+            ExecutorOperation::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "before".to_owned(),
+                execution_id: "write".to_owned(),
+            },
+            ExecutorOperation::ReadFile {
+                path: "note.txt".to_owned(),
+                offset: 0,
+                limit: 100,
+                execution_id: "read-before".to_owned(),
+            },
+            ExecutorOperation::EditFile {
+                path: "note.txt".to_owned(),
+                old_string: "before".to_owned(),
+                new_string: "after".to_owned(),
+                execution_id: "edit".to_owned(),
+            },
+            ExecutorOperation::ReadFile {
+                path: "note.txt".to_owned(),
+                offset: 0,
+                limit: 100,
+                execution_id: "read-after".to_owned(),
+            },
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            let response = client
+                .execute_authorized(
+                    operation,
+                    CommittedExecutionPermit::executor_fixture(
+                        &format!("roundtrip-{index}"),
+                        ToolInvocationRoute::Normal,
+                        ExecutionAuthorityProvenance::AgentOwn,
+                    ),
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            match (index, response) {
+                (0, ExecutorResponse::Written {}) | (2, ExecutorResponse::Edited {}) => {}
+                (1, ExecutorResponse::ReadFile { result }) => assert_eq!(result.content, "before"),
+                (3, ExecutorResponse::ReadFile { result }) => assert_eq!(result.content, "after"),
+                (_, response) => panic!("unexpected response: {response:?}"),
             }
-        );
+        }
         server.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "after"
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_workspace_post_emission_cancel_preserves_primary_without_cancel_frame() {
+        for mutate in [false, true] {
+            let root = temp_root("prd-cancel");
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("visible.txt"), "visible").unwrap();
+            let socket = root.join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let cancel = CancellationToken::new();
+            let cancel_server = cancel.clone();
+            let service_identity = identity();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut first_line = Vec::new();
+                let count = read.read_until(b'\n', &mut first_line).await.unwrap();
+                assert!(count > 0, "authorized request must reach production socket");
+                assert_eq!(first_line.pop(), Some(b'\n'));
+                let request: Value = serde_json::from_slice(&first_line).unwrap();
+                assert_eq!(
+                    request["operation"]["type"],
+                    if mutate { "write_file" } else { "list_dir" }
+                );
+                assert!(request["call_authority"].is_object());
+
+                // The primary request is now emitted. The production endpoint owns
+                // a single synchronous exchange, so cancellation cannot become an
+                // unverified second tool operation on this connection.
+                cancel_server.cancel();
+                let mut second_line = Vec::new();
+                assert!(
+                    timeout(
+                        Duration::from_millis(100),
+                        read.read_until(b'\n', &mut second_line),
+                    )
+                    .await
+                    .is_err(),
+                    "authorized production operation must not emit a follow-up Cancel frame"
+                );
+                assert!(second_line.is_empty());
+
+                run_critical_executor_test_service(first_line, write, service_identity, workspace)
+                    .await
+                    .unwrap();
+            });
+
+            let operation = if mutate {
+                ExecutorOperation::WriteFile {
+                    path: "visible.txt".to_owned(),
+                    content: "updated".to_owned(),
+                    execution_id: "production-write-cancel".to_owned(),
+                }
+            } else {
+                ExecutorOperation::ListDir {
+                    path: ".".to_owned(),
+                    execution_id: "production-read-cancel".to_owned(),
+                }
+            };
+            let response = ExecutorClient::new(&socket, identity())
+                .with_call_authority_signing_key(Zeroizing::new([7; 32]))
+                .unwrap()
+                .with_deadlines(test_deadlines())
+                .execute_authorized(
+                    operation,
+                    CommittedExecutionPermit::executor_fixture(
+                        "grant-production-read-cancel",
+                        ToolInvocationRoute::Normal,
+                        ExecutionAuthorityProvenance::AgentOwn,
+                    ),
+                    cancel,
+                    Arc::new(|_| {}),
+                )
+                .await
+                .expect("post-emission cancellation must preserve the production primary terminal")
+                .into_inner();
+            assert_eq!(
+                response,
+                if mutate {
+                    ExecutorResponse::Written {}
+                } else {
+                    ExecutorResponse::Listed {
+                        entries: vec!["visible.txt".to_owned()],
+                    }
+                }
+            );
+            server.await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("workspace/visible.txt")).unwrap(),
+                if mutate { "updated" } else { "visible" }
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     async fn run_source_transfer(
