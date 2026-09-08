@@ -4,12 +4,16 @@ pub const SYSTEM_PROMPT_VERSION: &str = "4";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactPrompt {
     L0ToL1,
+    L1ToL2,
+    L2Reintegration,
 }
 
 impl CompactPrompt {
     pub(crate) fn as_str(self) -> &'static str {
         let prompt = match self {
             Self::L0ToL1 => include_str!("../prompts/compact-l0-to-l1.md"),
+            Self::L1ToL2 => include_str!("../prompts/compact-l1-to-l2.md"),
+            Self::L2Reintegration => include_str!("../prompts/compact-l2-reintegration.md"),
         };
         without_trailing_newline(prompt)
     }

@@ -20,7 +20,11 @@ const MIDDLE_SUMMARY: &str = "The intervening source was checked before the late
 const MIDDLE_RAW: &str = "Intervening original observation replaced by its summary.";
 const DIRECTIVE: &str = "Reorganize the designated record using the complete preceding context.";
 
-async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
+async fn parent_prompt(
+    spec: &ModelSpec,
+    native: bool,
+) -> (PromptContext, Vec<VisibleMemoryFragment>) {
+    let mut visible_memory = Vec::new();
     let timestamp = DateTime::parse_from_rfc3339("2026-09-07T23:40:12.123456789Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -191,8 +195,7 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
         // between still-raw A and C. The summary has no fabricated transcript ID
         // or sequence; only its original batch establishes its chronological slot.
         use crate::memory::{
-            BatchState, CompactResult, ConsolidatedMemory, DecryptedMemorySummary, L0Batch,
-            ThreeLayerMemory,
+            BatchState, CompactResult, DecryptedMemorySummary, L0Batch, ThreeLayerMemory,
             estimate::{
                 ProviderContextItemWithFootprint, TokenCalibration, eviction_footprint_for_payload,
             },
@@ -219,10 +222,7 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
         let mut life_log = prompt.messages.clone();
         life_log.insert(3, middle.clone());
         let mut memory = ThreeLayerMemory::new(
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new(String::new()),
-                est_tokens: 0,
-            },
+            std::collections::VecDeque::new(),
             TokenCalibration::default(),
         );
         memory.push_l0(L0Batch::new(life_log[..3].to_vec(), 1, 0, 100));
@@ -234,6 +234,10 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
         memory.store_compact_result(
             source_batch,
             CompactResult {
+                original_seq_span: Some(crate::memory::OriginalSequenceSpan {
+                    from_seq: 35,
+                    to_seq: 35,
+                }),
                 summary: DecryptedMemorySummary::new(MIDDLE_SUMMARY.into()),
                 est_tokens: 15,
                 time_range: (
@@ -257,14 +261,19 @@ async fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
         assembler
             .install_hydrated_memory(memory, &life_log, provider_context)
             .unwrap();
-        prompt = assembler.assemble(&life_log, 0).await.unwrap();
+        let assembled = assembler
+            .assemble_with_estimate(&life_log, 0)
+            .await
+            .unwrap();
+        visible_memory = assembled.visible_memory;
+        prompt = assembled.prompt;
         assert!(prompt.messages.iter().any(|message| matches!(message,
             ContextMessage::Synthetic { message: Message::User(user) }
                 if user.incoming_timing.is_none() && user.content.iter().any(|content|
                     matches!(content, UserContent::Text { text } if text.contains(MIDDLE_SUMMARY)))
         )), "L1 must remain synthetic, not acquire a persisted transcript identity");
     }
-    prompt
+    (prompt, visible_memory)
 }
 
 fn anthropic_content(messages: &[Value]) -> Vec<(Value, Value)> {
@@ -343,8 +352,11 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
             }),
             native_compaction: native,
         };
-        let prompt = parent_prompt(&spec, native).await;
-        let snapshot = ParentContextSnapshot::capture(&prompt, &spec, &options);
+        let (prompt, visible_memory) = parent_prompt(&spec, native).await;
+        let snapshot =
+            ParentContextSnapshot::capture_with_memory(&prompt, &spec, &options, &visible_memory)
+                .unwrap();
+        assert_eq!(snapshot.visible_memory().len(), usize::from(!native));
         let fork = snapshot
             .fork_with_directive(UserMessage {
                 incoming_source: None,

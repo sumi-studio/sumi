@@ -22,6 +22,7 @@ use crate::prompts::CompactPrompt;
 use crate::provider::types::{
     AssistantContent, ContextMessage, Message, ParentContextSnapshot, PromptContext, ProviderEvent,
     ProviderEventStream, ProviderOutput, StopReason, UserContent, UserMessage,
+    VisibleMemoryFragment,
 };
 use crate::provider::{ModelSpec, RequestOptions};
 use crate::store::{
@@ -63,10 +64,17 @@ struct TargetMessage {
 }
 
 #[derive(Clone, Serialize)]
-struct CompactionTarget {
-    batch_id: BatchId,
-    source_version: u64,
-    messages: Vec<TargetMessage>,
+#[serde(untagged)]
+enum CompactionTarget {
+    L0 {
+        batch_id: BatchId,
+        source_version: u64,
+        messages: Vec<TargetMessage>,
+    },
+    Upper {
+        kind: String,
+        fragments: Vec<VisibleMemoryFragment>,
+    },
 }
 
 /// Only an actual parent snapshot can construct the reasoning input. Durable
@@ -132,7 +140,7 @@ impl CompactionInput {
         }
         Ok(Self {
             parent,
-            target: CompactionTarget {
+            target: CompactionTarget::L0 {
                 batch_id,
                 source_version,
                 messages: target_messages,
@@ -147,9 +155,11 @@ impl CompactionInput {
         let mut target = serde_json::to_value(&self.target)
             .map_err(|error| CompactError::InvalidInput(error.to_string()))?;
         let mut images = Vec::new();
-        for message in target["messages"]
-            .as_array_mut()
-            .expect("serialized target messages")
+        for message in target
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
         {
             if let Some(content) = message["original"]["content"].as_array_mut() {
                 for block in content {
@@ -169,7 +179,7 @@ impl CompactionInput {
         let target = serde_json::to_string(&serde_json::json!({"compact_target": target}))
             .map_err(|error| CompactError::InvalidInput(error.to_string()))?;
         let mut content = vec![UserContent::Text {
-            text: format!("{}\n\n{}", CompactPrompt::L0ToL1.as_str(), target),
+            text: format!("{}\n\n{}", self.compact_prompt().as_str(), target),
         }];
         for (index, image) in images.into_iter().enumerate() {
             content.push(UserContent::Text {
@@ -187,12 +197,52 @@ impl CompactionInput {
             .map_err(CompactError::InvalidInput)
     }
 
+    fn compact_prompt(&self) -> CompactPrompt {
+        match &self.target {
+            CompactionTarget::L0 { .. } => CompactPrompt::L0ToL1,
+            CompactionTarget::Upper { kind, .. } if kind == "compact_l1" => CompactPrompt::L1ToL2,
+            CompactionTarget::Upper { .. } => CompactPrompt::L2Reintegration,
+        }
+    }
+
     fn time_range(&self) -> (DateTime<Utc>, DateTime<Utc>) {
-        let timestamps = self.target.messages.iter().map(|message| message.timestamp);
-        (
-            timestamps.clone().min().expect("nonempty target"),
-            timestamps.max().expect("nonempty target"),
-        )
+        match &self.target {
+            CompactionTarget::L0 { messages, .. } => (
+                messages
+                    .iter()
+                    .map(|m| m.timestamp)
+                    .min()
+                    .expect("nonempty target"),
+                messages
+                    .iter()
+                    .map(|m| m.timestamp)
+                    .max()
+                    .expect("nonempty target"),
+            ),
+            CompactionTarget::Upper { fragments, .. } => (
+                fragments
+                    .iter()
+                    .map(|f| f.time_range.0)
+                    .min()
+                    .expect("nonempty target"),
+                fragments
+                    .iter()
+                    .map(|f| f.time_range.1)
+                    .max()
+                    .expect("nonempty target"),
+            ),
+        }
+    }
+
+    fn original_seq_span(&self) -> Option<super::OriginalSequenceSpan> {
+        let (from_seq, to_seq) = match &self.target {
+            CompactionTarget::L0 { messages, .. } => (messages.first()?.seq, messages.last()?.seq),
+            CompactionTarget::Upper { fragments, .. } => (
+                fragments.first()?.original_seq_span?.from_seq,
+                fragments.last()?.original_seq_span?.to_seq,
+            ),
+        };
+        Some(super::OriginalSequenceSpan { from_seq, to_seq })
     }
 }
 
@@ -299,25 +349,38 @@ fn result_from_output(
     }
     let est_tokens = crate::memory::estimate::estimate_text_tokens(&text)
         .map_err(|error| CompactError::Estimate(error.to_string()))?;
+    if let CompactionTarget::Upper { fragments, .. } = &input.target {
+        let source_tokens = fragments
+            .iter()
+            .try_fold(0u64, |total, fragment| {
+                crate::memory::estimate::estimate_text_tokens(&fragment.text)
+                    .map(|tokens| total.saturating_add(tokens))
+            })
+            .map_err(|error| CompactError::Estimate(error.to_string()))?;
+        if est_tokens >= source_tokens {
+            return Ok(None);
+        }
+    }
     Ok(Some(CompactResult {
+        original_seq_span: input.original_seq_span(),
         summary: DecryptedMemorySummary::new(text),
         est_tokens,
         time_range: input.time_range(),
     }))
 }
 
-/// Run at most one queued L0 edit from a fresh parent snapshot. The caller owns
+/// Run at most one memory edit from a fresh parent snapshot. The caller owns
 /// the task lifetime and supplies a new actual snapshot for the next attempt.
 /// Missing target context never falls back to a batch-only reconstruction.
-pub(crate) async fn compact_next_l0(
+pub(crate) async fn compact_next_memory(
     store: Arc<Store>,
     parent: ParentContextSnapshot,
     cancel: CancellationToken,
 ) -> Result<bool> {
-    compact_next_l0_with_provider(store, parent, cancel, &ParentProvider).await
+    compact_next_memory_with_provider(store, parent, cancel, &ParentProvider).await
 }
 
-async fn compact_next_l0_with_provider(
+async fn compact_next_memory_with_provider(
     store: Arc<Store>,
     parent: ParentContextSnapshot,
     cancel: CancellationToken,
@@ -327,6 +390,7 @@ async fn compact_next_l0_with_provider(
         return Ok(false);
     }
     recover_expired_running_jobs(&store).await?;
+    prepare_upper_job(&store, &parent).await?;
     let Some((mut job, input)) = claim_next_pending_job(&store, &parent).await? else {
         return Ok(false);
     };
@@ -363,8 +427,50 @@ async fn input_for_job(
     job: &Job,
     parent: ParentContextSnapshot,
 ) -> Result<Option<CompactionInput>> {
-    if job.kind != MemoryJobKind::CompactL0 || job.source_ids.len() != 1 {
-        bail!("only a single L0 batch can be a memory edit target");
+    if job.kind != MemoryJobKind::CompactL0 {
+        let expected = job_source_versions(job)?;
+        if current_batch_versions(store, &expected).await? != expected {
+            return Ok(None);
+        }
+        let fragments: Vec<_> = job
+            .source_ids
+            .iter()
+            .map(|id| {
+                parent
+                    .visible_memory()
+                    .iter()
+                    .find(|fragment| {
+                        fragment.batch_id.to_string() == *id
+                            && expected.get(&fragment.batch_id) == Some(&fragment.version)
+                    })
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        if fragments.len() != job.source_ids.len() || !contiguous_fragments(&fragments) {
+            return Ok(None);
+        }
+        let expected_layer = if job.kind == MemoryJobKind::CompactL1 {
+            crate::provider::types::MemoryLayer::L1
+        } else {
+            crate::provider::types::MemoryLayer::L2
+        };
+        if fragments
+            .iter()
+            .any(|fragment| fragment.layer != expected_layer)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(CompactionInput {
+            parent,
+            target: CompactionTarget::Upper {
+                kind: job.kind.as_str().to_owned(),
+                fragments,
+            },
+        }));
+    }
+    if job.source_ids.len() != 1 {
+        bail!("L0 edit requires exactly one source");
     }
     let source_id = &job.source_ids[0];
     let rows = sqlx::query(
@@ -552,6 +658,171 @@ async fn current_batch_versions(
     Ok(current)
 }
 
+/// Targets must be adjacent in the actual request, not merely adjacent in a
+/// layer's shelf. A retained raw message or other-layer fragment ends a group.
+fn contiguous_fragments(fragments: &[VisibleMemoryFragment]) -> bool {
+    !fragments.is_empty()
+        && fragments
+            .iter()
+            .all(|fragment| fragment.original_seq_span.is_some())
+        && fragments.windows(2).all(|pair| {
+            pair[0].message_index.checked_add(1) == Some(pair[1].message_index)
+                && pair[0].adjacency_group == pair[1].adjacency_group
+                && pair[0].original_seq_span.unwrap().to_seq
+                    < pair[1].original_seq_span.unwrap().from_seq
+        })
+}
+
+async fn upper_layer_tokens(store: &Store, layer: i64) -> Result<u64> {
+    // Compacted sources remain visible until replacement; a compacted output
+    // candidate is not yet visible. The indexed job relation distinguishes them.
+    let value: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(b.est_tokens), 0) FROM memory_batches b
+         WHERE b.layer = ? AND (b.state = 'promoted' OR
+           (b.state = 'compacted' AND EXISTS (
+             SELECT 1 FROM memory_jobs j, json_each(j.source_ids) source
+             WHERE j.status = 'completed' AND source.value = b.id)))",
+    )
+    .bind(layer)
+    .fetch_one(store.pool())
+    .await?;
+    Ok(u64::try_from(value)?)
+}
+
+async fn prepare_upper_job(store: &Store, parent: &ParentContextSnapshot) -> Result<()> {
+    // One upper job owns a source group until it is applied or retained. L0
+    // preparation remains independent and can keep running as experience arrives.
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM memory_jobs WHERE kind != 'compact_l0'
+         AND status IN ('pending', 'running', 'completed'))",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    if busy {
+        return Ok(());
+    }
+    for (kind, layer, limit, drop_to) in [
+        (
+            MemoryJobKind::CompactL1,
+            crate::provider::types::MemoryLayer::L1,
+            super::L1_LIMIT,
+            super::L1_DROP_TO,
+        ),
+        (
+            MemoryJobKind::ConsolidateL2,
+            crate::provider::types::MemoryLayer::L2,
+            super::L2_LIMIT,
+            super::L2_LIMIT,
+        ),
+    ] {
+        let total = upper_layer_tokens(
+            store,
+            if kind == MemoryJobKind::CompactL1 {
+                1
+            } else {
+                2
+            },
+        )
+        .await?;
+        if total <= limit {
+            continue;
+        }
+        let mut fragments: Vec<_> = parent
+            .visible_memory()
+            .iter()
+            .filter(|fragment| fragment.layer == layer && fragment.original_seq_span.is_some())
+            .cloned()
+            .collect();
+        fragments.sort_by_key(|fragment| fragment.message_index);
+        while !fragments.is_empty() {
+            let mut selected = vec![fragments.remove(0)];
+            let mut consumed = crate::memory::estimate::estimate_text_tokens(&selected[0].text)?;
+            while let Some(fragment) = fragments.first() {
+                if kind == MemoryJobKind::CompactL1 && consumed >= total.saturating_sub(drop_to) {
+                    break;
+                }
+                if !contiguous_fragments(&[selected.last().unwrap().clone(), fragment.clone()]) {
+                    break;
+                }
+                let fragment = fragments.remove(0);
+                consumed = consumed.saturating_add(crate::memory::estimate::estimate_text_tokens(
+                    &fragment.text,
+                )?);
+                selected.push(fragment);
+            }
+            let source_ids: Vec<_> = selected.iter().map(|f| f.batch_id.to_string()).collect();
+            let expected: BTreeMap<_, _> =
+                selected.iter().map(|f| (f.batch_id, f.version)).collect();
+            if current_batch_versions(store, &expected).await? != expected {
+                continue;
+            }
+            // A prior KEEP_UNCHANGED applies only to this exact source version tuple.
+            let unchanged = sqlx::query("SELECT source_ids, source_versions FROM memory_jobs WHERE kind = ? AND json_extract(source_ids, '$[0]') = ? AND status = 'unchanged'")
+            .bind(kind.as_str()).bind(&source_ids[0]).fetch_all(store.pool()).await?;
+            let mut retained = false;
+            for row in unchanged {
+                let ids: Vec<String> =
+                    serde_json::from_str(row.try_get::<String, _>("source_ids")?.as_str())?;
+                let versions: HashMap<String, i64> =
+                    serde_json::from_str(row.try_get::<String, _>("source_versions")?.as_str())?;
+                if ids == source_ids
+                    && selected.iter().all(|f| {
+                        versions.get(&f.batch_id.to_string()).copied()
+                            == i64::try_from(f.version).ok()
+                    })
+                {
+                    retained = true;
+                    break;
+                }
+            }
+            if retained {
+                continue;
+            }
+            let target = Uuid::now_v7();
+            let mut versions: BTreeMap<String, i64> = selected
+                .iter()
+                .map(|f| Ok((f.batch_id.to_string(), i64::try_from(f.version)?)))
+                .collect::<Result<_>>()?;
+            versions.insert(target.to_string(), 0);
+            let transition = MemoryTransition {
+                expected_source_states: expected
+                    .keys()
+                    .map(|id| (*id, MemoryBatchState::Promoted))
+                    .collect(),
+                expected_source_versions: expected,
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    target.to_string(),
+                    MemoryLayer::L2,
+                    0,
+                    0,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                job_inserts: vec![MemoryJobRecord::new(
+                    Uuid::now_v7().to_string(),
+                    kind,
+                    0,
+                    source_ids,
+                    versions,
+                )],
+                ..Default::default()
+            };
+            EventWriter::new(Arc::new(store.clone()))
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::memory_maintenance("upper_memory_prepared")?),
+                        projections: vec![Projection::MemoryTransition(transition)],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await?;
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 async fn claim_next_pending_job(
     store: &Store,
     parent: &ParentContextSnapshot,
@@ -560,7 +831,7 @@ async fn claim_next_pending_job(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
          FROM memory_jobs
-         WHERE status = 'pending' AND kind = 'compact_l0'
+         WHERE status = 'pending'
          ORDER BY batch_seq ASC, created_at ASC",
     )
     .fetch_all(store.pool())
@@ -813,7 +1084,12 @@ async fn complete_job(
             job.source_versions.get(source_id).copied().ok_or_else(|| {
                 anyhow!("source version missing for {source_id} in job {}", job.id)
             })?;
-        if version != expected || state != MemoryBatchState::Compacting.as_str() {
+        let expected_state = if job.kind == MemoryJobKind::CompactL0 {
+            MemoryBatchState::Compacting
+        } else {
+            MemoryBatchState::Promoted
+        };
+        if version != expected || state != expected_state.as_str() {
             supersede_stale_job(store, job, &target).await?;
             return Ok(false);
         }
@@ -876,7 +1152,11 @@ async fn retain_original_job(store: &Store, job: &Job) -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("memory edit target is missing"))?;
     let mut mutations = Vec::with_capacity(job.source_ids.len() + 1);
-    for source_id in &job.source_ids {
+    for source_id in job
+        .source_ids
+        .iter()
+        .filter(|_| job.kind == MemoryJobKind::CompactL0)
+    {
         let batch_id = Uuid::parse_str(source_id)?;
         let row = sqlx::query("SELECT est_tokens FROM memory_batches WHERE id = ?")
             .bind(source_id)
@@ -1067,31 +1347,24 @@ pub(crate) async fn recover_boot_memory_jobs(
 }
 
 /// Prepare results asynchronously, but retain the original provider prefix until
-/// live L0 strictly exceeds its budget. Apply only enough oldest ready chunks to
-/// return within the budget; unavailable older chunks do not block later ones.
-/// Apply completed L0 edits independently. Each transaction checks only its
-/// captured source versions, so an unchanged or unavailable older batch cannot
-/// prevent another completed edit from becoming usable. Summary chronology is
-/// retained by the target batch sequence and result time range.
+/// its source layer exceeds its budget. Every layer uses exact source versions;
+/// unrelated new experience and unchanged earlier groups do not block it.
 pub(crate) async fn apply_ready_memory(store: Arc<Store>) -> Result<usize> {
-    if live_l0_tokens(&store).await? <= super::L0_LIMIT {
-        return Ok(0);
-    }
     let rows = sqlx::query(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
-         FROM memory_jobs WHERE kind = 'compact_l0' AND status = 'completed'
-         ORDER BY batch_seq ASC",
-    )
-    .fetch_all(store.pool())
-    .await?;
+         FROM memory_jobs WHERE status = 'completed'
+         ORDER BY CASE kind WHEN 'compact_l0' THEN 0 WHEN 'compact_l1' THEN 1 ELSE 2 END, batch_seq ASC",
+    ).fetch_all(store.pool()).await?;
     let mut applied = 0;
     for row in rows {
-        if live_l0_tokens(&store).await? <= super::L0_LIMIT {
-            break;
-        }
         let job = parse_job(&row)?;
-        if apply_completed_job(store.clone(), &job).await? {
+        let needed = match job.kind {
+            MemoryJobKind::CompactL0 => live_l0_tokens(&store).await? > super::L0_LIMIT,
+            MemoryJobKind::CompactL1 => upper_layer_tokens(&store, 1).await? > super::L1_LIMIT,
+            MemoryJobKind::ConsolidateL2 => upper_layer_tokens(&store, 2).await? > super::L2_LIMIT,
+        };
+        if needed && apply_completed_job(store.clone(), &job).await? {
             applied += 1;
         }
     }
@@ -2152,7 +2425,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                compact_next_l0_with_provider(
+                compact_next_memory_with_provider(
                     store.clone(),
                     parent,
                     CancellationToken::new(),
@@ -2189,14 +2462,10 @@ mod tests {
                         Uuid::parse_str(&source).unwrap(),
                         source_version as u64,
                     )]),
-                    batch_mutations: vec![MemoryBatchMutation {
-                        batch_id: Uuid::parse_str(&source).unwrap(),
-                        expected_version: source_version as u64,
-                        new_state: MemoryBatchState::Compacting,
-                        summary: None,
-                        est_tokens: 0,
-                        footprint_delta: 0,
-                    }],
+                    expected_source_states: BTreeMap::from([(
+                        Uuid::parse_str(&source).unwrap(),
+                        MemoryBatchState::Promoted,
+                    )]),
                     batch_inserts: vec![MemoryBatchRecord::new(
                         &target,
                         MemoryLayer::L2,
@@ -2211,7 +2480,7 @@ mod tests {
                         MemoryJobKind::CompactL1,
                         1,
                         vec![source.clone()],
-                        BTreeMap::from([(source.clone(), source_version + 1), (target.clone(), 0)]),
+                        BTreeMap::from([(source.clone(), source_version), (target.clone(), 0)]),
                     )],
                     ..Default::default()
                 },
@@ -2244,7 +2513,7 @@ mod tests {
             restore_abandoned_sources(
                 &store,
                 &obsolete,
-                MemoryBatchState::Compacting,
+                MemoryBatchState::Promoted,
                 &mut guards,
                 &mut mutations,
             )
@@ -2256,6 +2525,7 @@ mod tests {
             );
             if completed {
                 let candidate = CompactResult {
+                    original_seq_span: None,
                     summary: DecryptedMemorySummary::new("Abandoned output".into()),
                     est_tokens: 5,
                     time_range: (timestamp(), timestamp()),
@@ -2312,7 +2582,7 @@ mod tests {
             assert_eq!(memory.l1().len(), 1);
             assert_eq!(memory.l1()[0].summary.expose(), expected);
             assert_eq!(memory.l1()[0].est_tokens, source_estimate as u64);
-            assert!(memory.l2().summary.expose().is_empty());
+            assert!(memory.l2().is_empty());
         }
     }
 
@@ -2329,7 +2599,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            compact_next_l0_with_provider(
+            compact_next_memory_with_provider(
                 store.clone(),
                 parent.clone(),
                 CancellationToken::new(),
@@ -2351,7 +2621,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            compact_next_l0_with_provider(store, parent, CancellationToken::new(), &retry)
+            compact_next_memory_with_provider(store, parent, CancellationToken::new(), &retry)
                 .await
                 .unwrap()
         );
@@ -2379,7 +2649,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !compact_next_l0_with_provider(
+            !compact_next_memory_with_provider(
                 store.clone(),
                 parent.clone(),
                 CancellationToken::new(),
@@ -2393,7 +2663,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            compact_next_l0_with_provider(
+            compact_next_memory_with_provider(
                 store.clone(),
                 parent.clone(),
                 CancellationToken::new(),
@@ -2425,7 +2695,7 @@ mod tests {
                 .unwrap();
         assert_eq!(retained, 1);
         assert!(
-            !compact_next_l0_with_provider(store, parent, CancellationToken::new(), &summary)
+            !compact_next_memory_with_provider(store, parent, CancellationToken::new(), &summary)
                 .await
                 .unwrap()
         );
@@ -2452,7 +2722,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            compact_next_l0_with_provider(
+            compact_next_memory_with_provider(
                 store.clone(),
                 parent,
                 CancellationToken::new(),
@@ -2531,12 +2801,11 @@ mod tests {
             vec![],
         )
         .await;
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM memory_jobs WHERE status = 'pending' AND kind = 'compact_l0'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_jobs WHERE status = 'pending'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
         assert!(pending >= 1, "real user boundary seals old L0");
         snapshot(hydrate(store).await.messages)
     }
@@ -2554,7 +2823,7 @@ mod tests {
         let task_store = store.clone();
         let task_provider = provider.clone();
         let task = tokio::spawn(async move {
-            compact_next_l0_with_provider(
+            compact_next_memory_with_provider(
                 task_store,
                 parent,
                 CancellationToken::new(),
@@ -2623,7 +2892,7 @@ mod tests {
         };
         for _ in 0..2 {
             assert!(
-                compact_next_l0_with_provider(
+                compact_next_memory_with_provider(
                     store.clone(),
                     parent.clone(),
                     CancellationToken::new(),
@@ -2670,7 +2939,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            compact_next_l0_with_provider(
+            compact_next_memory_with_provider(
                 store.clone(),
                 parent,
                 CancellationToken::new(),
@@ -2750,7 +3019,7 @@ mod tests {
         };
         for _ in 0..2 {
             assert!(
-                compact_next_l0_with_provider(
+                compact_next_memory_with_provider(
                     store.clone(),
                     parent.clone(),
                     CancellationToken::new(),
@@ -2857,7 +3126,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !compact_next_l0_with_provider(
+            !compact_next_memory_with_provider(
                 store.clone(),
                 parent,
                 CancellationToken::new(),
@@ -2879,4 +3148,5 @@ mod tests {
         assert_eq!(active, before, "the original representations remain active");
         assert!(memory.l1().is_empty());
     }
+    include!("compactor/upper_tests.rs");
 }
