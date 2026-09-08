@@ -336,7 +336,13 @@ func (s *BrowserAuthServer) serveSessionStatus(w http.ResponseWriter, r *http.Re
 	}
 	claims, err := s.Sessions.VerifySession(r.Context(), cookie.Value)
 	if err != nil {
-		writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+		if errors.Is(err, errBrowserSessionInvalid) || errors.Is(err, errBrowserSessionRevoked) {
+			writeBrowserAuthJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+		} else {
+			// Failure to check revocation is not proof of session loss.
+			// Keep authorization closed without telling clients to erase drafts.
+			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		}
 		return
 	}
 	if !validBrowserAuthorityBindingID(claims.authorityBindingID) {

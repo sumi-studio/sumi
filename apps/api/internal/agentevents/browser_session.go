@@ -34,6 +34,7 @@ var (
 	errBrowserSessionMissing   = errors.New("browser session cookie is missing")
 	errBrowserSessionDuplicate = errors.New("duplicate browser session cookies")
 	errBrowserSessionRevoked   = errors.New("browser session revoked")
+	errBrowserSessionInvalid   = errors.New("invalid browser session")
 	errBrowserSessionRetired   = errors.New("browser session already retired")
 	errRevocationCapacity      = errors.New("browser session revocation capacity exhausted")
 )
@@ -333,7 +334,12 @@ func (v *HMACUserSessionVerifier) signPreparedSession(
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
 	claims, err := v.verifySignedSession(ctx, signedCookie)
 	if err != nil {
-		return UserSessionClaims{}, err
+		// A canceled verification has not established that the cookie is
+		// invalid. Only failures of the local signed-cookie checks do so.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return UserSessionClaims{}, err
+		}
+		return UserSessionClaims{}, fmt.Errorf("%w: %w", errBrowserSessionInvalid, err)
 	}
 	if err := v.revocations.CheckBrowserSession(
 		ctx,
