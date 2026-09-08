@@ -408,10 +408,10 @@ mod tests {
     fn calibrated_forced_threshold_checks_exact_below_above_and_overflow() {
         let ratio = TokenCalibration::new(2.0).expect("ratio");
         let assistant = boundary(MessageRole::Assistant, false, &[], false);
-        assert_eq!(seal_before_next(&batch(5_000, 0), &assistant, ratio), None);
-        assert_eq!(seal_before_next(&batch(4_999, 0), &assistant, ratio), None);
+        assert_eq!(seal_before_next(&batch(10_000, 0), &assistant, ratio), None);
+        assert_eq!(seal_before_next(&batch(9_999, 0), &assistant, ratio), None);
         assert_eq!(
-            seal_before_next(&batch(5_001, 0), &assistant, ratio),
+            seal_before_next(&batch(10_001, 0), &assistant, ratio),
             Some(SealReason::ForcedFootprint)
         );
         assert_eq!(

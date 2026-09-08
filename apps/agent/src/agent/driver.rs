@@ -545,6 +545,8 @@ impl RunDriver for InjectedRunDriver {
         let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
             .context("rehydrated memory graph is invalid after idle apply")?;
 
+        let more_prepared_results = !memory.shelf().is_empty();
+
         // Session calls this only while it uniquely owns RunCore. Prepare
         // every fallible value first, then refresh assembler and core before
         // reporting success; provider admission cannot observe the old view.
@@ -555,6 +557,12 @@ impl RunDriver for InjectedRunDriver {
         )?;
         core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
         maintenance.refresh_pending.store(false, Ordering::Release);
+        if more_prepared_results {
+            // Session clears its readiness flag after a successful refresh.
+            // Keep the remaining shelf eligible at later idle boundaries even
+            // if no further fork completes before L0 crosses the limit again.
+            self.memory_ready.notify_one();
+        }
         Ok(true)
     }
 

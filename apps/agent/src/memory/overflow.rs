@@ -340,7 +340,7 @@ fn capacity_notice(omitted: &[ContextMessage]) -> Option<ContextMessage> {
              {} earlier raw entries from private history, sequence range {}..={}, message timestamps {} through {}, \
              are outside this working view because the provider rejected its size. They have not been summarized or deleted. \
              Their contents and any uncertainty about them remain in your original private history. \
-             Reread with memory_recall({{\"operation\":\"read\",\"from_seq\":{},\"limit\":5}}), \
+             Reread with conversation_history({{\"operation\":\"read\",\"from_seq\":{},\"limit\":5}}), \
              following next_after_seq while needed through sequence {}. Do not treat this omission as evidence that those experiences were unimportant.",
                     persisted.len(),
                     first_seq,

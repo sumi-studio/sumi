@@ -578,7 +578,7 @@ mod tests {
     async fn oversized_original_can_be_reread_in_bounded_fragments_without_losing_details_or_images()
      {
         use crate::provider::types::{UserContent, ValidatedToolArguments};
-        use crate::tools::memory::MemoryRecallTool;
+        use crate::tools::memory::ConversationHistoryTool;
         use crate::tools::{Tool, ToolCtx, ToolError, WorkspacePaths};
         use tokio_util::sync::CancellationToken;
 
@@ -599,7 +599,7 @@ mod tests {
             &original("the later observation"),
         )
         .await;
-        let tool = MemoryRecallTool::new(store.clone());
+        let tool = ConversationHistoryTool::new(store.clone());
         let workspace = WorkspacePaths::new("/workspace").unwrap();
         let mut request = json!({"operation":"read","from_seq":1,"limit":1});
         let mut reconstructed = String::new();

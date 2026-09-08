@@ -28,7 +28,7 @@ use self::estimate::{TokenCalibration, estimate_public_messages};
 
 /// Minimum public estimate before an open L0 batch is sealed at a user-turn
 /// boundary.
-pub const L0_BATCH_MIN: u64 = 5_000;
+pub const L0_BATCH_MIN: u64 = 10_000;
 /// Maximum effective estimate tolerated by an open batch.  This is the
 /// forced-seal fallback threshold, not a general seal boundary.
 pub const L0_FORCED_SEAL_LIMIT: u64 = L0_BATCH_MIN * 2;
@@ -2078,8 +2078,8 @@ mod tests {
 
     #[test]
     fn memory_limits_match_the_canonical_defaults() {
-        assert_eq!(L0_BATCH_MIN, 5_000);
-        assert_eq!(L0_FORCED_SEAL_LIMIT, 10_000);
+        assert_eq!(L0_BATCH_MIN, 10_000);
+        assert_eq!(L0_FORCED_SEAL_LIMIT, 20_000);
         assert_eq!(L0_LIMIT, 40_000);
         assert_eq!(L0_DROP_TO, 30_000);
         assert_eq!(L1_LIMIT, 15_000);

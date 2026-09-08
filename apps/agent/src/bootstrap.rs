@@ -71,7 +71,7 @@ use crate::{
     tools::{
         Tool, WorkspacePaths,
         executor::{ExecutorClient, decode_hex_32, remote_executor_registry_with_tools},
-        memory::MemoryRecallTool,
+        memory::ConversationHistoryTool,
         messaging::MessagingTool,
         workspace::WorkspaceListTool,
         workspace_invitation::{WorkspaceInvitationAcceptTool, WorkspaceInvitationListTool},
@@ -1179,8 +1179,8 @@ async fn run_after_not_ready(
         );
         let workspace_invitation_accept_tool: Arc<dyn Tool> =
             Arc::new(WorkspaceInvitationAcceptTool::new(workspace_invitation_api));
-        let memory_recall_tool: Arc<dyn Tool> =
-            Arc::new(MemoryRecallTool::new(store.as_ref().clone()));
+        let conversation_history_tool: Arc<dyn Tool> =
+            Arc::new(ConversationHistoryTool::new(store.as_ref().clone()));
         let registry = remote_executor_registry_with_tools(
             executor_client.clone(),
             [
@@ -1188,7 +1188,7 @@ async fn run_after_not_ready(
                 workspace_list_tool,
                 workspace_invitation_list_tool,
                 workspace_invitation_accept_tool,
-                memory_recall_tool,
+                conversation_history_tool,
             ],
         )
         .context(
