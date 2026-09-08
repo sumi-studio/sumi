@@ -690,3 +690,35 @@ func waitForFile(t *testing.T, path string) {
 	}
 	t.Fatalf("timed out waiting for %s", path)
 }
+
+func TestChatGPTActivationContainsIdentityButNoConversationCredential(t *testing.T) {
+	config := testActivationConfig()
+	config.ModelPreset = "chatgpt-responses"
+	config.ModelID = "gpt-6-astra"
+	config.ModelReasoningEffort = "medium"
+	config.ModelAccountScope = "actual-account"
+	config.ChatGPTConnectionID = "connection"
+	config.ProviderAPIKey = ""
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	env := activationEnvironment(config)
+	if _, err := mergeEnvironment(nil, env, nil, testPAID); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := env["SUMI_PROVIDER_API_KEY"]; exists {
+		t.Fatal("native runtime received conversation API key")
+	}
+	if env["SUMI_CHATGPT_CONNECTION_ID"] != "connection" || env["SUMI_MODEL_ACCOUNT_SCOPE"] != "actual-account" || env["SUMI_MODEL_REASONING_EFFORT"] != "medium" || env["SUMI_EXECUTION_REVIEWER_API_KEY"] != config.ExecutionReviewerAPIKey {
+		t.Fatal("native identity or reviewer boundary missing")
+	}
+	config.ProviderAPIKey = "wrong-provider-key"
+	if config.Validate() == nil {
+		t.Fatal("native activation accepted unrelated provider credential")
+	}
+	config.ProviderAPIKey = ""
+	config.ModelAccountScope = ""
+	if config.Validate() == nil {
+		t.Fatal("native activation accepted fabricated absent account scope")
+	}
+}

@@ -723,48 +723,154 @@ func TestAdmissionHoldPreventsIdleStopEvenAfterTimeout(t *testing.T) {
 }
 
 func TestIdleClaimRejectsAdmissionUntilReplacementGeneration(t *testing.T) {
-	old := &blockingStopProcess{done: make(chan struct{}), stopEntered: make(chan struct{}), releaseStop: make(chan struct{})}
-	fresh := &fakeProcess{done: make(chan struct{})}
-	spawner := &sequenceSpawner{processes: []Process{old, fresh}}
-	now := time.Now()
-	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, IdleTimeout: time.Minute, Now: func() time.Time { return now }})
+	for _, explicit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cold", true: "explicit"}[explicit], func(t *testing.T) {
+			old := &blockingStopProcess{done: make(chan struct{}), stopEntered: make(chan struct{}), releaseStop: make(chan struct{})}
+			fresh := &fakeProcess{done: make(chan struct{})}
+			spawner := &sequenceSpawner{processes: []Process{old, fresh}}
+			now := time.Now()
+			mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, IdleTimeout: time.Minute, Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(2 * time.Minute)
+			reaped := make(chan error, 1)
+			go func() {
+				var err error
+				if explicit {
+					_, err = mgr.StopIfIdle("agent")
+				} else {
+					_, err = mgr.StopIdleCold()
+				}
+				reaped <- err
+			}()
+			<-old.stopEntered
+			if release, err := mgr.HoldAdmission("agent"); err == nil {
+				release()
+				t.Fatal("accepted input into stopping generation")
+			}
+			ready := make(chan error, 1)
+			go func() { ready <- mgr.EnsureRunning(context.Background(), "agent") }()
+			select {
+			case err := <-ready:
+				t.Fatalf("ensure returned before stop completed: %v", err)
+			default:
+			}
+			close(old.releaseStop)
+			if err := <-reaped; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-ready; err != nil {
+				t.Fatal(err)
+			}
+			release, err := mgr.HoldAdmission("agent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			if fresh.isStopped() {
+				t.Fatal("old idle stop killed replacement")
+			}
+			if err := mgr.Stop("agent"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestStopIfIdleChecksWorkAdmissionAndActivityWithoutAgeOrWarmth(t *testing.T) {
+	spawner := newFakeSpawner()
+	busy := true
+	var beforeClaim func()
+	mgr, err := New(Config{
+		Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}, warmth: map[string]string{"agent": WarmthWarm}},
+		ClaimIdle: func(_ string, claim func() bool) (bool, error) {
+			if busy {
+				return false, nil
+			}
+			if beforeClaim != nil {
+				beforeClaim()
+			}
+			return claim(), nil
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(2 * time.Minute)
-	reaped := make(chan error, 1)
-	go func() { _, err := mgr.StopIdleCold(); reaped <- err }()
-	<-old.stopEntered
-	if release, err := mgr.HoldAdmission("agent"); err == nil {
-		release()
-		t.Fatal("accepted input into stopping generation")
+	assertSkipped := func() {
+		t.Helper()
+		if stopped, err := mgr.StopIfIdle("agent"); err != nil || stopped {
+			t.Fatalf("expected skip: %v %v", stopped, err)
+		}
+		if !mgr.Running("agent") {
+			t.Fatal("lost live runtime")
+		}
 	}
-	ready := make(chan error, 1)
-	go func() { ready <- mgr.EnsureRunning(context.Background(), "agent") }()
-	select {
-	case err := <-ready:
-		t.Fatalf("ensure returned before stop completed: %v", err)
-	default:
-	}
-	close(old.releaseStop)
-	if err := <-reaped; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-ready; err != nil {
-		t.Fatal(err)
-	}
+	assertSkipped()
+	busy = false
 	release, err := mgr.HoldAdmission("agent")
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertSkipped()
 	release()
-	if fresh.isStopped() {
-		t.Fatal("old idle stop killed replacement")
+	beforeClaim = func() { mgr.Touch("agent") }
+	assertSkipped()
+	beforeClaim = nil
+	if stopped, err := mgr.StopIfIdle("agent"); err != nil || !stopped {
+		t.Fatalf("idle warm runtime: %v %v", stopped, err)
 	}
-	if err := mgr.Stop("agent"); err != nil {
+	if stopped, err := mgr.StopIfIdle("agent"); err != nil || !stopped {
+		t.Fatalf("absent runtime: %v %v", stopped, err)
+	}
+}
+
+func TestStopIfIdleFailureRetainsLiveRuntime(t *testing.T) {
+	mgr, err := New(Config{Spawner: newFakeSpawner(), Resolver: fakeResolver{}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	failure := errors.New("still alive")
+	process := &fakeProcess{stopErr: failure}
+	// No exit signal: a failed stop must keep this exact runtime available for
+	// later inspection/cleanup instead of pretending the process disappeared.
+	rt := &agentRuntime{process: process}
+	mgr.running["agent"] = rt
+	if stopped, err := mgr.StopIfIdle("agent"); stopped || !errors.Is(err, failure) {
+		t.Fatalf("failed stop: %v %v", stopped, err)
+	}
+	if mgr.running["agent"] != rt || mgr.stopping["agent"] != nil {
+		t.Fatal("failed stop lost runtime or retained reservation")
+	}
+}
+
+func TestStopIfIdleAbsentRequiresNoLifecycleOperation(t *testing.T) {
+	for _, state := range []string{"absent", "starting", "stopping", "closing", "external"} {
+		t.Run(state, func(t *testing.T) {
+			mgr, err := New(Config{Spawner: newFakeSpawner(), Resolver: fakeResolver{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch state {
+			case "starting":
+				mgr.starting["agent"] = &startAttempt{done: make(chan struct{})}
+			case "stopping":
+				mgr.stopping["agent"] = &stopAttempt{done: make(chan struct{})}
+			case "closing":
+				mgr.closing = true
+			case "external":
+				mgr.skip["agent"] = true
+			}
+			ready, err := mgr.StopIfIdle("agent")
+			if err != nil || ready != (state == "absent") {
+				t.Fatalf("ready = %v, error = %v", ready, err)
+			}
+		})
 	}
 }

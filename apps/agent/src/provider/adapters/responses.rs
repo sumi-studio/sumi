@@ -11,7 +11,7 @@ use crate::provider::{
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
-    model::{ModelSpec, ProtocolCompat, RequestOptions, ResponsesCompat},
+    model::{ModelSpec, ProtocolCompat, RequestOptions, ResponsesCompat, ResponsesDialect},
     types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
@@ -30,6 +30,8 @@ pub enum ResponsesAdapterError {
     InvalidTemperature(f64),
     #[error("invalid Responses request context: {0}")]
     InvalidContext(String),
+    #[error("Responses Lite does not support a temperature override")]
+    UnsupportedTemperature,
     #[error("invalid Responses stream event: {0}")]
     InvalidEvent(String),
     #[error("provider returned an error: {message}")]
@@ -188,7 +190,68 @@ pub fn build_request(
             request.insert("include".to_owned(), json!(["reasoning.encrypted_content"]));
         }
     }
+    if compat.dialect == ResponsesDialect::CodexLite {
+        if options.temperature.is_some() {
+            return Err(ResponsesAdapterError::UnsupportedTemperature);
+        }
+        apply_lite_dialect(spec, context, options, &mut request);
+    }
     Ok(Value::Object(request))
+}
+
+/// The native Astra dialect carries instructions and tools in the ordered input.
+/// IDs depend on the bound provider/account and visible payload, never a random
+/// request ID, so a memory fork and its parent retain the same prefix identity.
+fn apply_lite_dialect(
+    spec: &ModelSpec,
+    context: &PromptContext,
+    options: &RequestOptions,
+    request: &mut Map<String, Value>,
+) {
+    let namespace = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        spec.provider_instance_id().as_bytes(),
+    );
+    let stable_id = |kind: &str, value: &Value| {
+        format!(
+            "{kind}_{}",
+            uuid::Uuid::new_v5(&namespace, value.to_string().as_bytes())
+        )
+    };
+    let functions: Vec<Value> = context.tools.iter().map(convert_tool).collect();
+    let tools = if functions.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            json!({"type":"namespace","name":"functions","description":"Sumi workspace tools","tools":functions}),
+        ]
+    };
+    let mut additional = json!({"type":"additional_tools","role":"developer","tools":tools});
+    additional["id"] = json!(stable_id("at", &additional));
+    let mut prefix = vec![additional];
+    if !context.system_prompt.is_empty() {
+        let mut instructions = json!({"type":"message","role":"developer","content":[{"type":"input_text","text":context.system_prompt}]});
+        instructions["id"] = json!(stable_id("msg", &instructions));
+        prefix.push(instructions);
+    }
+    if let Some(Value::Array(input)) = request.get_mut("input") {
+        input.splice(0..0, prefix);
+    }
+    request.remove("instructions");
+    request.remove("tools");
+    request.remove("max_output_tokens");
+    request.insert("parallel_tool_calls".into(), json!(false));
+    request
+        .entry("tool_choice".to_owned())
+        .or_insert(json!("auto"));
+    let reasoning = request.entry("reasoning".to_owned()).or_insert(json!({}));
+    reasoning["context"] = json!("all_turns");
+    if reasoning.get("effort").is_none() {
+        reasoning["effort"] = json!("medium");
+    }
+    if let Some(session_id) = &options.session_id {
+        request.insert("prompt_cache_key".into(), json!(session_id));
+    }
 }
 
 pub(in crate::provider) fn build_replay_probe_request(
@@ -305,6 +368,21 @@ pub fn build_compact_request(
     let compat = ensure_responses_spec(spec)?;
     if !compat.supports_native_compact {
         return Err(ResponsesAdapterError::UnsupportedProtocol);
+    }
+    if compat.dialect == ResponsesDialect::CodexLite {
+        let mut request = build_request(
+            spec,
+            context,
+            &RequestOptions {
+                native_compaction: true,
+                ..Default::default()
+            },
+        )?;
+        let object = request.as_object_mut().expect("request object");
+        for key in ["stream", "store", "include", "tool_choice"] {
+            object.remove(key);
+        }
+        return Ok(request);
     }
     let mut request = Map::new();
     request.insert("model".into(), json!(spec.id));
@@ -1185,12 +1263,18 @@ fn convert_input(
                             "role":"assistant",
                             "content":[{"type":"output_text","text":text,"annotations":[],"logprobs":[]}],
                         })),
-                        AssistantContent::ToolCall { tool_call, .. } => output.push(json!({
-                            "type":"function_call",
-                            "call_id":tool_call.id,
-                            "name":tool_call.name,
-                            "arguments":tool_call.provider_arguments().to_string(),
-                        })),
+                        AssistantContent::ToolCall { tool_call, .. } => {
+                            let mut item = json!({
+                                "type":"function_call",
+                                "call_id":tool_call.id,
+                                "name":tool_call.name,
+                                "arguments":tool_call.provider_arguments().to_string(),
+                            });
+                            if compat.dialect == ResponsesDialect::CodexLite {
+                                item["namespace"] = json!("functions");
+                            }
+                            output.push(item);
+                        },
                         AssistantContent::Thinking { .. } => {}
                         AssistantContent::RejectedToolCall { .. } => {
                             return Err(ResponsesAdapterError::InvalidContext(
@@ -1595,6 +1679,7 @@ impl ResponsesReceiveState {
                 }
             }
             "function_call" => {
+                validate_execution_namespace(item)?;
                 event_add = 1;
                 is_tool = true;
                 events.push(ProviderEvent::ToolCallStart {
@@ -2156,6 +2241,7 @@ impl ResponsesReceiveState {
                 })
             }
             "function_call" => {
+                validate_execution_namespace(item)?;
                 let Some(OutputSlot::Tool {
                     id,
                     call_id,
@@ -3146,6 +3232,18 @@ fn backfilled_reasoning_fragments(
     // as their ordinals differ; the request builder enforces the (wire, ordinal)
     // pair, so the terminal backfill does not duplicate that check here.
     Ok((result, additional_bytes))
+}
+
+fn validate_execution_namespace(item: &Map<String, Value>) -> Result<(), ResponsesAdapterError> {
+    if let Some(namespace) = item.get("namespace")
+        && namespace.as_str() != Some("functions")
+    {
+        return Err(ResponsesAdapterError::Provider {
+            code: Some("unsupported_tool_namespace".into()),
+            message: "provider requested a tool namespace that Sumi did not expose".into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_canonical_item(item: &Value) -> Result<(), String> {
@@ -6394,5 +6492,76 @@ mod tests {
         ] {
             assert!(validate_canonical_item(&invalid).is_err(), "{invalid}");
         }
+    }
+    #[test]
+    fn chatgpt_functions_namespace_is_validated_and_reconstructed_for_followup() {
+        let mut values = fixture_values();
+        for value in &mut values {
+            if value["item"]["type"] == "function_call" {
+                value["item"]["namespace"] = json!("functions");
+            }
+            if let Some(output) = value["response"]["output"].as_array_mut() {
+                for item in output {
+                    if item["type"] == "function_call" {
+                        item["namespace"] = json!("functions");
+                    }
+                }
+            }
+        }
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let mut call = None;
+        for value in values {
+            let pushed = state.push_json(&value.to_string()).unwrap();
+            let mut events = pushed.events;
+            if let Some(terminal) = pushed.terminal {
+                events.extend(terminal.events);
+            }
+            for event in events {
+                if let ProviderEvent::ToolCallEnd { tool_call, .. } = event {
+                    call = Some(tool_call);
+                }
+            }
+        }
+        state.finish_eof().unwrap();
+        let call = call.expect("native namespace executes as a bare Sumi tool");
+        assert_eq!(call.name, "weather");
+        let spec = ModelSpec::preset("chatgpt-responses").unwrap();
+        let context = PromptContext {
+            system_prompt: "Sumi system".into(),
+            memory_blocks: vec![],
+            messages: vec![ContextMessage::Synthetic {
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::ToolCall {
+                        tool_call: call,
+                        wire_item_index: 0,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: Utc::now(),
+                }),
+            }],
+            provider_context: vec![],
+            replay_provenance: None,
+            tools: vec![],
+        };
+        let request = build_request(&spec, &context, &RequestOptions::default()).unwrap();
+        let call = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(call["namespace"], "functions");
+        assert_eq!(call["name"], "weather");
+        assert_eq!(call["call_id"], "call_fixture");
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let error = state.push_json(r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"type":"function_call","namespace":"unexposed","call_id":"c","name":"weather","arguments":""}}"#).unwrap_err();
+        assert!(error.to_string().contains("namespace"));
     }
 }

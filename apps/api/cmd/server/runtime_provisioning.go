@@ -53,6 +53,7 @@ type provisionedRuntimeSpawnerConfig struct {
 	TeardownTimeout     time.Duration
 	StartupReadyTimeout time.Duration
 	Activation          runtimeprovision.ActivationConfig
+	ResolveActivation   runtimeActivationResolver
 }
 
 // provisionedRuntimeSpawner is the only production lazy-spawn implementation.
@@ -195,6 +196,12 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	}
 
 	activation := s.config.Activation
+	if s.config.ResolveActivation != nil {
+		activation, err = s.config.ResolveActivation(ctx, config.AgentID, activation)
+		if err != nil {
+			return nil, cleanup(errors.New("resolve PA model connection failed"))
+		}
+	}
 	activation.GatewayURL = config.GatewayURL
 	activation.LocalControlBearer = bearer
 	activation.AgentWrappingKey = config.WrappingKey.Bytes

@@ -765,6 +765,9 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET":      config.EscalationReviewerModelPreset,
 		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV": "SUMI_ESCALATION_REVIEWER_API_KEY",
 	}
+	if config.ModelPreset == "chatgpt-responses" {
+		delete(values, "SUMI_PROVIDER_API_KEY")
+	}
 	if config.ModelPreset != "" {
 		values["SUMI_MODEL_PRESET"] = config.ModelPreset
 	}
@@ -772,6 +775,9 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 		values["SUMI_MODEL_ID"] = config.ModelID
 	}
 	for name, value := range map[string]string{
+		"SUMI_MODEL_REASONING_EFFORT":                  config.ModelReasoningEffort,
+		"SUMI_MODEL_ACCOUNT_SCOPE":                     config.ModelAccountScope,
+		"SUMI_CHATGPT_CONNECTION_ID":                   config.ChatGPTConnectionID,
 		"SUMI_EXECUTION_REVIEWER_MODEL_ID":             config.ExecutionReviewerModelID,
 		"SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL":       config.ExecutionReviewerModelBaseURL,
 		"SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE":  config.ExecutionReviewerAccountScope,
@@ -885,6 +891,9 @@ var reservedEnvironment = map[string]bool{
 }
 
 var allowedActivationEnvironment = map[string]bool{
+	"SUMI_MODEL_REASONING_EFFORT":                  true,
+	"SUMI_MODEL_ACCOUNT_SCOPE":                     true,
+	"SUMI_CHATGPT_CONNECTION_ID":                   true,
 	"SUMI_GATEWAY_URL":                             true,
 	"SUMI_LOCAL_CONTROL_BEARER":                    true,
 	"SUMI_LOCAL_CONTROL_SERVER_UID":                true,

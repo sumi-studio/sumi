@@ -232,7 +232,9 @@ case "${role}" in
     load_runtime_secret SUMI_LOCAL_CONTROL_BEARER "${LOCAL_CONTROL_BEARER_FILE}"
     load_runtime_secret SUMI_AGENT_WRAPPING_KEY "${AGENT_WRAPPING_KEY_FILE}"
     load_runtime_secret SUMI_APPROVAL_SECRET_DIGEST_KEY "${APPROVAL_SECRET_DIGEST_KEY_FILE}"
-    load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
+    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" ]]; then
+      load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
+    fi
     load_runtime_secret SUMI_EXECUTION_REVIEWER_API_KEY "${EXECUTION_REVIEWER_API_KEY_FILE}"
     load_runtime_secret SUMI_ESCALATION_REVIEWER_API_KEY "${ESCALATION_REVIEWER_API_KEY_FILE}"
     for name in \
@@ -245,7 +247,6 @@ case "${role}" in
       SUMI_AGENT_WRAPPING_KEY \
       SUMI_AGENT_WRAPPING_KEY_ID \
       SUMI_APPROVAL_SECRET_DIGEST_KEY \
-      SUMI_PROVIDER_API_KEY \
       SUMI_EXECUTION_REVIEWER_API_KEY \
       SUMI_EXECUTION_REVIEWER_MODEL_PRESET \
       SUMI_ESCALATION_REVIEWER_API_KEY \
@@ -253,6 +254,11 @@ case "${role}" in
     do
       require_env "${name}"
     done
+    if [[ "${SUMI_MODEL_PRESET:-}" == "chatgpt-responses" ]]; then
+      for name in SUMI_CHATGPT_CONNECTION_ID SUMI_MODEL_ACCOUNT_SCOPE SUMI_MODEL_ID SUMI_MODEL_REASONING_EFFORT; do require_env "${name}"; done
+    else
+      require_env SUMI_PROVIDER_API_KEY
+    fi
     [[ "${SUMI_WORKSPACE}" == /workspace ]] ||
       fail "SUMI_WORKSPACE must match the mounted /workspace path"
     if [[ -v SUMI_MODEL_ID ]]; then
@@ -282,7 +288,6 @@ case "${role}" in
       "SUMI_APPROVAL_SECRET_DIGEST_KEY=${SUMI_APPROVAL_SECRET_DIGEST_KEY}"
       "SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET:-kimi-k3}"
       "SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY"
-      "SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}"
       "SUMI_EXECUTION_REVIEWER_MODEL_PRESET=${SUMI_EXECUTION_REVIEWER_MODEL_PRESET}"
       "SUMI_EXECUTION_REVIEWER_MODEL_API_KEY_ENV=SUMI_EXECUTION_REVIEWER_API_KEY"
       "SUMI_EXECUTION_REVIEWER_API_KEY=${SUMI_EXECUTION_REVIEWER_API_KEY}"
@@ -292,6 +297,9 @@ case "${role}" in
       "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}"
       "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
     )
+    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" ]]; then
+      runtime_environment+=("SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}")
+    fi
     for name in \
       SUMI_REAP_ATTESTATION_PERSONALITY_AGENT_ID \
       SUMI_REAP_ATTESTATION_EPOCH_GENERATION \
@@ -306,6 +314,9 @@ case "${role}" in
       runtime_environment+=("SUMI_MODEL_ID=${SUMI_MODEL_ID}")
     fi
     for name in \
+      SUMI_CHATGPT_CONNECTION_ID \
+      SUMI_MODEL_ACCOUNT_SCOPE \
+      SUMI_MODEL_REASONING_EFFORT \
       SUMI_EXECUTION_REVIEWER_MODEL_ID \
       SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \
       SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE \

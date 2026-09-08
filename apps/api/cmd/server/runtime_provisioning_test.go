@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"net"
 	"os"
 	"path/filepath"
@@ -1088,4 +1089,45 @@ func containsOrdered(haystack, needles []string) bool {
 		}
 	}
 	return next == len(needles)
+}
+
+type validatingRuntimeProvisioner struct{ *fakeRuntimeProvisioner }
+
+func (p validatingRuntimeProvisioner) Activate(ctx context.Context, request runtimeprovision.ActivateRequest) (runtimeprovision.Inspection, error) {
+	if err := request.Activation.Validate(); err != nil {
+		return runtimeprovision.Inspection{}, err
+	}
+	return p.fakeRuntimeProvisioner.Activate(ctx, request)
+}
+func TestProvisionedRuntimeSelectsChatGPTWithoutFallbackConversationKey(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		connected, reviewer bool
+		pass                bool
+	}{
+		{"connected native", true, true, true},
+		{"unconnected API fallback lacks key", false, true, false},
+		{"native still requires reviewer", true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+			spawner.config.Provisioner = validatingRuntimeProvisioner{provisioner}
+			spawner.config.Activation.ProviderAPIKey = ""
+			if !tc.reviewer {
+				spawner.config.Activation.ExecutionReviewerAPIKey = ""
+			}
+			connection := &chatGPTTestStore{status: chatgpt.Status{Connected: tc.connected, ConnectionID: "connection", AccountID: "account", Selection: chatgpt.Selection{Model: "gpt-6-astra", Effort: "medium"}}}
+			native := &chatGPTRuntime{connections: connection, employers: &chatGPTTestEmployer{kind: "human"}}
+			spawner.config.ResolveActivation = native.activation
+			process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{AgentID: provisionedTestPAIDs[0], WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws"})
+			if (err == nil) != tc.pass {
+				t.Fatalf("unexpected selected activation result: %v", err)
+			}
+			if process != nil {
+				if err := process.Stop(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }

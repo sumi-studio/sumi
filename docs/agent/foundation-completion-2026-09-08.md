@@ -92,6 +92,15 @@ or additional evidence of general recovery coverage.
 
 ## Audit items and remaining acceptance
 
+The user also explicitly requested native GPT-6 Astra support through ChatGPT
+login on 2026-09-08. This includes a usable connection and reconnection flow,
+account-scoped inference credentials, model/effort selection, and the existing
+Sumi memory/tool loop running through the native backend. The development-only
+Codex OAuth proxy is not acceptance of that request. Provider-native steering
+and asynchronous tools require separate wire-level and real-backend evidence;
+selecting the model does not establish those capabilities. Sumi remains the
+agent harness, including its own history and tools.
+
 Status here describes capability, not whether a historical issue happens to
 be open. “Partial” is not closure. Precise source references remain in the
 original audit and the current implementation; this table names the behavior
