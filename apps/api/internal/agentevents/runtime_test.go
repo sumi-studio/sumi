@@ -197,8 +197,8 @@ func TestDurableGatewayFencesStaleAckDurableAndVolatileEvents(t *testing.T) {
 	}
 	select {
 	case event := <-volatile:
-		if !bytes.Contains(event.Event, []byte(`"delta":"current"`)) {
-			t.Fatalf("unexpected current volatile event: %s", event.Event)
+		if !bytes.Contains(event.events[0].Event, []byte(`"delta":"current"`)) {
+			t.Fatalf("unexpected current volatile event: %s", event.events[0].Event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("current volatile event was not published")

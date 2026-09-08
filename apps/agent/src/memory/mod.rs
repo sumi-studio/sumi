@@ -491,6 +491,7 @@ impl ThreeLayerMemory {
         }
         for members in memberships_by_batch.values_mut() {
             members.sort_by_key(|membership| membership.ord);
+            let mut previous_seq = None;
             for (index, member) in members.iter().enumerate() {
                 let expected = u64::try_from(index)
                     .map_err(|_| anyhow!("hydrated memory membership ordinal overflow"))?
@@ -502,6 +503,15 @@ impl ThreeLayerMemory {
                         member.batch_id,
                         member.ord
                     );
+                }
+                if let ContextMessage::Persisted { seq, .. } = &member.message {
+                    if *seq == 0 || previous_seq.is_some_and(|previous| *seq <= previous) {
+                        bail!(
+                            "historical L0 membership is not in transcript order for {}",
+                            member.batch_id
+                        );
+                    }
+                    previous_seq = Some(*seq);
                 }
             }
         }
@@ -521,18 +531,15 @@ impl ThreeLayerMemory {
             let members = memberships_by_batch.get(batch_id);
             match batch.state {
                 MemoryBatchState::Dropped => {
-                    if members.is_some_and(|members| !members.is_empty()) {
-                        bail!("dropped L0 batch {batch_id} retains message membership");
-                    }
+                    // Historical membership remains a stable reread address;
+                    // inactive batches contribute no current working context.
                     continue;
                 }
                 MemoryBatchState::Open
+                | MemoryBatchState::Sealed
                 | MemoryBatchState::Compacting
                 | MemoryBatchState::CompactFailed
                 | MemoryBatchState::Compacted => {}
-                MemoryBatchState::Sealed => {
-                    unreachable!("durable sealed batches were rejected before reconstruction")
-                }
                 MemoryBatchState::Promoted => {
                     bail!("L0 batch {batch_id} cannot be in promoted state");
                 }
@@ -965,12 +972,6 @@ fn validate_batch_shape(batch: &HydratedMemoryBatch) -> Result<()> {
     if batch.batch_seq == 0 {
         bail!("memory batch {} has zero sequence", batch.id);
     }
-    if batch.state == MemoryBatchState::Sealed {
-        bail!(
-            "memory batch {} is durably sealed; sealing must atomically reserve a compaction job",
-            batch.id
-        );
-    }
     if let Some(summary) = &batch.summary
         && summary.est_tokens != batch.est_tokens
     {
@@ -998,7 +999,10 @@ fn validate_batch_shape(batch: &HydratedMemoryBatch) -> Result<()> {
                     batch.id
                 );
             }
-            if batch.state == MemoryBatchState::Open {
+            if matches!(
+                batch.state,
+                MemoryBatchState::Open | MemoryBatchState::Sealed
+            ) {
                 bail!(
                     "{:?} batch {} cannot be in open state",
                     batch.layer,
@@ -1007,9 +1011,7 @@ fn validate_batch_shape(batch: &HydratedMemoryBatch) -> Result<()> {
             }
             if matches!(
                 batch.state,
-                MemoryBatchState::Compacted
-                    | MemoryBatchState::Promoted
-                    | MemoryBatchState::Dropped
+                MemoryBatchState::Compacted | MemoryBatchState::Promoted
             ) && batch.summary.is_none()
             {
                 bail!(
@@ -1202,6 +1204,15 @@ fn validate_jobs(
                 MemoryBatchState::CompactFailed,
                 false,
             ),
+            MemoryJobStatus::Unchanged => {
+                if job.kind != MemoryJobKind::CompactL0 || target.summary.is_some() {
+                    bail!(
+                        "unchanged job {} must retain L0 without a generated summary",
+                        job.id
+                    );
+                }
+                (MemoryBatchState::Sealed, MemoryBatchState::Dropped, false)
+            }
             MemoryJobStatus::Discarded => (
                 MemoryBatchState::CompactFailed,
                 MemoryBatchState::CompactFailed,
@@ -1390,7 +1401,12 @@ fn validate_batch_job_relationships(
                 );
             }
             (MemoryLayer::L1, MemoryBatchState::Dropped)
-                if !is_source(batch.id, MemoryJobKind::CompactL1, MemoryJobStatus::Applied) =>
+                if !is_source(batch.id, MemoryJobKind::CompactL1, MemoryJobStatus::Applied)
+                    && !is_target(
+                        batch.id,
+                        MemoryJobKind::CompactL0,
+                        MemoryJobStatus::Unchanged,
+                    ) =>
             {
                 bail!(
                     "dropped L1 batch {} has no applied CompactL1 source job",
@@ -1471,6 +1487,11 @@ fn validate_apply_cursors(
 ) -> Result<()> {
     let mut seen = Vec::new();
     for cursor in cursors {
+        // Independent L0 replacements are guarded by their exact source
+        // versions. A failed/no-op older job must not block later batches.
+        if cursor.kind == MemoryJobKind::CompactL0 {
+            continue;
+        }
         if seen.contains(&cursor.kind) {
             bail!(
                 "hydrated memory contains duplicate {} apply cursor",
@@ -1526,10 +1547,11 @@ fn validate_apply_cursors(
     }
 
     for job in jobs.iter().filter(|job| {
-        matches!(
-            job.status,
-            MemoryJobStatus::Applied | MemoryJobStatus::Discarded
-        )
+        job.kind != MemoryJobKind::CompactL0
+            && matches!(
+                job.status,
+                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
+            )
     }) {
         let cursor = cursors
             .iter()
@@ -1571,9 +1593,7 @@ fn validate_l0_job_state(batch: &HydratedMemoryBatch, jobs: &[HydratedMemoryJob]
         MemoryBatchState::CompactFailed => Some(&[MemoryJobStatus::Failed][..]),
         MemoryBatchState::Compacted => Some(&[MemoryJobStatus::Completed][..]),
         MemoryBatchState::Open => None,
-        MemoryBatchState::Sealed => {
-            unreachable!("durable sealed batches were rejected before L0 validation")
-        }
+        MemoryBatchState::Sealed => Some(&[MemoryJobStatus::Unchanged][..]),
         MemoryBatchState::Dropped => Some(&[MemoryJobStatus::Applied][..]),
         MemoryBatchState::Promoted => None,
     };
@@ -1621,9 +1641,7 @@ fn l0_runtime_state(state: MemoryBatchState) -> Result<BatchState> {
         MemoryBatchState::Compacting => Ok(BatchState::Compacting),
         MemoryBatchState::CompactFailed => Ok(BatchState::CompactFailed),
         MemoryBatchState::Compacted => Ok(BatchState::Compacted),
-        MemoryBatchState::Sealed => {
-            bail!("durable sealed L0 batch cannot enter runtime")
-        }
+        MemoryBatchState::Sealed => Ok(BatchState::Sealed),
         MemoryBatchState::Promoted | MemoryBatchState::Dropped => {
             bail!("non-live L0 state {} cannot enter runtime", state.as_str())
         }
@@ -1720,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_every_durable_sealed_batch() {
+    fn sealed_original_requires_a_completed_unchanged_decision() {
         let batch_id = Uuid::now_v7();
         let message = persisted_user("sealed-message", 1, "must be atomic");
         let estimate = message_estimate(&message);
@@ -1744,8 +1762,121 @@ mod tests {
 
         let error = ThreeLayerMemory::from_hydrated(hydrated)
             .err()
-            .expect("a durable sealed snapshot is not producer-reachable");
-        assert!(error.to_string().contains("durably sealed"), "{error:#}");
+            .expect("an unexplained sealed snapshot is not producer-reachable");
+        assert!(
+            error
+                .to_string()
+                .contains("without a matching CompactL0 job"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn unchanged_decision_hydrates_original_experience_without_generated_memory() {
+        let source = Uuid::now_v7();
+        let target = Uuid::now_v7();
+        let message = persisted_user("unchanged-original", 1, "Keep this exact experience.");
+        let estimate = message_estimate(&message);
+        let hydrated = HydratedMemoryRuntime::new(
+            vec![
+                HydratedMemoryBatch::new(
+                    source,
+                    MemoryLayer::L0,
+                    1,
+                    1,
+                    2,
+                    MemoryBatchState::Sealed,
+                    estimate,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    target,
+                    MemoryLayer::L1,
+                    1,
+                    1,
+                    1,
+                    MemoryBatchState::Dropped,
+                    0,
+                    0,
+                    None,
+                ),
+            ],
+            vec![HydratedMemoryMembership::new(source, 1, message.clone())],
+            vec![HydratedMemoryJob::new(
+                Uuid::now_v7(),
+                MemoryJobKind::CompactL0,
+                1,
+                vec![source],
+                BTreeMap::from([(source, 2), (target, 1)]),
+                MemoryJobStatus::Unchanged,
+                None,
+            )],
+            vec![],
+            HashMap::new(),
+        );
+        let memory =
+            ThreeLayerMemory::from_hydrated(hydrated).expect("unchanged experience hydrates");
+        assert_eq!(memory.l0().len(), 1);
+        assert_eq!(memory.l0()[0].messages, vec![message]);
+        assert_eq!(memory.l0()[0].state, BatchState::Sealed);
+        assert!(memory.l1().is_empty());
+        assert!(memory.shelf().is_empty());
+    }
+
+    #[test]
+    fn historical_batch_membership_is_retained_without_replaying_replaced_raw_context() {
+        let source = Uuid::now_v7();
+        let target = Uuid::now_v7();
+        let message = persisted_user(
+            "original-address",
+            1,
+            "Original history remains rereadable.",
+        );
+        let summary = hydrated_summary("Organized representation with original source cue.", 12);
+        let hydrated = HydratedMemoryRuntime::new(
+            vec![
+                HydratedMemoryBatch::new(
+                    source,
+                    MemoryLayer::L0,
+                    1,
+                    1,
+                    3,
+                    MemoryBatchState::Dropped,
+                    0,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    target,
+                    MemoryLayer::L1,
+                    1,
+                    1,
+                    2,
+                    MemoryBatchState::Promoted,
+                    12,
+                    0,
+                    Some(summary.clone()),
+                ),
+            ],
+            vec![HydratedMemoryMembership::new(source, 1, message)],
+            vec![HydratedMemoryJob::new(
+                Uuid::now_v7(),
+                MemoryJobKind::CompactL0,
+                1,
+                vec![source],
+                BTreeMap::from([(source, 3), (target, 2)]),
+                MemoryJobStatus::Applied,
+                Some(summary),
+            )],
+            vec![],
+            HashMap::new(),
+        );
+        let memory =
+            ThreeLayerMemory::from_hydrated(hydrated).expect("retained original addresses hydrate");
+        assert!(memory.l0().is_empty());
+        assert_eq!(memory.l1().len(), 1);
+        assert_eq!(memory.l1()[0].source_batch, source);
     }
 
     #[test]
@@ -1812,52 +1943,6 @@ mod tests {
                 .contains("Error assistant error-assistant must not belong to an L0"),
             "{error:#}"
         );
-    }
-
-    #[test]
-    fn failed_job_holds_fifo_cursor() {
-        let failed = HydratedMemoryJob::new(
-            Uuid::now_v7(),
-            MemoryJobKind::CompactL0,
-            1,
-            vec![Uuid::now_v7()],
-            BTreeMap::new(),
-            MemoryJobStatus::Failed,
-            None,
-        );
-        let error = validate_apply_cursors(
-            &[failed],
-            &[HydratedMemoryCursor::new(MemoryJobKind::CompactL0, 2)],
-        )
-        .expect_err("failed work must never be passed by the FIFO cursor");
-        assert!(error.to_string().contains("skips failed job"), "{error:#}");
-    }
-
-    #[test]
-    fn only_applied_and_discarded_jobs_may_be_behind_cursor() {
-        let applied = HydratedMemoryJob::new(
-            Uuid::now_v7(),
-            MemoryJobKind::CompactL0,
-            1,
-            vec![Uuid::now_v7()],
-            BTreeMap::new(),
-            MemoryJobStatus::Applied,
-            Some(hydrated_summary("applied", 1)),
-        );
-        let discarded = HydratedMemoryJob::new(
-            Uuid::now_v7(),
-            MemoryJobKind::CompactL0,
-            2,
-            vec![Uuid::now_v7()],
-            BTreeMap::new(),
-            MemoryJobStatus::Discarded,
-            Some(hydrated_summary("discarded", 1)),
-        );
-        validate_apply_cursors(
-            &[applied, discarded],
-            &[HydratedMemoryCursor::new(MemoryJobKind::CompactL0, 3)],
-        )
-        .expect("applied and discarded terminal holes may be passed");
     }
 
     #[test]

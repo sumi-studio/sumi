@@ -8,6 +8,7 @@ mod memory_state;
 mod physical_recovery;
 mod post_commit;
 mod provider_context;
+mod recall;
 mod recovery;
 mod redactor;
 mod sizer;
@@ -86,14 +87,11 @@ pub(crate) use self::post_commit::{
     EventWriterQuiescence, PostCommitDispatcherOwner, PostCommitEpochCapability, PostCommitReceiver,
 };
 #[cfg(test)]
-pub(crate) use self::provider_context::{
-    EncryptedProviderContextRecord, provider_context_record_id,
-};
+pub(crate) use self::provider_context::EncryptedProviderContextRecord;
 pub(crate) use self::provider_context::{ProviderContextKind, provider_context_idempotency_key};
 #[cfg(test)]
-pub(crate) use self::provider_context::{
-    ProviderContextMutationApplier, ProviderContextMutationBuilder,
-};
+pub(crate) use self::recall::RecallSource;
+pub(crate) use self::recall::{RecallPage, RecallRequest, RecalledMessage};
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
@@ -5549,7 +5547,6 @@ mod tests {
                     est_tokens: result.est_tokens,
                     summary: Some(result),
                     footprint_delta: 0,
-                    delete_membership: false,
                 }],
                 ..Default::default()
             },
@@ -5619,7 +5616,6 @@ mod tests {
                     summary: Some(source_result),
                     est_tokens: 42,
                     footprint_delta: 0,
-                    delete_membership: false,
                 }],
                 ..Default::default()
             },
@@ -5636,7 +5632,6 @@ mod tests {
                     summary: None,
                     est_tokens: 42,
                     footprint_delta: 0,
-                    delete_membership: false,
                 }],
                 ..Default::default()
             },
@@ -5731,7 +5726,6 @@ mod tests {
                         summary: None,
                         est_tokens: 42,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                     MemoryBatchMutation {
                         batch_id: target_id,
@@ -5740,7 +5734,6 @@ mod tests {
                         summary: Some(result.clone()),
                         est_tokens,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                 ],
                 job_mutations: vec![MemoryJobMutation::Complete {
@@ -5766,7 +5759,6 @@ mod tests {
                         summary: None,
                         est_tokens: 42,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                     MemoryBatchMutation {
                         batch_id: target_id,
@@ -5775,7 +5767,6 @@ mod tests {
                         summary: None,
                         est_tokens,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                 ],
                 job_mutations: vec![MemoryJobMutation::Apply {
@@ -6230,7 +6221,6 @@ mod tests {
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                     MemoryBatchMutation {
                         batch_id: target_id,
@@ -6239,7 +6229,6 @@ mod tests {
                         summary: Some(result.clone()),
                         est_tokens: result.est_tokens,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                 ],
                 job_mutations: vec![MemoryJobMutation::Complete {
@@ -6265,7 +6254,6 @@ mod tests {
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
-                        delete_membership: true,
                     },
                     MemoryBatchMutation {
                         batch_id: target_id,
@@ -6274,7 +6262,6 @@ mod tests {
                         summary: None,
                         est_tokens: 42,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                 ],
                 job_mutations: vec![MemoryJobMutation::Apply {
@@ -6354,7 +6341,6 @@ mod tests {
                     summary: None,
                     est_tokens: source_est_tokens,
                     footprint_delta: 0,
-                    delete_membership: false,
                 }],
                 job_inserts: vec![MemoryJobRecord::new(
                     job_id.clone(),
@@ -6413,7 +6399,6 @@ mod tests {
                         summary: None,
                         est_tokens: source_est_tokens,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                     MemoryBatchMutation {
                         batch_id: target_id,
@@ -6422,7 +6407,6 @@ mod tests {
                         summary: Some(result.clone()),
                         est_tokens: result.est_tokens,
                         footprint_delta: 0,
-                        delete_membership: false,
                     },
                 ],
                 job_mutations: vec![MemoryJobMutation::Complete {
@@ -6540,7 +6524,6 @@ mod tests {
                     est_tokens: u64::try_from(est_tokens)
                         .expect("fixture source estimate is non-negative"),
                     footprint_delta: 0,
-                    delete_membership: false,
                 }],
                 job_inserts: vec![MemoryJobRecord::new(
                     job_id.clone(),

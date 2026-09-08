@@ -14,6 +14,9 @@ pub mod retry;
 pub mod transport;
 pub mod types;
 
+#[cfg(test)]
+mod memory_fork_tests;
+
 use std::{
     env,
     future::Future,
@@ -199,11 +202,25 @@ impl TtftObservation {
     }
 }
 
+fn session_request(
+    request: reqwest::RequestBuilder,
+    spec: &ModelSpec,
+    options: &RequestOptions,
+) -> reqwest::RequestBuilder {
+    if spec.provider == "opencode-go"
+        && let Some(session_id) = &options.session_id
+    {
+        return request.header("x-opencode-session", session_id);
+    }
+    request
+}
+
 pub(crate) fn http_client() -> Result<&'static reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .user_agent(concat!("sumi-agent/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .map_err(|error| error.to_string())
@@ -699,8 +716,7 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    let mut request = client
-        .post(spec.endpoint())
+    let mut request = session_request(client.post(spec.endpoint()), &spec, &options)
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01");
     if let Some(compat) = spec.anthropic_compat()
@@ -1099,7 +1115,11 @@ async fn run_responses_stream(
         }
     };
     let request = body
-        .apply(client.post(spec.endpoint()).bearer_auth(api_key))
+        .apply(session_request(
+            client.post(spec.endpoint()).bearer_auth(api_key),
+            &spec,
+            &options,
+        ))
         .send();
     let (response, request_sent_at) =
         match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |at| {
@@ -1457,7 +1477,11 @@ async fn run_chat_stream(
         }
     };
     let request = body
-        .apply(client.post(spec.endpoint()).bearer_auth(api_key))
+        .apply(session_request(
+            client.post(spec.endpoint()).bearer_auth(api_key),
+            &spec,
+            &options,
+        ))
         .send();
     let (response, request_sent_at) =
         match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |at| {
@@ -5899,6 +5923,124 @@ fi
         })
         .await
         .expect("live provider request timed out")
+    }
+
+    #[tokio::test]
+    async fn provider_session_headers_follow_parent_fork_and_separate_people() {
+        for (preset, path, fixture) in [
+            (
+                "kimi-k3",
+                "/chat/completions",
+                include_str!("../../tests/fixtures/kimi_text.sse"),
+            ),
+            (
+                "openai-responses",
+                "/responses",
+                include_str!("../../tests/fixtures/openai_responses_official.sse"),
+            ),
+            (
+                "anthropic",
+                "/messages",
+                include_str!("../../tests/fixtures/anthropic_messages_official.sse"),
+            ),
+        ] {
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = captured.clone();
+            let app = Router::new().route(
+                path,
+                post(move |headers: axum::http::HeaderMap| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(headers);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(fixture))
+                            .unwrap()
+                    }
+                }),
+            );
+            let (base_url, server) = serve_router(app).await;
+            let mut spec = ModelSpec::preset(preset).unwrap();
+            spec.provider = "opencode-go".to_owned();
+            spec.base_url = base_url;
+            let prompt = PromptContext::new(
+                "identity fixture".to_owned(),
+                vec![],
+                vec![ContextMessage::Synthetic {
+                    message: Message::User(UserMessage {
+                        content: vec![UserContent::Text {
+                            text: "Hello".to_owned(),
+                        }],
+                        timestamp: chrono::Utc::now(),
+                    }),
+                }],
+                vec![],
+                vec![],
+            );
+            let options = RequestOptions {
+                session_id: Some("019927a0-0000-7000-8000-000000000001".to_owned()),
+                ..RequestOptions::default()
+            };
+            let snapshot = types::ParentContextSnapshot::capture(&prompt, &spec, &options);
+            let fork = snapshot
+                .fork_with_directive(types::UserMessage {
+                    content: vec![types::UserContent::Text {
+                        text: "Maintain your memory.".to_owned(),
+                    }],
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+            run_live_output(
+                spec.clone(),
+                prompt.clone(),
+                options.clone(),
+                "fixture-key".to_owned(),
+            )
+            .await;
+            run_live_output(
+                snapshot.spec().clone(),
+                fork,
+                snapshot.options().clone(),
+                "fixture-key".to_owned(),
+            )
+            .await;
+            let other = RequestOptions {
+                session_id: Some("019927a0-0000-7000-8000-000000000002".to_owned()),
+                ..options.clone()
+            };
+            run_live_output(
+                spec.clone(),
+                prompt.clone(),
+                other.clone(),
+                "fixture-key".to_owned(),
+            )
+            .await;
+            spec.provider = "unrelated-provider".to_owned();
+            run_live_output(spec, prompt, options.clone(), "fixture-key".to_owned()).await;
+            server.abort();
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            for headers in requests.iter() {
+                assert_eq!(
+                    headers["user-agent"],
+                    concat!("sumi-agent/", env!("CARGO_PKG_VERSION"))
+                );
+            }
+            assert_eq!(
+                requests[0]["x-opencode-session"],
+                options.session_id.as_deref().unwrap()
+            );
+            assert_eq!(
+                requests[1]["x-opencode-session"],
+                requests[0]["x-opencode-session"]
+            );
+            assert_eq!(
+                requests[2]["x-opencode-session"],
+                other.session_id.as_deref().unwrap()
+            );
+            assert!(!requests[3].contains_key("x-opencode-session"));
+        }
     }
 
     #[tokio::test]

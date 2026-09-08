@@ -392,6 +392,9 @@ pub struct StructuredOutputSchema {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RequestOptions {
+    /// Stable identity of this PA's continuous conversation. Transport metadata
+    /// only: memory forks and auxiliary calls retain the same identity.
+    pub session_id: Option<String>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub tool_choice: Option<Value>,

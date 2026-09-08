@@ -66,7 +66,7 @@ type DurableGateway struct {
 	// browserSubscribers carry volatile frames only. Durable replay always
 	// reads the event log, so disconnecting a slow browser cannot lose durable
 	// history or grow this process without bound.
-	browserSubscribers    map[string]map[uint64]chan Envelope
+	browserSubscribers    map[string]map[uint64]chan browserVolatileBatch
 	nextBrowserSubscriber uint64
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
@@ -311,7 +311,7 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		MaxAckTail:                   256,
 		MaxBrowserSessionRevocations: maxRevokedSessions,
 		tails:                        make(map[string]*personalityAgentLogState),
-		browserSubscribers:           make(map[string]map[uint64]chan Envelope),
+		browserSubscribers:           make(map[string]map[uint64]chan browserVolatileBatch),
 		stateRebuilt:                 make(map[string]bool),
 		runInFlight:                  make(map[string]bool),
 		pendingApprovals:             make(map[string]map[string]bool),
@@ -1300,16 +1300,16 @@ func (g *DurableGateway) CommandDispositionFor(
 	return disposition, disposition != nil, nil
 }
 
-// SubscribeBrowserVolatile registers one bounded live-only receiver. A slow
-// consumer is disconnected rather than buffering unbounded volatile deltas.
-func (g *DurableGateway) SubscribeBrowserVolatile(personalityAgentID string) (<-chan Envelope, func()) {
+// SubscribeBrowserVolatile registers one bounded live-only receiver. Adjacent
+// deltas are combined while pending; sustained overload still disconnects.
+func (g *DurableGateway) SubscribeBrowserVolatile(personalityAgentID string) (<-chan browserVolatileBatch, func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.nextBrowserSubscriber++
 	id := g.nextBrowserSubscriber
-	out := make(chan Envelope, 64)
+	out := make(chan browserVolatileBatch, 1)
 	if g.browserSubscribers[personalityAgentID] == nil {
-		g.browserSubscribers[personalityAgentID] = make(map[uint64]chan Envelope)
+		g.browserSubscribers[personalityAgentID] = make(map[uint64]chan browserVolatileBatch)
 	}
 	g.browserSubscribers[personalityAgentID][id] = out
 	var once sync.Once
@@ -1324,14 +1324,18 @@ func (g *DurableGateway) SubscribeBrowserVolatile(personalityAgentID string) (<-
 
 func (g *DurableGateway) publishVolatileLocked(personalityAgentID string, envelope Envelope) {
 	for id, subscriber := range g.browserSubscribers[personalityAgentID] {
+		// Only this publisher sends, under g.mu. Taking the pending batch
+		// transfers its ownership; the consumer cannot be reading it too.
+		var batch browserVolatileBatch
 		select {
-		case subscriber <- envelope:
+		case batch = <-subscriber:
 		default:
-			// The receiver is no longer a safe live stream. Removing and closing
-			// it makes its writer fail closed; durable replay remains available on
-			// reconnect.
-			g.removeBrowserSubscriberLocked(personalityAgentID, id)
 		}
+		if !batch.append(envelope) {
+			g.removeBrowserSubscriberLocked(personalityAgentID, id)
+			continue
+		}
+		subscriber <- batch
 	}
 }
 

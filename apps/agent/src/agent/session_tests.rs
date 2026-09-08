@@ -6194,6 +6194,8 @@ struct IdleMaintenanceDriver {
     provider_calls: AtomicUsize,
     maintenance_calls: AtomicUsize,
     result: IdleMaintenanceResult,
+    ready: Notify,
+    applied: Notify,
 }
 
 impl IdleMaintenanceDriver {
@@ -6202,6 +6204,8 @@ impl IdleMaintenanceDriver {
             provider_calls: AtomicUsize::new(0),
             maintenance_calls: AtomicUsize::new(0),
             result,
+            ready: Notify::new(),
+            applied: Notify::new(),
         }
     }
 
@@ -6222,6 +6226,7 @@ impl RunDriver for IdleMaintenanceDriver {
 
     async fn apply_idle_memory_maintenance(&self, core: &mut RunCore) -> Result<bool> {
         self.maintenance_calls.fetch_add(1, Ordering::SeqCst);
+        self.applied.notify_one();
         match self.result {
             IdleMaintenanceResult::Refreshed => {
                 // The production contract requires the durable apply and the
@@ -6238,6 +6243,10 @@ impl RunDriver for IdleMaintenanceDriver {
             IdleMaintenanceResult::NotCommitted => Ok(false),
             IdleMaintenanceResult::Failed => Err(anyhow!("fixture maintenance apply failed")),
         }
+    }
+
+    async fn memory_maintenance_ready(&self) {
+        self.ready.notified().await;
     }
 
     async fn start_provider_for_command(
@@ -6420,7 +6429,28 @@ async fn maintenance_ready_while_idle_applies_an_independent_completed_shelf_imm
 }
 
 #[tokio::test]
-async fn failed_or_uncommitted_maintenance_preserves_pending_and_blocks_stale_provider_calls() {
+async fn background_memory_completion_wakes_an_idle_session_without_a_user_message() {
+    let (gateway, commands, _frames) = gateway();
+    let driver = Arc::new(IdleMaintenanceDriver::new(IdleMaintenanceResult::Refreshed));
+    let session = session(gateway, Arc::new(SequentialRunWorker::new(driver.clone()))).await;
+    let task = tokio::spawn(session.run());
+
+    driver.ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), driver.applied.notified())
+        .await
+        .expect("background completion wakes the idle event loop");
+    assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 0);
+
+    drop(commands);
+    assert!(matches!(
+        task.await.expect("join session"),
+        SessionResult::Completed(_)
+    ));
+}
+
+#[tokio::test]
+async fn failed_or_uncommitted_maintenance_preserves_experience_and_allows_the_next_user() {
     for result in [
         IdleMaintenanceResult::NotCommitted,
         IdleMaintenanceResult::Failed,
@@ -6434,13 +6464,9 @@ async fn failed_or_uncommitted_maintenance_preserves_pending_and_blocks_stale_pr
             .admit_and_route(user(1))
             .await
             .expect("first no-tool command");
-        let failure = drive_active_to_completion(&mut session)
+        drive_active_to_completion(&mut session)
             .await
-            .expect_err("uncommitted maintenance must fail closed at Idle");
-        assert!(matches!(
-            failure,
-            SessionFailure::Worker(WorkerFailure::Error(_))
-        ));
+            .expect("ordinary memory failure does not terminate the session");
         assert_eq!(driver.provider_calls.load(Ordering::SeqCst), 1);
         assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 1);
         assert!(
@@ -6452,17 +6478,39 @@ async fn failed_or_uncommitted_maintenance_preserves_pending_and_blocks_stale_pr
                 .is_some()
         );
 
-        let stale_attempt = session.admit_and_route(user(2)).await;
-        assert!(matches!(
-            stale_attempt,
-            Err(SessionFailure::Worker(WorkerFailure::Error(_)))
-        ));
+        let original_context = session
+            .core
+            .as_ref()
+            .expect("idle core")
+            .runtime_context
+            .clone();
+        session
+            .admit_and_route(user(2))
+            .await
+            .expect("next user remains usable");
+        drive_active_to_completion(&mut session)
+            .await
+            .expect("second turn survives deferred memory work");
         assert_eq!(
             driver.provider_calls.load(Ordering::SeqCst),
-            1,
-            "a pending unrefreshed transition must block the next provider call"
+            2,
+            "memory maintenance failure must not stop later conversation"
         );
-        assert_eq!(driver.maintenance_calls.load(Ordering::SeqCst), 2);
+        assert!(driver.maintenance_calls.load(Ordering::SeqCst) >= 2);
+        let context = &session
+            .core
+            .as_ref()
+            .expect("returned core")
+            .runtime_context;
+        assert!(
+            original_context
+                .iter()
+                .all(|message| context.contains(message))
+        );
+        assert!(
+            context.len() > original_context.len(),
+            "new experience is appended"
+        );
     }
 }
 

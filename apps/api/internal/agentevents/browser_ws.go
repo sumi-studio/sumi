@@ -886,7 +886,7 @@ func (s *BrowserServer) browserEventPump(
 	personalityAgentID string,
 	lastConsumed uint64,
 	readiness directChatReadiness,
-	volatile <-chan Envelope,
+	volatile <-chan browserVolatileBatch,
 	authorize func(func() error) error,
 	write func(any) error,
 ) error {
@@ -912,12 +912,9 @@ func (s *BrowserServer) browserEventPump(
 			return err
 		}
 		select {
-		case envelope, ok := <-volatile:
+		case batch, ok := <-volatile:
 			if !ok {
 				return errors.New("browser volatile event queue exhausted")
-			}
-			if envelope.PersonalityAgentID != personalityAgentID {
-				return errors.New("browser volatile event target mismatch")
 			}
 			// A durable commit can land after the catch-up above while its
 			// corresponding volatile successor is already queued. Re-establish
@@ -927,12 +924,17 @@ func (s *BrowserServer) browserEventPump(
 			if err != nil {
 				return err
 			}
-			projected, err := projectBrowserEvent(envelope)
-			if err != nil {
-				return fmt.Errorf("project volatile browser event: %w", err)
-			}
-			if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
-				return err
+			for _, envelope := range batch.events {
+				if envelope.PersonalityAgentID != personalityAgentID {
+					return errors.New("browser volatile event target mismatch")
+				}
+				projected, err := projectBrowserEvent(envelope)
+				if err != nil {
+					return fmt.Errorf("project volatile browser event: %w", err)
+				}
+				if err := write(browserEventFrame{Type: "event", Envelope: projected}); err != nil {
+					return err
+				}
 			}
 			if s.Spawner != nil {
 				if err := authorizeOperation(func() error {

@@ -765,9 +765,10 @@ impl DurableBridge {
         // now and the final Applied ACK with the run's terminal events.
         acks.retain(|ack| ack.command_id != command.envelope().command_id.as_str());
 
-        // The original owner completes with the aborted AgentEnd, not with the
-        // abort control; record it now before the binding switches to Abort.
-        self.aborted_owner = Some((self.worker_command_id.clone(), self.worker_command_seq));
+        // Finish the current durable user owner with AgentEnd. A committed
+        // steer may have replaced the initiating worker's owner already; that
+        // immutable worker identity authenticates outputs, not this handoff.
+        self.aborted_owner = Some((self.binding.command_id.clone(), self.binding.command_seq));
         // Advance the bridge binding to the abort command itself so that the
         // final AgentEnd knows which control to ACK.
         self.binding.command_id = command.envelope().command_id.to_string();
@@ -3910,6 +3911,15 @@ mod tests {
 
     #[tokio::test]
     async fn hard_steer_user_message_consumes_pending_start_and_allows_tool_result() {
+        committed_hard_steer_followup(false).await;
+    }
+
+    #[tokio::test]
+    async fn abort_after_committed_hard_steer_closes_current_owner() {
+        committed_hard_steer_followup(true).await;
+    }
+
+    async fn committed_hard_steer_followup(abort: bool) {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
 
@@ -4032,6 +4042,89 @@ mod tests {
             .await
             .expect("commit hard-steer user MessageEnd");
         committed.resolve_message_receipts();
+
+        if abort {
+            let abort_id = "00000000-0000-4000-8000-000000000003";
+            writer
+                .persist_inbound(&test_abort_command(3, abort_id))
+                .await
+                .expect("persist abort after steering handoff");
+            bridge
+                .bind_abort(&writer, test_admitted_abort(3, abort_id))
+                .await
+                .expect("abort current owner");
+            // The worker identity remains the initiating command even though the
+            // durable user owner has changed to the committed steering command.
+            let mut worker_binding = bridge.binding.clone();
+            worker_binding.command_id = owner_id.to_owned();
+            worker_binding.command_seq = 1;
+            let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+                content: Vec::new(),
+                model: "test".to_owned(),
+                provider: "test".to_owned(),
+                origin: crate::provider::types::ProviderOrigin {
+                    provider_instance_id: "test".to_owned(),
+                    protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                    model: "test".to_owned(),
+                },
+                usage: crate::provider::types::Usage::default(),
+                stop_reason: StopReason::Aborted,
+                error_message: None,
+                provider_code: None,
+                interrupted: true,
+                timestamp: test_timestamp(),
+            });
+            for event in [
+                AgentEvent::MessageStart {
+                    message_id: "steered-aborted-assistant".to_owned(),
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "steered-aborted-assistant".to_owned(),
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(assistant)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                let message_commit_barrier = matches!(event, AgentEvent::MessageEnd { .. })
+                    .then(|| MessageCommitBarrier::channel().0);
+                bridge
+                    .commit(
+                        &writer,
+                        RunOutput {
+                            binding: worker_binding.clone(),
+                            event,
+                            commit_barrier: None,
+                            message_commit_barrier,
+                            retry_wait_commit_barrier: None,
+                            approval_command: None,
+                            approval_not_started: None,
+                            approval_cancelled: None,
+                        },
+                    )
+                    .await
+                    .expect("steered worker must finish normally after abort")
+                    .resolve_message_receipts();
+            }
+            assert_eq!(bridge.phase, RunPhase::Finished);
+            let states: Vec<(String, String)> =
+                sqlx::query_as("SELECT command_id, status FROM inbound_commands ORDER BY seq")
+                    .fetch_all(store.pool())
+                    .await
+                    .expect("command outcomes");
+            assert_eq!(
+                states,
+                vec![
+                    (owner_id.to_owned(), "applied".to_owned()),
+                    (steer_id.to_owned(), "applied".to_owned()),
+                    (abort_id.to_owned(), "applied".to_owned()),
+                ]
+            );
+            return;
+        }
 
         let tool_message_id = "tool-result-1".to_owned();
         let tool_message = PublicMessage::ToolResult(ToolResultMessage {

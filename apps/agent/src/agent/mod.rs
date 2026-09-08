@@ -759,6 +759,10 @@ pub(crate) trait RunWorker: Send + Sync + 'static {
         Box::pin(async { Ok(false) })
     }
 
+    fn memory_maintenance_ready(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -1259,8 +1263,8 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    /// T26 forwards the maintainer's durable `MaintenanceReady` wake signal
-    /// here.  The transition runs only while no worker owns the RunCore.
+    /// The driver's background completion wakes the Session here. The result
+    /// can be applied only while no active worker owns the RunCore.
     pub(crate) async fn maintenance_ready(&mut self) -> Result<(), SessionFailure> {
         self.maintenance_ready_pending = true;
         if self.active.is_none() {
@@ -1282,6 +1286,7 @@ impl<G: Gateway + 'static> Session<G> {
                 )]
                 enum IdleSelected {
                     Shutdown,
+                    MemoryReady,
                     Command(Result<InboundCommand>),
                     Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
                 }
@@ -1289,10 +1294,15 @@ impl<G: Gateway + 'static> Session<G> {
                     biased;
                     _ = shutdown.cancelled() => IdleSelected::Shutdown,
                     command = self.gateway_reader.next_command() => IdleSelected::Command(command),
+                    _ = self.worker.memory_maintenance_ready() => IdleSelected::MemoryReady,
                     writer = &mut self.writer_done => IdleSelected::Writer(writer),
                 };
                 let inbound = match selected {
                     IdleSelected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
+                    IdleSelected::MemoryReady => {
+                        self.maintenance_ready().await?;
+                        continue;
+                    }
                     IdleSelected::Command(Ok(inbound)) => inbound,
                     IdleSelected::Command(Err(error))
                         if error.downcast_ref::<GatewayClosed>().is_some() =>
@@ -1314,6 +1324,7 @@ impl<G: Gateway + 'static> Session<G> {
             #[allow(clippy::large_enum_variant)]
             enum Selected {
                 Shutdown,
+                MemoryReady,
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
                 Event(Option<RunOutput>),
@@ -1327,6 +1338,7 @@ impl<G: Gateway + 'static> Session<G> {
                     completion = &mut active.completion_rx => Selected::Completion(completion),
                     _ = shutdown.cancelled() => Selected::Shutdown,
                     command = self.gateway_reader.next_command() => Selected::Command(command),
+                    _ = self.worker.memory_maintenance_ready() => Selected::MemoryReady,
                     event = active.events_rx.recv() => Selected::Event(event),
                     writer = &mut self.writer_done => Selected::Writer(writer),
                 }
@@ -1334,6 +1346,7 @@ impl<G: Gateway + 'static> Session<G> {
 
             match selected {
                 Selected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
+                Selected::MemoryReady => self.maintenance_ready().await?,
                 Selected::Completion(completion) => self.finish_run(completion).await?,
                 Selected::Command(Ok(inbound)) => self.admit_and_route(inbound).await?,
                 Selected::Command(Err(error))
@@ -2270,20 +2283,21 @@ impl<G: Gateway + 'static> Session<G> {
         if core.pending_overflow_apply().is_none() && !self.maintenance_ready_pending {
             return Ok(());
         }
-        let applied = self
-            .worker
-            .apply_idle_memory_maintenance(core)
-            .await
-            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
-        if applied {
-            core.clear_pending_overflow_apply();
-            self.maintenance_ready_pending = false;
-            return Ok(());
+        match self.worker.apply_idle_memory_maintenance(core).await {
+            Ok(true) => {
+                core.clear_pending_overflow_apply();
+                self.maintenance_ready_pending = false;
+            }
+            Ok(false) => {
+                // A queued result may still be running or may have become
+                // stale. Retain the canonical experience and retry at a later
+                // idle boundary; this is not a failure of the person/session.
+            }
+            Err(error) => {
+                tracing::warn!(%error, "memory maintenance deferred; current context retained");
+            }
         }
-        Err(SessionFailure::Worker(WorkerFailure::Error(
-            "idle memory maintenance is pending but did not commit a refreshed transition"
-                .to_owned(),
-        )))
+        Ok(())
     }
 
     async fn route_deferred_after_run(&mut self) -> Result<(), SessionFailure> {

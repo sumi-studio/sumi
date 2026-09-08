@@ -5444,7 +5444,6 @@ mod tests {
                             summary: None,
                             est_tokens: 0,
                             footprint_delta: 0,
-                            delete_membership: true,
                         }],
                         ..Default::default()
                     })],
@@ -5594,7 +5593,6 @@ mod tests {
                             summary: None,
                             est_tokens: 0,
                             footprint_delta: 0,
-                            delete_membership: true,
                         }],
                         ..Default::default()
                     })],

@@ -6,15 +6,20 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,7 +29,7 @@ use crate::{
     },
     memory::{
         ThreeLayerMemory,
-        compactor::apply_ready_memory,
+        compactor::{apply_ready_memory, compact_next_l0},
         context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
         estimate::{ProviderContextItemWithFootprint, TokenCalibration},
         overflow::AssemblyMode,
@@ -33,9 +38,9 @@ use crate::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
         RequestOptions, stream_observed, timing_observation_channel,
         types::{
-            AssistantMessage, ContextMessage, PromptContext, ProviderContextFragment,
-            ProviderEventStream, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
-            ToolResultMessage, Usage,
+            AssistantMessage, ContextMessage, ParentContextSnapshot, PromptContext,
+            ProviderContextFragment, ProviderEventStream, PublicAssistantMessage, PublicMessage,
+            StopReason, ToolCall, ToolResultMessage, Usage,
         },
     },
     runtime::contracts::{
@@ -61,6 +66,10 @@ pub(crate) type StreamStarter = dyn Fn(
         CancellationToken,
         ProviderTimingObserver,
     ) -> ProviderEventStream
+    + Send
+    + Sync;
+
+type MemoryCompactionStarter = dyn Fn(Arc<Store>, ParentContextSnapshot, CancellationToken) -> BoxFuture<'static, Result<bool>>
     + Send
     + Sync;
 
@@ -156,6 +165,11 @@ pub(crate) struct InjectedRunDriver {
     timings: RunTimingSamples,
     timing_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     memory_maintenance: Option<HydratedMemoryMaintenance>,
+    memory_compactor: Arc<MemoryCompactionStarter>,
+    memory_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    memory_cancel: CancellationToken,
+    memory_ready: Arc<Notify>,
+    memory_retry_after: Arc<Mutex<Option<Instant>>>,
     send_view_progress: Mutex<SendViewProgress>,
     personality_agent_context: Option<PersonalityAgentPromptContextHandle>,
 }
@@ -164,6 +178,7 @@ struct HydratedMemoryMaintenance {
     store: Arc<Store>,
     lease: ProcessGenerationLease,
     fence: GenerationRecoveryFence,
+    refresh_pending: AtomicBool,
 }
 
 #[derive(Default)]
@@ -230,6 +245,13 @@ impl InjectedRunDriver {
             timings: RunTimingSamples::default(),
             timing_tasks: Mutex::new(Vec::new()),
             memory_maintenance: None,
+            memory_compactor: Arc::new(|store, parent, cancel| {
+                Box::pin(compact_next_l0(store, parent, cancel))
+            }),
+            memory_task: Mutex::new(None),
+            memory_cancel: CancellationToken::new(),
+            memory_ready: Arc::new(Notify::new()),
+            memory_retry_after: Arc::new(Mutex::new(None)),
             send_view_progress: Mutex::new(SendViewProgress::default()),
             personality_agent_context: None,
         })
@@ -289,7 +311,11 @@ impl InjectedRunDriver {
             store,
             lease: expected_lease.clone(),
             fence: expected_fence.clone(),
+            refresh_pending: AtomicBool::new(false),
         });
+        // A process may restart after the compact result became durable but
+        // before it was applied. Let the first idle boundary inspect it.
+        self.memory_ready.notify_one();
         Ok(self)
     }
 
@@ -335,6 +361,7 @@ impl InjectedRunDriver {
         {
             options.tool_choice = None;
         }
+        self.start_memory_fork(&prompt, &options);
         let (observer, observations) = timing_observation_channel();
         let timing_cancel = cancel.clone();
         let events = (self.stream_starter)(self.spec.clone(), prompt, options, cancel, observer);
@@ -354,6 +381,44 @@ impl InjectedRunDriver {
             uncalibrated_prompt_estimate,
             events,
         })
+    }
+
+    fn start_memory_fork(&self, prompt: &PromptContext, options: &RequestOptions) {
+        let Some(maintenance) = &self.memory_maintenance else {
+            return;
+        };
+        let mut task = self.memory_task.lock().expect("memory task lock");
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        if self
+            .memory_retry_after
+            .lock()
+            .expect("memory retry lock")
+            .is_some_and(|after| Instant::now() < after)
+        {
+            return;
+        }
+        let parent = ParentContextSnapshot::capture(prompt, &self.spec, options);
+        let store = maintenance.store.clone();
+        let compactor = self.memory_compactor.clone();
+        let cancel = self.memory_cancel.child_token();
+        let ready = self.memory_ready.clone();
+        let retry_after = self.memory_retry_after.clone();
+        *task = Some(tokio::spawn(async move {
+            match compactor(store, parent, cancel).await {
+                Ok(true) => ready.notify_one(),
+                Ok(false) => {}
+                Err(error) => {
+                    // Retry only from a new actual parent request. Neither a
+                    // failed attempt nor a refresh invents a new reasoning
+                    // fork or replaces the parent's current experience.
+                    *retry_after.lock().expect("memory retry lock") =
+                        Some(Instant::now() + Duration::from_secs(30));
+                    tracing::warn!(%error, "background memory organization deferred");
+                }
+            }
+        }));
     }
 
     fn record_actual_send_view(
@@ -433,8 +498,20 @@ impl RunDriver for InjectedRunDriver {
         let maintenance = self.memory_maintenance.as_ref().ok_or_else(|| {
             anyhow!("idle memory maintenance has no authenticated Store/hydration binding")
         })?;
-        let applied = apply_ready_memory(maintenance.store.clone()).await?;
-        if applied == 0 {
+        let applied = match apply_ready_memory(maintenance.store.clone()).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                // Independent completed jobs may have committed before a
+                // later transition failed. Preserve the refresh obligation
+                // even when the batch operation cannot return its count.
+                maintenance.refresh_pending.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        if applied > 0 {
+            maintenance.refresh_pending.store(true, Ordering::Release);
+        }
+        if !maintenance.refresh_pending.load(Ordering::Acquire) {
             return Ok(false);
         }
 
@@ -477,7 +554,12 @@ impl RunDriver for InjectedRunDriver {
             hydrated.provider_context.clone(),
         )?;
         core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+        maintenance.refresh_pending.store(false, Ordering::Release);
         Ok(true)
+    }
+
+    async fn memory_maintenance_ready(&self) {
+        self.memory_ready.notified().await;
     }
 
     async fn start_provider_for_command(
@@ -634,7 +716,12 @@ impl RunDriver for InjectedRunDriver {
         _request: OverflowRecoveryRequest,
         active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
-        let replacement = self.assembler.recover_overflow(active_context)?;
+        let replacement = self.assembler.recover_overflow_with_output_reserve(
+            active_context,
+            self.options
+                .max_tokens
+                .unwrap_or(self.spec.default_output_tokens),
+        )?;
         if self.memory_maintenance.is_some() {
             let recovered = self
                 .assembler
@@ -704,6 +791,15 @@ fn provider_send_view_digest(prompt: &PromptContext) -> Result<[u8; 32]> {
 
 impl Drop for InjectedRunDriver {
     fn drop(&mut self) {
+        self.memory_cancel.cancel();
+        if let Some(task) = self
+            .memory_task
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         for task in self
             .timing_tasks
             .get_mut()
@@ -1103,6 +1199,135 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn memory_fork_uses_actual_request_and_does_not_block_new_input() {
+        let store = Arc::new(
+            Store::session_test_store("memory-live-fork")
+                .await
+                .expect("store"),
+        );
+        let generation = generation(12);
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "memory-live-lease",
+        )
+        .expect("lease");
+        let fence = GenerationRecoveryFence::new(&lease, "memory-live-fence").expect("fence");
+        let hydrated = match store.hydrate(&lease, &fence).await.expect("hydrate") {
+            HydrationOutcome::Complete(hydrated) => hydrated,
+            other => panic!("clean store: {other:?}"),
+        };
+        let (spec, prompt, registry, workspace) = dependencies();
+        let observed = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
+        let sent = observed.clone();
+        let starter: Arc<StreamStarter> = Arc::new(move |spec, prompt, _, cancel, _| {
+            sent.lock().expect("sent prompts").push(prompt);
+            let (_tx, rx) = mpsc::channel(1);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        });
+        let mut driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions {
+                tool_choice: Some(json!("required")),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation),
+            starter,
+        )
+        .expect("driver")
+        .with_hydrated_memory(store, &lease, &fence, &hydrated)
+        .expect("bind memory");
+        // Consume the cold-boot inspection signal so the next signal belongs
+        // to this actual in-flight completion.
+        driver.memory_maintenance_ready().await;
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let child_release = release.clone();
+        driver.memory_compactor = Arc::new(move |_store, parent, cancel| {
+            let captured_tx = captured_tx.clone();
+            let release = child_release.clone();
+            Box::pin(async move {
+                captured_tx.send(parent).expect("capture receiver");
+                tokio::select! {
+                    _ = cancel.cancelled() => bail!("cancelled fixture fork"),
+                    _ = release.notified() => Ok(true),
+                }
+            })
+        });
+        let first = ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "The comparison uses the earlier draft.".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        let mut current = vec![first];
+        let _first_attempt = driver
+            .start_provider_for_command(0, &current, None, CancellationToken::new())
+            .await
+            .expect("first provider starts");
+        let fork = captured_rx.recv().await.expect("fork captured");
+        assert_eq!(fork.prompt(), &observed.lock().expect("prompts")[0]);
+        assert_eq!(fork.options().tool_choice, Some(json!("required")));
+
+        let correction = ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "Correction: use the updated draft instead.".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        current.push(correction.clone());
+        let _next_attempt = driver
+            .start_provider_for_command(1, &current, None, CancellationToken::new())
+            .await
+            .expect("new input proceeds while the fork is held");
+        assert!(
+            captured_rx.try_recv().is_err(),
+            "only one fork may be in flight"
+        );
+        assert!(
+            observed.lock().expect("prompts")[1]
+                .messages
+                .contains(&correction)
+        );
+        assert!(
+            !fork.prompt().messages.contains(&correction),
+            "captured prefix is immutable"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), driver.memory_maintenance_ready())
+            .await
+            .expect("completed fork wakes maintenance");
+        let task = driver
+            .memory_task
+            .lock()
+            .expect("task")
+            .take()
+            .expect("finished task");
+        task.await.expect("join fork");
+        let _third_attempt = driver
+            .start_provider_for_command(2, &current, None, CancellationToken::new())
+            .await
+            .expect("fresh request starts a new fork");
+        let next_fork = captured_rx.recv().await.expect("fresh fork");
+        assert_eq!(next_fork.prompt(), &observed.lock().expect("prompts")[2]);
+        assert!(next_fork.prompt().messages.contains(&correction));
+        assert_eq!(
+            next_fork.options().tool_choice,
+            None,
+            "effective retry options are captured"
+        );
+        release.notify_one();
     }
 
     #[tokio::test]

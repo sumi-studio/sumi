@@ -1102,10 +1102,18 @@ struct ChatDelta {
     reasoning: Option<String>,
     #[serde(default)]
     reasoning_text: Option<String>,
-    #[serde(default)]
+    // The Chat Completions delta schema permits explicit null as well as omission.
+    #[serde(default, deserialize_with = "deserialize_tool_call_deltas")]
     tool_calls: Vec<ChatToolDelta>,
     #[serde(default)]
     function_call: Option<ChatFunctionDelta>,
+}
+
+fn deserialize_tool_call_deltas<'de, D>(deserializer: D) -> Result<Vec<ChatToolDelta>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<ChatToolDelta>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2136,6 +2144,36 @@ mod tests {
                 "additionalProperties": false
             }),
         }
+    }
+
+    #[test]
+    fn nullable_tool_call_deltas_preserve_text_and_reject_invalid_shapes() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        for tool_calls in [None, Some(json!(null)), Some(json!([]))] {
+            let mut delta = json!({"role":"assistant", "content":"OK"});
+            if let Some(tool_calls) = tool_calls {
+                delta["tool_calls"] = tool_calls;
+            }
+            let payload = json!({"id":"glm-fixture", "model":"glm-5.3-flash", "choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]}).to_string();
+            let mut receive = ChatReceiveState::new(registry.clone());
+            let events = receive.push_json(&payload).expect("optional tool_calls");
+            assert!(events.iter().any(
+                |event| matches!(event, ProviderEvent::TextDelta { delta, .. } if delta == "OK")
+            ));
+        }
+        for tool_calls in [json!({}), json!("invalid"), json!(false), json!([null])] {
+            let mut receive = ChatReceiveState::new(registry.clone());
+            let payload = json!({"choices":[{"delta":{"tool_calls":tool_calls}}]}).to_string();
+            assert!(matches!(
+                receive.push_json(&payload),
+                Err(ChatAdapterError::InvalidChunk(_))
+            ));
+        }
+        let mut receive = ChatReceiveState::new(registry);
+        assert!(matches!(
+            receive.push_json(r#"{"choices":null}"#),
+            Err(ChatAdapterError::InvalidChunk(_))
+        ));
     }
 
     fn tool_definition_named(name: &str) -> ToolDefinition {
