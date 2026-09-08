@@ -3149,4 +3149,5 @@ mod tests {
         assert!(memory.l1().is_empty());
     }
     include!("compactor/upper_tests.rs");
+    include!("compactor/upper_real_tests.rs");
 }
