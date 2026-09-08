@@ -58,3 +58,25 @@ Actual replies should use the destination's normal Messaging path.
 
 This document records product direction and a correction. It does not claim
 that the revised integration or UI has been implemented or accepted.
+
+## Requested presentation and interaction quality
+
+The user subsequently requested improving the current screen, with ChatGPT Web
+as a reference for readability, neutral appearance, and usability, and Codex
+desktop as a reference for information architecture and interaction. Preserve
+the current colors. Thought and tool presentation are important in their own
+right, not secondary details to leave behind a generic completion label.
+
+The user explicitly rejected collecting tools separately from prose because it
+destroys the visible chronology. Preserve the actual order of prose blocks,
+available display summaries, operations, and outcomes. A run-wide overview may
+aid navigation but must not replace the chronological account. Detail expansion
+must retain the surrounding context. Do not fabricate model reasoning, times,
+success, or a delivery destination not established by actual events.
+
+The user also reported lost scroll position and forced jumps to the top.
+Acceptance must exercise replay, lazy rendering, streaming updates, viewport
+changes, and detail expansion in a browser. Reading older content should retain
+the reader's position; following new output is appropriate while already at
+the end. A successful text replay test alone does not establish usable layout
+or scrolling.
