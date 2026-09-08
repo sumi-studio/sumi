@@ -159,6 +159,8 @@ const HYDRATION_PAGE_SIZE: i64 = 64;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MemorySummaryPayload {
+    #[serde(default)]
+    original_seq_span: Option<crate::memory::OriginalSequenceSpan>,
     summary: String,
     est_tokens: u64,
     from: DateTime<Utc>,
@@ -2232,7 +2234,7 @@ impl Store {
                 let state = MemoryBatchState::from_str(&state_text).ok_or_else(|| {
                     anyhow!("memory batch {id_text} has unknown state {state_text}")
                 })?;
-                let summary = if state == MemoryBatchState::Dropped {
+                let mut summary = if state == MemoryBatchState::Dropped {
                     None
                 } else {
                     match (
@@ -2258,6 +2260,32 @@ impl Store {
                         _ => bail!("memory batch {id_text} summary fields are inconsistent"),
                     }
                 };
+
+                if layer == MemoryLayer::L1 {
+                    if let Some(current) = summary.as_ref() {
+                        if current.original_seq_span().is_none() {
+                            let producer: Option<String> = sqlx::query_scalar(
+                                "SELECT source_ids FROM memory_jobs WHERE kind = 'compact_l0'
+                                 AND batch_seq = ? AND status IN ('completed', 'applied')",
+                            )
+                            .bind(row.try_get::<i64, _>("batch_seq")?)
+                            .fetch_optional(&mut **transaction)
+                            .await?;
+                            if let Some(producer) = producer {
+                                let sources: Vec<String> = serde_json::from_str(&producer)?;
+                                if sources.len() != 1 {
+                                    bail!("L1 batch {id_text} has invalid immediate L0 lineage");
+                                }
+                                let span = self
+                                    .immediate_l0_original_span(transaction, &sources[0])
+                                    .await?;
+                                summary = summary
+                                    .take()
+                                    .map(|value| value.with_original_seq_span(span));
+                            }
+                        }
+                    }
+                }
 
                 let ord = u64::try_from(row.try_get::<i64, _>("ord")?)
                     .with_context(|| format!("memory batch {id_text} ord out of u64 range"))?;
@@ -2427,7 +2455,7 @@ impl Store {
                     }
                 }
 
-                let result = match (
+                let mut result = match (
                     row.try_get::<Option<String>, _>("result_key_ref")?,
                     row.try_get::<Option<Vec<u8>>, _>("result_ciphertext")?,
                     row.try_get::<Option<String>, _>("result_projection")?,
@@ -2449,6 +2477,18 @@ impl Store {
                     (None, None, None, None) => None,
                     _ => bail!("memory job {id_text} result fields are inconsistent"),
                 };
+
+                if kind == MemoryJobKind::CompactL0
+                    && result
+                        .as_ref()
+                        .is_some_and(|value| value.original_seq_span().is_none())
+                    && source_ids.len() == 1
+                {
+                    let span = self
+                        .immediate_l0_original_span(transaction, &source_ids[0].to_string())
+                        .await?;
+                    result = result.map(|value| value.with_original_seq_span(span));
+                }
 
                 jobs.push(HydratedMemoryJob::new(
                     id,
@@ -2533,6 +2573,45 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Recover a pre-span L1's placement from its one immediate L0 source.
+    /// This never follows upper summary ancestry or reads original ciphertext.
+    async fn immediate_l0_original_span(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        source: &str,
+    ) -> Result<Option<crate::memory::OriginalSequenceSpan>> {
+        let layer: Option<i64> =
+            sqlx::query_scalar("SELECT layer FROM memory_batches WHERE id = ?")
+                .bind(source)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        if layer != Some(0) {
+            bail!("summary source {source} is not an existing L0 batch");
+        }
+        let first: Option<i64> = sqlx::query_scalar(
+            "SELECT m.seq FROM memory_batch_messages b JOIN messages m ON m.id = b.message_id
+             WHERE b.batch_id = ? ORDER BY b.ord ASC LIMIT 1",
+        )
+        .bind(source)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let last: Option<i64> = sqlx::query_scalar(
+            "SELECT m.seq FROM memory_batch_messages b JOIN messages m ON m.id = b.message_id
+             WHERE b.batch_id = ? ORDER BY b.ord DESC LIMIT 1",
+        )
+        .bind(source)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        match (first, last) {
+            (Some(first), Some(last)) => Ok(Some(crate::memory::OriginalSequenceSpan::new(
+                u64::try_from(first)?,
+                u64::try_from(last)?,
+            )?)),
+            (None, None) => Ok(None),
+            _ => bail!("summary source {source} has inconsistent original membership endpoints"),
+        }
+    }
+
     async fn hydrate_memory_summary(
         &self,
         key_cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
@@ -2596,6 +2675,7 @@ impl Store {
             payload.from,
             payload.to,
         )
+        .map(|summary| summary.with_original_seq_span(payload.original_seq_span))
         .with_context(|| format!("{table} projection for {row_id} has an invalid summary payload"))
     }
 
@@ -5539,9 +5619,62 @@ mod tests {
             .await
     }
 
+    #[tokio::test]
+    async fn encrypted_memory_summary_preserves_original_sequence_span() {
+        let store = store().await;
+        let id = Uuid::now_v7().to_string();
+        let mut result = fixture_compact_result("Original experiences, not generation order.", 12);
+        result.original_seq_span = Some(crate::memory::OriginalSequenceSpan::new(7, 42).unwrap());
+        insert_authenticated_summary_batch(&store, &id, result).await;
+        let row = sqlx::query("SELECT summary_key_ref, summary_ciphertext, summary_projection, summary_redaction_version FROM memory_batches WHERE id = ?")
+            .bind(&id).fetch_one(store.pool()).await.unwrap();
+        let restored = authenticate_memory_summary(
+            &store,
+            &row.get::<String, _>("summary_key_ref"),
+            &row.get::<Vec<u8>, _>("summary_ciphertext"),
+            &row.get::<String, _>("summary_projection"),
+            row.get::<i64, _>("summary_redaction_version"),
+            "memory_batches",
+            &id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored.original_seq_span(),
+            Some(crate::memory::OriginalSequenceSpan::new(7, 42).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_summary_rejects_invalid_original_sequence_span() {
+        let store = store().await;
+        for (from, to) in [(0, 3), (8, 7)] {
+            let id = Uuid::now_v7().to_string();
+            let key = store.memory_summary_key("batch", &id).await.unwrap();
+            let mut payload = test_memory_payload();
+            payload["original_seq_span"] = json!({"from_seq": from, "to_seq": to});
+            let (ciphertext, projection, version) =
+                encrypt_memory_projection(&store, &key, "memory_batches", &id, &payload);
+            assert!(
+                authenticate_memory_summary(
+                    &store,
+                    &key.key_ref,
+                    &ciphertext,
+                    &projection,
+                    i64::from(version),
+                    "memory_batches",
+                    &id
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
     fn fixture_compact_result(summary: &str, est_tokens: u64) -> crate::memory::CompactResult {
         let now = Utc::now();
         crate::memory::CompactResult {
+            original_seq_span: None,
             summary: crate::memory::DecryptedMemorySummary::new(summary.to_owned()),
             est_tokens,
             time_range: (now, now),
@@ -5750,6 +5883,7 @@ mod tests {
         .await;
         let now = Utc::now();
         let result = crate::memory::CompactResult {
+            original_seq_span: None,
             summary: crate::memory::DecryptedMemorySummary::new(summary_text.to_owned()),
             est_tokens,
             time_range: (now, now),
@@ -6248,6 +6382,7 @@ mod tests {
 
         let now = Utc::now();
         let result = crate::memory::CompactResult {
+            original_seq_span: None,
             summary: crate::memory::DecryptedMemorySummary::new(
                 "Nothing of secret value here.".to_owned(),
             ),
@@ -6344,7 +6479,7 @@ mod tests {
             memory.l1()[0].summary.expose(),
             "Nothing of secret value here."
         );
-        assert_eq!(memory.l2().summary.expose(), "");
+        assert!(memory.l2().is_empty());
     }
 
     #[tokio::test]
@@ -6475,6 +6610,25 @@ mod tests {
         else {
             panic!("completed CompactL0 shelf must hydrate without physical recovery");
         };
+        let original_seqs: Vec<_> = state
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                crate::provider::types::ContextMessage::Persisted { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        let original_span = crate::memory::OriginalSequenceSpan::new(
+            *original_seqs
+                .iter()
+                .min()
+                .expect("original conversation exists"),
+            *original_seqs
+                .iter()
+                .max()
+                .expect("original conversation exists"),
+        )
+        .unwrap();
         let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
             .expect("completed shelf graph reconstructs");
         let shelf = memory
@@ -6483,6 +6637,7 @@ mod tests {
             .expect("completed CompactL0 result is restored to its source shelf");
         assert_eq!(shelf.summary.expose(), "completed L1 shelf");
         assert_eq!(shelf.est_tokens, 7);
+        assert_eq!(shelf.original_seq_span, Some(original_span),);
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT status FROM memory_jobs WHERE id = ?")
                 .bind(job_id)
@@ -6494,7 +6649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_hydration_folds_multiple_authenticated_l2_rows_in_order() {
+    async fn store_hydration_preserves_multiple_authenticated_l2_fragments() {
         let store = store().await;
         apply_compact_l1_fixture(&store, "first durable L2", 3, 1, true).await;
         apply_compact_l1_fixture(&store, "second durable L2", 5, 2, false).await;
@@ -6513,10 +6668,29 @@ mod tests {
         assert!(memory.l0().is_empty());
         assert!(memory.l1().is_empty());
         assert_eq!(
-            memory.l2().summary.expose(),
-            "first durable L2\n\nsecond durable L2"
+            memory
+                .l2()
+                .iter()
+                .map(|entry| entry.summary.expose())
+                .collect::<Vec<_>>(),
+            vec!["first durable L2", "second durable L2"]
         );
-        assert_eq!(memory.l2().est_tokens, 8);
+        assert_eq!(
+            memory
+                .l2()
+                .iter()
+                .map(|entry| entry.est_tokens)
+                .sum::<u64>(),
+            8
+        );
+        assert_ne!(memory.l2()[0].batch_id, memory.l2()[1].batch_id);
+        assert!(
+            memory
+                .l2()
+                .iter()
+                .all(|entry| entry.source_batches.len() == 1 && entry.original_seq_span.is_none()),
+            "historical L2 fragments retain immediate lineage without inventing original spans"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM memory_batches
@@ -6882,6 +7056,7 @@ mod tests {
 
         let now = Utc::now();
         let result = crate::memory::CompactResult {
+            original_seq_span: None,
             summary: crate::memory::DecryptedMemorySummary::new(
                 "Nothing of secret value here.".to_owned(),
             ),
@@ -7004,6 +7179,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids(&live_messages), vec!["native-owner", "latest"]);
         assert_eq!(memory.l1().len(), 1);
+        assert_eq!(
+            memory.l1()[0].original_seq_span,
+            Some(crate::memory::OriginalSequenceSpan::new(4, 10).unwrap()),
+            "pre-span L1 placement comes from its immediate dropped L0 originals"
+        );
         let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec)
             .unwrap()
             .with_mode(AssemblyMode::ProviderNative);

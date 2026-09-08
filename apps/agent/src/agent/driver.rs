@@ -29,7 +29,7 @@ use crate::{
     },
     memory::{
         ThreeLayerMemory,
-        compactor::{apply_ready_memory, compact_next_l0},
+        compactor::{apply_ready_memory, compact_next_memory},
         context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
         estimate::{ProviderContextItemWithFootprint, TokenCalibration},
         overflow::AssemblyMode,
@@ -246,7 +246,7 @@ impl InjectedRunDriver {
             timing_tasks: Mutex::new(Vec::new()),
             memory_maintenance: None,
             memory_compactor: Arc::new(|store, parent, cancel| {
-                Box::pin(compact_next_l0(store, parent, cancel))
+                Box::pin(compact_next_memory(store, parent, cancel))
             }),
             memory_task: Mutex::new(None),
             memory_cancel: CancellationToken::new(),
@@ -361,7 +361,7 @@ impl InjectedRunDriver {
         {
             options.tool_choice = None;
         }
-        self.start_memory_fork(&prompt, &options);
+        self.start_memory_fork(&prompt, &options, &assembled.visible_memory);
         let (observer, observations) = timing_observation_channel();
         let timing_cancel = cancel.clone();
         let events = (self.stream_starter)(self.spec.clone(), prompt, options, cancel, observer);
@@ -383,7 +383,12 @@ impl InjectedRunDriver {
         })
     }
 
-    fn start_memory_fork(&self, prompt: &PromptContext, options: &RequestOptions) {
+    fn start_memory_fork(
+        &self,
+        prompt: &PromptContext,
+        options: &RequestOptions,
+        visible_memory: &[crate::provider::types::VisibleMemoryFragment],
+    ) {
         let Some(maintenance) = &self.memory_maintenance else {
             return;
         };
@@ -399,7 +404,18 @@ impl InjectedRunDriver {
         {
             return;
         }
-        let parent = ParentContextSnapshot::capture(prompt, &self.spec, options);
+        let parent = match ParentContextSnapshot::capture_with_memory(
+            prompt,
+            &self.spec,
+            options,
+            visible_memory,
+        ) {
+            Ok(parent) => parent,
+            Err(error) => {
+                tracing::warn!(%error, "memory target map did not match the actual request");
+                return;
+            }
+        };
         let store = maintenance.store.clone();
         let compactor = self.memory_compactor.clone();
         let cancel = self.memory_cancel.child_token();

@@ -1,0 +1,75 @@
+{
+  "status": "PARTIAL_ACCEPTANCE",
+  "sha": "0b88996acd46c76247d9cc9389d83af8fca501fe",
+  "images": {
+    "api": "sha256:7555b9da97fc90629c813dac7f634b245372505dbb3cd21bd6e16906838176bb",
+    "agent": "sha256:ae38f48a212abd3567b90da99bb41b661953b8cc201cc95abdc68d1cf8dbfa93",
+    "provisioner": "sha256:85f8f55317e612921ec6ddb72ad8ee84df45c97699e7d37a791267b3987e017a",
+    "web": "sha256:37948b53b7af4bf508b2e2c3d35fc81d9d7583fa8259afdfa73902656b69c641"
+  },
+  "limitations": [
+    "Invitation acceptance uses a separate setup-only DirectChat turn.",
+    "No claim of native Astra, all concurrency cases, or rendered UI quality."
+  ],
+  "logReload": {
+    "matched": true,
+    "through_seq": 46,
+    "completed_summary_count": 0
+  },
+  "cleanup": {
+    "apps": [
+      {
+        "id": "01a08145-7fd4-74f4-92b6-0142ad212fce",
+        "disabled": true
+      },
+      {
+        "id": "01a08145-7fc4-7918-b64c-384adb508e5c",
+        "disabled": true
+      }
+    ],
+    "sessionRevoked": true,
+    "stoppedRuntime": [
+      "60697a76670685790df65e820b62cc01cf0e00ad5d2b788399eac5df1d5a32d6",
+      "dbf29ef5cec6ca7aa9ad6b4f11364329a34db460c9e2d468568f98763e7541ef",
+      "8a12d6781cd9feb2e248b2142d664b70b04c352225f468be2b7acd3dc87a69e2"
+    ],
+    "browserClosed": true,
+    "retainedIdentityAndHistory": true
+  },
+  "dmReply": {
+    "message_id": "01a08147-cde7-733e-bbba-97e49d63e95b",
+    "place": {
+      "kind": "dm",
+      "dm_id": "01a08146-33dc-763d-8bd8-75c5bec991b7"
+    },
+    "author": {
+      "kind": "personality_agent",
+      "personality_agent_id": "01a08145-7b42-7501-8b1c-476219f6a6fc"
+    },
+    "content": "DM_OK_893904bfb7f3",
+    "created_at": "2026-09-08T13:49:21.764068Z"
+  },
+  "reminderReply": {
+    "message_id": "01a08149-946f-73ba-b933-0d0d5a8746a5",
+    "place": {
+      "kind": "dm",
+      "dm_id": "01a08146-33dc-763d-8bd8-75c5bec991b7"
+    },
+    "author": {
+      "kind": "personality_agent",
+      "personality_agent_id": "01a08145-7b42-7501-8b1c-476219f6a6fc"
+    },
+    "content": "REMINDER_DUE_893904bfb7f3",
+    "created_at": "2026-09-08T13:51:18.123762Z"
+  },
+  "cancelSuppressed": {
+    "event_id": "01a0814a-003d-73a0-9c77-9b39125f2e31",
+    "available_at": "2026-09-08T13:52:45.719212+00:00",
+    "admitted_at": null,
+    "suppressed_at": "2026-09-08T13:52:04.635731+00:00",
+    "suppression_reason": "source_unavailable"
+  },
+  "scope": "Owned synthetic shared-environment run; same image set throughout. Prior wt1r55 stalled and remains unexplained; this passing rerun does not prove that fault fixed.",
+  "runner_status": "PASSED",
+  "unverified_required_step": "No resolve_reply_later receipt for the original due reminder. The separate cancellation marker was resolved and suppressed. The old runner did not require original reminder resolution."
+}

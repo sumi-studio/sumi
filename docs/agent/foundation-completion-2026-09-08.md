@@ -13,7 +13,9 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment: `5f3fa8130775a359706ba055c7fda73f81b80f20` (PR #377).
+Current shared deployment: `ba3eeb7503555a1885a6ae54a56ec5182876f424`
+(the unmerged #379/#380/#382 stack). This is a deployed candidate, not accepted
+completion of its new capabilities.
 The private-file acceptance below was performed on the preceding `8cbba0b8`
 milestone. A subsequent recipient-delivery run on #376 passed after repairing
 reviewer stream cancellation.
@@ -90,6 +92,54 @@ to UUIDv7); native events showed both read operations completed. The final probe
 also verified reload and cleanup. These failed probes are not application failures
 or additional evidence of general recovery coverage.
 
+## Attention, activity log and native ChatGPT candidate
+
+The initial #379/#380 cutover preserved existing histories, recorded five native pre-external-event
+boundaries and converted 319 API event rows with all five heads matching their
+native histories. Command files were unchanged. Two never-initialized volumes
+remained empty; an unregistered historical database was backed up unchanged.
+
+The first actual Attention probe accepted its Workspace invitation through the
+real tool, closed the DirectChat socket, stopped its owned runtime and sent an
+ordinary DM without a mention. The delivery row remained unacknowledged through
+retries and the probe timed out without a real Messaging reply. Diagnosis found
+an actual UUID v4 command durably appended at sequence 2, while the delivery
+receipt column accepted only UUID v7. Thus a missing DB acknowledgement did not
+mean that no command had been appended. The fixture delivery tests had used v7
+receipts and missed this integration mismatch. Public execution events also
+showed that sequence 2 was processed: the fixture's earlier blanket instruction
+not to send messages caused review to block the later DM reply. The setup prompt
+has therefore been scoped to invitation acceptance; this is a fixture correction,
+not permission to bypass action review. This is a failed acceptance,
+despite passing CI. Its isolated installations were disabled, session revoked and runtime
+stopped. Reminder and cancellation scenarios were not reached. Local evidence:
+`/tmp/sumi-attention-live-acceptance-41RNf9/evidence.json`.
+
+The #382 candidate corrected the receipt column with migration 0038 and is
+running with healthy API, web and provisioner services. A second fresh probe
+recorded the UUID v4 receipt successfully and the PA opened the DM. It proposed
+the requested reply, but review rejected it solely because the source participant
+was not a designated Human approver. This is a product mismatch between an
+ordinary conversational request and a grant of elevated authority. The probe
+timed out, then disabled its owned installations, revoked its session and stopped
+its runtime. Local evidence:
+`/tmp/sumi-attention-live-acceptance-GJk5Fn/evidence.json`.
+
+The next correction preserves authenticated Messaging source metadata separately
+from message content and evaluates ordinary replies within the PA's existing
+permissions. Participant speech must not grant employer rights or elevated
+approval. Actual reply, reminder and cancellation acceptance remain open.
+
+The activity-log component checks cover chronological interleaving, replay and
+scroll position at desktop and mobile widths. They do not establish physical
+iOS keyboard behavior. Native ChatGPT connection and Astra inference are
+implemented, but actual Human authorization and an actual Astra response remain
+unverified. The user's ChatGPT credentials are not borrowed from another harness.
+
+Upper memory replacement is implemented in #381 and is not in this shared
+deployment. The combined Rust suite passed 2,260 tests with 20 ignored; this does
+not establish semantic fidelity or long-run cache behavior with a real model.
+
 ## Audit items and remaining acceptance
 
 The user also explicitly requested native GPT-6 Astra support through ChatGPT
@@ -108,15 +158,15 @@ still needed to close each row.
 
 | ID | Current assessment | Remaining acceptance |
 | --- | --- | --- |
-| M01 | L0→L1 runs; upper-layer replacement boundary settled, implementation pending | Follow [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
+| M01 | L0→L1 runs; upper-layer replacement implemented in #381, not deployed | Verify actual selective replacement against [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
 | M02 | Full-parent fork and chronological replacement repaired; semantic quality partial | Evaluate meaning, uncertainty, corrections and unfinished details against originals; do not equate compression ratio with fidelity. |
 | M03 | Ordinary silent trimming repaired; capacity boundary remains | Accumulated L1 must not eventually make every subsequent request unrecoverable. |
 | M04 | Original history read/search and optional files available | Establish voluntary revision/strategic forgetting and recoverable source references without imposing an automatic memory-rewriting ritual. |
 | M05 | Maintenance failure isolation implemented | Exercise timeout, later user input, and retry from the later full parent context. |
-| A01 | Shared notification intents exist; PA ingress absent | Deliver an authorized shared event to the same PA without an open browser, with replay/dedup and optional response. |
-| A02 | Receipt timestamp/delta implemented | Project authenticated speaker, place, source identity and occurrence time as distinct from receipt time. |
+| A01 | Actual DM wake and receipt verified; normal reply blocked by request/approval conflation | Repair and verify ordinary replies within existing permissions, retaining replay/dedup and optional response. |
+| A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
-| A04 | Reminder records exist; scheduled wake absent | Due/canceled/overdue markers cause the appropriate single admission across restart, without manufacturing a reply. |
+| A04 | Scheduled wake implemented; actual probe not reached after DM failure | Due/canceled/overdue markers cause the appropriate single admission across restart, without manufacturing a reply. |
 | T01 | Tool progress/control exist; inference waits for completion | One real long-running operation returns a durable handle, allows other conversation and later result recovery without repeating the effect. |
 | T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
 | T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
@@ -129,7 +179,7 @@ still needed to close each row.
 | R04 | Warm prevents idle stopping but does not restore | Explicit intended presence survives exit/reboot with bounded restoration and observable failure. |
 | R05 | Active-state reconstruction deployed and verified on an existing PA in #377 | All three CI jobs passed; local suite 2,210 passed, 20 ignored. Native migration 21 added all 15 indexes with previous migration checksums intact. Existing conversation context identified the old report and read its corrected bytes; old/new replies survived reload. Large active suffixes remain proportional work. |
 | P01 | No provider-native steering/async path | Verify an actual documented supported provider contract before adopting it; internal async/steering is not evidence of native support. |
-| P02 | Model overrides partial; effort not wired | Explicit supported effort/budget reaches the provider; incompatible configuration is explained before sending. Model switching is a separate remaining path. |
+| P02 | ChatGPT connection, Astra effort and idle switching implemented in #380 | Verify actual authorization, inference and switching; configured values and synthetic protocol tests alone do not establish live activation. |
 | P03 | Harmless incoming reasoning metadata projected to canonical fields | Implemented; incremental response, canonical context serialization and next-request tests pass. Required structure and outgoing rules remain checked. Deployed in #375. |
 | P04 | Provider Retry-After respected | Implemented; loopback HTTP and controlled-time tests cover delay, steering, cancellation and fallback. Delays over five minutes end automatic retry instead of resending early. Deployed in #375. |
 | P05 | Per-response limits only | Account for an explicitly bounded undertaking/wake across restart, stop further admissions truthfully and support replenishment. |
@@ -167,3 +217,66 @@ through correction, a detour, a question, external waiting, long conversation,
 interruption, a real artifact and delivery. It must also be possible to remain
 quiet, decline a method, or change an optional practice. Closing a run, a PR or
 this table does not by itself prove the undertaking complete.
+
+### Latest observed acceptance — 2026-09-08
+
+Candidate #382 at `0b88996a` passed its current Rust, API/Postgres and web CI.
+The shared-environment run `wt1r55` produced a real PA-authored Messaging DM
+reply with no DirectChat socket, and replay matched through event 46. A real
+one-minute reply-later event also produced its requested Messaging reply.
+The overall run failed at cancellation: the next message was admitted as
+command 5, but the retained public event log ends at event 88, after the
+preceding reminder's write and before its proposed resolve tool ran. This
+is not yet evidence of a cancellation implementation failure; runtime
+termination or lost progress still needs diagnosis. Fixture cleanup completed.
+Evidence: `/tmp/sumi-attention-live-acceptance-wt1r55/evidence.json` and
+`/tmp/sumi-attention-wt1r55-diagnosis.json`.
+
+The staged upper-memory real-provider test passed all mechanical checks
+(4 provider streams, including store close/reopen). The parent answered
+October 19; the selected old L1 and reintegrated L2 retained provisional
+October 12; after a later correction and reopen the parent answered October
+21. All preserved the uncertain venue and original note location. This is
+a synthetic staged scenario, not a natural long-running session or a
+completed independent semantic acceptance. Normalized provider counters
+reported cache reads of 71,168 and 34,304 on the two forks; these do not
+prove longitudinal cache savings. Trace: `/tmp/sumi-upper-real-session-20260908/trace.json`.
+
+The subsequent diagnostic run `kk9dbT` passed DM delivery, replay, an actual
+one-minute reminder, cancellation through real tools, and suppression past the
+cancelled deadline. All four images remained pinned; cleanup revoked the
+fixture session, disabled its apps, and stopped only its owned runtime.
+[Selected synthetic evidence](evidence/attention-delivery-2026-09-08.json)
+records these results. The earlier `wt1r55` stall is still unexplained, so
+this rerun does not establish that intermittent lost progress is fixed.
+
+Independent review found the staged upper-memory replacements faithful to the
+selected sources. It also found original-history verification incomplete:
+the earlier trace recorded only the first recall page. The test now follows
+pagination and checks actual original facts and separation from later history;
+its focused offline validation passed (one scenario, no model calls). This does not retroactively
+strengthen the previous real-model trace.
+
+Correction after receipt-level review: `kk9dbT`'s runner status was PASSED,
+but it did not require resolving the original due reminder. The final tool
+sequence contains no such resolve receipt; only the separately created
+cancellation marker was resolved. The selected artifact now labels this
+PARTIAL_ACCEPTANCE. Delivery and separate cancellation are proven; completion
+of the original reminder workflow is not. The runner now requires both its
+write receipt and its matching resolve receipt before advancing. No fresh
+real run has yet validated that stronger condition.
+
+Diagnostic-only shared update `ba3eeb75` passed all three CI jobs and routine
+cutover checks, preserving existing mounts and the ChatGPT encryption key.
+No history conversion or schema migration ran. Configuration and PostgreSQL
+backups were taken; PA volumes were retained in place. The actual-model
+run below requires the original reminder resolve receipt.
+
+The strengthened run `zzT9jd` completed on `ba3eeb75`. Its original reminder
+resolve call `messaging_8` started at event 93 and returned resolved=true for
+the matching marker at event 94. The separate cancellation was suppressed
+before its due time and remained unadmitted after the deadline. DM delivery,
+replay, unchanged image bindings and fixture cleanup also passed.
+[Resolution evidence](evidence/attention-resolution-2026-09-08.json) records
+the matched receipts. The earlier partial artifact is retained as such;
+the unexplained earlier stall is not claimed fixed by this passing scenario.

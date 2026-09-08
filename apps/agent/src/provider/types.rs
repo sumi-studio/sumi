@@ -1242,6 +1242,51 @@ pub struct PromptContext {
     pub(crate) replay_provenance: Option<crate::memory::context_assembler::ReplayProvenance>,
 }
 
+/// A memory fragment that actually appears in one assembled provider prompt.
+/// Identity is carried out of band; callers never recover it by parsing prose.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct VisibleMemoryFragment {
+    pub message_index: usize,
+    /// First fragment identity in an uninterrupted pre-normalization group.
+    pub adjacency_group: uuid::Uuid,
+    pub layer: MemoryLayer,
+    pub batch_id: uuid::Uuid,
+    pub version: u64,
+    pub source_ids: Vec<uuid::Uuid>,
+    pub original_seq_span: Option<crate::memory::OriginalSequenceSpan>,
+    pub time_range: (DateTime<Utc>, DateTime<Utc>),
+    pub text: String,
+}
+
+impl VisibleMemoryFragment {
+    pub(crate) fn render_message(&self) -> ContextMessage {
+        let source = serde_json::json!({
+            "operation": "read", "batch_id": self.batch_id, "limit": 5,
+        });
+        let position_note = if self.original_seq_span.is_none() {
+            " Original transcript position is not recorded."
+        } else {
+            ""
+        };
+        ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                incoming_source: None,
+                incoming_timing: None,
+                timestamp: self.time_range.1,
+                content: vec![UserContent::Text {
+                    text: format!(
+                        "[Memory fragment recorded {} through {}.{}]\nSource: conversation_history({source}). For further pages, pass next_after_seq as after_seq.\n{}",
+                        self.time_range.0.to_rfc3339(),
+                        self.time_range.1.to_rfc3339(),
+                        position_note,
+                        self.text,
+                    ),
+                }],
+            }),
+        }
+    }
+}
+
 /// An immutable copy of one actual parent provider input. The memory target
 /// describes what a fork may reorganize; it does not narrow this input.
 ///
@@ -1254,6 +1299,7 @@ pub struct ParentContextSnapshot {
     prompt: PromptContext,
     spec: super::model::ModelSpec,
     options: super::model::RequestOptions,
+    visible_memory: Vec<VisibleMemoryFragment>,
 }
 
 impl ParentContextSnapshot {
@@ -1266,7 +1312,44 @@ impl ParentContextSnapshot {
             prompt: prompt.clone(),
             spec: spec.clone(),
             options: options.clone(),
+            visible_memory: Vec::new(),
         }
+    }
+
+    pub(crate) fn capture_with_memory(
+        prompt: &PromptContext,
+        spec: &super::model::ModelSpec,
+        options: &super::model::RequestOptions,
+        visible_memory: &[VisibleMemoryFragment],
+    ) -> Result<Self, String> {
+        let mut identities = std::collections::HashSet::new();
+        let mut positions = std::collections::HashSet::new();
+        for fragment in visible_memory {
+            if !identities.insert(fragment.batch_id) || !positions.insert(fragment.message_index) {
+                return Err("visible memory contains duplicate identity or position".into());
+            }
+            if fragment.source_ids.is_empty()
+                || fragment.time_range.0 > fragment.time_range.1
+                || fragment
+                    .original_seq_span
+                    .as_ref()
+                    .is_some_and(|span| span.from_seq == 0 || span.from_seq > span.to_seq)
+            {
+                return Err("visible memory has invalid source or original range".into());
+            }
+            if prompt.messages.get(fragment.message_index) != Some(&fragment.render_message()) {
+                return Err(
+                    "visible memory descriptor does not match the actual parent prompt".into(),
+                );
+            }
+        }
+        let mut snapshot = Self::capture(prompt, spec, options);
+        snapshot.visible_memory = visible_memory.to_vec();
+        Ok(snapshot)
+    }
+
+    pub(crate) fn visible_memory(&self) -> &[VisibleMemoryFragment] {
+        &self.visible_memory
     }
 
     pub fn prompt(&self) -> &PromptContext {

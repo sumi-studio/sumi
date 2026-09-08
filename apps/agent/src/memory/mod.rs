@@ -110,23 +110,60 @@ impl DecryptedMemorySummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OriginalSequenceSpan {
+    pub from_seq: u64,
+    pub to_seq: u64,
+}
+
+impl OriginalSequenceSpan {
+    pub(crate) fn new(from_seq: u64, to_seq: u64) -> Result<Self> {
+        if from_seq == 0 || from_seq > to_seq {
+            bail!("original sequence span must be positive and ordered");
+        }
+        Ok(Self { from_seq, to_seq })
+    }
+}
+
+impl<'de> Deserialize<'de> for OriginalSequenceSpan {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            from_seq: u64,
+            to_seq: u64,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(fields.from_seq, fields.to_seq).map_err(serde::de::Error::custom)
+    }
+}
+
 pub struct L1Entry {
+    pub batch_id: BatchId,
+    pub version: u64,
     pub source_batch: BatchId,
     pub source_batch_seq: u64,
     pub summary: DecryptedMemorySummary,
     pub est_tokens: u64,
     pub time_range: (DateTime<Utc>, DateTime<Utc>),
+    pub(crate) original_seq_span: Option<OriginalSequenceSpan>,
 }
 
-pub struct ConsolidatedMemory {
+pub struct L2Entry {
+    pub batch_id: BatchId,
+    pub version: u64,
+    pub source_batches: Vec<BatchId>,
     pub summary: DecryptedMemorySummary,
     pub est_tokens: u64,
+    pub time_range: (DateTime<Utc>, DateTime<Utc>),
+    pub(crate) original_seq_span: Option<OriginalSequenceSpan>,
 }
 
 pub struct CompactResult {
     pub summary: DecryptedMemorySummary,
     pub est_tokens: u64,
     pub time_range: (DateTime<Utc>, DateTime<Utc>),
+    pub(crate) original_seq_span: Option<OriginalSequenceSpan>,
 }
 
 impl Clone for CompactResult {
@@ -135,6 +172,7 @@ impl Clone for CompactResult {
             summary: DecryptedMemorySummary::new(self.summary.expose().to_owned()),
             est_tokens: self.est_tokens,
             time_range: self.time_range,
+            original_seq_span: self.original_seq_span,
         }
     }
 }
@@ -145,6 +183,7 @@ impl Clone for CompactResult {
 /// key reference, ciphertext, or redacted projection. Plaintext remains behind
 /// [`DecryptedMemorySummary`]'s explicit access boundary.
 pub(crate) struct HydratedMemorySummary {
+    original_seq_span: Option<OriginalSequenceSpan>,
     summary: DecryptedMemorySummary,
     est_tokens: u64,
     time_range: (DateTime<Utc>, DateTime<Utc>),
@@ -156,6 +195,7 @@ impl Clone for HydratedMemorySummary {
             summary: DecryptedMemorySummary::new(self.summary.expose().to_owned()),
             est_tokens: self.est_tokens,
             time_range: self.time_range,
+            original_seq_span: self.original_seq_span,
         }
     }
 }
@@ -174,11 +214,22 @@ impl HydratedMemorySummary {
             summary: DecryptedMemorySummary::new(summary),
             est_tokens,
             time_range: (from, to),
+            original_seq_span: None,
         })
     }
 
+    pub(crate) fn original_seq_span(&self) -> Option<OriginalSequenceSpan> {
+        self.original_seq_span
+    }
+
+    pub(crate) fn with_original_seq_span(mut self, span: Option<OriginalSequenceSpan>) -> Self {
+        self.original_seq_span = span;
+        self
+    }
+
     fn semantically_matches(&self, other: &Self) -> bool {
-        self.est_tokens == other.est_tokens
+        self.original_seq_span == other.original_seq_span
+            && self.est_tokens == other.est_tokens
             && self.time_range == other.time_range
             && self.summary.expose() == other.summary.expose()
     }
@@ -193,23 +244,26 @@ impl HydratedMemorySummary {
             summary: self.summary,
             est_tokens: self.est_tokens,
             time_range: self.time_range,
+            original_seq_span: self.original_seq_span,
         }
     }
 
-    fn into_l1_entry(self, source_batch: BatchId, source_batch_seq: u64) -> L1Entry {
+    fn into_l1_entry(
+        self,
+        batch_id: BatchId,
+        version: u64,
+        source_batch: BatchId,
+        source_batch_seq: u64,
+    ) -> L1Entry {
         L1Entry {
+            batch_id,
+            version,
             source_batch,
             source_batch_seq,
             summary: self.summary,
             est_tokens: self.est_tokens,
             time_range: self.time_range,
-        }
-    }
-
-    fn into_consolidated(self) -> ConsolidatedMemory {
-        ConsolidatedMemory {
-            summary: self.summary,
-            est_tokens: self.est_tokens,
+            original_seq_span: self.original_seq_span,
         }
     }
 }
@@ -404,7 +458,7 @@ impl fmt::Debug for HydratedMemoryRuntime {
 /// compaction shelf.  Durable persistence and promotion are intentionally
 /// owned by later tasks.
 pub struct ThreeLayerMemory {
-    l2: ConsolidatedMemory,
+    l2: VecDeque<L2Entry>,
     l1: VecDeque<L1Entry>,
     l0: VecDeque<L0Batch>,
     shelf: HashMap<BatchId, CompactResult>,
@@ -414,7 +468,7 @@ pub struct ThreeLayerMemory {
 }
 
 impl ThreeLayerMemory {
-    pub fn new(l2: ConsolidatedMemory, calib: TokenCalibration) -> Self {
+    pub fn new(l2: VecDeque<L2Entry>, calib: TokenCalibration) -> Self {
         Self {
             l2,
             l1: VecDeque::new(),
@@ -432,13 +486,13 @@ impl ThreeLayerMemory {
     /// Cold boot must never turn a malformed durable graph into empty memory.
     /// This boundary therefore validates batch identity/order, L0 membership,
     /// provider-context ownership, compaction source/target witnesses, job
-    /// state, summaries, and FIFO cursors before exposing runtime state.
+    /// state and summaries before exposing runtime state.
     pub(crate) fn from_hydrated(hydrated: HydratedMemoryRuntime) -> Result<Self> {
         let HydratedMemoryRuntime {
             batches,
             memberships,
             jobs,
-            cursors,
+            cursors: _,
             anchored_footprints,
             calibration,
             active_selection,
@@ -548,11 +602,9 @@ impl ThreeLayerMemory {
             &jobs,
             active_selection.is_some(),
         )?;
-        if let Some((_, job_sequence_max)) = &active_selection {
-            validate_selected_apply_cursors(&jobs, &cursors, job_sequence_max)?;
-        } else {
-            validate_apply_cursors(&jobs, &cursors)?;
-        }
+        // Every layer applies an independently versioned source group. A legacy
+        // prefix cursor cannot witness those replacements or block a later group.
+        // Batch/job lineage and exact source state above remain authoritative.
 
         let mut l0_ids = ordered_batch_ids(&batches_by_id, MemoryLayer::L0);
         let mut previous_message_seq = None;
@@ -774,41 +826,45 @@ impl ThreeLayerMemory {
                 l1_sources.remove(&batch.id).ok_or_else(|| {
                     anyhow!("visible L1 batch {batch_id} has no applied CompactL0 source identity")
                 })?;
-            l1.push_back(summary.into_l1_entry(source_batch, source_batch_seq));
+            l1.push_back(summary.into_l1_entry(
+                batch.id,
+                batch.version,
+                source_batch,
+                source_batch_seq,
+            ));
         }
 
-        // Repeated CompactL1 applies append independently authenticated L2
-        // rows. Until a ConsolidateL2 job is applied, all visible rows are
-        // live memory. Fold them into the runtime's single L2 block in
-        // durable ordinal order without dropping an older summary.
-        let l2 = if l2_ids.is_empty() {
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new(String::new()),
-                est_tokens: 0,
-            }
-        } else {
-            let mut combined = Zeroizing::new(String::new());
-            let mut total_est_tokens = 0_u64;
-            for batch_id in l2_ids {
-                let batch = batches_by_id
-                    .remove(&batch_id)
-                    .expect("validated visible L2 batch must remain present");
-                let summary = batch.summary.ok_or_else(|| {
-                    anyhow!("visible L2 batch {batch_id} is missing an authenticated summary")
-                })?;
-                if !combined.is_empty() {
-                    combined.push_str("\n\n");
-                }
-                combined.push_str(summary.summary.expose());
-                total_est_tokens = total_est_tokens
-                    .checked_add(summary.est_tokens)
-                    .ok_or_else(|| anyhow!("hydrated visible L2 estimate overflow"))?;
-            }
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary(combined),
-                est_tokens: total_est_tokens,
-            }
-        };
+        // Keep each selected fragment and its immediate producer lineage. No
+        // archive traversal is needed to retain or place current experience.
+        let mut l2 = VecDeque::new();
+        for batch_id in l2_ids {
+            let batch = batches_by_id
+                .remove(&batch_id)
+                .expect("validated visible L2 batch must remain present");
+            let summary = batch.summary.ok_or_else(|| {
+                anyhow!("visible L2 batch {batch_id} is missing an authenticated summary")
+            })?;
+            let producer = jobs
+                .iter()
+                .find(|job| {
+                    job.status == MemoryJobStatus::Applied
+                        && target_layer(job.kind) == MemoryLayer::L2
+                        && job.batch_seq == batch.batch_seq
+                })
+                .ok_or_else(|| anyhow!("visible L2 batch {batch_id} has no applied producer"))?;
+            l2.push_back(L2Entry {
+                batch_id,
+                version: batch.version,
+                source_batches: producer.source_ids.clone(),
+                summary: summary.summary,
+                est_tokens: summary.est_tokens,
+                time_range: summary.time_range,
+                original_seq_span: summary.original_seq_span,
+            });
+        }
+        // Unknown historical ranges stay explicit; never manufacture a seq.
+        l2.make_contiguous()
+            .sort_by_key(|entry| entry.original_seq_span.map(|span| span.from_seq));
 
         let mut shelf = HashMap::new();
         for job in jobs {
@@ -841,8 +897,16 @@ impl ThreeLayerMemory {
         })
     }
 
-    pub fn l2(&self) -> &ConsolidatedMemory {
+    pub fn l2(&self) -> &VecDeque<L2Entry> {
         &self.l2
+    }
+
+    pub fn l2_total(&self) -> Result<u64> {
+        self.l2.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(entry.est_tokens)
+                .ok_or_else(|| anyhow!("L2 estimate overflow"))
+        })
     }
 
     pub fn l1(&self) -> &VecDeque<L1Entry> {
@@ -928,6 +992,9 @@ impl ThreeLayerMemory {
         };
         let time_range = result.time_range;
         self.l1.push_back(L1Entry {
+            batch_id: Uuid::now_v7(),
+            version: 1,
+            original_seq_span: result.original_seq_span,
             source_batch: batch_id,
             source_batch_seq: batch.batch_seq,
             summary: result.summary,
@@ -935,24 +1002,6 @@ impl ThreeLayerMemory {
             time_range,
         });
         Ok(())
-    }
-
-    /// Replace L1 entries with a compacted L2 summary.  Used when L1 overflows.
-    pub fn compact_l1_to_l2(&mut self, result: CompactResult) {
-        self.l1.clear();
-        self.l2 = ConsolidatedMemory {
-            summary: result.summary,
-            est_tokens: result.est_tokens,
-        };
-    }
-
-    /// Replace the L2 summary with a consolidated summary.  Used when L2
-    /// itself grows beyond its limit.
-    pub fn consolidate_l2(&mut self, result: CompactResult) {
-        self.l2 = ConsolidatedMemory {
-            summary: result.summary,
-            est_tokens: result.est_tokens,
-        };
     }
 
     pub fn l0_totals(&self) -> anyhow::Result<(u64, u64)> {
@@ -1124,50 +1173,6 @@ fn validate_selected_batch_order(batches: &HashMap<BatchId, HydratedMemoryBatch>
     Ok(())
 }
 
-fn validate_selected_apply_cursors(
-    jobs: &[HydratedMemoryJob],
-    cursors: &[HydratedMemoryCursor],
-    sequence_max: &HashMap<String, u64>,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    for cursor in cursors {
-        if !seen.insert(job_kind_rank(cursor.kind)) {
-            bail!("duplicate durable memory apply cursor");
-        }
-        if cursor.kind == MemoryJobKind::CompactL0 {
-            continue;
-        }
-        let after_last = sequence_max
-            .get(cursor.kind.as_str())
-            .and_then(|last| last.checked_add(1))
-            .ok_or_else(|| anyhow!("memory cursor has no durable job range"))?;
-        if cursor.next_batch_seq == 0 || cursor.next_batch_seq > after_last {
-            bail!("memory cursor is outside durable job range");
-        }
-        for job in jobs.iter().filter(|job| job.kind == cursor.kind) {
-            let terminal = matches!(
-                job.status,
-                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
-            );
-            if terminal != (job.batch_seq < cursor.next_batch_seq) {
-                bail!("memory cursor disagrees with selected job {} state", job.id);
-            }
-        }
-    }
-    for job in jobs.iter().filter(|job| {
-        job.kind != MemoryJobKind::CompactL0
-            && matches!(
-                job.status,
-                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
-            )
-    }) {
-        if !seen.contains(&job_kind_rank(job.kind)) {
-            bail!("terminal memory job {} has no apply cursor", job.id);
-        }
-    }
-    Ok(())
-}
-
 fn ordered_batch_ids(
     batches: &HashMap<BatchId, HydratedMemoryBatch>,
     layer: MemoryLayer,
@@ -1205,10 +1210,12 @@ fn validate_jobs_selected(
     let mut target_jobs = HashSet::new();
     let mut kind_sequences = HashSet::new();
     let mut source_owner = HashMap::new();
-    for job in jobs
-        .iter()
-        .filter(|job| job.status != MemoryJobStatus::Discarded)
-    {
+    for job in jobs.iter().filter(|job| {
+        !matches!(
+            job.status,
+            MemoryJobStatus::Discarded | MemoryJobStatus::Unchanged
+        )
+    }) {
         for source_id in &job.source_ids {
             if source_owner.insert(*source_id, job).is_some() {
                 bail!(
@@ -1305,7 +1312,11 @@ fn validate_jobs_selected(
 
         let (source_state, target_state, requires_result) = match job.status {
             MemoryJobStatus::Pending | MemoryJobStatus::Running => (
-                MemoryBatchState::Compacting,
+                if job.kind == MemoryJobKind::CompactL0 {
+                    MemoryBatchState::Compacting
+                } else {
+                    MemoryBatchState::Promoted
+                },
                 MemoryBatchState::Compacting,
                 false,
             ),
@@ -1327,13 +1338,21 @@ fn validate_jobs_selected(
                 false,
             ),
             MemoryJobStatus::Unchanged => {
-                if job.kind != MemoryJobKind::CompactL0 || target.summary.is_some() {
+                if target.summary.is_some() {
                     bail!(
-                        "unchanged job {} must retain L0 without a generated summary",
+                        "unchanged job {} must retain its source without a generated summary",
                         job.id
                     );
                 }
-                (MemoryBatchState::Sealed, MemoryBatchState::Dropped, false)
+                (
+                    if job.kind == MemoryJobKind::CompactL0 {
+                        MemoryBatchState::Sealed
+                    } else {
+                        MemoryBatchState::Promoted
+                    },
+                    MemoryBatchState::Dropped,
+                    false,
+                )
             }
             MemoryJobStatus::Discarded => (
                 MemoryBatchState::CompactFailed,
@@ -1417,7 +1436,10 @@ fn validate_jobs_selected(
                 .get(&target_id)
                 .copied()
                 .expect("successor exact source witness was validated above");
-            if successor_version <= predecessor_version {
+            if successor_version < predecessor_version
+                || (successor_version == predecessor_version
+                    && successor.kind == MemoryJobKind::CompactL0)
+            {
                 bail!(
                     "hydrated job {} does not advance target {target_id} beyond predecessor job {}",
                     successor.id,
@@ -1559,6 +1581,14 @@ fn validate_batch_job_relationships_selected(
                     batch.id,
                     MemoryJobKind::ConsolidateL2,
                     MemoryJobStatus::Applied,
+                ) && !is_target(
+                    batch.id,
+                    MemoryJobKind::CompactL1,
+                    MemoryJobStatus::Unchanged,
+                ) && !is_target(
+                    batch.id,
+                    MemoryJobKind::ConsolidateL2,
+                    MemoryJobStatus::Unchanged,
                 ) =>
             {
                 bail!(
@@ -1618,103 +1648,6 @@ fn validate_summary_batch_state_owner(
             batch.layer,
             batch.id
         );
-    }
-    Ok(())
-}
-
-fn validate_apply_cursors(
-    jobs: &[HydratedMemoryJob],
-    cursors: &[HydratedMemoryCursor],
-) -> Result<()> {
-    let mut seen = Vec::new();
-    for cursor in cursors {
-        // Independent L0 replacements are guarded by their exact source
-        // versions. A failed/no-op older job must not block later batches.
-        if cursor.kind == MemoryJobKind::CompactL0 {
-            continue;
-        }
-        if seen.contains(&cursor.kind) {
-            bail!(
-                "hydrated memory contains duplicate {} apply cursor",
-                cursor.kind.as_str()
-            );
-        }
-        seen.push(cursor.kind);
-        let mut kind_jobs = jobs
-            .iter()
-            .filter(|job| job.kind == cursor.kind)
-            .collect::<Vec<_>>();
-        if kind_jobs.is_empty() {
-            bail!(
-                "hydrated memory has {} apply cursor without any jobs",
-                cursor.kind.as_str()
-            );
-        }
-        kind_jobs.sort_by_key(|job| job.batch_seq);
-        let first = kind_jobs
-            .first()
-            .expect("non-empty kind jobs has first")
-            .batch_seq;
-        let last = kind_jobs
-            .last()
-            .expect("non-empty kind jobs has last")
-            .batch_seq;
-        let after_last = last
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("hydrated {} cursor overflow", cursor.kind.as_str()))?;
-        if cursor.next_batch_seq < first || cursor.next_batch_seq > after_last {
-            bail!(
-                "hydrated {} cursor {} is outside durable job range {first}..={after_last}",
-                cursor.kind.as_str(),
-                cursor.next_batch_seq
-            );
-        }
-        for job in kind_jobs {
-            if job.batch_seq < cursor.next_batch_seq
-                && !matches!(
-                    job.status,
-                    MemoryJobStatus::Applied | MemoryJobStatus::Discarded
-                )
-            {
-                bail!(
-                    "hydrated {} cursor skips {} job {} at sequence {}",
-                    cursor.kind.as_str(),
-                    job.status.as_str(),
-                    job.id,
-                    job.batch_seq
-                );
-            }
-        }
-    }
-
-    for job in jobs.iter().filter(|job| {
-        job.kind != MemoryJobKind::CompactL0
-            && matches!(
-                job.status,
-                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
-            )
-    }) {
-        let cursor = cursors
-            .iter()
-            .find(|cursor| cursor.kind == job.kind)
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} {} job {} has no durable apply cursor",
-                    job.status.as_str(),
-                    job.kind.as_str(),
-                    job.id
-                )
-            })?;
-        if cursor.next_batch_seq <= job.batch_seq {
-            bail!(
-                "{} apply cursor {} has not advanced past {} job {} at sequence {}",
-                job.kind.as_str(),
-                cursor.next_batch_seq,
-                job.status.as_str(),
-                job.id,
-                job.batch_seq
-            );
-        }
     }
     Ok(())
 }
@@ -2029,10 +1962,37 @@ mod tests {
         let l1 = Uuid::now_v7();
         let prior_l2 = Uuid::now_v7();
         let current_l2 = Uuid::now_v7();
+        let older_source = Uuid::now_v7();
+        let older_l2 = Uuid::now_v7();
+        let older_summary = hydrated_summary("Earlier experience generated later", 7)
+            .with_original_seq_span(Some(OriginalSequenceSpan::new(1, 99).unwrap()));
         let l1_summary = hydrated_summary("Current experience", 8);
-        let l2_summary = hydrated_summary("Integrated earlier experience", 11);
+        let l2_summary = hydrated_summary("Integrated earlier experience", 11)
+            .with_original_seq_span(Some(OriginalSequenceSpan::new(100, 200).unwrap()));
         let hydrated = HydratedMemoryRuntime::new(
             vec![
+                HydratedMemoryBatch::new(
+                    older_source,
+                    MemoryLayer::L1,
+                    999,
+                    999,
+                    3,
+                    MemoryBatchState::Dropped,
+                    40,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    older_l2,
+                    MemoryLayer::L2,
+                    800,
+                    800,
+                    2,
+                    MemoryBatchState::Promoted,
+                    7,
+                    0,
+                    Some(older_summary.clone()),
+                ),
                 HydratedMemoryBatch::new(
                     original,
                     MemoryLayer::L0,
@@ -2082,6 +2042,15 @@ mod tests {
             vec![
                 HydratedMemoryJob::new(
                     Uuid::now_v7(),
+                    MemoryJobKind::CompactL1,
+                    800,
+                    vec![older_source],
+                    BTreeMap::from([(older_source, 3), (older_l2, 2)]),
+                    MemoryJobStatus::Applied,
+                    Some(older_summary),
+                ),
+                HydratedMemoryJob::new(
+                    Uuid::now_v7(),
                     MemoryJobKind::CompactL0,
                     42,
                     vec![original],
@@ -2099,13 +2068,17 @@ mod tests {
                     Some(l2_summary),
                 ),
             ],
-            vec![HydratedMemoryCursor::new(MemoryJobKind::ConsolidateL2, 900)],
+            vec![
+                HydratedMemoryCursor::new(MemoryJobKind::ConsolidateL2, 900),
+                HydratedMemoryCursor::new(MemoryJobKind::CompactL1, 801),
+            ],
             HashMap::new(),
         )
         .with_active_selection(
             5_000,
             HashMap::from([
                 ("compact_l0".to_owned(), 4_999),
+                ("compact_l1".to_owned(), 800),
                 ("consolidate_l2".to_owned(), 899),
             ]),
         );
@@ -2115,9 +2088,21 @@ mod tests {
         assert_eq!(memory.l1()[0].source_batch, original);
         assert_eq!(memory.l1()[0].source_batch_seq, 42);
         assert_eq!(
-            memory.l2().summary.expose(),
+            memory.l2()[1].summary.expose(),
             "Integrated earlier experience"
         );
+        assert_eq!(memory.l1()[0].batch_id, l1);
+        assert_eq!(memory.l1()[0].version, 2);
+        assert_eq!(memory.l2().len(), 2);
+        assert_eq!(memory.l2()[0].batch_id, older_l2);
+        assert_eq!(memory.l2()[0].source_batches, vec![older_source]);
+        assert_eq!(memory.l2()[1].batch_id, current_l2);
+        assert_eq!(memory.l2()[1].source_batches, vec![prior_l2]);
+        assert_eq!(
+            memory.l2()[1].original_seq_span,
+            Some(OriginalSequenceSpan::new(100, 200).unwrap())
+        );
+        assert_eq!(memory.l2_total().unwrap(), 18);
         assert_eq!(memory.next_l0_batch_seq(), 5_000);
     }
 
@@ -2319,6 +2304,88 @@ mod tests {
     }
 
     #[test]
+    fn original_sequence_span_rejects_unknown_or_invalid_bounds() {
+        for raw in [
+            r#"{"from_seq":0,"to_seq":2}"#,
+            r#"{"from_seq":3,"to_seq":2}"#,
+            r#"{"from_seq":1}"#,
+        ] {
+            assert!(serde_json::from_str::<OriginalSequenceSpan>(raw).is_err());
+        }
+        let span = OriginalSequenceSpan::new(1, 2).unwrap();
+        assert_eq!(
+            serde_json::from_value::<OriginalSequenceSpan>(serde_json::to_value(span).unwrap())
+                .unwrap(),
+            span
+        );
+    }
+
+    #[test]
+    fn upper_preparation_and_unchanged_keep_promoted_source_identity() {
+        for status in [
+            MemoryJobStatus::Pending,
+            MemoryJobStatus::Running,
+            MemoryJobStatus::Unchanged,
+        ] {
+            let source = Uuid::now_v7();
+            let target = Uuid::now_v7();
+            let summary = hydrated_summary("Still visible original experience", 9);
+            let target_state = if status == MemoryJobStatus::Unchanged {
+                MemoryBatchState::Dropped
+            } else {
+                MemoryBatchState::Compacting
+            };
+            let batches = HashMap::from([
+                (
+                    source,
+                    HydratedMemoryBatch::new(
+                        source,
+                        MemoryLayer::L1,
+                        1,
+                        1,
+                        2,
+                        MemoryBatchState::Promoted,
+                        9,
+                        0,
+                        Some(summary),
+                    ),
+                ),
+                (
+                    target,
+                    HydratedMemoryBatch::new(
+                        target,
+                        MemoryLayer::L2,
+                        1,
+                        1,
+                        1,
+                        target_state,
+                        0,
+                        0,
+                        None,
+                    ),
+                ),
+            ]);
+            let layer_seq = HashMap::from([
+                ((layer_rank(MemoryLayer::L1), 1), source),
+                ((layer_rank(MemoryLayer::L2), 1), target),
+            ]);
+            let job = HydratedMemoryJob::new(
+                Uuid::now_v7(),
+                MemoryJobKind::CompactL1,
+                1,
+                vec![source],
+                BTreeMap::from([(source, 2), (target, 1)]),
+                status,
+                None,
+            );
+            validate_jobs(&batches, &layer_seq, &[job])
+                .expect("preparation/unchanged does not mutate source identity or visibility");
+            assert_eq!(batches[&source].version, 2);
+            assert_eq!(batches[&source].state, MemoryBatchState::Promoted);
+        }
+    }
+
+    #[test]
     fn memory_limits_match_the_canonical_defaults() {
         assert_eq!(L0_BATCH_MIN, 10_000);
         assert_eq!(L0_FORCED_SEAL_LIMIT, 20_000);
@@ -2331,13 +2398,7 @@ mod tests {
 
     #[test]
     fn missing_shelf_result_does_not_remove_l0_batch() {
-        let mut memory = ThreeLayerMemory::new(
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new(String::new()),
-                est_tokens: 0,
-            },
-            TokenCalibration::default(),
-        );
+        let mut memory = ThreeLayerMemory::new(VecDeque::new(), TokenCalibration::default());
         let batch = L0Batch::new(Vec::new(), memory.allocate_l0_batch_seq(), 7, 11);
         let id = batch.id;
         memory.push_l0(batch);
@@ -2349,13 +2410,7 @@ mod tests {
 
     #[test]
     fn l0_sequence_never_reuses_a_promoted_or_removed_queue_position() {
-        let mut memory = ThreeLayerMemory::new(
-            ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new(String::new()),
-                est_tokens: 0,
-            },
-            TokenCalibration::default(),
-        );
+        let mut memory = ThreeLayerMemory::new(VecDeque::new(), TokenCalibration::default());
         let first = memory.allocate_l0_batch_seq();
         memory.push_l0(L0Batch::new(Vec::new(), first, 0, 0));
         memory.l0_mut().pop_front();

@@ -128,6 +128,8 @@ fn admission_record_hmac(
 
 #[derive(Serialize)]
 struct MemorySummaryPayload<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_seq_span: Option<crate::memory::OriginalSequenceSpan>,
     summary: &'a str,
     est_tokens: u64,
     from: &'a DateTime<Utc>,
@@ -5687,6 +5689,7 @@ impl EventWriter {
     ) -> Result<(Vec<u8>, String, u32)> {
         let mut raw = Zeroizing::new(
             serde_json::to_vec(&MemorySummaryPayload {
+                original_seq_span: result.original_seq_span.clone(),
                 summary: result.summary.expose(),
                 est_tokens: result.est_tokens,
                 from: &result.time_range.0,
@@ -9202,6 +9205,7 @@ fn charge_transaction_bytes(total: &mut usize, bytes: usize) -> Result<()> {
 
 fn compact_result_preflight_bytes(redactor: &Redactor, result: &CompactResult) -> Result<usize> {
     let raw = serde_json::to_vec(&MemorySummaryPayload {
+        original_seq_span: result.original_seq_span.clone(),
         summary: result.summary.expose(),
         est_tokens: result.est_tokens,
         from: &result.time_range.0,
