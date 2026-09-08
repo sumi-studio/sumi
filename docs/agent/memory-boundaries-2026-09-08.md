@@ -16,10 +16,17 @@ they are currently in the upstream layer. The exclusion concerns experience
 that remains outside that selected replacement. Later corrections retained
 elsewhere must not become facts supposedly known at the earlier point.
 
-L2-internal reintegration is distinct. The user emphasized chronological
-preservation for operations other than L2 reintegration; this does not settle
-all semantics of reintegration or authorize arbitrary mixing. Its remaining
-choices should be made explicitly rather than inferred as the opposite rule.
+The user subsequently clarified L2-internal reintegration in the main
+conversation: material already present in L2 may be reorganized without strict
+chronological ordering. Content retained in L1 or L0 must not be imported into
+that reintegration. This permits organization within existing L2, not expansion
+of its information sources into the upstream layers.
+
+The user also proposed letting the compression fork see completed but unpromoted
+batches as promoted. This is a design question under discussion, not an accepted
+change to the full-parent fork contract. Evaluate candidate visibility separately
+from replacing the actual parent prefix, preserving original selected source and
+distinguishing speculative candidate text from committed memory.
 
 Implementation and evaluation must distinguish full-context access from the
 provenance and chronological scope of the text actually substituted. Do not
