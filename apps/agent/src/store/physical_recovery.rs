@@ -46,6 +46,7 @@ pub(crate) struct PhysicalRecoveryIntent {
 /// allocated only by the EventWriter transaction that applies the receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PhysicalRecoveryIntentRequest {
+    pub provider_call_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub command_id: String,

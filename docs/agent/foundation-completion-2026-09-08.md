@@ -14,8 +14,10 @@ condition. No test of personhood is proposed here.
 ## Baseline and accepted milestone
 
 Current shared deployment: `ba3eeb7503555a1885a6ae54a56ec5182876f424`
-(the unmerged #379/#380/#382 stack). This is a deployed candidate, not accepted
-completion of its new capabilities.
+(the product code integrated through #382). Main is now
+`4e59a46fa136c9b64a6d77fb0b5d799d90934ff0`, including upper memory #381.
+Upper memory has not yet been deployed. This does not mean that all of #362
+or native account sign-in acceptance is complete.
 The private-file acceptance below was performed on the preceding `8cbba0b8`
 milestone. A subsequent recipient-delivery run on #376 passed after repairing
 reviewer stream cancellation.
@@ -136,7 +138,7 @@ iOS keyboard behavior. Native ChatGPT connection and Astra inference are
 implemented, but actual Human authorization and an actual Astra response remain
 unverified. The user's ChatGPT credentials are not borrowed from another harness.
 
-Upper memory replacement is implemented in #381 and is not in this shared
+Upper memory replacement was merged through #381 and is not in this shared
 deployment. The combined Rust suite passed 2,260 tests with 20 ignored; this does
 not establish semantic fidelity or long-run cache behavior with a real model.
 
@@ -280,3 +282,19 @@ replay, unchanged image bindings and fixture cleanup also passed.
 [Resolution evidence](evidence/attention-resolution-2026-09-08.json) records
 the matched receipts. The earlier partial artifact is retained as such;
 the unexplained earlier stall is not claimed fixed by this passing scenario.
+
+## Provider call identity repair
+
+A scripted provider reusing `echo_0` on a later response caused the real Session
+and sequential execution worker to reject the second durable operation and lose
+ownership. This is a reproduced harness failure, not an observed live-provider
+duplicate. New incoming calls now receive an internal ID scoped to their
+assistant message. The original provider ID remains available for wire pairing,
+including approvals, recovery and memory transformations. Opaque native items
+are unchanged.
+
+Both cross-command and same-command reuse regressions pass. Exact request-body
+comparison passes for Chat Completions, Responses, Anthropic, native replay and
+ChatGPT Responses. The combined Rust library suite passes 2,225 tests with 19
+ignored opt-in/subprocess cases; Go and TypeScript contract checks also pass.
+This repair is not yet deployed.

@@ -309,3 +309,35 @@ func TestIncomingTimingValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestProviderCallIdentityMapping(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		validate func(json.RawMessage) error
+	}{
+		{"call", `{"id":"internal-1","name":"read","route":"normal","arguments":{}}`, validateToolCall},
+		{"rejected", `{"id":"internal-1","name":"read","error":"invalid_json"}`, validateRejectedToolCall},
+		{"result", `{"tool_call_id":"internal-1","tool_name":"read","content":[],"details":null,"is_error":false,"timestamp":"2026-09-08T00:00:00Z"}`, validateToolResultPayload},
+		{"message", `{"role":"tool_result","tool_call_id":"internal-1","tool_name":"read","content":[],"details":null,"is_error":false,"timestamp":"2026-09-08T00:00:00Z"}`, validatePublicMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var value map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.raw), &value); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{`"read_0"`, `17`, `{}`, `null`} {
+				value["provider_call_id"] = json.RawMessage(id)
+				raw, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = tc.validate(raw)
+				if (err == nil) != (id == `"read_0"`) {
+					t.Fatalf("provider_call_id=%s: unexpected validation result %v", id, err)
+				}
+			}
+		})
+	}
+}

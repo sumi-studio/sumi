@@ -164,6 +164,7 @@ pub enum WaiterResult {
 /// Per-pending-request state stored in the broker.
 #[allow(dead_code)]
 struct PendingEntry {
+    provider_call_id: Option<String>,
     action: CanonicalAction,
     tool_call_id: String,
     run_id: String,
@@ -175,6 +176,7 @@ struct PendingEntry {
 /// is no longer attached to a live run.
 #[derive(Clone, Debug)]
 pub struct PendingSummary {
+    pub provider_call_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
 }
@@ -697,6 +699,7 @@ impl ApprovalBroker {
             .unwrap_or_else(|e| e.into_inner())
             .get(request_id)
             .map(|entry| PendingSummary {
+                provider_call_id: entry.provider_call_id.clone(),
                 tool_call_id: entry.tool_call_id.clone(),
                 tool_name: entry.action.tool.clone(),
             })
@@ -737,6 +740,7 @@ impl ApprovalBroker {
             .insert(
                 request_id,
                 PendingEntry {
+                    provider_call_id: tool_call.provider_call_id.clone(),
                     action: action.clone(),
                     tool_call_id: tool_call.id.clone(),
                     run_id: run_id.to_owned(),
@@ -983,6 +987,7 @@ mod tests {
 
     fn read_file_call(path: &str) -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -992,6 +997,7 @@ mod tests {
 
     fn bash_call(command: &str) -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: "call-2".to_owned(),
             name: "bash".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,

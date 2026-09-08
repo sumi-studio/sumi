@@ -12193,6 +12193,7 @@ async fn verify_authenticated_message_projection(
 }
 
 pub(super) struct RunningToolRecoveryEvidence {
+    pub(super) provider_call_id: Option<String>,
     pub(super) tool_name: String,
     pub(super) assistant_message_id: String,
 }
@@ -12294,6 +12295,7 @@ pub(super) async fn authenticate_running_tool_intent(
     }
     if assistant_sequences.is_empty() && ownerless == OwnerlessRunningTool::SynthesizeOwner {
         return Ok(RunningToolRecoveryEvidence {
+            provider_call_id: None,
             tool_name,
             assistant_message_id: format!("synthesized-owner-{tool_call_id}"),
         });
@@ -12330,7 +12332,26 @@ pub(super) async fn authenticate_running_tool_intent(
         );
     }
 
+    let provider_call_id = assistant
+        .envelope
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content.iter().find(|item| {
+                item.pointer("/tool_call/id").and_then(Value::as_str) == Some(tool_call_id)
+            })
+        })
+        .and_then(|item| item.pointer("/tool_call/provider_call_id"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("owning ToolCall provider identity must be a string"))
+        })
+        .transpose()?;
     Ok(RunningToolRecoveryEvidence {
+        provider_call_id,
         tool_name,
         assistant_message_id: assistant_message_id.to_owned(),
     })
@@ -16251,6 +16272,7 @@ mod tests {
             .validate(&bound)
             .expect("valid route denial fixture");
         let exact = ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: evidence.tool_call_id.clone(),
             tool_name: "fixture".to_owned(),
             content: vec![UserContent::Text {
@@ -17366,6 +17388,7 @@ mod tests {
 
     fn tool_result(tool_call_id: &str, text: &str, is_error: bool) -> PublicMessage {
         PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: tool_call_id.to_owned(),
             tool_name: "test".to_owned(),
             content: vec![UserContent::Text {
@@ -17453,6 +17476,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, tool_call_id)| PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: (*tool_call_id).to_owned(),
                         name: "test".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -19971,6 +19995,7 @@ mod tests {
         let rejected_only = PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![PublicAssistantContent::RejectedToolCall {
                 rejected: RejectedToolCall {
+                    provider_call_id: None,
                     id: "rejected-not-executable".to_owned(),
                     name: "test".to_owned(),
                     error: ToolArgumentError::InvalidJson,
@@ -20826,6 +20851,7 @@ mod tests {
             "structured-signature-value",
         ];
         let message = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "tool-key-redaction".to_owned(),
             tool_name: "test".to_owned(),
             content: vec![UserContent::Text {
@@ -20851,6 +20877,7 @@ mod tests {
         let rejected = PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![PublicAssistantContent::RejectedToolCall {
                 rejected: RejectedToolCall {
+                    provider_call_id: None,
                     id: "tool-key-redaction".to_owned(),
                     name: "test".to_owned(),
                     error: ToolArgumentError::InvalidJson,
@@ -21024,6 +21051,7 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let message = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "tool-collision".to_owned(),
             tool_name: "test".to_owned(),
             content: Vec::new(),
@@ -25731,6 +25759,7 @@ mod tests {
         let rejected = PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![PublicAssistantContent::RejectedToolCall {
                 rejected: RejectedToolCall {
+                    provider_call_id: None,
                     id: "rejected-no-execution".to_owned(),
                     name: "test".to_owned(),
                     error: ToolArgumentError::InvalidJson,
@@ -26526,6 +26555,7 @@ mod tests {
             .expect("commit approval resolution and tool start");
 
         let tool_result = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "tool-1".to_owned(),
             tool_name: "test".to_owned(),
             content: vec![UserContent::Text {
@@ -29105,6 +29135,7 @@ mod tests {
             },
             "tool_terminal" => {
                 let result = PublicMessage::ToolResult(ToolResultMessage {
+                    provider_call_id: None,
                     tool_call_id: "tool-1".to_owned(),
                     tool_name: "test".to_owned(),
                     content: vec![UserContent::Text {

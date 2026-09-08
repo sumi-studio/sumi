@@ -353,7 +353,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext, system_prompt: &s
                         | AssistantContent::RejectedToolCall { .. } => {}
                         AssistantContent::ToolCall { tool_call, .. } => {
                             tool_calls.push(json!({
-                                "id": tool_call.id,
+                                "id": tool_call.wire_id(),
                                 "type": "function",
                                 "function": {
                                     "name": tool_call.name,
@@ -497,7 +497,7 @@ fn convert_tool_result(message: &ToolResultMessage, supports_images: bool) -> Va
     json!({
         "role": "tool",
         "content": content,
-        "tool_call_id": message.tool_call_id,
+        "tool_call_id": message.wire_id(),
     })
 }
 
@@ -2097,6 +2097,7 @@ mod tests {
                         },
                         AssistantContent::ToolCall {
                             tool_call: ToolCall {
+                                provider_call_id: None,
                                 id: "call|with+noise".to_owned(),
                                 name: "read_file".to_owned(),
                                 route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2118,6 +2119,7 @@ mod tests {
                     timestamp: Utc::now(),
                 })),
                 synthetic(Message::ToolResult(ToolResultMessage {
+                    provider_call_id: None,
                     tool_call_id: "call|with+noise".to_owned(),
                     tool_name: "read_file".to_owned(),
                     content: vec![UserContent::Text {
@@ -2808,6 +2810,7 @@ mod tests {
         let assistant = Message::Assistant(AssistantMessage {
             content: vec![AssistantContent::ToolCall {
                 tool_call: ToolCall {
+                    provider_call_id: None,
                     id: "call-1".to_owned(),
                     name: "read_file".to_owned(),
                     route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2828,6 +2831,7 @@ mod tests {
             timestamp: Utc::now(),
         });
         let result = Message::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),
             content: vec![UserContent::Text {

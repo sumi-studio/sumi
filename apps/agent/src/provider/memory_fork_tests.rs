@@ -48,6 +48,7 @@ async fn parent_prompt(
     }
     content.push(AssistantContent::ToolCall {
         tool_call: ToolCall {
+            provider_call_id: None,
             id: "call_parent".into(),
             name: "read_file".into(),
             route: ToolInvocationRoute::Elevated,
@@ -82,6 +83,7 @@ async fn parent_prompt(
             timestamp,
         }),
         Message::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call_parent".into(),
             tool_name: "read_file".into(),
             content: vec![
@@ -543,4 +545,133 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
             "exactly parent and fork were sent"
         );
     }
+}
+
+fn scope_parent_tool_identity(prompt: &mut PromptContext) {
+    let internal = scoped_tool_call_id("parent-20", "call_parent");
+    for entry in &mut prompt.messages {
+        let message = match entry {
+            ContextMessage::Persisted { message, .. } | ContextMessage::Synthetic { message } => {
+                message
+            }
+        };
+        match message {
+            Message::Assistant(assistant) => {
+                for content in &mut assistant.content {
+                    if let AssistantContent::ToolCall { tool_call, .. } = content {
+                        tool_call.provider_call_id = Some(tool_call.id.clone());
+                        tool_call.id = internal.clone();
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                result.provider_call_id = Some(result.tool_call_id.clone());
+                result.tool_call_id = internal.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_tool_identity_preserves_exact_provider_request_and_opaque_prefix() {
+    for (preset, native) in [
+        ("kimi-k3", false),
+        ("openai-responses", false),
+        ("anthropic", false),
+        ("openai-responses", true),
+        ("anthropic", true),
+        ("chatgpt-responses", false),
+    ] {
+        let spec = ModelSpec::preset(preset).unwrap();
+        // Clone the same assembled snapshot: independently generated memory batches
+        // have different IDs, which would test fixture randomness instead of identity.
+        let (raw, _) = parent_prompt(&spec, native).await;
+        let provenance = raw.verified_replay_provenance().unwrap();
+        let mut scoped = raw.clone();
+        scoped.replay_provenance = None;
+        scope_parent_tool_identity(&mut scoped);
+        // Production assigns identity before assembly seals the send view.
+        // Seal this fixture with the same origin and coverage as its raw twin.
+        match provenance {
+            Some(VerifiedReplayProvenance::SumiNormalized {
+                provider_origin,
+                canonical_through_seq,
+            }) => crate::memory::context_assembler::bind_sumi_replay_for_origin_test(
+                &mut scoped,
+                provider_origin,
+                canonical_through_seq,
+            )
+            .unwrap(),
+            Some(VerifiedReplayProvenance::ProviderNativeExact {
+                provider_origin,
+                native_coverage_through_seq,
+                canonical_suffix_through_seq,
+            }) => bind_native_replay_for_test(
+                &mut scoped,
+                provider_origin,
+                native_coverage_through_seq,
+                canonical_suffix_through_seq,
+            )
+            .unwrap(),
+            None => {}
+        }
+        assert_eq!(
+            raw.provider_context, scoped.provider_context,
+            "opaque bytes/metadata unchanged"
+        );
+        let options = RequestOptions {
+            native_compaction: native,
+            ..RequestOptions::default()
+        };
+        let build = |context: &PromptContext| match spec.protocol {
+            ApiProtocol::OpenAiChatCompletions => {
+                super::adapters::chat_completions::build_request(&spec, context, &options).unwrap()
+            }
+            ApiProtocol::OpenAiResponses => {
+                super::adapters::responses::build_request(&spec, context, &options).unwrap()
+            }
+            ApiProtocol::AnthropicMessages => {
+                super::adapters::anthropic::build_request(&spec, context, &options).unwrap()
+            }
+        };
+        assert_eq!(
+            build(&raw),
+            build(&scoped),
+            "identity split changed {preset} native={native} provider payload"
+        );
+        assert!(
+            !build(&scoped)
+                .to_string()
+                .contains(&scoped_tool_call_id("parent-20", "call_parent"))
+        );
+    }
+}
+
+#[test]
+fn scoped_tool_identity_is_stable_unambiguous_and_keeps_retained_wire_ids() {
+    let scoped = scoped_tool_call_id("assistant-a", "echo_0");
+    assert_eq!(scoped, scoped_tool_call_id("assistant-a", "echo_0"));
+    assert_ne!(scoped, scoped_tool_call_id("assistant-b", "echo_0"));
+    assert_ne!(
+        scoped_tool_call_id("a", "bc"),
+        scoped_tool_call_id("ab", "c")
+    );
+    let mut rejected = RejectedToolCall {
+        id: "echo_0".into(),
+        provider_call_id: None,
+        name: "read_file".into(),
+        error: ToolArgumentError::InvalidJson,
+    };
+    let legacy = serde_json::to_value(&rejected).unwrap();
+    assert!(legacy.get("provider_call_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<RejectedToolCall>(legacy)
+            .unwrap()
+            .wire_id(),
+        "echo_0"
+    );
+    rejected.provider_call_id = Some(rejected.id.clone());
+    rejected.id = scoped;
+    assert_eq!(rejected.wire_id(), "echo_0");
 }

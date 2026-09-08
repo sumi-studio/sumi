@@ -460,6 +460,7 @@ $defs:
     properties:
       role: { const: tool_result }
       tool_call_id: { type: string }
+      provider_call_id: { type: string }
       tool_name: { type: string }
       content:
         type: array
@@ -475,6 +476,7 @@ $defs:
     additionalProperties: false
     properties:
       tool_call_id: { type: string }
+      provider_call_id: { type: string }
       tool_name: { type: string }
       content:
         type: array
@@ -537,6 +539,7 @@ $defs:
     additionalProperties: false
     properties:
       id: { type: string }
+      provider_call_id: { type: string }
       name: { type: string }
       route: { type: string, enum: [normal, elevated] }
       arguments:
@@ -550,6 +553,7 @@ $defs:
     additionalProperties: false
     properties:
       id: { type: string }
+      provider_call_id: { type: string }
       name: { type: string }
       error: { $ref: '#/$defs/ToolArgumentError' }
 

@@ -615,6 +615,7 @@ export interface PublicAssistantMessage {
  */
 export interface ToolCall {
   id: string;
+  provider_call_id?: string;
   name: string;
   route: "normal" | "elevated";
   /**
@@ -630,6 +631,7 @@ export interface ToolCall {
  */
 export interface RejectedToolCall {
   id: string;
+  provider_call_id?: string;
   name: string;
   error: ToolArgumentError;
 }
@@ -661,6 +663,7 @@ export interface Usage {
 export interface ToolResultMessage {
   role: "tool_result";
   tool_call_id: string;
+  provider_call_id?: string;
   tool_name: string;
   content: UserContent[];
   details: AnyJSON;
@@ -675,6 +678,7 @@ export interface ToolResultMessage {
  */
 export interface ToolResultPayload {
   tool_call_id: string;
+  provider_call_id?: string;
   tool_name: string;
   content: UserContent[];
   details: AnyJSON;

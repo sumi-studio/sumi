@@ -400,6 +400,7 @@ mod tests {
                 },
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "private-tool-call-id".to_owned(),
                         name: "private-tool-name".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -412,6 +413,7 @@ mod tests {
                 },
                 PublicAssistantContent::RejectedToolCall {
                     rejected: RejectedToolCall {
+                        provider_call_id: None,
                         id: "private-rejected-tool-call-id".to_owned(),
                         name: "private-rejected-tool-name".to_owned(),
                         error: ToolArgumentError::SchemaViolation,
@@ -455,6 +457,7 @@ mod tests {
     #[test]
     fn tool_result_search_indexes_only_visible_text_content() {
         let message = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "private-tool-call-id".to_owned(),
             tool_name: "private-tool-name".to_owned(),
             content: vec![

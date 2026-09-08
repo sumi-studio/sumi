@@ -679,6 +679,7 @@ impl RunDriver for InjectedRunDriver {
             .await?;
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: output.content,
             details: output.details,
@@ -710,6 +711,7 @@ impl RunDriver for InjectedRunDriver {
         Ok(BoundToolResult {
             result: ToolResultMessage {
                 tool_call_id,
+                provider_call_id: None,
                 tool_name,
                 content: outcome.output.content,
                 details: outcome.output.details,
@@ -1780,6 +1782,7 @@ mod tests {
         .expect("driver");
         let call = ToolCall {
             id: "call-1".to_owned(),
+            provider_call_id: None,
             name: "fixture_tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(json!({"value":"x"}))
@@ -1880,6 +1883,7 @@ mod tests {
 
         let call = ToolCall {
             id: "call-1".to_owned(),
+            provider_call_id: None,
             name: "error_tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(json!({}))
@@ -2591,9 +2595,18 @@ mod tests {
             message_ends[2].pointer("/envelope/event/message/role"),
             Some(&json!("tool_result"))
         );
+        let execution_id = crate::provider::types::scoped_tool_call_id(start_ids[1], "call-1");
         assert_eq!(
             message_ends[2].pointer("/envelope/event/message/tool_call_id"),
+            Some(&json!(execution_id))
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/provider_call_id"),
             Some(&json!("call-1"))
+        );
+        assert_eq!(
+            message_ends[1].pointer("/envelope/event/message/content/0/tool_call/id"),
+            Some(&json!(execution_id))
         );
         assert_eq!(
             message_ends[2].pointer("/envelope/event/message/tool_name"),
@@ -2605,7 +2618,7 @@ mod tests {
         );
         assert_eq!(
             start_ids[2],
-            expected_tool_result_message_id(start_ids[1], "call-1"),
+            expected_tool_result_message_id(start_ids[1], &execution_id),
             "tool-result message ID must be bound to its assistant/tool-call pair"
         );
         assert_ne!(start_ids[1], start_ids[3]);
@@ -2631,7 +2644,7 @@ mod tests {
             .expect("real FakeTool progress event");
         assert_eq!(
             progress.pointer("/envelope/event/tool_call_id"),
-            Some(&json!("call-1"))
+            Some(&json!(execution_id))
         );
         assert_eq!(
             progress.pointer("/envelope/event/partial/phase"),

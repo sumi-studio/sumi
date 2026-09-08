@@ -5609,6 +5609,7 @@ mod tests {
 
     fn tool_call(id: &str, action: Value) -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: id.to_owned(),
             name: TOOL_NAME.to_owned(),
             route: ToolInvocationRoute::Normal,
@@ -6151,6 +6152,7 @@ mod tests {
         let (api, _tool, registry) = binding_fixture().await;
         let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
         let call = |id: &str, value: Value| ToolCall {
+            provider_call_id: None,
             id: id.to_owned(),
             name: TOOL_NAME.to_owned(),
             route: ToolInvocationRoute::Normal,

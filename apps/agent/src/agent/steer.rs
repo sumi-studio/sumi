@@ -1501,6 +1501,7 @@ mod tests {
                 PublicAssistantContent::ToolCall {
                     tool_call: crate::provider::types::ToolCall {
                         id: "call-1".to_owned(),
+                        provider_call_id: None,
                         name: "bash".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
                         arguments: serde_json::from_value(serde_json::json!({})).unwrap(),

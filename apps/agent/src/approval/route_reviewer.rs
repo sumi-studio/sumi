@@ -521,6 +521,7 @@ impl ReviewerToolRuntime {
         cancel: CancellationToken,
     ) -> ReviewerToolOutcome {
         let started = Instant::now();
+        call.provider_call_id = Some(call.wire_id().to_owned());
         call.id = format!("review-{}-{}", reviewer.as_str(), ordinal + 1);
         let arguments = self
             .redactor
@@ -556,9 +557,11 @@ impl ReviewerToolRuntime {
             is_error,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
+        let provider_call_id = call.provider_call_id.clone();
         ReviewerToolOutcome {
             call,
             result: ToolResultMessage {
+                provider_call_id,
                 tool_call_id: trace_call_id(reviewer, ordinal),
                 tool_name: trace.tool.clone(),
                 content: vec![UserContent::Text { text: content }],
@@ -665,6 +668,8 @@ fn cap_reviewer_trace_arguments(value: Value) -> Value {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewerToolCallEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
     pub id: String,
     pub tool: String,
     pub route: ToolInvocationRoute,
@@ -702,6 +707,8 @@ pub enum ReviewerTranscriptEntry {
         rejected_tool_calls: Vec<ReviewerRejectedToolCallEvidence>,
     },
     ToolResult {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_call_id: Option<String>,
         tool: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
@@ -1820,6 +1827,7 @@ fn transcript_messages(
                         })?;
                     content.push(AssistantContent::ToolCall {
                         tool_call: ToolCall {
+                            provider_call_id: call.provider_call_id.clone(),
                             id: call.id.clone(),
                             name: call.tool.clone(),
                             route: call.route,
@@ -1865,12 +1873,14 @@ fn transcript_messages(
                 })
             }
             ReviewerTranscriptEntry::ToolResult {
+                provider_call_id,
                 tool,
                 tool_call_id,
                 is_error,
                 content,
                 ..
             } => Message::ToolResult(ToolResultMessage {
+                provider_call_id: provider_call_id.clone(),
                 tool_call_id: tool_call_id.clone().ok_or_else(|| {
                     ReviewerTransportError::Fatal(
                         "reviewer transcript tool result is missing its call id".to_owned(),
@@ -3330,6 +3340,7 @@ mod tests {
                     text: Some("I will verify the record first.".to_owned()),
                     text_truncated: false,
                     tool_calls: vec![ReviewerToolCallEvidence {
+                        provider_call_id: None,
                         id: "prior-call-wire-sentinel".to_owned(),
                         tool: "prior_lookup_wire_sentinel".to_owned(),
                         route: ToolInvocationRoute::Normal,
@@ -3338,6 +3349,7 @@ mod tests {
                     rejected_tool_calls: Vec::new(),
                 },
                 ReviewerTranscriptEntry::ToolResult {
+                    provider_call_id: None,
                     tool: "prior_lookup_wire_sentinel".to_owned(),
                     tool_call_id: Some("prior-call-wire-sentinel".to_owned()),
                     is_error: false,
@@ -3607,6 +3619,7 @@ mod tests {
 
     fn reviewer_tool_call() -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: "provider-call-id".to_owned(),
             name: "inspect".to_owned(),
             route: ToolInvocationRoute::Normal,
@@ -3738,7 +3751,18 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "review-execution-1")
+                        .any(|m| m["role"] == "assistant"
+                            && m["tool_calls"].as_array().is_some_and(|calls| calls
+                                .iter()
+                                .any(|call| call["id"] == "inspection"))),
+                    "the provider sees its original call and matching result identity"
+                );
+                assert!(
+                    requests[1]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "inspection")
                 );
             }
         }

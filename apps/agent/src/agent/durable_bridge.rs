@@ -4381,6 +4381,7 @@ mod tests {
         let tool_message_id = "tool-result-1".to_owned();
         let tool_message = PublicMessage::ToolResult(ToolResultMessage {
             tool_call_id: "call-1".to_owned(),
+            provider_call_id: None,
             tool_name: "read_file".to_owned(),
             content: vec![UserContent::Text {
                 text: "result".to_owned(),
@@ -5108,6 +5109,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "soft-call".to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5189,6 +5191,7 @@ mod tests {
 
         let result_message = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
+            provider_call_id: tool_call.provider_call_id.clone(),
             tool_name: tool_call.name.clone(),
             content: vec![UserContent::Text {
                 text: "ok".to_owned(),
@@ -5397,6 +5400,7 @@ mod tests {
 
         let length_call = ToolCall {
             id: "length-call".to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5455,6 +5459,7 @@ mod tests {
 
         let result_message = ToolResultMessage {
             tool_call_id: length_call.id.clone(),
+            provider_call_id: length_call.provider_call_id.clone(),
             tool_name: length_call.name.clone(),
             content: vec![UserContent::Text {
                 text: "not executed".to_owned(),
@@ -5605,6 +5610,7 @@ mod tests {
         let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
         let tool_call = ToolCall {
             id: "policy-denied-call".to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5651,6 +5657,7 @@ mod tests {
 
         let result = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
+            provider_call_id: tool_call.provider_call_id.clone(),
             tool_name: tool_call.name,
             content: vec![UserContent::Text {
                 text: "policy denied".to_owned(),
@@ -6107,6 +6114,7 @@ mod tests {
         let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
         let tool_call = ToolCall {
             id: "soft-bound-call".to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -6220,6 +6228,7 @@ mod tests {
         let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
         let tool_call = ToolCall {
             id: "abort-bound-call".to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -6351,6 +6360,7 @@ mod tests {
         };
         let tool_call = ToolCall {
             id: tool_call_id.to_owned(),
+            provider_call_id: None,
             name: "bash".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -6482,6 +6492,7 @@ mod tests {
 
         let result = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
+            provider_call_id: tool_call.provider_call_id.clone(),
             tool_name: tool_call.name.clone(),
             content: Vec::new(),
             details: serde_json::json!({"error": "approval_denied"}),
@@ -6676,6 +6687,7 @@ mod tests {
 
         let result = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
+            provider_call_id: tool_call.provider_call_id.clone(),
             tool_name: tool_call.name.clone(),
             content: Vec::new(),
             details: serde_json::json!({"error":"approval_rejected"}),
@@ -6790,6 +6802,7 @@ mod tests {
 
         let result = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
+            provider_call_id: tool_call.provider_call_id.clone(),
             tool_name: tool_call.name.clone(),
             content: Vec::new(),
             details: serde_json::json!({"error": "approval_cancelled"}),

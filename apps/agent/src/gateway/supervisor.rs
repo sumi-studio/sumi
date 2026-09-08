@@ -10835,6 +10835,7 @@ mod tests {
                         content: (0..TOOL_COUNT)
                             .map(|index| PublicAssistantContent::ToolCall {
                                 tool_call: ToolCall {
+                                    provider_call_id: None,
                                     id: format!("blocked-pump-tool-{index}"),
                                     name: "blocked-pump-tool".to_owned(),
                                     route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -10878,6 +10879,7 @@ mod tests {
                     for index in 0..TOOL_COUNT {
                         let tool_call_id = format!("blocked-pump-tool-{index}");
                         let result = ToolResultMessage {
+                            provider_call_id: None,
                             tool_call_id: tool_call_id.clone(),
                             tool_name: "blocked-pump-tool".to_owned(),
                             content: vec![UserContent::Text {

@@ -1556,6 +1556,7 @@ impl Store {
                 )
                 .await?;
                 intents.push(PhysicalRecoveryIntentRequest {
+                    provider_call_id: evidence.provider_call_id,
                     tool_call_id,
                     tool_name: evidence.tool_name,
                     command_id,
@@ -8090,6 +8091,7 @@ mod tests {
         )
         .expect("validated bash arguments");
         let tool_call = ToolCall {
+            provider_call_id: None,
             id: "call-1".to_owned(),
             name: "bash".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,

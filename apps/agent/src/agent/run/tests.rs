@@ -266,7 +266,7 @@ impl RunDriver for FixtureDriver {
         self.tool_order
             .lock()
             .expect("tool order")
-            .push(call.id.clone());
+            .push(call.wire_id().to_owned());
         tokio::task::yield_now().await;
         self.active_tools.fetch_sub(1, Ordering::SeqCst);
         if let Some(Some(error)) = self
@@ -279,6 +279,7 @@ impl RunDriver for FixtureDriver {
         }
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: Vec::new(),
             details: json!({"ok": call.id}),
@@ -455,6 +456,7 @@ fn public_message(message: &AssistantMessage) -> PublicMessage {
 fn call(id: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
+        provider_call_id: None,
         name: format!("tool-{id}"),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(json!({"id": id}))
@@ -600,6 +602,7 @@ fn route_denial_tool_result_distinguishes_judged_and_technical_review_blocks() {
 fn rejected(id: &str) -> RejectedToolCall {
     RejectedToolCall {
         id: id.to_owned(),
+        provider_call_id: None,
         name: format!("tool-{id}"),
         error: ToolArgumentError::InvalidJson,
     }
@@ -608,6 +611,7 @@ fn rejected(id: &str) -> RejectedToolCall {
 fn rejected_result(rejected: &RejectedToolCall) -> ToolResultMessage {
     ToolResultMessage {
         tool_call_id: rejected.id.clone(),
+        provider_call_id: rejected.provider_call_id.clone(),
         tool_name: rejected.name.clone(),
         content: vec![UserContent::Text {
             text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments.".to_owned(),
@@ -1022,6 +1026,7 @@ async fn route_run_loop_sends_human_and_current_assistant_pending_call_to_review
 
     let call = ToolCall {
         id: CALL_ID.to_owned(),
+        provider_call_id: None,
         name: "fixture_tool".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"target":"one"})).expect("validated fixture args"),
@@ -1174,6 +1179,7 @@ impl RunDriver for BoundRouteControlProbeDriver {
             BoundRouteSettlement::Success => Ok(BoundToolResult {
                 result: ToolResultMessage {
                     tool_call_id,
+                    provider_call_id: None,
                     tool_name,
                     content: vec![UserContent::Text {
                         text: "committed".to_owned(),
@@ -1207,6 +1213,7 @@ impl RunDriver for BoundRouteControlProbeDriver {
 async fn authorized_run_loop_route(call_id: &str) -> AuthorizedBoundInvocation {
     let call = ToolCall {
         id: call_id.to_owned(),
+        provider_call_id: None,
         name: "fixture_tool".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"target":"one"}))
@@ -1397,6 +1404,7 @@ async fn tool_evaluation_without_broker_fails_closed() {
     let mut runner = Runner::new(core, driver, control_rx, events_tx);
     let call = ToolCall {
         id: "call-no-broker".to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
@@ -1477,6 +1485,7 @@ async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
     let mut runner = Runner::new(core, driver, control_rx, events_tx);
     let call = ToolCall {
         id: "call-review-wait".to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
@@ -2965,6 +2974,72 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     }
 }
 
+#[test]
+fn provider_tool_identity_scopes_live_and_terminal_without_rewriting_opaque_context() {
+    let raw = call("provider-local-0");
+    let mut live = ProviderEvent::ToolCallEnd {
+        content_index: 0,
+        tool_call: raw.clone(),
+    };
+    let mut terminal = ProviderEvent::Done {
+        reason: StopReason::ToolUse,
+        output: ProviderOutput {
+            message: assistant(
+                StopReason::ToolUse,
+                vec![AssistantContent::ToolCall {
+                    tool_call: raw,
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            ),
+            provider_context: cancellation_provider_context(),
+        },
+    };
+    let original_opaque = serde_json::to_value(cancellation_provider_context()).unwrap();
+    scope_provider_tool_ids("message-a", &mut live);
+    scope_provider_tool_ids("message-a", &mut terminal);
+    let ProviderEvent::ToolCallEnd {
+        tool_call: live_call,
+        ..
+    } = &live
+    else {
+        unreachable!()
+    };
+    let ProviderEvent::Done { output, .. } = &terminal else {
+        unreachable!()
+    };
+    let AssistantContent::ToolCall {
+        tool_call: terminal_call,
+        ..
+    } = &output.message.content[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(live_call, terminal_call);
+    assert_eq!(live_call.wire_id(), "provider-local-0");
+    assert_ne!(live_call.id, live_call.wire_id());
+    assert_eq!(
+        serde_json::to_value(&output.provider_context).unwrap(),
+        original_opaque
+    );
+    let first_id = live_call.id.clone();
+    scope_provider_tool_ids("message-a", &mut live);
+    let ProviderEvent::ToolCallEnd { tool_call, .. } = &live else {
+        unreachable!()
+    };
+    assert_eq!(tool_call.id, first_id, "same event normalization is stable");
+    scope_provider_tool_ids("message-b", &mut live);
+    let ProviderEvent::ToolCallEnd { tool_call, .. } = &live else {
+        unreachable!()
+    };
+    assert_ne!(
+        tool_call.id, first_id,
+        "another turn of the same command gets a distinct identity"
+    );
+    assert_eq!(tool_call.wire_id(), "provider-local-0");
+}
+
 #[tokio::test]
 async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
     let tool_turn = || {
@@ -2993,7 +3068,7 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
                 message_id,
                 message,
             } if matches!(message.as_ref(), PublicMessage::ToolResult(result)
-                if result.tool_call_id == "reused") =>
+                if result.wire_id() == "reused") =>
             {
                 Some(message_id.clone())
             }
@@ -3007,7 +3082,7 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
                 message_id,
                 message,
             } if matches!(message.as_ref(), PublicMessage::ToolResult(result)
-                if result.tool_call_id == "reused") =>
+                if result.wire_id() == "reused") =>
             {
                 Some(message_id.clone())
             }
@@ -3017,12 +3092,24 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
     assert_eq!(starts, ends, "each result must close under its start ID");
     assert_eq!(starts.len(), 2);
     assert_ne!(starts[0], starts[1]);
-    let first_pair_id = tool_result_message_id("assistant-0", "reused");
+    let first_pair_id = tool_result_message_id(
+        "assistant-0",
+        &crate::provider::types::scoped_tool_call_id("assistant-0", "reused"),
+    );
     assert_eq!(starts[0], first_pair_id);
-    assert_eq!(starts[1], tool_result_message_id("assistant-1", "reused"));
+    assert_eq!(
+        starts[1],
+        tool_result_message_id(
+            "assistant-1",
+            &crate::provider::types::scoped_tool_call_id("assistant-1", "reused")
+        )
+    );
     assert_eq!(
         first_pair_id,
-        tool_result_message_id("assistant-0", "reused"),
+        tool_result_message_id(
+            "assistant-0",
+            &crate::provider::types::scoped_tool_call_id("assistant-0", "reused")
+        ),
         "replaying the same assistant/call pair must reproduce the ID"
     );
     assert!(
@@ -3117,11 +3204,15 @@ async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_t
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
+    let mut expected_first = rejected_first.clone();
+    expected_first.provider_call_id = Some(rejected_first.id.clone());
+    expected_first.id =
+        crate::provider::types::scoped_tool_call_id("assistant-0", &rejected_first.id);
     let (completion, events) = run_fixture(driver.clone()).await;
     assert_completed(completion);
     let valid_start = events
         .iter()
-        .position(|event| matches!(event, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == &valid.id))
+        .position(|event| matches!(event, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == &crate::provider::types::scoped_tool_call_id("assistant-0", &valid.id)))
         .expect("valid execution start");
     for rejected in [&rejected_first, &rejected_second] {
         let rejected_end = events
@@ -3131,7 +3222,7 @@ async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_t
                     event,
                     AgentEvent::MessageEnd { message, .. }
                         if matches!(message.as_ref(), PublicMessage::ToolResult(result)
-                            if result.tool_call_id == rejected.id)
+                            if result.wire_id() == rejected.id)
                 )
             })
             .expect("rejected result end");
@@ -3145,12 +3236,12 @@ async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_t
         matches!(
             first_turn,
             AgentEvent::TurnEnd { message: Some(message), tool_results }
-                if tool_results.len() == 1 && tool_results[0].tool_call_id == valid.id
+                if tool_results.len() == 1 && tool_results[0].wire_id() == valid.id
                     && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
                         if assistant.content.iter().any(|content| matches!(
                             content,
                             PublicAssistantContent::RejectedToolCall { rejected: value, .. }
-                                if value == &rejected_first
+                                if value == &expected_first
                         )))
         ),
         "unexpected first turn: {first_turn:#?}"
@@ -3163,18 +3254,18 @@ async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_t
             if assistant.content.iter().any(|content| matches!(
                 content,
                 AssistantContent::RejectedToolCall { rejected: value, .. }
-                    if value == &rejected_first
+                    if value == &expected_first
             ))
     ));
     assert!(matches!(
         context_message(&contexts[1][2]),
         Message::ToolResult(result)
-            if result.tool_call_id == rejected_first.id && result.is_error
+            if result.wire_id() == rejected_first.id && result.is_error
     ));
     assert!(matches!(
         context_message(&contexts[1][3]),
         Message::ToolResult(result)
-            if result.tool_call_id == rejected_second.id && result.is_error
+            if result.wire_id() == rejected_second.id && result.is_error
     ));
 }
 
@@ -3220,7 +3311,7 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
                     event,
                     AgentEvent::MessageEnd { message, .. }
                         if matches!(message.as_ref(), PublicMessage::ToolResult(result)
-                            if result.tool_call_id == rejected.id && result.is_error)
+                            if result.wire_id() == rejected.id && result.is_error)
                 )
             })
             .unwrap_or_else(|| panic!("rejected result MessageEnd missing: {events:#?}"));
@@ -3267,7 +3358,7 @@ async fn retryable_error_commits_rejected_result_before_scheduling_next_attempt(
         .position(|event| {
             matches!(event, AgentEvent::MessageEnd { message, .. }
                 if matches!(message.as_ref(), PublicMessage::ToolResult(result)
-                    if result.tool_call_id == rejected.id && result.is_error))
+                    if result.wire_id() == rejected.id && result.is_error))
         })
         .expect("rejected result MessageEnd");
     let retry = events
@@ -3281,7 +3372,7 @@ async fn retryable_error_commits_rejected_result_before_scheduling_next_attempt(
     assert_eq!(contexts[1].len(), 2, "error assistant stays outside L0");
     assert!(matches!(
         context_message(&contexts[1][1]),
-        Message::ToolResult(result) if result.tool_call_id == rejected.id && result.is_error
+        Message::ToolResult(result) if result.wire_id() == rejected.id && result.is_error
     ));
 }
 
@@ -4110,6 +4201,7 @@ impl RunDriver for UpdateDriver {
         on_update(json!({"phase":"half"}));
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: vec![UserContent::Text {
                 text: "done".to_owned(),
@@ -4200,6 +4292,7 @@ impl RunDriver for ReleaseDriver {
         self.release.notified().await;
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: vec![UserContent::Text {
                 text: "released".to_owned(),
@@ -4367,6 +4460,7 @@ async fn approval_wait_preserves_pending_across_failed_control_authorization(abo
     ));
     let call = ToolCall {
         id: "approval-authorization-failure".to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
@@ -5080,6 +5174,7 @@ async fn runtime_shutdown_interrupts_pending_approval_phase() {
     ));
     let call = ToolCall {
         id: "runtime-shutdown-approval".to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(json!({"command": "git status"}))
@@ -5191,6 +5286,7 @@ impl RunDriver for ControlProbeDriver {
         drop(on_update);
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: vec![UserContent::Text {
                 text: "released".to_owned(),
@@ -5450,7 +5546,7 @@ impl RunDriver for HardSteerToolDriver {
         self.executed_tools
             .lock()
             .expect("executed tools")
-            .push(call.id.clone());
+            .push(call.wire_id().to_owned());
         self.tool_started.notify_one();
         tokio::select! {
             _ = self.tool_released.notified() => {}
@@ -5460,6 +5556,7 @@ impl RunDriver for HardSteerToolDriver {
         }
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: vec![UserContent::Text {
                 text: "cancelled".to_owned(),
@@ -5565,7 +5662,7 @@ async fn soft_steer_during_tool_execution_lets_active_tool_finish() {
         } if matches!(
             message.as_ref(),
             PublicMessage::ToolResult(result)
-                if result.tool_call_id == "not-started"
+                if result.wire_id() == "not-started"
                     && result.is_error
                     && matches!(
                         &result.content[0],
@@ -6553,6 +6650,7 @@ impl ReviewerTransport for RecordingReviewer {
 fn bash_call(id: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(

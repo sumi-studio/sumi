@@ -566,7 +566,7 @@ fn convert_messages(
                     "user",
                     vec![json!({
                     "type":"tool_result",
-                    "tool_use_id":result.tool_call_id,
+                    "tool_use_id":result.wire_id(),
                     "content":result.content.iter()
                         .map(|content| anthropic_user_content(content, spec.supports_images))
                         .collect::<Vec<_>>(),
@@ -684,7 +684,7 @@ fn convert_messages(
                         }
                         AssistantContent::Thinking { .. } => {}
                         AssistantContent::ToolCall { tool_call, .. } => {
-                            validate_tool_use_id(&tool_call.id)?;
+                            validate_tool_use_id(tool_call.wire_id())?;
                             if !pending_tool_ids.insert(tool_call.id.clone()) {
                                 return Err(AnthropicAdapterError::InvalidContext(
                                     "duplicate unresolved tool_use id".into(),
@@ -692,7 +692,7 @@ fn convert_messages(
                             }
                             blocks.push(json!({
                                 "type":"tool_use",
-                                "id":tool_call.id,
+                                "id":tool_call.wire_id(),
                                 "name":tool_call.name,
                                 "input":tool_call.provider_arguments(),
                             }));
@@ -2220,6 +2220,7 @@ mod tests {
         let assistant = AssistantMessage {
             content: vec![AssistantContent::ToolCall {
                 tool_call: crate::provider::types::ToolCall {
+                    provider_call_id: None,
                     id: "toolu_1".into(),
                     name: "read_file".into(),
                     route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2257,6 +2258,7 @@ mod tests {
                 })),
                 synthetic(Message::Assistant(assistant)),
                 synthetic(Message::ToolResult(ToolResultMessage {
+                    provider_call_id: None,
                     tool_call_id: "toolu_1".into(),
                     tool_name: "read_file".into(),
                     content: vec![UserContent::Text { text: "ok".into() }],
@@ -2547,6 +2549,7 @@ mod tests {
             let assistant = AssistantMessage {
                 content: vec![AssistantContent::ToolCall {
                     tool_call: crate::provider::types::ToolCall {
+                        provider_call_id: None,
                         id: "toolu_image".into(),
                         name: "read_file".into(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2583,6 +2586,7 @@ mod tests {
                     })),
                     synthetic(Message::Assistant(assistant)),
                     synthetic(Message::ToolResult(ToolResultMessage {
+                        provider_call_id: None,
                         tool_call_id: "toolu_image".into(),
                         tool_name: "read_file".into(),
                         content: vec![UserContent::Image {
@@ -2871,6 +2875,7 @@ mod tests {
                 },
                 AssistantContent::ToolCall {
                     tool_call: crate::provider::types::ToolCall {
+                        provider_call_id: None,
                         id: "toolu_1".into(),
                         name: "read_file".into(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2914,6 +2919,7 @@ mod tests {
                 id: "result-1".into(),
                 seq: 3,
                 message: Message::ToolResult(ToolResultMessage {
+                    provider_call_id: None,
                     tool_call_id: "toolu_1".into(),
                     tool_name: "read_file".into(),
                     content: vec![UserContent::Text { text: "ok".into() }],
@@ -3417,6 +3423,7 @@ mod tests {
             message: Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::RejectedToolCall {
                     rejected: RejectedToolCall {
+                        provider_call_id: None,
                         id: "rejected-call".into(),
                         name: "fixture".into(),
                         error: ToolArgumentError::SchemaViolation,

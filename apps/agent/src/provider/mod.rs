@@ -5373,6 +5373,7 @@ fi
                     ProviderEvent::ToolCallEnd {
                         content_index: 1,
                         tool_call: ToolCall {
+                            provider_call_id: None,
                             id: "call-valid".to_owned(),
                             name: "read_file".to_owned(),
                             route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -5416,11 +5417,13 @@ fi
         ProviderEvent::ToolCallRejected {
             content_index,
             rejected: RejectedToolCall {
+                provider_call_id: None,
                 id: "call-rejected".to_owned(),
                 name: "read_file".to_owned(),
                 error: ToolArgumentError::InvalidJson,
             },
             synthetic_result: ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: "call-rejected".to_owned(),
                 tool_name: "read_file".to_owned(),
                 content: vec![UserContent::Text {
@@ -5442,6 +5445,7 @@ fi
         ProviderEvent::ToolCallEnd {
             content_index,
             tool_call: ToolCall {
+                provider_call_id: None,
                 id: "call-valid".to_owned(),
                 name: "read_file".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -5875,6 +5879,7 @@ fi
                 },
                 types::ContextMessage::Synthetic {
                     message: types::Message::ToolResult(types::ToolResultMessage {
+                        provider_call_id: calls[0].provider_call_id.clone(),
                         tool_call_id: calls[0].id.clone(),
                         tool_name: calls[0].name.clone(),
                         content: vec![types::UserContent::Text {

@@ -135,6 +135,7 @@ impl ApprovalRuntime {
                     .pending_summary(request_id)
                     .map(|summary| ApprovalPendingSummary {
                         tool_call_id: summary.tool_call_id,
+                        provider_call_id: summary.provider_call_id,
                         tool_name: summary.tool_name,
                     })
             }
@@ -144,6 +145,7 @@ impl ApprovalRuntime {
                     .pending_summary(request_id)
                     .map(|summary| ApprovalPendingSummary {
                         tool_call_id: summary.tool_call_id,
+                        provider_call_id: summary.provider_call_id,
                         tool_name: summary.tool_name,
                     })
             }
@@ -181,6 +183,7 @@ impl ApprovalRuntime {
 
 struct ApprovalPendingSummary {
     tool_call_id: String,
+    provider_call_id: Option<String>,
     tool_name: String,
 }
 
@@ -1977,6 +1980,7 @@ impl<G: Gateway + 'static> Session<G> {
 
             let result_message = ToolResultMessage {
                 tool_call_id: summary.tool_call_id.clone(),
+                provider_call_id: summary.provider_call_id.clone(),
                 tool_name: summary.tool_name.clone(),
                 content: vec![UserContent::Text {
                     text: "Approval decision arrived after the owning run ended; the tool was not started.".to_owned(),

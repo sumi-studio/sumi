@@ -1266,7 +1266,7 @@ fn convert_input(
                         AssistantContent::ToolCall { tool_call, .. } => {
                             let mut item = json!({
                                 "type":"function_call",
-                                "call_id":tool_call.id,
+                                "call_id":tool_call.wire_id(),
                                 "name":tool_call.name,
                                 "arguments":tool_call.provider_arguments().to_string(),
                             });
@@ -1310,7 +1310,7 @@ fn convert_input(
                 };
                 output.push(json!({
                     "type":"function_call_output",
-                    "call_id":result.tool_call_id,
+                    "call_id":result.wire_id(),
                     "output":output_text,
                 }));
             }
@@ -4300,6 +4300,7 @@ mod tests {
                 ProviderEvent::ToolCallEnd {
                     content_index: 2,
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "call_fixture".into(),
                         name: "weather".into(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,

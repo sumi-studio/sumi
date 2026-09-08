@@ -503,6 +503,7 @@ mod tests {
 
     fn tool_result(tool_name: &str, body: &str, is_error: bool) -> PublicMessage {
         PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call-1".to_owned(),
             tool_name: tool_name.to_owned(),
             content: vec![UserContent::Text {
@@ -519,6 +520,7 @@ mod tests {
             serde_json::from_value(json!({"command": command })).unwrap();
         PublicAssistantContent::ToolCall {
             tool_call: ToolCall {
+                provider_call_id: None,
                 id: "call-1".to_owned(),
                 name: "bash".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -531,6 +533,7 @@ mod tests {
     fn rejected_tool_call(name: &str) -> PublicAssistantContent {
         PublicAssistantContent::RejectedToolCall {
             rejected: RejectedToolCall {
+                provider_call_id: None,
                 id: "rejected-call-1".to_owned(),
                 name: name.to_owned(),
                 error: ToolArgumentError::SchemaViolation,
