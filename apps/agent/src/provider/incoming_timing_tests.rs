@@ -49,7 +49,7 @@ fn payload_blocks(preset: &str, user: UserMessage) -> Vec<Value> {
 #[test]
 fn all_provider_payloads_preserve_raw_content_after_utc_receipt_metadata() {
     let received_at = timestamp();
-    let expected = "[Incoming event receipt: received_at_utc=2026-09-08T00:00:00.125Z; previous_received_at_utc=2026-09-07T23:59:58.875Z; receipt_clock_delta_ms=+1250; previous_command_seq=17]";
+    let expected = "[Received 2026-09-08 00:00:00 UTC; approximately 1 second since the previous incoming message]";
     let user = UserMessage {
         incoming_timing: Some(IncomingEventTiming {
             previous_receipt: Some(IncomingEventReceipt {
@@ -94,10 +94,7 @@ fn first_receipt_has_no_invented_interval_and_synthetic_user_has_no_prefix() {
     };
     for preset in ["kimi-k3", "openai-responses", "anthropic"] {
         let blocks = payload_blocks(preset, user.clone());
-        assert_eq!(
-            blocks[0]["text"],
-            "[Incoming event receipt: received_at_utc=2026-09-08T00:00:00.125Z]"
-        );
+        assert_eq!(blocks[0]["text"], "[Received 2026-09-08 00:00:00 UTC]");
     }
     user.incoming_timing = None;
     for preset in ["kimi-k3", "openai-responses", "anthropic"] {
@@ -114,30 +111,60 @@ fn first_receipt_has_no_invented_interval_and_synthetic_user_has_no_prefix() {
 }
 
 #[test]
-fn receipt_clock_delta_preserves_submillisecond_sign_and_precision() {
-    for (nanoseconds, expected) in [
-        (-250_000_000, "-250"),
-        (-1_250_001, "-1.250001"),
-        (-250_000, "-0.25"),
-        (-1, "-0.000001"),
-        (0, "+0"),
-        (1, "+0.000001"),
+fn receipt_intervals_are_readable_without_hiding_clock_regressions() {
+    for (delta, expected) in [
+        (
+            chrono::Duration::milliseconds(16_926),
+            "approximately 17 seconds since the previous incoming message",
+        ),
+        (
+            chrono::Duration::seconds(125),
+            "2 minutes 5 seconds since the previous incoming message",
+        ),
+        (
+            chrono::Duration::seconds(7_380),
+            "2 hours 3 minutes since the previous incoming message",
+        ),
+        (
+            chrono::Duration::seconds(7_384),
+            "approximately 2 hours 3 minutes since the previous incoming message",
+        ),
+        (
+            chrono::Duration::hours(51),
+            "2 days 3 hours since the previous incoming message",
+        ),
+        (
+            chrono::Duration::nanoseconds(1),
+            "less than a second since the previous incoming message",
+        ),
+        (
+            chrono::Duration::nanoseconds(-1),
+            "receipt clock is less than a second earlier than the previous receipt",
+        ),
+        (
+            chrono::Duration::milliseconds(-1_600),
+            "receipt clock is approximately 2 seconds earlier than the previous receipt",
+        ),
+        (
+            chrono::Duration::zero(),
+            "same receipt time as the previous incoming message",
+        ),
     ] {
         let user = UserMessage {
             incoming_timing: Some(IncomingEventTiming {
                 previous_receipt: Some(IncomingEventReceipt {
-                    received_at: timestamp() - chrono::Duration::nanoseconds(nanoseconds),
+                    received_at: timestamp() - delta,
                     command_seq: 18,
                 }),
             }),
             content: vec![],
             timestamp: timestamp(),
         };
-        assert!(
-            user.incoming_timing_text()
-                .unwrap()
-                .contains(&format!("receipt_clock_delta_ms={expected};")),
-            "delta {nanoseconds} ns must preserve its signed exact value"
+        let rendered = user.incoming_timing_text().unwrap();
+        assert_eq!(
+            rendered,
+            format!("[Received 2026-09-08 00:00:00 UTC; {expected}]")
         );
+        assert!(!rendered.contains("command_seq") && !rendered.contains("delta_ms"));
     }
 }

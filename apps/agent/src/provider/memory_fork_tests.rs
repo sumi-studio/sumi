@@ -367,9 +367,9 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         let encoded = serde_json::to_string(parent_items).unwrap();
         assert!(encoded.contains(IMAGE), "parent image must reach the wire");
         assert!(encoded.contains("Latest correction outside the edit target"));
-        assert_eq!(encoded.matches("Incoming event receipt:").count(), 2);
-        assert!(encoded.contains("received_at_utc=2026-09-07T23:40:12.123456789Z"));
-        assert!(encoded.contains("receipt_clock_delta_ms=+125000"));
+        assert_eq!(encoded.matches("[Received ").count(), 2);
+        assert!(encoded.contains("Received 2026-09-07 23:40:12 UTC"));
+        assert!(encoded.contains("2 minutes 5 seconds since the previous incoming message"));
         assert_eq!(encoded.contains("opaque-parent-window"), native);
         let (call_id, arguments) = match spec.protocol {
             ApiProtocol::OpenAiChatCompletions => {

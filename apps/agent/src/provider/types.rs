@@ -352,35 +352,68 @@ impl UserMessage {
     /// Raw content is kept separate, including images and user-authored text.
     pub fn incoming_timing_text(&self) -> Option<String> {
         let timing = self.incoming_timing.as_ref()?;
-        let utc = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-        let mut fields = vec![format!("received_at_utc={}", utc(self.timestamp))];
+        let received = self.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
+        let mut text = format!("[Received {received}");
         if let Some(previous) = &timing.previous_receipt {
-            fields.push(format!(
-                "previous_received_at_utc={}",
-                utc(previous.received_at)
-            ));
             let delta = self.timestamp.signed_duration_since(previous.received_at);
-            let sign = if delta < chrono::Duration::zero() {
-                '-'
+            if delta.is_zero() {
+                text.push_str("; same receipt time as the previous incoming message");
             } else {
-                '+'
-            };
-            let whole_ms = delta.num_milliseconds().unsigned_abs();
-            let remainder_ns = (delta.subsec_nanos() % 1_000_000).unsigned_abs();
-            let fractional_ms = if remainder_ns == 0 {
-                String::new()
-            } else {
-                format!(".{remainder_ns:06}")
-                    .trim_end_matches('0')
-                    .to_owned()
-            };
-            fields.push(format!(
-                "receipt_clock_delta_ms={sign}{whole_ms}{fractional_ms}"
-            ));
-            fields.push(format!("previous_command_seq={}", previous.command_seq));
+                let duration = readable_receipt_interval(delta.abs());
+                if delta < chrono::Duration::zero() {
+                    text.push_str(&format!(
+                        "; receipt clock is {duration} earlier than the previous receipt"
+                    ));
+                } else {
+                    text.push_str(&format!("; {duration} since the previous incoming message"));
+                }
+            }
         }
-        Some(format!("[Incoming event receipt: {}]", fields.join("; ")))
+        text.push(']');
+        Some(text)
     }
+}
+
+fn readable_receipt_interval(duration: chrono::Duration) -> String {
+    if duration < chrono::Duration::seconds(1) {
+        return "less than a second".into();
+    }
+    let seconds = duration.num_seconds();
+    let resolution = if seconds >= 86_400 {
+        3_600
+    } else if seconds >= 3_600 {
+        60
+    } else {
+        1
+    };
+    let rounded = (seconds
+        + resolution / 2
+        + i64::from(resolution == 1 && duration.subsec_nanos() >= 500_000_000))
+        / resolution
+        * resolution;
+    let approximate = duration != chrono::Duration::seconds(rounded);
+    let mut remaining = rounded;
+    let mut units = Vec::new();
+    for (size, name) in [
+        (86_400, "day"),
+        (3_600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ] {
+        let count = remaining / size;
+        if count > 0 {
+            units.push(format!(
+                "{count} {name}{}",
+                if count == 1 { "" } else { "s" }
+            ));
+            remaining %= size;
+        }
+    }
+    format!(
+        "{}{}",
+        if approximate { "approximately " } else { "" },
+        units.join(" ")
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -271,6 +271,7 @@ impl EventBatchSizer {
         Ok(size)
     }
 
+    #[cfg(test)]
     pub(crate) fn command_window<'a>(
         redactor: &Redactor,
         commands: impl IntoIterator<Item = CommandSizeInput<'a>>,
