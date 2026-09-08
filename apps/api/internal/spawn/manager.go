@@ -52,6 +52,10 @@ type WrappingKeyMaterial struct {
 	Bytes string
 }
 
+// ErrCleanupIncomplete means Wait ended without proving physical teardown.
+// Ordinary process exit errors do not carry this marker.
+var ErrCleanupIncomplete = errors.New("runtime cleanup incomplete")
+
 // Process represents a running agent process.
 type Process interface {
 	Wait() error
@@ -111,6 +115,7 @@ type Manager struct {
 
 type agentRuntime struct {
 	process          Process
+	cleanupPending   bool
 	lastActive       time.Time
 	warmth           string
 	activityRevision uint64
@@ -187,6 +192,13 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 			}
 		}
 		if rt, ok := m.running[agentID]; ok {
+			if rt.cleanupPending {
+				m.mu.Unlock()
+				if err := m.Stop(agentID); err != nil {
+					return err
+				}
+				continue
+			}
 			rt.lastActive = m.now()
 			rt.activityRevision++
 			m.mu.Unlock()
@@ -228,13 +240,17 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 		m.mu.Unlock()
 
 		// StopAll won the publication race. A spawner that returned success after
-		// manager cancellation must not escape shutdown or enter the running map.
+		// manager cancellation must not escape shutdown or become available for work.
 		if runtime != nil {
 			if stopErr := runtime.process.Stop(); stopErr != nil {
 				attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
 			}
 		}
 		m.mu.Lock()
+		if runtime != nil && attempt.cleanupErr != nil {
+			runtime.cleanupPending = true
+			m.running[agentID] = runtime
+		}
 		attempt.err = errors.Join(ErrManagerClosed, attempt.cleanupErr)
 		delete(m.starting, agentID)
 		close(attempt.done)
@@ -277,13 +293,18 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRunti
 	return &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}, nil
 }
 
-// watchRuntime evicts only the exact process instance whose Wait completed.
+// watchRuntime evicts only an exited instance; incomplete cleanup remains owned
+// but cannot admit work until a later lifecycle request finishes cleanup.
 // A prior epoch may finish after a replacement has already been published.
 func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
-	_ = runtime.process.Wait()
+	err := runtime.process.Wait()
 	m.mu.Lock()
 	if m.running[agentID] == runtime {
-		delete(m.running, agentID)
+		if errors.Is(err, ErrCleanupIncomplete) {
+			runtime.cleanupPending = true
+		} else {
+			delete(m.running, agentID)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -302,8 +323,8 @@ func (m *Manager) Touch(agentID string) {
 func (m *Manager) Running(agentID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.running[agentID]
-	return ok
+	rt := m.running[agentID]
+	return rt != nil && !rt.cleanupPending
 }
 
 // HoldAdmission protects an already-running generation across durable command
@@ -315,7 +336,7 @@ func (m *Manager) HoldAdmission(agentID string) (func(), error) {
 		return func() {}, nil
 	}
 	rt := m.running[agentID]
-	if m.closing || rt == nil || m.stopping[agentID] != nil {
+	if m.closing || rt == nil || rt.cleanupPending || m.stopping[agentID] != nil {
 		return nil, errors.New("runtime is not available for admission")
 	}
 	rt.admissions++
@@ -360,7 +381,11 @@ func (m *Manager) Stop(agentID string) error {
 		m.mu.Lock()
 		attempt.err = err
 		if m.running[agentID] == rt {
-			delete(m.running, agentID)
+			if err == nil {
+				delete(m.running, agentID)
+			} else {
+				rt.cleanupPending = true
+			}
 		}
 		delete(m.stopping, agentID)
 		close(attempt.done)
@@ -453,9 +478,13 @@ func (m *Manager) stopSelectedIdle(id string, rt *agentRuntime, revision uint64,
 	err = rt.process.Stop()
 	m.mu.Lock()
 	attempt.err = err
-	// A failed stop stays tracked unless its Wait watcher observes exit.
-	if err == nil && m.running[id] == rt {
-		delete(m.running, id)
+	// Failed cleanup stays owned and is unavailable for further admission.
+	if m.running[id] == rt {
+		if err == nil {
+			delete(m.running, id)
+		} else {
+			rt.cleanupPending = true
+		}
 	}
 	delete(m.stopping, id)
 	close(attempt.done)

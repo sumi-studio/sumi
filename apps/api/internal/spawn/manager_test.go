@@ -874,3 +874,121 @@ func TestStopIfIdleAbsentRequiresNoLifecycleOperation(t *testing.T) {
 		})
 	}
 }
+
+func TestIncompleteCleanupStaysOwnedAndRetriesBeforeReplacement(t *testing.T) {
+	failure := errors.New("reap temporarily unavailable")
+	first := &fakeProcess{waitErr: errors.Join(ErrCleanupIncomplete, failure), stopErr: failure}
+	second := &fakeProcess{done: make(chan struct{})}
+	spawner := &sequenceSpawner{processes: []Process{second}}
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &agentRuntime{process: first}
+	mgr.running["agent"] = rt
+	mgr.watchRuntime("agent", rt)
+	if mgr.Running("agent") {
+		t.Fatal("pending cleanup advertised healthy")
+	}
+	if _, err := mgr.HoldAdmission("agent"); err == nil {
+		t.Fatal("pending cleanup admitted command")
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); !errors.Is(err, failure) {
+		t.Fatalf("ensure=%v", err)
+	}
+	if spawner.next != 0 {
+		t.Fatal("replacement spawned before cleanup")
+	}
+	if mgr.running["agent"] != rt {
+		t.Fatal("failed cleanup lost ownership")
+	}
+	first.stopErr = nil
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if spawner.next != 1 || !mgr.Running("agent") {
+		t.Fatal("replacement missing after recovery")
+	}
+	if err := mgr.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStopAllRetainsAndReportsUnresolvedCleanupAcrossRetries(t *testing.T) {
+	failure := errors.New("physical cleanup failed")
+	process := &fakeProcess{waitErr: errors.Join(ErrCleanupIncomplete, failure), stopErr: failure}
+	mgr, err := New(Config{Spawner: &sequenceSpawner{}, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &agentRuntime{process: process}
+	mgr.running["agent"] = rt
+	mgr.watchRuntime("agent", rt)
+	for i := 0; i < 2; i++ {
+		if err := mgr.StopAll(); !errors.Is(err, failure) {
+			t.Fatalf("shutdown=%v", err)
+		}
+		if mgr.running["agent"] != rt {
+			t.Fatal("unresolved owner disappeared")
+		}
+	}
+	process.stopErr = nil
+	if err := mgr.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	if len(mgr.running) != 0 {
+		t.Fatal("cleaned runtime retained")
+	}
+}
+
+func TestOrdinaryProcessExitErrorDoesNotBecomePendingCleanup(t *testing.T) {
+	mgr, err := New(Config{Spawner: &sequenceSpawner{}, Resolver: fakeResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := &agentRuntime{process: &fakeProcess{waitErr: errors.New("exit status 1")}}
+	mgr.running["agent"] = rt
+	mgr.watchRuntime("agent", rt)
+	if len(mgr.running) != 0 {
+		t.Fatal("ordinary exited process retained")
+	}
+}
+
+func TestStopAllRetainsLateStartWhoseCleanupFails(t *testing.T) {
+	spawner := newLateSuccessSpawner()
+	failure := errors.New("late physical cleanup failed")
+	spawner.process.stopErr = failure
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{keys: map[string]string{"agent": "key"}}, ShutdownTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan error, 1)
+	go func() { started <- mgr.EnsureRunning(context.Background(), "agent") }()
+	<-spawner.started
+	stopped := make(chan error, 1)
+	go func() { stopped <- mgr.StopAll() }()
+	<-spawner.canceled
+	close(spawner.release)
+	if err := <-started; !errors.Is(err, ErrManagerClosed) || !errors.Is(err, failure) {
+		t.Fatalf("start=%v", err)
+	}
+	if err := <-stopped; !errors.Is(err, failure) {
+		t.Fatalf("shutdown=%v", err)
+	}
+	if mgr.Running("agent") {
+		t.Fatal("late unresolved runtime advertised healthy")
+	}
+	if _, err := mgr.HoldAdmission("agent"); err == nil {
+		t.Fatal("late runtime admitted work")
+	}
+	if err := mgr.StopAll(); !errors.Is(err, failure) {
+		t.Fatalf("persistent shutdown=%v", err)
+	}
+	spawner.process.stopErr = nil
+	if err := mgr.StopAll(); err != nil {
+		t.Fatalf("recovery=%v", err)
+	}
+	if len(mgr.running) != 0 {
+		t.Fatal("reaped late runtime retained")
+	}
+}
