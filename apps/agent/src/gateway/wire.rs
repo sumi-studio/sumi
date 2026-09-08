@@ -643,6 +643,14 @@ pub enum WireAgentEvent {
     Steered {
         mode: WireSteerMode,
     },
+    ReasoningSummary {
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        wire_item_index: u64,
+        message_id: MessageId,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        content_index: u64,
+        content: String,
+    },
     MemoryMaintenance {
         kind: WireMemoryMaintKind,
     },
@@ -702,6 +710,7 @@ impl WireAgentEvent {
             Self::ApprovalResolved { .. } => "approval_resolved",
             Self::Steered { .. } => "steered",
             Self::MemoryMaintenance { .. } => "memory_maintenance",
+            Self::ReasoningSummary { .. } => "reasoning_summary",
             Self::RetryScheduled { .. } => "retry_scheduled",
             Self::CommandDisposition(_) => "command_disposition",
             Self::Error { .. } => "error",
@@ -1150,6 +1159,18 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
             },
             AgentEvent::Steered { mode } => Self::Steered {
                 mode: mode.try_into()?,
+            },
+            AgentEvent::ReasoningSummary {
+                wire_item_index,
+                message_id,
+                content_index,
+                content,
+            } => Self::ReasoningSummary {
+                wire_item_index: u64::from(wire_item_index),
+                message_id: MessageId::parse(&message_id)
+                    .map_err(|_| WireError::InvalidMessageId(message_id))?,
+                content_index: wire_json_safe_integer(content_index as u64)?,
+                content,
             },
             AgentEvent::MemoryMaintenance { kind } => Self::MemoryMaintenance {
                 kind: kind.try_into()?,

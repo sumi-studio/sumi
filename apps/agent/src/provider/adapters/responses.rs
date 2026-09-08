@@ -1527,15 +1527,6 @@ impl ResponsesReceiveState {
                     content_index: index as usize,
                     content,
                 }),
-                OutputSlot::Reasoning {
-                    summary_slot,
-                    summary,
-                    started: true,
-                    ..
-                } => events.push(ProviderEvent::ReasoningSummaryEnd {
-                    content_index: summary_slot,
-                    content: summary,
-                }),
                 OutputSlot::Reasoning { .. } => {}
                 OutputSlot::Tool {
                     call_id,
@@ -2251,6 +2242,7 @@ impl ResponsesReceiveState {
                 Ok(ResponsesPush {
                     events: if started {
                         vec![ProviderEvent::ReasoningSummaryEnd {
+                            wire_item_index: index,
                             content_index: summary_slot,
                             content: summary,
                         }]
@@ -4194,6 +4186,7 @@ mod tests {
                     delta: "Checking.".into(),
                 },
                 ProviderEvent::ReasoningSummaryEnd {
+                    wire_item_index: 1,
                     content_index: 0,
                     content: "Checking.".into(),
                 },
@@ -5732,12 +5725,62 @@ mod tests {
         let events = payloads
             .iter()
             .flat_map(|payload| state.push_json(payload).unwrap().events)
+            .collect::<Vec<_>>();
+        let starts = events
+            .iter()
             .filter_map(|event| match event {
-                ProviderEvent::ReasoningSummaryStart { content_index } => Some(content_index),
+                ProviderEvent::ReasoningSummaryStart { content_index } => Some(*content_index),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(events, vec![0, 1]);
+        assert_eq!(starts, vec![0, 1]);
+        assert!(events.iter().any(|event| matches!(event,ProviderEvent::ReasoningSummaryEnd { wire_item_index: 1, content_index: 0, content } if content == "one")));
+        // A later incomplete part must not be promoted to a completed summary.
+        assert!(
+            !state
+                .fail()
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ReasoningSummaryEnd { .. }))
+        );
+    }
+
+    #[test]
+    fn completed_summary_preserves_multiple_parts_in_one_wire_item() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let mut sequence = 0u64;
+        let mut push = |mut value: Value| {
+            value["sequence_number"] = json!(sequence);
+            sequence += 1;
+            state.push_json(&value.to_string()).unwrap().events
+        };
+        push(
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}),
+        );
+        for (index, text) in ["first", "second"].into_iter().enumerate() {
+            push(
+                json!({"type":"response.reasoning_summary_part.added","item_id":"r","output_index":0,"summary_index":index,"part":{"type":"summary_text","text":""}}),
+            );
+            push(
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"r","output_index":0,"summary_index":index,"delta":text}),
+            );
+            push(
+                json!({"type":"response.reasoning_summary_text.done","item_id":"r","output_index":0,"summary_index":index,"text":text}),
+            );
+            push(
+                json!({"type":"response.reasoning_summary_part.done","item_id":"r","output_index":0,"summary_index":index,"part":{"type":"summary_text","text":text}}),
+            );
+        }
+        let events = push(
+            json!({"type":"response.output_item.done","output_index":0,"item":{"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}]}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ReasoningSummaryEnd {
+                wire_item_index: 0,
+                content_index: 0,
+                content: "first\n\nsecond".to_owned()
+            }]
+        );
     }
 
     #[test]

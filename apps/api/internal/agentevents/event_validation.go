@@ -52,6 +52,21 @@ func validateEvent(raw json.RawMessage) error {
 		}
 		return nil
 
+	case "reasoning_summary":
+		if err := requireAndAllow(obj, []string{"type", "message_id", "content_index", "wire_item_index", "content"}, []string{"type", "message_id", "content_index", "wire_item_index", "content"}); err != nil {
+			return err
+		}
+		if err := validateUUID(obj["message_id"]); err != nil {
+			return err
+		}
+		if err := validateJSONSafeInteger(obj["content_index"]); err != nil {
+			return err
+		}
+		if err := validateJSONSafeInteger(obj["wire_item_index"]); err != nil {
+			return err
+		}
+		return validateString(obj["content"])
+
 	case "message_update":
 		if err := requireAndAllow(obj, []string{"type", "message_id", "event"}, []string{"type", "message_id", "event"}); err != nil {
 			return err

@@ -1832,6 +1832,7 @@ mod tests {
                 delta: "safe summary".to_owned(),
             },
             ProviderEvent::ReasoningSummaryEnd {
+                wire_item_index: 1,
                 content_index: 1,
                 content: "safe summary".to_owned(),
             },

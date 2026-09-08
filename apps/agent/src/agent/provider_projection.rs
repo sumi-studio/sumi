@@ -255,9 +255,12 @@ impl ProviderEventProjector {
                 delta,
             }),
             ProviderEvent::ReasoningSummaryEnd {
+                wire_item_index,
                 content_index,
                 content,
-            } => self.update(PublicStreamEvent::ReasoningSummaryEnd {
+            } => ProjectedProviderEvent::Update(AgentEvent::ReasoningSummary {
+                message_id: self.message_id.clone(),
+                wire_item_index,
                 content_index,
                 content,
             }),
@@ -535,6 +538,7 @@ mod tests {
             ),
             (
                 ProviderEvent::ReasoningSummaryEnd {
+                    wire_item_index: 4,
                     content_index: 3,
                     content: "summary".to_owned(),
                 },
@@ -545,7 +549,19 @@ mod tests {
             ),
         ];
         for (provider, public) in cases {
-            let expected = if matches!(&provider, ProviderEvent::ToolCallDelta { .. }) {
+            let expected = if let ProviderEvent::ReasoningSummaryEnd {
+                wire_item_index,
+                content_index,
+                content,
+            } = &provider
+            {
+                ProjectedProviderEvent::Update(AgentEvent::ReasoningSummary {
+                    message_id: "message-1".to_owned(),
+                    wire_item_index: *wire_item_index,
+                    content_index: *content_index,
+                    content: content.clone(),
+                })
+            } else if matches!(&provider, ProviderEvent::ToolCallDelta { .. }) {
                 ProjectedProviderEvent::PrivateToolEnvelopeDelta
             } else {
                 ProjectedProviderEvent::Update(AgentEvent::MessageUpdate {

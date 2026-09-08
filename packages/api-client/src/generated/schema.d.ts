@@ -1029,6 +1029,15 @@ export interface components {
             message_id: string;
             message: components["schemas"]["PublicMessage"];
         };
+        /** @description Completed provider-authored display summary. Not raw reasoning or model replay content. */
+        ReasoningSummaryEvent: {
+            /** @constant */
+            type: "reasoning_summary";
+            message_id: components["schemas"]["CanonicalUUID"];
+            wire_item_index: components["schemas"]["JsonSafeInteger"];
+            content_index: components["schemas"]["JsonSafeInteger"];
+            content: string;
+        };
         /** @description any JSON object whose property values are JSON-safe AnyJSON values */
         AnyJSONObject: {
             [key: string]: components["schemas"]["AnyJSON"];
@@ -1146,7 +1155,7 @@ export interface components {
             status: "rejected";
             reject_reason: components["schemas"]["CommandRejectReason"];
         };
-        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ReasoningSummaryEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {

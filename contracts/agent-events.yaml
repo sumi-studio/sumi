@@ -94,6 +94,18 @@ $defs:
         description: durable messages.id; user messages are UUIDv5(command_id, namespace)
       message: { $ref: '#/$defs/PublicMessage' }
 
+  ReasoningSummaryEvent:
+    type: object
+    description: Completed provider-authored display summary. Not raw reasoning or model replay content.
+    required: [type, message_id, content_index, wire_item_index, content]
+    additionalProperties: false
+    properties:
+      type: { const: reasoning_summary }
+      message_id: { $ref: '#/$defs/CanonicalUUID' }
+      wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
+      content_index: { $ref: '#/$defs/JsonSafeInteger' }
+      content: { type: string }
+
   MessageUpdateEvent:
     type: object
     required: [type, message_id, event]
@@ -248,6 +260,7 @@ $defs:
       - { $ref: '#/$defs/MessageStartEvent' }
       - { $ref: '#/$defs/MessageUpdateEvent' }
       - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ReasoningSummaryEvent' }
       - { $ref: '#/$defs/ToolExecutionStartEvent' }
       - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
@@ -267,6 +280,7 @@ $defs:
       - { $ref: '#/$defs/TurnEndEvent' }
       - { $ref: '#/$defs/MessageStartEvent' }
       - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ReasoningSummaryEvent' }
       - { $ref: '#/$defs/ToolExecutionStartEvent' }
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
       - { $ref: '#/$defs/ApprovalRequestedEvent' }

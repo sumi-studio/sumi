@@ -778,6 +778,7 @@ pub enum ProviderEvent {
         delta: String,
     },
     ReasoningSummaryEnd {
+        wire_item_index: u32,
         content_index: usize,
         content: String,
     },

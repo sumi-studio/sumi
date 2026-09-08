@@ -1063,6 +1063,25 @@ impl DurableBridge {
         let event = output.event;
         let message_commit_barrier = output.message_commit_barrier;
         let outputs = match event {
+            AgentEvent::ReasoningSummary {
+                wire_item_index,
+                ref message_id,
+                content_index,
+                ref content,
+            } => {
+                if self.assistant_open.as_deref() != Some(message_id.as_str()) {
+                    bail!("reasoning summary has no prerequisite durable MessageStart");
+                }
+                let durable = DurableEvent::reasoning_summary(
+                    self.binding.run_id.clone(),
+                    self.binding.turn_id.clone(),
+                    message_id.clone(),
+                    wire_item_index,
+                    content_index,
+                    content.clone(),
+                )?;
+                self.commit_single(writer, durable, Vec::new(), event).await
+            }
             AgentEvent::MessageUpdate { ref message_id, .. } => {
                 if self.assistant_open.as_deref() != Some(message_id.as_str()) {
                     bail!("volatile message update has no prerequisite durable MessageStart");
@@ -3719,6 +3738,145 @@ mod tests {
         assert!(
             (f64::from_bits(u64::from_be_bytes(receipt_bits)) - 1.3).abs() < 1.0e-12,
             "default 1.0 ratio updated from a 200/100 observation with alpha 0.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_completed_summary_is_durable_without_becoming_model_memory() {
+        use crate::agent::provider_projection::{ProjectedProviderEvent, ProviderEventProjector};
+        use crate::provider::{
+            adapters::responses::ResponsesReceiveState,
+            assembler::{FrozenToolSchemaRegistry, ResponseBudget},
+            types::ProviderEvent,
+        };
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000032",
+            "run-summary",
+            "turn-summary",
+            RunPhase::UserCommitted,
+        )
+        .await;
+        let message_id = "00000000-0000-4000-8000-000000000033".to_owned();
+        let spec = ModelSpec::preset("openai-responses").unwrap();
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &assistant,
+                            Some(binding.run_id.clone()),
+                            Some(binding.turn_id.clone()),
+                        )
+                        .unwrap(),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: binding.command_id.clone(),
+                        run_id: binding.run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(message_id.clone());
+        let mut projector = ProviderEventProjector::new(message_id.clone()).unwrap();
+        projector.project(ProviderEvent::Start).unwrap();
+        let mut state = ResponsesReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+        );
+        let mut committed_seq = None;
+        'stream: for line in
+            include_str!("../../tests/fixtures/openai_responses_official.sse").lines()
+        {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            for event in state.push_json(data).unwrap().events {
+                let projected = projector.project(event).unwrap();
+                if let ProjectedProviderEvent::Update(event) = projected {
+                    let summary = matches!(event, AgentEvent::ReasoningSummary { .. });
+                    let committed = bridge
+                        .commit(
+                            &writer,
+                            RunOutput {
+                                binding: binding.clone(),
+                                event,
+                                commit_barrier: None,
+                                message_commit_barrier: None,
+                                retry_wait_commit_barrier: None,
+                                approval_command: None,
+                                approval_not_started: None,
+                                approval_cancelled: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    if summary {
+                        committed_seq = committed.outputs.first().unwrap().seq;
+                        break 'stream;
+                    }
+                    assert!(committed.outputs.iter().all(|output| output.seq.is_none()));
+                }
+            }
+        }
+        let seq = committed_seq.expect("completed provider summary has durable sequence");
+        drop(bridge);
+        drop(projector);
+        drop(state);
+        let replay = crate::store::raw_events_after(&store, seq - 1, 16)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&replay[0], (actual, AgentEvent::ReasoningSummary { message_id: id, content_index: 0, wire_item_index: 1, content }) if *actual == seq && id == &message_id && content == "Checking.")
+        );
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(_, event)| matches!(event, AgentEvent::ReasoningSummary { .. }))
+                .count(),
+            1
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "display summary must not become model context"
+        );
+        let encoded = serde_json::to_string(&replay[0].1).unwrap();
+        assert!(
+            !encoded.contains("encrypted_content")
+                && !encoded.contains("signature_field")
+                && !encoded.contains("thinking")
         );
     }
 

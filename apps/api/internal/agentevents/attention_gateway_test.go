@@ -352,20 +352,20 @@ func TestAttentionWebSocketShowsSourceAndActionsWithArtifactRedactionLiveAndRepl
 	defer conn.Close()
 	assertDirectChatStatus(t, conn, "ready")
 	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: pa, Generation: 7}
-	hidden := []json.RawMessage{attentionSourceMessage(t), json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-private","tool_name":"read_file","args":{"path":"PRIVATE_TOOL_ARGS"}}`), json.RawMessage(`{"type":"tool_execution_end","tool_call_id":"call-private","result":{"text":"PRIVATE_TOOL_RESULT","handle":"artifact://018f47a2-9b3c-7def-8abc-0123456789ab/tool-output/private"},"is_error":false}`)}
+	hidden := []json.RawMessage{attentionSourceMessage(t), json.RawMessage(`{"type":"reasoning_summary","message_id":"00000000-0000-4000-8000-000000000001","content_index":0,"wire_item_index":1,"content":"Completed provider display summary"}`), json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-private","tool_name":"read_file","args":{"path":"PRIVATE_TOOL_ARGS"}}`), json.RawMessage(`{"type":"tool_execution_end","tool_call_id":"call-private","result":{"text":"PRIVATE_TOOL_RESULT","handle":"artifact://018f47a2-9b3c-7def-8abc-0123456789ab/tool-output/private"},"is_error":false}`)}
 	for i, event := range hidden {
 		seq := uint64(i + 1)
 		if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: pa, Audience: AudienceSecretary, Event: event}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	seq := uint64(4)
+	seq := uint64(5)
 	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, PersonalityAgentID: pa, Audience: AudienceDirectChat, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	readVisible := func(c *websocket.Conn, last uint64) {
 		t.Helper()
-		for expected := last + 1; expected <= 4; expected++ {
+		for expected := last + 1; expected <= 5; expected++ {
 			c.SetReadDeadline(time.Now().Add(time.Second))
 			_, raw, err := c.ReadMessage()
 			if err != nil {
@@ -378,16 +378,19 @@ func TestAttentionWebSocketShowsSourceAndActionsWithArtifactRedactionLiveAndRepl
 			if frame.Envelope.Seq == nil || *frame.Envelope.Seq != expected {
 				t.Fatalf("sequence: %s", raw)
 			}
-			if expected <= 3 && frame.Envelope.Audience != AudienceSecretary {
+			if expected <= 4 && frame.Envelope.Audience != AudienceSecretary {
 				t.Fatal("execution context missing")
 			}
 			if expected == 1 && (!bytes.Contains(raw, []byte("incoming_source")) || !bytes.Contains(raw, []byte("PRIVATE_SOURCE_TEXT"))) {
 				t.Fatal("received experience hidden")
 			}
-			if expected == 2 && !bytes.Contains(raw, []byte("PRIVATE_TOOL_ARGS")) {
+			if expected == 2 && !bytes.Contains(raw, []byte("Completed provider display summary")) {
+				t.Fatal("completed summary lost or reordered")
+			}
+			if expected == 3 && !bytes.Contains(raw, []byte("PRIVATE_TOOL_ARGS")) {
 				t.Fatal("action hidden")
 			}
-			if expected == 3 {
+			if expected == 4 {
 				if !bytes.Contains(raw, []byte("PRIVATE_TOOL_RESULT")) || !bytes.Contains(raw, []byte("artifact://tool-output/private")) {
 					t.Fatal("result missing")
 				}

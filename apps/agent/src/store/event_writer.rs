@@ -310,6 +310,29 @@ impl DurableEvent {
         )
     }
 
+    pub(crate) fn reasoning_summary(
+        run_id: String,
+        turn_id: String,
+        message_id: String,
+        wire_item_index: u32,
+        content_index: usize,
+        content: String,
+    ) -> Result<Self> {
+        Self::from_parts(
+            AgentEvent::ReasoningSummary {
+                wire_item_index,
+                message_id,
+                content_index,
+                content,
+            },
+            DurableEventMetadata {
+                run_id: Some(run_id),
+                turn_id: Some(turn_id),
+                ..DurableEventMetadata::default()
+            },
+        )
+    }
+
     #[allow(
         dead_code,
         reason = "T17 memory maintenance events are wired by the T20 maintainer"
@@ -722,6 +745,12 @@ impl DurableEvent {
             AgentEvent::CommandDisposition(event) => DurableEventIdentity {
                 command_id: Some(&event.command_id),
                 ..empty("command_disposition")
+            },
+            AgentEvent::ReasoningSummary { message_id, .. } => DurableEventIdentity {
+                run_id: self.metadata.run_id.as_deref(),
+                turn_id: self.metadata.turn_id.as_deref(),
+                message_id: Some(message_id),
+                ..empty("reasoning_summary")
             },
             AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
             AgentEvent::MessageUpdate { .. }
@@ -7719,6 +7748,20 @@ fn validate_batch_shape_with_recovery(
                         bail!(
                             "durable CommandDisposition command_seq exceeds the JSON-safe integer range"
                         );
+                    }
+                }
+                AgentEvent::ReasoningSummary {
+                    message_id,
+                    content_index,
+                    ..
+                } => {
+                    uuid::Uuid::parse_str(message_id).context("summary message_id must be UUID")?;
+                    if event.metadata.run_id.as_deref().is_none_or(str::is_empty)
+                        || event.metadata.turn_id.as_deref().is_none_or(str::is_empty)
+                        || (*content_index as u128)
+                            > crate::gateway::wire::MAX_JSON_SAFE_INTEGER as u128
+                    {
+                        bail!("summary requires run/turn and JSON-safe index");
                     }
                 }
                 AgentEvent::MemoryMaintenance { kind } => {

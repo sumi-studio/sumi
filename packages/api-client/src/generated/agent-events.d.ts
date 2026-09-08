@@ -30,6 +30,7 @@ export type DurableAgentEvent =
   | TurnEndEvent
   | MessageStartEvent
   | MessageEndEvent
+  | ReasoningSummaryEvent
   | ToolExecutionStartEvent
   | ToolExecutionEndEvent
   | ApprovalRequestedEvent
@@ -389,6 +390,7 @@ export type AgentEvent =
   | MessageStartEvent
   | MessageUpdateEvent
   | MessageEndEvent
+  | ReasoningSummaryEvent
   | ToolExecutionStartEvent
   | ToolExecutionUpdateEvent
   | ToolExecutionEndEvent
@@ -702,6 +704,19 @@ export interface MessageEndEvent {
    */
   message_id: string;
   message: PublicMessage;
+}
+/**
+ * Completed provider-authored display summary. Not raw reasoning or model replay content.
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ReasoningSummaryEvent".
+ */
+export interface ReasoningSummaryEvent {
+  type: "reasoning_summary";
+  message_id: CanonicalUUID;
+  wire_item_index: JsonSafeInteger;
+  content_index: JsonSafeInteger;
+  content: string;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
