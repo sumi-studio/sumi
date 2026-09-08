@@ -1,0 +1,115 @@
+{
+  "status": "PASSED",
+  "sha": "ba3eeb7503555a1885a6ae54a56ec5182876f424",
+  "images": {
+    "api": "sha256:69438f546bdd3de0678ff5027370a1312a7a395133a8982882a2f154f55586e4",
+    "agent": "sha256:8a59c8ce169f3993816a51b60e0bdd574ce0baac9c5e3087ca278ca2ff2f9915",
+    "provisioner": "sha256:f806e5516023d3a40ae1794ea3b399727272ef0cb9c4b2ca72b718e81aec8129",
+    "web": "sha256:c2181471dd396117ad7299c989081a210637e88e9259f5d8326807886b9f507c"
+  },
+  "limitations": [
+    "Invitation acceptance uses a separate setup-only DirectChat turn.",
+    "No claim of native Astra, all concurrency cases, or rendered UI quality."
+  ],
+  "cleanup": {
+    "apps": [
+      {
+        "id": "01a0815b-e96c-7327-9903-e40fc9dd8bd6",
+        "disabled": true
+      },
+      {
+        "id": "01a0815b-e95b-7ddd-8471-34aaa57582bb",
+        "disabled": true
+      }
+    ],
+    "sessionRevoked": true,
+    "stoppedRuntime": [
+      "206e566352111baad267950ab9d2d9239dc2e67779ec26b5d9cf1e60aa03be73",
+      "98c645707d903eb5ca5e27aab2b04b222287624a98188c6f2394a87e6d26328e",
+      "fc40361baec4ce515fc8beb0ccd777b1d12c3e1d3ef931902199d16538084a80"
+    ],
+    "browserClosed": true,
+    "retainedIdentityAndHistory": true
+  },
+  "logReload": {
+    "matched": true,
+    "through_seq": 46,
+    "completed_summary_count": 0
+  },
+  "original_reminder_resolution": {
+    "start": {
+      "seq": 93,
+      "audience": "secretary",
+      "type": "tool_execution_start",
+      "tool_call_id": "messaging_8",
+      "name": "messaging",
+      "args": {
+        "action": "resolve_reply_later",
+        "marker_id": "01a0815d-fb3b-7dcd-981a-8b6b2f5a3fe7",
+        "workspace_id": "01a0815b-e930-7e73-9841-058263cc29a8"
+      }
+    },
+    "end": {
+      "seq": 94,
+      "audience": "secretary",
+      "type": "tool_execution_end",
+      "tool_call_id": "messaging_8",
+      "is_error": false,
+      "details": {
+        "marker": {
+          "marker_id": "01a0815d-fb3b-7dcd-981a-8b6b2f5a3fe7",
+          "message_id": "01a0815d-7015-7013-87fc-83e260f7ea61",
+          "note": "REMINDER_DUE_14f3c4b48e0e",
+          "participant": {
+            "kind": "personality_agent",
+            "personality_agent_id": "01a0815b-e48e-7a9e-a573-97e392b41b2b"
+          },
+          "place": {
+            "dm_id": "01a0815c-7da5-7755-ae08-9eb36e547bf6",
+            "kind": "dm"
+          },
+          "remind_at": "2026-09-08T14:14:35.159187Z",
+          "resolved": true
+        }
+      }
+    }
+  },
+  "dmReply": {
+    "message_id": "01a0815d-6c45-773c-ae4f-592eccc440f5",
+    "place": {
+      "kind": "dm",
+      "dm_id": "01a0815c-7da5-7755-ae08-9eb36e547bf6"
+    },
+    "author": {
+      "kind": "personality_agent",
+      "personality_agent_id": "01a0815b-e48e-7a9e-a573-97e392b41b2b"
+    },
+    "content": "DM_OK_14f3c4b48e0e",
+    "created_at": "2026-09-08T14:12:58.560788Z"
+  },
+  "reminderReply": {
+    "message_id": "01a0815f-42be-7d3e-9816-c43b85298a77",
+    "place": {
+      "kind": "dm",
+      "dm_id": "01a0815c-7da5-7755-ae08-9eb36e547bf6"
+    },
+    "author": {
+      "kind": "personality_agent",
+      "personality_agent_id": "01a0815b-e48e-7a9e-a573-97e392b41b2b"
+    },
+    "content": "REMINDER_DUE_14f3c4b48e0e",
+    "created_at": "2026-09-08T14:14:59.004032Z"
+  },
+  "cancel_suppression": {
+    "event_id": "01a0815f-f779-7b5c-8180-eaf887d04da1",
+    "available_at": "2026-09-08T14:16:45.269206+00:00",
+    "admitted_at": null,
+    "suppressed_at": "2026-09-08T14:15:58.964125+00:00",
+    "suppression_reason": "source_unavailable"
+  },
+  "diagnostic_capture": {
+    "complete": true,
+    "stage_count": 94
+  },
+  "limits": "Owned synthetic real-provider scenario; no physical iOS, native ChatGPT login or long-running concurrency claim. Previous wt1r55 stall remains unexplained."
+}

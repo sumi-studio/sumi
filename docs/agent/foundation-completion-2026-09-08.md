@@ -13,7 +13,7 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment: `0b88996acd46c76247d9cc9389d83af8fca501fe`
+Current shared deployment: `ba3eeb7503555a1885a6ae54a56ec5182876f424`
 (the unmerged #379/#380/#382 stack). This is a deployed candidate, not accepted
 completion of its new capabilities.
 The private-file acceptance below was performed on the preceding `8cbba0b8`
@@ -265,3 +265,18 @@ PARTIAL_ACCEPTANCE. Delivery and separate cancellation are proven; completion
 of the original reminder workflow is not. The runner now requires both its
 write receipt and its matching resolve receipt before advancing. No fresh
 real run has yet validated that stronger condition.
+
+Diagnostic-only shared update `ba3eeb75` passed all three CI jobs and routine
+cutover checks, preserving existing mounts and the ChatGPT encryption key.
+No history conversion or schema migration ran. Configuration and PostgreSQL
+backups were taken; PA volumes were retained in place. The actual-model
+run below requires the original reminder resolve receipt.
+
+The strengthened run `zzT9jd` completed on `ba3eeb75`. Its original reminder
+resolve call `messaging_8` started at event 93 and returned resolved=true for
+the matching marker at event 94. The separate cancellation was suppressed
+before its due time and remained unadmitted after the deadline. DM delivery,
+replay, unchanged image bindings and fixture cleanup also passed.
+[Resolution evidence](evidence/attention-resolution-2026-09-08.json) records
+the matched receipts. The earlier partial artifact is retained as such;
+the unexplained earlier stall is not claimed fixed by this passing scenario.
