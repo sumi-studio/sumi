@@ -1,5 +1,6 @@
 //! Durable conversation, event, and memory storage.
 
+mod active_memory;
 mod crypto;
 mod delivery;
 mod event_log;
@@ -151,45 +152,6 @@ pub(crate) use transcript::TranscriptRecord;
 /// processed and dropped before the next page is requested, so decrypted
 /// plaintext and `SqliteRow` buffers are not retained for the whole history.
 const HYDRATION_PAGE_SIZE: i64 = 64;
-const HYDRATION_MAX_ROWS: u64 = 100_000;
-const HYDRATION_MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug)]
-struct HydrationBudget {
-    max_rows: u64,
-    max_encoded_bytes: u64,
-}
-
-impl Default for HydrationBudget {
-    fn default() -> Self {
-        Self {
-            max_rows: HYDRATION_MAX_ROWS,
-            max_encoded_bytes: HYDRATION_MAX_ENCODED_BYTES,
-        }
-    }
-}
-
-impl HydrationBudget {
-    fn validate(self, rows: i64, encoded_bytes: i64) -> Result<()> {
-        let rows = u64::try_from(rows).context("hydration row count is negative")?;
-        let encoded_bytes =
-            u64::try_from(encoded_bytes).context("hydration encoded-byte count is negative")?;
-        if rows > self.max_rows {
-            bail!(
-                "hydration snapshot has {rows} rows, exceeding the {}-row budget",
-                self.max_rows
-            );
-        }
-        if encoded_bytes > self.max_encoded_bytes {
-            bail!(
-                "hydration snapshot has {encoded_bytes} encoded bytes, exceeding the {}-byte budget",
-                self.max_encoded_bytes
-            );
-        }
-        Ok(())
-    }
-}
-
 /// Canonical plaintext encrypted in `memory_batches` summaries and
 /// `memory_jobs` results. Store is the sole decryption/redaction verifier and
 /// immediately converts this DTO to a ciphertext-free runtime value.
@@ -697,8 +659,6 @@ impl Store {
                 .context("failed to roll back hydration transaction")?;
             return Ok(HydrationOutcome::PhysicalRecoveryRequired(intents));
         }
-        self.preflight_hydration_budget(&mut transaction, HydrationBudget::default())
-            .await?;
         transaction
             .commit()
             .await
@@ -732,15 +692,84 @@ impl Store {
                 post_recovery_intents,
             ));
         }
-        self.preflight_hydration_budget(&mut transaction, HydrationBudget::default())
+        let selected = active_memory::ActiveMemorySelection::load(&mut transaction).await?;
+        let live_ids = serde_json::to_string(&selected.live_l0_batch_ids)?;
+        let message_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT message_id FROM memory_batch_messages
+             WHERE batch_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(live_ids)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut messages = self
+            .hydrate_messages_for_ids(&mut transaction, &message_ids)
             .await?;
-        let messages = self
-            .hydrate_messages(&mut transaction)
-            .await
-            .context("failed to hydrate authenticated transcript rows")?;
+        let transcript_through_seq = u64::try_from(
+            sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(seq) FROM messages")
+                .fetch_one(&mut *transaction)
+                .await?
+                .unwrap_or(0),
+        )
+        .context("transcript watermark is outside u64")?;
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
             .await?;
+        // Native windows and interrupted Error attempts may retain an owner
+        // outside live L0. Keep those exact authenticated owners for recovery,
+        // without hydrating unrelated original history.
+        let owner_ids: Vec<String> = provider_context
+            .iter()
+            .map(|row| row.item.retention_owner.message_id.clone())
+            .filter(|id| {
+                !messages.iter().any(|message| {
+                    matches!(message,
+                ContextMessage::Persisted { id: existing, .. } if existing == id)
+                })
+            })
+            .collect();
+        messages.extend(
+            self.hydrate_messages_for_ids(&mut transaction, &owner_ids)
+                .await?,
+        );
+        // An applicable native window replaces the prefix only. Its coverage
+        // anchor and every original message after it remain the canonical
+        // native suffix, even when fallback L0 has since been compacted.
+        let native_coverage = provider_context
+            .iter()
+            .filter_map(|row| match &row.item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+                | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+                    Some(coverage.through_message_seq)
+                }
+                _ => None,
+            })
+            .min();
+        if let Some(coverage) = native_coverage {
+            let native_ids: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM messages WHERE seq >= ? ORDER BY seq")
+                    .bind(i64::try_from(coverage)?)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+            let existing: std::collections::HashSet<String> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    ContextMessage::Persisted { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let missing: Vec<String> = native_ids
+                .into_iter()
+                .filter(|id| !existing.contains(id))
+                .collect();
+            messages.extend(
+                self.hydrate_messages_for_ids(&mut transaction, &missing)
+                    .await?,
+            );
+        }
+        messages.sort_by_key(|message| match message {
+            ContextMessage::Persisted { seq, .. } => *seq,
+            _ => 0,
+        });
         let pending_error_context = pending_error_context_recovery(&messages, &provider_context)?;
         let memory = self
             .hydrate_memory_runtime(&messages, &provider_context, &mut transaction)
@@ -800,6 +829,7 @@ impl Store {
             fence: fence.clone(),
             receipt,
             messages,
+            transcript_through_seq,
             provider_context,
             memory,
             resume: ResumeDirective::AdmitCommands,
@@ -1141,7 +1171,9 @@ impl Store {
                     authorization_evidence_digest, denial_evidence_key_ref,
                     denial_evidence_ciphertext, denial_evidence_digest
              FROM tool_executions
-             WHERE invocation_route IS NOT NULL OR authority_provenance IS NOT NULL
+             WHERE (state IN ('prepared', 'running') OR run_id IN
+                 (SELECT run_id FROM inbound_commands WHERE status = 'applying'))
+               AND (invocation_route IS NOT NULL OR authority_provenance IS NOT NULL
                 OR descriptor_digest IS NOT NULL OR bound_evidence_digest IS NOT NULL
                 OR bound_invocation_key_ref IS NOT NULL
                 OR bound_invocation_ciphertext IS NOT NULL
@@ -1150,7 +1182,7 @@ impl Store {
                 OR authorization_evidence_digest IS NOT NULL
                 OR denial_evidence_key_ref IS NOT NULL
                 OR denial_evidence_ciphertext IS NOT NULL
-                OR denial_evidence_digest IS NOT NULL
+                OR denial_evidence_digest IS NOT NULL)
              ORDER BY tool_call_id",
         )
         .fetch_all(&mut **transaction)
@@ -1296,7 +1328,9 @@ impl Store {
                     human_decision_key_ref, human_decision_ciphertext,
                     human_decision_digest
              FROM approval_log
-             WHERE invocation_route IS NOT NULL OR descriptor_digest IS NOT NULL
+             WHERE (state = 'pending' OR run_id IN
+                 (SELECT run_id FROM inbound_commands WHERE status = 'applying'))
+               AND (invocation_route IS NOT NULL OR descriptor_digest IS NOT NULL
                 OR bound_evidence_digest IS NOT NULL
                 OR bound_invocation_key_ref IS NOT NULL
                 OR bound_invocation_ciphertext IS NOT NULL
@@ -1308,7 +1342,7 @@ impl Store {
                 OR escalation_review_digest IS NOT NULL
                 OR human_decision_key_ref IS NOT NULL
                 OR human_decision_ciphertext IS NOT NULL
-                OR human_decision_digest IS NOT NULL
+                OR human_decision_digest IS NOT NULL)
              ORDER BY id",
         )
         .fetch_all(&mut **transaction)
@@ -1530,146 +1564,43 @@ impl Store {
         Ok(intents)
     }
 
-    async fn preflight_hydration_budget(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        budget: HydrationBudget,
-    ) -> Result<()> {
-        // Bound the total rows and encoded bytes that the typed hydration
-        // snapshot can materialize before decrypting any transcript, provider,
-        // or memory payload. Fixed-width integers are represented by a small
-        // per-row allowance; all variable-width columns are counted as their
-        // UTF-8/BLOB byte lengths.
-        let row = sqlx::query(
-            "SELECT
-                COALESCE(SUM(row_count), 0) AS row_count,
-                COALESCE(SUM(encoded_bytes), 0) AS encoded_bytes
-             FROM (
-                SELECT COUNT(*) AS row_count,
-                       COALESCE(SUM(
-                         64 +
-                         length(CAST(id AS BLOB)) +
-                         length(CAST(role AS BLOB)) +
-                         length(CAST(raw_key_ref AS BLOB)) +
-                         length(raw_ciphertext) +
-                         length(CAST(payload AS BLOB)) +
-                         length(CAST(search_text AS BLOB))
-                       ), 0) AS encoded_bytes
-                FROM messages
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         96 +
-                         length(CAST(id AS BLOB)) +
-                         COALESCE(length(CAST(message_id AS BLOB)), 0) +
-                         length(CAST(idempotency_key AS BLOB)) +
-                         length(CAST(kind AS BLOB)) +
-                         COALESCE(length(CAST(context_fingerprint AS BLOB)), 0) +
-                         length(CAST(provider_instance_id AS BLOB)) +
-                         length(CAST(protocol AS BLOB)) +
-                         length(CAST(model AS BLOB)) +
-                         length(CAST(key_ref AS BLOB)) +
-                         length(ciphertext)
-                       ), 0)
-                FROM provider_context
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         64 +
-                         length(CAST(mutation_id AS BLOB)) +
-                         length(CAST(state AS BLOB)) +
-                         length(CAST(intent_key_ref AS BLOB)) +
-                         length(intent_ciphertext) +
-                         length(CAST(hmac_key_id AS BLOB)) +
-                         length(intent_hmac) +
-                         length(CAST(prepared_at AS BLOB)) +
-                         COALESCE(length(CAST(finished_at AS BLOB)), 0) +
-                         COALESCE(length(CAST(terminal_reason AS BLOB)), 0)
-                       ), 0)
-                FROM provider_context_mutations
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         32 +
-                         length(CAST(scope_key AS BLOB)) +
-                         length(CAST(latest_insert_id AS BLOB)) +
-                         length(CAST(updated_at AS BLOB))
-                       ), 0)
-                FROM provider_context_replace_heads
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         48 +
-                         length(CAST(state AS BLOB)) +
-                         COALESCE(length(set_digest), 0) +
-                         COALESCE(length(CAST(key_ref AS BLOB)), 0) +
-                         COALESCE(length(head_hmac), 0)
-                       ), 0)
-                FROM provider_context_projection_head
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         96 +
-                         length(CAST(id AS BLOB)) +
-                         length(CAST(state AS BLOB)) +
-                         COALESCE(length(CAST(summary_key_ref AS BLOB)), 0) +
-                         COALESCE(length(summary_ciphertext), 0) +
-                         COALESCE(length(CAST(summary_projection AS BLOB)), 0)
-                       ), 0)
-                FROM memory_batches
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         16 +
-                         length(CAST(batch_id AS BLOB)) +
-                         length(CAST(message_id AS BLOB))
-                       ), 0)
-                FROM memory_batch_messages
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(
-                         96 +
-                         length(CAST(id AS BLOB)) +
-                         length(CAST(kind AS BLOB)) +
-                         length(CAST(source_ids AS BLOB)) +
-                         length(CAST(source_versions AS BLOB)) +
-                         length(CAST(status AS BLOB)) +
-                         COALESCE(length(CAST(lease_until AS BLOB)), 0) +
-                         COALESCE(length(CAST(result_key_ref AS BLOB)), 0) +
-                         COALESCE(length(result_ciphertext), 0) +
-                         COALESCE(length(CAST(result_projection AS BLOB)), 0)
-                       ), 0)
-                FROM memory_jobs
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(16 + length(CAST(kind AS BLOB))), 0)
-                FROM memory_apply_cursors
-                UNION ALL
-                SELECT COUNT(*),
-                       COALESCE(SUM(40 + length(ratio_bits)), 0)
-                FROM memory_calibration
-             )",
-        )
-        .fetch_one(&mut **transaction)
-        .await
-        .context("failed to preflight hydration snapshot bounds")?;
-        budget.validate(row.try_get("row_count")?, row.try_get("encoded_bytes")?)
-    }
-
     async fn hydrate_messages(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<Vec<ContextMessage>> {
+        self.hydrate_selected_messages(transaction, None).await
+    }
+
+    pub(super) async fn hydrate_messages_for_ids(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        ids: &[String],
+    ) -> Result<Vec<ContextMessage>> {
+        self.hydrate_selected_messages(transaction, Some(ids)).await
+    }
+
+    async fn hydrate_selected_messages(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        ids: Option<&[String]>,
+    ) -> Result<Vec<ContextMessage>> {
+        let selected = ids.map(serde_json::to_string).transpose()?;
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let mut messages = Vec::new();
         let mut offset = 0_i64;
         loop {
-            let rows = sqlx::query(
+            let rows = sqlx::query(if selected.is_some() {
                 "SELECT id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
-                        redaction_version, interrupted
-                 FROM messages ORDER BY seq LIMIT ? OFFSET ?",
-            )
+                            redaction_version, interrupted
+                     FROM messages WHERE id IN (SELECT value FROM json_each(?))
+                     ORDER BY seq LIMIT ? OFFSET ?"
+            } else {
+                "SELECT id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                            redaction_version, interrupted
+                     FROM messages WHERE ? IS NULL ORDER BY seq LIMIT ? OFFSET ?"
+            })
+            .bind(selected.as_deref())
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
@@ -1772,11 +1703,15 @@ impl Store {
         let mut provider_context = Vec::new();
         let mut offset = 0_i64;
 
+        // A sparse snapshot still retains canonical order; collecting into a
+        // map must not silently repair duplicate or reordered input.
+        crate::provider::types::validate_native_suffix(messages, None)
+            .map_err(|error| anyhow!("invalid provider hydration transcript: {error}"))?;
         // Persisted messages indexed by seq for anchor and provider-origin lookups.
-        let seq_to_message: BTreeMap<u64, &ContextMessage> = messages
+        let mut seq_to_message: BTreeMap<u64, ContextMessage> = messages
             .iter()
             .filter_map(|message| match message {
-                ContextMessage::Persisted { seq, .. } => Some((*seq, message)),
+                ContextMessage::Persisted { seq, .. } => Some((*seq, message.clone())),
                 ContextMessage::Synthetic { .. } => None,
             })
             .collect();
@@ -1890,6 +1825,19 @@ impl Store {
                     bail!(
                         "provider-context record {id} key_ref does not match authenticated retention owner"
                     );
+                }
+                if !seq_to_message.contains_key(&item.retention_owner.message_seq) {
+                    let owners = self
+                        .hydrate_messages_for_ids(
+                            transaction,
+                            &[item.retention_owner.message_id.clone()],
+                        )
+                        .await?;
+                    for owner in owners {
+                        if let ContextMessage::Persisted { seq, .. } = &owner {
+                            seq_to_message.insert(*seq, owner);
+                        }
+                    }
                 }
                 let owner_message = seq_to_message
                     .get(&item.retention_owner.message_seq)
@@ -2061,7 +2009,26 @@ impl Store {
                             );
                         }
 
-                        validate_native_suffix_for_hydration(messages, coverage.through_message_seq)
+                        if !seq_to_message.contains_key(&coverage.through_message_seq) {
+                            let coverage_id: Option<String> =
+                                sqlx::query_scalar("SELECT id FROM messages WHERE seq = ?")
+                                    .bind(i64::try_from(coverage.through_message_seq)?)
+                                    .fetch_optional(&mut **transaction)
+                                    .await?;
+                            if let Some(coverage_id) = coverage_id {
+                                for message in self
+                                    .hydrate_messages_for_ids(transaction, &[coverage_id])
+                                    .await?
+                                {
+                                    if let ContextMessage::Persisted { seq, .. } = &message {
+                                        seq_to_message.insert(*seq, message);
+                                    }
+                                }
+                            }
+                        }
+                        let native_messages: Vec<ContextMessage> =
+                            seq_to_message.values().cloned().collect();
+                        validate_native_suffix_for_hydration(&native_messages, coverage.through_message_seq)
                         .map_err(|message| {
                             anyhow!("provider-context record {id} failed native suffix validation: {message}")
                         })?;
@@ -2154,6 +2121,10 @@ impl Store {
         provider_context: &[ProviderContextItemWithFootprint],
         transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<HydratedMemoryRuntime> {
+        let selected = active_memory::ActiveMemorySelection::load(&mut **transaction).await?;
+        let batch_ids = serde_json::to_string(&selected.batch_ids)?;
+        let live_l0_ids = serde_json::to_string(&selected.live_l0_batch_ids)?;
+        let job_ids = serde_json::to_string(&selected.job_ids)?;
         let mut persisted_messages = HashMap::with_capacity(messages.len());
         for message in messages {
             let ContextMessage::Persisted { id, .. } = message else {
@@ -2233,8 +2204,10 @@ impl Store {
                 "SELECT id, layer, ord, batch_seq, version, state, est_tokens,
                     eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
                     summary_projection, summary_redaction_version
-                 FROM memory_batches ORDER BY layer, ord LIMIT ? OFFSET ?",
+                 FROM memory_batches WHERE id IN (SELECT value FROM json_each(?))
+                 ORDER BY layer, ord LIMIT ? OFFSET ?",
             )
+            .bind(&batch_ids)
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
@@ -2256,27 +2229,31 @@ impl Store {
                 let state = MemoryBatchState::from_str(&state_text).ok_or_else(|| {
                     anyhow!("memory batch {id_text} has unknown state {state_text}")
                 })?;
-                let summary = match (
-                    row.try_get::<Option<String>, _>("summary_key_ref")?,
-                    row.try_get::<Option<Vec<u8>>, _>("summary_ciphertext")?,
-                    row.try_get::<Option<String>, _>("summary_projection")?,
-                    row.try_get::<Option<i64>, _>("summary_redaction_version")?,
-                ) {
-                    (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => Some(
-                        self.hydrate_memory_summary(
-                            &mut key_cache,
-                            transaction,
-                            &key_ref,
-                            &ciphertext,
-                            &projection,
-                            version,
-                            "memory_batches",
-                            &id_text,
-                        )
-                        .await?,
-                    ),
-                    (None, None, None, None) => None,
-                    _ => bail!("memory batch {id_text} summary fields are inconsistent"),
+                let summary = if state == MemoryBatchState::Dropped {
+                    None
+                } else {
+                    match (
+                        row.try_get::<Option<String>, _>("summary_key_ref")?,
+                        row.try_get::<Option<Vec<u8>>, _>("summary_ciphertext")?,
+                        row.try_get::<Option<String>, _>("summary_projection")?,
+                        row.try_get::<Option<i64>, _>("summary_redaction_version")?,
+                    ) {
+                        (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => Some(
+                            self.hydrate_memory_summary(
+                                &mut key_cache,
+                                transaction,
+                                &key_ref,
+                                &ciphertext,
+                                &projection,
+                                version,
+                                "memory_batches",
+                                &id_text,
+                            )
+                            .await?,
+                        ),
+                        (None, None, None, None) => None,
+                        _ => bail!("memory batch {id_text} summary fields are inconsistent"),
+                    }
                 };
 
                 let ord = u64::try_from(row.try_get::<i64, _>("ord")?)
@@ -2319,9 +2296,10 @@ impl Store {
         loop {
             let rows = sqlx::query(
                 "SELECT batch_id, message_id, ord
-                 FROM memory_batch_messages
+                 FROM memory_batch_messages WHERE batch_id IN (SELECT value FROM json_each(?))
                  ORDER BY batch_id, ord LIMIT ? OFFSET ?",
             )
+            .bind(&live_l0_ids)
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
@@ -2363,8 +2341,9 @@ impl Store {
                 "SELECT id, kind, batch_seq, source_ids, source_versions, status,
                     lease_until, attempts, result_key_ref, result_ciphertext,
                     result_projection, result_redaction_version
-                 FROM memory_jobs ORDER BY id LIMIT ? OFFSET ?",
+                 FROM memory_jobs WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ? OFFSET ?",
             )
+            .bind(&job_ids)
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
@@ -2512,7 +2491,8 @@ impl Store {
 
         Ok(
             HydratedMemoryRuntime::new(batches, memberships, jobs, cursors, anchored_footprints)
-                .with_calibration(calibration),
+                .with_calibration(calibration)
+                .with_active_selection(selected.next_l0_batch_seq, selected.job_sequence_max),
         )
     }
 
@@ -2931,22 +2911,6 @@ impl Store {
     }
 
     async fn validate_startup(&self) -> Result<()> {
-        let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
-            .fetch_one(&self.pool)
-            .await
-            .context("failed to run SQLite quick_check")?;
-        if quick_check != "ok" {
-            bail!("SQLite quick_check failed: {quick_check}");
-        }
-
-        let foreign_key_violation = sqlx::query("PRAGMA foreign_key_check")
-            .fetch_optional(&self.pool)
-            .await
-            .context("failed to run SQLite foreign_key_check")?;
-        if foreign_key_violation.is_some() {
-            bail!("SQLite foreign_key_check found a violation");
-        }
-
         let rows = sqlx::query("SELECT personality_agent_id FROM agent_scope ORDER BY singleton")
             .fetch_all(&self.pool)
             .await
@@ -2968,81 +2932,9 @@ impl Store {
             );
         }
 
-        // Public projections are readable without decrypting their raw source,
-        // so an unsupported rule version must stop startup before any command
-        // admission. These bounded existence probes avoid replaying projections
-        // whose exact event parity is authenticated separately by EventWriter.
-        for (table, column, label) in [
-            ("messages", "redaction_version", "message"),
-            ("approval_log", "redaction_version", "approval"),
-            ("agent_events", "redaction_version", "event"),
-            (
-                "memory_batches",
-                "summary_redaction_version",
-                "memory batch",
-            ),
-            ("memory_jobs", "result_redaction_version", "memory job"),
-        ] {
-            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} <> ? LIMIT 1)");
-            let unsupported: i64 = sqlx::query_scalar(&sql)
-                .bind(i64::from(self.redactor.version()))
-                .fetch_one(&self.pool)
-                .await
-                .with_context(|| format!("failed to validate {label} redaction versions"))?;
-            if unsupported != 0 {
-                bail!("persisted {label} projection uses an unsupported redaction version");
-            }
-        }
-
-        let active_keys = sqlx::query(
-            "SELECT key_ref, scope, purpose, personality_agent_id, retention_unit, algorithm,
-                    wrap_key_id, wrap_nonce, wrapped_key
-             FROM data_keys WHERE state = 'active' ORDER BY key_ref",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("failed to validate active data keys")?;
-        for row in active_keys {
-            let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
-            let key_ref: String = row.try_get("key_ref")?;
-            let algorithm: String = row.try_get("algorithm")?;
-            if algorithm != WRAP_ALGORITHM {
-                bail!("active data key {key_ref} has unsupported algorithm {algorithm}");
-            }
-            let key_scope = match row.try_get::<String, _>("scope")?.as_str() {
-                "personality_agent" => DataKeyScope::PersonalityAgent,
-                value => bail!("active data key {key_ref} has unknown scope {value}"),
-            };
-            let personality_agent_id: String = row.try_get("personality_agent_id")?;
-            let retention_unit: String = row.try_get("retention_unit")?;
-            validate_retention_unit(purpose, &retention_unit)?;
-            if personality_agent_id != self.scope.personality_agent_id.as_str() {
-                bail!("active private key {key_ref} is bound to another personality agent");
-            }
-            let wrap_key_id: String = row.try_get("wrap_key_id")?;
-            let wrapping_key = self
-                .key_provider
-                .key_by_id(&wrap_key_id)
-                .await
-                .with_context(|| format!("failed to obtain wrapping key {wrap_key_id}"))?;
-            let aad = KeyWrapAad {
-                key_ref: key_ref.clone(),
-                scope: key_scope,
-                purpose,
-                personality_agent_id,
-                retention_unit,
-                wrap_key_id,
-            };
-            unwrap_data_key(
-                key_ref,
-                purpose,
-                row.try_get::<Vec<u8>, _>("wrapped_key")?.as_slice(),
-                row.try_get::<Vec<u8>, _>("wrap_nonce")?.as_slice(),
-                &wrapping_key,
-                &aad,
-            )
-            .context("active data-key row failed authenticated startup validation")?;
-        }
+        // Readiness validates the private Store identity. Selected records and
+        // keys are authenticated when hydrated/read; archive-wide integrity,
+        // version and key scans must not put a lifetime limit on conversation.
         Ok(())
     }
 
@@ -3137,7 +3029,7 @@ impl Store {
             );
         }
         let row = sqlx::query(
-            "SELECT key_ref, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT key_ref, retention_unit, algorithm, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE scope = 'personality_agent' AND personality_agent_id = ? AND purpose = ?
                AND retention_unit = 'agent' AND state = 'active'",
@@ -3151,6 +3043,9 @@ impl Store {
             return Ok(None);
         };
         let key_ref: String = row.try_get("key_ref")?;
+        if row.try_get::<&str, _>("algorithm")? != WRAP_ALGORITHM {
+            bail!("data key {key_ref} uses an unsupported wrapping algorithm");
+        }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
         let aad = KeyWrapAad {
@@ -3327,7 +3222,7 @@ impl Store {
 
     pub(crate) async fn data_key_by_ref(&self, key_ref: &str) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
@@ -3342,6 +3237,9 @@ impl Store {
         validate_retention_unit(purpose, &retention_unit)?;
         if personality_agent_id != self.scope.personality_agent_id.as_str() {
             bail!("data key {key_ref} belongs to another personality agent");
+        }
+        if row.try_get::<&str, _>("algorithm")? != WRAP_ALGORITHM {
+            bail!("data key {key_ref} uses an unsupported wrapping algorithm");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
@@ -3369,7 +3267,7 @@ impl Store {
         key_ref: &str,
     ) -> Result<DataKeyMaterial> {
         let row = sqlx::query(
-            "SELECT purpose, personality_agent_id, retention_unit, wrap_key_id, wrap_nonce, wrapped_key
+            "SELECT purpose, personality_agent_id, retention_unit, algorithm, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE key_ref = ? AND scope = 'personality_agent' AND state = 'active'",
         )
@@ -3384,6 +3282,9 @@ impl Store {
         validate_retention_unit(purpose, &retention_unit)?;
         if personality_agent_id != self.scope.personality_agent_id.as_str() {
             bail!("data key {key_ref} belongs to another personality agent");
+        }
+        if row.try_get::<&str, _>("algorithm")? != WRAP_ALGORITHM {
+            bail!("data key {key_ref} uses an unsupported wrapping algorithm");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
         let wrapping_key = self.key_provider.key_by_id(&wrap_key_id).await?;
@@ -4990,7 +4891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_rejects_tampered_wrapped_key() {
+    async fn selected_read_rejects_tampered_wrapped_key() {
         let store = store().await;
         store
             .private_key(DataKeyPurpose::Event)
@@ -5003,19 +4904,15 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
-            Ok(_) => panic!("tampered key must fail startup validation"),
-            Err(error) => error,
-        };
+        let reopened = Store::finish_open(pool, scope(), provider()).await.unwrap();
         assert!(
-            error
-                .to_string()
-                .contains("authenticated startup validation")
+            reopened.private_key(DataKeyPurpose::Event).await.is_err(),
+            "selected damaged event key must fail when accessed"
         );
     }
 
     #[tokio::test]
-    async fn startup_rejects_unknown_active_key_algorithm() {
+    async fn selected_read_rejects_unknown_active_key_algorithm() {
         let store = store().await;
         store
             .private_key(DataKeyPurpose::Event)
@@ -5028,15 +4925,15 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
-            Ok(_) => panic!("unknown active key algorithm must fail startup"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("unsupported algorithm"));
+        let reopened = Store::finish_open(pool, scope(), provider()).await.unwrap();
+        assert!(
+            reopened.private_key(DataKeyPurpose::Event).await.is_err(),
+            "selected damaged event key must fail when accessed"
+        );
     }
 
     #[tokio::test]
-    async fn startup_rejects_unsupported_message_redaction_version() {
+    async fn selected_read_rejects_unsupported_message_redaction_version() {
         let store = store().await;
         let key = store
             .private_key(DataKeyPurpose::Transcript)
@@ -5055,19 +4952,17 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
-            Ok(_) => panic!("message projection version 2 must fail startup"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("message projection uses an unsupported redaction version")
-        );
+        let reopened = Store::finish_open(pool, scope(), provider()).await.unwrap();
+        let mut tx = reopened.pool().begin().await.unwrap();
+        let error = reopened
+            .hydrate_messages_for_ids(&mut tx, &["message-version-2".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported redaction version"));
     }
 
     #[tokio::test]
-    async fn startup_rejects_unsupported_approval_redaction_version() {
+    async fn recovery_rejects_invalid_pending_approval_owner() {
         let store = store().await;
         sqlx::query(
             "INSERT INTO approval_log(
@@ -5082,14 +4977,14 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
-            Ok(_) => panic!("approval projection version 2 must fail startup"),
-            Err(error) => error,
-        };
+        let reopened = Store::finish_open(pool, scope(), provider()).await.unwrap();
+        let error = reopened
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("pending approval without a valid active owner cannot authorize recovery");
         assert!(
-            error
-                .to_string()
-                .contains("approval projection uses an unsupported redaction version")
+            format!("{error:#}").contains("requires its exact prepared tool"),
+            "{error:#}"
         );
     }
 
@@ -5193,12 +5088,22 @@ mod tests {
     }
 
     async fn seed_persisted_assistant(store: &Store, message_id: &str, seq: u64, spec: &ModelSpec) {
+        seed_persisted_assistant_content(store, message_id, seq, spec, Vec::new()).await;
+    }
+
+    async fn seed_persisted_assistant_content(
+        store: &Store,
+        message_id: &str,
+        seq: u64,
+        spec: &ModelSpec,
+        content: Vec<crate::provider::types::PublicAssistantContent>,
+    ) {
         let transcript_key = store
             .private_key(DataKeyPurpose::Transcript)
             .await
             .expect("mint transcript key");
         let public = PublicMessage::Assistant(PublicAssistantMessage {
-            content: vec![],
+            content,
             model: spec.id.clone(),
             provider: spec.provider.clone(),
             origin: spec.origin(),
@@ -6120,6 +6025,11 @@ mod tests {
             fixture_compact_result("Nothing of secret value here.", 42),
         )
         .await;
+        sqlx::query("UPDATE memory_batches SET state = 'promoted' WHERE id = ?")
+            .bind(&batch_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
 
         let error = store
             .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
@@ -6128,7 +6038,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(
             message.contains("hydrated memory graph is structurally invalid")
-                && message.contains("has no matching compaction job"),
+                && message.contains("has no applied CompactL0 target job"),
             "{message}"
         );
     }
@@ -6619,6 +6529,389 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_restart_keeps_archived_postcoverage_originals() {
+        use crate::memory::overflow::AssemblyMode;
+        use crate::provider::context_fingerprint::compute_context_fingerprint;
+        use crate::provider::types::{NativeCompactionCoverage, PromptContext};
+
+        let dir = std::env::temp_dir().join(format!("sumi-native-restart-{}", Uuid::now_v7()));
+        let path = dir.join("agent.db");
+        let store = Store::open(&path, scope(), provider()).await.unwrap();
+        let spec = responses_spec();
+        let anchors = [
+            ("coverage", 4),
+            ("archived-suffix", 10),
+            ("native-owner", 16),
+            ("latest", 22),
+        ];
+        for (id, seq) in anchors {
+            seed_persisted_assistant_content(
+                &store,
+                id,
+                seq,
+                &spec,
+                vec![crate::provider::types::PublicAssistantContent::Text {
+                    text: format!("Original content for {id}."),
+                    wire_item_index: 0,
+                }],
+            )
+            .await;
+        }
+        super::event_writer::seed_provider_context_owner_event_evidence(&store, &anchors)
+            .await
+            .unwrap();
+        let mut transaction = store.pool().begin().await.unwrap();
+        let original = store
+            .hydrate_messages_for_ids(
+                &mut transaction,
+                &anchors
+                    .iter()
+                    .map(|(id, _)| (*id).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        // This fixture tests Store/native memory reconstruction, not command
+        // recovery. The owner-evidence helper supplies authenticated transcript
+        // receipts but synthetic applying commands without complete TurnStart
+        // lifecycles. Make those test-only projections inactive before reopening;
+        // do not pretend they went through a production completion sequence.
+        sqlx::query(
+            "UPDATE inbound_commands SET status = 'applied', run_phase = 'finished',
+             applied_at = ? WHERE status = 'applying'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        EventWriter::new(Arc::new(store.clone()))
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+
+        let prompt = PromptContext {
+            system_prompt: "Native restart regression.".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: Vec::new(),
+            replay_provenance: None,
+        };
+        let native = ProviderContextItem {
+            retention_owner: ProviderContextAnchor {
+                message_id: "native-owner".to_owned(),
+                message_seq: 16,
+            },
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![
+                    json!({"type":"compaction", "id":"native-cmp", "encrypted_content":"opaque"}),
+                ],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 4,
+                    context_fingerprint: compute_context_fingerprint(
+                        &spec,
+                        &prompt.system_prompt,
+                        &prompt.tools,
+                    )
+                    .unwrap(),
+                },
+            },
+        };
+        let key = store
+            .provider_context_item_key(&native, Some((0, 0)))
+            .await
+            .unwrap();
+        EncryptedProviderContextRecord::encrypt_native_window(
+            &native,
+            &native.provider_origin.provider_instance_id,
+            native.provider_origin.protocol,
+            &native.provider_origin.model,
+            eviction_footprint_for_payload(&spec, &native.payload).unwrap(),
+            &key,
+            store.scope(),
+            0,
+            0,
+        )
+        .unwrap()
+        .insert_committed(&store)
+        .await
+        .unwrap();
+        let live_estimate = crate::memory::estimate::estimate_public_messages(
+            &original[2..]
+                .iter()
+                .map(crate::memory::overflow::context_message_to_public)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let live_id = Uuid::now_v7().to_string();
+        let source_id = Uuid::now_v7();
+        let target_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        let source_key = source_id.to_string();
+        let target_key = target_id.to_string();
+        let job_key = job_id.to_string();
+        let initial_source_versions =
+            BTreeMap::from([(source_key.clone(), 0_i64), (target_key.clone(), 0_i64)]);
+
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_graph",
+            MemoryTransition {
+                batch_inserts: vec![
+                    MemoryBatchRecord::new(
+                        source_key.clone(),
+                        MemoryLayer::L0,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        target_key.clone(),
+                        MemoryLayer::L1,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        live_id.clone(),
+                        MemoryLayer::L0,
+                        0,
+                        0,
+                        MemoryBatchState::Open,
+                        i64::try_from(live_estimate).unwrap(),
+                        0,
+                    ),
+                ],
+                membership_inserts: vec![
+                    MemoryBatchMessageRecord {
+                        batch_id: source_key.clone(),
+                        message_id: "coverage".to_owned(),
+                        ord: 1,
+                    },
+                    MemoryBatchMessageRecord {
+                        batch_id: source_key.clone(),
+                        message_id: "archived-suffix".to_owned(),
+                        ord: 2,
+                    },
+                    MemoryBatchMessageRecord {
+                        batch_id: live_id.clone(),
+                        message_id: "native-owner".to_owned(),
+                        ord: 1,
+                    },
+                    MemoryBatchMessageRecord {
+                        batch_id: live_id.clone(),
+                        message_id: "latest".to_owned(),
+                        ord: 2,
+                    },
+                ],
+                job_inserts: vec![MemoryJobRecord::new(
+                    job_key.clone(),
+                    MemoryJobKind::CompactL0,
+                    0,
+                    vec![source_key.clone()],
+                    initial_source_versions,
+                )],
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL0.as_str().to_owned(),
+                    expected: 0,
+                    next: 1,
+                    initialize: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let lease_until = "2099-01-01T00:00:00Z".to_owned();
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_claim",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Claim {
+                    job_id: job_key.clone(),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_start",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Start {
+                    job_id: job_key.clone(),
+                    expected_attempt: 0,
+                    lease_witness: Some(lease_until.clone()),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let now = Utc::now();
+        let result = crate::memory::CompactResult {
+            summary: crate::memory::DecryptedMemorySummary::new(
+                "Nothing of secret value here.".to_owned(),
+            ),
+            est_tokens: 42,
+            time_range: (now, now),
+        };
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_complete",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: Some(result.clone()),
+                        est_tokens: result.est_tokens,
+                        footprint_delta: 0,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Complete {
+                    job_id: job_key.clone(),
+                    expected_attempt: 1,
+                    lease_witness: Some(lease_until),
+                    result,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_apply",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 1)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Dropped,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Promoted,
+                        summary: None,
+                        est_tokens: 42,
+                        footprint_delta: 0,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Apply {
+                    job_id: job_key,
+                    expected_attempt: 1,
+                    lease_witness: None,
+                }],
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL0.as_str().to_owned(),
+                    expected: 1,
+                    next: 2,
+                    initialize: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&source_key)
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            "dropped"
+        );
+        store.pool().close().await;
+        drop(store);
+        let reopened = Store::open(&path, scope(), provider()).await.unwrap();
+        let lease = test_lease(1);
+        let HydrationOutcome::Complete(state) =
+            reopened.hydrate(&lease, &test_fence(&lease)).await.unwrap()
+        else {
+            panic!("native restart unexpectedly requires logical recovery");
+        };
+        let ids = |messages: &[ContextMessage]| {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    ContextMessage::Persisted { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&state.messages),
+            vec!["coverage", "archived-suffix", "native-owner", "latest"]
+        );
+        assert_eq!(
+            state.messages, original,
+            "Store must preserve original postcoverage content, not substitute L1"
+        );
+        assert_eq!(state.provider_context.len(), 1);
+        assert_eq!(state.provider_context[0].item, native);
+        let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory).unwrap();
+        let live_messages = memory
+            .l0()
+            .iter()
+            .flat_map(|batch| batch.messages.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids(&live_messages), vec!["native-owner", "latest"]);
+        assert_eq!(memory.l1().len(), 1);
+        let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec)
+            .unwrap()
+            .with_mode(AssemblyMode::ProviderNative);
+        assembler
+            .install_hydrated_memory_at(
+                memory,
+                state.transcript_through_seq,
+                state.provider_context,
+            )
+            .unwrap();
+        let assembled = assembler.assemble(&state.messages, 1).await.unwrap();
+        assert_eq!(assembled.provider_context, vec![native]);
+        assert!(
+            assembled.memory_blocks.is_empty(),
+            "matching native must replace Sumi fallback"
+        );
+        assert_eq!(
+            ids(&assembled.messages),
+            vec!["archived-suffix", "native-owner", "latest"]
+        );
+        assert_eq!(assembled.messages, original[1..].to_vec());
+        reopened.pool().close().await;
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn hydrate_loads_transcript_and_memory_in_one_snapshot() {
         let store = store().await;
         let user = insert_user_message(&store, 1, "hello snapshot").await;
@@ -6640,6 +6933,52 @@ mod tests {
         assert!(!state.memory.is_empty());
         assert!(state.provider_context.is_empty());
         assert_eq!(state.resume, ResumeDirective::AdmitCommands);
+    }
+
+    #[tokio::test]
+    async fn cold_boot_ignores_large_inactive_mutation_archive() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "current conversation").await;
+        complete_user_message_fixture(&store, &user).await;
+        let key = store.private_key(DataKeyPurpose::Mutation).await.unwrap();
+        // Terminal audit envelopes are deliberately unreadable: neither their
+        // contents nor their lifetime count are current recovery authority.
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100001)
+             INSERT INTO provider_context_mutations(mutation_id, state, intent_key_ref,
+                 intent_ciphertext, hmac_key_id, intent_hmac, prepared_at, finished_at)
+             SELECT printf('archived-%d', x), 'applied', ?, zeroblob(700),
+                 'unused', zeroblob(32), 'now', 'now' FROM n",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        // Rebuild the writer's process cache to exercise actual cold hydration.
+        EventWriter::new(Arc::new(store.clone()))
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .unwrap()
+        else {
+            panic!("inactive archive must not prevent cold readiness");
+        };
+        assert_eq!(state.messages.len(), 2);
+        assert!(
+            matches!(&state.messages[0], ContextMessage::Persisted { id, .. } if id == &user.message_id)
+        );
+        assert_eq!(state.resume, ResumeDirective::AdmitCommands);
+        let original = store
+            .recall_messages(&super::recall::RecallRequest {
+                message_id: Some(user.message_id),
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(original.messages.len(), 1);
     }
 
     #[tokio::test]
@@ -6738,6 +7077,11 @@ mod tests {
             fixture_compact_result("Nothing of secret value here.", 42),
         )
         .await;
+        sqlx::query("UPDATE memory_batches SET state = 'promoted' WHERE id = ?")
+            .bind(&batch_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
         let mut ciphertext: Vec<u8> =
             sqlx::query_scalar("SELECT summary_ciphertext FROM memory_batches WHERE id = ?")
                 .bind(&batch_id)
@@ -6758,7 +7102,7 @@ mod tests {
             .expect_err("tampered memory batch must fail hydrate");
         let message = format!("{error:#}");
         assert!(
-            message.contains("authenticated memory projection digest mismatch"),
+            message.contains("failed to decrypt memory_batches projection"),
             "{message}"
         );
     }
@@ -7126,24 +7470,6 @@ mod tests {
         assert!(
             message.contains("requires exactly one transcript row, found 0")
                 && message.contains(&assistant_id),
-            "{message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn hydrate_rejects_transcript_row_without_message_end() {
-        let store = store().await;
-        insert_user_message(&store, 1, "authenticated user").await;
-        insert_raw_user_message(&store, "extra-transcript", 999, "not in event log").await;
-
-        let error = store
-            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
-            .await
-            .expect_err("extra transcript row must fail exact MessageEnd hydration");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("transcript row count")
-                && message.contains("authenticated MessageEnd count"),
             "{message}"
         );
     }

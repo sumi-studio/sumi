@@ -339,6 +339,7 @@ pub(crate) struct HydratedMemoryRuntime {
     cursors: Vec<HydratedMemoryCursor>,
     anchored_footprints: HashMap<String, u64>,
     calibration: TokenCalibration,
+    active_selection: Option<(u64, HashMap<String, u64>)>,
 }
 
 impl HydratedMemoryRuntime {
@@ -356,7 +357,19 @@ impl HydratedMemoryRuntime {
             cursors,
             anchored_footprints,
             calibration: TokenCalibration::default(),
+            active_selection: None,
         }
+    }
+
+    /// The store selected the current graph and immediate lineage witnesses.
+    /// Counters describe the whole durable namespace, not just selected rows.
+    pub(crate) fn with_active_selection(
+        mut self,
+        next_l0_batch_seq: u64,
+        job_sequence_max: HashMap<String, u64>,
+    ) -> Self {
+        self.active_selection = Some((next_l0_batch_seq, job_sequence_max));
+        self
     }
 
     pub(crate) fn with_calibration(mut self, calibration: TokenCalibration) -> Self {
@@ -428,6 +441,7 @@ impl ThreeLayerMemory {
             cursors,
             anchored_footprints,
             calibration,
+            active_selection,
         } = hydrated;
 
         let mut batches_by_id = HashMap::with_capacity(batches.len());
@@ -450,7 +464,11 @@ impl ThreeLayerMemory {
             }
             validate_batch_shape(batch)?;
         }
-        validate_batch_order(&batches_by_id)?;
+        if active_selection.is_some() {
+            validate_selected_batch_order(&batches_by_id)?;
+        } else {
+            validate_batch_order(&batches_by_id)?;
+        }
 
         let mut memberships_by_batch: HashMap<BatchId, Vec<HydratedMemoryMembership>> =
             HashMap::new();
@@ -518,9 +536,23 @@ impl ThreeLayerMemory {
             }
         }
 
-        validate_jobs(&batches_by_id, &batches_by_layer_seq, &jobs)?;
-        validate_batch_job_relationships(&batches_by_id, &batches_by_layer_seq, &jobs)?;
-        validate_apply_cursors(&jobs, &cursors)?;
+        validate_jobs_selected(
+            &batches_by_id,
+            &batches_by_layer_seq,
+            &jobs,
+            active_selection.is_some(),
+        )?;
+        validate_batch_job_relationships_selected(
+            &batches_by_id,
+            &batches_by_layer_seq,
+            &jobs,
+            active_selection.is_some(),
+        )?;
+        if let Some((_, job_sequence_max)) = &active_selection {
+            validate_selected_apply_cursors(&jobs, &cursors, job_sequence_max)?;
+        } else {
+            validate_apply_cursors(&jobs, &cursors)?;
+        }
 
         let mut l0_ids = ordered_batch_ids(&batches_by_id, MemoryLayer::L0);
         let mut previous_message_seq = None;
@@ -679,7 +711,7 @@ impl ThreeLayerMemory {
                         && is_visible_summary_source_state(batch.state))
             })
             .collect::<Vec<_>>();
-        let next_l0_batch_seq = batches_by_id
+        let selected_next_l0_batch_seq = batches_by_id
             .values()
             .filter(|batch| batch.layer == MemoryLayer::L0)
             .map(|batch| batch.batch_seq)
@@ -691,6 +723,12 @@ impl ThreeLayerMemory {
             })
             .transpose()?
             .unwrap_or(0);
+        let next_l0_batch_seq = active_selection
+            .map(|(next, _)| next)
+            .unwrap_or(selected_next_l0_batch_seq);
+        if next_l0_batch_seq < selected_next_l0_batch_seq {
+            bail!("durable L0 sequence counter precedes selected memory batches");
+        }
 
         let mut l0 = VecDeque::new();
         let mut l0_estimate = 0u64;
@@ -1071,6 +1109,65 @@ fn validate_batch_order(batches: &HashMap<BatchId, HydratedMemoryBatch>) -> Resu
     Ok(())
 }
 
+fn validate_selected_batch_order(batches: &HashMap<BatchId, HydratedMemoryBatch>) -> Result<()> {
+    for layer in [MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2] {
+        let mut ordinals = HashSet::new();
+        for batch in batches.values().filter(|batch| batch.layer == layer) {
+            if !ordinals.insert(batch.ord) || batch.ord != batch.batch_seq {
+                bail!(
+                    "selected memory batch {} has inconsistent durable order",
+                    batch.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_selected_apply_cursors(
+    jobs: &[HydratedMemoryJob],
+    cursors: &[HydratedMemoryCursor],
+    sequence_max: &HashMap<String, u64>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for cursor in cursors {
+        if !seen.insert(job_kind_rank(cursor.kind)) {
+            bail!("duplicate durable memory apply cursor");
+        }
+        if cursor.kind == MemoryJobKind::CompactL0 {
+            continue;
+        }
+        let after_last = sequence_max
+            .get(cursor.kind.as_str())
+            .and_then(|last| last.checked_add(1))
+            .ok_or_else(|| anyhow!("memory cursor has no durable job range"))?;
+        if cursor.next_batch_seq == 0 || cursor.next_batch_seq > after_last {
+            bail!("memory cursor is outside durable job range");
+        }
+        for job in jobs.iter().filter(|job| job.kind == cursor.kind) {
+            let terminal = matches!(
+                job.status,
+                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
+            );
+            if terminal != (job.batch_seq < cursor.next_batch_seq) {
+                bail!("memory cursor disagrees with selected job {} state", job.id);
+            }
+        }
+    }
+    for job in jobs.iter().filter(|job| {
+        job.kind != MemoryJobKind::CompactL0
+            && matches!(
+                job.status,
+                MemoryJobStatus::Applied | MemoryJobStatus::Discarded
+            )
+    }) {
+        if !seen.contains(&job_kind_rank(job.kind)) {
+            bail!("terminal memory job {} has no apply cursor", job.id);
+        }
+    }
+    Ok(())
+}
+
 fn ordered_batch_ids(
     batches: &HashMap<BatchId, HydratedMemoryBatch>,
     layer: MemoryLayer,
@@ -1089,10 +1186,20 @@ fn ordered_batch_ids(
     ids
 }
 
+#[cfg(test)]
 fn validate_jobs(
     batches: &HashMap<BatchId, HydratedMemoryBatch>,
     batches_by_layer_seq: &HashMap<(u8, u64), BatchId>,
     jobs: &[HydratedMemoryJob],
+) -> Result<()> {
+    validate_jobs_selected(batches, batches_by_layer_seq, jobs, false)
+}
+
+fn validate_jobs_selected(
+    batches: &HashMap<BatchId, HydratedMemoryBatch>,
+    batches_by_layer_seq: &HashMap<(u8, u64), BatchId>,
+    jobs: &[HydratedMemoryJob],
+    selected: bool,
 ) -> Result<()> {
     let mut job_ids = HashSet::new();
     let mut target_jobs = HashSet::new();
@@ -1212,7 +1319,11 @@ fn validate_jobs(
             }
             MemoryJobStatus::Failed => (
                 MemoryBatchState::CompactFailed,
-                MemoryBatchState::CompactFailed,
+                if selected {
+                    MemoryBatchState::Dropped
+                } else {
+                    MemoryBatchState::CompactFailed
+                },
                 false,
             ),
             MemoryJobStatus::Unchanged => {
@@ -1314,7 +1425,18 @@ fn validate_jobs(
                 );
             }
         } else {
-            if job.source_versions.get(&target_id) != Some(&target.version) {
+            // Applied producers establish identity and summary. A later
+            // abandoned attempt may restore that same summary to Promoted
+            // with a newer version; retired jobs need not be hydrated to
+            // justify that current state.
+            let restored_summary = selected
+                && job.status == MemoryJobStatus::Applied
+                && target.state == MemoryBatchState::Promoted
+                && job
+                    .source_versions
+                    .get(&target_id)
+                    .is_some_and(|version| *version <= target.version);
+            if !restored_summary && job.source_versions.get(&target_id) != Some(&target.version) {
                 bail!(
                     "hydrated memory job {} target witness for batch {target_id} does not match current version",
                     job.id
@@ -1334,10 +1456,11 @@ fn validate_jobs(
     Ok(())
 }
 
-fn validate_batch_job_relationships(
+fn validate_batch_job_relationships_selected(
     batches: &HashMap<BatchId, HydratedMemoryBatch>,
     batches_by_layer_seq: &HashMap<(u8, u64), BatchId>,
     jobs: &[HydratedMemoryJob],
+    selected: bool,
 ) -> Result<()> {
     let target_for = |job: &HydratedMemoryJob| {
         batches_by_layer_seq
@@ -1363,7 +1486,9 @@ fn validate_batch_job_relationships(
         .iter()
         .filter(|job| job.status != MemoryJobStatus::Discarded)
     {
-        if source_layer(job.kind) == MemoryLayer::L0 {
+        if source_layer(job.kind) == MemoryLayer::L0
+            || (selected && job.status == MemoryJobStatus::Applied)
+        {
             continue;
         }
         for source_id in &job.source_ids {
@@ -1381,6 +1506,11 @@ fn validate_batch_job_relationships(
     }
 
     for batch in batches.values() {
+        if selected && batch.state == MemoryBatchState::Dropped {
+            // Immediate lineage identity, not an active summary or a request
+            // to recursively authenticate the archive that produced it.
+            continue;
+        }
         match (batch.layer, batch.state) {
             (MemoryLayer::L0, MemoryBatchState::Dropped)
                 if !is_source(batch.id, MemoryJobKind::CompactL0, MemoryJobStatus::Applied) =>
@@ -1890,6 +2020,104 @@ mod tests {
         assert_eq!(memory.l1().len(), 1);
         assert_eq!(memory.l1()[0].source_batch, source);
         assert_eq!(memory.l1()[0].source_batch_seq, 1);
+    }
+
+    #[test]
+    fn selected_memory_preserves_original_identity_without_archived_bodies_or_recursive_lineage() {
+        let original = Uuid::now_v7();
+        let l1 = Uuid::now_v7();
+        let prior_l2 = Uuid::now_v7();
+        let current_l2 = Uuid::now_v7();
+        let l1_summary = hydrated_summary("Current experience", 8);
+        let l2_summary = hydrated_summary("Integrated earlier experience", 11);
+        let hydrated = HydratedMemoryRuntime::new(
+            vec![
+                HydratedMemoryBatch::new(
+                    original,
+                    MemoryLayer::L0,
+                    42,
+                    42,
+                    3,
+                    MemoryBatchState::Dropped,
+                    50_000,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    l1,
+                    MemoryLayer::L1,
+                    42,
+                    42,
+                    2,
+                    MemoryBatchState::Promoted,
+                    8,
+                    0,
+                    Some(l1_summary.clone()),
+                ),
+                HydratedMemoryBatch::new(
+                    prior_l2,
+                    MemoryLayer::L2,
+                    700,
+                    700,
+                    5,
+                    MemoryBatchState::Dropped,
+                    90,
+                    0,
+                    None,
+                ),
+                HydratedMemoryBatch::new(
+                    current_l2,
+                    MemoryLayer::L2,
+                    701,
+                    701,
+                    2,
+                    MemoryBatchState::Promoted,
+                    11,
+                    0,
+                    Some(l2_summary.clone()),
+                ),
+            ],
+            vec![],
+            vec![
+                HydratedMemoryJob::new(
+                    Uuid::now_v7(),
+                    MemoryJobKind::CompactL0,
+                    42,
+                    vec![original],
+                    BTreeMap::from([(original, 3), (l1, 2)]),
+                    MemoryJobStatus::Applied,
+                    Some(l1_summary),
+                ),
+                HydratedMemoryJob::new(
+                    Uuid::now_v7(),
+                    MemoryJobKind::ConsolidateL2,
+                    701,
+                    vec![prior_l2],
+                    BTreeMap::from([(prior_l2, 5), (current_l2, 2)]),
+                    MemoryJobStatus::Applied,
+                    Some(l2_summary),
+                ),
+            ],
+            vec![HydratedMemoryCursor::new(MemoryJobKind::ConsolidateL2, 900)],
+            HashMap::new(),
+        )
+        .with_active_selection(
+            5_000,
+            HashMap::from([
+                ("compact_l0".to_owned(), 4_999),
+                ("consolidate_l2".to_owned(), 899),
+            ]),
+        );
+        let memory = ThreeLayerMemory::from_hydrated(hydrated)
+            .expect("selected current graph reconstructs without archive witnesses");
+        assert!(memory.l0().is_empty());
+        assert_eq!(memory.l1()[0].source_batch, original);
+        assert_eq!(memory.l1()[0].source_batch_seq, 42);
+        assert_eq!(
+            memory.l2().summary.expose(),
+            "Integrated earlier experience"
+        );
+        assert_eq!(memory.next_l0_batch_seq(), 5_000);
     }
 
     #[test]

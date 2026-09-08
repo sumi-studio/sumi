@@ -673,59 +673,80 @@ async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
     Ok(())
 }
 
-/// A concurrent worker has advanced the source batches past the snapshot in
-/// `job`. Fail the stale job and close its target in a single transaction so
-/// the scheduler does not leave a `compacting` orphan behind or reset a stale
-/// job back to `pending`. Any source batch that is still `compacting` is also
-/// failed so it will be revisited by recovery, while already-applied/dropped
-/// sources are left untouched.
-async fn supersede_stale_job(
+/// Restore only sources still owned by this snapshot. A failed speculative
+/// summary must not hide the earlier summary or revive a superseded source.
+async fn restore_abandoned_sources(
     store: &Store,
     job: &Job,
-    target: &BatchRow,
-) -> Result<(), WorkerError> {
-    let target_uuid = BatchId::parse_str(&target.id)
-        .with_context(|| format!("target batch id {} is not a UUID", target.id))?;
-
-    let mut expected_source_versions = BTreeMap::new();
-    let mut batch_mutations = Vec::new();
-
-    expected_source_versions.insert(target_uuid, target.version as u64);
-    batch_mutations.push(MemoryBatchMutation {
-        batch_id: target_uuid,
-        expected_version: target.version as u64,
-        new_state: MemoryBatchState::CompactFailed,
-        summary: None,
-        est_tokens: 0,
-        footprint_delta: 0,
-    });
-
+    owned_state: MemoryBatchState,
+    expected_versions: &mut BTreeMap<BatchId, u64>,
+    mutations: &mut Vec<MemoryBatchMutation>,
+) -> Result<()> {
     for source_id in &job.source_ids {
         let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
             .bind(source_id)
             .fetch_optional(store.pool())
-            .await
-            .with_context(|| format!("failed to load source batch {source_id} for supersede"))?
+            .await?
             .ok_or_else(|| anyhow!("source batch {source_id} missing for supersede"))?;
         let version: i64 = row.try_get("version")?;
         let state: String = row.try_get("state")?;
-        let batch_uuid = BatchId::parse_str(source_id)
-            .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
-        let version = u64::try_from(version)
-            .with_context(|| format!("source batch {source_id} version out of range"))?;
-        expected_source_versions.insert(batch_uuid, version);
-        if state == MemoryBatchState::Compacting.as_str() {
-            batch_mutations.push(MemoryBatchMutation {
+        let batch_uuid = BatchId::parse_str(source_id)?;
+        let checked_version = u64::try_from(version)?;
+        expected_versions.insert(batch_uuid, checked_version);
+        if state == owned_state.as_str()
+            && job.source_versions.get(source_id).copied() == Some(version)
+        {
+            mutations.push(MemoryBatchMutation {
                 batch_id: batch_uuid,
-                expected_version: version,
-                new_state: MemoryBatchState::CompactFailed,
+                expected_version: checked_version,
+                new_state: if job.kind == MemoryJobKind::CompactL0 {
+                    MemoryBatchState::CompactFailed
+                } else {
+                    MemoryBatchState::Promoted
+                },
+                // A state-only transition preserves the existing encrypted
+                // summary, exact estimate, membership and provider footprint.
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: 0,
             });
         }
     }
+    Ok(())
+}
 
+/// Retire this job's speculative target atomically with restoring any source
+/// still owned by its snapshot. Later generations remain untouched.
+async fn supersede_stale_job(
+    store: &Store,
+    job: &Job,
+    target: &BatchRow,
+) -> Result<(), WorkerError> {
+    let target_uuid = BatchId::parse_str(&target.id).context("invalid abandoned target id")?;
+    let target_version =
+        u64::try_from(target.version).context("invalid abandoned target version")?;
+    let mut expected_source_versions = BTreeMap::from([(target_uuid, target_version)]);
+    let mut batch_mutations = Vec::new();
+    if target.state == MemoryBatchState::Compacting
+        && job.source_versions.get(&target.id).copied() == Some(target.version)
+    {
+        batch_mutations.push(MemoryBatchMutation {
+            batch_id: target_uuid,
+            expected_version: target_version,
+            new_state: MemoryBatchState::Dropped,
+            summary: None,
+            est_tokens: 0,
+            footprint_delta: 0,
+        });
+    }
+    restore_abandoned_sources(
+        store,
+        job,
+        MemoryBatchState::Compacting,
+        &mut expected_source_versions,
+        &mut batch_mutations,
+    )
+    .await?;
     let transition = MemoryTransition {
         expected_source_versions,
         batch_mutations,
@@ -734,10 +755,8 @@ async fn supersede_stale_job(
             expected_attempt: job.attempts,
             lease_witness: job.lease_until.clone(),
         }],
-        cursor_advance: None,
         ..Default::default()
     };
-
     EventWriter::new(Arc::new(store.clone()))
         .apply(EventBatch {
             writes: vec![EventWrite {
@@ -1132,13 +1151,23 @@ async fn discard_stale_completed_job(
         batch_mutations.push(MemoryBatchMutation {
             batch_id: target_uuid,
             expected_version: target_version as u64,
-            new_state: MemoryBatchState::CompactFailed,
+            new_state: MemoryBatchState::Dropped,
             summary: None,
             est_tokens: 0,
             footprint_delta: 0,
         });
     }
 
+    if job.kind != MemoryJobKind::CompactL0 {
+        restore_abandoned_sources(
+            &store,
+            job,
+            MemoryBatchState::Compacted,
+            &mut expected_source_versions,
+            &mut batch_mutations,
+        )
+        .await?;
+    }
     let transition = MemoryTransition {
         expected_source_versions,
         batch_mutations,
@@ -2107,6 +2136,181 @@ mod tests {
             })
             .await
             .expect("commit fixture assistant terminal");
+    }
+
+    #[tokio::test]
+    async fn abandoned_higher_compaction_restores_source_across_hydration() {
+        for completed in [false, true] {
+            let store = test_store().await;
+            let parent = real_parent_with_queued_target(&store).await;
+            let expected = "The original experience remains available.";
+            let provider = FakeProvider {
+                text: expected.into(),
+                ..Default::default()
+            };
+            assert!(
+                compact_next_l0_with_provider(
+                    store.clone(),
+                    parent,
+                    CancellationToken::new(),
+                    &provider
+                )
+                .await
+                .unwrap()
+            );
+            let row = sqlx::query(
+                "SELECT * FROM memory_jobs WHERE kind = 'compact_l0' AND status = 'completed'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            let original_job = parse_job(&row).unwrap();
+            assert!(
+                apply_completed_job(store.clone(), &original_job)
+                    .await
+                    .unwrap()
+            );
+            let row = sqlx::query("SELECT id, version, est_tokens, summary_ciphertext FROM memory_batches WHERE layer = 1 AND state = 'promoted'")
+                .fetch_one(store.pool()).await.unwrap();
+            let source: String = row.get("id");
+            let source_version: i64 = row.get("version");
+            let source_estimate: i64 = row.get("est_tokens");
+            let source_ciphertext: Vec<u8> = row.get("summary_ciphertext");
+            let target = Uuid::now_v7().to_string();
+            let job_id = Uuid::now_v7().to_string();
+            insert_memory_fixture(
+                &store,
+                "fixture_higher_compaction",
+                MemoryTransition {
+                    expected_source_versions: BTreeMap::from([(
+                        Uuid::parse_str(&source).unwrap(),
+                        source_version as u64,
+                    )]),
+                    batch_mutations: vec![MemoryBatchMutation {
+                        batch_id: Uuid::parse_str(&source).unwrap(),
+                        expected_version: source_version as u64,
+                        new_state: MemoryBatchState::Compacting,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                    }],
+                    batch_inserts: vec![MemoryBatchRecord::new(
+                        &target,
+                        MemoryLayer::L2,
+                        1,
+                        1,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    )],
+                    job_inserts: vec![MemoryJobRecord::new(
+                        &job_id,
+                        MemoryJobKind::CompactL1,
+                        1,
+                        vec![source.clone()],
+                        BTreeMap::from([(source.clone(), source_version + 1), (target.clone(), 0)]),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await;
+            insert_memory_fixture(
+                &store,
+                "fixture_claim_higher",
+                MemoryTransition {
+                    job_mutations: vec![MemoryJobMutation::Claim {
+                        job_id: job_id.clone(),
+                        lease_until: (Utc::now() + LEASE_DURATION).to_rfc3339(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await;
+            let row = sqlx::query("SELECT * FROM memory_jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+            let job = parse_job(&row).unwrap();
+            // A source at the same state but a later version belongs to a
+            // successor. The failure path must not restore that source.
+            let mut obsolete = parse_job(&row).unwrap();
+            *obsolete.source_versions.get_mut(&source).unwrap() -= 1;
+            let mut guards = BTreeMap::new();
+            let mut mutations = Vec::new();
+            restore_abandoned_sources(
+                &store,
+                &obsolete,
+                MemoryBatchState::Compacting,
+                &mut guards,
+                &mut mutations,
+            )
+            .await
+            .unwrap();
+            assert!(
+                mutations.is_empty(),
+                "stale version must not regain ownership"
+            );
+            if completed {
+                let candidate = CompactResult {
+                    summary: DecryptedMemorySummary::new("Abandoned output".into()),
+                    est_tokens: 5,
+                    time_range: (timestamp(), timestamp()),
+                };
+                assert!(complete_job(&store, &job, &candidate).await.unwrap());
+                let row = sqlx::query("SELECT * FROM memory_jobs WHERE id = ?")
+                    .bind(&job_id)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+                let job = parse_job(&row).unwrap();
+                let target_row = load_target_batch(&store, job.kind, job.batch_seq)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                discard_stale_completed_job(
+                    store.clone(),
+                    &job,
+                    Some((&target, target_row.version, target_row.state.as_str())),
+                )
+                .await
+                .unwrap();
+            } else {
+                let target_row = load_target_batch(&store, job.kind, job.batch_seq)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                supersede_stale_job(&store, &job, &target_row)
+                    .await
+                    .unwrap();
+            }
+            let row = sqlx::query(
+                "SELECT state, est_tokens, summary_ciphertext FROM memory_batches WHERE id = ?",
+            )
+            .bind(&source)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(row.get::<String, _>("state"), "promoted");
+            assert_eq!(row.get::<i64, _>("est_tokens"), source_estimate);
+            assert_eq!(
+                row.get::<Vec<u8>, _>("summary_ciphertext"),
+                source_ciphertext
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SELECT state FROM memory_batches WHERE id = ?")
+                    .bind(&target)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                "dropped"
+            );
+            let memory = ThreeLayerMemory::from_hydrated(hydrate(&store).await.memory).unwrap();
+            assert_eq!(memory.l1().len(), 1);
+            assert_eq!(memory.l1()[0].summary.expose(), expected);
+            assert_eq!(memory.l1()[0].est_tokens, source_estimate as u64);
+            assert!(memory.l2().summary.expose().is_empty());
+        }
     }
 
     #[tokio::test]

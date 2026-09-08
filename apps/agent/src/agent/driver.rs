@@ -302,9 +302,9 @@ impl InjectedRunDriver {
 
         let memory = ThreeLayerMemory::from_hydrated(hydrated.memory.clone())
             .map_err(|error| anyhow!("hydrated memory graph is invalid: {error}"))?;
-        self.assembler.install_hydrated_memory(
+        self.assembler.install_hydrated_memory_at(
             memory,
-            &hydrated.messages,
+            hydrated.transcript_through_seq,
             hydrated.provider_context.clone(),
         )?;
         self.memory_maintenance = Some(HydratedMemoryMaintenance {
@@ -550,9 +550,9 @@ impl RunDriver for InjectedRunDriver {
         // Session calls this only while it uniquely owns RunCore. Prepare
         // every fallible value first, then refresh assembler and core before
         // reporting success; provider admission cannot observe the old view.
-        self.assembler.install_hydrated_memory(
+        self.assembler.install_hydrated_memory_at(
             memory,
-            &hydrated.messages,
+            hydrated.transcript_through_seq,
             hydrated.provider_context.clone(),
         )?;
         core.install_hydrated_context(hydrated.messages, hydrated.provider_context);

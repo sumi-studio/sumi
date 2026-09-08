@@ -1,0 +1,118 @@
+{
+  "status": "PASSED",
+  "sha": "7d898b0d28c78a9e4d732890dd4a7c5a78d664f0",
+  "completedAt": "2026-09-08T08:25:10.856Z",
+  "scenario": "Fresh owned synthetic Human asks its PA to create CSV, correct its value, then deliver to an owned shared Messaging channel. Human downloads from normal message card.",
+  "model": "kimi-k2.7-code",
+  "provider": "opencode-go",
+  "toolOperations": [
+    {
+      "stage": 1,
+      "name": "write_file",
+      "call_id": "write_file_0",
+      "start_seq": 7,
+      "end_seq": 8
+    },
+    {
+      "stage": 1,
+      "name": "read_file",
+      "call_id": "read_file_1",
+      "start_seq": 15,
+      "end_seq": 16
+    },
+    {
+      "stage": 2,
+      "name": "edit_file",
+      "call_id": "edit_file_2",
+      "start_seq": 32,
+      "end_seq": 33
+    },
+    {
+      "stage": 2,
+      "name": "read_file",
+      "call_id": "read_file_3",
+      "start_seq": 40,
+      "end_seq": 41
+    },
+    {
+      "stage": 3,
+      "name": "workspace_invitation_list",
+      "call_id": "workspace_invitation_list_4",
+      "start_seq": 57,
+      "end_seq": 58
+    },
+    {
+      "stage": 3,
+      "name": "workspace_invitation_accept",
+      "call_id": "workspace_invitation_accept_5",
+      "start_seq": 65,
+      "end_seq": 66
+    },
+    {
+      "stage": 3,
+      "name": "messaging",
+      "action": "open",
+      "call_id": "messaging_6",
+      "start_seq": 73,
+      "end_seq": 74
+    },
+    {
+      "stage": 3,
+      "name": "messaging",
+      "action": "write",
+      "call_id": "messaging_7",
+      "start_seq": 81,
+      "end_seq": 82
+    }
+  ],
+  "download": {
+    "filename": "report-0a1818ed7f3e.csv",
+    "bytes": 20,
+    "sha256": "2084259f7dba928b253e39b2ee476fd0662d44acba23df6b923816884c4ec02d",
+    "content": "item,count\napples,3\n"
+  },
+  "recipientMessage": {
+    "id": "01a0801e-ec50-73b8-9502-91592dab94fd",
+    "seq": 1,
+    "author": {
+      "kind": "personality_agent",
+      "personality_agent_id": "01a0801c-d262-74e6-bb57-45747911b7b4"
+    }
+  },
+  "reply": {
+    "epoch": 0,
+    "id": "01a0801e-ec79-7820-b4fd-1b0f5637c71b",
+    "seq": 88,
+    "text": "DELIVERED 0a1818ed7f3e",
+    "model": "kimi-k2.7-code",
+    "provider": "opencode-go"
+  },
+  "reloadConfirmed": true,
+  "sentCommandsBeforeReload": 3,
+  "sentCommandsAfterReload": 3,
+  "approvalCommands": 0,
+  "runtimeRechecked": true,
+  "cleanup": {
+    "installation": {
+      "id": "01a0801c-faae-7d36-b662-f3a7e7f6d016",
+      "epoch": "1"
+    },
+    "disableStatus": 200,
+    "installationDisabled": true,
+    "messagingAbsent": false,
+    "messagingDisableStatus": 200,
+    "messagingDisabled": true,
+    "csrfStatus": 200,
+    "logoutStatus": 204,
+    "sessionRevoked": true,
+    "contextClosed": true,
+    "browserClosed": true
+  },
+  "limits": [
+    "Owned synthetic identity, not existing-account Firebase login.",
+    "No physical iOS acceptance or runtime generation restart in this scenario.",
+    "No Human approval was requested in this successful run; it does not validate the optional approval UI branch.",
+    "Prior failed run truthfully reported a reviewer cancellation; PR376 fixes per-stream cancellation ownership, independently covered by actual HTTP/SSE read-tool continuation regression.",
+    "Does not close the remaining Issue362 foundation work."
+  ]
+}

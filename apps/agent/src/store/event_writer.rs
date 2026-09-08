@@ -79,7 +79,7 @@ use super::{
         MemoryJobResult, MemoryJobStatus, MemoryLayer, MemoryProjectionDeltaV1,
         MemoryProjectionEntity, MemoryProjectionKey, MemoryProjectionRef,
         capture_memory_projection_ref, commit_memory_projection, extend_memory_membership_digest,
-        load_verified_memory_projection_set, memory_membership_seed,
+        memory_membership_seed,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -2030,7 +2030,6 @@ fn monitor_commit_finalizer(task: tokio::task::JoinHandle<Result<()>>) -> Shared
 struct LifecycleCheckpoint {
     event_head: Option<EventLogHead>,
     lifecycle: DurableLifecycleState,
-    memory_projections: BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
     historical_rows_visited: u64,
 }
 
@@ -2296,9 +2295,9 @@ impl EventWriter {
         }
         let messages = self
             .store
-            .hydrate_messages(&mut authentication)
+            .hydrate_messages_for_ids(&mut authentication, &[message_id.to_owned()])
             .await
-            .context("failed to authenticate transcript for Error-context disposition")?;
+            .context("failed to authenticate Error-context disposition owner")?;
         let provider_context = self
             .store
             .hydrate_provider_context(&messages, &mut authentication)
@@ -2417,7 +2416,7 @@ impl EventWriter {
         &self.store
     }
 
-    /// Authenticates and reconstructs the durable lifecycle prefix exactly once
+    /// Authenticates selected active lifecycle dependencies exactly once
     /// for all EventWriter handles sharing this Store. Startup/recovery must call
     /// this before command admission; write entry points also call it defensively
     /// for tests and non-main embedders.
@@ -2447,7 +2446,7 @@ impl EventWriter {
     }
 
     #[cfg(test)]
-    async fn reset_checkpoint_after_direct_fixture_mutation(&self) {
+    pub(super) async fn reset_checkpoint_after_direct_fixture_mutation(&self) {
         self.gate.lock().await.checkpoint = None;
     }
 
@@ -3429,7 +3428,6 @@ impl EventWriter {
 
         let mut applied_writes = 0usize;
         let mut updated_event_head = previous_event_head.clone();
-        let mut updated_memory_projections = checkpoint.memory_projections.clone();
         let mut finalized_metadata_growth = 0usize;
         let mut receipt_outcome = None;
         for mut write in prepared {
@@ -3456,18 +3454,16 @@ impl EventWriter {
                 bail!("callers cannot supply pre-finalized memory projection metadata");
             }
 
+            // Only projections touched by this transaction need authentication.
+            // Keeping every historical batch here makes ordinary writes grow with lifetime.
+            let mut updated_memory_projections = BTreeMap::new();
             let mut captured = Vec::with_capacity(memory_keys.len());
             for key in memory_keys {
                 let captured_ref =
                     capture_memory_projection_ref(self.store.scope(), &mut transaction, key)
                         .await?;
-                let expected = updated_memory_projections.get(&captured_ref.0);
-                if expected != captured_ref.1.as_ref() {
-                    bail!(
-                        "current {:?} {} projection does not match the authenticated event-chain checkpoint",
-                        captured_ref.0.entity,
-                        captured_ref.0.id
-                    );
+                if let Some(reference) = &captured_ref.1 {
+                    updated_memory_projections.insert(captured_ref.0.clone(), reference.clone());
                 }
                 captured.push(captured_ref);
             }
@@ -3602,7 +3598,6 @@ impl EventWriter {
         let next_checkpoint = LifecycleCheckpoint {
             event_head: updated_event_head,
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
-            memory_projections: updated_memory_projections,
             historical_rows_visited: checkpoint.historical_rows_visited,
         };
         // From this point the database outcome is intentionally unknown to
@@ -6219,7 +6214,7 @@ async fn load_verified_event_head_in_transaction(
     .await
     .context("failed to load event-log head in EventBatch")?;
     let Some(row) = row else {
-        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        let event_count: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_events)")
             .fetch_one(&mut **transaction)
             .await?;
         if event_count != 0 {
@@ -6584,7 +6579,7 @@ async fn validate_prepared_error_context_fences(
     }
 
     let provider_context_rows =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM provider_context)")
             .fetch_one(&mut **transaction)
             .await
             .context("failed to inspect provider-context rows for the Error attempt fence")?;
@@ -6596,14 +6591,18 @@ async fn validate_prepared_error_context_fences(
         authenticate_event_log_snapshot(store, transaction)
             .await
             .context("failed to authenticate event history for the Error attempt fence")?;
-        let messages = store
-            .hydrate_messages(transaction)
-            .await
-            .context("failed to authenticate transcript for the Error attempt fence")?;
         let provider_context = store
-            .hydrate_provider_context(&messages, transaction)
+            .hydrate_provider_context(&[], transaction)
             .await
             .context("failed to authenticate provider context for the Error attempt fence")?;
+        let owner_ids = provider_context
+            .iter()
+            .map(|row| row.item.retention_owner.message_id.clone())
+            .collect::<Vec<_>>();
+        let messages = store
+            .hydrate_messages_for_ids(transaction, &owner_ids)
+            .await
+            .context("failed to authenticate provider owners for the Error attempt fence")?;
         pending_units = usize::from(
             super::pending_error_context_recovery(&messages, &provider_context)?.is_some(),
         );
@@ -11639,17 +11638,15 @@ async fn validate_non_empty_turn_end_bindings(
             .as_deref()
             .ok_or_else(|| anyhow!("non-empty TurnEnd has no turn_id"))?;
 
-        let lifecycle_metadata = serde_json::to_string(&DurableEventMetadata {
-            run_id: Some(run_id.to_owned()),
-            turn_id: Some(turn_id.to_owned()),
-            ..DurableEventMetadata::default()
-        })?;
         let stored_open = sqlx::query_scalar::<_, String>(
             "SELECT event_type FROM agent_events
-             WHERE event_type IN ('turn_start', 'turn_end') AND internal_metadata = ?
+             WHERE event_type IN ('turn_start', 'turn_end')
+               AND json_extract(internal_metadata,'$.run_id')=?
+               AND json_extract(internal_metadata,'$.turn_id')=?
              ORDER BY seq DESC LIMIT 1",
         )
-        .bind(lifecycle_metadata)
+        .bind(run_id)
+        .bind(turn_id)
         .fetch_optional(&mut **transaction)
         .await?
         .is_some_and(|event_type| event_type == "turn_start");
@@ -11713,12 +11710,7 @@ async fn validate_non_empty_turn_end_bindings(
 struct AuthenticatedDurableEvent {
     event: AgentEvent,
     kind: String,
-    internal_metadata: String,
     metadata: DurableEventMetadata,
-    key_ref: String,
-    ciphertext: Vec<u8>,
-    stored_envelope: String,
-    redaction_version: u32,
     envelope: Value,
 }
 
@@ -11773,13 +11765,8 @@ async fn load_authenticated_event(
     Ok(AuthenticatedDurableEvent {
         event,
         kind,
-        internal_metadata: internal_metadata.clone(),
         metadata: serde_json::from_str(&internal_metadata)
             .context("stored lifecycle metadata is invalid")?,
-        key_ref,
-        ciphertext,
-        stored_envelope: stored_envelope.clone(),
-        redaction_version,
         envelope: serde_json::from_str(&stored_envelope)
             .context("stored lifecycle envelope is invalid")?,
     })
@@ -11903,9 +11890,11 @@ pub(super) async fn authenticate_running_tool_intent(
     let sequences: Vec<i64> = sqlx::query_scalar(
         "SELECT seq FROM agent_events
          WHERE event_type = 'tool_execution_start'
+           AND json_extract(internal_metadata, '$.run_id') = ?
            AND json_extract(envelope, '$.tool_call_id') = ?
          ORDER BY seq",
     )
+    .bind(run_id)
     .bind(tool_call_id)
     .fetch_all(&mut **transaction)
     .await
@@ -11941,11 +11930,22 @@ pub(super) async fn authenticate_running_tool_intent(
          FROM agent_events AS event,
               json_each(json_extract(event.envelope, '$.message.content')) AS content
          WHERE event.event_type = 'message_end'
+           AND json_extract(event.internal_metadata, '$.run_id') = ?
+           AND event.seq >= COALESCE((
+               SELECT seq FROM agent_events WHERE event_type='turn_start'
+                 AND json_extract(internal_metadata,'$.run_id')=? AND seq<=?
+                 ORDER BY seq DESC LIMIT 1
+           ), 0)
+           AND event.seq < ?
            AND json_extract(event.envelope, '$.message.role') = 'assistant'
            AND json_extract(content.value, '$.type') = 'tool_call'
            AND json_extract(content.value, '$.tool_call.id') = ?
          ORDER BY event.seq",
     )
+    .bind(run_id)
+    .bind(run_id)
+    .bind(sequences[0])
+    .bind(sequences[0])
     .bind(tool_call_id)
     .fetch_all(&mut **transaction)
     .await
@@ -12002,7 +12002,7 @@ pub(super) async fn authenticate_running_tool_intent(
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
     let checkpoint =
-        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction, true).await?;
+        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
     transaction.commit().await?;
     Ok(checkpoint)
 }
@@ -12011,7 +12011,7 @@ pub(super) async fn authenticate_event_log_snapshot(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<()> {
-    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, true)
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
         .await
         .map(|_| ())
 }
@@ -12046,14 +12046,8 @@ pub(super) async fn authenticate_provider_context_owner_events(
         return Ok(());
     }
 
-    // Provider mutations may call this after staging an authenticated memory
-    // footprint delta but before the enclosing EventWriter commits its new
-    // memory-projection event metadata. Authenticate the complete event chain
-    // and exact MessageEnd rows without requiring the transient projection
-    // rows to equal the previous event-backed checkpoint.
-    reconstruct_authenticated_checkpoint_in_transaction(store, transaction, false)
-        .await
-        .context("failed to authenticate event history for provider-context invalidation")?;
+    // The private runtime database selects owners; authenticate exactly the
+    // referenced event payloads, without reopening unrelated archived history.
     for (seq, (expected_message_id, expected_message)) in expected {
         let physical_seq = sqlite_i64(seq, "provider-context retention owner event sequence")?;
         let event = load_authenticated_event(store, transaction, physical_seq).await?;
@@ -12448,72 +12442,88 @@ pub(crate) async fn seed_provider_context_owner_event_evidence(
 async fn reconstruct_authenticated_checkpoint_in_transaction(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
-    verify_current_memory_projection_rows: bool,
 ) -> Result<LifecycleCheckpoint> {
     let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
-    let mut memory_projections = BTreeMap::new();
-    let mut authenticated_message_count = 0_u64;
-    lifecycle.live_runs.extend(
-        sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT run_id FROM inbound_commands
-             WHERE run_id IS NOT NULL AND status = 'applying' AND run_phase <> 'finished'",
-        )
-        .fetch_all(&mut **transaction)
-        .await?,
-    );
-    for row in sqlx::query(
-        "SELECT run_id, turn_id FROM inbound_commands
-         WHERE run_id IS NOT NULL AND turn_id IS NOT NULL AND status = 'applying'
-           AND run_phase IN ('user_started','user_committed','assistant_started',
-                             'hard_steer_requested','cancel_requested')",
+    // These are private, transactionally maintained runtime projections. The
+    // executor cannot mutate them. Do not replay completed runs to prove the
+    // absence of a hypothetical database-only adversary at every restart.
+    let active_runs: Vec<String> = sqlx::query_scalar(
+        "SELECT run_id FROM inbound_commands
+         WHERE status = 'applying' AND run_id IS NOT NULL AND run_phase <> 'finished'
+         UNION SELECT run_id FROM tool_executions WHERE state IN ('prepared','running')
+         UNION SELECT run_id FROM approval_log WHERE state = 'pending'",
     )
     .fetch_all(&mut **transaction)
-    .await?
-    {
-        let run_id: String = row.try_get("run_id")?;
-        lifecycle
-            .open_turns
-            .insert(run_id.clone(), row.try_get("turn_id")?);
-        lifecycle.inferred_owner_turns.insert(run_id);
-    }
-
-    let mut after_seq = 0_i64;
-    let mut expected_seq = 1_u64;
-    let mut observed_count = 0_u64;
-    let mut chain_digest = [0_u8; EVENT_DIGEST_BYTES];
-    loop {
-        let page: Vec<i64> =
-            sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq > ? ORDER BY seq LIMIT ?")
-                .bind(after_seq)
-                .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
-                .fetch_all(&mut **transaction)
-                .await
-                .context("failed to page durable event history during startup recovery")?;
-        if page.is_empty() {
-            break;
+    .await?;
+    let mut observed_count = 0;
+    let mut roots = Vec::new();
+    let mut earliest_boundary = None::<i64>;
+    for run_id in active_runs {
+        lifecycle.live_runs.insert(run_id.clone());
+        // Recovery fixtures and pre-TurnStart command phases can infer their
+        // owner from the command projection. Real TurnStart evidence replaces it.
+        if let Some(turn_id) = sqlx::query_scalar::<_, String>(
+            "SELECT turn_id FROM inbound_commands
+             WHERE run_id=? AND status='applying' AND turn_id IS NOT NULL
+               AND run_phase IN ('user_started','user_committed','assistant_started',
+                                 'hard_steer_requested','cancel_requested') LIMIT 1",
+        )
+        .bind(&run_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        {
+            lifecycle.open_turns.insert(run_id.clone(), turn_id);
+            lifecycle.inferred_owner_turns.insert(run_id.clone());
         }
-        for physical_seq in page {
-            let seq =
-                u64::try_from(physical_seq).context("durable event sequence is outside u64")?;
-            if seq != expected_seq {
-                bail!(
-                    "durable event chain is not contiguous: expected {expected_seq}, found {seq}"
-                );
-            }
-            let event = load_authenticated_event(store, transaction, physical_seq).await?;
-            chain_digest = extend_event_chain(
-                &chain_digest,
-                EventChainEntry {
-                    seq,
-                    event_type: &event.kind,
-                    internal_metadata: &event.internal_metadata,
-                    key_ref: &event.key_ref,
-                    ciphertext: &event.ciphertext,
-                    envelope: &event.stored_envelope,
-                    redaction_version: event.redaction_version,
-                },
-            );
+        let agent_start: Option<i64> = sqlx::query_scalar(
+            "SELECT seq FROM agent_events WHERE event_type='agent_start'
+             AND json_extract(internal_metadata,'$.run_id')=?",
+        )
+        .bind(&run_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(seq) = agent_start {
+            roots.push(seq);
+        }
+        // Closed turns discard all their lifecycle state. Start at the most
+        // recent turn, except when an unresolved effect still names an earlier
+        // turn: that dependency must never be silently discarded.
+        let latest_turn: Option<i64> = sqlx::query_scalar(
+            "SELECT seq FROM agent_events WHERE event_type='turn_start'
+             AND json_extract(internal_metadata,'$.run_id')=? ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&run_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let mut boundary = latest_turn.or(agent_start).unwrap_or(0);
+        let dependency_turns: Vec<String> = sqlx::query_scalar(
+            "SELECT turn_id FROM approval_log WHERE run_id=? AND state='pending'
+             UNION SELECT c.turn_id FROM tool_executions t
+               JOIN inbound_commands c ON c.command_id=t.command_id
+               WHERE t.run_id=? AND t.state IN ('prepared','running') AND c.turn_id IS NOT NULL",
+        )
+        .bind(&run_id)
+        .bind(&run_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for turn_id in dependency_turns {
+            let start: Option<i64> = sqlx::query_scalar(
+                "SELECT seq FROM agent_events WHERE event_type='turn_start'
+                 AND json_extract(internal_metadata,'$.run_id')=?
+                 AND json_extract(internal_metadata,'$.turn_id')=?",
+            )
+            .bind(&run_id)
+            .bind(turn_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            boundary = boundary.min(start.or(agent_start).unwrap_or(0));
+        }
+        earliest_boundary = Some(earliest_boundary.map_or(boundary, |old| old.min(boundary)));
+    }
+    if let Some(boundary) = earliest_boundary {
+        for seq in roots.into_iter().filter(|seq| *seq < boundary) {
+            let event = load_authenticated_event(store, transaction, seq).await?;
             apply_lifecycle_event(
                 &mut lifecycle,
                 &event.kind,
@@ -12521,69 +12531,53 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 &event.envelope,
                 false,
             )?;
-            apply_memory_projection_delta(
-                &mut memory_projections,
-                seq,
-                &event.kind,
-                event.metadata.memory_projection.as_ref(),
-            )?;
-            if let AgentEvent::MessageEnd {
-                message_id,
-                message,
-            } = &event.event
-            {
-                verify_authenticated_message_projection(
-                    store,
-                    transaction,
-                    seq,
+            observed_count += 1;
+        }
+        // Approval and tool-result events intentionally carry no run metadata.
+        // Replay the related suffix in its original order, rather than filtering
+        // those necessary dependencies out or replaying them once per owner.
+        let mut after_seq = boundary.saturating_sub(1);
+        loop {
+            let page: Vec<i64> =
+                sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq>? ORDER BY seq LIMIT ?")
+                    .bind(after_seq)
+                    .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
+                    .fetch_all(&mut **transaction)
+                    .await?;
+            if page.is_empty() {
+                break;
+            }
+            for seq in page {
+                after_seq = seq;
+                let event = load_authenticated_event(store, transaction, seq).await?;
+                apply_lifecycle_event(
+                    &mut lifecycle,
+                    &event.kind,
+                    &event.metadata,
+                    &event.envelope,
+                    false,
+                )?;
+                if let AgentEvent::MessageEnd {
                     message_id,
                     message,
-                )
-                .await?;
-                authenticated_message_count = authenticated_message_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("authenticated MessageEnd count overflow"))?;
+                } = &event.event
+                {
+                    verify_authenticated_message_projection(
+                        store,
+                        transaction,
+                        sqlite_u64(seq, "active event sequence")?,
+                        message_id,
+                        message,
+                    )
+                    .await?;
+                }
+                observed_count += 1;
             }
-            observed_count = observed_count
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("durable event count overflow"))?;
-            expected_seq = expected_seq
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
-            after_seq = physical_seq;
         }
-    }
-    match &event_head {
-        None if observed_count == 0 => {}
-        None => bail!("durable events exist without an authenticated event-log head"),
-        Some(head)
-            if head.last_seq == expected_seq - 1
-                && head.event_count == observed_count
-                && head.chain_digest == chain_digest => {}
-        Some(_) => bail!("durable event history does not match authenticated head"),
-    }
-    if verify_current_memory_projection_rows {
-        let stored_memory_projections =
-            load_verified_memory_projection_set(store.scope(), transaction).await?;
-        if stored_memory_projections != memory_projections {
-            bail!("memory projection rows do not exactly match authenticated event commitments");
-        }
-    }
-    let stored_message_count = u64::try_from(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
-            .fetch_one(&mut **transaction)
-            .await?,
-    )
-    .context("stored transcript row count is outside u64")?;
-    if stored_message_count != authenticated_message_count {
-        bail!(
-            "transcript row count {stored_message_count} does not match authenticated MessageEnd count {authenticated_message_count}"
-        );
     }
     Ok(LifecycleCheckpoint {
         event_head,
         lifecycle,
-        memory_projections,
         historical_rows_visited: observed_count,
     })
 }
@@ -17381,7 +17375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calibration_observations_commit_exact_ema_receipts_and_authenticate_on_restart() {
+    async fn calibration_observations_preserve_exact_ema_receipts_and_validate_touched_state() {
         let path = std::env::current_dir()
             .expect("current package directory")
             .join("target")
@@ -17472,7 +17466,17 @@ mod tests {
         reopened_writer
             .initialize_recovery_checkpoint()
             .await
-            .expect("restart authenticates committed calibration");
+            .expect("restart restores active lifecycle without a calibration archive scan");
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT ratio_bits FROM memory_calibration WHERE singleton=1",
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("persisted calibration after restart"),
+            second_bits,
+            "restart preserves the exact committed EMA ratio",
+        );
 
         sqlx::query("UPDATE memory_calibration SET ratio_bits = ? WHERE singleton = 1")
             .bind(9.0_f64.to_bits().to_be_bytes().as_slice())
@@ -17483,14 +17487,33 @@ mod tests {
         reopened.pool().close().await;
         drop(reopened);
         let tampered = file_test_store(&path).await;
-        let error = EventWriter::new(tampered.clone())
+        EventWriter::new(tampered.clone())
             .initialize_recovery_checkpoint()
             .await
-            .expect_err("restart must reject calibration ratio tampering");
+            .expect("untouched calibration does not block lifecycle startup");
+        let mut transaction = tampered
+            .pool()
+            .begin()
+            .await
+            .expect("calibration transaction");
+        let error = capture_memory_projection_ref(
+            tampered.scope(),
+            &mut transaction,
+            MemoryProjectionKey {
+                entity: MemoryProjectionEntity::Calibration,
+                id: MEMORY_CALIBRATION_ID.to_owned(),
+            },
+        )
+        .await
+        .expect_err("a calibration write must reject an inconsistent selected projection");
         assert!(
             format!("{error:#}").contains("memory projection digest mismatch"),
             "{error:#}"
         );
+        transaction
+            .rollback()
+            .await
+            .expect("finish calibration inspection");
 
         tampered.pool().close().await;
         drop(tampered);
@@ -18572,7 +18595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_authenticates_existing_chain_and_never_advances_a_tampered_head() {
+    async fn restart_authenticates_active_payloads_without_rewriting_a_failed_checkpoint() {
         fn assistant_start_batch(command_id: &str, label: &str) -> EventBatch {
             let run_id = format!("run-{command_id}");
             let turn_id = format!("turn-{command_id}");
@@ -18624,13 +18647,10 @@ mod tests {
             (5, 5)
         );
 
-        for tamper in [
-            "envelope",
-            "internal_metadata",
-            "ciphertext",
-            "deletion",
-            "reorder",
-        ] {
+        // Payload corruption and row relocation remain invalid for selected
+        // active events. A full-archive metadata/deletion proof is no longer
+        // part of startup's private-SQLite trust boundary.
+        for tamper in ["envelope", "ciphertext", "reorder"] {
             let store = test_store().await;
             let writer = EventWriter::new(store.clone());
             let command_id = "00000000-0000-4000-8000-000000000095";
@@ -18656,23 +18676,11 @@ mod tests {
                         .await
                         .expect("tamper envelope");
                 }
-                "internal_metadata" => {
-                    sqlx::query("UPDATE agent_events SET internal_metadata='{}' WHERE seq=1")
-                        .execute(store.pool())
-                        .await
-                        .expect("tamper internal metadata");
-                }
                 "ciphertext" => {
                     sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=1")
                         .execute(store.pool())
                         .await
                         .expect("tamper ciphertext");
-                }
-                "deletion" => {
-                    sqlx::query("DELETE FROM agent_events WHERE seq=2")
-                        .execute(store.pool())
-                        .await
-                        .expect("delete event");
                 }
                 "reorder" => {
                     let mut transaction = store.pool().begin().await.expect("reorder transaction");
@@ -18943,6 +18951,19 @@ mod tests {
         }
         assert_eq!(writer.retained_turn_start_identities().await, 0);
 
+        let archived_seq: i64 = sqlx::query_scalar(
+            "SELECT seq FROM agent_events WHERE event_type='message_end'
+             AND json_extract(envelope,'$.message_id')='bounded-assistant-0'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("archived completed turn event");
+        sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=?")
+            .bind(archived_seq)
+            .execute(store.pool())
+            .await
+            .expect("corrupt only an inactive archived payload");
+
         store.pool().close().await;
         drop(writer);
         drop(store);
@@ -18957,6 +18978,18 @@ mod tests {
             .await
             .expect("reconstruct bounded checkpoint");
         assert_eq!(restarted_writer.retained_turn_start_identities().await, 0);
+        assert!(
+            restarted_writer.historical_rows_visited().await <= 5,
+            "restart must authenticate only AgentStart and the last turn, not all 128 turns"
+        );
+        let mut archive_read = reopened.pool().begin().await.expect("archive read");
+        assert!(
+            load_authenticated_event(&reopened, &mut archive_read, archived_seq)
+                .await
+                .is_err(),
+            "inactive corruption stays an error when that original event is actually read"
+        );
+        archive_read.rollback().await.expect("finish archive read");
         let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(reopened.pool())
             .await

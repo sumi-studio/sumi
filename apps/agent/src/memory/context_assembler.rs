@@ -293,6 +293,15 @@ impl ContextAssembler {
         provider_context: Vec<ProviderContextItemWithFootprint>,
     ) -> Result<()> {
         let transcript_through_seq = hydrated_transcript_cutoff(hydrated_messages)?;
+        self.install_hydrated_memory_at(memory, transcript_through_seq, provider_context)
+    }
+
+    pub(crate) fn install_hydrated_memory_at(
+        &self,
+        memory: ThreeLayerMemory,
+        transcript_through_seq: u64,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) -> Result<()> {
         for message in memory.l0().iter().flat_map(|batch| &batch.messages) {
             let ContextMessage::Persisted { seq, .. } = message else {
                 anyhow::bail!("hydrated L0 contains a synthetic message");

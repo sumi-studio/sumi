@@ -13,7 +13,10 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Reviewed/deployed baseline: `8cbba0b8d93b7559d5293dc34c27277127694b20`.
+Current shared deployment: `7d898b0d28c78a9e4d732890dd4a7c5a78d664f0` (PR #376).
+The private-file acceptance below was performed on the preceding `8cbba0b8`
+milestone. A subsequent recipient-delivery run on #376 passed after repairing
+reviewer stream cancellation.
 
 - #373 releases a temporary provider-overflow restriction after an actual
   durable L0→L1 replacement. Its 37 assembler tests and independent review
@@ -45,6 +48,27 @@ Cutover metadata is in
 `/tmp/sumi-workspace-cutover-8cbba0b8/cutover.json`; adjacent private resolved
 configuration and backups contain secrets and must not be published.
 
+## Recipient delivery and review recovery
+
+PR #376 fixes an actual delivery blocker: closing one provider stream after a
+reviewer read tool cancelled the shared review token, so the next round reported
+`reviewer cancelled`. Each stream now owns a child token. The real HTTP/SSE
+regression verifies read-tool continuation and parent cancellation; all three CI
+jobs passed on the exact reviewed commit before merge.
+
+The configured real model then executed eight successful tools across three
+Human turns: write/read, edit/read, invitation list/accept and Messaging open/write.
+The Human-facing attachment card downloaded `item,count\napples,3\n` (20 bytes),
+matching the corrected CSV. The same final reply survived reload without another
+command. Test installations were disabled, the session revoked and browsers closed.
+Existing shared data/configuration were retained; the HTTPS entry returned 200.
+
+[Allowlisted synthetic evidence](evidence/artifact-delivery-2026-09-08.json) records
+actual tool sequences, download bytes/hash and the acceptance limits. The original
+local evidence is `/tmp/sumi-artifact-delivery-acceptance-xT6mhc/evidence.json`.
+This scenario did not request additional Human approval and does not establish a
+generation restart, physical iOS behavior, or every existing-account login path.
+
 ## Audit items and remaining acceptance
 
 Status here describes capability, not whether a historical issue happens to
@@ -64,26 +88,26 @@ still needed to close each row.
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
 | A04 | Reminder records exist; scheduled wake absent | Due/canceled/overdue markers cause the appropriate single admission across restart, without manufacturing a reply. |
 | T01 | Tool progress/control exist; inference waits for completion | One real long-running operation returns a durable handle, allows other conversation and later result recovery without repeating the effect. |
-| T02 | Private file creation/editing accepted | A real recipient downloads the corrected artifact with matching bytes; failed delivery leaves a truthful unresolved outcome. |
+| T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
 | T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
 | T04 | Messaging images/text supported; intake/formats incomplete | Actual UI upload and content-based answer; unsupported content must be distinguished from content actually read. |
 | T05 | Helper delegation absent | One bounded attributable helper job supports message, result, cancellation and reconnect without cloning the secretary's continuation. |
 | T06 | Optional procedure files possible; extension lifecycle absent | Verify voluntary save/find/revise/reuse first; add discovery only for a demonstrated extension need. Never require reflection or skill use. |
 | R01 | Some restart phases supported | Recover additional ordinary durable phases from their actual evidence, without guessing outcomes of emitted effects. |
-| R02 | First dependency-health error still terminates runtime | Implemented with real-socket regression coverage: transient transport failure retains the runtime, while identity/epoch/protocol failure remains fenced. Shared deployment of this change is pending. |
-| R03 | Cold-idle reaper ignores active work | Implemented and independently reviewed; focused Go race tests cover active work, accepted input, completed idle work and admission/reaping. Shared deployment is pending. |
+| R02 | Transient health transport failures now retry | Implemented with real-socket regression coverage: transient transport failure retains the runtime, while identity/epoch/protocol failure remains fenced. Deployed in #375; shared fault-injection acceptance is not yet claimed. |
+| R03 | Active work and input admission protect cold-idle lifetime | Implemented and independently reviewed; focused Go race tests cover active work, accepted input, completed idle work and admission/reaping. Deployed in #375. |
 | R04 | Warm prevents idle stopping but does not restore | Explicit intended presence survives exit/reboot with bounded restoration and observable failure. |
 | R05 | Lifetime hydration row/byte ceilings remain | Load the active working set and page original history beyond existing ceilings; do not just raise constants. |
 | P01 | No provider-native steering/async path | Verify an actual documented supported provider contract before adopting it; internal async/steering is not evidence of native support. |
 | P02 | Model overrides partial; effort not wired | Explicit supported effort/budget reaches the provider; incompatible configuration is explained before sending. Model switching is a separate remaining path. |
-| P03 | Harmless extra reasoning metadata rejected | Implemented; incremental response, canonical context serialization and next-request tests pass. Required structure and outgoing rules remain checked. Shared deployment is pending. |
-| P04 | Retry ignores Retry-After | Implemented; loopback HTTP and controlled-time tests cover delay, steering, cancellation and fallback. Delays over five minutes end automatic retry instead of resending early. Shared deployment is pending. |
+| P03 | Harmless incoming reasoning metadata projected to canonical fields | Implemented; incremental response, canonical context serialization and next-request tests pass. Required structure and outgoing rules remain checked. Deployed in #375. |
+| P04 | Provider Retry-After respected | Implemented; loopback HTTP and controlled-time tests cover delay, steering, cancellation and fallback. Delays over five minutes end automatic retry instead of resending early. Deployed in #375. |
 | P05 | Per-response limits only | Account for an explicitly bounded undertaking/wake across restart, stop further admissions truthfully and support replenishment. |
 | U01 | Exact-call review exists; standing permission UI absent | Grant, view, narrow and revoke understandable scopes; recheck queued actions and retain effect truth. |
 | U02 | Cards render; shared action round trip absent | Human and PA act on the same authorized object/version with mobile/keyboard feedback and an attributable resulting event. |
 | U03 | Questions/polls exist without answer wake | An addressable question and later answer resume the originating context while unrelated activity remains possible. |
 | Q01 | Separate real-model evidence exists | Maintain a small reproducible opt-in set for correction, wait, interruption, actual artifacts and delivery; distinguish blocked/skipped/failed. |
-| Q02 | Useful local tests; Rust CI missing | A Rust regression workflow is prepared; its first actual CI run is pending. Local suite: 2,213 passed, 20 ignored (includes subprocess entry points and opt-in live-provider/performance cases). Continue reviewing relevance and explicit non-run reporting. |
+| Q02 | Rust CI now active; relevance review continues | The Rust regression workflow passed its first GitHub Actions run on the supported Rust 1.88 toolchain. Local suite: 2,213 passed, 20 ignored (includes subprocess entry points and opt-in live-provider/performance cases). Continue reviewing relevance and explicit non-run reporting. |
 
 ## Comparative items are reconciled, not multiplied into machinery
 
