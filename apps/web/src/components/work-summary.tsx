@@ -61,9 +61,7 @@ export function WorkSummary({
             run.status === "running" && "animate-pulse",
           )}
         />
-        {run.audience === "secretary"
-          ? "外部の出来事からの活動"
-          : "診断用の活動"}
+        {run.audience === "secretary" ? "外部の出来事からの活動" : "Sumiの活動"}
         <span>· {describeAgentRun(run)}</span>
       </div>
     );
@@ -120,7 +118,6 @@ function LiveRunDescription({ run }: { run: AgentRun }) {
 
 export function TraceRow({
   event,
-  phase = "result",
   open,
   onOpenChange,
 }: {
@@ -148,12 +145,7 @@ export function TraceRow({
       );
     case "tool":
       return (
-        <ToolTraceRow
-          event={event}
-          phase={phase}
-          open={open}
-          onOpenChange={onOpenChange}
-        />
+        <ToolTraceRow event={event} open={open} onOpenChange={onOpenChange} />
       );
     case "approval": {
       const Icon =
@@ -202,15 +194,17 @@ export function TraceRow({
 
 function ToolTraceRow({
   event,
-  phase,
   open,
   onOpenChange,
 }: {
   event: Extract<AgentTraceEvent, { type: "tool" }>;
-  phase: "activity" | "result";
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
 }) {
+  const phase =
+    event.status === "pending" || event.status === "running"
+      ? "activity"
+      : "result";
   const Icon = TOOL_ICONS[event.name as keyof typeof TOOL_ICONS] ?? Wrench;
   const detail = pickString(event.args.path) ?? pickString(event.args.command);
   const status = {
@@ -228,8 +222,10 @@ function ToolTraceRow({
       : event.result === undefined
         ? null
         : displayValue(event.result);
+  const failed = event.status === "error" || event.status === "cancelled";
+  const failure = failed ? toolFailureReason(event) : null;
   const previewText =
-    phase === "result" ? previewValue(event.result) : resultText;
+    failure ?? (phase === "result" ? previewValue(event.result) : resultText);
   const preview = previewText?.slice(0, 240);
   return (
     <details
@@ -257,17 +253,10 @@ function ToolTraceRow({
         <span
           className={cn(
             "text-xs",
-            phase === "result" && event.status === "error"
-              ? "text-red-600"
-              : "text-muted-foreground",
+            failed ? "text-red-600" : "text-muted-foreground",
           )}
         >
-          {phase === "activity" &&
-          (event.status === "done" ||
-            event.status === "error" ||
-            event.status === "cancelled")
-            ? "操作"
-            : status}
+          {status}
         </span>
         <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open/tool:rotate-90 motion-reduce:transition-none" />
         {detail && (
@@ -279,9 +268,7 @@ function ToolTraceRow({
           <p
             className={cn(
               "line-clamp-3 w-full whitespace-pre-wrap break-words pl-6 text-[13px] group-open/tool:hidden",
-              event.status === "error"
-                ? "text-red-600"
-                : "text-muted-foreground",
+              failed ? "text-red-600" : "text-muted-foreground",
             )}
           >
             {preview}
@@ -296,14 +283,18 @@ function ToolTraceRow({
         )}
         {phase === "result" && (
           <Payload
-            label="結果"
+            label={failed ? "理由" : "結果"}
             text={
+              failure ??
               resultText ??
               (event.status === "running" || event.status === "pending"
                 ? "結果を待っています"
                 : "結果の本文は記録されていません")
             }
           />
+        )}
+        {failed && resultText !== null && (
+          <Payload label="結果" text={resultText} />
         )}
       </div>
     </details>
@@ -335,6 +326,60 @@ function TraceLine({
       {children}
     </div>
   );
+}
+
+function toolFailureReason(
+  event: Extract<AgentTraceEvent, { type: "tool" }>,
+): string {
+  const result = asRecord(event.result);
+  const details = asRecord(result?.details) ?? result;
+  const review = asRecord(details?.review);
+  const content = Array.isArray(result?.content)
+    ? result.content
+        .flatMap((part) => {
+          const block = asRecord(part);
+          return block?.type === "text" && typeof block.text === "string"
+            ? [block.text]
+            : [];
+        })
+        .join("\n")
+    : "";
+  const actualReason =
+    pickString(details?.reason) ||
+    content ||
+    pickString(details?.error) ||
+    previewValue(event.result);
+  // A cancelled approval or a reviewer timeout does not establish who
+  // rejected the action. This exact public receipt proves a judged block.
+  if (
+    details?.error === "execution_review_blocked" &&
+    review?.judged === true &&
+    review.outcome === "block"
+  ) {
+    const rationale = pickString(review.rationale) || actualReason;
+    return ["自動レビューにより拒否されました", rationale]
+      .filter(Boolean)
+      .join("\n");
+  }
+  const resolution =
+    event.approvalResolution === "denied"
+      ? "承認が拒否されました"
+      : event.approvalResolution === "rejected"
+        ? "承認された操作を実行できませんでした"
+        : event.approvalResolution === "cancelled" ||
+            event.status === "cancelled"
+          ? "操作は中止されました"
+          : null;
+  return (
+    [resolution, actualReason].filter(Boolean).join("\n") ||
+    "失敗の理由は記録されていません"
+  );
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function previewValue(value: unknown): string | null {

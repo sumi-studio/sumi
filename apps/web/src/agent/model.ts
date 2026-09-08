@@ -27,6 +27,7 @@ export type AgentTraceEvent =
       args: Record<string, AnyJSON>;
       result: AnyJSON | undefined;
       progress?: AnyJSON;
+      approvalResolution?: "denied" | "rejected" | "cancelled";
       status: "pending" | "running" | "done" | "error" | "cancelled";
     }
   | {

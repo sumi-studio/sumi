@@ -419,7 +419,7 @@ function transcriptText(row: ConversationRow): string | null {
             ? row.trace.message
             : null;
     case "user":
-      return `${row.source ? `${row.source.actor.display_name || row.source.actor.principal_id} · ${row.source.source.place.name}` : "診断用の入力"}: ${row.text}`;
+      return `${row.source ? `${row.source.actor.display_name || row.source.actor.principal_id} · ${row.source.source.place.name}` : "あなた"}: ${row.text}`;
     case "prose":
       return `Sumi: ${row.text}`;
     case "approval":
@@ -495,7 +495,7 @@ function composerPlaceholder(
   if (ready === "not_ready" || ready === "stopped" || ready === "unavailable")
     return "現在エージェントを利用できません";
   if (ready === "unknown") return "エージェントを確認しています…";
-  return "Sumiへの診断用の指示…";
+  return "メッセージを入力…";
 }
 
 function unavailableMessage(ready: "stopped" | "unavailable" | "not_ready") {

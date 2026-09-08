@@ -715,7 +715,7 @@ const AssistantMessageId = "00000000-0000-4000-8000-000000000010";
 const UserMessageId = "00000000-0000-4000-8000-000000000011";
 const Timestamp = "2026-07-30T12:00:00Z";
 
-test("prose, public summary, tool operation, intervening prose and result retain their event positions", () => {
+test("one tool operation updates in place while intervening prose retains its event position", () => {
   let session = createAgentSession();
   const update = (event: PublicStreamEvent) => {
     session = apply(session, {
@@ -770,9 +770,8 @@ test("prose, public summary, tool operation, intervening prose and result retain
   assert.deepEqual(labels, [
     "First",
     "Check the source",
-    "read:activity",
-    "While waiting",
     "read:result",
+    "While waiting",
     "After result",
   ]);
   assert.equal(session.conversation.runs["run:1"].audience, "secretary");
@@ -988,4 +987,357 @@ test("canonical rejected operation stays between its surrounding prose blocks", 
       .map((row) => (row.kind === "prose" ? row.text : row.kind)),
     ["Before", "trace", "After"],
   );
+});
+
+test("tool progress and terminal receipt replace one stable invocation row across replay", () => {
+  const frames: BrowserEventEnvelope[] = [
+    { audience: "direct_chat", seq: 1, event: { type: "agent_start" } },
+    {
+      audience: "direct_chat",
+      seq: 2,
+      event: {
+        type: "tool_execution_start",
+        tool_call_id: "read-once",
+        tool_name: "read_file",
+        args: { path: "note" },
+      },
+    },
+    {
+      audience: "direct_chat",
+      seq: 3,
+      event: {
+        type: "message_end",
+        message_id: AssistantMessageId,
+        message: assistantMessage("While waiting"),
+      },
+    },
+    {
+      audience: "direct_chat",
+      seq: 4,
+      event: {
+        type: "tool_execution_end",
+        tool_call_id: "read-once",
+        result: "actual receipt",
+        is_error: false,
+      },
+    },
+  ];
+  let live = apply(apply(createAgentSession(), frames[0]), frames[1]);
+  const invocation = projectConversation(live.conversation).find(
+    (row) => row.kind === "trace",
+  );
+  assert.ok(invocation && invocation.kind === "trace");
+  assert.equal(invocation.trace.type, "tool");
+  live = apply(live, {
+    audience: "direct_chat",
+    event: {
+      type: "tool_execution_update",
+      tool_call_id: "read-once",
+      partial: "reading",
+    },
+  });
+  const progress = projectConversation(live.conversation).find(
+    (row) => row.kind === "trace",
+  );
+  assert.ok(progress?.kind === "trace" && progress.trace.type === "tool");
+  assert.equal(progress.id, invocation.id);
+  assert.equal(progress.trace.progress, "reading");
+  assert.equal(progress.trace.result, undefined);
+  live = apply(apply(live, frames[2]), frames[3]);
+  const rows = projectConversation(live.conversation).filter(
+    (row) => row.kind !== "agent-run",
+  );
+  assert.equal(rows.length, 2);
+  const operation = rows[0];
+  assert.ok(operation.kind === "trace" && operation.trace.type === "tool");
+  assert.equal(operation.id, invocation.id);
+  assert.equal(operation.trace.status, "done");
+  assert.equal(operation.trace.result, "actual receipt");
+  assert.deepEqual(operation.trace.args, { path: "note" });
+  assert.ok(rows[1].kind === "prose" && rows[1].text === "While waiting");
+  let replay = createAgentSession();
+  for (const frame of frames) replay = apply(replay, frame);
+  const replayRows = projectConversation(replay.conversation).filter(
+    (row) => row.kind !== "agent-run",
+  );
+  assert.deepEqual(
+    replayRows.map((row) => row.id),
+    rows.map((row) => row.id),
+  );
+  assert.ok(
+    replayRows[0].kind === "trace" && replayRows[0].trace.type === "tool",
+  );
+  assert.equal(replayRows[0].trace.result, "actual receipt");
+  assert.equal(apply(replay, frames[3]), replay);
+
+  // Even if a recovered model enumerates the receipt first, the invocation
+  // remains the single placement authority once it is present.
+  const receiptId = replay.conversation.entryOrder.find((id) =>
+    id.endsWith(":result"),
+  );
+  assert.ok(receiptId);
+  const receiptFirst = projectConversation({
+    ...replay.conversation,
+    entryOrder: [
+      receiptId,
+      ...replay.conversation.entryOrder.filter((id) => id !== receiptId),
+    ],
+  }).filter((row) => row.kind !== "agent-run");
+  assert.deepEqual(
+    receiptFirst.map((row) => row.id),
+    rows.map((row) => row.id),
+  );
+});
+
+test("pre-execution automatic review denial consumes canonical result without creating an execution start", () => {
+  let session = apply(createAgentSession(), {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 2,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: {
+        ...assistantMessage(""),
+        content: [
+          {
+            type: "tool_call",
+            wire_item_index: 0,
+            tool_call: {
+              id: "review-block",
+              name: "bash",
+              route: "normal",
+              arguments: { command: "echo hi" },
+            },
+          },
+        ],
+      },
+    },
+  });
+  const original = projectConversation(session.conversation).find(
+    (row) => row.kind === "trace",
+  );
+  assert.ok(original?.kind === "trace" && original.trace.type === "tool");
+  assert.equal(original.trace.status, "pending");
+  const message: PublicMessage = {
+    role: "tool_result",
+    tool_call_id: "review-block",
+    tool_name: "bash",
+    is_error: true,
+    timestamp: Timestamp,
+    content: [{ type: "text", text: "actual review reason" }],
+    details: {
+      error: "execution_review_blocked",
+      reason: "actual review reason",
+      review: {
+        judged: true,
+        outcome: "block",
+        rationale: "actual review reason",
+      },
+    },
+  };
+  const start = {
+    audience: "direct_chat" as const,
+    seq: 3,
+    event: {
+      type: "message_start" as const,
+      message_id: UserMessageId,
+      message,
+    },
+  };
+  session = apply(session, start);
+  const beforeReceipt = session.conversation.runs["run:1"].trace.find(
+    (trace) => trace.id === "review-block",
+  );
+  assert.ok(beforeReceipt?.type === "tool");
+  assert.equal(beforeReceipt.status, "pending");
+  const end = {
+    audience: "direct_chat" as const,
+    seq: 4,
+    event: { type: "message_end" as const, message_id: UserMessageId, message },
+  };
+  session = apply(session, end);
+  const rows = projectConversation(session.conversation).filter(
+    (row) => row.kind === "trace",
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, original.id);
+  assert.ok(rows[0].trace.type === "tool");
+  assert.equal(rows[0].trace.status, "error");
+  assert.deepEqual(rows[0].trace.result, {
+    content: message.content,
+    details: message.details,
+  });
+  assert.equal(apply(session, end), session);
+  const newer = apply(session, {
+    audience: "direct_chat",
+    seq: 5,
+    event: { type: "agent_start" },
+  });
+  const unknown = apply(newer, {
+    audience: "direct_chat",
+    seq: 6,
+    event: {
+      type: "message_end",
+      message_id: "unknown-result",
+      message: { ...message, tool_call_id: "not-known" },
+    },
+  });
+  assert.equal(unknown.conversation.runs["run:5"].trace.length, 0);
+});
+
+test("linked resolved approval joins tool failure while pending and standalone approval remain visible", () => {
+  for (const resolution of [
+    "cancelled",
+    { decision: { type: "deny_once" } },
+    { rejected: { decision: { type: "approve_once" } } },
+  ] as const) {
+    let session = apply(createAgentSession(), {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "agent_start" },
+    });
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 2,
+      event: {
+        type: "tool_execution_start",
+        tool_call_id: "reviewed",
+        tool_name: "bash",
+        args: {},
+      },
+    });
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 3,
+      event: {
+        type: "approval_requested",
+        request: approvalRequest("approval-linked", "reviewed"),
+      },
+    });
+    assert.equal(
+      projectConversation(session.conversation).filter(
+        (row) => row.kind === "approval",
+      ).length,
+      1,
+    );
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 4,
+      event: {
+        type: "approval_resolved",
+        request_id: "approval-linked",
+        resolution,
+      },
+    });
+    const rows = projectConversation(session.conversation);
+    assert.equal(rows.filter((row) => row.kind === "approval").length, 0);
+    const tool = rows.find(
+      (row) => row.kind === "trace" && row.trace.type === "tool",
+    );
+    assert.ok(tool?.kind === "trace" && tool.trace.type === "tool");
+    assert.equal(tool.trace.status, "cancelled");
+    assert.ok(tool.trace.approvalResolution);
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 5,
+      event: {
+        type: "approval_requested",
+        request: approvalRequest("orphan-approval", "no-tool"),
+      },
+    });
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 6,
+      event: {
+        type: "approval_resolved",
+        request_id: "orphan-approval",
+        resolution: "cancelled",
+      },
+    });
+    assert.equal(
+      projectConversation(session.conversation).filter(
+        (row) => row.kind === "approval",
+      ).length,
+      1,
+    );
+  }
+});
+
+test("canonical receipt after execution end updates the known original call across newer runs", () => {
+  let session = apply(createAgentSession(), {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 2,
+    event: {
+      type: "tool_execution_start",
+      tool_call_id: "old-call",
+      tool_name: "read_file",
+      args: { path: "note" },
+    },
+  });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 3,
+    event: {
+      type: "tool_execution_end",
+      tool_call_id: "old-call",
+      result: {
+        content: [{ type: "text", text: "receipt" }],
+        details: { bytes: 7 },
+      },
+      is_error: false,
+    },
+  });
+  const first = projectConversation(session.conversation).find(
+    (row) => row.kind === "trace",
+  );
+  assert.ok(first?.kind === "trace");
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 4,
+    event: { type: "agent_end" },
+  });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 5,
+    event: { type: "agent_start" },
+  });
+  const canonical: BrowserEventEnvelope = {
+    audience: "direct_chat",
+    seq: 6,
+    event: {
+      type: "message_end",
+      message_id: UserMessageId,
+      message: {
+        role: "tool_result",
+        tool_call_id: "old-call",
+        tool_name: "read_file",
+        content: [{ type: "text", text: "receipt" }],
+        details: { bytes: 7 },
+        is_error: false,
+        timestamp: Timestamp,
+      },
+    },
+  };
+  session = apply(session, canonical);
+  const rows = projectConversation(session.conversation).filter(
+    (row) => row.kind === "trace",
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, first.id);
+  assert.equal(rows[0].runId, "run:1");
+  assert.ok(rows[0].trace.type === "tool");
+  assert.equal(rows[0].trace.status, "done");
+  assert.deepEqual(rows[0].trace.args, { path: "note" });
+  assert.equal(session.conversation.runs["run:5"].trace.length, 0);
+  assert.equal(apply(session, canonical), session);
 });

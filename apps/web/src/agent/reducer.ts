@@ -268,7 +268,19 @@ function applyMessage(
       conversation: upsertEntry(session.conversation, entry),
     };
   }
-  if (message.role === "tool_result") return session;
+  if (message.role === "tool_result") {
+    // Pre-execution review denials have a durable result message but no
+    // ToolExecutionEnd. Admit its actual public receipt into the same call.
+    return complete && session.toolRunIds[message.tool_call_id]
+      ? applyToolEnd(
+          session,
+          message.tool_call_id,
+          { content: message.content, details: message.details },
+          message.is_error,
+          message.tool_name,
+        )
+      : session;
+  }
 
   const runId =
     session.messageRunIds[messageId] === undefined
@@ -535,6 +547,7 @@ function applyToolEnd(
   toolCallId: string,
   result: AnyJSON,
   isError: boolean,
+  toolName?: string,
 ): AgentSession {
   const runId = session.toolRunIds[toolCallId] ?? session.activeRunId;
   if (!runId) return session;
@@ -545,7 +558,7 @@ function applyToolEnd(
       : {
           type: "tool" as const,
           id: toolCallId,
-          name: toolCallId,
+          name: toolName ?? toolCallId,
           route: null,
           args: {},
           result: undefined,

@@ -977,6 +977,152 @@ test("rejects identity aliases and provenance only when they are structural fiel
   }
 });
 
+function providerCallIdentityEvents(identity = {}) {
+  const call = {
+    id: "887c92bc-62c2-5f47-96e1-d8a37dd742ff",
+    name: "workspace_list",
+    route: "normal",
+    arguments: {},
+    ...identity,
+  };
+  const rejected = {
+    id: "call-2",
+    name: "workspace_list",
+    error: "invalid_json",
+    ...identity,
+  };
+  const result = {
+    tool_call_id: call.id,
+    tool_name: "workspace_list",
+    content: [],
+    details: {},
+    is_error: false,
+    timestamp,
+    ...identity,
+  };
+  const assistant = assistantMessage([
+    { type: "tool_call", tool_call: call, wire_item_index: 0 },
+  ]);
+  return [
+    {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000101",
+      message: assistant,
+    },
+    {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000102",
+      message: assistantMessage([
+        { type: "rejected_tool_call", rejected, wire_item_index: 0 },
+      ]),
+    },
+    {
+      type: "message_start",
+      message_id: "00000000-0000-4000-8000-000000000103",
+      message: { role: "tool_result", ...result },
+    },
+    {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000103",
+      message: { role: "tool_result", ...result },
+    },
+    { type: "turn_end", message: assistant, tool_results: [result] },
+    {
+      type: "message_update",
+      message_id: "00000000-0000-4000-8000-000000000101",
+      event: { type: "tool_call_end", content_index: 0, tool_call: call },
+    },
+    {
+      type: "message_update",
+      message_id: "00000000-0000-4000-8000-000000000102",
+      event: { type: "tool_call_rejected", content_index: 0, rejected },
+    },
+  ];
+}
+
+test("tool identities accept only the optional canonical provider call ID", () => {
+  for (const identity of [
+    {},
+    { provider_call_id: "functions.workspace_list:0" },
+    { provider_call_id: "" },
+  ]) {
+    for (const value of providerCallIdentityEvents(identity)) {
+      const frame =
+        value.type === "message_update"
+          ? {
+              type: "event",
+              envelope: { audience: "direct_chat", event: value },
+            }
+          : event(1, value);
+      assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+    }
+  }
+  for (const identity of [
+    { provider_call_id: null },
+    { provider_call_id: 7 },
+    { provider_call_id: false },
+    { provider_call_id: {} },
+    { provider_call_id: "wire-1", extra: true },
+  ]) {
+    for (const value of providerCallIdentityEvents(identity)) {
+      const frame =
+        value.type === "message_update"
+          ? {
+              type: "event",
+              envelope: { audience: "direct_chat", event: value },
+            }
+          : event(1, value);
+      assert.equal(parseDirectChatServerFrame(frame, 0), undefined);
+    }
+  }
+});
+
+test("provider call IDs do not poison replay before the saved final response", () => {
+  FakeWebSocket.instances = [];
+  const socket = new DirectChatSocket();
+  const received = [];
+  socket.onFrame((frame) => received.push(frame));
+  socket.bindInstallation(binding);
+  socket.connect();
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
+  const values = providerCallIdentityEvents({
+    provider_call_id: "functions.workspace_list:0",
+  });
+  const frames = [
+    values[0],
+    values[3],
+    values[4],
+    {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000104",
+      message: assistantMessage([
+        {
+          type: "text",
+          text: "Workspace lookup completed.",
+          wire_item_index: 0,
+        },
+      ]),
+    },
+  ];
+  try {
+    frames.forEach((value, index) => {
+      wire.receive(event(index + 1, value));
+    });
+    assert.equal(wire.readyState, FakeWebSocket.OPEN);
+    assert.deepEqual(received.at(-1), event(frames.length, frames.at(-1)));
+    wire.drop();
+    socket.connect();
+    const resumed = FakeWebSocket.instances.at(-1);
+    resumed.open();
+    assert.deepEqual(resumed.sent.map(JSON.parse), [
+      { type: "hello", last_event_seq: frames.length },
+    ]);
+  } finally {
+    socket.close();
+  }
+});
+
 test("preserves identity-like keys and paid data inside explicit AnyJSON fields", () => {
   const opaque = {
     personality_agent_id: "literal-data",
