@@ -1152,6 +1152,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
             prompt,
             tool_call_offset,
             cancel,
+            stream,
         )
         .await
     }
@@ -1202,6 +1203,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
             prompt,
             tool_call_offset,
             cancel,
+            stream,
         )
         .await
     }
@@ -1249,6 +1251,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
                 0
             },
             cancel,
+            stream,
         )
         .await
     }
@@ -1268,6 +1271,12 @@ async fn complete_provider_review(
     prompt: &impl ProviderReviewPrompt,
     tool_call_offset: usize,
     cancel: CancellationToken,
+    start_stream: fn(
+        ModelSpec,
+        PromptContext,
+        RequestOptions,
+        CancellationToken,
+    ) -> crate::provider::types::ProviderEventStream,
 ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
     let structured_retry = tool_call_offset == usize::MAX;
     let tool_definitions = if structured_retry {
@@ -1286,11 +1295,13 @@ async fn complete_provider_review(
     options.session_id = Some(session_id.to_owned());
     let mut trace = Vec::new();
     loop {
-        let mut events = stream(
+        // Each HTTP round owns its cancellation. Dropping a completed stream
+        // must not cancel the review that continues after a read-tool result.
+        let mut events = start_stream(
             spec.clone(),
             context.clone(),
             options.clone(),
-            cancel.clone(),
+            cancel.child_token(),
         );
         let message = loop {
             let Some(event) = events.recv().await else {
@@ -3473,6 +3484,131 @@ mod tests {
                 "query": "secret=abcdefghijklmnop"
             }))
             .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_review_read_round_continues_without_cancelling_parent() {
+        use axum::{Json, Router, response::IntoResponse};
+        const ANSWER: &str = r#"{"outcome":"allow","risk":"low","rationale":"verified by read"}"#;
+        fn local_stream(
+            spec: ModelSpec,
+            context: PromptContext,
+            options: RequestOptions,
+            cancel: CancellationToken,
+        ) -> crate::provider::types::ProviderEventStream {
+            crate::provider::stream_with_api_key_observed(
+                spec,
+                context,
+                options,
+                cancel,
+                Some("test-key".into()),
+                None,
+            )
+        }
+        for cancel_parent in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let observed = requests.clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let notify = started.clone();
+            let app = Router::new().fallback(move |Json(body): Json<Value>| {
+                let observed = observed.clone();
+                let notify = notify.clone();
+                async move {
+                    let round = {
+                        let mut requests = observed.lock().unwrap();
+                        requests.push(body);
+                        requests.len()
+                    };
+                    notify.notify_one();
+                    if cancel_parent {
+                        std::future::pending::<()>().await;
+                    }
+                    let (delta, finish) = if round == 1 {
+                        (json!({"role":"assistant","tool_calls":[{"index":0,"id":"inspection","type":"function","function":{"name":"inspect","arguments":"{\"route\":\"normal\",\"input\":{\"query\":\"check CSV\"}}"}}]}), "tool_calls")
+                    } else {
+                        (json!({"role":"assistant","content":ANSWER}), "stop")
+                    };
+                    let chunk = json!({"id":format!("review-{round}"),"object":"chat.completion.chunk","created":1,"model":"kimi-k3","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                    let terminal = json!({"id":format!("review-{round}"),"object":"chat.completion.chunk","created":1,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+                    ([("content-type", "text/event-stream")], format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")).into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut spec = ModelSpec::preset("kimi-k3").unwrap();
+            spec.base_url = format!("http://{address}");
+            let (tools, calls) = reviewer_tool_runtime(RoutePolicy::baseline_only_v1());
+            let prompt = ExecutionReviewerPrompt {
+                system: EXECUTION_SYSTEM_PROMPT,
+                output_schema: ExecutionReviewOutputSchema::v7(),
+                prompt_version: EXECUTION_PROMPT_VERSION_V7,
+                schema_version: EXECUTION_SCHEMA_VERSION_V7,
+                request: execution_request(),
+                reviewer_tool_trace: vec![],
+                retry_validation_code: None,
+            };
+            let parent = CancellationToken::new();
+            let review_cancel = parent.clone();
+            let mut review = tokio::spawn(async move {
+                complete_provider_review(
+                    &spec,
+                    "review-continuation",
+                    ReviewerKind::Execution,
+                    Some(&tools),
+                    prompt.system,
+                    prompt.output_schema.provider_schema(),
+                    &prompt,
+                    0,
+                    review_cancel,
+                    local_stream,
+                )
+                .await
+            });
+            if cancel_parent {
+                if timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .is_err()
+                {
+                    parent.cancel();
+                    review.abort();
+                    server.abort();
+                    panic!("review request did not start");
+                }
+                parent.cancel();
+            }
+            let result = timeout(Duration::from_secs(5), &mut review).await;
+            if result.is_err() {
+                parent.cancel();
+                review.abort();
+            }
+            server.abort();
+            let result = result.expect("bounded review").unwrap();
+            if cancel_parent {
+                assert_eq!(result.unwrap_err(), ReviewerTransportError::Cancelled);
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+                assert_eq!(requests.lock().unwrap().len(), 1);
+            } else {
+                let result = result.expect("read result can reach the next provider round");
+                assert_eq!(result.text, ANSWER);
+                assert_eq!(result.tool_trace.len(), 1);
+                assert!(!result.tool_trace[0].is_error);
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                assert!(
+                    !parent.is_cancelled(),
+                    "completed stream ownership must not escape its round"
+                );
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(
+                    requests[1]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "review-execution-1")
+                );
+            }
         }
     }
 
