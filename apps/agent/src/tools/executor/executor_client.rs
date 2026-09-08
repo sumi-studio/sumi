@@ -43,6 +43,26 @@ use crate::tools::{
 };
 
 const MAX_EXECUTOR_UPDATES: usize = 65_536;
+
+/// Health has no effects. Transport loss may be probed again, whereas a
+/// response that fails identity/protocol validation must fence the runtime.
+#[derive(Debug)]
+pub(crate) enum HealthProbeFailure {
+    Unavailable(ToolError),
+    InvalidResponse(ToolError),
+}
+
+impl HealthProbeFailure {
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+
+    pub(crate) fn into_tool_error(self) -> ToolError {
+        match self {
+            Self::Unavailable(error) | Self::InvalidResponse(error) => error,
+        }
+    }
+}
 const GENERATION_ROLLOVER_REQUIRED_MESSAGE: &str = "executor generation rollover required";
 const REPLAY_OUTCOME_UNAVAILABLE_MESSAGE: &str = "executor replay outcome is no longer retained";
 const CALL_AUTHORITY_REPLAY_MESSAGE: &str = "executor exact-call authority was already consumed";
@@ -247,32 +267,115 @@ impl ExecutorClient {
 
     /// Run one authenticated Health exchange on a fresh Unix connection.
     ///
-    /// Health has no execution identity, so cancellation is prompt only before
-    /// request emission. After emission the short `overall` bound closes the
-    /// connection without manufacturing an invalid empty Cancel operation.
+    /// Health has no effects, so cancellation closes its connection promptly
+    /// without manufacturing an invalid empty Cancel operation.
     pub async fn health_with_cancellation(
         &self,
         cancel: CancellationToken,
         overall: Duration,
     ) -> Result<(), ToolError> {
-        match self
-            .execute_with_overall(
-                ExecutorOperation::Health {
-                    service_role: ExecutorServiceRole::ToolExecutor,
-                },
-                None,
-                cancel,
-                Arc::new(|_| {}),
-                overall,
-            )
-            .await?
-        {
-            ExecutorResponse::Healthy {
+        self.probe_health(cancel, overall)
+            .await
+            .map_err(HealthProbeFailure::into_tool_error)
+    }
+
+    pub(crate) async fn probe_health(
+        &self,
+        cancel: CancellationToken,
+        overall: Duration,
+    ) -> Result<(), HealthProbeFailure> {
+        use HealthProbeFailure::{InvalidResponse, Unavailable};
+        let exchange = async {
+            let request_id = format!("executor-{}", Uuid::now_v7());
+            let operation = ExecutorOperation::Health {
                 service_role: ExecutorServiceRole::ToolExecutor,
-            } => Ok(()),
-            _ => Err(ToolError::Protocol(
-                "executor health returned a non-health response".to_owned(),
-            )),
+            };
+            let encoded = encode_request(&self.identity, &request_id, None, operation.clone())
+                .map_err(InvalidResponse)?;
+            let stream = timeout(self.deadlines.connect, UnixStream::connect(&self.socket))
+                .await
+                .map_err(|_| {
+                    Unavailable(ToolError::Rpc(
+                        "executor connection deadline elapsed".into(),
+                    ))
+                })?
+                .map_err(|error| {
+                    Unavailable(ToolError::Rpc(format!(
+                        "executor connection failed: {error}"
+                    )))
+                })?;
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            write_with_deadline(&mut write, &encoded, self.deadlines.write, "health request")
+                .await
+                .map_err(Unavailable)?;
+            let line = timeout(self.deadlines.frame, read_bounded_line(&mut read))
+                .await
+                .map_err(|_| {
+                    Unavailable(indeterminate("executor response frame deadline elapsed"))
+                })?
+                .map_err(|error| match error {
+                    ToolError::Io(_) | ToolError::Rpc(_) => Unavailable(error),
+                    _ => InvalidResponse(error),
+                })?
+                .ok_or_else(|| {
+                    Unavailable(indeterminate("executor closed before health response"))
+                })?;
+            match decode_rpc_frame::<ExecutorResponse>(&line, &self.identity)
+                .map_err(InvalidResponse)?
+            {
+                RpcFrame::Terminal {
+                    request_id: received_id,
+                    result,
+                    ..
+                } if received_id == request_id => match result
+                    .map_err(|error| InvalidResponse(map_rpc_error(&operation, error)))?
+                {
+                    ExecutorResponse::Healthy {
+                        service_role: ExecutorServiceRole::ToolExecutor,
+                    } => Ok(()),
+                    _ => Err(InvalidResponse(ToolError::Protocol(
+                        "executor health returned a non-health response".into(),
+                    ))),
+                },
+                _ => Err(InvalidResponse(ToolError::Protocol(
+                    "executor health response identity or type mismatch".into(),
+                ))),
+            }?;
+            shutdown_with_deadline(&mut write, self.deadlines.write)
+                .await
+                .map_err(Unavailable)?;
+            let trailing = timeout(self.deadlines.frame, read_bounded_line(&mut read))
+                .await
+                .map_err(|_| {
+                    Unavailable(indeterminate("executor health completion deadline elapsed"))
+                })?
+                .map_err(|error| match error {
+                    ToolError::Io(ref cause)
+                        if cause.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        InvalidResponse(ToolError::Protocol(
+                            "executor emitted trailing bytes after health terminal".into(),
+                        ))
+                    }
+                    ToolError::Io(_) | ToolError::Rpc(_) => Unavailable(error),
+                    _ => InvalidResponse(error),
+                })?;
+            if trailing.is_some() {
+                return Err(InvalidResponse(ToolError::Protocol(
+                    "executor emitted a response after health terminal".into(),
+                )));
+            }
+            Ok(())
+        };
+        // Dropping a Health connection is safe even after emission: it cannot
+        // mutate anything and no synthetic Cancel operation is sent.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Unavailable(ToolError::Cancelled)),
+            result = timeout(overall, exchange) => result.unwrap_or_else(|_| {
+                Err(Unavailable(indeterminate("executor overall exchange deadline elapsed")))
+            }),
         }
     }
 
@@ -877,9 +980,10 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
             return if line.is_empty() {
                 Ok(None)
             } else {
-                Err(ToolError::Protocol(
-                    "executor response ended before newline".to_owned(),
-                ))
+                Err(ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "executor response ended before newline",
+                )))
             };
         }
         let separator = buffer.iter().position(|byte| matches!(byte, b'\n' | b'\r'));
@@ -1686,18 +1790,24 @@ mod tests {
             let mut deadlines = test_deadlines();
             deadlines.frame = Duration::from_millis(80);
             deadlines.overall = Duration::from_millis(250);
-            let error = ExecutorClient::new(&socket, identity())
+            let failure = ExecutorClient::new(&socket, identity())
                 .with_deadlines(deadlines)
-                .health()
+                .probe_health(CancellationToken::new(), deadlines.overall)
                 .await
                 .expect_err("untrusted health endpoint");
-            if mode == "rpc-error" {
-                assert!(matches!(error, ToolError::Protocol(_)), "{mode}: {error:?}");
-            } else {
+            assert_eq!(
+                failure.is_unavailable(),
+                matches!(mode, "stalled" | "eof"),
+                "{mode}: {failure:?}"
+            );
+            let error = failure.into_tool_error();
+            if matches!(mode, "stalled" | "eof") {
                 assert!(
                     matches!(error, ToolError::RpcIndeterminate(_)),
                     "{mode}: {error:?}"
                 );
+            } else {
+                assert!(matches!(error, ToolError::Protocol(_)), "{mode}: {error:?}");
             }
             server.await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
@@ -2086,6 +2196,46 @@ mod tests {
             assert!(result.is_err(), "{label} must be refused");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_transport_truncation_and_cancellation_close_without_cancel_frames() {
+        for cancel_after_request in [false, true] {
+            let root = temp_root("health-interrupted");
+            let socket = root.join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let cancel = CancellationToken::new();
+            let server_cancel = cancel.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let request = read_request(&mut read).await;
+                assert_eq!(request["operation"]["type"], "health");
+                if cancel_after_request {
+                    server_cancel.cancel();
+                    let mut trailing = String::new();
+                    assert_eq!(read.read_line(&mut trailing).await.unwrap(), 0);
+                } else {
+                    write.write_all(b"{\"type\":\"terminal\"").await.unwrap();
+                }
+            });
+            let failure = ExecutorClient::new(&socket, identity())
+                .probe_health(cancel, Duration::from_millis(100))
+                .await
+                .unwrap_err();
+            assert!(failure.is_unavailable(), "{failure:?}");
+            let error = failure.into_tool_error();
+            if cancel_after_request {
+                assert!(matches!(error, ToolError::Cancelled));
+            } else {
+                assert!(
+                    matches!(error, ToolError::Io(cause) if cause.kind() == std::io::ErrorKind::UnexpectedEof)
+                );
+            }
+            server.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

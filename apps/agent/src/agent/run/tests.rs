@@ -83,6 +83,7 @@ fn executor_authority_capacity_fail_stops_generation_but_one_shot_replay_does_no
 
 #[derive(Clone)]
 enum Script {
+    RetryAfter(Box<AssistantMessage>, Duration),
     Output(Box<AssistantMessage>),
     Events(Vec<ProviderEvent>),
     StartFailure(&'static str),
@@ -222,6 +223,14 @@ impl RunDriver for FixtureDriver {
             .pop_front()
             .expect("provider script");
         match script {
+            Script::RetryAfter(message, delay) => {
+                let mut attempt = provider_attempt(attempt, *message);
+                let hint = Arc::new(std::sync::OnceLock::new());
+                hint.set(RetryAfter::NotBefore(tokio::time::Instant::now() + delay))
+                    .unwrap();
+                attempt.events = attempt.events.with_retry_after(hint);
+                Ok(attempt)
+            }
             Script::Output(message) => Ok(provider_attempt(attempt, *message)),
             Script::Events(events) => Ok(provider_attempt_from_events(attempt, events)),
             Script::StartFailure(error) => Err(anyhow!(error)),
@@ -2622,6 +2631,89 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn server_retry_after_controls_do_not_resend_before_deadline() {
+    for kind in ["command", "hard", "soft", "retry"] {
+        let driver = Arc::new(
+            FixtureDriver::new(vec![
+                Script::RetryAfter(
+                    Box::new(assistant(
+                        StopReason::Error,
+                        Vec::new(),
+                        Some("429: overloaded"),
+                        Some("http_429"),
+                    )),
+                    Duration::from_secs(120),
+                ),
+                output(assistant(StopReason::Stop, Vec::new(), None, None)),
+            ])
+            .blocking_retry(),
+        );
+        let worker = SequentialRunWorker::new(driver.clone());
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let completion = tokio::spawn(async move {
+            worker
+                .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+                .await
+        });
+        let collector = tokio::spawn(async move {
+            let mut message_seq = 1;
+            while let Some(mut output) = events_rx.recv().await {
+                resolve_message_output(&mut output, &mut message_seq);
+                if let Some(barrier) = output.commit_barrier.take() {
+                    barrier.committed();
+                }
+            }
+        });
+        driver.retry_waiting.notified().await;
+        if kind == "command" {
+            control_tx
+                .send(RunControl::Command(admitted_user(2)))
+                .await
+                .unwrap();
+        } else {
+            let (accepted, accepted_rx) = oneshot::channel();
+            let (committed_tx, committed) = oneshot::channel();
+            let control = match kind {
+                "hard" => RunControl::HardSteer {
+                    command: admitted_user(2),
+                    accepted,
+                },
+                "soft" => RunControl::SoftSteer {
+                    command: admitted_user(2),
+                    accepted,
+                    committed,
+                },
+                _ => RunControl::RetrySteer {
+                    command: admitted_user(2),
+                    accepted,
+                    committed,
+                },
+            };
+            control_tx.send(control).await.unwrap();
+            assert!(accepted_rx.await.unwrap());
+            if kind != "hard" {
+                committed_tx.send(()).unwrap();
+            }
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(driver.started_contexts.lock().unwrap().len(), 1, "{kind}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_completed(completion.await.unwrap());
+        collector.await.unwrap();
+        let contexts = driver.started_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2, "{kind}");
+        assert_eq!(
+            contexts[1].len(),
+            2,
+            "one copy of each user message: {kind}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stale_retry_steer_acceptance_releases_exact_claim_without_loss_or_duplicate() {
     let driver = Arc::new(
@@ -4948,8 +5040,11 @@ async fn runtime_shutdown_interrupts_retry_wait_phase() {
         control_rx,
         events_tx,
     );
-    let task =
-        tokio::spawn(async move { runner.wait_retry_or_control(Duration::from_secs(30)).await });
+    let task = tokio::spawn(async move {
+        runner
+            .wait_retry_or_control(Duration::from_secs(30), None)
+            .await
+    });
 
     driver.retry_waiting.notified().await;
     shutdown.cancel();

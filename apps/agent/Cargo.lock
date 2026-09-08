@@ -2359,6 +2359,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hmac",
+ "httpdate",
  "jsonschema",
  "libc",
  "libsqlite3-sys",

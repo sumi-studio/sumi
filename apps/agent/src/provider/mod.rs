@@ -95,6 +95,7 @@ pub enum NativeCompactionError {
 }
 
 struct ProducerChannels {
+    retry_after: Arc<OnceLock<retry::RetryAfter>>,
     normal: mpsc::Sender<ProviderEvent>,
     priority_terminal: mpsc::Sender<ProviderEvent>,
     ordered_prefix_drain: Option<mpsc::Sender<()>>,
@@ -443,6 +444,8 @@ fn stream_chat_with_api_key(
         model = %spec.id,
         protocol = "open_ai_chat_completions"
     );
+    let retry_after = Arc::new(OnceLock::new());
+    let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
         async move {
             run_chat_stream(
@@ -452,6 +455,7 @@ fn stream_chat_with_api_key(
                 stream_cancel,
                 api_key,
                 ProducerChannels {
+                    retry_after: producer_retry_after,
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     ordered_prefix_drain: None,
@@ -472,6 +476,7 @@ fn stream_chat_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .with_retry_after(retry_after)
     .own_producer(producer_task)
 }
 
@@ -501,6 +506,8 @@ fn stream_responses_with_api_key(
         model = %spec.id,
         protocol = "open_ai_responses"
     );
+    let retry_after = Arc::new(OnceLock::new());
+    let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
         async move {
             run_responses_stream(
@@ -510,6 +517,7 @@ fn stream_responses_with_api_key(
                 stream_cancel,
                 api_key,
                 ProducerChannels {
+                    retry_after: producer_retry_after,
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     ordered_prefix_drain: Some(ordered_prefix_drain_tx),
@@ -531,6 +539,7 @@ fn stream_responses_with_api_key(
         success_terminal_committed,
     )
     .with_ordered_prefix_drain(ordered_prefix_drain_rx)
+    .with_retry_after(retry_after)
     .own_producer(producer_task)
 }
 
@@ -559,6 +568,8 @@ fn stream_anthropic_with_api_key(
         model = %spec.id,
         protocol = "anthropic_messages"
     );
+    let retry_after = Arc::new(OnceLock::new());
+    let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
         async move {
             run_anthropic_stream(
@@ -568,6 +579,7 @@ fn stream_anthropic_with_api_key(
                 stream_cancel,
                 api_key,
                 ProducerChannels {
+                    retry_after: producer_retry_after,
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     ordered_prefix_drain: None,
@@ -588,6 +600,7 @@ fn stream_anthropic_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .with_retry_after(retry_after)
     .own_producer(producer_task)
 }
 
@@ -600,6 +613,7 @@ async fn run_anthropic_stream(
     channels: ProducerChannels,
 ) {
     let ProducerChannels {
+        retry_after,
         normal: tx,
         priority_terminal: priority_terminal_tx,
         ordered_prefix_drain: _,
@@ -820,6 +834,9 @@ async fn run_anthropic_stream(
         match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
             Ok(transport) => transport,
             Err(error) => {
+                if let Some(hint) = error.retry_after() {
+                    let _ = retry_after.set(hint);
+                }
                 let cancelled = matches!(error, SseError::Cancelled) || cancel.is_cancelled();
                 if cancelled {
                     finish_failure_with_context(
@@ -999,6 +1016,7 @@ async fn run_responses_stream(
     channels: ProducerChannels,
 ) {
     let ProducerChannels {
+        retry_after,
         normal: tx,
         priority_terminal: priority_terminal_tx,
         ordered_prefix_drain,
@@ -1186,6 +1204,9 @@ async fn run_responses_stream(
         match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
             Ok(transport) => transport,
             Err(error) => {
+                if let Some(hint) = error.retry_after() {
+                    let _ = retry_after.set(hint);
+                }
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1353,6 +1374,7 @@ async fn run_chat_stream(
     channels: ProducerChannels,
 ) {
     let ProducerChannels {
+        retry_after,
         normal: tx,
         priority_terminal: priority_terminal_tx,
         ordered_prefix_drain: _,
@@ -1546,6 +1568,9 @@ async fn run_chat_stream(
         match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
             Ok(transport) => transport,
             Err(error) => {
+                if let Some(hint) = error.retry_after() {
+                    let _ = retry_after.set(hint);
+                }
                 let cancelled = matches!(error, SseError::Cancelled) || cancel.is_cancelled();
                 let code = transport_error_code(&error);
                 finish_failure(
@@ -4411,6 +4436,72 @@ fi
             complete_snapshot_digest(&events),
             "69a1e7c2a9312f5c121694947b8058475bb5a06a13651605d15b21187a79c3a0"
         );
+    }
+
+    #[tokio::test]
+    async fn http_retry_after_reaches_each_provider_stream_and_cancelable_wait() {
+        for protocol in [
+            types::ApiProtocol::OpenAiChatCompletions,
+            types::ApiProtocol::OpenAiResponses,
+            types::ApiProtocol::AnthropicMessages,
+        ] {
+            let app = Router::new().fallback(|| async {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("retry-after", "120")
+                    .body(Body::from("temporarily overloaded"))
+                    .unwrap()
+            });
+            let (base_url, server) = serve_router(app).await;
+            let mut spec = ModelSpec::preset(match protocol {
+                types::ApiProtocol::OpenAiChatCompletions => "kimi-k3",
+                types::ApiProtocol::OpenAiResponses => "openai-responses",
+                types::ApiProtocol::AnthropicMessages => "anthropic",
+            })
+            .unwrap();
+            spec.base_url = base_url;
+            let mut stream = stream_with_api_key(
+                spec,
+                persisted_context(1),
+                RequestOptions::default(),
+                CancellationToken::new(),
+                Some("test-key".into()),
+            );
+            let mut terminal = None;
+            while let Some(event) = stream.recv().await {
+                terminal = Some(event);
+            }
+            server.abort();
+            let Some(ProviderEvent::Error { output, .. }) = terminal else {
+                panic!("expected HTTP failure for {protocol:?}")
+            };
+            assert_eq!(
+                output.message.provider_code.as_deref(),
+                Some("http_429"),
+                "{protocol:?}: {:?}",
+                output.message.error_message
+            );
+            assert!(retry::is_retryable(&output.message));
+            let hint = stream
+                .retry_after()
+                .expect("server scheduling hint survives terminal");
+            let Some(delay) = retry::retry_delay_with_server(0, Some(hint)) else {
+                panic!("bounded retry")
+            };
+            assert!(delay > Duration::from_secs(110) && delay <= Duration::from_secs(120));
+            // Pause only after real HTTP I/O; no network timeout is advanced virtually.
+            tokio::time::pause();
+            let cancel = CancellationToken::new();
+            let wait_cancel = cancel.clone();
+            let waiting =
+                tokio::spawn(async move { retry::sleep_or_cancel(delay, &wait_cancel).await });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(109)).await;
+            assert!(!waiting.is_finished());
+            cancel.cancel();
+            assert!(!waiting.await.unwrap());
+            tokio::time::resume();
+        }
     }
 
     #[tokio::test]

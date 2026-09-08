@@ -89,6 +89,19 @@ type DirectChatSpawner interface {
 	Touch(agentID string)
 }
 
+// holdRuntimeAdmission coordinates the production idle reaper with durable
+// append. External/test spawners without an idle reaper need no such hold.
+func holdRuntimeAdmission(spawner DirectChatSpawner, agentID string) (func(), error) {
+	if holder, ok := spawner.(interface{ HoldAdmission(string) (func(), error) }); ok {
+		release, err := holder.HoldAdmission(agentID)
+		if err != nil {
+			return nil, errBrowserRuntimeUnavailable
+		}
+		return release, nil
+	}
+	return func() {}, nil
+}
+
 // StaticIdentityBindingResolver is the deliberately narrow hackathon binding:
 // exactly one configured Firebase UID maps to exactly one server-owned Sumi
 // principal. Every other external identity is denied.

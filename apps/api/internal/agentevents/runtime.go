@@ -1797,6 +1797,39 @@ func (g *DurableGateway) EnsureAgentSessionStateRebuilt(ctx context.Context, per
 	return nil
 }
 
+// ClaimIdleRuntime excludes durable event publication while the manager
+// reserves its stop. Lock order is gateway.mu -> manager.mu; process stopping
+// must happen only after this method returns. Browser admission touches/ensures
+// the manager before appending a command, so the manager also rechecks activity.
+func (g *DurableGateway) ClaimIdleRuntime(ctx context.Context, personalityAgentID string, claim func() bool) (bool, error) {
+	if err := g.EnsureAgentSessionStateRebuilt(ctx, personalityAgentID); err != nil {
+		return false, err
+	}
+	// ACK publication locks its file before gateway.mu. Inspect commands first
+	// to preserve that order. Admissions after this snapshot are excluded by
+	// the manager's hold/revision check when claim reserves the stop.
+	next, err := g.NextCommandSeq(ctx, TokenClaims{PersonalityAgentID: personalityAgentID})
+	if err != nil {
+		return false, err
+	}
+	snapshot, err := g.commands.commandSnapshot(ctx, personalityAgentID)
+	if err != nil {
+		return false, err
+	}
+	if next != snapshot.nextSeq {
+		return false, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stateMu.RLock()
+	busy := g.runInFlight[personalityAgentID]
+	g.stateMu.RUnlock()
+	if busy {
+		return false, nil
+	}
+	return claim(), nil
+}
+
 // IsRunInFlight reports whether a durable agent_start has not yet been closed
 // by agent_end. It is used by the browser command guard to reject meaningless
 // aborts without closing the window during tool execution, continuation calls,

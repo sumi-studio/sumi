@@ -86,7 +86,10 @@ type Config struct {
 	SharedNonce     string
 	IdleTimeout     time.Duration // cold-mode idle stop delay; 0 disables auto-stop
 	ShutdownTimeout time.Duration // bound for in-flight starts during StopAll; 0 uses 5s
-	Now             func() time.Time
+	// ClaimIdle holds the activity source's lock while claim reserves an idle
+	// stop. claim only takes Manager.mu; neither callback may stop a process.
+	ClaimIdle func(agentID string, claim func() bool) (bool, error)
+	Now       func() time.Time
 	// SkipAgentIDs are agents already managed externally (e.g. the legacy
 	// single-process dev agent). EnsureRunning is a no-op for them.
 	SkipAgentIDs []string
@@ -107,9 +110,11 @@ type Manager struct {
 }
 
 type agentRuntime struct {
-	process    Process
-	lastActive time.Time
-	warmth     string
+	process          Process
+	lastActive       time.Time
+	warmth           string
+	activityRevision uint64
+	admissions       uint64
 }
 
 type startAttempt struct {
@@ -183,6 +188,7 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 		}
 		if rt, ok := m.running[agentID]; ok {
 			rt.lastActive = m.now()
+			rt.activityRevision++
 			m.mu.Unlock()
 			return nil
 		}
@@ -288,6 +294,7 @@ func (m *Manager) Touch(agentID string) {
 	defer m.mu.Unlock()
 	if rt, ok := m.running[agentID]; ok {
 		rt.lastActive = m.now()
+		rt.activityRevision++
 	}
 }
 
@@ -297,6 +304,33 @@ func (m *Manager) Running(agentID string) bool {
 	defer m.mu.Unlock()
 	_, ok := m.running[agentID]
 	return ok
+}
+
+// HoldAdmission protects an already-running generation across durable command
+// append. If idle reclamation won first, callers must reject before appending.
+func (m *Manager) HoldAdmission(agentID string) (func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.skip[agentID] {
+		return func() {}, nil
+	}
+	rt := m.running[agentID]
+	if m.closing || rt == nil || m.stopping[agentID] != nil {
+		return nil, errors.New("runtime is not available for admission")
+	}
+	rt.admissions++
+	rt.activityRevision++
+	rt.lastActive = m.now()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			rt.admissions--
+			rt.lastActive = m.now()
+			rt.activityRevision++
+		})
+	}, nil
 }
 
 // Stop terminates a running agent.
@@ -335,29 +369,72 @@ func (m *Manager) Stop(agentID string) error {
 	}
 }
 
-// StopIdleCold stops any running cold-mode agent that has been idle longer than
-// the configured IdleTimeout. Warm-mode agents are never stopped. Returns the
-// agent ids that were stopped.
-func (m *Manager) StopIdleCold() []string {
+// StopIdleCold reserves each idle stop atomically with runtime activity, then
+// stops outside all activity/manager locks. Only successful stops are reported.
+func (m *Manager) StopIdleCold() ([]string, error) {
 	if m.idleStop <= 0 {
-		return nil
+		return nil, nil
 	}
-	now := m.now()
-	var stopped []string
 	m.mu.Lock()
-	for agentID, rt := range m.running {
-		if rt.warmth == WarmthWarm {
-			continue
-		}
-		if now.Sub(rt.lastActive) >= m.idleStop {
-			stopped = append(stopped, agentID)
+	type candidate struct {
+		runtime  *agentRuntime
+		revision uint64
+	}
+	candidates := make(map[string]candidate)
+	for id, rt := range m.running {
+		if rt.warmth != WarmthWarm && m.now().Sub(rt.lastActive) >= m.idleStop {
+			candidates[id] = candidate{rt, rt.activityRevision}
 		}
 	}
 	m.mu.Unlock()
-	for _, agentID := range stopped {
-		_ = m.Stop(agentID)
+	var stopped []string
+	var failures []error
+	for id, selected := range candidates {
+		rt := selected.runtime
+		var attempt *stopAttempt
+		claim := func() bool {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if m.closing || m.running[id] != rt || m.stopping[id] != nil || rt.admissions != 0 || rt.activityRevision != selected.revision ||
+				m.now().Sub(rt.lastActive) < m.idleStop {
+				return false
+			}
+			attempt = &stopAttempt{done: make(chan struct{})}
+			m.stopping[id] = attempt
+			return true
+		}
+		var claimed bool
+		var err error
+		if m.cfg.ClaimIdle != nil {
+			claimed, err = m.cfg.ClaimIdle(id, claim)
+		} else {
+			claimed = claim()
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("inspect idle agent %s: %w", id, err))
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		err = rt.process.Stop()
+		m.mu.Lock()
+		attempt.err = err
+		// On failure, retain the runtime for a later stop/inspection. Its Wait
+		// watcher independently removes it if the process actually exited.
+		if err == nil && m.running[id] == rt {
+			delete(m.running, id)
+		}
+		delete(m.stopping, id)
+		close(attempt.done)
+		m.mu.Unlock()
+		if err != nil {
+			failures = append(failures, fmt.Errorf("stop idle agent %s: %w", id, err))
+		} else {
+			stopped = append(stopped, id)
+		}
 	}
-	return stopped
+	return stopped, errors.Join(failures...)
 }
 
 // Warmth returns the warmth setting of a running agent, or "" if not running.

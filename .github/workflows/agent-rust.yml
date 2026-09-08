@@ -1,0 +1,38 @@
+name: Agent Rust regressions
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  agent-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    defaults:
+      run:
+        working-directory: apps/agent
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install the supported Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +1.88.0 fmt --all -- --check
+
+      - name: Run agent regressions
+        run: cargo +1.88.0 test --locked --bin sumi-agent -- --test-threads=2
+
+      # Actual-image Docker and real-provider scenarios are separate opt-in
+      # acceptance checks. A passing unit job does not claim they ran here.

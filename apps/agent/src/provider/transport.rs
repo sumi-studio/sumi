@@ -1,8 +1,14 @@
-use std::{collections::VecDeque, pin::Pin, time::Duration};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    time::{Duration, SystemTime},
+};
 
 use futures_util::{Stream, StreamExt};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+use super::retry::{MAX_SERVER_RETRY_WAIT, RetryAfter};
 
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
@@ -19,7 +25,11 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SseError {
     #[error("{status}: {body}")]
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+        retry_after: Option<RetryAfter>,
+    },
     #[error("SSE transport error: {0}")]
     Transport(String),
     #[error("SSE stream was idle for {seconds} seconds")]
@@ -38,6 +48,41 @@ pub enum SseError {
     ResponseTooLong { limit: usize },
     #[error("SSE stream ended before the current event was terminated")]
     UnexpectedEof,
+}
+
+// RFC 9110 section 10.2.3. A syntactically valid but enormous delay must
+// suppress automatic retries, not become a malformed-header fallback.
+fn parse_retry_after(
+    value: &str,
+    wall: SystemTime,
+    monotonic: tokio::time::Instant,
+) -> Option<RetryAfter> {
+    let value = value.trim();
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        match value.parse::<u64>() {
+            Ok(seconds) => Duration::from_secs(seconds),
+            Err(_) => return Some(RetryAfter::BeyondAutomaticWait),
+        }
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(wall)
+            .unwrap_or_default()
+    };
+    Some(if delay > MAX_SERVER_RETRY_WAIT {
+        RetryAfter::BeyondAutomaticWait
+    } else {
+        RetryAfter::NotBefore(monotonic + delay)
+    })
+}
+
+impl SseError {
+    pub(crate) fn retry_after(&self) -> Option<RetryAfter> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +107,14 @@ impl SseStream {
         max_wire_bytes: usize,
     ) -> Result<Self, SseError> {
         let status = response.status();
+        // Capture both clocks at header receipt; reading an error body may take time.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                parse_retry_after(value, SystemTime::now(), tokio::time::Instant::now())
+            });
         let bytes = response.bytes_stream().map(|chunk| {
             chunk
                 .map(|bytes| bytes.to_vec())
@@ -74,6 +127,7 @@ impl SseStream {
             return Err(SseError::Http {
                 status: status.as_u16(),
                 body,
+                retry_after,
             });
         }
 
@@ -455,6 +509,41 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_parses_http_dates_seconds_and_bounded_delays() {
+        let wall = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let now = tokio::time::Instant::now();
+        for header in [
+            "120",
+            "Sun, 06 Nov 1994 08:51:37 GMT",
+            "Sunday, 06-Nov-94 08:51:37 GMT",
+            "Sun Nov  6 08:51:37 1994",
+        ] {
+            assert_eq!(
+                parse_retry_after(header, wall, now),
+                Some(RetryAfter::NotBefore(now + Duration::from_secs(120))),
+                "{header}"
+            );
+        }
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:36 GMT", wall, now),
+            Some(RetryAfter::NotBefore(now))
+        );
+        for header in ["", "-1", "+1", "1.5", "tomorrow", "1, 2"] {
+            assert_eq!(parse_retry_after(header, wall, now), None, "{header}");
+        }
+        for header in [
+            "301",
+            "999999999999999999999999999999",
+            "Sun, 06 Nov 1994 09:49:37 GMT",
+        ] {
+            assert_eq!(
+                parse_retry_after(header, wall, now),
+                Some(RetryAfter::BeyondAutomaticWait)
+            );
+        }
+    }
+
+    #[test]
     fn joins_multiple_data_lines_at_blank_line() {
         let events = parser_events([b"data: one\r\ndata: two\n\n".as_slice()]).expect("valid SSE");
         assert_eq!(
@@ -755,7 +844,11 @@ mod tests {
         );
         assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
 
-        let error = SseError::Http { status: 429, body };
+        let error = SseError::Http {
+            status: 429,
+            body,
+            retry_after: None,
+        };
         assert!(error.to_string().starts_with("429: "));
     }
 
@@ -852,6 +945,7 @@ mod tests {
         assert!(first.ends_with("... [truncated]]"));
 
         let error = SseError::Http {
+            retry_after: None,
             status: 503,
             body: first,
         };
