@@ -1213,6 +1213,7 @@ async fn run_after_not_ready(
                 Arc::new(ProviderExecutionReviewerTransport::new(
                     execution_reviewer_spec,
                     reviewer_tools.clone(),
+                    context.authority.personality_agent_id().to_string(),
                 )),
                 ReviewerBudgetV1::execution(),
             )
@@ -1225,6 +1226,7 @@ async fn run_after_not_ready(
                 Arc::new(ProviderEscalationReviewerTransport::new(
                     escalation_reviewer_spec,
                     reviewer_tools,
+                    context.authority.personality_agent_id().to_string(),
                 )),
                 ReviewerBudgetV1::escalation(),
             )
@@ -1249,6 +1251,7 @@ async fn run_after_not_ready(
                 escalation_objection_model,
                 Arc::new(ProviderEscalationObjectionResponderTransport::new(
                     model_spec.clone(),
+                    context.authority.personality_agent_id().to_string(),
                 )),
                 ReviewerBudgetV1::escalation(),
                 personality_agent_context.clone(),
@@ -1266,7 +1269,10 @@ async fn run_after_not_ready(
         );
         let driver = InjectedRunDriver::new(
             model_spec,
-            RequestOptions::default(),
+            RequestOptions {
+                session_id: Some(context.authority.personality_agent_id().to_string()),
+                ..RequestOptions::default()
+            },
             Some(prompt),
             Some(registry),
             Some(workspace),

@@ -1108,15 +1108,25 @@ pub trait EscalationObjectionResponderTransport: Send + Sync {
 /// Production transport for Execution AutoReview. Its concrete type stays
 /// separate from the escalation transport even when both use one provider.
 pub struct ProviderExecutionReviewerTransport {
+    session_id: String,
     spec: ModelSpec,
     model: ReviewerModelSpec,
     tools: Arc<ReviewerToolRuntime>,
 }
 
 impl ProviderExecutionReviewerTransport {
-    pub(crate) fn new(spec: ModelSpec, tools: Arc<ReviewerToolRuntime>) -> Self {
+    pub(crate) fn new(
+        spec: ModelSpec,
+        tools: Arc<ReviewerToolRuntime>,
+        session_id: String,
+    ) -> Self {
         let model = ReviewerModelSpec::from_provider(&spec);
-        Self { spec, model, tools }
+        Self {
+            spec,
+            model,
+            tools,
+            session_id,
+        }
     }
 }
 
@@ -1134,6 +1144,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
             &self.spec,
+            &self.session_id,
             ReviewerKind::Execution,
             Some(self.tools.as_ref()),
             prompt.system,
@@ -1147,15 +1158,25 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
 }
 
 pub struct ProviderEscalationReviewerTransport {
+    session_id: String,
     spec: ModelSpec,
     model: ReviewerModelSpec,
     tools: Arc<ReviewerToolRuntime>,
 }
 
 impl ProviderEscalationReviewerTransport {
-    pub(crate) fn new(spec: ModelSpec, tools: Arc<ReviewerToolRuntime>) -> Self {
+    pub(crate) fn new(
+        spec: ModelSpec,
+        tools: Arc<ReviewerToolRuntime>,
+        session_id: String,
+    ) -> Self {
         let model = ReviewerModelSpec::from_provider(&spec);
-        Self { spec, model, tools }
+        Self {
+            spec,
+            model,
+            tools,
+            session_id,
+        }
     }
 }
 
@@ -1173,6 +1194,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
             &self.spec,
+            &self.session_id,
             ReviewerKind::Escalation,
             Some(self.tools.as_ref()),
             prompt.system,
@@ -1186,14 +1208,19 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
 }
 
 pub struct ProviderEscalationObjectionResponderTransport {
+    session_id: String,
     spec: ModelSpec,
     model: ReviewerModelSpec,
 }
 
 impl ProviderEscalationObjectionResponderTransport {
-    pub(crate) fn new(spec: ModelSpec) -> Self {
+    pub(crate) fn new(spec: ModelSpec, session_id: String) -> Self {
         let model = ReviewerModelSpec::from_provider(&spec);
-        Self { spec, model }
+        Self {
+            spec,
+            model,
+            session_id,
+        }
     }
 }
 
@@ -1210,6 +1237,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
             &self.spec,
+            &self.session_id,
             ReviewerKind::Escalation,
             None,
             &prompt.system,
@@ -1232,6 +1260,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
 )]
 async fn complete_provider_review(
     spec: &ModelSpec,
+    session_id: &str,
     reviewer: ReviewerKind,
     tools: Option<&ReviewerToolRuntime>,
     system: &str,
@@ -1246,7 +1275,7 @@ async fn complete_provider_review(
     } else {
         tools.map_or_else(Vec::new, ReviewerToolRuntime::definitions)
     };
-    let (mut context, options) = build_provider_review_request(
+    let (mut context, mut options) = build_provider_review_request(
         spec,
         system,
         output_schema,
@@ -1254,6 +1283,7 @@ async fn complete_provider_review(
         &tool_definitions,
         structured_retry,
     )?;
+    options.session_id = Some(session_id.to_owned());
     let mut trace = Vec::new();
     loop {
         let mut events = stream(

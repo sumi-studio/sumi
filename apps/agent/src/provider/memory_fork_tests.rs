@@ -253,6 +253,7 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         spec.base_url = base_url.clone();
         spec.account_scope = "parent-wire-test".into();
         let options = RequestOptions {
+            session_id: Some("019927a0-0000-7000-8000-000000000001".to_owned()),
             max_tokens: Some(8192),
             temperature: Some(0.2),
             tool_choice: Some(json!("auto")),
