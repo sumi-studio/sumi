@@ -53,6 +53,9 @@ fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
     });
     let messages = [
         Message::User(UserMessage {
+            incoming_timing: Some(IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![
                 UserContent::Text {
                     text: "Original source".into(),
@@ -87,10 +90,16 @@ fn parent_prompt(spec: &ModelSpec, native: bool) -> PromptContext {
             timestamp,
         }),
         Message::User(UserMessage {
+            incoming_timing: Some(IncomingEventTiming {
+                previous_receipt: Some(IncomingEventReceipt {
+                    received_at: timestamp,
+                    command_seq: 10,
+                }),
+            }),
             content: vec![UserContent::Text {
                 text: "Latest correction outside the edit target".into(),
             }],
-            timestamp,
+            timestamp: timestamp + chrono::Duration::seconds(125),
         }),
     ]
     .into_iter()
@@ -269,6 +278,7 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         let snapshot = ParentContextSnapshot::capture(&prompt, &spec, &options);
         let fork = snapshot
             .fork_with_directive(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: DIRECTIVE.into(),
                 }],
@@ -357,6 +367,9 @@ async fn memory_fork_keeps_parent_context_on_the_actual_provider_wire() {
         let encoded = serde_json::to_string(parent_items).unwrap();
         assert!(encoded.contains(IMAGE), "parent image must reach the wire");
         assert!(encoded.contains("Latest correction outside the edit target"));
+        assert_eq!(encoded.matches("Incoming event receipt:").count(), 2);
+        assert!(encoded.contains("received_at_utc=2026-09-07T23:40:12.123456789Z"));
+        assert!(encoded.contains("receipt_clock_delta_ms=+125000"));
         assert_eq!(encoded.contains("opaque-parent-window"), native);
         let (call_id, arguments) = match spec.protocol {
             ApiProtocol::OpenAiChatCompletions => {

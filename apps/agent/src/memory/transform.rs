@@ -409,6 +409,7 @@ fn flush_orphan_result(
     };
     result.push(ContextMessage::Synthetic {
         message: Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: ORPHAN_TOOL_RESULT_NOTICE.to_owned(),
             }],
@@ -421,6 +422,7 @@ fn flush_rejections(result: &mut Vec<ContextMessage>, pending: &mut Vec<PendingR
     for pending in pending.drain(..) {
         result.push(ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!(
                         "{REJECTED_TOOL_NOTICE_PREFIX}{}` {REJECTED_TOOL_NOTICE_SUFFIX}",
@@ -543,6 +545,7 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],

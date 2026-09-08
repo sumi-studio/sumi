@@ -309,7 +309,10 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext, system_prompt: &s
     while index < messages.len() {
         match messages[index] {
             Message::User(message) => {
-                let content = convert_user_content(&message.content, spec.supports_images);
+                let mut content = convert_user_content(&message.content, spec.supports_images);
+                if let Some(timing) = message.incoming_timing_text() {
+                    content.insert(0, json!({"type":"text", "text":timing}));
+                }
                 if !content.is_empty() {
                     output.push(json!({"role": "user", "content": content}));
                 }
@@ -2078,6 +2081,7 @@ mod tests {
             ],
             messages: vec![
                 synthetic(Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "read it".to_owned(),
                     }],
@@ -2276,6 +2280,7 @@ mod tests {
 
     fn user_message(text: &str) -> Message {
         Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],
@@ -2482,6 +2487,7 @@ mod tests {
         let spec = ModelSpec::preset("kimi-k3").expect("preset");
         let opencode = ModelSpec::preset("opencode-go").expect("preset");
         let user = Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: "hello".to_owned(),
             }],
@@ -2523,6 +2529,7 @@ mod tests {
             timestamp: Utc::now(),
         });
         let image_user = Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![
                 UserContent::Text {
                     text: "inspect".to_owned(),
@@ -2535,86 +2542,88 @@ mod tests {
             timestamp: Utc::now(),
         });
         json!({
-            "normal": build_request(
-                &spec,
-                &simple_context(vec![user.clone()], vec![]),
-                &RequestOptions::default()
-            ).expect("normal request"),
-            "tool_roundtrip": build_request(
-                &spec,
-                &tool_context,
-                &RequestOptions::default()
-            ).expect("tool roundtrip request"),
-            "thinking_replay": build_request(
-                &spec,
-                &thinking_context,
-                &RequestOptions::default()
-            ).expect("thinking request"),
-            "cross_origin": build_request(
-                &spec,
-                &cross_origin_context,
-                &RequestOptions::default()
-            ).expect("cross-origin request"),
-            "interrupted": build_request(
-                &spec,
-                &simple_context(vec![user, interrupted], vec![]),
-                &RequestOptions::default()
-            ).expect("interrupted request"),
-            "image": build_request(
-                &spec,
-                &simple_context(vec![image_user], vec![]),
-                &RequestOptions::default()
-            ).expect("image request"),
-            "opencode_live_capture_request": build_request(
-                &opencode,
-                &PromptContext {
-                    system_prompt: String::new(),
-                    memory_blocks: vec![],
-                    messages: vec![synthetic(Message::User(UserMessage {
-                        content: vec![UserContent::Text {
-                            text: "Reply with exactly fixture-ok".to_owned(),
-                        }],
-                        timestamp: Utc::now(),
-                    }))],
-                    provider_context: vec![],
-                    tools: vec![],
-                    replay_provenance: None,
-                },
-                &RequestOptions {
-                    max_tokens: Some(64),
-                    ..RequestOptions::default()
-                }
-            ).expect("OpenCode live capture request"),
-            "opencode_tool_live_gate_first_turn": build_request(
-                &opencode,
-                &PromptContext {
-                    system_prompt: "Use the requested tool exactly once.".to_owned(),
-                    memory_blocks: vec![],
-                    messages: vec![synthetic(Message::User(UserMessage {
-                        content: vec![UserContent::Text {
-                            text: "Call echo_value once with value live-smoke-ok.".to_owned(),
-                        }],
-                        timestamp: Utc::now(),
-                    }))],
-                    provider_context: vec![],
-                    tools: vec![ToolDefinition {
-                        name: "echo_value".to_owned(),
-                        description: "Return the supplied value unchanged.".to_owned(),
-                        parameters: json!({
-                            "type":"object",
-                            "properties":{"value":{"type":"string"}},
-                            "required":["value"],
-                            "additionalProperties":false
-                        }),
-                    }],
-                    replay_provenance: None,
-                },
-                &RequestOptions {
-                    max_tokens: Some(4_096),
-                    ..RequestOptions::default()
-                }
-            ).expect("OpenCode live tool gate request")
-        })
+                   "normal": build_request(
+                       &spec,
+                       &simple_context(vec![user.clone()], vec![]),
+                       &RequestOptions::default()
+                   ).expect("normal request"),
+                   "tool_roundtrip": build_request(
+                       &spec,
+                       &tool_context,
+                       &RequestOptions::default()
+                   ).expect("tool roundtrip request"),
+                   "thinking_replay": build_request(
+                       &spec,
+                       &thinking_context,
+                       &RequestOptions::default()
+                   ).expect("thinking request"),
+                   "cross_origin": build_request(
+                       &spec,
+                       &cross_origin_context,
+                       &RequestOptions::default()
+                   ).expect("cross-origin request"),
+                   "interrupted": build_request(
+                       &spec,
+                       &simple_context(vec![user, interrupted], vec![]),
+                       &RequestOptions::default()
+                   ).expect("interrupted request"),
+                   "image": build_request(
+                       &spec,
+                       &simple_context(vec![image_user], vec![]),
+                       &RequestOptions::default()
+                   ).expect("image request"),
+                   "opencode_live_capture_request": build_request(
+                       &opencode,
+                       &PromptContext {
+                           system_prompt: String::new(),
+                           memory_blocks: vec![],
+                           messages: vec![synthetic(Message::User(UserMessage {
+        incoming_timing: None,
+                               content: vec![UserContent::Text {
+                                   text: "Reply with exactly fixture-ok".to_owned(),
+                               }],
+                               timestamp: Utc::now(),
+                           }))],
+                           provider_context: vec![],
+                           tools: vec![],
+                           replay_provenance: None,
+                       },
+                       &RequestOptions {
+                           max_tokens: Some(64),
+                           ..RequestOptions::default()
+                       }
+                   ).expect("OpenCode live capture request"),
+                   "opencode_tool_live_gate_first_turn": build_request(
+                       &opencode,
+                       &PromptContext {
+                           system_prompt: "Use the requested tool exactly once.".to_owned(),
+                           memory_blocks: vec![],
+                           messages: vec![synthetic(Message::User(UserMessage {
+        incoming_timing: None,
+                               content: vec![UserContent::Text {
+                                   text: "Call echo_value once with value live-smoke-ok.".to_owned(),
+                               }],
+                               timestamp: Utc::now(),
+                           }))],
+                           provider_context: vec![],
+                           tools: vec![ToolDefinition {
+                               name: "echo_value".to_owned(),
+                               description: "Return the supplied value unchanged.".to_owned(),
+                               parameters: json!({
+                                   "type":"object",
+                                   "properties":{"value":{"type":"string"}},
+                                   "required":["value"],
+                                   "additionalProperties":false
+                               }),
+                           }],
+                           replay_provenance: None,
+                       },
+                       &RequestOptions {
+                           max_tokens: Some(4_096),
+                           ..RequestOptions::default()
+                       }
+                   ).expect("OpenCode live tool gate request")
+               })
     }
 
     #[test]
@@ -2842,6 +2851,7 @@ mod tests {
     fn opencode_rejects_only_live_proven_unsupported_required_tool_choice() {
         let context = simple_context(
             vec![Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Call read_file.".to_owned(),
                 }],

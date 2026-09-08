@@ -218,7 +218,14 @@ pub fn estimate_text_tokens(text: &str) -> Result<u64, EstimateError> {
 /// content.  Opaque provider context is intentionally absent from this API.
 pub fn estimate_public_message(message: &PublicMessage) -> Result<u64, EstimateError> {
     match message {
-        PublicMessage::User(message) => message.content.iter().try_fold(0, add_user_content),
+        PublicMessage::User(message) => {
+            let timing = message
+                .incoming_timing_text()
+                .map(|text| estimate_text_tokens(&text))
+                .transpose()?
+                .unwrap_or(0);
+            message.content.iter().try_fold(timing, add_user_content)
+        }
         PublicMessage::Assistant(message) => {
             message.content.iter().try_fold(0_u64, |total, content| {
                 let estimate = match content {
@@ -432,6 +439,34 @@ mod tests {
             is_error: false,
             timestamp: chrono::Utc::now(),
         })
+    }
+
+    #[test]
+    fn incoming_receipt_metadata_contributes_to_prompt_budget() {
+        let mut message = crate::provider::types::UserMessage {
+            content: vec![UserContent::Text {
+                text: "hello".into(),
+            }],
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-08T01:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            incoming_timing: None,
+        };
+        let raw = estimate_public_message(&PublicMessage::User(message.clone())).unwrap();
+        message.incoming_timing = Some(crate::provider::types::IncomingEventTiming {
+            previous_receipt: None,
+        });
+        let timed = estimate_public_message(&PublicMessage::User(message.clone())).unwrap();
+        assert!(
+            timed > raw,
+            "visible receipt metadata must not disappear from memory budgets"
+        );
+        assert_eq!(
+            message.content,
+            vec![UserContent::Text {
+                text: "hello".into()
+            }]
+        );
     }
 
     #[test]

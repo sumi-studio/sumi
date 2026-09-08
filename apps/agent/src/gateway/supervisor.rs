@@ -10562,6 +10562,7 @@ mod tests {
                         panic!("active reconnect fixture requires a user message");
                     };
                     let user = PublicMessage::User(UserMessage {
+                        incoming_timing: None,
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });
@@ -10747,6 +10748,7 @@ mod tests {
                         panic!("fixture requires user message");
                     };
                     let user = PublicMessage::User(UserMessage {
+                        incoming_timing: None,
                         content: vec![UserContent::Text { text: text.clone() }],
                         timestamp: initial.received_at(),
                     });

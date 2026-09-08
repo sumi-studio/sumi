@@ -51,6 +51,13 @@ export type UserContent =
       mime_type: string;
     };
 /**
+ * non-negative integer representable exactly by JavaScript number clients
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "JsonSafeInteger".
+ */
+export type JsonSafeInteger = number;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicAssistantContent".
  */
@@ -76,13 +83,6 @@ export type PublicAssistantContent =
       rejected: RejectedToolCall;
       wire_item_index: JsonSafeInteger;
     };
-/**
- * non-negative integer representable exactly by JavaScript number clients
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "JsonSafeInteger".
- */
-export type JsonSafeInteger = number;
 /**
  * any JSON value
  *
@@ -466,6 +466,19 @@ export interface UserMessage {
   role: "user";
   content: UserContent[];
   timestamp: string;
+  incoming_timing?: IncomingEventTiming;
+}
+/**
+ * Server-authored receipt timing; absent for messages without an incoming event.
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "IncomingEventTiming".
+ */
+export interface IncomingEventTiming {
+  previous_receipt: null | {
+    command_seq: JsonSafeInteger;
+    received_at: string;
+  };
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

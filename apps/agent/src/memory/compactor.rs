@@ -179,6 +179,7 @@ impl CompactionInput {
         }
         self.parent
             .fork_with_directive(UserMessage {
+                incoming_timing: None,
                 content,
                 timestamp: Utc::now(),
             })
@@ -1321,6 +1322,7 @@ mod tests {
 
     fn user(text: &str) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text { text: text.into() }],
             timestamp: timestamp(),
         })
@@ -1941,7 +1943,16 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("fixture command received_at");
+        let timing_json: Option<String> = sqlx::query_scalar(
+            "SELECT incoming_timing_json FROM inbound_commands WHERE command_id = ?",
+        )
+        .bind(command_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("fixture timing");
         let user = PublicMessage::User(UserMessage {
+            incoming_timing: timing_json
+                .map(|json| serde_json::from_str(&json).expect("fixture timing json")),
             content: vec![UserContent::Text {
                 text: user_text.to_owned(),
             }],

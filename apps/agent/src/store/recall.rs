@@ -287,6 +287,11 @@ mod tests {
                 .await
                 .unwrap();
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: writer
+                .timing_for_command(&command_id)
+                .await
+                .expect("fixture timing")
+                .1,
             content: vec![UserContent::Text {
                 text: text.to_owned(),
             }],

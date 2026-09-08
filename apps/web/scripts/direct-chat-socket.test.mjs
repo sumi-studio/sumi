@@ -1660,3 +1660,56 @@ test("transport loss keeps an approval pending and resends the same decision and
     );
   });
 });
+
+test("server receipt timing preserves user text and rejects malformed metadata", () => {
+  const text = "朝9時にお願いします。\n  original spacing  ";
+  const frame = (incoming_timing) =>
+    event(1, {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000001",
+      message: {
+        role: "user",
+        content: [{ type: "text", text }],
+        timestamp,
+        incoming_timing,
+      },
+    });
+  for (const previous_receipt of [
+    null,
+    { command_seq: 7, received_at: timestamp },
+  ]) {
+    const parsed = parseDirectChatServerFrame(frame({ previous_receipt }), 0);
+    assert.equal(parsed?.type, "event");
+    const timeline = new DirectChatTimeline();
+    timeline.apply(parsed);
+    assert.equal(timeline.items()[0].text, text);
+  }
+  for (const timing of [
+    null,
+    {},
+    { previous_receipt: null, extra: true },
+    { previous_receipt: { command_seq: null, received_at: timestamp } },
+    { previous_receipt: { command_seq: -1, received_at: timestamp } },
+    {
+      previous_receipt: {
+        command_seq: Number.MAX_SAFE_INTEGER + 1,
+        received_at: timestamp,
+      },
+    },
+    { previous_receipt: { command_seq: 1, received_at: "yesterday" } },
+    { previous_receipt: { command_seq: 1 } },
+    {
+      previous_receipt: { command_seq: 1, received_at: timestamp, extra: true },
+    },
+  ])
+    assert.equal(parseDirectChatServerFrame(frame(timing), 0), undefined);
+  assert.equal(
+    isDirectChatCommand({
+      type: "user_message",
+      text,
+      attachments: [],
+      incoming_timing: { previous_receipt: null },
+    }),
+    false,
+  );
+});

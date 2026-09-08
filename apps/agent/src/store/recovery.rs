@@ -2542,6 +2542,11 @@ pub(crate) mod tests {
                 .await
                 .expect("ToolUse recovery command timestamp");
         let user = PublicMessage::User(UserMessage {
+            incoming_timing: writer
+                .timing_for_command(TOOL_USE_RECOVERY_COMMAND_ID)
+                .await
+                .expect("fixture timing")
+                .1,
             content: vec![UserContent::Text {
                 text: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
             }],

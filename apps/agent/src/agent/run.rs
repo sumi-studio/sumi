@@ -3384,6 +3384,7 @@ impl Runner {
         };
         debug_assert!(attachments.is_empty());
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: command.incoming_timing(),
             content: vec![UserContent::Text { text: text.clone() }],
             timestamp: command.received_at(),
         });

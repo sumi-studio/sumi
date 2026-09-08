@@ -648,6 +648,7 @@ pub(crate) struct AdmittedCommand {
     envelope: CommandEnvelope,
     received_at: DateTime<Utc>,
     received_monotonic: Option<Instant>,
+    incoming_timing: Option<crate::provider::types::IncomingEventTiming>,
 }
 
 impl AdmittedCommand {
@@ -656,6 +657,7 @@ impl AdmittedCommand {
             envelope,
             received_at,
             received_monotonic: None,
+            incoming_timing: None,
         }
     }
 
@@ -668,7 +670,20 @@ impl AdmittedCommand {
             envelope,
             received_at,
             received_monotonic: Some(received_monotonic),
+            incoming_timing: None,
         }
+    }
+
+    pub(crate) fn with_incoming_timing(
+        mut self,
+        timing: Option<crate::provider::types::IncomingEventTiming>,
+    ) -> Self {
+        self.incoming_timing = timing;
+        self
+    }
+
+    pub(crate) fn incoming_timing(&self) -> Option<crate::provider::types::IncomingEventTiming> {
+        self.incoming_timing.clone()
     }
 
     pub(crate) fn envelope(&self) -> &CommandEnvelope {
@@ -1431,6 +1446,7 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = receipt.ack;
         let receipt_origin = receipt.origin;
         let received_at = receipt.received_at;
+        let incoming_timing = receipt.incoming_timing;
         self.enqueue_durable_events(receipt.events).await?;
         self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])
             .await?;
@@ -1456,9 +1472,10 @@ impl<G: Gateway + 'static> Session<G> {
             unreachable!("invalid commands return above");
         };
         let command = if recovered_replay {
-            AdmittedCommand::new(command, received_at)
+            AdmittedCommand::new(command, received_at).with_incoming_timing(incoming_timing)
         } else {
             AdmittedCommand::live(command, received_at, received_monotonic)
+                .with_incoming_timing(incoming_timing)
         };
         if self.active.is_some() {
             if self.route_retry_wait_command(&command).await? {

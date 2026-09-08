@@ -815,12 +815,21 @@ export interface components {
             data: string;
             mime_type: string;
         };
+        /** @description Server-authored receipt timing; absent for messages without an incoming event. */
+        IncomingEventTiming: {
+            previous_receipt: null | {
+                command_seq: components["schemas"]["JsonSafeInteger"];
+                /** Format: date-time */
+                received_at: string;
+            };
+        };
         UserMessage: {
             /** @constant */
             role: "user";
             content: components["schemas"]["UserContent"][];
             /** Format: date-time */
             timestamp: string;
+            incoming_timing?: components["schemas"]["IncomingEventTiming"];
         };
         /** @description any JSON value */
         AnyJSON: {

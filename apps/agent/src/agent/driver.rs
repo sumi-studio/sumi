@@ -1270,6 +1270,7 @@ mod tests {
         });
         let first = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "The comparison uses the earlier draft.".to_owned(),
                 }],
@@ -1287,6 +1288,7 @@ mod tests {
 
         let correction = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Correction: use the updated draft instead.".to_owned(),
                 }],
@@ -1496,6 +1498,7 @@ mod tests {
             },
             ContextMessage::Synthetic {
                 message: Message::User(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "latest active user".to_owned(),
                     }],
@@ -2650,12 +2653,35 @@ mod tests {
             requests[0].pointer("/messages/0"),
             Some(&json!({"role":"system", "content":"fixture"}))
         );
+        let admitted_user: UserMessage = serde_json::from_value(
+            message_ends[0]
+                .pointer("/envelope/event/message")
+                .expect("public user message")
+                .clone(),
+        )
+        .expect("public user receipt");
+        assert!(
+            admitted_user
+                .incoming_timing
+                .as_ref()
+                .expect("incoming receipt")
+                .previous_receipt
+                .is_none()
+        );
         assert_eq!(
             requests[0].pointer("/messages/1"),
             Some(&json!({
                 "role":"user",
-                "content":[{"text":"run", "type":"text"}]
+                "content":[
+                    {"text": admitted_user.incoming_timing_text().expect("receipt metadata"), "type":"text"},
+                    {"text":"run", "type":"text"}
+                ]
             }))
+        );
+        assert_eq!(
+            requests[0].pointer("/messages/1"),
+            requests[1].pointer("/messages/1"),
+            "a later provider call must retain the same ingress time"
         );
         assert_eq!(
             requests[0].pointer("/tools/0/function/name"),
@@ -3041,6 +3067,7 @@ mod tests {
             id: "u1".to_owned(),
             seq: 1,
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "hello".to_owned(),
                 }],

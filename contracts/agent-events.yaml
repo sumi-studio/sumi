@@ -388,6 +388,23 @@ $defs:
         type: array
         items: { $ref: '#/$defs/UserContent' }
       timestamp: { type: string, format: date-time }
+      incoming_timing: { $ref: '#/$defs/IncomingEventTiming' }
+
+  IncomingEventTiming:
+    description: Server-authored receipt timing; absent for messages without an incoming event.
+    type: object
+    required: [previous_receipt]
+    additionalProperties: false
+    properties:
+      previous_receipt:
+        oneOf:
+          - type: 'null'
+          - type: object
+            required: [command_seq, received_at]
+            additionalProperties: false
+            properties:
+              command_seq: { $ref: '#/$defs/JsonSafeInteger' }
+              received_at: { type: string, format: date-time }
 
   PublicAssistantMessage:
     type: object

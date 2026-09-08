@@ -372,6 +372,7 @@ mod tests {
     #[test]
     fn user_search_indexes_only_visible_text_content() {
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![
                 UserContent::Text {
                     text: "ordinary user text".to_owned(),
@@ -438,6 +439,7 @@ mod tests {
     #[test]
     fn image_only_message_has_no_search_text() {
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Image {
                 data: "private-base64-image-data".to_owned(),
                 mime_type: "image/private-fixture".to_owned(),
@@ -477,6 +479,7 @@ mod tests {
     fn search_text_is_derived_from_the_redacted_typed_projection() {
         let secret = "sk-abcdefghijklmnop";
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text {
                 text: format!("visible {secret}"),
             }],

@@ -328,8 +328,59 @@ pub struct NativeCompactionCoverage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_timing: Option<IncomingEventTiming>,
     pub content: Vec<UserContent>,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Receipt timing is attached once at ingress, independently of any time mentioned
+/// in the event's content. Replaying the event does not refresh this metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingEventTiming {
+    pub previous_receipt: Option<IncomingEventReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncomingEventReceipt {
+    pub command_seq: u64,
+    pub received_at: DateTime<Utc>,
+}
+
+impl UserMessage {
+    /// The same non-instructional prefix is used by every provider send view.
+    /// Raw content is kept separate, including images and user-authored text.
+    pub fn incoming_timing_text(&self) -> Option<String> {
+        let timing = self.incoming_timing.as_ref()?;
+        let utc = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        let mut fields = vec![format!("received_at_utc={}", utc(self.timestamp))];
+        if let Some(previous) = &timing.previous_receipt {
+            fields.push(format!(
+                "previous_received_at_utc={}",
+                utc(previous.received_at)
+            ));
+            let delta = self.timestamp.signed_duration_since(previous.received_at);
+            let sign = if delta < chrono::Duration::zero() {
+                '-'
+            } else {
+                '+'
+            };
+            let whole_ms = delta.num_milliseconds().unsigned_abs();
+            let remainder_ns = (delta.subsec_nanos() % 1_000_000).unsigned_abs();
+            let fractional_ms = if remainder_ns == 0 {
+                String::new()
+            } else {
+                format!(".{remainder_ns:06}")
+                    .trim_end_matches('0')
+                    .to_owned()
+            };
+            fields.push(format!(
+                "receipt_clock_delta_ms={sign}{whole_ms}{fractional_ms}"
+            ));
+            fields.push(format!("previous_command_seq={}", previous.command_seq));
+        }
+        Some(format!("[Incoming event receipt: {}]", fields.join("; ")))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1505,6 +1556,7 @@ mod tests {
     #[test]
     fn message_types_round_trip_with_stable_tags() {
         let user = Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![
                 UserContent::Text {
                     text: "hello".to_owned(),

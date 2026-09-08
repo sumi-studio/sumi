@@ -1399,6 +1399,7 @@ mod tests {
             id: format!("msg-{seq}"),
             seq,
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: text.to_owned(),
                 }],
@@ -1564,6 +1565,7 @@ mod tests {
     fn synthetic_attachment_identity_is_content_addressed() {
         let first = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "first".to_owned(),
                 }],
@@ -1572,6 +1574,7 @@ mod tests {
         };
         let second = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "second".to_owned(),
                 }],
@@ -2506,6 +2509,7 @@ mod tests {
             assert_eq!(snapshot.options(), &original_options);
 
             let directive = UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "Reorganize messages 1–3 using the whole context.".into(),
                 }],
@@ -2632,6 +2636,7 @@ mod tests {
             );
             let fork = snapshot
                 .fork_with_directive(UserMessage {
+                    incoming_timing: None,
                     content: vec![UserContent::Text {
                         text: "Organize the target with this same context.".into(),
                     }],
@@ -2861,6 +2866,7 @@ mod tests {
         };
         let synthetic = ContextMessage::Synthetic {
             message: Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: "authorized diagnostic".to_owned(),
                 }],

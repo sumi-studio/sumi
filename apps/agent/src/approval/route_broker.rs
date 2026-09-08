@@ -1852,6 +1852,7 @@ mod tests {
 
     fn user_message(text: impl Into<String>) -> PublicMessage {
         PublicMessage::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text { text: text.into() }],
             timestamp: Utc::now(),
         })
@@ -3160,6 +3161,7 @@ mod tests {
         assert_eq!(INVITE_CODE_SENTINEL.chars().count(), 43);
         let transcript = vec![
             PublicMessage::User(UserMessage {
+                incoming_timing: None,
                 content: vec![
                     UserContent::Text {
                         text: USER_SENTINEL.to_owned(),

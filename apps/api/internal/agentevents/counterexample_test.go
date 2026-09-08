@@ -292,3 +292,20 @@ func TestToolCallRouteIsRequiredAndExact(t *testing.T) {
 		}
 	}
 }
+
+func TestIncomingTimingValidation(t *testing.T) {
+	for _, raw := range []string{
+		`null`, `{}`, `{"previous_receipt":null,"extra":1}`,
+		`{"previous_receipt":{"command_seq":null,"received_at":"2026-09-08T00:00:00Z"}}`,
+		`{"previous_receipt":{"command_seq":-1,"received_at":"2026-09-08T00:00:00Z"}}`,
+		`{"previous_receipt":{"command_seq":9007199254740992,"received_at":"2026-09-08T00:00:00Z"}}`,
+		`{"previous_receipt":{"command_seq":1,"received_at":"yesterday"}}`,
+		`{"previous_receipt":{"command_seq":1}}`,
+		`{"previous_receipt":{"command_seq":1,"received_at":"2026-09-08T00:00:00Z","extra":1}}`,
+	} {
+		message := json.RawMessage(`{"role":"user","content":[],"timestamp":"2026-09-08T01:00:00Z","incoming_timing":` + raw + `}`)
+		if err := validatePublicMessage(message); err == nil {
+			t.Errorf("accepted malformed timing: %s", raw)
+		}
+	}
+}

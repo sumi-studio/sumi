@@ -762,6 +762,7 @@ pub(crate) fn build_user_message(command: &AdmittedCommand) -> Result<PublicMess
         bail!("T16 steer does not accept attachments");
     }
     Ok(PublicMessage::User(crate::provider::types::UserMessage {
+        incoming_timing: command.incoming_timing(),
         content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
         timestamp: command.received_at(),
     }))
@@ -853,6 +854,9 @@ mod tests {
             },
             test_timestamp(),
         )
+        .with_incoming_timing(Some(crate::provider::types::IncomingEventTiming {
+            previous_receipt: None,
+        }))
     }
 
     fn test_admitted_by(
@@ -880,6 +884,9 @@ mod tests {
             },
             test_timestamp(),
         )
+        .with_incoming_timing(Some(crate::provider::types::IncomingEventTiming {
+            previous_receipt: None,
+        }))
     }
 
     async fn test_store() -> Arc<Store> {
@@ -890,7 +897,7 @@ mod tests {
     }
 
     async fn persist_and_pin(
-        store: &Store,
+        _store: &Store,
         writer: &EventWriter,
         seq: u64,
         command_id: &str,
@@ -901,12 +908,10 @@ mod tests {
             .persist_inbound(&test_user_command(seq, command_id, text))
             .await
             .expect("persist command");
-        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
-            .bind(timestamp.to_rfc3339())
-            .bind(command_id)
-            .execute(store.pool())
+        writer
+            .pin_incoming_timing_for_test(command_id, timestamp)
             .await
-            .expect("pin durable timestamp");
+            .expect("pin authenticated fixture timing");
         timestamp
     }
 
@@ -951,6 +956,9 @@ mod tests {
         let message_id =
             crate::store::user_message_id(&crate::gateway::test_personality_agent_id(), command_id);
         let message = PublicMessage::User(UserMessage {
+            incoming_timing: Some(crate::provider::types::IncomingEventTiming {
+                previous_receipt: None,
+            }),
             content: vec![UserContent::Text {
                 text: "owner".to_owned(),
             }],

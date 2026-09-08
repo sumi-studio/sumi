@@ -1695,6 +1695,7 @@ fn provider_evidence_digest(
 fn synthetic_user_message(text: String) -> ContextMessage {
     ContextMessage::Synthetic {
         message: Message::User(UserMessage {
+            incoming_timing: None,
             content: vec![UserContent::Text { text }],
             timestamp: Utc::now(),
         }),
@@ -1714,6 +1715,7 @@ fn transcript_messages(
         };
         let mut message = match entry {
             ReviewerTranscriptEntry::User { text, .. } => Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text { text: text.clone() }],
                 timestamp: Utc::now(),
             }),
@@ -1833,6 +1835,7 @@ fn transcript_messages(
                 omitted_user_turns,
                 marker,
             } => Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!(
                         "[machine-generated untrusted omission marker: {omitted_user_turns} older Human turn(s) omitted; {marker}]"
@@ -1884,6 +1887,7 @@ fn transcript_messages(
                 omitted_tool_results,
                 marker,
             } => Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!(
                         "[machine-generated untrusted omission marker: {omitted_tool_results} older tool result(s) omitted; {marker}]"
@@ -1895,6 +1899,7 @@ fn transcript_messages(
                 omitted_orphan_tool_results,
                 marker,
             } => Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!(
                         "[machine-generated untrusted omission marker: {omitted_orphan_tool_results} orphan tool result(s) omitted because no retained matching call id was available; {marker}]"
@@ -1903,6 +1908,7 @@ fn transcript_messages(
                 timestamp: Utc::now(),
             }),
             ReviewerTranscriptEntry::NoHumanTurn { marker } => Message::User(UserMessage {
+                incoming_timing: None,
                 content: vec![UserContent::Text {
                     text: format!(
                         "[machine-generated conversation state: {marker}; this is not a Human message or authorization]"

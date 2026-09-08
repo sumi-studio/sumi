@@ -206,6 +206,34 @@ func validateEvent(raw json.RawMessage) error {
 	}
 }
 
+func validateIncomingEventTiming(raw json.RawMessage) error {
+	obj, err := asObject(raw, "incoming timing")
+	if err != nil {
+		return err
+	}
+	if err := requireAndAllow(obj, []string{"previous_receipt"}, []string{"previous_receipt"}); err != nil {
+		return err
+	}
+	previous := obj["previous_receipt"]
+	if bytes.Equal(bytes.TrimSpace(previous), []byte("null")) {
+		return nil
+	}
+	receipt, err := asObject(previous, "previous receipt")
+	if err != nil {
+		return err
+	}
+	if err := requireAndAllow(receipt, []string{"command_seq", "received_at"}, []string{"command_seq", "received_at"}); err != nil {
+		return err
+	}
+	if bytes.Equal(bytes.TrimSpace(receipt["command_seq"]), []byte("null")) {
+		return fmt.Errorf("command_seq must be an integer")
+	}
+	if err := validateJSONSafeInteger(receipt["command_seq"]); err != nil {
+		return err
+	}
+	return validateDateTime(receipt["received_at"])
+}
+
 func validatePublicMessage(raw json.RawMessage) error {
 	if err := checkDuplicateKeys(raw); err != nil {
 		return err
@@ -221,7 +249,7 @@ func validatePublicMessage(raw json.RawMessage) error {
 
 	switch role {
 	case "user":
-		if err := requireAndAllow(obj, []string{"role", "content", "timestamp"}, []string{"role", "content", "timestamp"}); err != nil {
+		if err := requireAndAllow(obj, []string{"role", "content", "timestamp"}, []string{"role", "content", "timestamp", "incoming_timing"}); err != nil {
 			return err
 		}
 		if err := validateArray(obj["content"], validateUserContent); err != nil {
@@ -229,6 +257,11 @@ func validatePublicMessage(raw json.RawMessage) error {
 		}
 		if err := validateDateTime(obj["timestamp"]); err != nil {
 			return fmt.Errorf("user message timestamp: %w", err)
+		}
+		if timing, ok := obj["incoming_timing"]; ok {
+			if err := validateIncomingEventTiming(timing); err != nil {
+				return fmt.Errorf("user message incoming_timing: %w", err)
+			}
 		}
 		return nil
 
