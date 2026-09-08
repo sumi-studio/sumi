@@ -13,10 +13,10 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment: `ba3eeb7503555a1885a6ae54a56ec5182876f424`
-(the product code integrated through #382). Main is now
-`4e59a46fa136c9b64a6d77fb0b5d799d90934ff0`, including upper memory #381.
-Upper memory has not yet been deployed. This does not mean that all of #362
+Current shared deployment: `bc49022a7bfef70b659a5e6c6478ae165698ffa1`,
+including upper memory #381 and provider-call identity repair #383. The verified
+#383 main merge is `6aef3b2053cc5cc4e59d736b060e9d41ef51a129`.
+This does not mean that all of #362
 or native account sign-in acceptance is complete.
 The private-file acceptance below was performed on the preceding `8cbba0b8`
 milestone. A subsequent recipient-delivery run on #376 passed after repairing
@@ -130,7 +130,9 @@ its runtime. Local evidence:
 The next correction preserves authenticated Messaging source metadata separately
 from message content and evaluates ordinary replies within the PA's existing
 permissions. Participant speech must not grant employer rights or elevated
-approval. Actual reply, reminder and cancellation acceptance remain open.
+approval. At that point, actual reply, reminder and cancellation acceptance
+remained open;
+the later runs below record the results.
 
 The activity-log component checks cover chronological interleaving, replay and
 scroll position at desktop and mobile widths. They do not establish physical
@@ -138,8 +140,9 @@ iOS keyboard behavior. Native ChatGPT connection and Astra inference are
 implemented, but actual Human authorization and an actual Astra response remain
 unverified. The user's ChatGPT credentials are not borrowed from another harness.
 
-Upper memory replacement was merged through #381 and is not in this shared
-deployment. The combined Rust suite passed 2,260 tests with 20 ignored; this does
+Upper memory replacement was merged through #381 and is included in the current
+shared deployment. Its staged semantic evidence is described below. The earlier
+combined Rust suite passed 2,260 tests with 20 ignored; this does
 not establish semantic fidelity or long-run cache behavior with a real model.
 
 ## Audit items and remaining acceptance
@@ -160,15 +163,15 @@ still needed to close each row.
 
 | ID | Current assessment | Remaining acceptance |
 | --- | --- | --- |
-| M01 | L0→L1 runs; upper-layer replacement implemented in #381, not deployed | Verify actual selective replacement against [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
+| M01 | L0→L1 runs; upper-layer replacement deployed through #381; staged real-provider evidence below | Verify actual selective replacement against [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
 | M02 | Full-parent fork and chronological replacement repaired; semantic quality partial | Evaluate meaning, uncertainty, corrections and unfinished details against originals; do not equate compression ratio with fidelity. |
 | M03 | Ordinary silent trimming repaired; capacity boundary remains | Accumulated L1 must not eventually make every subsequent request unrecoverable. |
 | M04 | Original history read/search and optional files available | Establish voluntary revision/strategic forgetting and recoverable source references without imposing an automatic memory-rewriting ritual. |
 | M05 | Maintenance failure isolation implemented | Exercise timeout, later user input, and retry from the later full parent context. |
-| A01 | Actual DM wake and receipt verified; normal reply blocked by request/approval conflation | Repair and verify ordinary replies within existing permissions, retaining replay/dedup and optional response. |
+| A01 | Actual DM wake, ordinary reply and replay verified after request/approval repair | Broaden interruption and duplicate-delivery acceptance while retaining optional response and existing permissions. |
 | A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
-| A04 | Scheduled wake implemented; actual probe not reached after DM failure | Due/canceled/overdue markers cause the appropriate single admission across restart, without manufacturing a reply. |
+| A04 | Actual due reminder write/resolve and cancellation suppression verified | Exercise overdue markers across restart and verify a single admission without manufacturing a reply. |
 | T01 | Tool progress/control exist; inference waits for completion | One real long-running operation returns a durable handle, allows other conversation and later result recovery without repeating the effect. |
 | T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
 | T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
@@ -265,8 +268,9 @@ sequence contains no such resolve receipt; only the separately created
 cancellation marker was resolved. The selected artifact now labels this
 PARTIAL_ACCEPTANCE. Delivery and separate cancellation are proven; completion
 of the original reminder workflow is not. The runner now requires both its
-write receipt and its matching resolve receipt before advancing. No fresh
-real run has yet validated that stronger condition.
+write receipt and its matching resolve receipt before advancing. At that point,
+no fresh
+real run had validated that stronger condition; the following runs did.
 
 Diagnostic-only shared update `ba3eeb75` passed all three CI jobs and routine
 cutover checks, preserving existing mounts and the ChatGPT encryption key.
@@ -297,4 +301,20 @@ Both cross-command and same-command reuse regressions pass. Exact request-body
 comparison passes for Chat Completions, Responses, Anthropic, native replay and
 ChatGPT Responses. The combined Rust library suite passes 2,225 tests with 19
 ignored opt-in/subprocess cases; Go and TypeScript contract checks also pass.
-This repair is not yet deployed.
+This repair is deployed through #383; current real-model acceptance follows.
+
+## Current deployment acceptance — 2026-09-09 JST
+
+PR #383 merged after all three exact-head CI checks and independent review.
+The shared deployment now includes #381 and #383, retaining existing
+configuration, encryption key, mounts and histories. No history reset or schema
+migration was needed for this update.
+
+The actual Kimi run `1hDq1o` completed with exit 0. The original due marker
+was resolved at events 105–106, following its actual Messaging write; the
+separate cancellation marker was resolved at 137–138 and remained unadmitted
+past its deadline. DM delivery with the DirectChat socket closed, log replay,
+pinned images and owned-fixture cleanup also passed.
+[Selected evidence](evidence/attention-identity-2026-09-09.json) preserves those
+receipts. This does not prove native ChatGPT/Astra activation, physical iOS
+quality, natural long-run memory fidelity, or the cause of the earlier stall.

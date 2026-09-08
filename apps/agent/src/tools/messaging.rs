@@ -1895,12 +1895,16 @@ impl BoundToolAdapter for MessagingTool {
                 urgency,
                 reply_to,
             } if !attachment_paths.is_empty() => {
+                // The authorized action already owns its exact destination and
+                // source paths. Transfer and remote writes need no view lock;
+                // another open may change focus while this effect settles.
+                drop(state);
                 committed_effect_permit
                     .begin_messaging_workspace_send_effect()
                     .complete(|continuation| {
                         self.execute_attachment_write(
                             &scope,
-                            &mut state,
+                            view.clone(),
                             place_id,
                             content,
                             attachment_paths,
@@ -2537,7 +2541,7 @@ impl MessagingTool {
     async fn execute_attachment_write(
         &self,
         scope: &ExactMessagingScope,
-        state: &mut MessagingViewState,
+        view: Arc<Mutex<MessagingViewState>>,
         place_id: String,
         content: String,
         attachment_paths: Vec<String>,
@@ -2639,9 +2643,10 @@ impl MessagingTool {
         for (index, attachment) in attachments.iter_mut().enumerate() {
             attachment.position = index as u8;
         }
+        let mut state = view.lock().await;
         if state.focused_place_id.as_deref() == Some(place_id.as_str()) {
             upsert_visible_message(
-                state,
+                &mut state,
                 VisibleMessage {
                     message_id: receipt.message_id.clone(),
                     seq: Some(receipt.seq),
@@ -4730,6 +4735,7 @@ mod tests {
     struct FakeMessagingSourceTransfer {
         specs: Vec<TestSourceSpec>,
         calls: AsyncMutex<Vec<(Vec<String>, String)>>,
+        gate: AsyncMutex<Option<Arc<Semaphore>>>,
         fail: bool,
     }
 
@@ -4738,6 +4744,7 @@ mod tests {
             Self {
                 specs,
                 calls: AsyncMutex::new(Vec::new()),
+                gate: AsyncMutex::new(None),
                 fail: false,
             }
         }
@@ -4746,6 +4753,7 @@ mod tests {
             Self {
                 specs: Vec::new(),
                 calls: AsyncMutex::new(Vec::new()),
+                gate: AsyncMutex::new(None),
                 fail: true,
             }
         }
@@ -4761,6 +4769,12 @@ mod tests {
             cancel: CancellationToken,
         ) -> Result<Vec<TransferredSource>, ToolError> {
             self.calls.lock().await.push((paths.clone(), execution_id));
+            if let Some(gate) = self.gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("source gate remains open")
+                    .forget();
+            }
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
@@ -4863,6 +4877,7 @@ mod tests {
         writes: AsyncMutex<Vec<RecordedWrite>>,
         written_nonces: AsyncMutex<BTreeSet<String>>,
         uploads: AsyncMutex<Vec<RecordedUpload>>,
+        upload_gate: AsyncMutex<Option<Arc<Semaphore>>>,
         uploaded_by_nonce: AsyncMutex<BTreeMap<String, MessagingAttachmentMetadata>>,
         upload_failure_on_call: AsyncMutex<Option<usize>>,
         upload_failure_class: AsyncMutex<Option<MessagingApiFailureClass>>,
@@ -5213,6 +5228,12 @@ mod tests {
                 bytes,
                 sha256: sha256.clone(),
             });
+            if let Some(gate) = self.upload_gate.lock().await.clone() {
+                gate.acquire()
+                    .await
+                    .expect("upload gate remains open")
+                    .forget();
+            }
             if *self.upload_failure_on_call.lock().await == Some(call_index) {
                 let class = self
                     .upload_failure_class
@@ -8210,6 +8231,116 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(test_attachment_id(0), 0), (test_attachment_id(1), 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_write_allows_open_during_io_without_changing_its_destination() {
+        for stage in ["source", "upload", "write"] {
+            let (api, source, tool, registry) =
+                attachment_binding_fixture(test_source_specs()).await;
+            let gate = Arc::new(Semaphore::new(0));
+            match stage {
+                "source" => *source.gate.lock().await = Some(gate.clone()),
+                "upload" => *api.upload_gate.lock().await = Some(gate.clone()),
+                "write" => *api.write_gate.lock().await = Some(gate.clone()),
+                _ => unreachable!(),
+            }
+            let registry = Arc::new(registry);
+            let execution = tokio::spawn({
+                let registry = registry.clone();
+                async move {
+                    execute_bound_action(
+                        &registry,
+                        "write-while-opening",
+                        json!({
+                            "action": "write",
+                            "content": "attachment for A",
+                            "attachments": ["docs/report.txt", "images/pixel.png"]
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let reached = match stage {
+                        "source" => !source.calls.lock().await.is_empty(),
+                        "upload" => !api.uploads.lock().await.is_empty(),
+                        "write" => api
+                            .calls
+                            .lock()
+                            .await
+                            .iter()
+                            .any(|call| call == "write:place-a"),
+                        _ => unreachable!(),
+                    };
+                    if reached {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("attachment write reaches the I/O barrier");
+            assert!(!execution.is_finished());
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_bound_action(
+                    &registry,
+                    "open-during-attachment",
+                    json!({"action": "open", "place_id": "place-b"}),
+                ),
+            )
+            .await
+            .expect("opening B must not wait for attachment I/O")
+            .expect("open B succeeds");
+            let visible_before = {
+                let state = default_state(&tool).await;
+                assert_eq!(state.focused_place_id.as_deref(), Some("place-b"));
+                state
+                    .visible_messages
+                    .iter()
+                    .map(|message| message.message_id.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert!(!execution.is_finished());
+            gate.add_permits(2);
+            execution
+                .await
+                .expect("write task joins")
+                .expect("attachment write succeeds");
+
+            let uploads = api.uploads.lock().await;
+            assert_eq!(uploads.len(), 2);
+            for (index, upload) in uploads.iter().enumerate() {
+                assert_eq!(upload.place_id, "place-a");
+                assert_eq!(
+                    upload.client_nonce,
+                    attachment_client_nonce("flow", "write-while-opening", index)
+                );
+            }
+            assert_eq!(
+                api.writes.lock().await.as_slice(),
+                &[(
+                    "place-a".to_owned(),
+                    "attachment for A".to_owned(),
+                    client_nonce("flow", "write-while-opening"),
+                    vec![test_attachment_id(0), test_attachment_id(1)],
+                )]
+            );
+            let state = default_state(&tool).await;
+            assert_eq!(state.focused_place_id.as_deref(), Some("place-b"));
+            assert_eq!(
+                state
+                    .visible_messages
+                    .iter()
+                    .map(|message| message.message_id.clone())
+                    .collect::<Vec<_>>(),
+                visible_before,
+                "the receipt for A must not alter B's visible messages",
+            );
+        }
     }
 
     #[tokio::test]
