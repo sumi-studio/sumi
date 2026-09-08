@@ -52,6 +52,8 @@ web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ PersonalityAgentIdご
 
 書き込みでは正規化したパス・本文・置換文字列を`Mutate`の実行内容へ固定し、通常／追加承認の既存経路と、実行時の署名・有効期限の確認を通す。操作はdirfd起点で本人のworkspace内に限定し、read/write mountを持つのはexecutorだけとする。runtimeやbrokerへworkspaceの直接アクセスを追加しない。削除、bash、artifact handleを使う操作はこの本番RPCの公開対象には含めない。送信後の処理をキャンセルできたと偽らず、実行結果が確定するか不明なままかを既存の結果契約で扱う。
 
+ここで扱うのは各PA専用のファイルであり、人間と共有するNotesアプリではない。Docker構成の更新時は、agentだけでなくCompose定義を内包するprovisionerも更新し、新しいgenerationで起動する。
+
 ## 配置形態
 
 | 用途 | 構成 |

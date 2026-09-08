@@ -822,19 +822,12 @@ mod tests {
         let verifier = ExecutorCallAuthorityVerifier::new(
             call_authority_key_id(),
             issuer.verifying_key(),
-            rpc,
+            rpc.clone(),
         )
         .unwrap()
         .with_clock(Arc::new(FixedClock(1_001)));
         let other_pa =
             RpcIdentity::from_wire("018f47a2-9b3c-7def-8abc-0123456789ac", 7, "nonce-a").unwrap();
-        let other_verifier = ExecutorCallAuthorityVerifier::new(
-            call_authority_key_id(),
-            issuer.verifying_key(),
-            other_pa,
-        )
-        .unwrap()
-        .with_clock(Arc::new(FixedClock(1_001)));
         for operation in [
             ExecutorOperation::WriteFile {
                 path: "note.txt".to_owned(),
@@ -857,9 +850,22 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+            // PA ownership is validated by the RPC envelope before call-authority
+            // verification. A verifier alone intentionally checks boot/permit identity.
+            let request = serde_json::json!({
+                "personality_agent_id": rpc.personality_agent_id(),
+                "generation": rpc.generation().to_wire(),
+                "nonce": rpc.nonce().as_str(),
+                "request_id": "mutation",
+                "call_authority": &token,
+                "operation": &operation,
+            });
+            let encoded = serde_json::to_vec(&request).unwrap();
             assert!(
-                other_verifier
-                    .verify(Some(&token), "mutation", &operation)
+                crate::tools::executor::protocol::decode_executor_rpc_line(&encoded, &rpc).is_ok()
+            );
+            assert!(
+                crate::tools::executor::protocol::decode_executor_rpc_line(&encoded, &other_pa)
                     .is_err()
             );
             let mut changed = operation.clone();

@@ -990,7 +990,6 @@ mod tests {
         fs,
         os::unix::{fs::MetadataExt, fs::PermissionsExt, fs::symlink},
         path::PathBuf,
-        sync::Mutex,
     };
 
     use uuid::Uuid;
@@ -1023,8 +1022,6 @@ mod tests {
     ) -> Result<ArtifactResponse, ToolError> {
         broker.execute(personality_agent_id, operation)
     }
-
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     struct UmaskGuard(libc::mode_t);
 
@@ -1130,7 +1127,26 @@ mod tests {
 
     #[test]
     fn hostile_umasks_still_produce_private_root_directories_and_file() {
-        let _guard = UMASK_LOCK.lock().unwrap();
+        const ISOLATED: &str = "SUMI_ARTIFACT_UMASK_TEST_CHILD";
+        if std::env::var_os(ISOLATED).is_none() {
+            // umask is process-wide: a mutex local to this test cannot protect
+            // unrelated filesystem tests running in the same test binary.
+            let test_thread = std::thread::current();
+            let test_name = test_thread.name().expect("named Rust test thread");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .output()
+                .expect("run isolated umask test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated umask test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         for mask in [0o000, 0o077] {
             let root = TestRoot::new();
             {

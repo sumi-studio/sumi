@@ -3999,6 +3999,18 @@ mod tests {
 
     #[tokio::test]
     async fn bound_listener_detects_post_bind_ancestor_unlink_rename_and_entry_replacement() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        // Every positive fixture ancestor must be trusted even when the test
+        // process inherits a group-writable umask. Replacements stay private
+        // too, so revalidation fails on identity rather than permissions.
+        let create_private_chain = |path: &Path| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .expect("create private listener chain");
+        };
         let root = std::env::temp_dir().join(format!("sxr-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).expect("create socket revalidation root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
@@ -4006,14 +4018,14 @@ mod tests {
 
         let rename_ancestor = root.join("rename/ancestor");
         let rename_parent = rename_ancestor.join("parent");
-        std::fs::create_dir_all(&rename_parent).expect("create rename chain");
+        create_private_chain(&rename_parent);
         let rename_socket = rename_parent.join("executor.sock");
         let renamed_listener = bind_unix_listener(&rename_socket, "test")
             .await
             .expect("bind rename listener");
         let detached_ancestor = root.join("rename/detached");
         std::fs::rename(&rename_ancestor, &detached_ancestor).expect("rename pinned ancestor");
-        std::fs::create_dir_all(&rename_parent).expect("replace ancestor chain");
+        create_private_chain(&rename_parent);
         assert!(
             renamed_listener.verify("test").is_err(),
             "renamed and replaced ancestor chain remained trusted"
@@ -4022,7 +4034,7 @@ mod tests {
 
         let unlink_ancestor = root.join("unlink/ancestor");
         let unlink_parent = unlink_ancestor.join("parent");
-        std::fs::create_dir_all(&unlink_parent).expect("create unlink chain");
+        create_private_chain(&unlink_parent);
         let unlink_socket = unlink_parent.join("executor.sock");
         let unlinked_listener = bind_unix_listener(&unlink_socket, "test")
             .await
@@ -4039,7 +4051,7 @@ mod tests {
         drop(unlinked_listener);
 
         let replacement_parent = root.join("replacement");
-        std::fs::create_dir(&replacement_parent).expect("create replacement parent");
+        create_private_chain(&replacement_parent);
         let replacement_socket = replacement_parent.join("executor.sock");
         let original_listener = bind_unix_listener(&replacement_socket, "test")
             .await

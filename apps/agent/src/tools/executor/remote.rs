@@ -2145,12 +2145,10 @@ mod tests {
         for name in ["write_file", "edit_file"] {
             assert_eq!(registry.get(name).unwrap().risk(), ToolRisk::Mutating);
             assert!(
-                !registry
-                    .get(name)
-                    .unwrap()
-                    .bound_adapter()
-                    .unwrap()
-                    .reviewer_read_capable()
+                registry
+                    .reviewer_read_definitions()
+                    .iter()
+                    .all(|definition| definition.name != name)
             );
         }
         let grep = registry.get("grep").unwrap().def();
