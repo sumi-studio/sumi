@@ -735,7 +735,7 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			volatile := make(chan Envelope)
+			volatile := make(chan browserVolatileBatch)
 			appendResult := make(chan error, 1)
 			var frames []browserEventFrame
 			write := func(frame any) error {
@@ -761,10 +761,10 @@ func TestBrowserEventPumpCatchesUpDurableCommitBeforeQueuedVolatileEvent(t *test
 							return
 						}
 						select {
-						case volatile <- Envelope{
+						case volatile <- browserVolatileBatch{events: []Envelope{{
 							PersonalityAgentID: personalityAgentID,
 							Event:              json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`),
-						}:
+						}}}:
 						case <-ctx.Done():
 						}
 					}()
