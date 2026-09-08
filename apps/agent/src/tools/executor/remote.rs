@@ -1349,6 +1349,7 @@ mod tests {
 
     fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: id.to_owned(),
             name: name.to_owned(),
             route: ToolInvocationRoute::Normal,
@@ -2396,6 +2397,7 @@ mod tests {
 
         for (name, arguments, has_private_pattern) in cases {
             let call = ToolCall {
+                provider_call_id: None,
                 id: format!("remote-elevated-{name}-secret"),
                 name: name.to_owned(),
                 route: ToolInvocationRoute::Elevated,

@@ -1792,6 +1792,7 @@ mod tests {
             user.content.push(image.clone());
         }
         let call = ToolCall {
+            provider_call_id: None,
             id: "call-exact".into(),
             name: "read_file".into(),
             route: ToolInvocationRoute::Elevated,
@@ -1824,6 +1825,7 @@ mod tests {
             id: "result-message".into(),
             seq: 3,
             message: Message::ToolResult(ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: "call-exact".into(),
                 tool_name: "read_file".into(),
                 content: vec![UserContent::Text {

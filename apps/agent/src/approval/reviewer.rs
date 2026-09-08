@@ -1806,6 +1806,7 @@ mod tests {
             PublicMessage::Assistant(PublicAssistantMessage {
                 content: vec![PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "call-1".to_owned(),
                         name: "bash".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -1828,6 +1829,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             }),
             PublicMessage::ToolResult(crate::provider::types::ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: "call-1".to_owned(),
                 tool_name: "bash".to_owned(),
                 content: vec![UserContent::Text {

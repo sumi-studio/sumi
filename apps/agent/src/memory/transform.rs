@@ -76,7 +76,7 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
     let mut pending_rejections = Vec::<PendingRejection>::new();
     let mut consumed_call_ids = HashSet::<String>::new();
     let mut seen_call_ids = HashSet::<String>::new();
-    let mut accepted_call_ids = HashMap::<String, String>::new();
+    let mut accepted_call_ids = HashMap::<String, (String, Option<String>)>::new();
     let mut pending_orphan_result = None;
 
     for context in messages.iter().cloned() {
@@ -128,9 +128,17 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                             let raw_id = tool_call.id.clone();
                             if seen_call_ids.insert(raw_id.clone()) {
                                 if let Some(constraint) = tool_id_constraint {
-                                    tool_call.id = mapped_tool_id(&raw_id, &mut id_map, constraint);
+                                    let mapped = mapped_tool_id(
+                                        tool_call.wire_id(),
+                                        &mut id_map,
+                                        constraint,
+                                    );
+                                    tool_call.provider_call_id = Some(mapped);
                                 }
-                                accepted_call_ids.insert(raw_id.clone(), tool_call.id.clone());
+                                accepted_call_ids.insert(
+                                    raw_id.clone(),
+                                    (tool_call.id.clone(), tool_call.provider_call_id.clone()),
+                                );
                                 has_sendable_content = true;
                                 pending_tools.push(PendingTool {
                                     call: tool_call.clone(),
@@ -144,6 +152,7 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                             } else {
                                 pending_rejections.push(PendingRejection {
                                     rejected: RejectedToolCall {
+                                        provider_call_id: tool_call.provider_call_id.clone(),
                                         id: raw_id,
                                         name: tool_call.name.clone(),
                                         error:
@@ -184,10 +193,11 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
             }
             Message::ToolResult(tool_result) => {
                 let raw_id = tool_result.tool_call_id.clone();
-                if let Some(wire_id) = accepted_call_ids.get(&raw_id) {
+                if let Some((internal_id, provider_call_id)) = accepted_call_ids.get(&raw_id) {
                     if seen_tool_results.insert(raw_id) {
                         let mut tool_result = tool_result.clone();
-                        tool_result.tool_call_id = wire_id.clone();
+                        tool_result.tool_call_id = internal_id.clone();
+                        tool_result.provider_call_id = provider_call_id.clone();
                         result.push(with_message(context, Message::ToolResult(tool_result)));
                     }
                     continue;
@@ -387,6 +397,7 @@ fn flush_pending_tools(
         }
         result.push(ContextMessage::Synthetic {
             message: Message::ToolResult(ToolResultMessage {
+                provider_call_id: pending.call.provider_call_id,
                 tool_call_id: pending.call.id,
                 tool_name: pending.call.name,
                 content: vec![UserContent::Text {
@@ -506,6 +517,7 @@ mod tests {
     fn tool_call(id: &str, name: &str) -> AssistantContent {
         AssistantContent::ToolCall {
             tool_call: ToolCall {
+                provider_call_id: None,
                 id: id.to_owned(),
                 name: name.to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -518,6 +530,7 @@ mod tests {
     fn rejected(id: &str, name: &str) -> AssistantContent {
         AssistantContent::RejectedToolCall {
             rejected: RejectedToolCall {
+                provider_call_id: None,
                 id: id.to_owned(),
                 name: name.to_owned(),
                 error: ToolArgumentError::SchemaViolation,
@@ -558,6 +571,7 @@ mod tests {
 
     fn result(id: &str, error: bool) -> Message {
         Message::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: id.to_owned(),
             tool_name: "tool".to_owned(),
             content: vec![UserContent::Text {
@@ -895,7 +909,7 @@ mod tests {
             &output[1],
             ContextMessage::Synthetic {
                 message: Message::ToolResult(result)
-            } if result.tool_call_id == normalized
+            } if result.wire_id() == normalized
                 && result.is_error
                 && result.details == json!({"code": "missing_tool_result"})
         ));
@@ -1614,9 +1628,11 @@ mod tests {
         let Message::ToolResult(result) = message(&output[1]) else {
             panic!("tool result");
         };
-        assert!(tool_call.id.starts_with("call_bad-"));
+        assert!(tool_call.wire_id().starts_with("call_bad-"));
+        assert_eq!(tool_call.id, original);
         assert_eq!(result.tool_call_id, tool_call.id);
-        assert!(tool_call.id.len() <= 40);
+        assert_eq!(result.wire_id(), tool_call.wire_id());
+        assert!(tool_call.wire_id().len() <= 40);
     }
 
     #[test]
@@ -1646,8 +1662,9 @@ mod tests {
         let Message::ToolResult(result) = message(&output[1]) else {
             panic!("tool result");
         };
-        assert!(tool_call.id.len() <= 40);
+        assert!(tool_call.wire_id().len() <= 40);
         assert_eq!(result.tool_call_id, tool_call.id);
+        assert_eq!(result.wire_id(), tool_call.wire_id());
     }
 
     #[test]
@@ -1711,10 +1728,11 @@ mod tests {
             panic!("tool result");
         };
 
-        assert!(tool_call.id.len() <= 40);
-        assert_eq!(tool_call.id.len(), 38);
-        assert_eq!(&tool_call.id[..27], "呼出し界界界界界界");
+        assert!(tool_call.wire_id().len() <= 40);
+        assert_eq!(tool_call.wire_id().len(), 38);
+        assert_eq!(&tool_call.wire_id()[..27], "呼出し界界界界界界");
         assert_eq!(result.tool_call_id, tool_call.id);
+        assert_eq!(result.wire_id(), tool_call.wire_id());
     }
 
     #[test]
@@ -1776,9 +1794,11 @@ mod tests {
         let Message::ToolResult(result) = message(&output[1]) else {
             panic!("tool result");
         };
-        assert_ne!(tool_call.id, original);
-        assert!(ToolIdConstraint::Anthropic.accepts(&tool_call.id));
+        assert_eq!(tool_call.id, original);
+        assert_ne!(tool_call.wire_id(), original);
+        assert!(ToolIdConstraint::Anthropic.accepts(tool_call.wire_id()));
         assert_eq!(result.tool_call_id, tool_call.id);
+        assert_eq!(result.wire_id(), tool_call.wire_id());
     }
 
     #[test]
@@ -1813,14 +1833,14 @@ mod tests {
             .content
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let result_ids = output[1..]
             .iter()
             .filter_map(|context| match message(context) {
-                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                Message::ToolResult(result) => Some(result.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1862,8 +1882,9 @@ mod tests {
             let Message::ToolResult(result) = message(&output[1]) else {
                 panic!("tool result");
             };
-            assert!(ToolIdConstraint::Anthropic.accepts(&tool_call.id));
+            assert!(ToolIdConstraint::Anthropic.accepts(tool_call.wire_id()));
             assert_eq!(result.tool_call_id, tool_call.id);
+            assert_eq!(result.wire_id(), tool_call.wire_id());
         }
     }
 
@@ -1897,7 +1918,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1912,7 +1933,7 @@ mod tests {
             output[1..]
                 .iter()
                 .filter_map(|context| match message(context) {
-                    Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    Message::ToolResult(result) => Some(result.wire_id()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -1951,7 +1972,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1967,7 +1988,7 @@ mod tests {
             output[1..]
                 .iter()
                 .filter_map(|context| match message(context) {
-                    Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    Message::ToolResult(result) => Some(result.wire_id()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -2005,7 +2026,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(&tool_call.id),
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2044,7 +2065,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2054,7 +2075,7 @@ mod tests {
         let results = output
             .iter()
             .filter_map(|context| match message(context) {
-                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                Message::ToolResult(result) => Some(result.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2205,7 +2226,7 @@ mod tests {
             .filter_map(|context| match message(context) {
                 Message::Assistant(assistant) => assistant.content.iter().find_map(|content| {
                     if let AssistantContent::ToolCall { tool_call, .. } = content {
-                        Some(tool_call.id.clone())
+                        Some(tool_call.wire_id().to_owned())
                     } else {
                         None
                     }
@@ -2217,7 +2238,7 @@ mod tests {
             .iter()
             .filter_map(|context| match message(context) {
                 Message::ToolResult(result) if !result.is_error => {
-                    Some(result.tool_call_id.clone())
+                    Some(result.wire_id().to_owned())
                 }
                 _ => None,
             })
@@ -2257,7 +2278,7 @@ mod tests {
             .filter_map(|context| match message(context) {
                 Message::Assistant(assistant) => assistant.content.iter().find_map(|content| {
                     if let AssistantContent::ToolCall { tool_call, .. } = content {
-                        Some(tool_call.id.as_str())
+                        Some(tool_call.wire_id())
                     } else {
                         None
                     }
@@ -2268,7 +2289,7 @@ mod tests {
         let result_ids = output
             .iter()
             .filter_map(|context| match message(context) {
-                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                Message::ToolResult(result) => Some(result.wire_id()),
                 _ => None,
             })
             .collect::<Vec<_>>();

@@ -237,13 +237,13 @@ pub fn estimate_public_message(message: &PublicMessage) -> Result<u64, EstimateE
                         let arguments = serde_json::to_string(tool_call.arguments.as_object())
                             .map_err(|error| EstimateError::SerializerFailure(error.to_string()))?;
                         checked_sum([
-                            estimate_text_tokens(&tool_call.id)?,
+                            estimate_text_tokens(tool_call.wire_id())?,
                             estimate_text_tokens(&tool_call.name)?,
                             estimate_text_tokens(&arguments)?,
                         ])
                     }
                     PublicAssistantContent::RejectedToolCall { rejected, .. } => checked_sum([
-                        estimate_text_tokens(&rejected.id)?,
+                        estimate_text_tokens(rejected.wire_id())?,
                         estimate_text_tokens(&rejected.name)?,
                     ]),
                 }?;
@@ -254,7 +254,7 @@ pub fn estimate_public_message(message: &PublicMessage) -> Result<u64, EstimateE
         }
         PublicMessage::ToolResult(message) => checked_sum([
             estimate_tool_result_content(&message.content)?,
-            estimate_text_tokens(&message.tool_call_id)?,
+            estimate_text_tokens(message.wire_id())?,
         ]),
     }
 }
@@ -432,6 +432,7 @@ mod tests {
         details: Value,
     ) -> PublicMessage {
         PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             content,

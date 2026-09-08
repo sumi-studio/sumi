@@ -664,6 +664,7 @@ mod tests {
         let list = registry
             .bind(
                 &crate::provider::types::ToolCall {
+                    provider_call_id: None,
                     id: "provider-review-invitation-list".to_owned(),
                     name: LIST_TOOL_NAME.to_owned(),
                     route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -691,6 +692,7 @@ mod tests {
         let accept = registry
             .bind(
                 &crate::provider::types::ToolCall {
+                    provider_call_id: None,
                     id: "provider-review-invitation-accept".to_owned(),
                     name: ACCEPT_TOOL_NAME.to_owned(),
                     route: crate::provider::types::ToolInvocationRoute::Elevated,

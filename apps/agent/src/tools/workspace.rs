@@ -417,6 +417,7 @@ mod tests {
         let sealed = registry
             .bind(
                 &ToolCall {
+                    provider_call_id: None,
                     id: "cancelled-workspace-list".to_owned(),
                     name: LIST_TOOL_NAME.to_owned(),
                     route: ToolInvocationRoute::Normal,
@@ -541,6 +542,7 @@ mod tests {
         let registry = builder.build();
         let workspace = workspace_paths();
         let call = ToolCall {
+            provider_call_id: None,
             id: "cursor-review".to_owned(),
             name: LIST_TOOL_NAME.to_owned(),
             route: ToolInvocationRoute::Elevated,

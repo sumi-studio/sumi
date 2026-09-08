@@ -864,6 +864,12 @@ pub enum WirePublicMessage {
         timestamp: DateTime<Utc>,
     },
     ToolResult {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present_or_error_on_null"
+        )]
+        provider_call_id: Option<String>,
         tool_call_id: String,
         tool_name: String,
         content: Vec<WireUserContent>,
@@ -909,6 +915,12 @@ pub enum WirePublicAssistantContent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireToolCall {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_error_on_null"
+    )]
+    pub provider_call_id: Option<String>,
     pub id: String,
     pub name: String,
     pub route: ToolInvocationRoute,
@@ -918,6 +930,12 @@ pub struct WireToolCall {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireRejectedToolCall {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_error_on_null"
+    )]
+    pub provider_call_id: Option<String>,
     pub id: String,
     pub name: String,
     pub error: WireToolArgumentError,
@@ -979,6 +997,12 @@ pub enum WireStopReason {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireToolResultMessage {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_error_on_null"
+    )]
+    pub provider_call_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub content: Vec<WireUserContent>,
@@ -1387,6 +1411,7 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                 timestamp,
             },
             PublicMessage::ToolResult(ToolResultMessage {
+                provider_call_id,
                 tool_call_id,
                 tool_name,
                 content,
@@ -1394,6 +1419,7 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                 is_error,
                 timestamp,
             }) => Self::ToolResult {
+                provider_call_id,
                 tool_call_id,
                 tool_name,
                 content: content
@@ -1460,6 +1486,7 @@ impl TryFrom<ToolCall> for WireToolCall {
     type Error = WireError;
     fn try_from(tool_call: ToolCall) -> Result<Self, WireError> {
         Ok(Self {
+            provider_call_id: tool_call.provider_call_id,
             id: tool_call.id,
             name: tool_call.name,
             route: tool_call.route,
@@ -1472,6 +1499,7 @@ impl TryFrom<RejectedToolCall> for WireRejectedToolCall {
     type Error = WireError;
     fn try_from(rejected: RejectedToolCall) -> Result<Self, WireError> {
         Ok(Self {
+            provider_call_id: rejected.provider_call_id,
             id: rejected.id,
             name: rejected.name,
             error: rejected.error.try_into()?,
@@ -1545,6 +1573,7 @@ impl TryFrom<ToolResultMessage> for WireToolResultMessage {
     type Error = WireError;
     fn try_from(message: ToolResultMessage) -> Result<Self, WireError> {
         Ok(Self {
+            provider_call_id: message.provider_call_id,
             tool_call_id: message.tool_call_id,
             tool_name: message.tool_name,
             content: message
@@ -2080,6 +2109,7 @@ mod tests {
 
     fn tool_call() -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -2693,6 +2723,7 @@ mod tests {
         round_trip_agent_event(retry);
 
         let tool_result = ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),
             content: vec![UserContent::Text {
@@ -2782,6 +2813,7 @@ mod tests {
     fn public_stream_event_round_trips() {
         fn rejected_tool_call() -> RejectedToolCall {
             RejectedToolCall {
+                provider_call_id: None,
                 id: "call-2".to_owned(),
                 name: "read_file".to_owned(),
                 error: ToolArgumentError::SchemaViolation,
@@ -2969,6 +3001,7 @@ mod tests {
                 },
                 PublicAssistantContent::RejectedToolCall {
                     rejected: RejectedToolCall {
+                        provider_call_id: None,
                         id: "call-2".to_owned(),
                         name: "read_file".to_owned(),
                         error: ToolArgumentError::SchemaViolation,
@@ -2989,6 +3022,7 @@ mod tests {
         round_trip_public_message(assistant);
 
         let tool_result = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),
             content: vec![UserContent::Text {

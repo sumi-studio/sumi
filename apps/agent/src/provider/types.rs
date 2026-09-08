@@ -485,6 +485,9 @@ pub struct PublicAssistantMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultMessage {
+    /// Original provider correlation ID; absent on unscoped/retained records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub content: Vec<UserContent>,
@@ -539,6 +542,9 @@ pub enum PublicAssistantContent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Original provider correlation ID; absent on unscoped/retained records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
     pub id: String,
     pub name: String,
     pub route: ToolInvocationRoute,
@@ -565,7 +571,36 @@ impl ToolInvocationRoute {
     }
 }
 
+/// Scope execution identity to one assistant message without changing provider IDs.
+pub fn scoped_tool_call_id(assistant_message_id: &str, provider_call_id: &str) -> String {
+    let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"sumi-tool-execution/v1");
+    let mut tuple = Vec::with_capacity(16 + assistant_message_id.len() + provider_call_id.len());
+    for part in [assistant_message_id, provider_call_id] {
+        tuple.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        tuple.extend_from_slice(part.as_bytes());
+    }
+    uuid::Uuid::new_v5(&namespace, &tuple).to_string()
+}
+
+impl ToolResultMessage {
+    pub fn wire_id(&self) -> &str {
+        self.provider_call_id
+            .as_deref()
+            .unwrap_or(&self.tool_call_id)
+    }
+}
+
+impl RejectedToolCall {
+    pub fn wire_id(&self) -> &str {
+        self.provider_call_id.as_deref().unwrap_or(&self.id)
+    }
+}
+
 impl ToolCall {
+    pub fn wire_id(&self) -> &str {
+        self.provider_call_id.as_deref().unwrap_or(&self.id)
+    }
+
     /// Reconstruct the required provider-visible envelope without exposing it
     /// to app tools. Provider replay must preserve the immutable route.
     pub fn provider_arguments(&self) -> Value {
@@ -629,6 +664,9 @@ impl PartialEq<Value> for ToolArgsPreview {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectedToolCall {
+    /// Original provider correlation ID; absent on unscoped/retained records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
     pub id: String,
     pub name: String,
     pub error: ToolArgumentError,
@@ -1586,6 +1624,7 @@ mod tests {
 
     fn tool_call() -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
             route: ToolInvocationRoute::Normal,
@@ -1735,6 +1774,7 @@ mod tests {
         });
         let assistant = Message::Assistant(assistant_message());
         let tool_result = Message::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),
             content: vec![UserContent::Text {

@@ -2355,6 +2355,7 @@ fn approval_fixture_assistant(tool_call_id: &str) -> PublicMessage {
     assistant.content.push(PublicAssistantContent::ToolCall {
         tool_call: ToolCall {
             id: tool_call_id.to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
             arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -2548,6 +2549,7 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
 
     let result = PublicMessage::ToolResult(ToolResultMessage {
         tool_call_id: request.tool_call_id.clone(),
+        provider_call_id: None,
         tool_name: request.tool_name,
         content: vec![UserContent::Text {
             text: "Tool execution cancelled".to_owned(),
@@ -2599,6 +2601,7 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
     ));
     let call = ToolCall {
         id: "approval-tool".to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({"command": "git status"}))
@@ -3751,11 +3754,13 @@ impl MultiRejectedReceiptDriver {
         let rejections = vec![
             RejectedToolCall {
                 id: "rejected-receipt-a".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 error: ToolArgumentError::InvalidJson,
             },
             RejectedToolCall {
                 id: "rejected-receipt-b".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 error: ToolArgumentError::SchemaViolation,
             },
@@ -3770,6 +3775,7 @@ impl MultiRejectedReceiptDriver {
     fn malformed(terminal_ids: &[&str], streamed_ids: &[&str]) -> Self {
         let rejected = |id: &&str| RejectedToolCall {
             id: (*id).to_owned(),
+            provider_call_id: None,
             name: "fixture-tool".to_owned(),
             error: ToolArgumentError::InvalidJson,
         };
@@ -3842,6 +3848,7 @@ impl RunDriver for MultiRejectedReceiptDriver {
                     rejected: rejected.clone(),
                     synthetic_result: ToolResultMessage {
                         tool_call_id: rejected.id.clone(),
+                        provider_call_id: rejected.provider_call_id.clone(),
                         tool_name: rejected.name.clone(),
                         content: vec![UserContent::Text {
                             text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments."
@@ -3961,6 +3968,7 @@ impl RunDriver for DurableToolBarrierDriver {
         let reason = if attempt == 0 {
             let call = ToolCall {
                 id: "barrier-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -4026,6 +4034,7 @@ impl RunDriver for DurableToolBarrierDriver {
             .store(state == "running", Ordering::SeqCst);
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: Vec::new(),
             details: serde_json::json!({"ok":true}),
@@ -4097,6 +4106,7 @@ impl RunDriver for IndeterminateToolDriver {
         let reason = if attempt == 0 {
             let call = ToolCall {
                 id: "indeterminate-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -4276,7 +4286,7 @@ async fn sequential_worker_makes_progress_with_multiple_rejected_result_receipts
             ContextMessage::Persisted {
                 message: crate::provider::types::Message::ToolResult(result),
                 ..
-            } if result.tool_call_id == expected_id && result.is_error
+            } if result.wire_id() == expected_id && result.is_error
         ));
     }
 }
@@ -4405,7 +4415,11 @@ async fn tool_driver_observes_running_only_after_start_commit() {
         "send normalization preserves exact durable anchors",
     );
     let state: String =
-        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id=?")
+            .bind(crate::provider::types::scoped_tool_call_id(
+                "barrier-assistant-0",
+                "barrier-call",
+            ))
             .fetch_one(&pool)
             .await
             .expect("tool row");
@@ -4446,12 +4460,15 @@ async fn rpc_indeterminate_after_start_fails_worker_and_leaves_durable_tool_runn
         "worker failure must expose indeterminate RPC outcome: {failure}"
     );
 
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM tool_executions WHERE tool_call_id='indeterminate-call'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("tool row");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id=?")
+            .bind(crate::provider::types::scoped_tool_call_id(
+                "indeterminate-assistant-0",
+                "indeterminate-call",
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("tool row");
     assert_eq!(state, "running");
 
     let tool_end_events: i64 = sqlx::query_scalar(
@@ -4536,12 +4553,15 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
             .contains("fixture rejects running transition")
     );
     assert_eq!(driver.executions.load(Ordering::SeqCst), 0);
-    let execution_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='barrier-call'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("tool execution row count");
+    let execution_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_executions WHERE tool_call_id=?")
+            .bind(crate::provider::types::scoped_tool_call_id(
+                "barrier-assistant-0",
+                "barrier-call",
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("tool execution row count");
     assert_eq!(
         execution_rows, 0,
         "rejected atomic Prepare+Start must not leave a replay-blocking prepared row"
@@ -5420,6 +5440,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
             });
             let call = ToolCall {
                 id: "length-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5438,6 +5459,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
             let length = PublicMessage::Assistant(length);
             let result = ToolResultMessage {
                 tool_call_id: call.id.clone(),
+                provider_call_id: call.provider_call_id.clone(),
                 tool_name: call.name.clone(),
                 content: vec![UserContent::Text {
                     text: "Tool call was not executed: output token limit".to_owned(),
@@ -5574,6 +5596,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
                 }
                 let call = ToolCall {
                     id: format!("length-call-{ordinal}"),
+                    provider_call_id: None,
                     name: "fixture-tool".to_owned(),
                     route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5593,6 +5616,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
                 let assistant = PublicMessage::Assistant(assistant);
                 let result = ToolResultMessage {
                     tool_call_id: call.id.clone(),
+                    provider_call_id: call.provider_call_id.clone(),
                     tool_name: call.name,
                     content: vec![UserContent::Text {
                         text: "Tool call was not executed by the Length guard".to_owned(),
@@ -5717,11 +5741,13 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             emit_idle_injection(&events, &initial).await;
             let rejected = RejectedToolCall {
                 id: "rejected-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 error: ToolArgumentError::SchemaViolation,
             };
             let rejected_second = RejectedToolCall {
                 id: "rejected-call-2".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 error: ToolArgumentError::InvalidJson,
             };
@@ -5731,6 +5757,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             };
             let valid = ToolCall {
                 id: "valid-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -5757,6 +5784,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             let first = PublicMessage::Assistant(first);
             let result = ToolResultMessage {
                 tool_call_id: rejected.id.clone(),
+                provider_call_id: rejected.provider_call_id.clone(),
                 tool_name: rejected.name.clone(),
                 content: vec![UserContent::Text {
                     text: "Tool arguments were rejected; regenerate the call".to_owned(),
@@ -5768,6 +5796,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             let result_message = PublicMessage::ToolResult(result.clone());
             let result_second = ToolResultMessage {
                 tool_call_id: rejected_second.id.clone(),
+                provider_call_id: rejected_second.provider_call_id.clone(),
                 tool_name: rejected_second.name.clone(),
                 content: vec![UserContent::Text {
                     text: "Tool arguments were rejected; regenerate the call".to_owned(),
@@ -5779,6 +5808,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             let result_second_message = PublicMessage::ToolResult(result_second);
             let valid_result = ToolResultMessage {
                 tool_call_id: valid.id.clone(),
+                provider_call_id: valid.provider_call_id.clone(),
                 tool_name: valid.name.clone(),
                 content: vec![UserContent::Text {
                     text: "done".to_owned(),
@@ -7604,6 +7634,7 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
     let broker = live_responses_approval_broker();
     let call = |id: &str, value: &str| ToolCall {
         id: id.to_owned(),
+        provider_call_id: None,
         name: "echo_value".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({"value": value}))
@@ -7658,6 +7689,7 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
     }
     let unknown = ToolCall {
         id: "unknown".to_owned(),
+        provider_call_id: None,
         name: "unknown_tool".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value(serde_json::json!({})).expect("valid object"),
@@ -8444,6 +8476,7 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
             emit_idle_injection(&events, &initial).await;
             let call = ToolCall {
                 id: "normal-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -8462,6 +8495,7 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
             let tool_use = PublicMessage::Assistant(tool_use);
             let result = ToolResultMessage {
                 tool_call_id: call.id.clone(),
+                provider_call_id: call.provider_call_id.clone(),
                 tool_name: call.name.clone(),
                 content: Vec::new(),
                 details: serde_json::json!({"ok":true}),
@@ -8587,6 +8621,123 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
 }
 
 #[tokio::test]
+async fn successive_commands_can_reuse_provider_tool_call_id_for_distinct_operations() {
+    assert_reused_provider_tool_call_id(true).await;
+}
+
+#[tokio::test]
+async fn successive_turns_of_one_command_can_reuse_provider_tool_call_id() {
+    assert_reused_provider_tool_call_id(false).await;
+}
+
+async fn assert_reused_provider_tool_call_id(separate_commands: bool) {
+    let store = Store::session_test_store("reused-provider-tool-id")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let executed = Arc::new(AtomicBool::new(false));
+    let scripted_call = |value: &str| ToolCall {
+        id: "echo_0".to_owned(),
+        provider_call_id: None,
+        name: "fixture_echo".to_owned(),
+        route: crate::provider::types::ToolInvocationRoute::Normal,
+        arguments: serde_json::from_value::<ValidatedToolArguments>(
+            serde_json::json!({"value": value}),
+        )
+        .expect("safe fixture arguments"),
+    };
+    // The fake provider supplies real streamed calls; Session and its sequential
+    // worker must independently commit and execute both, despite the reused ID.
+    let mut scripts = VecDeque::from([ApprovalTestScript::ToolCall(scripted_call("first"))]);
+    if separate_commands {
+        scripts.push_back(ApprovalTestScript::Stop);
+    }
+    scripts.push_back(ApprovalTestScript::ToolCall(scripted_call("second")));
+    scripts.push_back(ApprovalTestScript::Stop);
+    let driver = Arc::new(ApprovalTestDriver {
+        scripts: Mutex::new(scripts),
+        executed: executed.clone(),
+        provider_attempts: AtomicUsize::new(0),
+        result_text: "fixture echo completed".to_owned(),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+    for command_seq in 1..=if separate_commands { 2 } else { 1 } {
+        executed.store(false, Ordering::SeqCst);
+        commands.send(user(command_seq)).await.expect("command");
+        let wait = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let applied = frames
+                    .lock()
+                    .expect("frames")
+                    .iter()
+                    .filter(|frame| {
+                        matches!(frame, OutboundFrame::CommandAck { ack }
+                        if ack.status == CommandAckStatus::Applied)
+                    })
+                    .count();
+                if applied >= command_seq as usize || task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if wait.is_err() {
+            task.abort();
+            let _ = task.await;
+            panic!("command {command_seq} did not finish within the fixture deadline");
+        }
+        if task.is_finished() {
+            drop(commands);
+            completed(task.await.expect("session join"));
+            panic!("session ended before completing command {command_seq}");
+        }
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "command {command_seq} did not execute its own operation"
+        );
+    }
+    drop(commands);
+    completed(task.await.expect("session join"));
+    let completed_operations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_executions WHERE state='succeeded'")
+            .fetch_one(&pool)
+            .await
+            .expect("completed operations");
+    assert_eq!(
+        completed_operations, 2,
+        "both operations need independent durable identities"
+    );
+    assert_eq!(
+        driver.provider_attempts.load(Ordering::SeqCst),
+        if separate_commands { 4 } else { 3 }
+    );
+    let results: Vec<String> =
+        sqlx::query_scalar("SELECT payload FROM messages WHERE role='tool_result' ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("durable results");
+    let results: Vec<ToolResultMessage> = results
+        .iter()
+        .map(|raw| serde_json::from_str(raw).expect("result"))
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_ne!(results[0].tool_call_id, results[1].tool_call_id);
+    assert!(results.iter().all(|result| result.wire_id() == "echo_0"
+        && result.provider_call_id.as_deref() == Some("echo_0")));
+}
+
+#[tokio::test]
 async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
     for generation in [0, MAX_PROCESS_GENERATION] {
         assert_normal_tool_lifecycle_persists_generation(
@@ -8611,6 +8762,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
             emit_idle_injection(&events, &initial).await;
             let call = ToolCall {
                 id: "ended-call".to_owned(),
+                provider_call_id: None,
                 name: "fixture-tool".to_owned(),
                 route: crate::provider::types::ToolInvocationRoute::Normal,
                 arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -8628,6 +8780,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
             });
             let result = ToolResultMessage {
                 tool_call_id: call.id.clone(),
+                provider_call_id: call.provider_call_id.clone(),
                 tool_name: call.name.clone(),
                 content: Vec::new(),
                 details: serde_json::json!({"ok":true}),
@@ -10662,6 +10815,7 @@ fn bash_tool_call(id: &str) -> ToolCall {
 fn bash_tool_call_with_command(id: &str, command: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
+        provider_call_id: None,
         name: "bash".to_owned(),
         route: crate::provider::types::ToolInvocationRoute::Normal,
         arguments: serde_json::from_value::<ValidatedToolArguments>(
@@ -10875,6 +11029,7 @@ impl RunDriver for ApprovalTestDriver {
         self.executed.store(true, Ordering::SeqCst);
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             tool_name: call.name.clone(),
             content: vec![UserContent::Text {
                 text: self.result_text.clone(),
@@ -11215,12 +11370,15 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
         "denied bash must not execute"
     );
 
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("tool execution row");
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, error_code FROM tool_executions WHERE tool_call_id = ?1")
+            .bind(crate::provider::types::scoped_tool_call_id(
+                "assistant-0",
+                "call-1",
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("tool execution row");
     assert_eq!(row.0, "not_started");
     assert_eq!(row.1.as_deref(), Some("approval_denied"));
 }
@@ -11299,6 +11457,7 @@ async fn later_approval_decision_does_not_overtake_an_earlier_deferred_user_mess
             async move {
                 let call = ToolCall {
                     id: "ordering-call".to_owned(),
+                    provider_call_id: None,
                     name: "bash".to_owned(),
                     route: crate::provider::types::ToolInvocationRoute::Normal,
                     arguments: serde_json::from_value(serde_json::json!({
@@ -11465,12 +11624,15 @@ async fn session_user_approve_once_allows_bash_and_executes() {
         "approved bash must execute"
     );
 
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("tool execution row");
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT state, error_code FROM tool_executions WHERE tool_call_id = ?1")
+            .bind(crate::provider::types::scoped_tool_call_id(
+                "assistant-0",
+                "call-1",
+            ))
+            .fetch_one(&pool)
+            .await
+            .expect("tool execution row");
     assert_eq!(row.0, "succeeded");
     assert!(row.1.is_none());
 
@@ -11570,13 +11732,17 @@ async fn session_user_approve_always_persists_rule_and_executes() {
         i64,
     ) = sqlx::query_as(
         "SELECT
-           (SELECT state FROM approval_log WHERE id = ?),
-           (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+           (SELECT state FROM approval_log WHERE id = ?1),
+           (SELECT state FROM tool_executions WHERE tool_call_id = ?2),
            (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
            (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_requested'),
            (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_resolved')",
     )
     .bind(&request_id)
+    .bind(crate::provider::types::scoped_tool_call_id(
+        "assistant-0",
+        "call-1",
+    ))
     .fetch_one(&pool)
     .await
     .expect("durable approval and execution records");
@@ -11758,13 +11924,17 @@ async fn session_approve_always_normalization_matrix_is_durable_and_replayable()
             String,
         ) = sqlx::query_as(
             "SELECT
-                (SELECT state FROM approval_log WHERE id = ?),
-                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
-                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT state FROM approval_log WHERE id = ?1),
+                (SELECT state FROM tool_executions WHERE tool_call_id = ?2),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = ?2),
                 (SELECT COUNT(*) FROM approval_rules),
                 (SELECT status FROM inbound_commands WHERE seq = 2)",
         )
         .bind(&request_id)
+        .bind(crate::provider::types::scoped_tool_call_id(
+            "assistant-0",
+            "call-1",
+        ))
         .fetch_one(&pool)
         .await
         .expect("normalized durable state");
@@ -11916,21 +12086,25 @@ async fn assert_pre_start_approval_control_race(store_name: &str, control: Inbou
         String,
     ) = sqlx::query_as(
         "SELECT
-                (SELECT state FROM approval_log WHERE id = ?),
-                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
-                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT state FROM approval_log WHERE id = ?1),
+                (SELECT state FROM tool_executions WHERE tool_call_id = ?3),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = ?3),
                 (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
                 (SELECT COUNT(*) FROM agent_events
                  WHERE event_type = 'tool_execution_start'
-                   AND json_extract(envelope, '$.tool_call_id') = 'call-1'),
+                   AND json_extract(envelope, '$.tool_call_id') = ?3),
                 (SELECT COUNT(*) FROM agent_events
                  WHERE event_type = 'approval_resolved'
-                   AND json_extract(envelope, '$.request_id') = ?),
+                   AND json_extract(envelope, '$.request_id') = ?2),
                 (SELECT status FROM inbound_commands WHERE seq = 2),
                 (SELECT status FROM inbound_commands WHERE seq = 3)",
     )
     .bind(&request_id)
     .bind(&request_id)
+    .bind(crate::provider::types::scoped_tool_call_id(
+        "assistant-0",
+        "call-1",
+    ))
     .fetch_one(&pool)
     .await
     .expect("atomic pre-start cancellation state");
@@ -12092,17 +12266,21 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
         "SELECT
             (SELECT status FROM inbound_commands WHERE seq = 2),
             (SELECT status FROM inbound_commands WHERE seq = 3),
-            (SELECT state FROM approval_log WHERE id = ?),
-            (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+            (SELECT state FROM approval_log WHERE id = ?1),
+            (SELECT state FROM tool_executions WHERE tool_call_id = ?3),
             (SELECT COUNT(*) FROM agent_events
              WHERE event_type = 'approval_resolved'
-               AND json_extract(envelope, '$.request_id') = ?),
+               AND json_extract(envelope, '$.request_id') = ?2),
             (SELECT COUNT(*) FROM agent_events
              WHERE event_type = 'tool_execution_start'
-               AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+               AND json_extract(envelope, '$.tool_call_id') = ?3)",
     )
     .bind(&request_id)
     .bind(&request_id)
+    .bind(crate::provider::types::scoped_tool_call_id(
+        "assistant-0",
+        "call-1",
+    ))
     .fetch_one(&pool)
     .await
     .expect("staged duplicate durable state");
@@ -12168,17 +12346,21 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
             "SELECT
                 (SELECT status FROM inbound_commands WHERE seq = 2),
                 (SELECT status FROM inbound_commands WHERE seq = 3),
-                (SELECT state FROM approval_log WHERE id = ?),
-                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT state FROM approval_log WHERE id = ?1),
+                (SELECT state FROM tool_executions WHERE tool_call_id = ?3),
                 (SELECT COUNT(*) FROM agent_events
                  WHERE event_type = 'approval_resolved'
-                   AND json_extract(envelope, '$.request_id') = ?),
+                   AND json_extract(envelope, '$.request_id') = ?2),
                 (SELECT COUNT(*) FROM agent_events
                  WHERE event_type = 'tool_execution_start'
-                   AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+                   AND json_extract(envelope, '$.tool_call_id') = ?3)",
         )
         .bind(&request_id)
         .bind(&request_id)
+        .bind(crate::provider::types::scoped_tool_call_id(
+            "assistant-0",
+            "call-1"
+        ))
         .fetch_one(store.pool())
         .await
         .expect("restarted staged duplicate durable state"),

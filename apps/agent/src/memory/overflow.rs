@@ -427,6 +427,7 @@ fn message_to_public(message: &Message) -> PublicMessage {
     match message {
         Message::User(user) => PublicMessage::User(user.clone()),
         Message::ToolResult(ToolResultMessage {
+            provider_call_id,
             tool_call_id,
             tool_name,
             content,
@@ -434,6 +435,7 @@ fn message_to_public(message: &Message) -> PublicMessage {
             is_error,
             timestamp,
         }) => PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: provider_call_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
             content: content.clone(),

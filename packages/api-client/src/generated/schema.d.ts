@@ -912,6 +912,7 @@ export interface components {
         } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
         ToolCall: {
             id: string;
+            provider_call_id?: string;
             name: string;
             /** @enum {string} */
             route: "normal" | "elevated";
@@ -924,6 +925,7 @@ export interface components {
         ToolArgumentError: "invalid_json" | "non_object" | "schema_violation" | "incomplete_response" | "too_large";
         RejectedToolCall: {
             id: string;
+            provider_call_id?: string;
             name: string;
             error: components["schemas"]["ToolArgumentError"];
         };
@@ -985,6 +987,7 @@ export interface components {
             /** @constant */
             role: "tool_result";
             tool_call_id: string;
+            provider_call_id?: string;
             tool_name: string;
             content: components["schemas"]["UserContent"][];
             details: components["schemas"]["AnyJSON"];
@@ -996,6 +999,7 @@ export interface components {
         /** @description tool result nested in TurnEnd; the enclosing event supplies its type */
         ToolResultPayload: {
             tool_call_id: string;
+            provider_call_id?: string;
             tool_name: string;
             content: components["schemas"]["UserContent"][];
             details: components["schemas"]["AnyJSON"];

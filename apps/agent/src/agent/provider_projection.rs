@@ -581,11 +581,13 @@ mod tests {
         let mut projector = started();
         let rejected = RejectedToolCall {
             id: "call-1".to_owned(),
+            provider_call_id: None,
             name: "read".to_owned(),
             error: ToolArgumentError::InvalidJson,
         };
         let synthetic_result = ToolResultMessage {
             tool_call_id: "call-1".to_owned(),
+            provider_call_id: None,
             tool_name: "read".to_owned(),
             content: Vec::new(),
             details: json!({"error": "invalid"}),

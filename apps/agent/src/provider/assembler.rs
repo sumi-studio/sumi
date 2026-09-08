@@ -1137,6 +1137,7 @@ impl ToolArgumentAccumulator {
         };
 
         ToolArgumentOutcome::Validated(ToolCall {
+            provider_call_id: None,
             id: call_id,
             name: tool_name,
             route,
@@ -1175,11 +1176,13 @@ fn rejected_outcome(
 ) -> ToolArgumentOutcome {
     let constraint = canonical_rejection_constraint(detail.error, &detail.constraint);
     let rejected = RejectedToolCall {
+        provider_call_id: None,
         id: call_id.clone(),
         name: tool_name.clone(),
         error: detail.error,
     };
     let synthetic_result = ToolResultMessage {
+        provider_call_id: None,
         tool_call_id: call_id,
         tool_name,
         content: vec![UserContent::Text {
@@ -1391,11 +1394,13 @@ mod tests {
         ProviderEvent::ToolCallRejected {
             content_index,
             rejected: RejectedToolCall {
+                provider_call_id: None,
                 id: id.to_owned(),
                 name: "read_file".to_owned(),
                 error,
             },
             synthetic_result: ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: id.to_owned(),
                 tool_name: "read_file".to_owned(),
                 content: vec![UserContent::Text {
@@ -1539,11 +1544,13 @@ mod tests {
             .apply(&ProviderEvent::ToolCallRejected {
                 content_index: 0,
                 rejected: RejectedToolCall {
+                    provider_call_id: None,
                     id: String::new(),
                     name: String::new(),
                     error: ToolArgumentError::InvalidJson,
                 },
                 synthetic_result: ToolResultMessage {
+                    provider_call_id: None,
                     tool_call_id: String::new(),
                     tool_name: String::new(),
                     content: vec![UserContent::Text {

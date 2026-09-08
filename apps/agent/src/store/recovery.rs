@@ -629,6 +629,7 @@ impl AssistantRecoverySnapshot {
                     let message_id =
                         tool_result_message_id(&assistant_message_id, call.id.as_str());
                     let result = ToolResultMessage {
+                        provider_call_id: call.provider_call_id.clone(),
                         tool_call_id: call.id.clone(),
                         tool_name: call.name.clone(),
                         content: vec![UserContent::Text {
@@ -738,6 +739,7 @@ impl AssistantRecoverySnapshot {
                         );
                     }
                     let result = ToolResultMessage {
+                        provider_call_id: call.provider_call_id.clone(),
                         tool_call_id: call.id.clone(),
                         tool_name: call.name.clone(),
                         content: vec![UserContent::Text {
@@ -1077,6 +1079,7 @@ impl SuffixRecovery {
                 )
                 .ok_or_else(|| anyhow::anyhow!("physical recovery terminal sequence overflow"))?;
             let result = ToolResultMessage {
+                provider_call_id: request.provider_call_id.clone(),
                 tool_call_id: request.tool_call_id.clone(),
                 tool_name: request.tool_name.clone(),
                 content: vec![UserContent::Text {
@@ -2287,6 +2290,7 @@ pub(crate) mod tests {
                 .map(
                     |(id, name, wire_item_index)| PublicAssistantContent::ToolCall {
                         tool_call: ToolCall {
+                            provider_call_id: None,
                             id: (*id).to_owned(),
                             name: (*name).to_owned(),
                             arguments: serde_json::from_value(json!({ "slot": *wire_item_index }))
@@ -2395,6 +2399,7 @@ pub(crate) mod tests {
         persist_running_tool(writer, tool_call_id, tool_name, slot).await;
 
         let result = ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: tool_call_id.to_owned(),
             tool_name: tool_name.to_owned(),
             content: vec![UserContent::Text {

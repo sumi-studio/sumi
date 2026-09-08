@@ -330,8 +330,13 @@ func validatePublicMessage(raw json.RawMessage) error {
 		return nil
 
 	case "tool_result":
-		if err := requireAndAllow(obj, []string{"role", "tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}, []string{"role", "tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}); err != nil {
+		if err := requireAndAllow(obj, []string{"role", "tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}, []string{"role", "tool_call_id", "tool_name", "content", "details", "is_error", "timestamp", "provider_call_id"}); err != nil {
 			return err
+		}
+		if rawID, ok := obj["provider_call_id"]; ok {
+			if err := validateString(rawID); err != nil {
+				return fmt.Errorf("provider_call_id: %w", err)
+			}
 		}
 		if err := validateString(obj["tool_call_id"]); err != nil {
 			return fmt.Errorf("tool_result message tool_call_id: %w", err)
@@ -554,8 +559,13 @@ func validateToolCall(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := requireAndAllow(obj, []string{"id", "name", "route", "arguments"}, []string{"id", "name", "route", "arguments"}); err != nil {
+	if err := requireAndAllow(obj, []string{"id", "name", "route", "arguments"}, []string{"id", "name", "route", "arguments", "provider_call_id"}); err != nil {
 		return err
+	}
+	if rawID, ok := obj["provider_call_id"]; ok {
+		if err := validateString(rawID); err != nil {
+			return fmt.Errorf("provider_call_id: %w", err)
+		}
 	}
 	if err := validateString(obj["id"]); err != nil {
 		return fmt.Errorf("tool call id: %w", err)
@@ -580,8 +590,13 @@ func validateRejectedToolCall(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := requireAndAllow(obj, []string{"id", "name", "error"}, []string{"id", "name", "error"}); err != nil {
+	if err := requireAndAllow(obj, []string{"id", "name", "error"}, []string{"id", "name", "error", "provider_call_id"}); err != nil {
 		return err
+	}
+	if rawID, ok := obj["provider_call_id"]; ok {
+		if err := validateString(rawID); err != nil {
+			return fmt.Errorf("provider_call_id: %w", err)
+		}
 	}
 	if err := validateString(obj["id"]); err != nil {
 		return fmt.Errorf("rejected tool call id: %w", err)
@@ -603,8 +618,13 @@ func validateToolResultPayload(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := requireAndAllow(obj, []string{"tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}, []string{"tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}); err != nil {
+	if err := requireAndAllow(obj, []string{"tool_call_id", "tool_name", "content", "details", "is_error", "timestamp"}, []string{"tool_call_id", "tool_name", "content", "details", "is_error", "timestamp", "provider_call_id"}); err != nil {
 		return err
+	}
+	if rawID, ok := obj["provider_call_id"]; ok {
+		if err := validateString(rawID); err != nil {
+			return fmt.Errorf("provider_call_id: %w", err)
+		}
 	}
 	if err := validateString(obj["tool_call_id"]); err != nil {
 		return fmt.Errorf("tool result tool_call_id: %w", err)

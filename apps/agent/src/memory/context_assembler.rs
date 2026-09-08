@@ -1661,6 +1661,7 @@ mod tests {
             message: Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::RejectedToolCall {
                     rejected: RejectedToolCall {
+                        provider_call_id: None,
                         id: id.to_owned(),
                         name: "fixture".to_owned(),
                         error: ToolArgumentError::SchemaViolation,
@@ -1685,6 +1686,7 @@ mod tests {
             id: format!("tool-result-{seq}"),
             seq,
             message: Message::ToolResult(ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: call_id.to_owned(),
                 tool_name: "fixture".to_owned(),
                 content: vec![UserContent::Text {
@@ -2061,6 +2063,7 @@ mod tests {
             message: Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall {
                     tool_call: crate::provider::types::ToolCall {
+                        provider_call_id: None,
                         id: covered_call_id.to_owned(),
                         name: "fixture".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -3269,6 +3272,7 @@ mod tests {
                 assistant.stop_reason = StopReason::ToolUse;
                 assistant.content.push(AssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "call-with-stable-id".into(),
                         name: "fixture".into(),
                         route: ToolInvocationRoute::Elevated,
@@ -4142,6 +4146,7 @@ mod tests {
             message: Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall {
                     tool_call: crate::provider::types::ToolCall {
+                        provider_call_id: None,
                         id: "call-4".to_owned(),
                         name: "fixture".to_owned(),
                         route: crate::provider::types::ToolInvocationRoute::Normal,
@@ -4165,6 +4170,7 @@ mod tests {
             id: "tool-4".to_owned(),
             seq: 5,
             message: Message::ToolResult(ToolResultMessage {
+                provider_call_id: None,
                 tool_call_id: "call-4".to_owned(),
                 tool_name: "fixture".to_owned(),
                 content: vec![UserContent::Text {

@@ -211,6 +211,7 @@ impl PendingApprovalRequest {
 }
 
 struct PendingEntry {
+    provider_call_id: Option<String>,
     sealed: SealedBoundToolInvocation,
     scope: ApprovalPrincipalScope,
     run_id: String,
@@ -260,6 +261,7 @@ impl ApprovalPrincipalScope {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingSummary {
+    pub provider_call_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
 }
@@ -444,6 +446,7 @@ impl RouteApprovalBroker {
         turn_id: &str,
         cancel: CancellationToken,
     ) -> Result<RouteApprovalOutcome> {
+        let canonical_transcript = transcript;
         scope.validate()?;
         let bound = sealed.invocation();
         let now = (self.clock)();
@@ -613,8 +616,16 @@ impl RouteApprovalBroker {
                         let review = self
                             .escalation_reviewer
                             .block_without_call(ReviewerTerminalClass::InsufficientEvidence);
-                        return self
-                            .make_pending(sealed, route, scope, run_id, turn_id, snapshot, review);
+                        return self.make_pending(
+                            canonical_transcript,
+                            sealed,
+                            route,
+                            scope,
+                            run_id,
+                            turn_id,
+                            snapshot,
+                            review,
+                        );
                     }
                 };
                 let review_request = EscalationReviewRequest {
@@ -632,13 +643,30 @@ impl RouteApprovalBroker {
                     | EscalationReviewResult::Block(review) => review,
                 };
                 if review.decision.outcome == EscalationReviewOutcome::AskHuman {
-                    self.make_pending(sealed, route, scope, run_id, turn_id, snapshot, review)
+                    self.make_pending(
+                        canonical_transcript,
+                        sealed,
+                        route,
+                        scope,
+                        run_id,
+                        turn_id,
+                        snapshot,
+                        review,
+                    )
                 } else {
                     let Some(responder) = self.escalation_objection_responder.as_ref() else {
                         review.pa_objection_failure =
                             Some("PA objection-response channel is unavailable".to_owned());
-                        return self
-                            .make_pending(sealed, route, scope, run_id, turn_id, snapshot, review);
+                        return self.make_pending(
+                            canonical_transcript,
+                            sealed,
+                            route,
+                            scope,
+                            run_id,
+                            turn_id,
+                            snapshot,
+                            review,
+                        );
                     };
                     let response = Box::pin(responder.answer(
                         EscalationObjectionRequest {
@@ -652,6 +680,7 @@ impl RouteApprovalBroker {
                     review.pa_objection_response = Some(Box::new(response));
                     match answer.map(|answer| answer.outcome) {
                         Some(EscalationObjectionOutcome::Proceed) => self.make_pending(
+                            canonical_transcript,
                             sealed, route, scope, run_id, turn_id, snapshot, review,
                         ),
                         Some(EscalationObjectionOutcome::Withdraw) => self.deny(
@@ -676,6 +705,7 @@ impl RouteApprovalBroker {
                                 "PA did not produce a valid objection answer (terminal: {terminal})"
                             ));
                             self.make_pending(
+                                canonical_transcript,
                                 sealed, route, scope, run_id, turn_id, snapshot, review,
                             )
                         }
@@ -764,6 +794,7 @@ impl RouteApprovalBroker {
     #[allow(clippy::too_many_arguments)]
     fn make_pending(
         &self,
+        transcript: &[PublicMessage],
         sealed: SealedBoundToolInvocation,
         route: ToolInvocationRoute,
         scope: ApprovalPrincipalScope,
@@ -778,6 +809,24 @@ impl RouteApprovalBroker {
             );
         }
         let bound = sealed.invocation();
+        let provider_call_id = transcript
+            .iter()
+            .rev()
+            .find_map(|message| {
+                let PublicMessage::Assistant(assistant) = message else {
+                    return None;
+                };
+                assistant.content.iter().find_map(|content| match content {
+                    PublicAssistantContent::ToolCall { tool_call, .. }
+                        if tool_call.id == bound.tool_call_id
+                            && tool_call.name == bound.tool_name =>
+                    {
+                        Some(tool_call.provider_call_id.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
         let durable_evidence = DurablePendingApprovalEvidence {
             bound: bound.clone(),
             policy: policy.clone(),
@@ -823,6 +872,7 @@ impl RouteApprovalBroker {
             .insert(
                 request_id,
                 PendingEntry {
+                    provider_call_id,
                     sealed,
                     scope,
                     run_id: run_id.to_owned(),
@@ -1039,6 +1089,7 @@ impl RouteApprovalBroker {
             .unwrap_or_else(|error| error.into_inner())
             .get(request_id)
             .map(|entry| PendingSummary {
+                provider_call_id: entry.provider_call_id.clone(),
                 tool_call_id: entry.sealed.invocation().tool_call_id.clone(),
                 tool_name: entry.sealed.invocation().tool_name.clone(),
             })
@@ -1145,6 +1196,7 @@ fn bounded_reviewer_transcript(
                                 text: None,
                                 text_truncated: false,
                                 tool_calls: vec![ReviewerToolCallEvidence {
+                                    provider_call_id: tool_call.provider_call_id.clone(),
                                     id: tool_call.id.clone(),
                                     tool: tool_call.name.clone(),
                                     route: tool_call.route,
@@ -1204,6 +1256,7 @@ fn bounded_reviewer_transcript(
                     ordinal,
                     result.tool_call_id.clone(),
                     ReviewerTranscriptEntry::ToolResult {
+                        provider_call_id: result.provider_call_id.clone(),
                         tool: tool.clone(),
                         tool_call_id: (!result.tool_call_id.is_empty())
                             .then(|| result.tool_call_id.clone()),
@@ -1941,6 +1994,7 @@ mod tests {
     ) -> PublicMessage {
         assistant_contents(vec![PublicAssistantContent::ToolCall {
             tool_call: ToolCall {
+                provider_call_id: None,
                 id: id.into(),
                 name: name.into(),
                 route,
@@ -1953,6 +2007,7 @@ mod tests {
     fn rejected_tool_call(name: impl Into<String>, error: ToolArgumentError) -> PublicMessage {
         assistant_contents(vec![PublicAssistantContent::RejectedToolCall {
             rejected: RejectedToolCall {
+                provider_call_id: None,
                 id: Uuid::now_v7().to_string(),
                 name: name.into(),
                 error,
@@ -1972,6 +2027,7 @@ mod tests {
         details: Value,
     ) -> PublicMessage {
         PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             content: vec![UserContent::Text { text: text.into() }],
@@ -1999,6 +2055,7 @@ mod tests {
             .expect("register bound tool");
         let registry = builder.build();
         let call = ToolCall {
+            provider_call_id: None,
             id: "tool-call-1".to_owned(),
             name: "app_action".to_owned(),
             route,
@@ -2718,6 +2775,7 @@ mod tests {
             assistant_contents(vec![
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "first-call-wire-order".to_owned(),
                         name: "first_tool_wire_order".to_owned(),
                         route: ToolInvocationRoute::Normal,
@@ -2728,6 +2786,7 @@ mod tests {
                 },
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "second-call-wire-order".to_owned(),
                         name: "second_tool_wire_order".to_owned(),
                         route: ToolInvocationRoute::Normal,
@@ -3225,6 +3284,7 @@ mod tests {
                 },
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "sibling-read".to_owned(),
                         name: "workspace_list".to_owned(),
                         route: ToolInvocationRoute::Normal,
@@ -3235,6 +3295,7 @@ mod tests {
                 },
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "pending-update".to_owned(),
                         name: "app_action".to_owned(),
                         route: ToolInvocationRoute::Elevated,
@@ -3272,6 +3333,7 @@ mod tests {
                 },
                 PublicAssistantContent::ToolCall {
                     tool_call: ToolCall {
+                        provider_call_id: None,
                         id: "secret-read".to_owned(),
                         name: "workspace_list".to_owned(),
                         route: ToolInvocationRoute::Normal,

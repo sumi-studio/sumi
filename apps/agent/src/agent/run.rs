@@ -1055,7 +1055,7 @@ impl Runner {
                     }
                 }
                 event = attempt.events.recv(), if self.hard_steer_command.is_none() || cancellation_observed => {
-                    let Some(event) = event else {
+                    let Some(mut event) = event else {
                         // EOF while not hard-steering.
                         drop(rejected_results);
                         if self.abort_requested {
@@ -1072,6 +1072,7 @@ impl Runner {
                             "provider stream ended without a terminal event".to_owned(),
                         ).await;
                     };
+                    scope_provider_tool_ids(&attempt.message_id, &mut event);
                     let terminal_message = match &event {
                         ProviderEvent::Done { output, .. } | ProviderEvent::Error { output, .. } => {
                             Some(output.message.clone())
@@ -2202,7 +2203,7 @@ impl Runner {
         {
             ToolStartOutcome::RouteStarted(authorized) => {
                 tracing::info!(tool_call_id = %call.id, stage = "execution_start", elapsed_ms = start_commit_started.elapsed().as_millis() as u64, "tool dispatch progress");
-                let (result, live_post_commit) = match self
+                let (mut result, live_post_commit) = match self
                     .execute_bound_tool_with_updates(authorized)
                     .await
                 {
@@ -2234,6 +2235,7 @@ impl Runner {
                         None,
                     ),
                 };
+                result.provider_call_id = call.provider_call_id.clone();
                 let receipt = self.emit_tool_result(assistant_message_id, &result).await?;
                 if let Some(post_commit) = live_post_commit {
                     let maintenance_started = std::time::Instant::now();
@@ -3102,7 +3104,12 @@ impl Runner {
             })
             .await?;
         }
-        result.map_err(ExecuteToolError::Tool)
+        result
+            .map(|mut result| {
+                result.provider_call_id = call.provider_call_id.clone();
+                result
+            })
+            .map_err(ExecuteToolError::Tool)
     }
 
     async fn execute_bound_tool_with_updates(
@@ -4313,6 +4320,52 @@ enum SyntheticAttemptFailure {
     Abort,
 }
 
+/// Assign execution identity only to newly received provider output. Retained
+/// history and native opaque fragments are never rewritten by this boundary.
+fn scope_provider_tool_ids(message_id: &str, event: &mut ProviderEvent) {
+    fn scope_call(message_id: &str, call: &mut ToolCall) {
+        let raw = call.wire_id().to_owned();
+        call.id = crate::provider::types::scoped_tool_call_id(message_id, &raw);
+        call.provider_call_id = Some(raw);
+    }
+    fn scope_rejected(message_id: &str, rejected: &mut crate::provider::types::RejectedToolCall) {
+        let raw = rejected.wire_id().to_owned();
+        rejected.id = crate::provider::types::scoped_tool_call_id(message_id, &raw);
+        rejected.provider_call_id = Some(raw);
+    }
+    match event {
+        ProviderEvent::ToolCallEnd { tool_call, .. } => scope_call(message_id, tool_call),
+        ProviderEvent::ToolCallRejected {
+            rejected,
+            synthetic_result,
+            ..
+        } => {
+            scope_rejected(message_id, rejected);
+            // Normalize independently so a mismatched synthetic result stays a
+            // mismatch and the existing correspondence validation rejects it.
+            let raw = synthetic_result.wire_id().to_owned();
+            synthetic_result.tool_call_id =
+                crate::provider::types::scoped_tool_call_id(message_id, &raw);
+            synthetic_result.provider_call_id = Some(raw);
+        }
+        ProviderEvent::Done { output, .. } | ProviderEvent::Error { output, .. } => {
+            for content in &mut output.message.content {
+                match content {
+                    AssistantContent::ToolCall { tool_call, .. } => {
+                        scope_call(message_id, tool_call)
+                    }
+                    AssistantContent::RejectedToolCall { rejected, .. } => {
+                        scope_rejected(message_id, rejected)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // ToolArgsPreview contains arguments only, never a call identifier.
+        _ => {}
+    }
+}
+
 fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
     let PublicMessage::Assistant(message) = message else {
         return Vec::new();
@@ -4518,6 +4571,7 @@ fn normalize_length_loop_guard(message: &PublicMessage) -> PublicMessage {
 fn error_tool_result(call: &ToolCall, message: &str) -> ToolResultMessage {
     ToolResultMessage {
         tool_call_id: call.id.clone(),
+        provider_call_id: call.provider_call_id.clone(),
         tool_name: call.name.clone(),
         content: vec![UserContent::Text {
             text: message.to_owned(),
@@ -4603,6 +4657,7 @@ fn route_denial_tool_result(
     }
     ToolResultMessage {
         tool_call_id: call.id.clone(),
+        provider_call_id: call.provider_call_id.clone(),
         tool_name: call.name.clone(),
         content: vec![UserContent::Text { text }],
         details,

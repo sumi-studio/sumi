@@ -1003,6 +1003,7 @@ mod tests {
 
     fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
         ToolCall {
+            provider_call_id: None,
             id: id.to_owned(),
             name: name.to_owned(),
             route: crate::provider::types::ToolInvocationRoute::Normal,
