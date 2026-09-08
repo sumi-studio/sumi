@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/google/uuid"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +64,7 @@ func (d *attentionDeliveryFixture) Admit(ctx context.Context, key string, event 
 		return AgentAttentionReceipt{}, errors.New("idempotency payload conflict")
 	}
 	if !found {
-		receipt = AgentAttentionReceipt{CommandID: newUUIDv7(), Seq: uint64(len(d.receipts) + 1)}
+		receipt = AgentAttentionReceipt{CommandID: uuid.NewString(), Seq: uint64(len(d.receipts) + 1)}
 		d.receipts[key], d.payloads[key] = receipt, string(data)
 		d.events = append(d.events, event)
 	}
