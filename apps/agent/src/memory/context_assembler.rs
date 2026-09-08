@@ -1103,7 +1103,7 @@ fn memory_blocks_from_three_layer(memory: &ThreeLayerMemory) -> Vec<MemoryBlock>
         blocks.push(MemoryBlock {
             layer: MemoryLayer::L1,
             text: format!(
-                "[Memory fragment recorded {} through {}. Its position before live messages does not indicate chronology.]\nSource: memory_recall({source}). For further pages, pass next_after_seq as after_seq.\n{}",
+                "[Memory fragment recorded {} through {}. Its position before live messages does not indicate chronology.]\nSource: conversation_history({source}). For further pages, pass next_after_seq as after_seq.\n{}",
                 entry.time_range.0.to_rfc3339(),
                 entry.time_range.1.to_rfc3339(),
                 entry.summary.expose(),
@@ -2352,7 +2352,7 @@ mod tests {
         assert!(blocks[0].text.contains("does not indicate chronology"));
         let read_args = blocks[0]
             .text
-            .split("memory_recall(")
+            .split("conversation_history(")
             .nth(1)
             .expect("actionable source read")
             .split(").")

@@ -1045,11 +1045,17 @@ pub(crate) async fn recover_boot_memory_jobs(
     recover_compacting_batches_with(writer).await
 }
 
+/// Prepare results asynchronously, but retain the original provider prefix until
+/// live L0 strictly exceeds its budget. Apply only enough oldest ready chunks to
+/// return within the budget; unavailable older chunks do not block later ones.
 /// Apply completed L0 edits independently. Each transaction checks only its
 /// captured source versions, so an unchanged or unavailable older batch cannot
 /// prevent another completed edit from becoming usable. Summary chronology is
 /// retained by the target batch sequence and result time range.
 pub(crate) async fn apply_ready_memory(store: Arc<Store>) -> Result<usize> {
+    if live_l0_tokens(&store).await? <= super::L0_LIMIT {
+        return Ok(0);
+    }
     let rows = sqlx::query(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
@@ -1060,12 +1066,47 @@ pub(crate) async fn apply_ready_memory(store: Arc<Store>) -> Result<usize> {
     .await?;
     let mut applied = 0;
     for row in rows {
+        if live_l0_tokens(&store).await? <= super::L0_LIMIT {
+            break;
+        }
         let job = parse_job(&row)?;
         if apply_completed_job(store.clone(), &job).await? {
             applied += 1;
         }
     }
     Ok(applied)
+}
+
+/// Read accounting in one snapshot. Summary shelf rows are L1 and do not count;
+/// compacted L0 remains live until its source-CAS promotion commits. The owning
+/// Session is idle, so no conversation writer can race these decisions.
+async fn live_l0_tokens(store: &Store) -> Result<u64> {
+    let mut tx = store.pool().begin().await?;
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(est_tokens), 0) AS public_tokens,
+                COALESCE(SUM(eviction_footprint_tokens), 0) AS footprint
+         FROM memory_batches WHERE layer = 0 AND state != 'dropped'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let public = u64::try_from(row.try_get::<i64, _>("public_tokens")?)?;
+    let footprint = u64::try_from(row.try_get::<i64, _>("footprint")?)?;
+    let bits = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT ratio_bits FROM memory_calibration WHERE singleton = 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let calibration = match bits {
+        Some(bits) => {
+            let bits: [u8; 8] = bits
+                .try_into()
+                .map_err(|_| anyhow!("invalid calibration bytes"))?;
+            super::estimate::TokenCalibration::new(f64::from_bits(u64::from_be_bytes(bits)))?
+        }
+        None => super::estimate::TokenCalibration::default(),
+    };
+    tx.commit().await?;
+    Ok(calibration.effective_tokens(public, footprint)?)
 }
 
 async fn discard_stale_completed_job(
@@ -2143,6 +2184,7 @@ mod tests {
             .await
             .unwrap()
         );
+        insert_pressure_batch(&store, 3, super::super::L0_LIMIT).await;
         assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 1);
         let first_state: String =
             sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
@@ -2207,7 +2249,28 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(old_attempts, 0);
+        insert_pressure_batch(&store, 3, super::super::L0_LIMIT).await;
         assert_eq!(apply_ready_memory(store).await.unwrap(), 1);
+    }
+
+    async fn insert_pressure_batch(store: &Store, seq: i64, tokens: u64) {
+        insert_memory_fixture(
+            store,
+            "test_pressure",
+            MemoryTransition {
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    Uuid::now_v7().to_string(),
+                    MemoryLayer::L0,
+                    0,
+                    seq,
+                    MemoryBatchState::Sealed,
+                    i64::try_from(tokens).unwrap(),
+                    0,
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn hydrate(store: &Store) -> crate::store::HydratedRunState {
@@ -2292,6 +2355,15 @@ mod tests {
             vec![],
         )
         .await;
+        seed_completed_authenticated_turn(
+            &store,
+            &chat_model(),
+            "Continue observing.",
+            "assistant-pressure",
+            public_assistant(&"additional detail ".repeat(5000)),
+            vec![],
+        )
+        .await;
         finish.notify_one();
         assert!(task.await.expect("fork task").expect("durable completion"));
         assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 1);
@@ -2311,6 +2383,249 @@ mod tests {
                 .l1()
                 .iter()
                 .any(|entry| entry.summary.expose().contains("/workspace/source"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_results_wait_at_exact_limit_and_apply_only_enough_oldest_chunks() {
+        let store = test_store().await;
+        let first = user("first observation");
+        let second = user("second observation");
+        let (a, _) = insert_l0_batch(&store, std::slice::from_ref(&first)).await;
+        let (b, _) = insert_l0_batch_with_seq(&store, 2, std::slice::from_ref(&second)).await;
+        insert_compact_l0_job(&store, &Uuid::now_v7().to_string(), &a, 1).await;
+        insert_compact_l0_job(&store, &Uuid::now_v7().to_string(), &b, 2).await;
+        let parent = snapshot(vec![
+            persisted(&format!("{a}-msg-0"), 100, first),
+            persisted(&format!("{b}-msg-0"), 200, second),
+        ]);
+        let provider = FakeProvider {
+            text: "observation retained".into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert!(
+                compact_next_l0_with_provider(
+                    store.clone(),
+                    parent.clone(),
+                    CancellationToken::new(),
+                    &provider
+                )
+                .await
+                .unwrap()
+            );
+        }
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+        insert_pressure_batch(&store, 3, super::super::L0_LIMIT - 200).await;
+        assert_eq!(live_l0_tokens(&store).await.unwrap(), 40_000);
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+        // No new fork runs or signals readiness when later input crosses the limit.
+        insert_pressure_batch(&store, 4, 1).await;
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 1);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM memory_jobs ORDER BY batch_seq")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(statuses, ["applied", "completed"]);
+        assert_eq!(live_l0_tokens(&store).await.unwrap(), 39_901);
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+        insert_pressure_batch(&store, 5, 100).await;
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 1);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM memory_jobs ORDER BY batch_seq")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(statuses, ["applied", "applied"]);
+        assert_eq!(live_l0_tokens(&store).await.unwrap(), 39_901);
+    }
+
+    #[tokio::test]
+    async fn completed_shelf_preserves_original_prefix_across_hydration_until_later_input() {
+        let store = test_store().await;
+        let parent = real_parent_with_queued_target(&store).await;
+        let before = hydrate(&store).await;
+        assert!(live_l0_tokens(&store).await.unwrap() < super::super::L0_LIMIT);
+        let provider = FakeProvider {
+            text: "I observed the source repeatedly.".into(),
+            ..Default::default()
+        };
+        assert!(
+            compact_next_l0_with_provider(
+                store.clone(),
+                parent,
+                CancellationToken::new(),
+                &provider
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+        let restored = hydrate(&store).await;
+        assert_eq!(
+            restored.messages, before.messages,
+            "original native message identities and contents survive preparation/restart"
+        );
+        assert_eq!(restored.provider_context, before.provider_context);
+        let memory = ThreeLayerMemory::from_hydrated(restored.memory).unwrap();
+        assert!(
+            memory.l1().is_empty(),
+            "ready L1 remains off the parent prefix"
+        );
+        assert!(!memory.shelf.is_empty());
+        let correction = "Correction: the source changed afterward.";
+        seed_completed_authenticated_turn(
+            &store,
+            &chat_model(),
+            correction,
+            "later-pressure",
+            public_assistant(&"new observed detail ".repeat(5000)),
+            vec![],
+        )
+        .await;
+        assert!(live_l0_tokens(&store).await.unwrap() > super::super::L0_LIMIT);
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 1);
+        let after = hydrate(&store).await;
+        assert!(after.messages.iter().any(|message| matches!(message,
+            ContextMessage::Persisted { message: Message::User(user), .. }
+                if user.content.iter().any(|part| matches!(part, UserContent::Text { text } if text == correction))
+        )));
+        assert_eq!(
+            ThreeLayerMemory::from_hydrated(after.memory)
+                .unwrap()
+                .l1()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_rearms_remaining_shelf_without_a_new_fork_completion() {
+        use crate::agent::{InjectedRunDriver, RunCore, RunDriver};
+        use crate::tools::{ToolRegistryBuilder, WorkspacePaths};
+        let store = test_store().await;
+        real_parent_with_queued_target(&store).await;
+        let detail = "Another distinct observed source and unchanged values. ".repeat(2400);
+        seed_completed_authenticated_turn(
+            &store,
+            &chat_model(),
+            "Observe another source.",
+            "second-source",
+            public_assistant(&detail),
+            vec![],
+        )
+        .await;
+        seed_completed_authenticated_turn(
+            &store,
+            &chat_model(),
+            "Continue.",
+            "second-closed",
+            public_assistant("Here."),
+            vec![],
+        )
+        .await;
+        let parent = snapshot(hydrate(&store).await.messages);
+        let provider = FakeProvider {
+            text: "Observation retained.".into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert!(
+                compact_next_l0_with_provider(
+                    store.clone(),
+                    parent.clone(),
+                    CancellationToken::new(),
+                    &provider
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let restored = hydrate(&store).await;
+        let generation = ProcessGeneration::from_wire(41).unwrap();
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation,
+            "memory-test-lease",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "memory-test-fence").unwrap();
+        let registry = ToolRegistryBuilder::default().build();
+        let prompt = PromptContext::new(
+            "fixture".into(),
+            vec![],
+            vec![],
+            vec![],
+            registry.definitions(),
+        );
+        let driver = InjectedRunDriver::with_stream_starter(
+            chat_model(),
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").unwrap()),
+            Some(generation),
+            Arc::new(|_, _, _, _, _| panic!("idle maintenance must not call the provider")),
+        )
+        .unwrap()
+        .with_hydrated_memory(store.clone(), &lease, &fence, &restored)
+        .unwrap();
+        let mut core = RunCore::new();
+        driver.memory_maintenance_ready().await; // boot notification
+        assert!(
+            driver
+                .apply_idle_memory_maintenance(&mut core)
+                .await
+                .unwrap()
+        );
+        assert!(live_l0_tokens(&store).await.unwrap() <= super::super::L0_LIMIT);
+        tokio::time::timeout(Duration::from_secs(1), driver.memory_maintenance_ready())
+            .await
+            .expect("successful partial application rearms the remaining shelf");
+        assert!(
+            !driver
+                .apply_idle_memory_maintenance(&mut core)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), driver.memory_maintenance_ready())
+                .await
+                .is_err(),
+            "waiting below the limit must not self-notify or busy-loop"
+        );
+        seed_completed_authenticated_turn(
+            &store,
+            &chat_model(),
+            "A later correction.",
+            "third-source",
+            public_assistant(&detail),
+            vec![],
+        )
+        .await;
+        assert!(
+            driver
+                .apply_idle_memory_maintenance(&mut core)
+                .await
+                .unwrap()
+        );
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM memory_jobs ORDER BY batch_seq")
+                .fetch_all(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| status.as_str() == "applied")
+                .count(),
+            2
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "later replacement did not need another fork"
         );
     }
 
