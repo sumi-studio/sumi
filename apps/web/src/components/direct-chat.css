@@ -69,7 +69,7 @@
 
 /* The inspected Codex disclosure uses measured height and opacity together. */
 .direct-chat-tool-panel {
-  height: var(--collapsible-panel-height);
+  height: var(--tool-content-height, var(--collapsible-panel-height));
   overflow: hidden;
   opacity: 1;
   transition:
