@@ -1927,7 +1927,15 @@ impl<G: Gateway + 'static> Session<G> {
     /// reaches a phase where an earlier deferred command could now be routed.
     /// Only processes the front of the queue so later commands can never
     /// overtake an earlier deferred one.
-    async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
+    // Construct this future outside event persistence's poll frame: control
+    // acceptance may persist another event before reclassification returns.
+    fn reclassify_deferred(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SessionFailure>> + Send + '_>> {
+        Box::pin(self.reclassify_deferred_inner())
+    }
+
+    async fn reclassify_deferred_inner(&mut self) -> Result<(), SessionFailure> {
         while let Some(command) = self.deferred_commands.pop_one() {
             let was_user_message = matches!(
                 command.envelope().command,
@@ -2672,6 +2680,17 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        // Leave the commit/send frame before controls can re-enter persistence.
+        if self.persist_active_event_boundary(output).await? {
+            self.reclassify_deferred().await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_active_event_boundary(
+        &mut self,
+        output: RunOutput,
+    ) -> Result<bool, SessionFailure> {
         // Approved decisions are intentionally staged until the matching
         // ToolExecutionStart. Even though that ApprovalResolved produces no
         // public output yet, it is still a routing boundary: a queued steer or
@@ -2726,10 +2745,7 @@ impl<G: Gateway + 'static> Session<G> {
             .map(|active| active.bridge.command_id().to_owned());
         self.send_committed(outputs, command_id, terminal_command_ids)
             .await?;
-        if assistant_started || approval_boundary {
-            self.reclassify_deferred().await?;
-        }
-        Ok(())
+        Ok(assistant_started || approval_boundary)
     }
 
     async fn send_committed(

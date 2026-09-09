@@ -581,13 +581,14 @@ impl Runner {
     }
 
     async fn run(mut self, initial: AdmittedCommand) -> RunCompletion {
-        let mut result = if self.core.recovered_tool_continuation.is_some() {
-            self.run_inner().await
+        let initial_claim = if self.core.recovered_tool_continuation.is_some() {
+            Ok(())
         } else {
-            match self.claim_ordered_initial(initial) {
-                Ok(()) => self.run_inner().await,
-                Err(failure) => Err(failure),
-            }
+            self.claim_ordered_initial(initial)
+        };
+        let mut result = match initial_claim {
+            Ok(()) => self.run_inner().await,
+            Err(failure) => Err(failure),
         };
         if let Err(failure) = self.recover_received_controls() {
             result = Err(failure);
