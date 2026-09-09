@@ -1185,19 +1185,18 @@ fn bounded_reviewer_transcript(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                if !text.is_empty() {
-                    let text = if let Some(source) = message.incoming_source.as_ref()
-                        && source.is_external()
-                    {
+                let external_source = message
+                    .incoming_source
+                    .as_ref()
+                    .filter(|source| source.is_external());
+                if external_source.is_some() || !text.is_empty() {
+                    if let Some(source) = external_source {
                         external_sources.insert(
                             ordinal,
                             redactor.redact_value(&serde_json::to_value(source)?)?,
                         );
-                        redactor.redact_text(&text)
-                    } else {
-                        redactor.redact_text(&text)
-                    };
-                    users.push((ordinal, text));
+                    }
+                    users.push((ordinal, redactor.redact_text(&text)));
                     ordinal += 1;
                 }
             }
@@ -2321,6 +2320,91 @@ mod tests {
             );
             assert!(event.1.contains("Please do this operation."));
         }
+    }
+
+    #[test]
+    fn metadata_only_poll_events_remain_ordered_external_evidence() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/agent-events-fixtures.json"
+        ))
+        .unwrap();
+        let mut messages = vec![user_message("")];
+        let mut expected = Vec::new();
+        for key in ["external_poll_vote", "external_poll_withdrawal"] {
+            let wire = fixtures[key]["wire"]["provenance"].clone();
+            let source: crate::runtime::contracts::IncomingProvenance =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert!(source.authenticated_direct_chat_human().is_none());
+            let mut message = user_message("");
+            let PublicMessage::User(user) = &mut message else {
+                unreachable!()
+            };
+            user.incoming_source = Some(source);
+            messages.push(message);
+            expected.push(wire);
+        }
+        let bounded = bounded_reviewer_transcript(&messages, &Redactor::v1(), "pending").unwrap();
+        assert_eq!(bounded.entries.len(), 3);
+        assert!(matches!(
+            bounded.entries[0],
+            ReviewerTranscriptEntry::NoHumanTurn { .. }
+        ));
+        for (entry, expected) in bounded.entries[1..].iter().zip(expected) {
+            let ReviewerTranscriptEntry::ExternalEvent {
+                source,
+                text,
+                truncated,
+            } = entry
+            else {
+                panic!("poll must remain external evidence");
+            };
+            assert_eq!(
+                *source, expected,
+                "question, ordered options, IDs and source identity survive intact"
+            );
+            assert!(text.is_empty(), "no participant utterance is fabricated");
+            assert!(!truncated);
+        }
+        let bounded =
+            bounded_reviewer_transcript(&[user_message("")], &Redactor::v1(), "pending").unwrap();
+        assert_eq!(bounded.entries.len(), 1);
+        assert!(matches!(
+            bounded.entries[0],
+            ReviewerTranscriptEntry::NoHumanTurn { .. }
+        ));
+    }
+
+    #[test]
+    fn metadata_only_events_still_obey_the_transcript_entry_limit() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../contracts/agent-events-fixtures.json"
+        ))
+        .unwrap();
+        let mut message = user_message("");
+        let PublicMessage::User(user) = &mut message else {
+            unreachable!()
+        };
+        user.incoming_source = Some(
+            serde_json::from_value(fixtures["external_poll_vote"]["wire"]["provenance"].clone())
+                .unwrap(),
+        );
+        let messages = vec![message; MAX_CONTEXT_USER_MESSAGES + 2];
+        let bounded = bounded_reviewer_transcript(&messages, &Redactor::v1(), "pending").unwrap();
+        assert_eq!(
+            bounded
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, ReviewerTranscriptEntry::ExternalEvent { .. }))
+                .count(),
+            MAX_CONTEXT_USER_MESSAGES
+        );
+        assert!(bounded.entries.iter().any(|entry| matches!(
+            entry,
+            ReviewerTranscriptEntry::UserOmission {
+                omitted_user_turns: 2,
+                ..
+            }
+        )));
     }
 
     #[tokio::test]
