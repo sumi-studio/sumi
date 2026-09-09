@@ -86,6 +86,12 @@ describe("one tool execution", () => {
     expect(screen.getByText("実行中")).toBeVisible();
     expect(screen.getByText("進行状況")).toBeVisible();
     expect(screen.getByText("入力")).toBeVisible();
+    const output = screen
+      .getByRole("region", { name: "進行状況" })
+      .querySelector("pre");
+    if (!output) throw new Error("Missing progress output");
+    output.scrollTop = 24;
+    output.focus();
     view.rerender(
       <TraceRow event={{ ...running, status, label: title, result }} open />,
     );
@@ -101,6 +107,11 @@ describe("one tool execution", () => {
     expect(screen.queryByText("進行状況")).toBeNull();
     expect(screen.getByText("入力")).toBeVisible();
     const resultLabel = status === "done" ? "結果" : "理由";
+    expect(
+      screen.getByRole("region", { name: resultLabel }).querySelector("pre"),
+    ).toBe(output);
+    expect(output.scrollTop).toBe(24);
+    expect(output).toHaveFocus();
     expect(screen.getByText(resultLabel)).toBeVisible();
     expect(screen.getByRole("region", { name: resultLabel })).toHaveTextContent(
       result ?? "操作は中止されました",

@@ -19,7 +19,7 @@ import {
   SquareTerminal,
   Wrench,
 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import type { AgentTraceEvent } from "../agent/model";
 import {
   type AgentRun,
@@ -203,6 +203,36 @@ function ToolTraceRow({
 }) {
   const [localOpen, setLocalOpen] = useState(false);
   const expanded = open ?? localOpen;
+  const panelRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const content = contentRef.current;
+    if (!expanded || !panel || !content) return;
+
+    // Base UI returns to auto height after opening. Measure the inner content
+    // so later results can resize the panel without observing its animation.
+    let previousHeight = -1;
+    const measure = () => {
+      const height = content.getBoundingClientRect().height;
+      if (height === previousHeight) return;
+      previousHeight = height;
+      panel.style.setProperty("--tool-content-height", `${height}px`);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      // Freeze an interrupted resize at its visible height before Base UI
+      // starts the closing transition, rather than jumping to the full result.
+      panel.style.setProperty(
+        "--tool-content-height",
+        `${panel.getBoundingClientRect().height}px`,
+      );
+    };
+  }, [expanded]);
   const phase =
     event.status === "pending" || event.status === "running"
       ? "activity"
@@ -274,19 +304,19 @@ function ToolTraceRow({
         <ChevronRight className="direct-chat-tool-chevron size-3.5 shrink-0 transition-transform motion-reduce:transition-none" />
       </CollapsibleTrigger>
       <CollapsibleContent
+        ref={panelRef}
         keepMounted
         className="direct-chat-tool-panel"
         aria-hidden={!expanded}
         inert={!expanded}
       >
-        <div className="space-y-3 pt-2 pb-2 pl-6">
+        <div ref={contentRef} className="space-y-3 pt-2 pb-2 pl-6">
           <Payload label="入力" text={displayValue(event.args)} />
-          {phase === "activity" && resultText !== null && (
-            <Payload label="進行状況" text={resultText} />
-          )}
-          {phase === "result" && (
+          {(phase === "result" || resultText !== null) && (
             <Payload
-              label={failed ? "理由" : "結果"}
+              label={
+                phase === "activity" ? "進行状況" : failed ? "理由" : "結果"
+              }
               text={
                 failure ??
                 resultText ??
