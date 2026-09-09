@@ -10,7 +10,7 @@ import type { KeyboardEvent } from "react";
 import { useEffect, useRef } from "react";
 import { isImeComposing } from "../lib/ime";
 
-const MIN_HEIGHT = 54;
+const MIN_HEIGHT = 44;
 const MAX_HEIGHT = 186;
 const isCoarsePointer =
   typeof window !== "undefined" &&
@@ -68,7 +68,7 @@ export function ChatPromptInput({
   return (
     <PromptInput
       className={[
-        "flex items-end border-neutral-200/80 shadow-none focus-within:border-neutral-300",
+        "direct-chat-composer flex flex-col border-neutral-200/80 shadow-none focus-within:border-neutral-300",
         className,
       ]
         .filter(Boolean)
@@ -79,7 +79,7 @@ export function ChatPromptInput({
       }}
     >
       <PromptInputTextarea
-        className="m-0 min-w-0 flex-1 px-4 py-3.5 text-base"
+        className="m-0 w-full min-w-0 px-3 py-2 text-base leading-6"
         ref={textareaRef}
         rows={1}
         value={value}
@@ -90,7 +90,7 @@ export function ChatPromptInput({
         onChange={(event) => onValueChange(event.target.value)}
         onKeyDown={handleKeyDown}
       />
-      <PromptInputFooter className="shrink-0 pl-0 pr-3 pb-3">
+      <PromptInputFooter className="direct-chat-composer-footer w-full justify-end px-2 pb-2">
         <PromptInputTools>
           {streaming && (
             <PromptInputButton

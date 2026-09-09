@@ -3,3 +3,77 @@
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
     "Yu Gothic UI", "Noto Sans CJK JP", "Noto Sans JP", "IPAGothic", sans-serif;
 }
+
+.direct-chat-message {
+  min-width: 0;
+  font-size: 1rem;
+  line-height: 1.625;
+}
+
+.direct-chat-message[data-role="user"] .direct-chat-message-content {
+  max-width: 77%;
+  border-radius: 1rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.direct-chat-message .message-markdown {
+  overflow-wrap: anywhere;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.direct-chat-message .message-markdown > div {
+  gap: 0;
+}
+
+.direct-chat-message .message-markdown > div > :is(p, ul, ol, blockquote) {
+  margin-block: 0.5em;
+}
+
+.direct-chat-message .message-markdown > div > p + p {
+  margin-block-start: 1em;
+}
+
+.direct-chat-message .message-markdown > div > p + :is(ul, ol) {
+  margin-block-start: 0;
+}
+
+.direct-chat-message .message-markdown > div > :first-child {
+  margin-block-start: 0;
+}
+
+.direct-chat-message .message-markdown > div > :last-child {
+  margin-block-end: 0;
+}
+
+.direct-chat-composer {
+  min-width: 0;
+  border-radius: 1.5rem;
+}
+
+.direct-chat-composer-footer {
+  margin-top: 0.25rem;
+}
+
+.direct-chat-tool-summary {
+  width: fit-content;
+  max-width: 100%;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .direct-chat-tool:not([open]) .direct-chat-tool-chevron {
+    opacity: 0;
+  }
+
+  .direct-chat-tool-summary:is(:hover, :focus-visible)
+    .direct-chat-tool-chevron {
+    opacity: 1;
+  }
+}
+
+@media (pointer: coarse) {
+  .direct-chat-composer-footer button {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+}

@@ -10,7 +10,7 @@ import { Marker, MarkerContent } from "@sumi/ui/components/marker";
 import { useCallback } from "react";
 import type { ChatItem } from "../agent/model";
 import { ApprovalConfirmation } from "./approval-confirmation";
-import { TraceRow, WorkSummary } from "./work-summary";
+import { TraceRow } from "./work-summary";
 
 interface ChatItemViewProps {
   item: ChatItem;
@@ -33,7 +33,6 @@ export function ChatItemView({
   agentMessageCopyText,
   onApprovalDecision,
   sendingApprovalRequestId = null,
-  onWorkSummaryOpen,
   onRichContentReady,
 }: ChatItemViewProps) {
   const handleRichContentReady = useCallback(
@@ -43,16 +42,10 @@ export function ChatItemView({
 
   switch (item.kind) {
     case "agent-run":
-      return (
-        <WorkSummary
-          headingOnly
-          run={item}
-          onOpenChange={(open) => open && onWorkSummaryOpen?.()}
-        />
-      );
+      return null;
     case "trace":
       return (
-        <div className="py-2">
+        <div className="direct-chat-activity py-0.5">
           <TraceRow
             event={item.trace}
             phase={item.phase}
@@ -65,14 +58,14 @@ export function ChatItemView({
       return (
         <Message
           from={item.source ? "assistant" : "user"}
-          className="max-w-full py-3"
+          className="direct-chat-message max-w-full py-2"
         >
           {item.source && (
             <div className="text-muted-foreground text-xs leading-5">
               {`${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`}
             </div>
           )}
-          <MessageContent className="whitespace-pre-wrap break-words text-base leading-relaxed">
+          <MessageContent className="direct-chat-message-content whitespace-pre-wrap break-words text-base leading-relaxed">
             {item.text}
           </MessageContent>
           <MessageMetadata
@@ -94,8 +87,11 @@ export function ChatItemView({
       );
     case "prose":
       return (
-        <Message from="assistant" className="max-w-full py-3">
-          <MessageContent className="text-base leading-relaxed">
+        <Message
+          from="assistant"
+          className="direct-chat-message max-w-full py-2"
+        >
+          <MessageContent className="direct-chat-message-content text-base leading-relaxed">
             <MessageResponse
               mode={item.streaming ? "streaming" : "static"}
               onRenderSettled={
