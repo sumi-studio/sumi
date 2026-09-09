@@ -2697,7 +2697,8 @@ fn render_attachment_output(
     metadata: MessagingAttachmentMetadata,
     response: OpenMessagingAttachmentResponse,
 ) -> Result<ToolOutput, ToolError> {
-    let details = serde_json::json!({"attachment": &metadata});
+    let mut details = serde_json::json!({"attachment": &metadata});
+    let mut is_error = false;
     let content = if is_safe_inline_image_mime(&metadata.mime) {
         vec![UserContent::Image {
             data: BASE64_STANDARD.encode(response.bytes.as_slice()),
@@ -2706,25 +2707,31 @@ fn render_attachment_output(
     } else if metadata.mime.starts_with("text/") || metadata.mime == "application/json" {
         match String::from_utf8(response.bytes.as_slice().to_vec()) {
             Ok(text) => vec![UserContent::Text { text }],
-            Err(_) => vec![UserContent::Text {
-                text: format!(
-                    "Attachment {} is {} bytes of {} and is not valid UTF-8.",
-                    metadata.filename, metadata.size_bytes, metadata.mime
-                ),
-            }],
+            Err(_) => {
+                is_error = true;
+                details["error"] = serde_json::json!("invalid_utf8");
+                vec![UserContent::Text {
+                    text: format!(
+                        "Attachment {} could not be read as text because it is not valid UTF-8. Its content has not been read; only attachment metadata is available.",
+                        metadata.filename,
+                    ),
+                }]
+            }
         }
     } else {
+        is_error = true;
+        details["error"] = serde_json::json!("unsupported_format");
         vec![UserContent::Text {
             text: format!(
-                "Attachment {} is {} bytes of {} (sha256 {}).",
-                metadata.filename, metadata.size_bytes, metadata.mime, metadata.sha256
+                "Attachment {} has unsupported content type {}. Its content has not been read; only attachment metadata is available.",
+                metadata.filename, metadata.mime,
             ),
         }]
     };
     Ok(ToolOutput {
         content,
         details,
-        is_error: false,
+        is_error,
     })
 }
 
@@ -8710,7 +8717,19 @@ mod tests {
                 "archive.bin",
                 "application/octet-stream",
                 b"\0\x01".as_slice(),
-                "metadata",
+                "unsupported_format",
+            ),
+            (
+                "document.pdf",
+                "application/pdf",
+                b"%PDF-1.7".as_slice(),
+                "unsupported_format",
+            ),
+            (
+                "broken.txt",
+                "text/plain",
+                b"\xff".as_slice(),
+                "invalid_utf8",
             ),
         ];
         for (index, (filename, mime, bytes, expected)) in cases.into_iter().enumerate() {
@@ -8727,7 +8746,14 @@ mod tests {
             };
             let output = render_attachment_output(metadata.clone(), response)
                 .expect("render accepted attachment");
-            assert_eq!(output.details, json!({"attachment":metadata}));
+            assert_eq!(output.details["attachment"], json!(metadata));
+            let unread = matches!(expected, "unsupported_format" | "invalid_utf8");
+            assert_eq!(output.is_error, unread);
+            if unread {
+                assert_eq!(output.details["error"], expected);
+            } else {
+                assert!(output.details.get("error").is_none());
+            }
             assert!(!output.details.to_string().contains("aGVsbG8="));
             match (expected, output.content.as_slice()) {
                 ("image", [UserContent::Image { data, mime_type }]) => {
@@ -8735,13 +8761,98 @@ mod tests {
                     assert_eq!(mime_type, mime);
                 }
                 ("text", [UserContent::Text { text }]) => assert_eq!(text, "hello"),
-                ("metadata", [UserContent::Text { text }]) => {
+                ("unsupported_format" | "invalid_utf8", [UserContent::Text { text }]) => {
                     assert!(text.contains(filename));
-                    assert!(text.contains("application/octet-stream"));
+                    assert!(text.contains("content has not been read"));
                     assert!(!text.contains("\0\x01"));
                 }
                 other => panic!("unexpected attachment rendering {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn attachment_image_bytes_reach_opencode_provider_request() {
+        use crate::provider::{
+            ModelSpec, RequestOptions,
+            adapters::chat_completions,
+            types::{ContextMessage, Message, PromptContext, ToolResultMessage},
+        };
+        let bytes = BASE64_STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=").unwrap();
+        let metadata = test_attachment_metadata(10, "picture.png", "image/png", &bytes, 0);
+        let output = render_attachment_output(
+            metadata.clone(),
+            OpenMessagingAttachmentResponse {
+                attachment: OpenMessagingAttachmentMetadata {
+                    attachment_id: metadata.attachment_id,
+                    filename: metadata.filename,
+                    mime: metadata.mime,
+                    size_bytes: metadata.size_bytes,
+                    sha256: metadata.sha256,
+                },
+                bytes: zeroize::Zeroizing::new(bytes.clone()),
+            },
+        )
+        .unwrap();
+        assert!(!output.is_error);
+        let context = PromptContext::new(
+            String::new(),
+            vec![],
+            vec![ContextMessage::Synthetic {
+                message: Message::ToolResult(ToolResultMessage {
+                    provider_call_id: None,
+                    tool_call_id: "attachment-read".into(),
+                    tool_name: "messaging".into(),
+                    content: output.content,
+                    details: output.details,
+                    is_error: output.is_error,
+                    timestamp: chrono::Utc::now(),
+                }),
+            }],
+            vec![],
+            vec![],
+        );
+        for preset in ["opencode-go", "opencode-zen-go"] {
+            let mut spec = ModelSpec::preset(preset).unwrap();
+            assert_eq!(spec.id, "kimi-k2.7-code");
+            let request =
+                chat_completions::build_request(&spec, &context, &RequestOptions::default())
+                    .unwrap();
+            let wire: Value =
+                serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+            let images: Vec<_> = wire["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .filter(|block| block["type"] == "image_url")
+                .collect();
+            assert_eq!(images.len(), 1);
+            let data = images[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("data:image/png;base64,")
+                .expect("original image MIME");
+            assert_eq!(BASE64_STANDARD.decode(data).unwrap(), bytes);
+
+            spec.supports_images = false;
+            let unsupported =
+                chat_completions::build_request(&spec, &context, &RequestOptions::default())
+                    .unwrap();
+            assert!(
+                unsupported["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|message| !message["content"].is_array())
+            );
+            assert!(
+                unsupported["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("image omitted")
+            );
         }
     }
 

@@ -1208,12 +1208,13 @@ zai_tool_stream = false
     }
 
     #[test]
-    fn opencode_model_override_keeps_gateway_specific_compat() {
+    fn opencode_model_override_keeps_gateway_compat_and_explicit_image_setting() {
         let file: FileConfig = toml::from_str(
             r#"
 [model]
 preset = "opencode-go"
 id = "glm-5.2"
+supports_images = false
 "#,
         )
         .expect("valid config");
@@ -1317,7 +1318,7 @@ default_output_tokens = 16000
         assert_eq!(spec.context_window, 262_144);
         assert_eq!(spec.max_output_tokens, 32_768);
         assert_eq!(spec.default_output_tokens, 16_384);
-        assert!(!spec.supports_images);
+        assert!(spec.supports_images);
     }
 
     #[test]

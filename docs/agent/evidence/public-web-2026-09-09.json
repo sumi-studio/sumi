@@ -1,0 +1,66 @@
+{
+  "scenario": "Public document read, recoverable DNS failure and conversation continuity",
+  "status": "PASSED",
+  "started_at": "2026-09-09T11:22:45.352221+00:00",
+  "finished_at": "2026-09-09T11:23:54.524193+00:00",
+  "source_revision": "c3fbabb3dc9a8f41a81388c990632331cb48ea0f",
+  "merged_pr": 399,
+  "model": "opencode-go/kimi-k2.7-code",
+  "fixture": {
+    "human": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+    "agent": "01a08510-9330-7c92-87c4-6b31c0c98836",
+    "workspace": "01a08510-9443-74a2-b711-c80875c1b274",
+    "place": "01a08510-9464-7dbc-b6a8-810e03c7285d"
+  },
+  "read": {
+    "tool_call_id": "c91f182a-41d7-55a6-978b-71fb39f5b033",
+    "start_event_seq": 592,
+    "result_event_seq": 593,
+    "requested_url": "https://www.rfc-editor.org/rfc/rfc2606.txt",
+    "fetched_url": "https://www.rfc-editor.org/rfc/rfc2606.txt",
+    "fetched_at": "2026-09-09T11:23:15.775999129Z",
+    "status_code": 200,
+    "media_type": "text/plain",
+    "body_bytes": 8008,
+    "body_sha256": "b6869c8984701701bc2e6973b6ffc750d497f845cc1a65a106e9301590a13ab0",
+    "text_truncated": false,
+    "answer": {
+      "eventSeq": 599,
+      "text": "T03_fb26488b2673: .test, .example, .invalid, .localhost"
+    }
+  },
+  "failed_read": {
+    "tool_call_id": "53ade4c1-4cb3-526d-9bee-7c9de9dd2ea7",
+    "result_event_seq": 612,
+    "is_error": true,
+    "error": "dns_failed",
+    "requested_url": "https://sumi-public-web-fb26488b2673.invalid/",
+    "answer": {
+      "eventSeq": 618,
+      "text": "T03_fb26488b2673: unavailable; no page content was read"
+    }
+  },
+  "subsequent_answer": {
+    "eventSeq": 627,
+    "text": "T03_fb26488b2673: 17 + 25 = 42"
+  },
+  "reconnect": {
+    "status": "READY",
+    "helloOnly": true,
+    "commandsSent": 0,
+    "socketClosed": true
+  },
+  "cleanup_complete": true,
+  "limitations": [
+    "One synthetic real Kimi scenario; not native ChatGPT/Astra acceptance.",
+    "Live plaintext document only; HTML extraction, redirect and destination limits have local tests.",
+    "No browser rendering, authenticated pages, PDF extraction or JavaScript execution.",
+    "Model omitted URL fragment; live fragment retention is not established."
+  ],
+  "prior_failed_probe": {
+    "path": "/tmp/sumi-public-web-734cp940/evidence.json",
+    "status": "FAILED",
+    "reason": "Probe required identical fragment even though the model fetched the exact same document without it; original failure retained.",
+    "cleanup_complete": true
+  }
+}

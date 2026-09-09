@@ -270,7 +270,7 @@ impl ModelSpec {
                 "OPENCODE_GO_API_KEY",
                 262_144,
                 32_768,
-                false,
+                true,
                 ChatCompat {
                     max_tokens_field: MaxTokensField::MaxTokens,
                     supports_usage_in_streaming: true,

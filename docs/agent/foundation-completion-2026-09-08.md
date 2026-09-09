@@ -424,3 +424,30 @@ Native container state was checked and deployment resumed from the stopped
 checkpoint, preserving all mounts and settings. The helper now waits a bounded
 time for that completion; this was a deployment-script correction, not a reason
 to weaken process isolation or remove data.
+
+## Public document reading and ordinary fetch failure
+
+PR #399 merged as `f1ad7e5106b1bcbfe50860323ee4dc44909c6c56`; all three CI
+jobs and independent review passed. All four shared images now use the reviewed
+source `c3fbabb3dc9a8f41a81388c990632331cb48ea0f`, whose tree matches the merge.
+The cutover retained existing configuration, volumes and histories.
+
+The owned real Kimi scenario fetched RFC 2606 through the normally reviewed
+`public_url_read`, then answered from its 8,008-byte body. A separate `.invalid`
+URL produced a normal `dns_failed` tool error; the PA stated that no content had
+been read and answered a subsequent unrelated question. Hello-only reconnect
+submitted zero commands, with the existing command set unchanged. Cleanup passed.
+
+The first probe failed because it required the model to preserve `#section-2`;
+the model fetched the exact same document without that fragment. Native events
+confirmed the correct document and hash. The corrected, independently reviewed
+probe accepts only that document with or without the fragment, while checking
+that the result preserves the actual tool argument. The original failure remains
+unchanged; a fresh run passed. This does not establish live fragment retention.
+
+[Selected evidence](evidence/public-web-2026-09-09.json) records the source, hashes,
+error and continuation. Full local evidence is
+`/tmp/sumi-public-web-kjtebw1c/evidence.json`. This is one plaintext real-model
+scenario, not browser rendering, authenticated reading, PDF support or native
+Astra acceptance. HTML extraction and destination/redirect limits have local
+tests; they were not exercised by this live document.
