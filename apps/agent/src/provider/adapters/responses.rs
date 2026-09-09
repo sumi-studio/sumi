@@ -1129,6 +1129,7 @@ fn convert_input(
                 let mut content = user
                     .content
                     .iter()
+                    .filter(|content| !matches!(content, UserContent::Text { text } if text.is_empty()))
                     .map(|content| match content {
                         UserContent::Text { text } => json!({"type":"input_text","text":text}),
                         UserContent::Image { data, mime_type } if spec.supports_images => json!({

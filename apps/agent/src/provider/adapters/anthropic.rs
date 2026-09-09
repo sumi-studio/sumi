@@ -548,6 +548,9 @@ fn convert_messages(
                 let mut blocks = user
                     .content
                     .iter()
+                    .filter(
+                        |content| !matches!(content, UserContent::Text { text } if text.is_empty()),
+                    )
                     .map(|content| anthropic_user_content(content, spec.supports_images))
                     .collect::<Vec<_>>();
                 if let Some(timing) = user.incoming_timing_text() {
