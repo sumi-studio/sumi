@@ -28,8 +28,8 @@ use crate::{
         route_broker::RouteApprovalBroker,
         route_policy::{PolicySnapshot, PolicySourceState, RoutePolicy},
         route_reviewer::{
-            ESCALATION_PROMPT_VERSION_V7, ESCALATION_REVIEWER_VERSION_V7,
-            ESCALATION_SCHEMA_VERSION_V7, EXECUTION_PROMPT_VERSION_V7,
+            ESCALATION_PROMPT_VERSION_V8, ESCALATION_REVIEWER_VERSION_V7,
+            ESCALATION_SCHEMA_VERSION_V7, EXECUTION_PROMPT_VERSION_V8,
             EXECUTION_REVIEWER_VERSION_V7, EXECUTION_SCHEMA_VERSION_V7, EscalationReviewDecision,
             EscalationReviewEvidence, EscalationReviewOutcome, EscalationReviewer,
             EscalationReviewerPrompt, EscalationReviewerTransport, ExecutionReviewDecision,
@@ -489,7 +489,7 @@ fn execution_review_denial(terminal: ReviewerTerminalClass) -> ToolExecutionDeni
         policy_decision: PolicyDecisionRecord::Unmatched,
         execution_review: Some(ExecutionReviewEvidence {
             reviewer_version: EXECUTION_REVIEWER_VERSION_V7.to_owned(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7.to_owned(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V8.to_owned(),
             schema_version: EXECUTION_SCHEMA_VERSION_V7.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),
@@ -533,7 +533,7 @@ fn escalation_review_denial() -> ToolExecutionDenialEvidence {
         execution_review: None,
         escalation_review: Some(EscalationReviewEvidence {
             reviewer_version: ESCALATION_REVIEWER_VERSION_V7.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V7.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V8.to_owned(),
             schema_version: ESCALATION_SCHEMA_VERSION_V7.to_owned(),
             model_id: "reviewer".to_owned(),
             model_binding_digest: "binding".to_owned(),

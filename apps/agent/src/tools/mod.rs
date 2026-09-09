@@ -484,6 +484,8 @@ struct RegisteredBoundToolAdapter {
 /// ADR 0013's durable start barrier still owns exactly one committed
 /// start/effect across crash, cancellation, and retry boundaries.
 pub(crate) struct SealedBoundToolInvocation {
+    registered_definition: ToolDefinition,
+    provider_call_id: Option<String>,
     invocation: BoundToolInvocation,
     sealed_evidence_digest: bound::InvocationDigest,
     flow_id: String,
@@ -493,6 +495,15 @@ pub(crate) struct SealedBoundToolInvocation {
 }
 
 impl SealedBoundToolInvocation {
+    /// Frozen registry metadata for review only, never execution authority.
+    pub(crate) fn registered_definition(&self) -> &ToolDefinition {
+        &self.registered_definition
+    }
+
+    pub(crate) fn provider_call_id(&self) -> Option<&str> {
+        self.provider_call_id.as_deref()
+    }
+
     pub(crate) fn invocation(&self) -> &BoundToolInvocation {
         &self.invocation
     }
@@ -589,6 +600,8 @@ impl ToolRegistry {
         )?;
         let sealed_evidence_digest = invocation.evidence_digest()?;
         Ok(SealedBoundToolInvocation {
+            registered_definition: registered.definition.clone(),
+            provider_call_id: call.provider_call_id.clone(),
             invocation,
             sealed_evidence_digest,
             flow_id: flow_id.to_owned(),
@@ -1325,14 +1338,17 @@ mod tests {
         let origin = registry();
         let other = registry();
         let workspace = WorkspacePaths::new("/workspace").expect("workspace path");
+        let mut proposal = call("call-1", "inspect", json!({"path": "alpha"}));
+        proposal.provider_call_id = Some("provider-inspect-0".into());
         let sealed = origin
-            .bind(
-                &call("call-1", "inspect", json!({"path": "alpha"})),
-                "flow-1",
-                &workspace,
-            )
+            .bind(&proposal, "flow-1", &workspace)
             .await
             .expect("bind invocation");
+
+        assert_eq!(sealed.registered_definition(), &origin.definitions()[0]);
+        assert_eq!(sealed.provider_call_id(), Some("provider-inspect-0"));
+        proposal.provider_call_id = Some("changed-after-binding".into());
+        assert_eq!(sealed.provider_call_id(), Some("provider-inspect-0"));
 
         assert_eq!(
             sealed.invocation().descriptor,
@@ -1650,6 +1666,8 @@ mod tests {
             serde_json::from_slice(&encoded).expect("deserialize durable evidence");
         let sealed_evidence_digest = invocation.evidence_digest().expect("valid evidence digest");
         let fabricated = SealedBoundToolInvocation {
+            registered_definition: restarted.definitions()[0].clone(),
+            provider_call_id: None,
             invocation,
             sealed_evidence_digest,
             flow_id: "flow-1".to_owned(),
