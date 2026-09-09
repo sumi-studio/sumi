@@ -14,6 +14,7 @@ import type { ChatItem } from "../agent/model";
 import { collectAgentCopyText, projectConversation } from "../agent/projection";
 import { useConversation } from "../agent/store";
 import { hasInspectableTrace } from "../agent/work-summary";
+import { userItemText } from "../lib/user-item-text";
 import { ChatPromptInput } from "./chat-prompt-input";
 import {
   ConversationVirtualizer,
@@ -422,7 +423,7 @@ function transcriptText(row: ConversationRow): string | null {
             ? row.trace.message
             : null;
     case "user":
-      return `${row.source ? `${row.source.actor.display_name || row.source.actor.principal_id} · ${row.source.source.place.name}` : "あなた"}: ${row.text}`;
+      return `${row.source ? `${row.source.actor.display_name || row.source.actor.principal_id}${row.source.source.kind === "messaging_poll_vote" ? " · 投票" : ""} · ${row.source.source.place.name}` : "あなた"}: ${userItemText(row)}`;
     case "prose":
       return `Sumi: ${row.text}`;
     case "approval":

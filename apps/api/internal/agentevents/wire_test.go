@@ -517,3 +517,86 @@ func TestReplyProvenanceMetadataRejectsMalformedTargets(t *testing.T) {
 		}
 	}
 }
+
+func TestPollVoteProvenancePreservesSelectionAndEquality(t *testing.T) {
+	const id = "01992000-0000-7000-8000-000000000008"
+	p := IncomingProvenance{
+		Version: 2, TenantID: "tenant", PersonalityAgentID: id,
+		Actor: ProvenanceActor{Kind: "human", PrincipalID: id},
+		Source: ProvenanceSource{Surface: "messaging", Kind: "messaging_poll_vote", EventID: id, WorkspaceID: id, InstallationID: id,
+			AuthorityEpoch: 1, Place: &ProvenancePlace{ID: id, Kind: "channel", Name: "Shared"}, MessageID: id, MessageRevision: 1, MessageSeq: 1,
+			OccurredAt: "2026-09-09T08:00:00Z", PollVote: &ProvenancePollVote{PollRevision: 2, Question: "When?", SelectedOptions: []ProvenancePollOption{{OptionID: id, Text: "Afternoon"}}}},
+	}
+	for _, selection := range [][]ProvenancePollOption{p.Source.PollVote.SelectedOptions, {}} {
+		p.Source.PollVote.SelectedOptions = selection
+		encoded, err := json.Marshal(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got IncomingProvenance
+		if err := json.Unmarshal(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !p.Equal(got) {
+			t.Fatal("round-trip changed poll provenance")
+		}
+		got.Source.PollVote.PollRevision++
+		if p.Equal(got) {
+			t.Fatal("different votes compared equal")
+		}
+	}
+}
+
+func TestPollVoteProvenanceRejectsAmbiguousSelections(t *testing.T) {
+	fixture, err := os.ReadFile("../../../../contracts/agent-events-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures map[string]struct {
+		Wire struct {
+			Provenance json.RawMessage `json:"provenance"`
+		} `json:"wire"`
+	}
+	if err := json.Unmarshal(fixture, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	const id = "01992000-0000-7000-8000-000000000008"
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any, map[string]any)
+	}{
+		{"missing vote", func(s, v map[string]any) { delete(s, "poll_vote") }},
+		{"null vote", func(s, v map[string]any) { s["poll_vote"] = nil }},
+		{"zero revision", func(s, v map[string]any) { v["poll_revision"] = 0 }},
+		{"null question", func(s, v map[string]any) { v["question"] = nil }},
+		{"missing question", func(s, v map[string]any) { delete(v, "question") }},
+		{"null selection", func(s, v map[string]any) { v["selected_options"] = nil }},
+		{"duplicate option", func(s, v map[string]any) {
+			v["selected_options"] = []any{map[string]any{"option_id": id, "text": "A"}, map[string]any{"option_id": id, "text": "B"}}
+		}},
+		{"missing option label", func(s, v map[string]any) { v["selected_options"] = []any{map[string]any{"option_id": id}} }},
+		{"reply linkage", func(s, v map[string]any) { s["reply_to_message_id"] = id }},
+		{"reminder field", func(s, v map[string]any) { s["due_at"] = nil }},
+		{"ordinary event", func(s, v map[string]any) { s["kind"] = "messaging_message" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var p map[string]any
+			if err := json.Unmarshal(fixtures["external_mention"].Wire.Provenance, &p); err != nil {
+				t.Fatal(err)
+			}
+			s := p["source"].(map[string]any)
+			s["kind"] = "messaging_poll_vote"
+			v := map[string]any{"poll_revision": 2, "question": "When?", "selected_options": []any{map[string]any{"option_id": id, "text": "Afternoon"}}}
+			s["poll_vote"] = v
+			tc.change(s, v)
+			raw, err := json.Marshal(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got IncomingProvenance
+			if err := json.Unmarshal(raw, &got); err == nil {
+				t.Fatal("accepted ambiguous poll vote")
+			}
+		})
+	}
+}

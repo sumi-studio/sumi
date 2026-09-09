@@ -194,7 +194,8 @@ func (s *ScopedStore) votePollWithClock(
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return Message{}, err
 	}
-	place, err := s.loadScopedPlace(ctx, tx, placeID)
+	// Attention delivery and question deletion also lock place before message.
+	place, err := s.lockScopedPlace(ctx, tx, placeID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -225,7 +226,8 @@ func (s *ScopedStore) votePollWithClock(
 	if err != nil {
 		return Message{}, fmt.Errorf("lock scoped poll: %w", err)
 	}
-	if closesAt != nil && !now().Before(*closesAt) {
+	votedAt := now().UTC()
+	if closesAt != nil && !votedAt.Before(*closesAt) {
 		return Message{}, ErrPollClosed
 	}
 	if !allowMulti && len(optionIDs) > 1 {
@@ -243,6 +245,18 @@ func (s *ScopedStore) votePollWithClock(
 			return Message{}, ErrPollOptionNotFound
 		}
 	}
+
+	// Compare the actor's complete previous choice as a set. A repeated choice
+	// still advances the existing poll revision, but is not a new answer.
+	var previousCount, unchangedCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE o.option_id = ANY($4))
+		FROM message_poll_votes v JOIN message_poll_options o ON o.option_id=v.option_id
+		WHERE o.message_id=$1 AND v.voter_kind=$2 AND v.voter_id=$3`,
+		messageID, s.Scope.Actor.Kind, s.Scope.Actor.ID, optionIDs).Scan(&previousCount, &unchangedCount); err != nil {
+		return Message{}, fmt.Errorf("read prior scoped poll choice: %w", err)
+	}
+	changed := previousCount != len(optionIDs) || unchangedCount != len(optionIDs)
 
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM message_poll_votes v
@@ -272,6 +286,11 @@ func (s *ScopedStore) votePollWithClock(
 	}
 	if parts[0].Poll == nil || parts[0].Poll.Revision != revision {
 		return Message{}, fmt.Errorf("load scoped poll vote projection at revision %d", revision)
+	}
+	if changed {
+		if err := s.issueAgentPollVote(ctx, tx, place, parts[0], votedAt); err != nil {
+			return Message{}, fmt.Errorf("issue poll vote attention: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped poll vote: %w", err)

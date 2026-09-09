@@ -1031,5 +1031,102 @@
         "content": "Original source text"
       }
     }
+  },
+  "external_poll_vote": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_poll_vote",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z",
+          "poll_vote": {
+            "poll_revision": 2,
+            "question": "Which time?",
+            "selected_options": [
+              {
+                "option_id": "01992000-0000-7000-8000-000000000011",
+                "text": "Morning"
+              },
+              {
+                "option_id": "01992000-0000-7000-8000-000000000010",
+                "text": "Evening"
+              }
+            ]
+          }
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": ""
+      }
+    }
+  },
+  "external_poll_withdrawal": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_poll_vote",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z",
+          "poll_vote": {
+            "poll_revision": 2,
+            "question": "Which time?",
+            "selected_options": []
+          }
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": ""
+      }
+    }
   }
 }
