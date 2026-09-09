@@ -1,0 +1,62 @@
+{
+  "status": "FAILED_BEFORE_REMINDER_SETUP",
+  "runtime_revision": "bc49022a7bfef70b659a5e6c6478ae165698ffa1",
+  "agent": "01a084f5-6c25-77dd-8ae2-737fa9173ed4",
+  "explicit_request": {
+    "invitation_id": "01a084f5-6d50-75c3-a0f7-0ad8f7735b51",
+    "workspace_id": "01a084f5-6d41-7f04-8488-9e967f78597b"
+  },
+  "events": [
+    {
+      "seq": 6,
+      "tool": "workspace_invitation_list",
+      "internal_id": "e0c8b19d-a6a8-554e-b444-ac758aaa5d9c",
+      "provider_id": "workspace_invitation_list_0"
+    },
+    {
+      "seq": 14,
+      "tool": "workspace_invitation_accept",
+      "internal_id": "fc3b47d5-a89a-559d-8074-cf0f709016d8",
+      "provider_id": "workspace_invitation_accept_1"
+    },
+    {
+      "seq": 16,
+      "error": "execution_review_blocked",
+      "review_outcome": "block",
+      "review_claims": [
+        "Pending tool absent from available toolset",
+        "Pending call ID conflicts with preceding list call"
+      ]
+    },
+    {
+      "seq": 20,
+      "assistant_claim": "Additional approval pending"
+    }
+  ],
+  "observations": [
+    "Both call ID pairs are distinct; literal collision was not observed.",
+    "Invitation acceptance is registered on the parent, but absent from the reviewer read-only tool subset.",
+    "No approval_requested event was recorded; the assistant description of pending approval was inaccurate.",
+    "No reminder was created, so this run provides no overdue/restart acceptance."
+  ],
+  "cleanup": {
+    "direct-chatDiscovery": true,
+    "messagingDiscovery": true,
+    "01a084f5-6d57-74ae-91a9-d77a4ada0bb7": {
+      "disabled": true
+    },
+    "01a084f5-6d61-7cdc-bf3f-0edb722cde1d": {
+      "disabled": true
+    },
+    "loggedOut": true,
+    "stoppedOwnedColdContainers": [
+      "8944a743070bb5748d4aa7e65afe2e641629229832d49ccffbe427187c4fc269",
+      "b1463f444ffd95d5a35dc4ae6763762fddeb42e00466e4d2f3b283b23f80dd98",
+      "6f3e40a0ebac99e0c8d96d353d7453d8605b0ea828cc8211e5c34f96ea419c30"
+    ],
+    "coldStopped": true
+  },
+  "cleanupComplete": true,
+  "source_evidence": "/tmp/sumi-reminder-restart-5m_2k2__/evidence.json",
+  "public_event_source": "Owned API event log, sequences 4, 6, 14, 16, 20"
+}

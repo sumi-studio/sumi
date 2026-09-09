@@ -13,7 +13,7 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment (2026-09-09): API
+Observed shared deployment after #389 (2026-09-09): API
 `b6d271b4e177cdbf27e0064ed69fb0000e7905f3` (#386), runtime/provisioner
 `bc49022a7bfef70b659a5e6c6478ae165698ffa1` (including #381/#383), and Web
 `055780646c749508bb9a6f75ffce4daaff43b505` (#389). These are deliberately
@@ -192,7 +192,7 @@ still needed to close each row.
 | P05 | Per-response limits only | Account for an explicitly bounded undertaking/wake across restart, stop further admissions truthfully and support replenishment. |
 | U01 | Exact-call review exists; standing permission UI absent | Grant, view, narrow and revoke understandable scopes; recheck queued actions and retain effect truth. |
 | U02 | Cards render; shared action round trip absent | Human and PA act on the same authorized object/version with mobile/keyboard feedback and an attributable resulting event. |
-| U03 | Questions/polls exist without answer wake | An addressable question and later answer resume the originating context while unrelated activity remains possible. |
+| U03 | Text reply Attention integrated in #390; live continuation pending; poll answer wake absent | Verify the same PA receives and uses the original-message reference after a later reply. Poll answers still need a delivery path. |
 | Q01 | Separate real-model evidence exists | Maintain a small reproducible opt-in set for correction, wait, interruption, actual artifacts and delivery; distinguish blocked/skipped/failed. |
 | Q02 | Rust CI now active; relevance review continues | The Rust regression workflow passed its first GitHub Actions run on the supported Rust 1.88 toolchain. Local suite: 2,213 passed, 20 ignored (includes subprocess entry points and opt-in live-provider/performance cases). Continue reviewing relevance and explicit non-run reporting. |
 
@@ -354,3 +354,21 @@ then revoked and its installation disabled again. Actual physical iOS behavior,
 live Codex pixel matching and animation of content growth while already open
 remain unverified or unimplemented; these are not claimed by the opening and
 closing check. Web returned HTTP 200 and API `/health` returned `status: ok`.
+
+## Overdue reminder probe and reviewer evidence defect
+
+The first stopped-runtime reminder probe did not reach reminder creation. Its
+explicitly requested invitation acceptance was blocked by execution review after
+a successful invitation-list result. The reviewer claimed the operation was not
+available and its ID conflicted with the preceding call. Native public events
+show two distinct internal IDs and two distinct provider IDs. The parent registry
+contains the operation; the reviewer receives a read-only inspection subset.
+These observations identify missing/ambiguous review evidence, not an actual
+call-ID collision. The PA's final description of an approval pending was also
+inaccurate: the recorded outcome was block, with no approval request.
+
+[Selected synthetic evidence](evidence/reviewer-capability-2026-09-09.json)
+records the failed scenario and successful cleanup. The probe now captures
+public tool-result messages, including pre-execution rejection, so a missing
+execution-end event does not hide the reason. This does not establish overdue
+reminder acceptance; that scenario must run after the evidence repair.

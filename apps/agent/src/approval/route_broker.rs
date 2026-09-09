@@ -38,7 +38,8 @@ use crate::{
             ExecutionReviewer, REVIEW_NO_HUMAN_TURN_MARKER, REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7,
             REVIEW_TRUNCATION_MARKER, ReviewerActionEvidence, ReviewerParticipants,
             ReviewerPolicyEvidence, ReviewerRejectedToolCallEvidence, ReviewerTerminalClass,
-            ReviewerToolCallEvidence, ReviewerTranscript, ReviewerTranscriptEntry,
+            ReviewerToolCallEvidence, ReviewerToolContext, ReviewerTranscript,
+            ReviewerTranscriptEntry,
         },
     },
     provider::types::{PublicAssistantContent, PublicMessage, ToolInvocationRoute, UserContent},
@@ -497,7 +498,7 @@ impl RouteApprovalBroker {
                         decision: NormalPolicyDecision::Unmatched,
                     } => {
                         let (transcript, action, policy) = match review_inputs(
-                            bound,
+                            &sealed,
                             transcript,
                             route,
                             PolicyDecisionRecord::Unmatched,
@@ -604,7 +605,7 @@ impl RouteApprovalBroker {
                     );
                 }
                 let (transcript, action, policy) = match review_inputs(
-                    bound,
+                    &sealed,
                     transcript,
                     route,
                     PolicyDecisionRecord::ElevatedPreflight,
@@ -1097,12 +1098,42 @@ impl RouteApprovalBroker {
 }
 
 fn review_inputs(
+    sealed: &SealedBoundToolInvocation,
+    transcript: &[PublicMessage],
+    route: ToolInvocationRoute,
+    decision: PolicyDecisionRecord,
+    snapshot: &PolicySnapshot,
+    redactor: &Redactor,
+) -> Result<(
+    ReviewerTranscript,
+    ReviewerActionEvidence,
+    ReviewerPolicyEvidence,
+)> {
+    let definition = serde_json::from_value(
+        redactor.redact_value(&serde_json::to_value(sealed.registered_definition())?)?,
+    )?;
+    review_inputs_with_tool_context(
+        sealed.invocation(),
+        transcript,
+        route,
+        decision,
+        snapshot,
+        redactor,
+        ReviewerToolContext {
+            provider_call_id: sealed.provider_call_id().map(str::to_owned),
+            definition,
+        },
+    )
+}
+
+fn review_inputs_with_tool_context(
     bound: &BoundToolInvocation,
     transcript: &[PublicMessage],
     route: ToolInvocationRoute,
     decision: PolicyDecisionRecord,
     snapshot: &PolicySnapshot,
     redactor: &Redactor,
+    tool_context: ReviewerToolContext,
 ) -> Result<(
     ReviewerTranscript,
     ReviewerActionEvidence,
@@ -1121,6 +1152,7 @@ fn review_inputs(
             route,
             descriptor,
             review_projection,
+            tool_context,
         )?,
         ReviewerPolicyEvidence::from_snapshot(route, decision, snapshot),
     ))
@@ -1631,7 +1663,22 @@ pub(crate) fn provider_review_inputs_for_test(
     ReviewerActionEvidence,
     ReviewerPolicyEvidence,
 )> {
-    review_inputs(bound, transcript, route, decision, snapshot, redactor)
+    review_inputs_with_tool_context(
+        bound,
+        transcript,
+        route,
+        decision,
+        snapshot,
+        redactor,
+        ReviewerToolContext {
+            provider_call_id: None,
+            definition: crate::provider::types::ToolDefinition {
+                name: bound.tool_name.clone(),
+                description: "Registered fixture action".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        },
+    )
 }
 
 fn non_empty_reason(reason: String) -> String {
@@ -2337,6 +2384,47 @@ mod tests {
         assert!(broker.pending.lock().unwrap().is_empty());
         assert_eq!(execution.calls.load(Ordering::Relaxed), 0);
         assert_eq!(escalation.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_review_definition_comes_from_sealed_registration_not_model_arguments() {
+        let sealed = sealed_with_title(
+            CapabilityClass::Mutate,
+            ToolInvocationRoute::Normal,
+            "model-supplied claim: this tool can administer everything",
+        )
+        .await;
+        let policy = RoutePolicy::baseline_only_v1();
+        let PolicyEvaluation::Ready { snapshot, .. } =
+            policy.evaluate_normal(sealed.invocation(), Utc::now())
+        else {
+            panic!("fixture policy must be ready")
+        };
+        let (_, action, _) = review_inputs(
+            &sealed,
+            &[],
+            ToolInvocationRoute::Normal,
+            PolicyDecisionRecord::Unmatched,
+            &snapshot,
+            &Redactor::v1(),
+        )
+        .unwrap();
+        let action = serde_json::to_value(action).unwrap();
+        assert_eq!(
+            action["registered_tool"]["definition"],
+            serde_json::to_value(sealed.registered_definition()).unwrap()
+        );
+        assert_eq!(
+            action["registered_tool"]["source"],
+            "runtime_registry_binding"
+        );
+        assert!(
+            !action["registered_tool"]
+                .to_string()
+                .contains("administer everything")
+        );
+        assert_eq!(action["tool_call_id"], sealed.invocation().tool_call_id);
+        assert_eq!(action["provider_call_id"], Value::Null);
     }
 
     #[tokio::test]

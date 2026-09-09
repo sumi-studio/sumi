@@ -50,8 +50,8 @@ const MAX_REVIEW_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_REVIEW_TOOL_CALLS: usize = 4;
 const MAX_REVIEW_TOOL_RESULT_CHARS: usize = 4_000;
 pub(crate) const MAX_REVIEW_ACTION_CHARS: usize = 64_000;
-const REVIEW_ACTION_SCHEMA_VERSION_V4: u32 = 4;
-const REVIEW_PROVIDER_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-evidence/v7\0";
+const REVIEW_ACTION_SCHEMA_VERSION_V5: u32 = 5;
+const REVIEW_PROVIDER_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-review-evidence/v8\0";
 pub(crate) const REVIEW_TRANSCRIPT_SCHEMA_VERSION_V7: u32 = 7;
 pub(crate) const REVIEW_TRUNCATION_MARKER: &str = "[... truncated ...]";
 pub(crate) const REVIEW_NO_HUMAN_TURN_MARKER: &str =
@@ -59,10 +59,10 @@ pub(crate) const REVIEW_NO_HUMAN_TURN_MARKER: &str =
 
 pub const REVIEWER_BUDGET_VERSION_V1: &str = "reviewer-budget/v1";
 pub const EXECUTION_REVIEWER_VERSION_V7: &str = "execution-reviewer/v7";
-pub const EXECUTION_PROMPT_VERSION_V7: &str = "execution-review-prompt/v7";
+pub const EXECUTION_PROMPT_VERSION_V8: &str = "execution-review-prompt/v8";
 pub const EXECUTION_SCHEMA_VERSION_V7: &str = "execution-review-schema/v7";
 pub const ESCALATION_REVIEWER_VERSION_V7: &str = "escalation-reviewer/v7";
-pub const ESCALATION_PROMPT_VERSION_V7: &str = "escalation-review-prompt/v7";
+pub const ESCALATION_PROMPT_VERSION_V8: &str = "escalation-review-prompt/v8";
 pub const ESCALATION_SCHEMA_VERSION_V7: &str = "escalation-review-schema/v7";
 pub const ESCALATION_OBJECTION_RESPONDER_VERSION_V1: &str = "escalation-objection-responder/v1";
 pub const ESCALATION_OBJECTION_PROMPT_VERSION_V1: &str = "escalation-objection-prompt/v1";
@@ -756,6 +756,21 @@ pub struct ReviewActionTruncation {
     marker: &'static str,
 }
 
+/// Display metadata from the same sealed registration as the pending action.
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewerToolContext {
+    pub provider_call_id: Option<String>,
+    pub definition: ToolDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredReviewTool {
+    source: &'static str,
+    usage: &'static str,
+    definition: ToolDefinition,
+}
+
 /// Provider-visible action evidence. Normal-size actions preserve the exact
 /// redacted descriptor and Human-facing projection as JSON values. Oversized
 /// values retain an explicit JSON prefix and omission count instead of being
@@ -765,6 +780,9 @@ pub struct ReviewActionTruncation {
 pub struct ReviewerActionEvidence {
     schema_version: u32,
     tool_call_id: String,
+    tool_call_id_namespace: &'static str,
+    provider_call_id: Option<String>,
+    registered_tool: RegisteredReviewTool,
     tool: String,
     route: ToolInvocationRoute,
     descriptor: Value,
@@ -779,6 +797,7 @@ impl ReviewerActionEvidence {
         route: ToolInvocationRoute,
         descriptor: Value,
         review_projection: Value,
+        tool_context: ReviewerToolContext,
     ) -> Result<Self, serde_json::Error> {
         let descriptor_json = serde_json::to_string(&descriptor)?;
         let projection_json = serde_json::to_string(&review_projection)?;
@@ -800,8 +819,15 @@ impl ReviewerActionEvidence {
         );
 
         Ok(Self {
-            schema_version: REVIEW_ACTION_SCHEMA_VERSION_V4,
+            schema_version: REVIEW_ACTION_SCHEMA_VERSION_V5,
             tool_call_id: tool_call_id.into(),
+            tool_call_id_namespace: "runtime_internal",
+            provider_call_id: tool_context.provider_call_id,
+            registered_tool: RegisteredReviewTool {
+                source: "runtime_registry_binding",
+                usage: "review_evidence_only; not a reviewer-callable tool",
+                definition: tool_context.definition,
+            },
             tool: tool.into(),
             route,
             descriptor,
@@ -1641,6 +1667,8 @@ struct PendingActionMessage<'a> {
     status: &'static str,
     trust: &'static str,
     tool_call_id: &'a str,
+    tool_call_id_namespace: &'static str,
+    provider_call_id: Option<&'a str>,
     tool: &'a str,
     route: ToolInvocationRoute,
     structured_evidence_follows: bool,
@@ -1683,6 +1711,8 @@ fn pending_action_message(prompt: &impl ProviderReviewPrompt) -> PendingActionMe
         status: "pending; not yet executed",
         trust: UNTRUSTED_EVIDENCE_LABEL,
         tool_call_id: &prompt.action().tool_call_id,
+        tool_call_id_namespace: prompt.action().tool_call_id_namespace,
+        provider_call_id: prompt.action().provider_call_id.as_deref(),
         tool: &prompt.action().tool,
         route: prompt.action().route,
         structured_evidence_follows: true,
@@ -2110,7 +2140,7 @@ pub(crate) fn execution_provider_wire_bodies_for_test(
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
                 output_schema: ExecutionReviewOutputSchema::v7(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V7,
+                prompt_version: EXECUTION_PROMPT_VERSION_V8,
                 schema_version: EXECUTION_SCHEMA_VERSION_V7,
                 request: request.clone(),
                 reviewer_tool_trace: Vec::new(),
@@ -2136,7 +2166,7 @@ pub(crate) fn escalation_provider_wire_bodies_for_test(
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
                 output_schema: EscalationReviewOutputSchema::v7(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V7,
+                prompt_version: ESCALATION_PROMPT_VERSION_V8,
                 schema_version: ESCALATION_SCHEMA_VERSION_V7,
                 request: request.clone(),
                 reviewer_tool_trace: Vec::new(),
@@ -2257,7 +2287,7 @@ impl ExecutionReviewer {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
                 output_schema: ExecutionReviewOutputSchema::v7(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V7,
+                prompt_version: EXECUTION_PROMPT_VERSION_V8,
                 schema_version: EXECUTION_SCHEMA_VERSION_V7,
                 request: request.clone(),
                 reviewer_tool_trace: tool_trace.clone(),
@@ -2390,7 +2420,7 @@ impl EscalationReviewer {
             let prompt = EscalationReviewerPrompt {
                 system: ESCALATION_SYSTEM_PROMPT,
                 output_schema: EscalationReviewOutputSchema::v7(),
-                prompt_version: ESCALATION_PROMPT_VERSION_V7,
+                prompt_version: ESCALATION_PROMPT_VERSION_V8,
                 schema_version: ESCALATION_SCHEMA_VERSION_V7,
                 request: request.clone(),
                 reviewer_tool_trace: tool_trace.clone(),
@@ -2842,7 +2872,7 @@ fn execution_result(
     }
     let evidence = ExecutionReviewEvidence {
         reviewer_version: EXECUTION_REVIEWER_VERSION_V7.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V7.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V8.to_owned(),
         schema_version: EXECUTION_SCHEMA_VERSION_V7.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -2865,7 +2895,7 @@ fn execution_synthetic_block(
 ) -> ExecutionReviewResult {
     ExecutionReviewResult::Block(ExecutionReviewEvidence {
         reviewer_version: EXECUTION_REVIEWER_VERSION_V7.to_owned(),
-        prompt_version: EXECUTION_PROMPT_VERSION_V7.to_owned(),
+        prompt_version: EXECUTION_PROMPT_VERSION_V8.to_owned(),
         schema_version: EXECUTION_SCHEMA_VERSION_V7.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -2893,7 +2923,7 @@ fn escalation_result(
     let ask_human = decision.outcome == EscalationReviewOutcome::AskHuman;
     let evidence = EscalationReviewEvidence {
         reviewer_version: ESCALATION_REVIEWER_VERSION_V7.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V7.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V8.to_owned(),
         schema_version: ESCALATION_SCHEMA_VERSION_V7.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -2918,7 +2948,7 @@ fn escalation_synthetic_block(
 ) -> EscalationReviewResult {
     let evidence = EscalationReviewEvidence {
         reviewer_version: ESCALATION_REVIEWER_VERSION_V7.to_owned(),
-        prompt_version: ESCALATION_PROMPT_VERSION_V7.to_owned(),
+        prompt_version: ESCALATION_PROMPT_VERSION_V8.to_owned(),
         schema_version: ESCALATION_SCHEMA_VERSION_V7.to_owned(),
         model_id: reviewer.model.id.clone(),
         model_binding_digest: reviewer.model.binding_digest(),
@@ -3239,6 +3269,14 @@ mod tests {
             route,
             serde_json::to_value(&bound.descriptor).expect("exact descriptor"),
             Value::Object(bound.review_projection.as_object().clone()),
+            ReviewerToolContext {
+                provider_call_id: None,
+                definition: ToolDefinition {
+                    name: bound.tool_name.clone(),
+                    description: "Registered fixture action".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            },
         )
         .expect("reviewer action evidence")
     }
@@ -3276,7 +3314,7 @@ mod tests {
         let mut prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request: execution_request(),
             reviewer_tool_trace: Vec::new(),
@@ -3524,12 +3562,126 @@ mod tests {
     }
 
     #[test]
+    fn review_wire_distinguishes_pending_internal_id_and_preserves_reused_provider_ids() {
+        let mut request = execution_request();
+        request.action.provider_call_id = Some("provider_call_0".into());
+        request.transcript.entries.truncate(1);
+        for turn_id in [1, 2] {
+            let internal_id = format!("internal-prior-{turn_id}");
+            request
+                .transcript
+                .entries
+                .push(ReviewerTranscriptEntry::Assistant {
+                    turn_id,
+                    text: None,
+                    text_truncated: false,
+                    tool_calls: vec![ReviewerToolCallEvidence {
+                        id: internal_id.clone(),
+                        provider_call_id: Some("provider_call_0".into()),
+                        tool: "inspect".into(),
+                        route: ToolInvocationRoute::Normal,
+                        arguments: json!({"query":turn_id}),
+                    }],
+                    rejected_tool_calls: vec![],
+                });
+            request
+                .transcript
+                .entries
+                .push(ReviewerTranscriptEntry::ToolResult {
+                    provider_call_id: Some("provider_call_0".into()),
+                    tool: "inspect".into(),
+                    tool_call_id: Some(internal_id),
+                    is_error: false,
+                    content: format!("result-{turn_id}"),
+                    truncated: false,
+                });
+        }
+        let prompt = ExecutionReviewerPrompt {
+            system: EXECUTION_SYSTEM_PROMPT,
+            output_schema: ExecutionReviewOutputSchema::v7(),
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
+            schema_version: EXECUTION_SCHEMA_VERSION_V7,
+            request,
+            reviewer_tool_trace: vec![],
+            retry_validation_code: None,
+        };
+        let (runtime, _) = reviewer_tool_runtime(RoutePolicy::baseline_only_v1());
+        let spec = ModelSpec::preset("kimi-k3").unwrap();
+        for retry in [false, true] {
+            let tools = if retry { vec![] } else { runtime.definitions() };
+            let (context, options) = build_provider_review_request(
+                &spec,
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                &prompt,
+                &tools,
+                retry,
+            )
+            .unwrap();
+            assert_eq!(context.tools, tools);
+            assert!(context.tools.iter().all(|tool| tool.name == "inspect"));
+            let wire = crate::provider::adapters::chat_completions::build_request(
+                &spec, &context, &options,
+            )
+            .unwrap();
+            let messages = wire["messages"].as_array().unwrap();
+            let calls = messages
+                .iter()
+                .filter_map(|message| message["tool_calls"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|call| call["id"] == "provider_call_0"));
+            let results = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result["tool_call_id"] == "provider_call_0")
+            );
+            let json_message = |message: &Value| -> Value {
+                let content = &message["content"];
+                let text = content
+                    .as_str()
+                    .or_else(|| content[0]["text"].as_str())
+                    .unwrap();
+                serde_json::from_str(text).unwrap()
+            };
+            let pending = json_message(&messages[messages.len() - 2]);
+            assert_eq!(pending["tool_call_id"], "tool-call-1");
+            assert_eq!(pending["tool_call_id_namespace"], "runtime_internal");
+            assert_eq!(pending["provider_call_id"], "provider_call_0");
+            let evidence = json_message(messages.last().unwrap());
+            assert_eq!(
+                evidence["action"]["registered_tool"]["source"],
+                "runtime_registry_binding"
+            );
+            assert_eq!(
+                evidence["action"]["registered_tool"]["definition"]["name"],
+                prompt.request.action.tool
+            );
+            assert_eq!(evidence["action"]["provider_call_id"], "provider_call_0");
+        }
+        // Other provider adapters must retain their existing history envelopes too.
+        for (_, wire) in execution_provider_wire_bodies_for_test(prompt.request.clone()) {
+            let encoded = serde_json::to_string(&wire).unwrap();
+            assert!(encoded.contains("provider_call_0"));
+            assert!(encoded.contains("runtime_internal"));
+            assert!(encoded.contains("runtime_registry_binding"));
+            assert!(!encoded.contains("internal-prior-"));
+        }
+    }
+
+    #[test]
     fn initial_review_carries_schema_with_tools_and_retry_uses_response_format() {
         let spec = ModelSpec::preset("openai-responses").unwrap();
         let prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request: execution_request(),
             reviewer_tool_trace: Vec::new(),
@@ -3687,7 +3839,7 @@ mod tests {
             let prompt = ExecutionReviewerPrompt {
                 system: EXECUTION_SYSTEM_PROMPT,
                 output_schema: ExecutionReviewOutputSchema::v7(),
-                prompt_version: EXECUTION_PROMPT_VERSION_V7,
+                prompt_version: EXECUTION_PROMPT_VERSION_V8,
                 schema_version: EXECUTION_SCHEMA_VERSION_V7,
                 request: execution_request(),
                 reviewer_tool_trace: vec![],
@@ -3864,6 +4016,9 @@ mod tests {
                     "schema_version",
                     "tool",
                     "tool_call_id",
+                    "tool_call_id_namespace",
+                    "provider_call_id",
+                    "registered_tool",
                     "truncation",
                 ])
             );
@@ -3935,6 +4090,14 @@ mod tests {
             ToolInvocationRoute::Elevated,
             json!({"operation":"write", "resource_scopes":[]}),
             json!({"content":"x".repeat(MAX_REVIEW_ACTION_CHARS)}),
+            ReviewerToolContext {
+                provider_call_id: None,
+                definition: ToolDefinition {
+                    name: "app_action".into(),
+                    description: "fixture".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            },
         )
         .expect("bounded action evidence");
         let encoded = serde_json::to_string(&action).expect("encoded action evidence");
@@ -4027,7 +4190,7 @@ mod tests {
         let prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request: execution_request(),
             reviewer_tool_trace: Vec::new(),
@@ -4143,7 +4306,7 @@ mod tests {
         let prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request,
             reviewer_tool_trace: Vec::new(),
@@ -4230,7 +4393,7 @@ mod tests {
         let base = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request: execution_request(),
             reviewer_tool_trace: Vec::new(),
@@ -4287,6 +4450,20 @@ mod tests {
             .push_str("-changed");
         changed.push(provider_evidence_digest(&pending_call).unwrap());
 
+        let mut provider_identity = base.clone();
+        provider_identity.request.action.provider_call_id = Some("different-wire-id".into());
+        changed.push(provider_evidence_digest(&provider_identity).unwrap());
+
+        let mut registered_definition = base.clone();
+        registered_definition
+            .request
+            .action
+            .registered_tool
+            .definition
+            .description
+            .push_str(" changed");
+        changed.push(provider_evidence_digest(&registered_definition).unwrap());
+
         let mut policy = base.clone();
         policy.request.policy.source_digest.push_str("-changed");
         changed.push(provider_evidence_digest(&policy).unwrap());
@@ -4325,7 +4502,7 @@ mod tests {
         let prompt = ExecutionReviewerPrompt {
             system: EXECUTION_SYSTEM_PROMPT,
             output_schema: ExecutionReviewOutputSchema::v7(),
-            prompt_version: EXECUTION_PROMPT_VERSION_V7,
+            prompt_version: EXECUTION_PROMPT_VERSION_V8,
             schema_version: EXECUTION_SCHEMA_VERSION_V7,
             request,
             reviewer_tool_trace: Vec::new(),
@@ -4794,13 +4971,13 @@ mod tests {
             ReviewerTerminalClass::ValidDecision
         );
         assert_eq!(evidence.reviewer_version, EXECUTION_REVIEWER_VERSION_V7);
-        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V7);
+        assert_eq!(evidence.prompt_version, EXECUTION_PROMPT_VERSION_V8);
         assert_eq!(evidence.schema_version, EXECUTION_SCHEMA_VERSION_V7);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 3);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, ExecutionReviewOutputSchema::v7());
-            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V7);
+            assert_eq!(prompt.prompt_version, EXECUTION_PROMPT_VERSION_V8);
             assert_eq!(prompt.schema_version, EXECUTION_SCHEMA_VERSION_V7);
             assert_eq!(
                 prompt.retry_validation_code,
@@ -4862,13 +5039,13 @@ mod tests {
             ReviewerTerminalClass::ValidDecision
         );
         assert_eq!(evidence.reviewer_version, ESCALATION_REVIEWER_VERSION_V7);
-        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V7);
+        assert_eq!(evidence.prompt_version, ESCALATION_PROMPT_VERSION_V8);
         assert_eq!(evidence.schema_version, ESCALATION_SCHEMA_VERSION_V7);
         let prompts = transport.prompts.lock().unwrap();
         assert_eq!(prompts.len(), 3);
         for (index, prompt) in prompts.iter().enumerate() {
             assert_eq!(prompt.output_schema, EscalationReviewOutputSchema::v7());
-            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V7);
+            assert_eq!(prompt.prompt_version, ESCALATION_PROMPT_VERSION_V8);
             assert_eq!(prompt.schema_version, ESCALATION_SCHEMA_VERSION_V7);
             assert_eq!(
                 prompt.retry_validation_code,

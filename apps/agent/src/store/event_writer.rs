@@ -15732,7 +15732,7 @@ mod tests {
             },
             route_policy::{ElevatedPolicyEvaluation, RoutePolicy},
             route_reviewer::{
-                ESCALATION_PROMPT_VERSION_V7, ESCALATION_REVIEWER_VERSION_V7,
+                ESCALATION_PROMPT_VERSION_V8, ESCALATION_REVIEWER_VERSION_V7,
                 ESCALATION_SCHEMA_VERSION_V7, EscalationReviewDecision, EscalationReviewEvidence,
                 EscalationReviewOutcome, ReviewerBudgetV1, ReviewerTerminalClass, RiskLevel,
             },
@@ -16231,7 +16231,7 @@ mod tests {
     fn escalation_ask_human_evidence() -> EscalationReviewEvidence {
         EscalationReviewEvidence {
             reviewer_version: ESCALATION_REVIEWER_VERSION_V7.to_owned(),
-            prompt_version: ESCALATION_PROMPT_VERSION_V7.to_owned(),
+            prompt_version: ESCALATION_PROMPT_VERSION_V8.to_owned(),
             schema_version: ESCALATION_SCHEMA_VERSION_V7.to_owned(),
             model_id: "fixture-reviewer".to_owned(),
             model_binding_digest: "fixture-model-binding".to_owned(),
@@ -16371,7 +16371,9 @@ mod tests {
         let bound =
             BoundToolInvocation::test_fixture("tool-route-evidence", CapabilityClass::Mutate);
         let policy = route_policy_snapshot(&bound);
-        let review = escalation_ask_human_evidence();
+        let mut review = escalation_ask_human_evidence();
+        // A saved older review remains authenticated history, not a fresh grant.
+        review.prompt_version = "escalation-review-prompt/v7".to_owned();
         writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
@@ -16436,7 +16438,7 @@ mod tests {
         store
             .verify_route_authority_evidence(&mut transaction)
             .await
-            .expect("fresh route evidence authenticates");
+            .expect("saved v7 route evidence authenticates after the prompt upgrade");
         transaction
             .rollback()
             .await
