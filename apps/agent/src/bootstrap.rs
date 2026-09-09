@@ -823,6 +823,11 @@ impl SessionTerminationReport {
         use crate::agent::RunOwnership;
 
         match result {
+            SessionResult::Suspended => Self {
+                status: "suspended",
+                ownership: SessionOwnershipReport::Lost,
+                failure: None,
+            },
             SessionResult::Completed(_) => Self {
                 status: "completed",
                 ownership: SessionOwnershipReport::Recovered,

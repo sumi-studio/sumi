@@ -11,9 +11,9 @@ use crate::provider::types::{
 };
 
 /// Marker appended to an interrupted assistant message so the model can tell the
-/// previous response was cut off by the user. This text is injected at replay
+/// previous response ended before completion. This text is injected at replay
 /// time and is never persisted.
-pub const INTERRUPTION_MARKER: &str = "[この応答はユーザーの割り込みにより中断された]";
+pub const INTERRUPTION_MARKER: &str = "[この応答は完了前に中断された]";
 pub(crate) const MISSING_TOOL_RESULT_TEXT: &str = "No result provided";
 const ORPHAN_TOOL_RESULT_NOTICE: &str = "対応するツール呼び出しがないツール結果は再送から除外されました。必要ならツール呼び出しを再生成してください。";
 const REJECTED_TOOL_NOTICE_PREFIX: &str = "ツール `";

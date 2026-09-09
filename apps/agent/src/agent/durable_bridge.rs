@@ -100,6 +100,7 @@ pub(crate) struct RunOutput {
     /// Tool-call ID whose `ToolResult` should be durably skipped as
     /// approval-cancelled before any matching `ToolExecutionStart`.
     pub approval_cancelled: Option<String>,
+    pub inference_interruption: Option<crate::store::InferenceInterruptionReason>,
 }
 
 pub(crate) enum ApprovalOutputContext {
@@ -151,6 +152,7 @@ impl RunOutput {
             approval_command: None,
             approval_not_started: None,
             approval_cancelled: None,
+            inference_interruption: None,
         }
     }
 }
@@ -526,7 +528,7 @@ impl DurableBridge {
         self.output_audience() == command.envelope().provenance.output_audience()
     }
 
-    pub(super) fn resume_tool_continuation(binding: DurableRunBinding, turn_open: bool) -> Self {
+    pub(super) fn resume_inference(binding: DurableRunBinding, turn_open: bool) -> Self {
         let mut bridge = Self::new(binding);
         bridge.phase = RunPhase::AssistantStarted;
         bridge.turn_open = turn_open;
@@ -994,6 +996,17 @@ impl DurableBridge {
         writer: &EventWriter,
         mut output: RunOutput,
     ) -> Result<CommittedRunOutput> {
+        let interruption = output.inference_interruption;
+        if interruption.is_some()
+            && (self.phase != RunPhase::AssistantStarted
+                || self.pending_steer_group.is_some()
+                || !matches!(
+                    output.event,
+                    AgentEvent::MessageEnd { .. } | AgentEvent::TurnEnd { .. }
+                ))
+        {
+            bail!("inference interruption cannot supersede a bound control or non-assistant event");
+        }
         let has_barrier = output.commit_barrier.is_some();
         let is_tool_start = matches!(output.event, AgentEvent::ToolExecutionStart { .. });
         if has_barrier != is_tool_start {
@@ -1300,6 +1313,7 @@ impl DurableBridge {
                     message_id,
                     *message,
                     message_commit_barrier.expect("MessageEnd barrier checked"),
+                    interruption,
                 ))
                 .await
             }
@@ -1656,7 +1670,8 @@ impl DurableBridge {
                                 &self.binding.turn_id,
                                 (*message).clone(),
                                 tool_results.clone(),
-                            )?,
+                            )?
+                            .with_inference_interruption(interruption),
                             projections,
                             AgentEvent::TurnEnd {
                                 message: Some(message),
@@ -2006,6 +2021,7 @@ impl DurableBridge {
         message_id: String,
         message: PublicMessage,
         barrier: MessageCommitBarrier,
+        interruption: Option<crate::store::InferenceInterruptionReason>,
     ) -> Result<(
         Vec<CommittedOutput>,
         Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
@@ -2079,13 +2095,16 @@ impl DurableBridge {
             writer,
             EventBatch {
                 writes: vec![EventWrite {
-                    event: Some(DurableEvent::message_in_turn(
-                        "message_end",
-                        &message_id,
-                        &message,
-                        Some(self.binding.run_id.clone()),
-                        Some(self.binding.turn_id.clone()),
-                    )?),
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            &message_id,
+                            &message,
+                            Some(self.binding.run_id.clone()),
+                            Some(self.binding.turn_id.clone()),
+                        )?
+                        .with_inference_interruption(interruption),
+                    ),
                     projections,
                 }],
                 injected_commands: Vec::new(),
@@ -3611,6 +3630,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -3728,6 +3748,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -3845,6 +3866,7 @@ mod tests {
                                 approval_command: None,
                                 approval_not_started: None,
                                 approval_cancelled: None,
+                                inference_interruption: None,
                             },
                         )
                         .await
@@ -3926,6 +3948,7 @@ mod tests {
             approval_command: None,
             approval_not_started: None,
             approval_cancelled: None,
+            inference_interruption: None,
         };
         assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
@@ -4047,6 +4070,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4076,6 +4100,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4093,6 +4118,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4241,6 +4267,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4275,6 +4302,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4296,6 +4324,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4362,6 +4391,7 @@ mod tests {
                             approval_command: None,
                             approval_not_started: None,
                             approval_cancelled: None,
+                            inference_interruption: None,
                         },
                     )
                     .await
@@ -4420,6 +4450,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4504,6 +4535,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -4586,6 +4618,7 @@ mod tests {
                             approval_command: None,
                             approval_not_started: None,
                             approval_cancelled: None,
+                            inference_interruption: None,
                         },
                     )
                     .await
@@ -4628,6 +4661,7 @@ mod tests {
                             approval_command: None,
                             approval_not_started: None,
                             approval_cancelled: None,
+                            inference_interruption: None,
                         },
                     )
                     .await
@@ -4665,6 +4699,7 @@ mod tests {
                         approval_command: None,
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -4691,6 +4726,7 @@ mod tests {
                         approval_command: None,
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -4750,6 +4786,7 @@ mod tests {
                         approval_command: None,
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -4863,6 +4900,7 @@ mod tests {
                         approval_command: None,
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -4880,6 +4918,7 @@ mod tests {
                         approval_command: None,
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -4973,6 +5012,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5156,6 +5196,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5179,6 +5220,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5223,6 +5265,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5244,6 +5287,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5265,6 +5309,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5286,6 +5331,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5303,6 +5349,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5335,6 +5382,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5356,6 +5404,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5447,6 +5496,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5492,6 +5542,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5513,6 +5564,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5534,6 +5586,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5551,6 +5604,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5656,6 +5710,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5689,6 +5744,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5711,6 +5767,7 @@ mod tests {
                         tool_call.id.clone(),
                     )),
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -5942,6 +5999,7 @@ mod tests {
                         ))),
                         approval_not_started: None,
                         approval_cancelled: None,
+                        inference_interruption: None,
                     },
                 )
                 .await
@@ -6015,6 +6073,7 @@ mod tests {
                     ))),
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6063,6 +6122,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6161,6 +6221,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6195,6 +6256,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6275,6 +6337,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6312,6 +6375,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6403,6 +6467,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6433,6 +6498,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6492,6 +6558,7 @@ mod tests {
                     ))),
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6523,6 +6590,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6546,6 +6614,7 @@ mod tests {
                         tool_call.id.clone(),
                     )),
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6572,6 +6641,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6589,6 +6659,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6660,6 +6731,7 @@ mod tests {
                     ))),
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6734,6 +6806,7 @@ mod tests {
                         tool_call.id.clone(),
                     )),
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6802,6 +6875,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6833,6 +6907,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6854,6 +6929,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: Some(tool_call.id.clone()),
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6880,6 +6956,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await
@@ -6897,6 +6974,7 @@ mod tests {
                     approval_command: None,
                     approval_not_started: None,
                     approval_cancelled: None,
+                    inference_interruption: None,
                 },
             )
             .await

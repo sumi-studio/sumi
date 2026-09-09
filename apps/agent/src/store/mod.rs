@@ -135,7 +135,7 @@ pub(crate) use recovery::tests::{
 )]
 pub(crate) use recovery::{
     HydratedRunState, HydrationOutcome, LogicalRecoveryExecutor, PendingApprovalRecovery,
-    PendingErrorContextRecovery, ReceivedUserCommand, RecoveredToolContinuation, RecoveryStep,
+    PendingErrorContextRecovery, ReceivedUserCommand, RecoveredInferenceContinuation, RecoveryStep,
     ResumeDirective, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
@@ -818,7 +818,7 @@ impl Store {
         };
 
         let continuation = if let [
-            RecoveryStep::ContinueToolTurn {
+            RecoveryStep::ContinueInference {
                 command_id,
                 run_id,
                 turn_id,
@@ -843,7 +843,7 @@ impl Store {
                 "user_message",
             )
             .await?;
-            let continuation = RecoveredToolContinuation {
+            let continuation = RecoveredInferenceContinuation {
                 envelope: crate::gateway::CommandEnvelope {
                     seq,
                     command_id: crate::gateway::CommandId::parse(command_id)
@@ -9152,3 +9152,5 @@ mod tests {
         assert_eq!(ids, vec!["rule-a", "rule-b"]);
     }
 }
+
+pub(crate) use event_writer::InferenceInterruptionReason;

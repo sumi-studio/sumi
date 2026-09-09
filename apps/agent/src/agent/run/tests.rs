@@ -842,6 +842,7 @@ fn recovered_context(label: &str) -> Vec<PublicMessage> {
 fn recovered_core(completion: RunCompletion) -> RunCore {
     match completion {
         RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("rehydration-required completion has no recoverable core: {failure}")
         }
@@ -1721,6 +1722,7 @@ fn assert_completed(completion: RunCompletion) {
     match completion {
         RunCompletion::Completed(_) => {}
         RunCompletion::Failed { failure, .. } => panic!("run failed: {failure}"),
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("run requires rehydration: {failure}")
         }
@@ -2405,6 +2407,7 @@ async fn abort_after_hard_steer_receipt_keeps_provider_context_in_returned_core(
         RunCompletion::Failed { failure, .. } => {
             panic!("post-receipt Abort run failed: {failure}")
         }
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("post-receipt Abort unexpectedly requires rehydration: {failure}")
         }
@@ -2821,6 +2824,7 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("unexpected rehydration requirement: {failure}")
         }
@@ -3293,6 +3297,7 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::Suspended => panic!("unexpected runtime suspension"),
             RunCompletion::RehydrationRequired { failure } => {
                 panic!("unexpected rehydration requirement: {failure}")
             }
@@ -3400,6 +3405,7 @@ async fn non_authoritative_projection_failure_and_eof_discard_rejected_results()
         let core = match completion {
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+            RunCompletion::Suspended => panic!("unexpected runtime suspension"),
             RunCompletion::RehydrationRequired { failure } => {
                 panic!("unexpected rehydration requirement: {failure}")
             }
@@ -3877,6 +3883,7 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("unexpected rehydration requirement: {failure}")
         }
@@ -4161,6 +4168,7 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
     let core = match completion {
         RunCompletion::Completed(core) => core,
         RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        RunCompletion::Suspended => panic!("unexpected runtime suspension"),
         RunCompletion::RehydrationRequired { failure } => {
             panic!("unexpected rehydration requirement: {failure}")
         }
@@ -4757,6 +4765,7 @@ async fn provider_streaming_abort_dropped_accept_is_no_op() {
             let completion = match completion {
                 RunCompletion::Completed(_) => "completed".to_owned(),
                 RunCompletion::Failed { failure, .. } => format!("{failure}"),
+                RunCompletion::Suspended => panic!("unexpected runtime suspension"),
                 RunCompletion::RehydrationRequired { failure } => {
                     format!("rehydration required: {failure}")
                 }

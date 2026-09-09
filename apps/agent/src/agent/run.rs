@@ -417,6 +417,7 @@ struct Runner {
     provider_cancel: Option<CancellationToken>,
     hard_steer_command: Option<AdmittedCommand>,
     abort_requested: bool,
+    inference_suspended: bool,
     /// Run-wide cancellation token. Dropping the runner cancels all child
     /// operations, including in-flight reviewer calls and tool executions.
     cancel: CancellationToken,
@@ -575,13 +576,14 @@ impl Runner {
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
+            inference_suspended: false,
             cancel,
             durable_terminal_pending: false,
         }
     }
 
     async fn run(mut self, initial: AdmittedCommand) -> RunCompletion {
-        let initial_claim = if self.core.recovered_tool_continuation.is_some() {
+        let initial_claim = if self.core.recovered_inference_continuation.is_some() {
             Ok(())
         } else {
             self.claim_ordered_initial(initial)
@@ -597,6 +599,9 @@ impl Runner {
         self.core.provider_context = std::mem::take(&mut self.provider_context);
         self.core.mark_mutated();
         match result {
+            Ok(()) if self.inference_suspended && !self.durable_terminal_pending => {
+                RunCompletion::Suspended
+            }
             Ok(()) if !self.durable_terminal_pending => {
                 RunCompletion::Completed(std::mem::take(&mut self.core))
             }
@@ -639,7 +644,7 @@ impl Runner {
     }
 
     async fn run_inner(&mut self) -> Result<(), WorkerFailure> {
-        if let Some(continuation) = self.core.recovered_tool_continuation.take() {
+        if let Some(continuation) = self.core.recovered_inference_continuation.take() {
             if !continuation.turn_open {
                 self.start_next_turn().await?;
             }
@@ -906,6 +911,12 @@ impl Runner {
                         self.inject_in_flight().await?;
                     }
                 }
+                AttemptOutcome::SuspendedInference { message, receipt } => {
+                    let receipt = self.await_message_receipt(receipt).await?;
+                    self.retain_committed(receipt, &message)?;
+                    self.close_turn(message, Vec::new()).await?;
+                    return Ok(());
+                }
                 AttemptOutcome::ClosedError {
                     assistant_message_id,
                     message,
@@ -1028,7 +1039,6 @@ impl Runner {
                 biased;
                 _ = runtime_cancel.cancelled(), if !runtime_shutdown_observed => {
                     runtime_shutdown_observed = true;
-                    self.abort_requested = true;
                     cancel.cancel();
                 }
                 control = self.controls.recv() => {
@@ -1069,7 +1079,8 @@ impl Runner {
                     let Some(mut event) = event else {
                         // EOF while not hard-steering.
                         drop(rejected_results);
-                        if self.abort_requested {
+                        if self.abort_requested || runtime_shutdown_observed {
+                            self.inference_suspended = runtime_shutdown_observed && !self.abort_requested && self.hard_steer_command.is_none() && self.in_flight_controls.is_empty();
                             return self.close_aborted_attempt(
                                 &attempt.message_id,
                                 message_started,
@@ -1189,7 +1200,8 @@ impl Runner {
                                 _ if length_guarded => normalize_length_loop_guard(terminal.message()),
                                 _ => terminal.message().clone(),
                             };
-                            if self.abort_requested {
+                            if self.abort_requested || (runtime_shutdown_observed && self.hard_steer_command.is_none()) {
+                                self.inference_suspended = runtime_shutdown_observed && !self.abort_requested && self.in_flight_controls.is_empty();
                                 self.hard_steer_command.take();
                                 return self
                                     .close_aborted_attempt(
@@ -1414,6 +1426,12 @@ impl Runner {
                 None,
             )
             .await?;
+        if self.inference_suspended {
+            return Ok(AttemptOutcome::SuspendedInference {
+                message: partial,
+                receipt,
+            });
+        }
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id.to_owned(),
             message: partial,
@@ -2162,6 +2180,7 @@ impl Runner {
                 approval_command: Some(ApprovalOutputContext::PendingRoute(Box::new(evidence))),
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -2195,6 +2214,7 @@ impl Runner {
                 }),
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -2987,6 +3007,7 @@ impl Runner {
                 }),
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -3260,6 +3281,7 @@ impl Runner {
                 approval_command: None,
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -3299,6 +3321,7 @@ impl Runner {
                 approval_command: None,
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -4017,6 +4040,9 @@ impl Runner {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
+        let inference_interruption = (self.inference_suspended
+            && matches!(event, AgentEvent::TurnEnd { .. }))
+        .then_some(crate::store::InferenceInterruptionReason::RuntimeShutdown);
         self.events
             .send(RunOutput {
                 binding,
@@ -4027,6 +4053,7 @@ impl Runner {
                 approval_command: None,
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -4116,6 +4143,9 @@ impl Runner {
                 approval_command: None,
                 approval_not_started,
                 approval_cancelled,
+                inference_interruption: self
+                    .inference_suspended
+                    .then_some(crate::store::InferenceInterruptionReason::RuntimeShutdown),
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -4147,6 +4177,7 @@ impl Runner {
                 approval_command: None,
                 approval_not_started: None,
                 approval_cancelled: None,
+                inference_interruption: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -4291,6 +4322,10 @@ impl<F> Drop for CancelOnDrop<F> {
 
 #[allow(clippy::large_enum_variant)]
 enum AttemptOutcome {
+    SuspendedInference {
+        message: PublicMessage,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
+    },
     Retry {
         retry_after: Option<RetryAfter>,
         assistant_message_id: String,
