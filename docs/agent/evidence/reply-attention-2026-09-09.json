@@ -1,0 +1,75 @@
+{
+  "status": "PASSED",
+  "startedAt": "2026-09-09T07:42:39.111675+00:00",
+  "finishedAt": "2026-09-09T07:45:21.456924+00:00",
+  "human": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+  "agent": "01a08510-9330-7c92-87c4-6b31c0c98836",
+  "workspace": "01a08510-9443-74a2-b711-c80875c1b274",
+  "place": "01a08510-9464-7dbc-b6a8-810e03c7285d",
+  "deployment": {
+    "api": "sha256:e10a65f85c76c36f6c88135d9a911cd5c3a0416d407d1e3fae25a9851ef00be3",
+    "web": "sha256:0ffb5acb535247c7be56b7aaf644a7af4298c9f0f3eb6268426ad5b0e7d755ab",
+    "runtime-provisioner": "sha256:fa807916394b7013aea367ca807e1c9a91e848685811426dcf94dfdaa6f69cb2",
+    "agent": "sha256:2992a7a4ff80e055614324c75386b56ed29af830775ada7c8f7b84160a137bd3"
+  },
+  "questionTurn": {
+    "command_id": "166de96d-db2b-4d9d-a900-b76e42773eb8",
+    "command_seq": 5,
+    "baselineEventSeq": 96,
+    "endEventSeq": 133,
+    "toolReceipt": {
+      "tool_call_id": "b688cfe7-4dec-5f71-b1e5-69f9646b2e26",
+      "event_seq": 116,
+      "content": "U03_f1f6446d22e0: Would you prefer morning or afternoon?",
+      "reply_to": null,
+      "message_id": "01a0851f-7a1b-73fd-a752-dd136e958d08",
+      "message_seq": 6
+    },
+    "message": {
+      "message_id": "01a0851f-7a1b-73fd-a752-dd136e958d08",
+      "seq": 6,
+      "author_kind": "personality_agent",
+      "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+      "reply_to": null,
+      "content": "U03_f1f6446d22e0: Would you prefer morning or afternoon?"
+    }
+  },
+  "humanAnswer": {
+    "message_id": "01a08520-5ab3-7408-9113-08fdb1be4760",
+    "seq": 8,
+    "author_kind": "human",
+    "author_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+    "reply_to": "01a0851f-7a1b-73fd-a752-dd136e958d08",
+    "content": "U03_f1f6446d22e0: I prefer afternoon."
+  },
+  "attentionCommand": {
+    "command_id": "b365c647-3c6f-4960-99af-3c6b4cabb656",
+    "seq": 6,
+    "event_id": "01a08520-5ab5-7994-9dfa-a5bc6b432a4e",
+    "reply_to_message_id": "01a0851f-7a1b-73fd-a752-dd136e958d08",
+    "message_id": "01a08520-5ab3-7408-9113-08fdb1be4760"
+  },
+  "followupTurn": {
+    "command_id": "b365c647-3c6f-4960-99af-3c6b4cabb656",
+    "command_seq": 6,
+    "baselineEventSeq": 133,
+    "endEventSeq": 158,
+    "toolReceipt": {
+      "tool_call_id": "f03f0acd-8d6e-5f51-a6ba-f081c1030d96",
+      "event_seq": 149,
+      "content": "U03_f1f6446d22e0: Afternoon confirmed.",
+      "reply_to": "01a08520-5ab3-7408-9113-08fdb1be4760",
+      "message_id": "01a08520-bf38-7f13-af70-6159c9219fcc",
+      "message_seq": 9
+    },
+    "message": {
+      "message_id": "01a08520-bf38-7f13-af70-6159c9219fcc",
+      "seq": 9,
+      "author_kind": "personality_agent",
+      "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+      "reply_to": "01a08520-5ab3-7408-9113-08fdb1be4760",
+      "content": "U03_f1f6446d22e0: Afternoon confirmed."
+    }
+  },
+  "cleanupComplete": true
+}

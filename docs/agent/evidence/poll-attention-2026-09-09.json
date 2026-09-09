@@ -1,0 +1,143 @@
+{
+  "status": "PASSED",
+  "startedAt": "2026-09-09T09:20:22.897344+00:00",
+  "finishedAt": "2026-09-09T09:22:23.781160+00:00",
+  "expectedRevision": "2de82d4f39f238f17164094f236e6b36e190a602",
+  "human": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+  "agent": "01a08510-9330-7c92-87c4-6b31c0c98836",
+  "workspace": "01a08510-9443-74a2-b711-c80875c1b274",
+  "place": "01a08510-9464-7dbc-b6a8-810e03c7285d",
+  "poll": {
+    "message_id": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+    "question": "POLL_f572b0b597d9: Would you prefer morning or afternoon?",
+    "allow_multi": false,
+    "revision": 0,
+    "options": [
+      {
+        "option_id": "01a08578-b935-7200-a5d9-e4170572aaaa",
+        "text": "morning",
+        "ord": 0
+      },
+      {
+        "option_id": "01a08578-b936-7108-81ed-42a6997d60e0",
+        "text": "afternoon",
+        "ord": 1
+      }
+    ]
+  },
+  "humanVote": {
+    "poll_message_id": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+    "poll_revision": 1,
+    "question": "POLL_f572b0b597d9: Would you prefer morning or afternoon?",
+    "selected_options": [
+      {
+        "option_id": "01a08578-b936-7108-81ed-42a6997d60e0",
+        "text": "afternoon"
+      }
+    ],
+    "actor": {
+      "kind": "human",
+      "principal_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4"
+    },
+    "persistedVotes": [
+      {
+        "option_id": "01a08578-b936-7108-81ed-42a6997d60e0",
+        "voter_kind": "human",
+        "voter_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+        "text": "afternoon"
+      }
+    ]
+  },
+  "attentionCommand": {
+    "command_id": "be232b8c-8e88-467b-b031-b3e1bb17016c",
+    "seq": 16,
+    "event_id": "01a08578-d9b5-731b-8f8c-d57dd25e8087",
+    "message_id": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+    "actor": {
+      "kind": "human",
+      "principal_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+      "display_name": "Reminder check dacceb935f03"
+    },
+    "content": "",
+    "poll_vote": {
+      "poll_revision": 1,
+      "question": "POLL_f572b0b597d9: Would you prefer morning or afternoon?",
+      "selected_options": [
+        {
+          "option_id": "01a08578-b936-7108-81ed-42a6997d60e0",
+          "text": "afternoon"
+        }
+      ]
+    }
+  },
+  "followupTurn": {
+    "command_id": "be232b8c-8e88-467b-b031-b3e1bb17016c",
+    "command_seq": 16,
+    "baselineEventSeq": 367,
+    "endEventSeq": 392,
+    "toolReceipt": {
+      "tool_call_id": "a47c0859-02bb-5afa-a556-0c76e3edf42e",
+      "event_seq": 383,
+      "content": "POLL_f572b0b597d9: Afternoon confirmed.",
+      "question": null,
+      "options": null,
+      "allow_multi": false,
+      "reply_to": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+      "message_id": "01a08579-8828-708d-9987-0008d55438e3",
+      "message_seq": 16
+    },
+    "message": {
+      "message_id": "01a08579-8828-708d-9987-0008d55438e3",
+      "seq": 16,
+      "author_kind": "personality_agent",
+      "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+      "reply_to": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+      "content": "POLL_f572b0b597d9: Afternoon confirmed."
+    }
+  },
+  "receivedSource": {
+    "actor": {
+      "kind": "human",
+      "principal_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+      "display_name": "Reminder check dacceb935f03"
+    },
+    "source": {
+      "surface": "messaging",
+      "event_id": "01a08578-d9b5-731b-8f8c-d57dd25e8087",
+      "kind": "messaging_poll_vote",
+      "workspace_id": "01a08510-9443-74a2-b711-c80875c1b274",
+      "installation_id": "01a08510-945c-76a6-a2dc-cec45eb55510",
+      "authority_epoch": 8,
+      "place": {
+        "id": "01a08510-9464-7dbc-b6a8-810e03c7285d",
+        "kind": "channel",
+        "name": "reminder-dacceb935f03"
+      },
+      "message_id": "01a08578-b932-7eaa-8c9f-fe213968b4e6",
+      "message_revision": 1,
+      "message_seq": 15,
+      "occurred_at": "2026-09-09T09:21:24.911182361Z",
+      "poll_vote": {
+        "poll_revision": 1,
+        "question": "POLL_f572b0b597d9: Would you prefer morning or afternoon?",
+        "selected_options": [
+          {
+            "option_id": "01a08578-b936-7108-81ed-42a6997d60e0",
+            "text": "afternoon"
+          }
+        ]
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": ""
+      }
+    ]
+  },
+  "cleanupComplete": true,
+  "limits": [
+    "One synthetic real Kimi poll vote and continuation; physical mobile UI and native Astra not exercised.",
+    "Metadata-only received event retains empty speech content; source carries the actual vote."
+  ]
+}

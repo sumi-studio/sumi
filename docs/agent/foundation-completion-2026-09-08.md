@@ -173,11 +173,11 @@ still needed to close each row.
 | A01 | Actual DM wake, ordinary reply and replay verified after request/approval repair | Broaden interruption and duplicate-delivery acceptance while retaining optional response and existing permissions. |
 | A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
-| A04 | Actual due reminder write/resolve and cancellation suppression verified | Exercise overdue markers across restart and verify a single admission without manufacturing a reply. |
+| A04 | Due reminder survives Cold stop and wakes the same PA; cancelled marker suppressed | Actual run verified one due admission and zero cancelled admissions. Whole-host reboot and admission/DB-ack crash injection remain outside this scenario. |
 | T01 | Durable workspace processes deployed through #398; same-PA cold-stop continuation, output read, report and reconnect/no-replay verified | Retain this opt-in real-model scenario. One synthetic process does not establish every failure or resource-limit case. |
 | T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
-| T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
-| T04 | Messaging images/text supported; intake/formats incomplete | Actual UI upload and content-based answer; unsupported content must be distinguished from content actually read. |
+| T03 | Reviewed public HTTPS document reading accepted in a real Kimi scenario (#399) | Authenticated connectors and full browser interaction remain separate; ordinary fetch-failure continuation passed. |
+| T04 | Browser DM upload and content-based text/image replies accepted (#400) | Unsupported formats return explicit unread errors; broader formats and native Astra remain outside this acceptance. |
 | T05 | Helper delegation absent | One bounded attributable helper job supports message, result, cancellation and reconnect without cloning the secretary's continuation. |
 | T06 | Optional procedure files possible; extension lifecycle absent | Verify voluntary save/find/revise/reuse first; add discovery only for a demonstrated extension need. Never require reflection or skill use. |
 | R01 | Some restart phases supported | Recover additional ordinary durable phases from their actual evidence, without guessing outcomes of emitted effects. |
@@ -192,7 +192,7 @@ still needed to close each row.
 | P05 | Per-response limits only | Account for an explicitly bounded undertaking/wake across restart, stop further admissions truthfully and support replenishment. |
 | U01 | Exact-call review exists; standing permission UI absent | Grant, view, narrow and revoke understandable scopes; recheck queued actions and retain effect truth. |
 | U02 | Cards render; shared action round trip absent | Human and PA act on the same authorized object/version with mobile/keyboard feedback and an attributable resulting event. |
-| U03 | Text reply Attention integrated in #390; live continuation pending; poll answer wake absent | Verify the same PA receives and uses the original-message reference after a later reply. Poll answers still need a delivery path. |
+| U03 | Actual text reply and poll-vote Attention continuations accepted | Same PA used the reply reference and selected poll option in a persisted Messaging response. Physical mobile interaction and native Astra remain unverified. |
 | Q01 | Separate real-model evidence exists | Maintain a small reproducible opt-in set for correction, wait, interruption, actual artifacts and delivery; distinguish blocked/skipped/failed. |
 | Q02 | Rust CI now active; relevance review continues | The Rust regression workflow passed its first GitHub Actions run on the supported Rust 1.88 toolchain. Local suite: 2,213 passed, 20 ignored (includes subprocess entry points and opt-in live-provider/performance cases). Continue reviewing relevance and explicit non-run reporting. |
 
@@ -451,3 +451,53 @@ error and continuation. Full local evidence is
 scenario, not browser rendering, authenticated reading, PDF support or native
 Astra acceptance. HTML extraction and destination/redirect limits have local
 tests; they were not exercised by this live document.
+
+## Browser Messaging attachment intake
+
+PR #400 merged as `5decea03673283ef0a730748afd2e432ae2825e8`; its reviewed
+source `8fcf99456dd528246bc7d3d2b821f442bea90c15` is deployed across all four
+shared images. All three CI jobs, 25 attachment tests, two configuration tests
+and independent review passed. Existing volumes and settings were retained.
+
+The same owned Human/PA pair used an ordinary DM. A real browser uploaded and
+sent `note.txt`, then `picture.png`, through the existing composer. Each upload
+and send occurred once. Attention delivered the authentic Human messages; the
+PA opened each attachment and replied through Messaging. The text reply contained
+the attachment-only number and quantity. The image reply identified its pixel-only
+number, blue circle and upper-right position. Filenames, alternative text and
+message prompts did not contain these answers. Attachment bytes/hashes, tool
+results, persisted replies and command identities were checked. Histories remain;
+owned installations were disabled, the session revoked and the Cold runtime stopped.
+
+The first run failed in the probe because API epoch `"13"` and command epoch `13`
+were compared as different types. Exact numeric comparison fixed that mismatch;
+the original failed record remains unchanged. Normal recovery retained the earlier
+message, and the subsequent text reply also answered that earlier attachment.
+
+[Selected evidence](evidence/attachment-intake-2026-09-09.json) preserves both
+current answers and their receipts. Full local evidence is
+`/tmp/sumi-attachment-intake-074724bw/evidence.json`. This verifies one Kimi
+text/image journey through desktop Chrome, not physical iOS, all image formats,
+PDF extraction or native Astra. No live provider request was captured: the
+actual adapter serialization regression and the live image-specific answer
+are separate evidence.
+
+## Reconciled reminder, reply and poll acceptance
+
+The table above now reflects three earlier successful real-model runs whose
+results had not yet replaced the stale pending assessments:
+
+- [Reminder restart](evidence/reminder-restart-2026-09-09.json): the same PA
+  restarted from generation 0 to 1 after its Cold runtime was stopped. The due
+  marker admitted one command; the cancelled marker admitted none. This is
+  admission evidence, not a claim about reminder-response quality or host reboot.
+- [Reply continuation](evidence/reply-attention-2026-09-09.json): a Human answer
+  retained its original-message reference through Attention, and the PA's
+  subsequent Messaging reply confirmed the selected afternoon preference.
+- [Poll continuation](evidence/poll-attention-2026-09-09.json): the persisted
+  afternoon vote arrived as source metadata, with no fabricated Human speech,
+  and the PA replied to the original poll with the correct choice.
+
+All three runs completed their owned-fixture cleanup. These are historical
+acceptances at their recorded revisions, not new reruns on #400. The earlier
+failed probes remain failed.

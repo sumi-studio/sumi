@@ -1,0 +1,179 @@
+{
+  "status": "PASSED",
+  "startedAt": "2026-09-09T11:40:01.548512+00:00",
+  "finishedAt": "2026-09-09T11:42:09.721128+00:00",
+  "expectedRevision": "8fcf99456dd528246bc7d3d2b821f442bea90c15",
+  "human": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+  "agent": "01a08510-9330-7c92-87c4-6b31c0c98836",
+  "workspace": "01a08510-9443-74a2-b711-c80875c1b274",
+  "cleanupComplete": true,
+  "limits": [
+    "Browser file input and send; API/event assertions verify resulting receipts",
+    "No live provider request capture; image proof is attachment bytes plus pixel-specific model answer; exact adapter regression is separate"
+  ],
+  "merged_pr": 400,
+  "model": "opencode-go/kimi-k2.7-code",
+  "dm_id": "01a085f5-2577-72fd-ad82-4f461fc82804",
+  "cases": [
+    {
+      "kind": "text",
+      "expected": {
+        "marker": "897188",
+        "item": "ねじ",
+        "quantity": 27
+      },
+      "filename": "note.txt",
+      "mime": "text/plain",
+      "sha256": "e54e16878170bc71ea7d22de7193ec3f0d1a2f45ba1b4d29a8f962dc1777df39",
+      "size_bytes": 95,
+      "attachment": {
+        "attachment_id": "01a085f7-f820-77b2-8329-c012fc6087bd",
+        "filename": "note.txt",
+        "mime": "text/plain",
+        "size_bytes": 95,
+        "sha256": "e54e16878170bc71ea7d22de7193ec3f0d1a2f45ba1b4d29a8f962dc1777df39",
+        "alt": "",
+        "spoiler": false
+      },
+      "humanReceipt": {
+        "message_id": "01a085f7-f919-77a2-aa3a-942d0c327d29",
+        "seq": 2,
+        "client_nonce": "d648a4fe-1cce-419b-a48d-1ab00d8cb5fd",
+        "created": true
+      },
+      "command": {
+        "seq": 28,
+        "command_id": "4cd04d70-90c1-4a57-b0b6-04ad25fad8af",
+        "source": {
+          "surface": "messaging",
+          "event_id": "01a085f7-f91d-70c7-8f23-d43a926451c4",
+          "kind": "messaging_message",
+          "workspace_id": "01a08510-9443-74a2-b711-c80875c1b274",
+          "installation_id": "01a08510-945c-76a6-a2dc-cec45eb55510",
+          "authority_epoch": 14,
+          "place": {
+            "id": "01a085f5-2577-72fd-ad82-4f461fc82804",
+            "kind": "dm",
+            "name": ""
+          },
+          "message_id": "01a085f7-f919-77a2-aa3a-942d0c327d29",
+          "message_revision": 1,
+          "message_seq": 2,
+          "occurred_at": "2026-09-09T11:40:16.020994Z"
+        },
+        "actor": {
+          "kind": "human",
+          "principal_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+          "display_name": "Reminder check dacceb935f03"
+        }
+      },
+      "openEvidence": [
+        {
+          "tool_call_id": "19f88c75-1e20-527f-8856-5e170be73c14",
+          "eventSeq": 662,
+          "contentType": "text/plain",
+          "sha256": "e54e16878170bc71ea7d22de7193ec3f0d1a2f45ba1b4d29a8f962dc1777df39",
+          "size_bytes": 95
+        }
+      ],
+      "answer": {
+        "tool_call_id": "2d92c53c-ba93-5fb8-ae55-96b4be375ce1",
+        "eventSeq": 670,
+        "message": {
+          "message_id": "01a085f8-ad90-7be8-92e4-d0400a809b63",
+          "seq": 3,
+          "author_kind": "personality_agent",
+          "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+          "reply_to": null,
+          "content": "1通目: 照合番号 954111、確認対象「ねじ」の数量は 88 個です。\n2通目: 照合番号 897188、確認対象「ねじ」の数量は 27 個です。"
+        }
+      },
+      "ack": "applied",
+      "historyRetained": true,
+      "passed": true
+    },
+    {
+      "kind": "image",
+      "expected": {
+        "marker": "310448",
+        "color": "blue",
+        "position": "upper right"
+      },
+      "filename": "picture.png",
+      "mime": "image/png",
+      "sha256": "995214d8f33d8a9e15b1269befdfedc7a4ddc31873e0001e3337bd3827566237",
+      "size_bytes": 3022,
+      "attachment": {
+        "attachment_id": "01a085f8-d31e-7f19-9f83-5feaae79bdd8",
+        "filename": "picture.png",
+        "mime": "image/png",
+        "size_bytes": 3022,
+        "sha256": "995214d8f33d8a9e15b1269befdfedc7a4ddc31873e0001e3337bd3827566237",
+        "alt": "",
+        "spoiler": false
+      },
+      "humanReceipt": {
+        "message_id": "01a085f8-d40e-77a3-8b19-4d42ab3a9a6b",
+        "seq": 4,
+        "client_nonce": "7ad3e398-72c9-4391-b541-7cc4f76d30c7",
+        "created": true
+      },
+      "command": {
+        "seq": 29,
+        "command_id": "912148ea-a2f1-4648-8e2d-fdc587c66b54",
+        "source": {
+          "surface": "messaging",
+          "event_id": "01a085f8-d411-7961-926d-2b640905d2f7",
+          "kind": "messaging_message",
+          "workspace_id": "01a08510-9443-74a2-b711-c80875c1b274",
+          "installation_id": "01a08510-945c-76a6-a2dc-cec45eb55510",
+          "authority_epoch": 14,
+          "place": {
+            "id": "01a085f5-2577-72fd-ad82-4f461fc82804",
+            "kind": "dm",
+            "name": ""
+          },
+          "message_id": "01a085f8-d40e-77a3-8b19-4d42ab3a9a6b",
+          "message_revision": 1,
+          "message_seq": 4,
+          "occurred_at": "2026-09-09T11:41:12.074652Z"
+        },
+        "actor": {
+          "kind": "human",
+          "principal_id": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+          "display_name": "Reminder check dacceb935f03"
+        }
+      },
+      "openEvidence": [
+        {
+          "tool_call_id": "22c60b73-9e16-5320-9fb2-ce4705c1057f",
+          "eventSeq": 695,
+          "contentType": "image/png",
+          "sha256": "995214d8f33d8a9e15b1269befdfedc7a4ddc31873e0001e3337bd3827566237",
+          "size_bytes": 3022
+        }
+      ],
+      "answer": {
+        "tool_call_id": "59a8b05e-dd08-5645-b3b7-1760c7794e13",
+        "eventSeq": 703,
+        "message": {
+          "message_id": "01a085f9-94ab-773b-9c9e-cbdf48ffe57d",
+          "seq": 5,
+          "author_kind": "personality_agent",
+          "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+          "reply_to": null,
+          "content": "照合番号: 310448\n丸の色: 青\n位置: 右上"
+        }
+      },
+      "ack": "applied",
+      "historyRetained": true,
+      "passed": true
+    }
+  ],
+  "prior_failure": {
+    "path": "/tmp/sumi-attachment-intake-j33_gzo4/evidence.json",
+    "status": "FAILED",
+    "reason": "Probe compared API authority epoch string with command integer; exact numeric comparison corrected. Original failure retained.",
+    "cleanup_complete": true
+  }
+}
