@@ -198,6 +198,9 @@ pub(super) fn external_source_fixture(
             "occurred_at": "2026-09-07T22:00:00Z"
         }
     });
+    if !reminder {
+        value["source"]["reply_to_message_id"] = "01992000-0000-7000-8000-000000000008".into();
+    }
     if reminder {
         value["actor"]["principal_id"] = value["personality_agent_id"].clone();
         value["source"]["marker_id"] = "01992000-0000-7000-8000-000000000008".into();

@@ -477,6 +477,7 @@ function isIncomingSource(value: unknown): boolean {
         "occurred_at",
         "marker_id",
         "due_at",
+        "reply_to_message_id",
       ],
     )
   )
@@ -501,8 +502,11 @@ function isIncomingSource(value: unknown): boolean {
     typeof place.name !== "string"
   )
     return false;
+  if ("reply_to_message_id" in source && !isUUID(source.reply_to_message_id))
+    return false;
   if (source.kind === "reply_later_due")
     return (
+      !("reply_to_message_id" in source) &&
       actor.kind === "personality_agent" &&
       actor.principal_id === value.personality_agent_id &&
       isUUID(source.marker_id) &&
@@ -512,7 +516,9 @@ function isIncomingSource(value: unknown): boolean {
   return (
     source.kind === "messaging_mention" ||
     (source.kind === "messaging_message" &&
-      (place.kind === "dm" || place.kind === "group_dm"))
+      (place.kind === "dm" ||
+        place.kind === "group_dm" ||
+        "reply_to_message_id" in source))
   );
 }
 

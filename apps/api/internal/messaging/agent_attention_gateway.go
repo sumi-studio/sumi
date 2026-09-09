@@ -34,7 +34,8 @@ func (a *AgentAttentionGateway) input(event AgentAttentionEvent) (agentevents.In
 		AuthorityEpoch: uint64(event.AuthorityEpoch),
 		Place:          &agentevents.ProvenancePlace{ID: event.Place.ID, Kind: event.Place.Kind, Name: event.Place.Name},
 		MessageID:      event.MessageID, MessageRevision: uint64(event.MessageRevision), MessageSeq: uint64(event.MessageSeq),
-		OccurredAt: event.OccurredAt.UTC().Format(time.RFC3339Nano), MarkerID: event.MarkerID,
+		ReplyToMessageID: event.ReplyToMessageID,
+		OccurredAt:       event.OccurredAt.UTC().Format(time.RFC3339Nano), MarkerID: event.MarkerID,
 	}
 	if event.DueAt != nil {
 		source.DueAt = event.DueAt.UTC().Format(time.RFC3339Nano)

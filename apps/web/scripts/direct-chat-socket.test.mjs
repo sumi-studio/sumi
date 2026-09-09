@@ -372,7 +372,12 @@ test("log preserves strict external source metadata and rejects malformed varian
       "utf8",
     ),
   );
-  for (const key of ["external_mention", "external_dm", "external_reminder"]) {
+  for (const key of [
+    "external_mention",
+    "external_dm",
+    "external_reminder",
+    "external_reply",
+  ]) {
     const fixture = fixtures[key];
     if (!fixture) throw new Error(`missing ${key}`);
     const frame = event(1, {
@@ -391,6 +396,8 @@ test("log preserves strict external source metadata and rejects malformed varian
       (x) => (x.version = 1),
       (x) => (x.source.authority_epoch = 0),
       (x) => (x.source.extra = true),
+      (x) => (x.source.reply_to_message_id = null),
+      (x) => (x.source.reply_to_message_id = "not-a-uuid"),
       (x) => (x.actor.kind = "system"),
     ]) {
       const bad = structuredClone(frame);

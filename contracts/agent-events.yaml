@@ -849,6 +849,7 @@ $defs:
           surface: { const: messaging }
           event_id: { $ref: '#/$defs/CanonicalUUID' }
           kind: { enum: [messaging_mention, messaging_message] }
+          reply_to_message_id: { $ref: '#/$defs/CanonicalUUID' }
           workspace_id: { $ref: '#/$defs/CanonicalUUID' }
           installation_id: { $ref: '#/$defs/CanonicalUUID' }
           authority_epoch: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }

@@ -76,6 +76,31 @@ function describeErrors(errors) {
 const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
 let failed = false;
 
+// Reply linkage is optional source metadata, never reminder metadata or text.
+for (const kind of [
+  "external_reply",
+  "external_mention",
+  "external_reminder",
+]) {
+  for (const target of [
+    null,
+    "",
+    "not-a-uuid",
+    "01992000-0000-7000-8000-000000000008",
+  ]) {
+    const wire = structuredClone(fixtures[kind].wire);
+    wire.provenance.source.reply_to_message_id = target;
+    const expected =
+      target === "01992000-0000-7000-8000-000000000008" &&
+      kind !== "external_reminder";
+    assert.equal(
+      getValidator("CommandEnvelope")(wire),
+      expected,
+      `${kind} reply target ${target}`,
+    );
+  }
+}
+
 for (const route of ["/direct-chat/commands", "/direct-chat/ws"]) {
   if (openApi.paths?.[route] === undefined) {
     console.error(`OpenAPI is missing required direct-chat route ${route}`);

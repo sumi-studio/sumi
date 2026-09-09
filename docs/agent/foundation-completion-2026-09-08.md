@@ -13,9 +13,11 @@ condition. No test of personhood is proposed here.
 
 ## Baseline and accepted milestone
 
-Current shared deployment: `bc49022a7bfef70b659a5e6c6478ae165698ffa1`,
-including upper memory #381 and provider-call identity repair #383. The verified
-#383 main merge is `6aef3b2053cc5cc4e59d736b060e9d41ef51a129`.
+Current shared deployment (2026-09-09): API
+`b6d271b4e177cdbf27e0064ed69fb0000e7905f3` (#386), runtime/provisioner
+`bc49022a7bfef70b659a5e6c6478ae165698ffa1` (including #381/#383), and Web
+`055780646c749508bb9a6f75ffce4daaff43b505` (#389). These are deliberately
+recorded separately: the later Web-only updates did not replace the runtime.
 This does not mean that all of #362
 or native account sign-in acceptance is complete.
 The private-file acceptance below was performed on the preceding `8cbba0b8`
@@ -181,7 +183,7 @@ still needed to close each row.
 | R01 | Some restart phases supported | Recover additional ordinary durable phases from their actual evidence, without guessing outcomes of emitted effects. |
 | R02 | Transient health transport failures now retry | Implemented with real-socket regression coverage: transient transport failure retains the runtime, while identity/epoch/protocol failure remains fenced. Deployed in #375; shared fault-injection acceptance is not yet claimed. |
 | R03 | Active work and input admission protect cold-idle lifetime | Implemented and independently reviewed; focused Go race tests cover active work, accepted input, completed idle work and admission/reaping. Deployed in #375. |
-| R04 | Warm prevents idle stopping but does not restore | Explicit intended presence survives exit/reboot with bounded restoration and observable failure. |
+| R04 | Warm restoration deployed in #386; host service recovery configured in #387 | Runtime exit and API restart restore the same owned PA without browser demand; Cold remains stopped. Actual whole-WSL reboot remains unverified. See the receipt-linked acceptance below. |
 | R05 | Active-state reconstruction deployed and verified on an existing PA in #377 | All three CI jobs passed; local suite 2,210 passed, 20 ignored. Native migration 21 added all 15 indexes with previous migration checksums intact. Existing conversation context identified the old report and read its corrected bytes; old/new replies survived reload. Large active suffixes remain proportional work. |
 | P01 | No provider-native steering/async path | Verify an actual documented supported provider contract before adopting it; internal async/steering is not evidence of native support. |
 | P02 | ChatGPT connection, Astra effort and idle switching implemented in #380 | Verify actual authorization, inference and switching; configured values and synthetic protocol tests alone do not establish live activation. |
@@ -318,3 +320,37 @@ pinned images and owned-fixture cleanup also passed.
 [Selected evidence](evidence/attention-identity-2026-09-09.json) preserves those
 receipts. This does not prove native ChatGPT/Astra activation, physical iOS
 quality, natural long-run memory fidelity, or the cause of the earlier stall.
+
+## Warm restoration and current Direct Chat acceptance — 2026-09-09
+
+[Native acceptance report](https://github.com/sumi-studio/sumi/issues/362#issuecomment-5596637290)
+records the owned PA's automatic restoration after runtime exit and API restart,
+plus a 40.4-second Cold observation exceeding the 30-second restoration sweep.
+The real model created/read a file, then identified it after restoration without
+the continuation prompt supplying its name or marker, edited it, and read the
+exact updated 28 bytes. Fresh replay matched all 57 persisted event sequences
+and bodies. Volatile unsequenced events were excluded. This bounded scenario
+is not evidence of general memory fidelity or whole-WSL restart recovery.
+
+The host's Docker restart policy and tmpfiles configuration were applied and
+verified against #387. Existing files, histories and configuration were retained.
+The test installation was disabled, its session revoked and revocation verified,
+and only its own Cold containers stopped.
+
+Direct Chat #385 repaired the browser's provider-call identity parsing, operation
+row updates and scroll restoration. #388 refined typography, tool rows and the
+composer from installed Codex App implementation evidence. #389 added measured
+height/opacity opening and closing using its 300ms easing; reduced-motion
+preferences disable these transitions. All three CI jobs and independent review
+passed before each merge. The integrated browser journey covers send, steer,
+approval, abort, replay, keyboard disclosure activation and retained panel DOM.
+Its stale fixture was repaired to supply the required output audience, without
+relaxing the production parser.
+
+The deployed #389 UI rendered the owned saved conversation at 390px, opened and
+closed the result panel, reported 0.3s normal/0s reduced-motion transitions, and
+had no horizontal overflow. No model command was sent. The owned session was
+then revoked and its installation disabled again. Actual physical iOS behavior,
+live Codex pixel matching and animation of content growth while already open
+remain unverified or unimplemented; these are not claimed by the opening and
+closing check. Web returned HTTP 200 and API `/health` returned `status: ok`.

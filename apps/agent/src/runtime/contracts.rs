@@ -290,6 +290,12 @@ pub struct MessagingSource {
     pub authority_epoch: u64,
     pub place: MessagingPlace,
     pub message_id: String,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reply_to_message_id: Option<String>,
     pub message_revision: u64,
     pub message_seq: u64,
     pub occurred_at: String,
@@ -357,6 +363,19 @@ impl MessagingSource {
             return Err(fail());
         }
         chrono::DateTime::parse_from_rfc3339(&self.occurred_at).map_err(|_| fail())?;
+        if let Some(id) = &self.reply_to_message_id {
+            if !matches!(
+                self.kind,
+                MessagingEventKind::MessagingMessage | MessagingEventKind::MessagingMention
+            ) || Uuid::parse_str(id)
+                .map_err(|_| fail())?
+                .hyphenated()
+                .to_string()
+                != *id
+            {
+                return Err(fail());
+            }
+        }
         match self.kind {
             MessagingEventKind::MessagingMention | MessagingEventKind::MessagingMessage
                 if self.marker_id.is_none() && self.due_at.is_none() =>
@@ -852,6 +871,22 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap(), dm);
         dm["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
         assert!(serde_json::from_value::<IncomingProvenance>(dm).is_err());
+        for kind in ["messaging_message", "messaging_mention"] {
+            let mut reply = raw.clone();
+            reply["source"]["kind"] = serde_json::json!(kind);
+            reply["source"]["reply_to_message_id"] =
+                serde_json::json!("01992000-0000-7000-8000-000000000008");
+            let parsed = serde_json::from_value::<IncomingProvenance>(reply.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), reply);
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!("not-a-uuid"),
+            ] {
+                reply["source"]["reply_to_message_id"] = invalid;
+                assert!(serde_json::from_value::<IncomingProvenance>(reply.clone()).is_err());
+            }
+        }
         let mut reminder = raw.clone();
         reminder["source"]["kind"] = serde_json::json!("reply_later_due");
         reminder["source"]["marker_id"] = serde_json::json!("01992000-0000-7000-8000-000000000008");
@@ -861,6 +896,10 @@ mod tests {
         reminder["actor"]["principal_id"] = reminder["personality_agent_id"].clone();
         let parsed = serde_json::from_value::<IncomingProvenance>(reminder.clone()).unwrap();
         assert_eq!(parsed.authenticated_direct_chat_human(), None);
+        let mut invalid_reply = reminder.clone();
+        invalid_reply["source"]["reply_to_message_id"] =
+            serde_json::json!("01992000-0000-7000-8000-000000000008");
+        assert!(serde_json::from_value::<IncomingProvenance>(invalid_reply).is_err());
         reminder["source"]["kind"] = serde_json::json!("messaging_mention");
         assert!(serde_json::from_value::<IncomingProvenance>(reminder).is_err());
         let mut direct =

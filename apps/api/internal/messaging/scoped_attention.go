@@ -481,6 +481,10 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 	if err != nil {
 		return fmt.Errorf("evaluate scoped notification intents: %w", err)
 	}
+	replyRecipient, err := s.issueAgentReply(ctx, tx, place, message, members, decisions)
+	if err != nil {
+		return fmt.Errorf("issue PA reply attention: %w", err)
+	}
 	for _, decision := range decisions {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_notification_intents
@@ -490,6 +494,9 @@ func (s *ScopedStore) issueScopedNotificationIntents(ctx context.Context, tx pgx
 			decision.Participant.Kind, decision.Participant.ID, decision.Reason,
 			decision.workspaceMemberID, decision.placeMemberID); err != nil {
 			return fmt.Errorf("issue scoped notification intent: %w", err)
+		}
+		if decision.Participant == replyRecipient {
+			continue // The reply already issued one event to this DM/mention recipient.
 		}
 		if err := s.issueAgentMessage(ctx, tx, place, message, members, decision); err != nil {
 			return fmt.Errorf("issue PA attention: %w", err)

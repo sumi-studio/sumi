@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,6 +30,19 @@ func TestAgentAttentionGatewayPreservesSourceAndReminderOrigin(t *testing.T) {
 	if body.Type != "external_event" || body.Content != event.Content {
 		t.Fatal("source text changed")
 	}
+	event.ReplyToMessageID, event.ReplyRequired = id, true
+	p, command, err = adapter.input(event)
+	if err != nil || p.Source.ReplyToMessageID != id || p.Actor.PrincipalID != event.Actor.ID {
+		t.Fatalf("reply metadata: %+v %v", p, err)
+	}
+	encoded, err := json.Marshal(p)
+	if err != nil || strings.Contains(string(encoded), "reply_required") || strings.Contains(string(command), "reply_required") {
+		t.Fatalf("internal delivery condition leaked: %s %s %v", encoded, command, err)
+	}
+	if err := json.Unmarshal(command, &body); err != nil || body.Content != event.Content {
+		t.Fatalf("reply body changed: %+v %v", body, err)
+	}
+	event.ReplyToMessageID, event.ReplyRequired = "", false
 	due := at.Add(time.Hour)
 	event.Kind = AgentAttentionReminder
 	event.MarkerID = id

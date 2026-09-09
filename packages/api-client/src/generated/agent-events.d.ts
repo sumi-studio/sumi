@@ -88,6 +88,7 @@ export type MessagingEventSource =
       surface: "messaging";
       event_id: CanonicalUUID;
       kind: "messaging_mention" | "messaging_message";
+      reply_to_message_id?: CanonicalUUID;
       workspace_id: CanonicalUUID;
       installation_id: CanonicalUUID;
       /**

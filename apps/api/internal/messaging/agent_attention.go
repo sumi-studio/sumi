@@ -30,12 +30,16 @@ type AgentAttentionEvent struct {
 	Actor              AgentAttentionActor `json:"actor"`
 	Place              AgentAttentionPlace `json:"place"`
 	MessageID          string              `json:"message_id"`
-	MessageRevision    int64               `json:"message_revision"`
-	MessageSeq         int64               `json:"message_seq"`
-	OccurredAt         time.Time           `json:"occurred_at"`
-	Content            string              `json:"content"`
-	MarkerID           string              `json:"marker_id,omitempty"`
-	DueAt              *time.Time          `json:"due_at,omitempty"`
+	// ReplyRequired is an outbox-only authorization condition. DM/mention
+	// delivery does not depend on the continued existence of the parent.
+	ReplyRequired    bool       `json:"reply_required,omitempty"`
+	ReplyToMessageID string     `json:"reply_to_message_id,omitempty"`
+	MessageRevision  int64      `json:"message_revision"`
+	MessageSeq       int64      `json:"message_seq"`
+	OccurredAt       time.Time  `json:"occurred_at"`
+	Content          string     `json:"content"`
+	MarkerID         string     `json:"marker_id,omitempty"`
+	DueAt            *time.Time `json:"due_at,omitempty"`
 }
 
 type AgentAttentionActor struct {
@@ -122,6 +126,68 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 	}
 	return s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
 		access.WorkspaceMemberID, access.PlaceMemberID, message.CreatedAt)
+}
+
+// A reply names its recipient through the persisted message author, never text
+// interpretation. It uses the same outbox as DM/mention attention and remains
+// subject to that recipient's notification settings and membership tenure.
+func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Place, message Message, members []MemberProfile, decisions []NotificationDecision) (ParticipantRef, error) {
+	if message.ReplyTo == "" {
+		return ParticipantRef{}, nil
+	}
+	parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, message.ReplyTo)
+	if err != nil {
+		return ParticipantRef{}, err
+	}
+	if parent.Deleted || parent.Author.Kind != KindPersonalityAgent || parent.Author == message.Author {
+		return ParticipantRef{}, nil
+	}
+	// Do not enroll a former participant merely because their old message is
+	// still visible. The recipient must be in this conversation now.
+	present, authorName := false, ""
+	for _, member := range members {
+		present = present || member.Participant == parent.Author
+		if member.Participant == message.Author {
+			authorName = member.DisplayName
+		}
+	}
+	if !present {
+		return ParticipantRef{}, nil
+	}
+	settings, err := s.scopedNotificationSettingsFor(ctx, tx, place.PlaceID, []ParticipantRef{parent.Author})
+	if err != nil {
+		return ParticipantRef{}, err
+	}
+	if settings[parent.Author.Key()].level == NotifyLevelMute {
+		return ParticipantRef{}, nil
+	}
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, parent.Author)
+	if err != nil {
+		return ParticipantRef{}, err
+	}
+	if parent.Seq < access.VisibleFromSeq {
+		return ParticipantRef{}, nil
+	}
+	event := s.attentionEvent(place, message, message.Author, authorName)
+	event.Kind, event.PersonalityAgentID = AgentAttentionMessage, parent.Author.ID
+	event.ReplyToMessageID, event.ReplyRequired = parent.MessageID, true
+	for _, decision := range decisions {
+		if decision.Participant != parent.Author {
+			continue
+		}
+		if decision.Reason == NotifyReasonDM {
+			event.ReplyRequired = false
+		} else {
+			for _, mention := range message.Mentions {
+				if mention == parent.Author {
+					event.Kind, event.ReplyRequired = AgentAttentionMention, false
+				}
+			}
+		}
+	}
+	err = s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
+		access.WorkspaceMemberID, access.PlaceMemberID, message.CreatedAt)
+	return parent.Author, err
 }
 
 func (s *ScopedStore) issueAgentReminder(ctx context.Context, tx pgx.Tx, place Place, message Message, marker ReplyLaterMarker, access PlaceAccess) error {
@@ -346,6 +412,15 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 	}
 	if message.Deleted || message.Seq < access.VisibleFromSeq {
 		return ErrMessageNotFound
+	}
+	if item.event.ReplyRequired {
+		parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, item.event.ReplyToMessageID)
+		if err != nil {
+			return err
+		}
+		if parent.Deleted || parent.Seq < access.VisibleFromSeq || parent.Author != s.Scope.Actor || message.ReplyTo != parent.MessageID {
+			return ErrMessageNotFound
+		}
 	}
 	if item.event.Kind == AgentAttentionReminder {
 		var due bool

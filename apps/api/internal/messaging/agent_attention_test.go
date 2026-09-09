@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/google/uuid"
+	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"sync"
 	"testing"
 	"time"
@@ -459,5 +461,234 @@ func TestAgentAttentionDMRecipientsReceiveWithoutMention(t *testing.T) {
 				t.Fatalf("self reply woke author: %+v %v", stats, err)
 			}
 		})
+	}
+}
+
+func TestAgentAttentionReplyReturnsToAuthorOnce(t *testing.T) {
+	for _, kind := range []string{"channel", "thread", "dm", "mention"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, place := w.workspaceWithChannel(t, ctx)
+			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+			sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanB)
+			if kind == "thread" {
+				thread, _, err := pa.CreateThread(ctx, place.PlaceID, "相談", "", "reply-thread")
+				if err != nil {
+					t.Fatal(err)
+				}
+				place = thread.Place
+			} else if kind == "dm" {
+				var err error
+				place, _, err = sender.EnsureDM(ctx, w.agent)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Replies remain direct attention even with mentions-only preferences.
+			if _, err := pa.SetNotificationSetting(ctx, NotifyLevelMentions, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			question, _, err := pa.AppendMessage(ctx, AppendInput{PlaceID: place.PlaceID, Content: "どちらにしますか", ClientNonce: "question"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := "明日でお願いします"
+			if kind == "mention" {
+				content = "@Kuro " + content
+			}
+			input := AppendInput{PlaceID: place.PlaceID, Content: content, ReplyTo: question.MessageID, ClientNonce: "answer"}
+			answer, _, err := sender.AppendMessage(ctx, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, created, err := sender.AppendMessage(ctx, input); err != nil || created {
+				t.Fatalf("replay: %v %v", created, err)
+			}
+			d := newAttentionDelivery()
+			// Simulate admission acknowledgement loss: retries must reuse frozen metadata.
+			d.afterAdmit = func(context.Context) error { return errors.New("lost admission acknowledgement") }
+			if stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10); err == nil || stats.Retried != 1 {
+				t.Fatalf("expected retry: %+v %v", stats, err)
+			}
+			d.afterAdmit = nil
+			if _, err := w.store.pool.Exec(ctx, "UPDATE agent_attention_deliveries SET next_attempt_at=now()"); err != nil {
+				t.Fatal(err)
+			}
+			stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10)
+			if err != nil || stats.Admitted != 1 || len(d.events) != 1 || d.calls != 1 {
+				t.Fatalf("delivery: %+v %v events=%d calls=%d", stats, err, len(d.events), d.calls)
+			}
+			event := d.events[0]
+			if event.PersonalityAgentID != w.agent.ID || event.Actor.ID != w.humanB.ID || event.MessageID != answer.MessageID || event.ReplyToMessageID != question.MessageID || event.Content != content || event.ReplyRequired != (kind == "channel" || kind == "thread") {
+				t.Fatalf("reply source: %+v", event)
+			}
+			if kind == "mention" && event.Kind != AgentAttentionMention {
+				t.Fatalf("mention reason lost: %+v", event)
+			}
+			messages, err := pa.MessagesSince(ctx, event.Place.ID, 0, 10)
+			if err != nil || len(messages) != 2 || messages[0].MessageID != event.ReplyToMessageID || messages[1].ReplyTo != messages[0].MessageID {
+				t.Fatalf("reopen original conversation: %+v %v", messages, err)
+			}
+		})
+	}
+}
+
+func TestAgentAttentionReplyRespectsRecipientAndSource(t *testing.T) {
+	for _, scenario := range []string{"mute", "self", "unrelated", "deleted_before", "deleted_after", "left", "disabled", "mention_parent_deleted", "dm_parent_deleted"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, place := w.workspaceWithChannel(t, ctx)
+			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+			sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanB)
+			if scenario == "dm_parent_deleted" {
+				var err error
+				place, _, err = sender.EnsureDM(ctx, w.agent)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			question, _, err := pa.AppendMessage(ctx, AppendInput{PlaceID: place.PlaceID, Content: "質問", ClientNonce: "question"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "mute" {
+				if _, err := pa.SetNotificationSetting(ctx, NotifyLevelMute, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "self" {
+				sender = pa
+			}
+			if scenario == "deleted_before" {
+				if _, err := pa.DeleteMessage(ctx, place.PlaceID, question.MessageID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			replyTo, content := question.MessageID, "回答"
+			if scenario == "unrelated" {
+				replyTo = ""
+			}
+			if scenario == "mention_parent_deleted" {
+				content = "@Kuro 回答"
+			}
+			if _, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: place.PlaceID, Content: content, ReplyTo: replyTo, ClientNonce: "answer"}); err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "deleted_after", "mention_parent_deleted", "dm_parent_deleted":
+				if _, err := pa.DeleteMessage(ctx, place.PlaceID, question.MessageID); err != nil {
+					t.Fatal(err)
+				}
+			case "left":
+				if err := w.workspaces.Leave(ctx, ws.WorkspaceID, w.agent); err != nil {
+					t.Fatal(err)
+				}
+			case "disabled":
+				if _, err := w.apps.SetEnabledByID(ctx, sender.Scope.InstallationID, w.humanA, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			d := newAttentionDelivery()
+			stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if scenario == "mention_parent_deleted" || scenario == "dm_parent_deleted" {
+				want = 1
+			}
+			if len(d.events) != want {
+				t.Fatalf("events=%+v stats=%+v", d.events, stats)
+			}
+			if scenario == "deleted_after" || scenario == "left" || scenario == "disabled" {
+				if stats.Suppressed != 1 || d.prepares != 0 {
+					t.Fatalf("source not suppressed before start: %+v prepares=%d", stats, d.prepares)
+				}
+			}
+		})
+	}
+}
+
+func TestAgentAttentionReplyAndOtherMentionHaveDistinctRecipients(t *testing.T) {
+	for _, mentionOther := range []bool{false, true} {
+		t.Run(fmt.Sprint(mentionOther), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, place := w.workspaceWithChannel(t, ctx)
+			otherID, err := koseki.New(w.store.pool).MintSecretary(ctx, w.humanB.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.store.AddWorkspaceMember(ctx, ws.WorkspaceID, PersonalityAgent(otherID), RoleMember); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.store.pool.Exec(ctx, "UPDATE agents SET display_name='Shiro' WHERE personality_agent_id=$1", otherID); err != nil {
+				t.Fatal(err)
+			}
+			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+			question, _, err := pa.AppendMessage(ctx, AppendInput{PlaceID: place.PlaceID, Content: "質問", ClientNonce: "question"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := "回答"
+			if mentionOther {
+				text += " @Shiro"
+			}
+			sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanB)
+			if _, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: place.PlaceID, Content: text, ReplyTo: question.MessageID, ClientNonce: "answer"}); err != nil {
+				t.Fatal(err)
+			}
+			d := newAttentionDelivery()
+			if _, err := w.store.core.DeliverAgentAttention(ctx, d, 10); err != nil {
+				t.Fatal(err)
+			}
+			counts := map[string]int{}
+			for _, event := range d.events {
+				counts[event.PersonalityAgentID]++
+			}
+			otherWant := 0
+			if mentionOther {
+				otherWant = 1
+			}
+			if counts[w.agent.ID] != 1 || counts[otherID] != otherWant || len(d.events) != 1+otherWant {
+				t.Fatalf("recipients: %+v", counts)
+			}
+		})
+	}
+}
+
+func TestAgentAttentionReplyDoesNotRejoinFormerThreadParticipant(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	ws, channel := w.workspaceWithChannel(t, ctx)
+	pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+	thread, _, err := pa.CreateThread(ctx, channel.PlaceID, "退出した相談", "", "thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	question, _, err := pa.AppendMessage(ctx, AppendInput{PlaceID: thread.Place.PlaceID, Content: "質問", ClientNonce: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.store.pool.Exec(ctx, "UPDATE place_members SET left_at=now() WHERE place_id=$1 AND member_id=$2", thread.Place.PlaceID, w.agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanB)
+	if _, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: thread.Place.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "answer"}); err != nil {
+		t.Fatal(err)
+	}
+	d := newAttentionDelivery()
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10); err != nil || stats.Admitted != 0 {
+		t.Fatalf("former participant: %+v %v", stats, err)
+	}
+	var joined int
+	if err := w.store.pool.QueryRow(ctx, "SELECT count(*) FROM place_members WHERE place_id=$1 AND member_id=$2 AND left_at IS NULL", thread.Place.PlaceID, w.agent.ID).Scan(&joined); err != nil || joined != 0 {
+		t.Fatalf("reply rejoined PA: %d %v", joined, err)
 	}
 }
