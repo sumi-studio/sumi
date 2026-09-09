@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 
 use chrono::{DateTime, Utc};
-use jsonschema::Validator;
+use jsonschema::{ValidationError, Validator, error::ValidationErrorKind};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -1091,20 +1091,23 @@ impl ToolArgumentAccumulator {
         };
         let instance = Value::Object(arguments.clone());
         if let Some(error) = schema.validator.iter_errors(&instance).next() {
-            let schema_path = error.schema_path().to_string();
-            return rejected_outcome(
-                call_id,
-                tool_name,
+            let detail = required_schema_detail(&error, schema, 0, &mut 64).unwrap_or_else(|| {
                 RejectionDetail {
                     error: ToolArgumentError::SchemaViolation,
                     instance_path: app_facing_instance_path(safe_instance_path(
                         &error.instance_path().to_string(),
                         &schema.property_names,
                     )),
-                    constraint: pointer_tail(&schema_path),
-                },
-                timestamp,
-            );
+                    // A Required error's own pointer identifies the existing parent,
+                    // not the missing child. Only the helper may label a path required.
+                    constraint: if matches!(error.kind(), ValidationErrorKind::Required { .. }) {
+                        "schema".to_owned()
+                    } else {
+                        pointer_tail(&error.schema_path().to_string())
+                    },
+                }
+            });
+            return rejected_outcome(call_id, tool_name, detail, timestamp);
         }
 
         let route = match arguments.get("route").and_then(Value::as_str) {
@@ -1168,6 +1171,115 @@ impl ToolArgumentAccumulator {
     }
 }
 
+// A required-property name comes from the frozen schema, never the rejected
+// instance. For tagged unions, only descend when sibling const failures leave
+// one possible branch at the same direct discriminator path. Ambiguous unions
+// retain the ordinary bounded diagnostic instead of guessing a repair.
+fn required_schema_detail(
+    error: &ValidationError<'_>,
+    schema: &FrozenToolSchema,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<RejectionDetail> {
+    if depth >= 8 || *remaining == 0 {
+        return None;
+    }
+    *remaining -= 1;
+    match error.kind() {
+        ValidationErrorKind::Required { property } => {
+            let name = property.as_str()?;
+            let segment = name.replace('~', "~0").replace('/', "~1");
+            if !schema.property_names.contains(name)
+                || segment.is_empty()
+                || segment.len() > 128
+                || !is_safe_path_segment(&segment)
+            {
+                return None;
+            }
+            let pointer = format!("{}/{}", error.instance_path(), segment);
+            let safe_path = safe_instance_path(&pointer, &schema.property_names);
+            let path = if error.instance_path().to_string().is_empty() {
+                safe_path
+            } else {
+                app_facing_instance_path(safe_path)
+            };
+            if path.is_empty() || path == "/*" {
+                return None;
+            }
+            Some(RejectionDetail {
+                error: ToolArgumentError::SchemaViolation,
+                instance_path: path,
+                constraint: "required".to_owned(),
+            })
+        }
+        ValidationErrorKind::OneOfNotValid { context } => {
+            if context.len() < 2 || context.len() > *remaining {
+                return None;
+            }
+            let parent = error.instance_path().to_string();
+            let mut exclusions: HashMap<String, HashSet<usize>> = HashMap::new();
+            for (branch, errors) in context.iter().enumerate() {
+                for child in errors {
+                    if *remaining == 0 {
+                        return None;
+                    }
+                    *remaining -= 1;
+                    if matches!(child.kind(), ValidationErrorKind::Constant { .. }) {
+                        let pointer = child.instance_path().to_string();
+                        if pointer
+                            .rsplit_once('/')
+                            .is_some_and(|(prefix, _)| prefix == parent)
+                        {
+                            exclusions.entry(pointer).or_default().insert(branch);
+                        }
+                    }
+                }
+            }
+            let mut selected = None;
+            for excluded in exclusions
+                .values()
+                .filter(|set| set.len() + 1 == context.len())
+            {
+                let branch = (0..context.len()).find(|index| !excluded.contains(index))?;
+                if selected.is_some_and(|previous| previous != branch) {
+                    return None;
+                }
+                selected = Some(branch);
+            }
+            let errors = &context[selected?];
+            // Prefer a directly missing field over another nested union.
+            for child in
+                errors
+                    .iter()
+                    .filter(|child| matches!(child.kind(), ValidationErrorKind::Required { .. }))
+                    .chain(errors.iter().filter(|child| {
+                        !matches!(child.kind(), ValidationErrorKind::Required { .. })
+                    }))
+            {
+                if let Some(detail) = required_schema_detail(child, schema, depth + 1, remaining) {
+                    return Some(detail);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn rejection_diagnostic_text(error: ToolArgumentError, constraint: &str, path: &str) -> String {
+    if error == ToolArgumentError::SchemaViolation
+        && constraint == "required"
+        && !path.is_empty()
+        && is_safe_instance_path(path)
+    {
+        format!(
+            "Tool arguments were rejected: missing required field {path}. Regenerate the tool call with complete, schema-valid arguments."
+        )
+    } else {
+        REJECTION_DIAGNOSTIC_TEXT.to_owned()
+    }
+}
+
 fn rejected_outcome(
     call_id: String,
     tool_name: String,
@@ -1186,7 +1298,7 @@ fn rejected_outcome(
         tool_call_id: call_id,
         tool_name,
         content: vec![UserContent::Text {
-            text: REJECTION_DIAGNOSTIC_TEXT.to_owned(),
+            text: rejection_diagnostic_text(detail.error, constraint, &detail.instance_path),
         }],
         details: json!({
             "category": rejection_category(detail.error),
@@ -1206,9 +1318,24 @@ fn validate_rejected_tool_pair(
     rejected: &RejectedToolCall,
     synthetic_result: &ToolResultMessage,
 ) -> Result<(), AssemblerError> {
+    // The old exact generic form is already durable history. New content is
+    // accepted only when it is the canonical rendering of the same safe details.
+    let expected_content = rejection_diagnostic_text(
+        rejected.error,
+        synthetic_result
+            .details
+            .get("constraint")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        synthetic_result
+            .details
+            .get("instance_path")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
     let valid_content = matches!(
         synthetic_result.content.as_slice(),
-        [UserContent::Text { text }] if text == REJECTION_DIAGNOSTIC_TEXT
+        [UserContent::Text { text }] if text == REJECTION_DIAGNOSTIC_TEXT || text == &expected_content
     );
     let valid_details = synthetic_result.details.as_object().is_some_and(|details| {
         let instance_path = details.get("instance_path").and_then(Value::as_str);
@@ -2594,6 +2721,252 @@ mod tests {
                 .expect("serialize rejection")
                 .contains(&raw_path)
         );
+    }
+
+    fn tagged_diagnostic_registry() -> FrozenToolSchemaRegistry {
+        FrozenToolSchemaRegistry::compile(&[ToolDefinition {
+            name: "tagged".into(), description: "test tagged input".into(),
+            parameters: json!({"type":"object","oneOf":[
+                {"properties":{"action":{"const":"start"},"executable":{"type":"string"}},"required":["action","executable"],"additionalProperties":false},
+                {"properties":{"action":{"const":"read_output"},"stream":{"enum":["stdout","stderr"]},"operation_id":{"type":"string"}},"required":["action","stream"],"additionalProperties":false},
+                {"properties":{"action":{"const":"cancel"}},"required":["action"],"additionalProperties":false}
+            ]}),
+        }]).unwrap()
+    }
+
+    #[test]
+    fn required_diagnostic_selects_unique_tagged_branch_without_echoing_arguments() {
+        let registry = tagged_diagnostic_registry();
+        let mut arguments = ToolArgumentAccumulator::new();
+        arguments.append(r#"{"route":"normal","input":{"action":"read_output","operation_id":"PRIVATE_ARGUMENT_VALUE","PRIVATE_ARGUMENT_KEY":"PRIVATE_ARGUMENT_VALUE"}}"#);
+        let outcome = arguments.finish("call-required", "tagged", &registry, timestamp());
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(!encoded.contains("PRIVATE_ARGUMENT"));
+        let ToolArgumentOutcome::Rejected {
+            rejected,
+            synthetic_result,
+        } = outcome
+        else {
+            panic!("missing stream must reject")
+        };
+        assert_eq!(synthetic_result.details["constraint"], "required");
+        assert_eq!(synthetic_result.details["instance_path"], "/stream");
+        assert!(
+            matches!(&synthetic_result.content[..], [UserContent::Text{text}] if text.contains("missing required field /stream"))
+        );
+        validate_rejected_tool_pair(&rejected, &synthetic_result).unwrap();
+
+        let mut corrected = ToolArgumentAccumulator::new();
+        corrected
+            .append(r#"{"route":"normal","input":{"action":"read_output","stream":"stdout"}}"#);
+        assert!(matches!(
+            corrected.finish("corrected", "tagged", &registry, timestamp()),
+            ToolArgumentOutcome::Validated(_)
+        ));
+    }
+
+    #[test]
+    fn required_diagnostic_does_not_guess_for_unknown_or_missing_discriminator() {
+        let registry = tagged_diagnostic_registry();
+        for input in [json!({"action":"PRIVATE_INVALID_ACTION"}), json!({})] {
+            let mut arguments = ToolArgumentAccumulator::new();
+            arguments.append(&json!({"route":"normal","input":input}).to_string());
+            let outcome = arguments.finish("call", "tagged", &registry, timestamp());
+            assert!(
+                !serde_json::to_string(&outcome)
+                    .unwrap()
+                    .contains("PRIVATE_INVALID_ACTION")
+            );
+            let ToolArgumentOutcome::Rejected {
+                synthetic_result, ..
+            } = outcome
+            else {
+                panic!("invalid action")
+            };
+            assert_eq!(synthetic_result.details["constraint"], "oneOf");
+            assert_eq!(
+                synthetic_result.content,
+                vec![UserContent::Text {
+                    text: REJECTION_DIAGNOSTIC_TEXT.into()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn required_diagnostic_content_and_replay_pair_are_canonical() {
+        let registry = schema_registry();
+        let mut arguments = ToolArgumentAccumulator::new();
+        arguments.append(r#"{"route":"normal","input":{}}"#);
+        let ToolArgumentOutcome::Rejected {
+            rejected,
+            synthetic_result,
+        } = arguments.finish("call", "read_file", &registry, timestamp())
+        else {
+            panic!("missing path")
+        };
+        assert_eq!(synthetic_result.details["instance_path"], "/path");
+        for old in [false, true] {
+            let mut result = synthetic_result.clone();
+            if old {
+                result.content = vec![UserContent::Text {
+                    text: REJECTION_DIAGNOSTIC_TEXT.into(),
+                }];
+            }
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).unwrap();
+            assembler
+                .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+                .unwrap();
+            assembler
+                .apply(&ProviderEvent::ToolCallRejected {
+                    content_index: 0,
+                    rejected: rejected.clone(),
+                    synthetic_result: result,
+                })
+                .unwrap();
+        }
+        let mut changed = synthetic_result.clone();
+        changed.details["instance_path"] = json!("/other");
+        assert!(validate_rejected_tool_pair(&rejected, &changed).is_err());
+        changed = synthetic_result.clone();
+        changed.content = vec![UserContent::Text {
+            text: "arbitrary schema explanation".into(),
+        }];
+        assert!(validate_rejected_tool_pair(&rejected, &changed).is_err());
+
+        use crate::provider::{
+            ModelSpec, RequestOptions, adapters,
+            types::{ContextMessage, Message, PromptContext},
+        };
+        let context = PromptContext::new(
+            String::new(),
+            vec![],
+            vec![ContextMessage::Synthetic {
+                message: Message::ToolResult(synthetic_result),
+            }],
+            vec![],
+            vec![],
+        );
+        let request = adapters::chat_completions::build_request(
+            &ModelSpec::preset("opencode-go").unwrap(),
+            &context,
+            &RequestOptions::default(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert!(wire["messages"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("missing required field /path"))
+        }));
+    }
+
+    #[test]
+    fn required_diagnostic_preserves_nested_path_and_bounded_fallback() {
+        let registry=FrozenToolSchemaRegistry::compile(&[ToolDefinition{name:"nested".into(),description:String::new(),parameters:json!({"type":"object","properties":{"config":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},"required":["config"]})}]).unwrap();
+        let mut arguments = ToolArgumentAccumulator::new();
+        arguments.append(r#"{"route":"normal","input":{"config":{}}}"#);
+        let ToolArgumentOutcome::Rejected {
+            synthetic_result, ..
+        } = arguments.finish("call", "nested", &registry, timestamp())
+        else {
+            panic!("missing nested path")
+        };
+        assert_eq!(synthetic_result.details["instance_path"], "/config/path");
+        let schema = registry.validator("nested").unwrap();
+        let instance = json!({"route":"normal","input":{"config":{}}});
+        let error = schema.validator.iter_errors(&instance).next().unwrap();
+        assert!(required_schema_detail(&error, schema, 0, &mut 0).is_none());
+        assert!(required_schema_detail(&error, schema, 8, &mut 64).is_none());
+    }
+
+    #[test]
+    fn required_diagnostic_unsafe_or_unlisted_field_does_not_blame_existing_parent() {
+        for (name, declare_property) in [
+            ("unsafe name".to_owned(), true),
+            ("required_only".to_owned(), false),
+            ("x".repeat(129), true),
+        ] {
+            let properties = if declare_property {
+                json!({name.clone():{"type":"string"}})
+            } else {
+                json!({})
+            };
+            let registry=FrozenToolSchemaRegistry::compile(&[ToolDefinition{name:"unsafe_required".into(),description:String::new(),parameters:json!({"type":"object","properties":{"config":{"type":"object","properties":properties,"required":[name]}},"required":["config"]})}]).unwrap();
+            let mut args = ToolArgumentAccumulator::new();
+            args.append(r#"{"route":"normal","input":{"config":{}}}"#);
+            let ToolArgumentOutcome::Rejected {
+                rejected,
+                synthetic_result,
+            } = args.finish("call", "unsafe_required", &registry, timestamp())
+            else {
+                panic!("required field")
+            };
+            assert_eq!(synthetic_result.details["constraint"], "schema");
+            assert_eq!(synthetic_result.details["instance_path"], "/config");
+            assert_eq!(
+                synthetic_result.content,
+                vec![UserContent::Text {
+                    text: REJECTION_DIAGNOSTIC_TEXT.into()
+                }]
+            );
+            validate_rejected_tool_pair(&rejected, &synthetic_result).unwrap();
+        }
+    }
+
+    #[test]
+    fn required_diagnostic_names_missing_envelope_input() {
+        let mut arguments = ToolArgumentAccumulator::new();
+        arguments.append(r#"{"route":"normal"}"#);
+        let ToolArgumentOutcome::Rejected {
+            synthetic_result, ..
+        } = arguments.finish("call", "read_file", &schema_registry(), timestamp())
+        else {
+            panic!("missing envelope input")
+        };
+        assert_eq!(synthetic_result.details["constraint"], "required");
+        assert_eq!(synthetic_result.details["instance_path"], "/input");
+    }
+
+    #[test]
+    fn required_diagnostic_ambiguous_unions_do_not_invent_missing_fields() {
+        let registry = FrozenToolSchemaRegistry::compile(&[ToolDefinition {
+            name: "ambiguous".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","oneOf":[
+                {"properties":{"path":{"type":"string"}},"required":["path"]},
+                {"properties":{"stream":{"type":"string"}},"required":["stream"]}
+            ]}),
+        }])
+        .unwrap();
+        for input in [
+            json!({}),
+            json!({"path":"PRIVATE_VALUE","stream":"PRIVATE_VALUE"}),
+        ] {
+            let mut args = ToolArgumentAccumulator::new();
+            args.append(&json!({"route":"normal","input":input}).to_string());
+            let outcome = args.finish("call", "ambiguous", &registry, timestamp());
+            assert!(
+                !serde_json::to_string(&outcome)
+                    .unwrap()
+                    .contains("PRIVATE_VALUE")
+            );
+            let ToolArgumentOutcome::Rejected {
+                synthetic_result, ..
+            } = outcome
+            else {
+                panic!("ambiguous oneOf")
+            };
+            assert_eq!(synthetic_result.details["constraint"], "oneOf");
+            assert_eq!(
+                synthetic_result.content,
+                vec![UserContent::Text {
+                    text: REJECTION_DIAGNOSTIC_TEXT.into()
+                }]
+            );
+        }
     }
 
     fn assert_rejected(outcome: ToolArgumentOutcome, expected: ToolArgumentError) {

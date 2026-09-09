@@ -174,7 +174,7 @@ still needed to close each row.
 | A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
 | A04 | Actual due reminder write/resolve and cancellation suppression verified | Exercise overdue markers across restart and verify a single admission without manufacturing a reply. |
-| T01 | Tool progress/control exist; inference waits for completion | One real long-running operation returns a durable handle, allows other conversation and later result recovery without repeating the effect. |
+| T01 | Durable workspace processes deployed in #397; actual completion wake, output read and Messaging report observed | Finish reconnect/no-replay acceptance and repair opaque argument-error recovery. The first probe stopped on an overbroad polling assertion, so it is not a full pass. |
 | T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
 | T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
 | T04 | Messaging images/text supported; intake/formats incomplete | Actual UI upload and content-based answer; unsupported content must be distinguished from content actually read. |
@@ -372,3 +372,30 @@ records the failed scenario and successful cleanup. The probe now captures
 public tool-result messages, including pre-execution rejection, so a missing
 execution-end event does not hide the reason. This does not establish overdue
 reminder acceptance; that scenario must run after the evidence repair.
+
+## Durable process continuation: observed, acceptance still open
+
+PR #397 introduced independently running workspace processes and completion
+Attention. On its shared deployment (`9b814576`), one owned synthetic PA started
+a delayed file-producing process, answered an unrelated arithmetic question,
+and was cold-stopped while the process kept running. The completion event then
+woke the same PA, which read stdout and posted the expected digest to Messaging.
+An independent read-only inspection of its workspace confirmed the exact artifact
+bytes and one execution-counter entry.
+
+The initial probe is still recorded as `FAILED`: it incorrectly classified a
+single status inspection **after** completion had been received as polling for
+completion. The predicate now checks for status/output execution starts before
+receipt of that operation's completion event, including failed calls. This
+correction does not establish the reconnect/no-replay phase, which was never
+reached. The original evidence remains unchanged at
+`/tmp/sumi-process-attention-lerj65x_/evidence.json`; the independent artifact
+check is adjacent in `artifact-audit.json`.
+
+The actual continuation also exposed repeated argument failures before a
+successful stdout read. Provider-payload tests retain the required `stream`
+field and its enum in the OpenCode Go, Responses and Anthropic requests.
+The rejection content, however, only told the model to regenerate its arguments;
+internal diagnostic details were not included in the Chat Completions tool
+result text. Actionable rejection recovery and a fresh end-to-end acceptance
+remain required. This run used the configured Kimi model, not native Astra.
