@@ -3574,7 +3574,7 @@ pub(crate) mod tests {
         );
         let end: String = sqlx::query_scalar("SELECT envelope FROM agent_events WHERE event_type='message_end' AND json_extract(envelope,'$.message_id')='later-assistant-attempt'")
             .fetch_one(store.pool()).await.unwrap();
-        let end: Value = serde_json::from_str(&end).unwrap();
+        let end: serde_json::Value = serde_json::from_str(&end).unwrap();
         assert_eq!(
             end["message"],
             serde_json::to_value(crate::agent::normalize_partial_assistant(later_start).unwrap())
