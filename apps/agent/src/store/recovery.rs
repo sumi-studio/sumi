@@ -3488,7 +3488,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn logical_error_recovery_cannot_close_a_later_unfinished_attempt() {
+    async fn logical_error_recovery_resumes_later_attempt_without_reusing_old_error() {
         let (store, writer) = setup().await;
         seed_tool_use_restart_seam_with_assistant(
             &writer,
@@ -3497,6 +3497,7 @@ pub(crate) mod tests {
             &[],
         )
         .await;
+        let later_start = tool_use_recovery_initial_assistant();
         writer
             .apply(EventBatch {
                 writes: vec![
@@ -3519,7 +3520,7 @@ pub(crate) mod tests {
                             DurableEvent::message_in_turn(
                                 "message_start",
                                 "later-assistant-attempt",
-                                &tool_use_recovery_initial_assistant(),
+                                &later_start,
                                 Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
                                 Some(TOOL_USE_RECOVERY_TURN_ID.to_owned()),
                             )
@@ -3543,17 +3544,69 @@ pub(crate) mod tests {
         let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(store.pool())
             .await
-            .expect("event count before rejected recovery");
-        let error = LogicalRecoveryExecutor
+            .expect("event count before latest-attempt recovery");
+        let old_error: String = sqlx::query_scalar("SELECT payload FROM messages WHERE id=?")
+            .bind(TOOL_USE_RECOVERY_ASSISTANT_ID)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        LogicalRecoveryExecutor
             .execute(&store, &steps, &lease, &fence)
             .await
-            .expect_err("old Error must not stand in for a later unfinished attempt");
-        assert!(error.to_string().contains("later attempt"), "{error:#}");
+            .expect("recover the later open attempt, not the old Error");
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(store.pool())
             .await
-            .expect("event count after rejected recovery");
-        assert_eq!(before, after);
+            .expect("event count after latest-attempt recovery");
+        assert_eq!(
+            after,
+            before + 2,
+            "only the latest MessageEnd and TurnEnd are appended"
+        );
+        let old_after: String = sqlx::query_scalar("SELECT payload FROM messages WHERE id=?")
+            .bind(TOOL_USE_RECOVERY_ASSISTANT_ID)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            old_after, old_error,
+            "the earlier Error remains exactly intact"
+        );
+        let end: String = sqlx::query_scalar("SELECT envelope FROM agent_events WHERE event_type='message_end' AND json_extract(envelope,'$.message_id')='later-assistant-attempt'")
+            .fetch_one(store.pool()).await.unwrap();
+        let end: Value = serde_json::from_str(&end).unwrap();
+        assert_eq!(
+            end["message"],
+            serde_json::to_value(crate::agent::normalize_partial_assistant(later_start).unwrap())
+                .unwrap()
+        );
+        let closure: (String, String, String) = sqlx::query_as("SELECT json_extract(internal_metadata,'$.run_id'), json_extract(internal_metadata,'$.turn_id'), json_extract(internal_metadata,'$.inference_interruption') FROM agent_events WHERE event_type='turn_end'")
+            .fetch_one(store.pool()).await.unwrap();
+        assert_eq!(
+            closure,
+            (
+                TOOL_USE_RECOVERY_RUN_ID.into(),
+                TOOL_USE_RECOVERY_TURN_ID.into(),
+                "process_restart".into()
+            )
+        );
+        let ended: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(ended, 0);
+        let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("latest attempt must permit normal inference")
+        };
+        let continuation = hydrated.continuation.unwrap();
+        assert_eq!(
+            continuation.envelope.command_id.as_str(),
+            TOOL_USE_RECOVERY_COMMAND_ID
+        );
+        assert_eq!(continuation.run_id, TOOL_USE_RECOVERY_RUN_ID);
+        assert_eq!(continuation.turn_id, TOOL_USE_RECOVERY_TURN_ID);
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM inbound_commands WHERE command_id=?",
