@@ -410,7 +410,7 @@ $defs:
         items: { $ref: '#/$defs/UserContent' }
       timestamp: { type: string, format: date-time }
       incoming_timing: { $ref: '#/$defs/IncomingEventTiming' }
-      incoming_source: { $ref: '#/$defs/MessagingProvenanceV2' }
+      incoming_source: { $ref: '#/$defs/ExternalProvenanceV2' }
 
   IncomingEventTiming:
     description: Server-authored receipt timing; absent for messages without an incoming event.
@@ -809,7 +809,51 @@ $defs:
   IncomingProvenance:
     oneOf:
       - { $ref: '#/$defs/DirectChatProvenanceV1' }
+      - { $ref: '#/$defs/ExternalProvenanceV2' }
+
+  ExternalProvenanceV2:
+    oneOf:
       - { $ref: '#/$defs/MessagingProvenanceV2' }
+      - { $ref: '#/$defs/WorkspaceOperationProvenanceV2' }
+
+  WorkspaceOperationProvenanceV2:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 2 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { const: personality_agent }
+          principal_id: { $ref: '#/$defs/PersonalityAgentId' }
+          display_name: { type: string }
+      source:
+        type: object
+        required: [surface, kind, event_id, operation_id, originating_tool_call_id, occurred_at, result]
+        additionalProperties: false
+        properties:
+          surface: { const: workspace_operation }
+          kind: { const: process_completed }
+          event_id: { type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' }
+          operation_id: { type: string, pattern: '^[0-9a-f]{64}$' }
+          originating_tool_call_id: { type: string, minLength: 1 }
+          occurred_at: { type: string, format: date-time }
+          result:
+            type: object
+            required: [state, exit_code, stdout_bytes, stderr_bytes, output_truncated]
+            additionalProperties: false
+            properties:
+              state: { enum: [succeeded, failed, cancelled, indeterminate] }
+              exit_code: { type: [integer, 'null'], minimum: -9007199254740991, maximum: 9007199254740991 }
+              stdout_bytes: { $ref: '#/$defs/JsonSafeInteger' }
+              stderr_bytes: { $ref: '#/$defs/JsonSafeInteger' }
+              output_truncated: { type: boolean }
+    $comment: actor.principal_id must equal personality_agent_id; enforce at runtime. event_id is canonical UUIDv7.
 
   MessagingProvenanceV2:
     type: object
@@ -952,7 +996,7 @@ $defs:
           provenance: { $ref: '#/$defs/DirectChatProvenanceV1' }
           command: { $ref: '#/$defs/Command' }
       - properties:
-          provenance: { $ref: '#/$defs/MessagingProvenanceV2' }
+          provenance: { $ref: '#/$defs/ExternalProvenanceV2' }
           command: { $ref: '#/$defs/ExternalEventCommand' }
     $comment: personality_agent_id must equal provenance.personality_agent_id; enforce this cross-field target equality at runtime.
 

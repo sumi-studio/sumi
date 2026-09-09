@@ -235,6 +235,10 @@ function isUUID(value: unknown): value is string {
   );
 }
 
+function isUUIDv7(value: unknown): value is string {
+  return isUUID(value) && value[14] === "7" && "89ab".includes(value[19]);
+}
+
 function isDateTime(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const match =
@@ -446,6 +450,45 @@ function isIncomingSource(value: unknown): boolean {
     ("display_name" in actor && typeof actor.display_name !== "string")
   )
     return false;
+  if (isRecord(source) && source.surface === "workspace_operation") {
+    const result = source.result;
+    return (
+      hasRequiredAndOnlyKeys(source, [
+        "surface",
+        "kind",
+        "event_id",
+        "operation_id",
+        "originating_tool_call_id",
+        "occurred_at",
+        "result",
+      ]) &&
+      actor.kind === "personality_agent" &&
+      actor.principal_id === value.personality_agent_id &&
+      isUUIDv7(value.personality_agent_id) &&
+      source.kind === "process_completed" &&
+      isUUIDv7(source.event_id) &&
+      typeof source.operation_id === "string" &&
+      /^[0-9a-f]{64}$/.test(source.operation_id) &&
+      typeof source.originating_tool_call_id === "string" &&
+      source.originating_tool_call_id.length > 0 &&
+      isDateTime(source.occurred_at) &&
+      isRecord(result) &&
+      hasRequiredAndOnlyKeys(result, [
+        "state",
+        "exit_code",
+        "stdout_bytes",
+        "stderr_bytes",
+        "output_truncated",
+      ]) &&
+      ["succeeded", "failed", "cancelled", "indeterminate"].includes(
+        String(result.state),
+      ) &&
+      (result.exit_code === null || Number.isSafeInteger(result.exit_code)) &&
+      isSafeSequence(result.stdout_bytes) &&
+      isSafeSequence(result.stderr_bytes) &&
+      typeof result.output_truncated === "boolean"
+    );
+  }
   if (
     !isRecord(source) ||
     !hasRequiredAndOnlyKeys(

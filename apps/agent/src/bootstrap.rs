@@ -33,6 +33,7 @@ use crate::{
     },
     apiclient::{
         messaging::MessagingApi,
+        process::ProcessApi,
         workspace::{WorkspaceApi, WorkspaceInvitationApi},
     },
     approval::{
@@ -78,6 +79,7 @@ use crate::{
         executor::{ExecutorClient, decode_hex_32, remote_executor_registry_with_tools},
         memory::ConversationHistoryTool,
         messaging::MessagingTool,
+        process::ProcessTool,
         workspace::WorkspaceListTool,
         workspace_invitation::{WorkspaceInvitationAcceptTool, WorkspaceInvitationListTool},
     },
@@ -1065,6 +1067,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
     .context("construct local-control HTTP client")?;
     let messaging_api: Arc<dyn MessagingApi> = Arc::new(control_client.clone());
     let workspace_api: Arc<dyn WorkspaceApi> = Arc::new(control_client.clone());
+    let process_api: Arc<dyn ProcessApi> = Arc::new(control_client.clone());
     let workspace_invitation_api: Arc<dyn WorkspaceInvitationApi> =
         Arc::new(control_client.clone());
     let control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane> =
@@ -1085,6 +1088,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         control,
         messaging_api,
         workspace_api,
+        process_api,
         workspace_invitation_api,
         Arc::new(control_client),
         executor_call_authority_private_key,
@@ -1098,6 +1102,7 @@ async fn run_after_not_ready(
     control: Arc<dyn crate::gateway::local_runtime::LocalControlPlane>,
     messaging_api: Arc<dyn MessagingApi>,
     workspace_api: Arc<dyn WorkspaceApi>,
+    process_api: Arc<dyn ProcessApi>,
     workspace_invitation_api: Arc<dyn WorkspaceInvitationApi>,
     chatgpt_resolver: Arc<dyn ChatGptCredentialResolver>,
     executor_call_authority_private_key: Zeroizing<[u8; 32]>,
@@ -1207,6 +1212,7 @@ async fn run_after_not_ready(
             executor_client.clone(),
         ));
         let workspace_list_tool: Arc<dyn Tool> = Arc::new(WorkspaceListTool::new(workspace_api));
+        let process_tool: Arc<dyn Tool> = Arc::new(ProcessTool::new(process_api));
         let workspace_invitation_list_tool: Arc<dyn Tool> = Arc::new(
             WorkspaceInvitationListTool::new(workspace_invitation_api.clone()),
         );
@@ -1219,6 +1225,7 @@ async fn run_after_not_ready(
             [
                 messaging_tool,
                 workspace_list_tool,
+                process_tool,
                 workspace_invitation_list_tool,
                 workspace_invitation_accept_tool,
                 conversation_history_tool,

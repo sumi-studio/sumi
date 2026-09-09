@@ -356,7 +356,7 @@ impl UserMessage {
         let source = self
             .incoming_source
             .as_ref()
-            .filter(|source| source.messaging_source().is_some());
+            .filter(|source| source.is_external());
         let source_text = source.map(|source| {
             // JSON keeps names and other source-authored labels quoted. This is
             // metadata in the user-message block, never a system instruction.

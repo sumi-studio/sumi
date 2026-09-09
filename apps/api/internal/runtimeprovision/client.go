@@ -95,6 +95,16 @@ func (client *Client) call(ctx context.Context, path string, input, output any) 
 		limited, _ := io.ReadAll(io.LimitReader(response.Body, 16<<10))
 		var protocolError errorResponse
 		if json.Unmarshal(limited, &protocolError) == nil && protocolError.Message != "" {
+			switch protocolError.Code {
+			case "process_not_found":
+				return fmt.Errorf("%w: %s", ErrProcessNotFound, protocolError.Message)
+			case "process_busy":
+				return fmt.Errorf("%w: %s", ErrProcessBusy, protocolError.Message)
+			case "invalid_process_request":
+				return fmt.Errorf("%w: %s", ErrInvalidProcessRequest, protocolError.Message)
+			case "conflict":
+				return fmt.Errorf("%w: %s", ErrConflict, protocolError.Message)
+			}
 			return fmt.Errorf("provisioner %s: %s", protocolError.Code, protocolError.Message)
 		}
 		return fmt.Errorf("provisioner returned HTTP %d", response.StatusCode)

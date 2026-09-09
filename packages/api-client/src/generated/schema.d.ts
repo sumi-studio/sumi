@@ -692,7 +692,7 @@ export interface components {
             provenance?: components["schemas"]["DirectChatProvenanceV1"];
             command?: components["schemas"]["Command"];
         } | {
-            provenance?: components["schemas"]["MessagingProvenanceV2"];
+            provenance?: components["schemas"]["ExternalProvenanceV2"];
             command?: components["schemas"]["ExternalEventCommand"];
         });
         /** @description exact lower-case hyphenated UUIDv7 personality-agent identity */
@@ -926,6 +926,39 @@ export interface components {
             };
             source: components["schemas"]["MessagingEventSource"];
         };
+        WorkspaceOperationProvenanceV2: {
+            /** @constant */
+            version: 2;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @constant */
+                kind: "personality_agent";
+                principal_id: components["schemas"]["PersonalityAgentId"];
+                display_name?: string;
+            };
+            source: {
+                /** @constant */
+                surface: "workspace_operation";
+                /** @constant */
+                kind: "process_completed";
+                /** Format: uuid */
+                event_id: string;
+                operation_id: string;
+                originating_tool_call_id: string;
+                /** Format: date-time */
+                occurred_at: string;
+                result: {
+                    /** @enum {unknown} */
+                    state: "succeeded" | "failed" | "cancelled" | "indeterminate";
+                    exit_code: number | null;
+                    stdout_bytes: components["schemas"]["JsonSafeInteger"];
+                    stderr_bytes: components["schemas"]["JsonSafeInteger"];
+                    output_truncated: boolean;
+                };
+            };
+        };
+        ExternalProvenanceV2: components["schemas"]["MessagingProvenanceV2"] | components["schemas"]["WorkspaceOperationProvenanceV2"];
         UserMessage: {
             /** @constant */
             role: "user";
@@ -933,7 +966,7 @@ export interface components {
             /** Format: date-time */
             timestamp: string;
             incoming_timing?: components["schemas"]["IncomingEventTiming"];
-            incoming_source?: components["schemas"]["MessagingProvenanceV2"];
+            incoming_source?: components["schemas"]["ExternalProvenanceV2"];
         };
         /** @description any JSON value */
         AnyJSON: {
@@ -1325,7 +1358,7 @@ export interface components {
             type: "external_event";
             content: string;
         };
-        IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["MessagingProvenanceV2"];
+        IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["ExternalProvenanceV2"];
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             audience: components["schemas"]["OutputAudience"];

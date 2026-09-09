@@ -387,6 +387,128 @@ impl fmt::Debug for LocalControlTransport {
     }
 }
 
+// Process requests use the same authenticated local-control transport. No
+// endpoint, credential, or acting PA can be selected by tool arguments.
+impl LocalControlHttpClient {
+    async fn process_request<Q, R>(
+        &self,
+        path: &str,
+        request: &Q,
+    ) -> crate::apiclient::process::ProcessApiResult<R>
+    where
+        Q: Serialize + Sync,
+        R: for<'de> Deserialize<'de>,
+    {
+        use crate::apiclient::process::ProcessApiError;
+        let (status, body) = self
+            .post_json_bounded_raw(path, request, 512 * 1024)
+            .await
+            .map_err(|_| ProcessApiError::Unavailable)?;
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                400 | 422 => ProcessApiError::InvalidRequest,
+                401 | 403 => ProcessApiError::Unauthorized,
+                404 => ProcessApiError::NotFound,
+                409 => ProcessApiError::Conflict,
+                429 => ProcessApiError::Busy,
+                _ => ProcessApiError::Unavailable,
+            });
+        }
+        serde_json::from_slice(body.as_slice()).map_err(|_| ProcessApiError::Protocol)
+    }
+
+    fn validate_process_operation(
+        &self,
+        operation: &crate::apiclient::process::ProcessOperation,
+    ) -> crate::apiclient::process::ProcessApiResult<()> {
+        use crate::apiclient::process::{ProcessApiError, valid_operation_id};
+        if !valid_operation_id(&operation.operation_id)
+            || operation.personality_agent_id != self.authority.personality_agent_id().to_string()
+            || operation.originating_tool_call_id.is_empty()
+            || !(1..=3600).contains(&operation.timeout_seconds)
+            || !uuid::Uuid::parse_str(&operation.event_id).is_ok_and(|id| {
+                id.get_version() == Some(uuid::Version::SortRand)
+                    && id.to_string() == operation.event_id
+            })
+        {
+            return Err(ProcessApiError::Protocol);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::apiclient::process::ProcessApi for LocalControlHttpClient {
+    async fn start(
+        &self,
+        request: &crate::apiclient::process::StartProcessRequest,
+    ) -> crate::apiclient::process::ProcessApiResult<crate::apiclient::process::ProcessOperation>
+    {
+        use crate::apiclient::process::{ProcessApiError, ProcessOperation};
+        let operation: ProcessOperation = self
+            .process_request("/process-operations/start", request)
+            .await?;
+        self.validate_process_operation(&operation)?;
+        if operation.originating_tool_call_id != request.originating_tool_call_id
+            || operation.executable != request.executable
+            || operation.args != request.args
+            || operation.cwd != request.cwd
+            || operation.timeout_seconds != request.timeout_seconds
+        {
+            return Err(ProcessApiError::Protocol);
+        }
+        Ok(operation)
+    }
+
+    async fn status(
+        &self,
+        request: &crate::apiclient::process::ProcessOperationRequest,
+    ) -> crate::apiclient::process::ProcessApiResult<crate::apiclient::process::ProcessOperation>
+    {
+        let operation: crate::apiclient::process::ProcessOperation = self
+            .process_request("/process-operations/status", request)
+            .await?;
+        self.validate_process_operation(&operation)?;
+        if operation.operation_id != request.operation_id {
+            return Err(crate::apiclient::process::ProcessApiError::Protocol);
+        }
+        Ok(operation)
+    }
+
+    async fn read_output(
+        &self,
+        request: &crate::apiclient::process::ProcessOutputRequest,
+    ) -> crate::apiclient::process::ProcessApiResult<crate::apiclient::process::ProcessOutput> {
+        let output: crate::apiclient::process::ProcessOutput = self
+            .process_request("/process-operations/output", request)
+            .await?;
+        if output.operation_id != request.operation_id
+            || output.stream != request.stream
+            || output.offset != request.offset
+            || output.next_offset < output.offset
+            || output.next_offset - output.offset > request.limit
+        {
+            return Err(crate::apiclient::process::ProcessApiError::Protocol);
+        }
+        Ok(output)
+    }
+
+    async fn cancel(
+        &self,
+        request: &crate::apiclient::process::ProcessOperationRequest,
+    ) -> crate::apiclient::process::ProcessApiResult<crate::apiclient::process::ProcessOperation>
+    {
+        let operation: crate::apiclient::process::ProcessOperation = self
+            .process_request("/process-operations/cancel", request)
+            .await?;
+        self.validate_process_operation(&operation)?;
+        if operation.operation_id != request.operation_id {
+            return Err(crate::apiclient::process::ProcessApiError::Protocol);
+        }
+        Ok(operation)
+    }
+}
+
 #[derive(Clone)]
 struct TrustedUnixEndpoint {
     path: PathBuf,

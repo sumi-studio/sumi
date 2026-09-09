@@ -74,6 +74,7 @@ func run() error {
 		IdleTimeout:  30 * time.Second,
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	go service.RunProcessObserver(ctx)
 	defer cancel()
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.Serve(listener) }()

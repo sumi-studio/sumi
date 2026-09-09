@@ -2,7 +2,7 @@ import type {
   AnyJSON,
   ApprovalDecision,
   ApprovalRequest,
-  MessagingProvenanceV2,
+  ExternalProvenanceV2,
   SteerMode,
   ToolCall,
 } from "@sumi/api-client";
@@ -83,7 +83,7 @@ export type ConversationEntry =
     }
   | {
       kind: "user";
-      source?: MessagingProvenanceV2;
+      source?: ExternalProvenanceV2;
       id: string;
       text: string;
       /** v1 direct chat accepts no attachments. */

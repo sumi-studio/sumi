@@ -9,7 +9,7 @@ import {
 import { Marker, MarkerContent } from "@sumi/ui/components/marker";
 import { useCallback } from "react";
 import type { ChatItem } from "../agent/model";
-import { userItemText } from "../lib/user-item-text";
+import { userItemSourceLabel, userItemText } from "../lib/user-item-text";
 import { ApprovalConfirmation } from "./approval-confirmation";
 import { TraceRow } from "./work-summary";
 
@@ -56,7 +56,6 @@ export function ChatItemView({
         </div>
       );
     case "user": {
-      const vote = item.source?.source.kind === "messaging_poll_vote";
       const text = userItemText(item);
       return (
         <Message
@@ -65,7 +64,7 @@ export function ChatItemView({
         >
           {item.source && (
             <div className="text-muted-foreground text-xs leading-5">
-              {`${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${vote ? " · 投票" : item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`}
+              {userItemSourceLabel(item)}
             </div>
           )}
           <MessageContent className="direct-chat-message-content whitespace-pre-wrap break-words text-base leading-relaxed">

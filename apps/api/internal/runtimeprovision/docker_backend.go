@@ -41,10 +41,11 @@ const (
 // Docker client or socket is exposed through the protocol or linked into API,
 // runtime, executor, or broker.
 type DockerBackend struct {
-	supervisor       string
-	baseEnvironment  []string
-	operationTimeout time.Duration
-	runner           commandRunner
+	supervisor        string
+	baseEnvironment   []string
+	operationTimeout  time.Duration
+	processLogTimeout time.Duration
+	runner            commandRunner
 }
 
 type commandRunner interface {

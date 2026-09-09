@@ -12,10 +12,11 @@ var ErrConflict = errors.New("runtime provision state conflict")
 // Service serializes every lifecycle transition for one PAID and makes
 // retries idempotent before delegating to the machine backend.
 type Service struct {
-	backend Backend
-	reaps   *durableReapState
-	mu      sync.Mutex
-	entries map[string]*serviceEntry
+	backend   Backend
+	processes *processStore
+	reaps     *durableReapState
+	mu        sync.Mutex
+	entries   map[string]*serviceEntry
 }
 
 type ServiceConfig struct {
@@ -40,7 +41,14 @@ func NewService(backend Backend, config ServiceConfig) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize durable reap state: %w", err)
 	}
-	return &Service{backend: backend, reaps: reaps, entries: make(map[string]*serviceEntry)}, nil
+	service := &Service{backend: backend, reaps: reaps, entries: make(map[string]*serviceEntry)}
+	if processBackend, ok := backend.(ProcessBackend); ok {
+		service.processes, err = newProcessStore(config.StateDirectory, processBackend)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return service, nil
 }
 
 func (service *Service) entry(personalityAgentID string) *serviceEntry {

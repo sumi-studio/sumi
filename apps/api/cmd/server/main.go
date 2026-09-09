@@ -32,6 +32,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
+	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -97,6 +98,7 @@ func run(ctx context.Context) (runErr error) {
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
+	app.startProcessAttention()
 	app.startChatGPTActivation()
 	app.startWarmReconciliation()
 	if app.spawnManager != nil {
@@ -239,6 +241,7 @@ type application struct {
 	spawnManager      *spawn.Manager
 	localRuntimes     *agentevents.LocalControlListenerRegistry
 	messagingServer   *messaging.Server
+	processOperations *processoperations.Server
 	backgroundCtx     context.Context
 	deliverAttention  func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
 	attentionWorkers  sync.WaitGroup
@@ -514,6 +517,11 @@ func newApplicationFromEnv() (*application, error) {
 			return nil, fmt.Errorf("register workspace local control routes: %w", err)
 		}
 	}
+	processOperations, err := processOperationsFromEnv(localControl)
+	if err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("process operation transport: %w", err)
+	}
 	localListener, err := localControlListenerFromEnv(enabled)
 	if err != nil {
 		closeOnError()
@@ -551,6 +559,12 @@ func newApplicationFromEnv() (*application, error) {
 			chatGPTActivation.manager = spawnManager
 		}
 		browser.SetSpawner(spawnManager)
+		if processOperations != nil {
+			processOperations.Delivery = &processoperations.GatewayDelivery{
+				Gateway: runtime, Spawner: spawnManager,
+				TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID")),
+			}
+		}
 	}
 	if chatGPTLogin != nil {
 		chatGPTLogin.RegisterRoutes(mux)
@@ -571,6 +585,7 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 	return &application{
+		processOperations: processOperations,
 		chatGPTLogin:      chatGPTLogin,
 		chatGPTActivation: chatGPTActivation,
 		deliverAttention:  deliverAttention,

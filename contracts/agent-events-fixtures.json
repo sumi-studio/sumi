@@ -1128,5 +1128,77 @@
         "content": ""
       }
     }
+  },
+  "external_process_completed": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "personality_agent",
+          "principal_id": "01992000-0000-7000-8000-000000000001"
+        },
+        "source": {
+          "surface": "workspace_operation",
+          "kind": "process_completed",
+          "event_id": "01992000-0000-7000-8000-000000000021",
+          "operation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "originating_tool_call_id": "process-start-call",
+          "occurred_at": "2026-09-09T10:00:00Z",
+          "result": {
+            "state": "succeeded",
+            "exit_code": 0,
+            "stdout_bytes": 512,
+            "stderr_bytes": 0,
+            "output_truncated": false
+          }
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": ""
+      }
+    }
+  },
+  "external_process_indeterminate": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "personality_agent",
+          "principal_id": "01992000-0000-7000-8000-000000000001"
+        },
+        "source": {
+          "surface": "workspace_operation",
+          "kind": "process_completed",
+          "event_id": "01992000-0000-7000-8000-000000000021",
+          "operation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "originating_tool_call_id": "process-start-call",
+          "occurred_at": "2026-09-09T10:00:00Z",
+          "result": {
+            "state": "indeterminate",
+            "exit_code": null,
+            "stdout_bytes": 512,
+            "stderr_bytes": 0,
+            "output_truncated": false
+          }
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": ""
+      }
+    }
   }
 }
