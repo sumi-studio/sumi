@@ -404,3 +404,29 @@ including failed logout, draft recovery, a failed Messaging bootstrap and
 successful retries. Google/GitHub
 sign-in itself is not exercised, and no PersonalityAgent or model provider is
 required for this journey.
+
+
+## Linux / WSL host restart
+
+On a systemd host, install the runtime directory definitions once:
+
+```bash
+sudo install -m 0644 deploy/local/sumi.tmpfiles.conf /etc/tmpfiles.d/sumi.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/sumi.conf
+```
+
+`/run` is temporary. These definitions restore the socket directories and their
+owners before Docker starts; they do not remove saved data. The existing
+`api-state-init` service still prepares persistent volume permissions when the
+stack is created.
+
+Postgres, API, Web, and the runtime provisioner use `unless-stopped`, so Docker
+can restore them after a host restart while respecting an explicit manual stop.
+Existing containers need to be recreated with this Compose configuration, or
+have their restart policy updated explicitly. Migration/init jobs and individual
+personality-agent runtimes are not made independently self-restarting.
+
+Docker restarts do not replay Compose dependency ordering. The API can initially
+fail while Postgres is still starting and then be retried by Docker. Check API
+health and the selected Web bind address after boot; a running container alone
+is not proof that the workspace is available.

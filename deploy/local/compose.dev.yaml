@@ -56,7 +56,7 @@ services:
       timeout: 2s
       retries: 30
       start_period: 2s
-    restart: "no"
+    restart: unless-stopped
 
   migrate:
     image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
@@ -204,7 +204,7 @@ services:
       timeout: 2s
       retries: 60
       start_period: 5s
-    restart: "no"
+    restart: unless-stopped
     stop_grace_period: 2m
 
   # LiveKit carries media only; API-issued room tokens retain admission
@@ -319,7 +319,7 @@ services:
       interval: 1s
       timeout: 2s
       retries: 30
-    restart: "no"
+    restart: unless-stopped
     stop_grace_period: 2m
 
   web:
@@ -355,7 +355,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    restart: "no"
+    restart: unless-stopped
 
 volumes:
   firebase-auth-data: {}
