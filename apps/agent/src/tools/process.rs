@@ -339,6 +339,70 @@ mod tests {
         starts: Mutex<Vec<StartProcessRequest>>,
     }
 
+    #[test]
+    fn process_schema_reaches_all_provider_payloads_with_required_output_stream() {
+        use crate::provider::{
+            ModelSpec, RequestOptions, adapters,
+            types::{ContextMessage, Message, PromptContext, UserMessage},
+        };
+
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(ProcessTool::new(Arc::new(FakeApi::default()))))
+            .unwrap();
+        let definitions = builder.build().definitions();
+        let context = PromptContext::new(
+            String::new(),
+            vec![],
+            vec![ContextMessage::Synthetic {
+                message: Message::User(UserMessage {
+                    incoming_source: None,
+                    incoming_timing: None,
+                    content: vec![UserContent::Text {
+                        text: "Read the process output.".into(),
+                    }],
+                    timestamp: chrono::Utc::now(),
+                }),
+            }],
+            vec![],
+            definitions,
+        );
+        for preset in ["opencode-go", "openai-responses", "anthropic"] {
+            let spec = ModelSpec::preset(preset).unwrap();
+            let options = RequestOptions::default();
+            let request = match preset {
+                "opencode-go" => {
+                    adapters::chat_completions::build_request(&spec, &context, &options).unwrap()
+                }
+                "openai-responses" => {
+                    adapters::responses::build_request(&spec, &context, &options).unwrap()
+                }
+                _ => adapters::anthropic::build_request(&spec, &context, &options).unwrap(),
+            };
+            let wire: Value =
+                serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+            let parameters = match preset {
+                "opencode-go" => &wire["tools"][0]["function"]["parameters"],
+                "openai-responses" => &wire["tools"][0]["parameters"],
+                _ => &wire["tools"][0]["input_schema"],
+            };
+            let validator = jsonschema::validator_for(parameters).unwrap();
+            let mut call = json!({"route":"normal", "input":{
+                "action":"read_output", "operation_id":"a".repeat(64)
+            }});
+            assert!(!validator.is_valid(&call), "{preset} must require stream");
+            for stream in ["stdout", "stderr"] {
+                call["input"]["stream"] = json!(stream);
+                assert!(validator.is_valid(&call), "{preset}: {stream}");
+            }
+            call["input"]["stream"] = json!("both");
+            assert!(
+                !validator.is_valid(&call),
+                "{preset} must retain stream enum"
+            );
+        }
+    }
+
     #[async_trait]
     impl ProcessApi for FakeApi {
         async fn start(&self, request: &StartProcessRequest) -> ProcessApiResult<ProcessOperation> {
