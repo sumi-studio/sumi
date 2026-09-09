@@ -992,3 +992,254 @@ func TestStopAllRetainsLateStartWhoseCleanupFails(t *testing.T) {
 		t.Fatal("reaped late runtime retained")
 	}
 }
+
+func TestReconcileWarmRestoresAfterExitAndFreshManager(t *testing.T) {
+	spawner := newFakeSpawner()
+	cfg := Config{Spawner: spawner, Resolver: fakeResolver{warmth: map[string]string{"warm": WarmthWarm, "cold": WarmthCold}}}
+	mgr, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"warm", "cold"} {
+		if err := mgr.ReconcileWarm(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !mgr.Running("warm") || mgr.Running("cold") {
+		t.Fatal("only warm should start")
+	}
+	first := spawner.processes["warm"]
+	first.once.Do(func() { close(first.done) })
+	deadline := time.Now().Add(time.Second)
+	for mgr.Running("warm") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if mgr.Running("warm") {
+		t.Fatal("exit was not observed")
+	}
+	if err := mgr.ReconcileWarm(context.Background(), "warm"); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.Running("warm") || len(spawner.spawns) != 2 {
+		t.Fatal("warm was not restored")
+	}
+	if err := mgr.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ReconcileWarm(context.Background(), "warm"); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("closed manager: %v", err)
+	}
+	fresh, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.StopAll()
+	if err := fresh.ReconcileWarm(context.Background(), "warm"); err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.Running("warm") || len(spawner.spawns) != 3 {
+		t.Fatal("fresh manager did not restore persisted warm intent")
+	}
+}
+
+func TestReconcileWarmRefreshesColdWithoutManufacturingActivity(t *testing.T) {
+	base := time.Now()
+	warmth := map[string]string{"agent": WarmthWarm}
+	mgr, err := New(Config{Spawner: newFakeSpawner(), Resolver: fakeResolver{warmth: warmth}, IdleTimeout: time.Minute, Now: func() time.Time { return base }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if err := mgr.ReconcileWarm(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	base = base.Add(time.Hour)
+	if err := mgr.ReconcileWarm(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	warmth["agent"] = WarmthCold
+	if err := mgr.ReconcileWarm(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := mgr.StopIdleCold()
+	if err != nil || len(stopped) != 1 {
+		t.Fatalf("refresh must preserve idle age: %v %v", stopped, err)
+	}
+	if err := mgr.ReconcileWarm(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Running("agent") {
+		t.Fatal("cold agent restarted")
+	}
+}
+
+func TestReconcileWarmCoalescesDemandAndShutdownCancelsStart(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		spawner := newBlockingSpawner()
+		mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{warmth: map[string]string{"warm": WarmthWarm}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := make(chan error, 1)
+		go func() { first <- mgr.ReconcileWarm(context.Background(), "warm") }()
+		<-spawner.started
+		second := make(chan error, 1)
+		go func() { second <- mgr.EnsureRunning(context.Background(), "warm") }()
+		if shutdown {
+			if err := mgr.StopAll(); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-first; !errors.Is(err, ErrManagerClosed) {
+				t.Fatalf("warm start after shutdown: %v", err)
+			}
+			if err := <-second; !errors.Is(err, ErrManagerClosed) {
+				t.Fatalf("demand start after shutdown: %v", err)
+			}
+			if mgr.Running("warm") {
+				t.Fatal("shutdown left a runtime")
+			}
+		} else {
+			close(spawner.release)
+			if err := <-first; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-second; err != nil {
+				t.Fatal(err)
+			}
+			if err := mgr.StopAll(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if spawner.spawnCount() != 1 {
+			t.Fatal("duplicate spawn")
+		}
+	}
+}
+
+func TestReconcileWarmRetainsCleanupFenceUntilRetrySucceeds(t *testing.T) {
+	spawner := newFakeSpawner()
+	mgr, err := New(Config{Spawner: spawner, Resolver: fakeResolver{warmth: map[string]string{"warm": WarmthWarm}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	failure := errors.New("cleanup unavailable")
+	process := &fakeProcess{stopErr: failure}
+	mgr.running["warm"] = &agentRuntime{process: process, cleanupPending: true}
+	if err := mgr.ReconcileWarm(context.Background(), "warm"); !errors.Is(err, failure) {
+		t.Fatalf("cleanup failure: %v", err)
+	}
+	if mgr.Running("warm") || len(spawner.spawns) != 0 {
+		t.Fatal("cleanup failure bypassed fence")
+	}
+	process.stopErr = nil
+	if err := mgr.ReconcileWarm(context.Background(), "warm"); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.Running("warm") || len(spawner.spawns) != 1 {
+		t.Fatal("cleanup retry did not restore warm runtime")
+	}
+}
+
+type coolingWarmResolver struct {
+	mu               sync.Mutex
+	reads            int
+	keyReads         int
+	admissionRead    chan struct{}
+	releaseAdmission chan struct{}
+}
+
+func (r *coolingWarmResolver) AgentWarmth(ctx context.Context, _ string) (string, error) {
+	r.mu.Lock()
+	r.reads++
+	read := r.reads
+	r.mu.Unlock()
+	if read == 1 {
+		return WarmthWarm, nil
+	}
+	if read == 2 && r.admissionRead != nil {
+		close(r.admissionRead)
+		select {
+		case <-r.releaseAdmission:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return WarmthCold, nil
+}
+func (r *coolingWarmResolver) AgentWrappingKey(context.Context, string) (WrappingKeyMaterial, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.keyReads++
+	return WrappingKeyMaterial{ID: "test/key", Bytes: "key"}, nil
+}
+
+func TestReconcileWarmRechecksWarmthAtStartAdmission(t *testing.T) {
+	spawner := newFakeSpawner()
+	resolver := &coolingWarmResolver{}
+	mgr, err := New(Config{Spawner: spawner, Resolver: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if err := mgr.ReconcileWarm(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Running("agent") || len(spawner.spawns) != 0 || resolver.keyReads != 0 {
+		t.Fatal("warm reconciliation spawned or resolved a key after setting became cold")
+	}
+	if err := mgr.EnsureRunning(context.Background(), "agent"); err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.Running("agent") || len(spawner.spawns) != 1 || spawner.spawns[0].Warmth != WarmthCold {
+		t.Fatal("ordinary demand must still start a cold agent")
+	}
+}
+
+type observedWaitContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *observedWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func TestDemandRetriesWarmOnlyAdmissionThatBecameCold(t *testing.T) {
+	spawner := newFakeSpawner()
+	resolver := &coolingWarmResolver{admissionRead: make(chan struct{}), releaseAdmission: make(chan struct{})}
+	mgr, err := New(Config{Spawner: spawner, Resolver: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	warmDone := make(chan error, 1)
+	go func() { warmDone <- mgr.ReconcileWarm(context.Background(), "agent") }()
+	<-resolver.admissionRead
+	// The warm-only start reservation is held during its second warmth read.
+	// Demand must not mistake that start's successful no-op for a live runtime.
+	demandDone := make(chan error, 1)
+	demandCtx := &observedWaitContext{Context: context.Background(), waiting: make(chan struct{})}
+	go func() { demandDone <- mgr.EnsureRunning(demandCtx, "agent") }()
+	select {
+	case <-demandCtx.waiting:
+		// With the start reservation held, Done is read when demand reaches
+		// the select waiting for that attempt. Release only after observing it.
+	case err := <-demandDone:
+		t.Fatalf("demand returned before admission settled: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("demand did not reach the pending start wait")
+	}
+	close(resolver.releaseAdmission)
+	if err := <-warmDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-demandDone; err != nil {
+		t.Fatal(err)
+	}
+	if !mgr.Running("agent") || len(spawner.spawns) != 1 || spawner.spawns[0].Warmth != WarmthCold {
+		t.Fatal("waiting demand did not obtain exactly one cold runtime")
+	}
+}
