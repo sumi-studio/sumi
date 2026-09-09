@@ -517,6 +517,10 @@ func newApplicationFromEnv() (*application, error) {
 			return nil, fmt.Errorf("register workspace local control routes: %w", err)
 		}
 	}
+	if err := registerPublicWeb(localControl); err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("register public URL reader: %w", err)
+	}
 	processOperations, err := processOperationsFromEnv(localControl)
 	if err != nil {
 		closeOnError()
