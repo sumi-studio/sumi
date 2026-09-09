@@ -173,7 +173,7 @@ impl IncomingProvenance {
         }
     }
     pub fn is_external(&self) -> bool {
-        self.messaging_source().is_some()
+        !matches!(self.source, IncomingSource::DirectChat {})
     }
     pub fn output_audience(&self) -> OutputAudience {
         if self.is_external() {
@@ -205,6 +205,14 @@ impl IncomingProvenance {
                     && self.actor.display_name.is_none() =>
             {
                 Ok(())
+            }
+            IncomingSource::WorkspaceOperation(source) if self.version == 2 => {
+                if self.actor.kind != ActorKind::PersonalityAgent
+                    || self.actor.principal_id != self.personality_agent_id.as_str()
+                {
+                    return Err(RuntimeContractError::InvalidIncomingProvenance);
+                }
+                source.validate()
             }
             IncomingSource::Messaging(source) if self.version == 2 => {
                 source.validate()?;
@@ -279,6 +287,74 @@ pub enum IncomingSource {
     // Source details are uncommon but IncomingProvenance is carried through
     // every command/message and their async futures, including DirectChat.
     Messaging(Box<MessagingSource>),
+    WorkspaceOperation(Box<WorkspaceOperationSource>),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOperationSource {
+    pub kind: WorkspaceOperationKind,
+    pub event_id: String,
+    pub operation_id: String,
+    pub originating_tool_call_id: String,
+    pub occurred_at: String,
+    pub result: WorkspaceOperationResult,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOperationKind {
+    ProcessCompleted,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOperationResult {
+    pub state: WorkspaceOperationState,
+    #[serde(deserialize_with = "required_nullable_exit_code")]
+    pub exit_code: Option<i64>,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub output_truncated: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOperationState {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Indeterminate,
+}
+fn required_nullable_exit_code<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    Option::<i64>::deserialize(deserializer)
+}
+impl WorkspaceOperationSource {
+    fn validate(&self) -> Result<(), RuntimeContractError> {
+        let event_id = Uuid::parse_str(&self.event_id)
+            .map_err(|_| RuntimeContractError::InvalidIncomingProvenance)?;
+        if event_id.hyphenated().to_string() != self.event_id
+            || event_id.get_version_num() != 7
+            || event_id.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(RuntimeContractError::InvalidIncomingProvenance);
+        }
+        if self.operation_id.len() != 64
+            || !self
+                .operation_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.originating_tool_call_id.is_empty()
+            || self.result.stdout_bytes > 9_007_199_254_740_991
+            || self.result.stderr_bytes > 9_007_199_254_740_991
+            || self
+                .result
+                .exit_code
+                .is_some_and(|n| n.unsigned_abs() > 9_007_199_254_740_991)
+            || chrono::DateTime::parse_from_rfc3339(&self.occurred_at).is_err()
+        {
+            return Err(RuntimeContractError::InvalidIncomingProvenance);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -956,6 +1032,60 @@ mod tests {
             serde_json::to_value(crate::gateway::test_direct_chat_provenance()).unwrap();
         direct["source"]["event_id"] = raw["source"]["event_id"].clone();
         assert!(serde_json::from_value::<IncomingProvenance>(direct).is_err());
+    }
+
+    #[test]
+    fn workspace_operation_provenance_preserves_terminal_result_without_human_authority() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/agent-events-fixtures.json"
+        ))
+        .unwrap();
+        for key in [
+            "external_process_completed",
+            "external_process_indeterminate",
+        ] {
+            let raw = fixtures[key]["wire"]["provenance"].clone();
+            let parsed: IncomingProvenance = serde_json::from_value(raw.clone()).unwrap();
+            assert!(parsed.is_external());
+            assert_eq!(parsed.output_audience(), OutputAudience::Secretary);
+            assert!(parsed.authenticated_direct_chat_human().is_none());
+            assert!(parsed.messaging_source().is_none());
+            assert_eq!(serde_json::to_value(parsed).unwrap(), raw);
+        }
+        let raw = fixtures["external_process_completed"]["wire"]["provenance"].clone();
+        for (pointer, value) in [
+            ("/actor/kind", serde_json::json!("human")),
+            ("/actor/principal_id", serde_json::json!("another-pa")),
+            (
+                "/source/event_id",
+                serde_json::json!("01992000-0000-4000-8000-000000000021"),
+            ),
+            ("/source/operation_id", serde_json::json!("ABC")),
+            ("/source/originating_tool_call_id", serde_json::json!("")),
+            ("/source/result/state", serde_json::json!("running")),
+            (
+                "/source/result/stdout_bytes",
+                serde_json::json!(9_007_199_254_740_992u64),
+            ),
+            ("/source/result/output_truncated", serde_json::Value::Null),
+            ("/source/surface", serde_json::json!("messaging")),
+        ] {
+            let mut bad = raw.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                serde_json::from_value::<IncomingProvenance>(bad).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut bad = raw.clone();
+        bad["source"]["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exit_code");
+        assert!(serde_json::from_value::<IncomingProvenance>(bad).is_err());
+        let mut bad = raw;
+        bad["source"]["message_id"] = serde_json::json!("01992000-0000-7000-8000-000000000001");
+        assert!(serde_json::from_value::<IncomingProvenance>(bad).is_err());
     }
 
     #[test]

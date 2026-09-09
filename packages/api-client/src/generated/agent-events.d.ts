@@ -66,6 +66,11 @@ export type UserContent =
  */
 export type JsonSafeInteger = number;
 /**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ExternalProvenanceV2".
+ */
+export type ExternalProvenanceV2 = MessagingProvenanceV2 | WorkspaceOperationProvenanceV2;
+/**
  * opaque ASCII tenant identity
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -466,7 +471,7 @@ export type Command =
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "IncomingProvenance".
  */
-export type IncomingProvenance = DirectChatProvenanceV1 | MessagingProvenanceV2;
+export type IncomingProvenance = DirectChatProvenanceV1 | ExternalProvenanceV2;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "CommandEnvelope".
@@ -478,7 +483,7 @@ export type CommandEnvelope =
       [k: string]: unknown;
     }
   | {
-      provenance?: MessagingProvenanceV2;
+      provenance?: ExternalProvenanceV2;
       command?: ExternalEventCommand;
       [k: string]: unknown;
     };
@@ -601,7 +606,7 @@ export interface UserMessage {
   content: UserContent[];
   timestamp: string;
   incoming_timing?: IncomingEventTiming;
-  incoming_source?: MessagingProvenanceV2;
+  incoming_source?: ExternalProvenanceV2;
 }
 /**
  * Server-authored receipt timing; absent for messages without an incoming event.
@@ -629,6 +634,35 @@ export interface MessagingProvenanceV2 {
     display_name?: string;
   };
   source: MessagingEventSource;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "WorkspaceOperationProvenanceV2".
+ */
+export interface WorkspaceOperationProvenanceV2 {
+  version: 2;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: {
+    kind: "personality_agent";
+    principal_id: PersonalityAgentId;
+    display_name?: string;
+  };
+  source: {
+    surface: "workspace_operation";
+    kind: "process_completed";
+    event_id: string;
+    operation_id: string;
+    originating_tool_call_id: string;
+    occurred_at: string;
+    result: {
+      state: "succeeded" | "failed" | "cancelled" | "indeterminate";
+      exit_code: number | null;
+      stdout_bytes: JsonSafeInteger;
+      stderr_bytes: JsonSafeInteger;
+      output_truncated: boolean;
+    };
+  };
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

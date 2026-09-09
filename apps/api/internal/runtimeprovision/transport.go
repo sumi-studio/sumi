@@ -32,6 +32,9 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		return
 	}
 	response.Header().Set("Content-Type", "application/json")
+	if handler.serveProcess(response, request) {
+		return
+	}
 	switch request.URL.Path {
 	case "/v1/prepare":
 		var input PrepareRequest

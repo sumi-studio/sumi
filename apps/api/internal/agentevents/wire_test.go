@@ -600,3 +600,67 @@ func TestPollVoteProvenanceRejectsAmbiguousSelections(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkspaceOperationProvenanceRoundTripAndValidation(t *testing.T) {
+	raw, err := os.ReadFile("../../../../contracts/agent-events-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures map[string]struct {
+		Wire json.RawMessage `json:"wire"`
+	}
+	if err := json.Unmarshal(raw, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"external_process_completed", "external_process_indeterminate"} {
+		var envelope CommandEnvelope
+		if err := json.Unmarshal(fixtures[key].Wire, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if err := envelope.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		encoded, _ := json.Marshal(envelope.Provenance)
+		var restored IncomingProvenance
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if !restored.Equal(envelope.Provenance) {
+			t.Fatal("terminal evidence changed")
+		}
+		restored.Source.Result.StdoutBytes++
+		if restored.Equal(envelope.Provenance) {
+			t.Fatal("result changes must alter provenance equality")
+		}
+	}
+	var envelope struct {
+		Provenance json.RawMessage `json:"provenance"`
+	}
+	if err := json.Unmarshal(fixtures["external_process_completed"].Wire, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(map[string]any){
+		func(v map[string]any) { v["actor"].(map[string]any)["kind"] = "human" },
+		func(v map[string]any) { v["actor"].(map[string]any)["principal_id"] = "another-pa" },
+		func(v map[string]any) {
+			v["source"].(map[string]any)["event_id"] = "01992000-0000-4000-8000-000000000021"
+		},
+		func(v map[string]any) { v["source"].(map[string]any)["operation_id"] = "ABC" },
+		func(v map[string]any) { v["source"].(map[string]any)["message_id"] = nil },
+		func(v map[string]any) { v["source"].(map[string]any)["surface"] = "messaging" },
+		func(v map[string]any) { delete(v["source"].(map[string]any)["result"].(map[string]any), "exit_code") },
+		func(v map[string]any) { v["source"].(map[string]any)["result"].(map[string]any)["stdout_bytes"] = -1 },
+		func(v map[string]any) { v["source"].(map[string]any)["result"].(map[string]any)["state"] = "running" },
+	} {
+		var v map[string]any
+		if err := json.Unmarshal(envelope.Provenance, &v); err != nil {
+			t.Fatal(err)
+		}
+		mutate(v)
+		bad, _ := json.Marshal(v)
+		var p IncomingProvenance
+		if err := json.Unmarshal(bad, &p); err == nil {
+			t.Fatalf("accepted invalid operation: %s", bad)
+		}
+	}
+}

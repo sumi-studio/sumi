@@ -311,12 +311,17 @@ fn external_event_always_shows_receipt_but_direct_chat_keeps_existing_prefix() {
 }
 
 #[test]
-fn poll_vote_source_reaches_all_providers_without_fabricated_utterance() {
+fn metadata_only_sources_reach_all_providers_without_fabricated_utterance() {
     let fixtures: Value = serde_json::from_str(include_str!(
         "../../../../contracts/agent-events-fixtures.json"
     ))
     .unwrap();
-    for key in ["external_poll_vote", "external_poll_withdrawal"] {
+    for key in [
+        "external_poll_vote",
+        "external_poll_withdrawal",
+        "external_process_completed",
+        "external_process_indeterminate",
+    ] {
         let raw = &fixtures[key]["wire"]["provenance"];
         let user = UserMessage {
             incoming_source: Some(serde_json::from_value(raw.clone()).unwrap()),

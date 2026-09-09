@@ -241,21 +241,87 @@ type ProvenanceActor struct {
 }
 
 type ProvenanceSource struct {
-	Surface          string              `json:"surface"`
-	EventID          string              `json:"event_id,omitempty"`
-	Kind             string              `json:"kind,omitempty"`
-	WorkspaceID      string              `json:"workspace_id,omitempty"`
-	InstallationID   string              `json:"installation_id,omitempty"`
-	AuthorityEpoch   uint64              `json:"authority_epoch,omitempty"`
-	Place            *ProvenancePlace    `json:"place,omitempty"`
-	MessageID        string              `json:"message_id,omitempty"`
-	ReplyToMessageID string              `json:"reply_to_message_id,omitempty"`
-	PollVote         *ProvenancePollVote `json:"poll_vote,omitempty"`
-	MessageRevision  uint64              `json:"message_revision,omitempty"`
-	MessageSeq       uint64              `json:"message_seq,omitempty"`
-	OccurredAt       string              `json:"occurred_at,omitempty"`
-	MarkerID         string              `json:"marker_id,omitempty"`
-	DueAt            string              `json:"due_at,omitempty"`
+	OperationID           string                     `json:"operation_id,omitempty"`
+	OriginatingToolCallID string                     `json:"originating_tool_call_id,omitempty"`
+	Result                *ProvenanceOperationResult `json:"result,omitempty"`
+	Surface               string                     `json:"surface"`
+	EventID               string                     `json:"event_id,omitempty"`
+	Kind                  string                     `json:"kind,omitempty"`
+	WorkspaceID           string                     `json:"workspace_id,omitempty"`
+	InstallationID        string                     `json:"installation_id,omitempty"`
+	AuthorityEpoch        uint64                     `json:"authority_epoch,omitempty"`
+	Place                 *ProvenancePlace           `json:"place,omitempty"`
+	MessageID             string                     `json:"message_id,omitempty"`
+	ReplyToMessageID      string                     `json:"reply_to_message_id,omitempty"`
+	PollVote              *ProvenancePollVote        `json:"poll_vote,omitempty"`
+	MessageRevision       uint64                     `json:"message_revision,omitempty"`
+	MessageSeq            uint64                     `json:"message_seq,omitempty"`
+	OccurredAt            string                     `json:"occurred_at,omitempty"`
+	MarkerID              string                     `json:"marker_id,omitempty"`
+	DueAt                 string                     `json:"due_at,omitempty"`
+}
+
+type ProvenanceOperationResult struct {
+	State           string `json:"state"`
+	ExitCode        *int64 `json:"exit_code"`
+	StdoutBytes     uint64 `json:"stdout_bytes"`
+	StderrBytes     uint64 `json:"stderr_bytes"`
+	OutputTruncated bool   `json:"output_truncated"`
+}
+
+func (v *ProvenanceOperationResult) UnmarshalJSON(data []byte) error {
+	type wire ProvenanceOperationResult
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"state", "exit_code", "stdout_bytes", "stderr_bytes", "output_truncated"} {
+		raw, ok := fields[key]
+		if !ok || (key != "exit_code" && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
+			return fmt.Errorf("operation result %s is required", key)
+		}
+	}
+	*v = ProvenanceOperationResult(decoded)
+	return nil
+}
+
+func equalOperationResult(a, b *ProvenanceOperationResult) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.State == b.State && a.StdoutBytes == b.StdoutBytes && a.StderrBytes == b.StderrBytes && a.OutputTruncated == b.OutputTruncated &&
+		((a.ExitCode == nil && b.ExitCode == nil) || (a.ExitCode != nil && b.ExitCode != nil && *a.ExitCode == *b.ExitCode))
+}
+
+var operationIDRegexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var operationEventIDRegexp = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+func (p IncomingProvenance) validateWorkspaceOperation() error {
+	source := p.Source
+	result := source.Result
+	if p.Actor.Kind != "personality_agent" || p.Actor.PrincipalID != p.PersonalityAgentID || source.Kind != "process_completed" || !operationEventIDRegexp.MatchString(source.EventID) || !operationIDRegexp.MatchString(source.OperationID) || source.OriginatingToolCallID == "" || result == nil {
+		return errors.New("invalid workspace operation source")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, source.OccurredAt); err != nil {
+		return errors.New("operation occurrence must be RFC3339")
+	}
+	source.Surface, source.Kind, source.EventID, source.OperationID, source.OriginatingToolCallID, source.OccurredAt, source.Result = "", "", "", "", "", "", nil
+	if source != (ProvenanceSource{}) {
+		return errors.New("workspace operation cannot carry other source fields")
+	}
+	switch result.State {
+	case "succeeded", "failed", "cancelled", "indeterminate":
+	default:
+		return errors.New("invalid operation terminal state")
+	}
+	if result.StdoutBytes > maxJSONSafeInteger || result.StderrBytes > maxJSONSafeInteger || (result.ExitCode != nil && (*result.ExitCode > int64(maxJSONSafeInteger) || *result.ExitCode < -int64(maxJSONSafeInteger))) {
+		return errors.New("operation result numbers must be JSON-safe")
+	}
+	return nil
 }
 
 var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
@@ -312,7 +378,9 @@ func (p IncomingProvenance) Equal(other IncomingProvenance) bool {
 	av, bv := p.Source.PollVote, other.Source.PollVote
 	p.Source.Place, other.Source.Place = nil, nil
 	p.Source.PollVote, other.Source.PollVote = nil, nil
-	return p == other && ((a == nil && b == nil) || (a != nil && b != nil && *a == *b)) &&
+	ar, br := p.Source.Result, other.Source.Result
+	p.Source.Result, other.Source.Result = nil, nil
+	return equalOperationResult(ar, br) && p == other && ((a == nil && b == nil) || (a != nil && b != nil && *a == *b)) &&
 		((av == nil && bv == nil) || (av != nil && bv != nil && av.PollRevision == bv.PollRevision && av.Question == bv.Question && slices.Equal(av.SelectedOptions, bv.SelectedOptions)))
 }
 
@@ -331,6 +399,12 @@ func (p IncomingProvenance) Validate() error {
 			return errors.New("version 1 provenance requires direct-chat authenticated Human")
 		}
 		return nil
+	}
+	if p.Version == 2 && p.Source.Surface == "workspace_operation" {
+		return p.validateWorkspaceOperation()
+	}
+	if p.Source.OperationID != "" || p.Source.OriginatingToolCallID != "" || p.Source.Result != nil {
+		return errors.New("operation metadata requires workspace_operation source")
 	}
 	if p.Version != 2 || p.Source.Surface != "messaging" {
 		return errors.New("external provenance requires version 2 messaging source")
@@ -417,7 +491,24 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 		if len(fields.Actor) != 2 || len(fields.Source) != 1 {
 			return errors.New("version 1 provenance has external source fields")
 		}
+	} else if value.Version == 2 && value.Source.Surface == "workspace_operation" {
+		if len(fields.Source) != 7 {
+			return errors.New("workspace operation source has missing or extra fields")
+		}
+		for _, key := range []string{"surface", "kind", "event_id", "operation_id", "originating_tool_call_id", "occurred_at", "result"} {
+			if raw, ok := fields.Source[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return fmt.Errorf("operation source %s is required", key)
+			}
+		}
+		if raw, ok := fields.Actor["display_name"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("actor display_name must be a string")
+		}
 	} else if value.Version == 2 {
+		for _, key := range []string{"operation_id", "originating_tool_call_id", "result"} {
+			if _, ok := fields.Source[key]; ok {
+				return errors.New("operation metadata requires workspace_operation source")
+			}
+		}
 		if raw, ok := fields.Actor["display_name"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return errors.New("actor display_name must be a string")
 		}

@@ -379,6 +379,8 @@ test("log preserves strict external source metadata and rejects malformed varian
     "external_reply",
     "external_poll_vote",
     "external_poll_withdrawal",
+    "external_process_completed",
+    "external_process_indeterminate",
   ]) {
     const fixture = fixtures[key];
     if (!fixture) throw new Error(`missing ${key}`);
@@ -2019,6 +2021,44 @@ test("poll source validates vote payload without creating utterance content", ()
   ]) {
     const bad = structuredClone(frame);
     mutate(bad.envelope.event.message.incoming_source.source);
+    assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
+  }
+});
+
+test("operation completion validates its own source and recipient", () => {
+  const fixtures = JSON.parse(
+    readFileSync(
+      new URL("../../../contracts/agent-events-fixtures.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const frame = event(1, {
+    type: "message_end",
+    message_id: "00000000-0000-4000-8000-000000000002",
+    message: {
+      role: "user",
+      content: [],
+      timestamp,
+      incoming_source: fixtures.external_process_completed.wire.provenance,
+    },
+  });
+  frame.envelope.audience = "secretary";
+  assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+  for (const mutate of [
+    (p) => (p.actor.kind = "human"),
+    (p) => (p.actor.principal_id = "other"),
+    (p) => (p.source.operation_id = "ABC"),
+    (p) => (p.source.event_id = "01992000-0000-4000-8000-000000000021"),
+    (p) => (p.source.message_id = null),
+    (p) => (p.source.surface = "messaging"),
+    (p) => delete p.source.result.exit_code,
+    (p) => (p.source.result.stdout_bytes = -1),
+    (p) => (p.source.result.stderr_bytes = Number.MAX_SAFE_INTEGER + 1),
+    (p) => (p.source.result.state = "running"),
+    (p) => (p.source.result.output_truncated = null),
+  ]) {
+    const bad = structuredClone(frame);
+    mutate(bad.envelope.event.message.incoming_source);
     assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
   }
 });

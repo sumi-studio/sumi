@@ -208,3 +208,43 @@ it("shows poll answers and withdrawals without inventing authored message text",
   expect(userItemText(item)).toBe("いつにしますか？\n回答を撤回しました");
   expect(item.text).toBe("");
 });
+
+it("shows process completion as operation metadata while keeping its body empty", () => {
+  const item: Extract<ChatItem, { kind: "user" }> = {
+    kind: "user",
+    id: "process",
+    text: "",
+    attachments: [],
+    delivery: "durable",
+    timestamp: "2026-09-09T10:00:00Z",
+    source: {
+      version: 2,
+      tenant_id: "tenant",
+      personality_agent_id: "01992000-0000-7000-8000-000000000001",
+      actor: {
+        kind: "personality_agent",
+        principal_id: "01992000-0000-7000-8000-000000000001",
+      },
+      source: {
+        surface: "workspace_operation",
+        kind: "process_completed",
+        event_id: "01992000-0000-7000-8000-000000000021",
+        operation_id: "a".repeat(64),
+        originating_tool_call_id: "start-call",
+        occurred_at: "2026-09-09T10:00:00Z",
+        result: {
+          state: "succeeded",
+          exit_code: 0,
+          stdout_bytes: 512,
+          stderr_bytes: 0,
+          output_truncated: false,
+        },
+      },
+    },
+  };
+  render(<ChatItemView item={item} />);
+  expect(screen.getByText("ワークスペース処理")).toBeVisible();
+  expect(screen.getByText(/終了コード 0/)).toBeVisible();
+  expect(screen.queryByText(/Messaging/)).toBeNull();
+  expect(item.text).toBe("");
+});
