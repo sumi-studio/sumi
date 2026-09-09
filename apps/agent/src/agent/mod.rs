@@ -411,6 +411,7 @@ pub(crate) struct RunCore {
     /// `ContextAssembler::set_provider_context` calls.
     provider_context: Vec<ProviderContextItemWithFootprint>,
     durable_binding: Option<DurableRunBinding>,
+    recovered_tool_continuation: Option<Box<crate::store::RecoveredToolContinuation>>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
     /// Session reserves the token around `bind_hard_steer` so the provider is
@@ -436,6 +437,7 @@ impl RunCore {
             runtime_context: Vec::new(),
             provider_context: Vec::new(),
             durable_binding: None,
+            recovered_tool_continuation: None,
             worker_phase: None,
             attempt_cancellation: None,
             runtime_shutdown: CancellationToken::new(),
@@ -581,6 +583,7 @@ impl SessionStartAuthority {
         let mut core = RunCore::new();
         core.runtime_context = hydrated.messages.clone();
         core.provider_context = hydrated.provider_context.clone();
+        core.recovered_tool_continuation = hydrated.continuation.clone();
         // Approval is a security-sensitive dependency of this exact RunCore.
         // Compose it before minting the binding; every later replacement goes
         // through `set_approval` and invalidates the binding.
@@ -1295,6 +1298,20 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         shutdown: &CancellationToken,
     ) -> Result<SessionLoopExit, SessionFailure> {
+        if shutdown.is_cancelled() {
+            return Ok(SessionLoopExit::ShutdownRequested);
+        }
+        if let Some(continuation) = self
+            .core
+            .as_ref()
+            .and_then(|core| core.recovered_tool_continuation.clone())
+        {
+            self.spawn_worker(AdmittedCommand::new(
+                continuation.envelope,
+                continuation.received_at,
+            ))
+            .await?;
+        }
         loop {
             if self.active.is_none() {
                 self.apply_idle_memory_maintenance().await?;
@@ -1910,7 +1927,15 @@ impl<G: Gateway + 'static> Session<G> {
     /// reaches a phase where an earlier deferred command could now be routed.
     /// Only processes the front of the queue so later commands can never
     /// overtake an earlier deferred one.
-    async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
+    // Construct this future outside event persistence's poll frame: control
+    // acceptance may persist another event before reclassification returns.
+    fn reclassify_deferred(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SessionFailure>> + Send + '_>> {
+        Box::pin(self.reclassify_deferred_inner())
+    }
+
+    async fn reclassify_deferred_inner(&mut self) -> Result<(), SessionFailure> {
         while let Some(command) = self.deferred_commands.pop_one() {
             let was_user_message = matches!(
                 command.envelope().command,
@@ -2165,21 +2190,39 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
-        let binding = DurableRunBinding::idle(&initial, self.executor_generation);
-        self.writer
-            .apply(crate::store::EventBatch {
-                writes: vec![crate::store::EventWrite {
-                    event: None,
-                    projections: vec![crate::store::Projection::CommandClassified {
-                        command_id: binding.command_id.clone(),
-                        application_kind: crate::store::ApplicationKind::IdleRun,
-                        run_id: binding.run_id.clone(),
-                        turn_id: binding.turn_id.clone(),
+        let continuation = self
+            .core
+            .as_ref()
+            .and_then(|core| core.recovered_tool_continuation.as_ref());
+        let binding = if let Some(continuation) = continuation {
+            DurableRunBinding {
+                command_id: initial.envelope().command_id.to_string(),
+                command_seq: initial.envelope().seq,
+                provenance: initial.envelope().provenance.clone(),
+                run_id: continuation.run_id.clone(),
+                turn_id: continuation.turn_id.clone(),
+                executor_generation: self.executor_generation,
+            }
+        } else {
+            DurableRunBinding::idle(&initial, self.executor_generation)
+        };
+        let resumed_turn_open = continuation.map(|continuation| continuation.turn_open);
+        if continuation.is_none() {
+            self.writer
+                .apply(crate::store::EventBatch {
+                    writes: vec![crate::store::EventWrite {
+                        event: None,
+                        projections: vec![crate::store::Projection::CommandClassified {
+                            command_id: binding.command_id.clone(),
+                            application_kind: crate::store::ApplicationKind::IdleRun,
+                            run_id: binding.run_id.clone(),
+                            turn_id: binding.turn_id.clone(),
+                        }],
                     }],
-                }],
-                injected_commands: Vec::new(),
-            })
-            .await?;
+                    injected_commands: Vec::new(),
+                })
+                .await?;
+        }
         let mut core = self
             .core
             .take()
@@ -2210,7 +2253,10 @@ impl<G: Gateway + 'static> Session<G> {
             events_rx,
             completion_rx,
             join,
-            bridge: DurableBridge::new(binding),
+            bridge: match resumed_turn_open {
+                Some(open) => DurableBridge::resume_tool_continuation(binding, open),
+                None => DurableBridge::new(binding),
+            },
             attempt_cancellation,
             approval,
             resolving_approvals: HashSet::new(),
@@ -2634,6 +2680,17 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        // Leave the commit/send frame before controls can re-enter persistence.
+        if self.persist_active_event_boundary(output).await? {
+            self.reclassify_deferred().await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_active_event_boundary(
+        &mut self,
+        output: RunOutput,
+    ) -> Result<bool, SessionFailure> {
         // Approved decisions are intentionally staged until the matching
         // ToolExecutionStart. Even though that ApprovalResolved produces no
         // public output yet, it is still a routing boundary: a queued steer or
@@ -2688,10 +2745,7 @@ impl<G: Gateway + 'static> Session<G> {
             .map(|active| active.bridge.command_id().to_owned());
         self.send_committed(outputs, command_id, terminal_command_ids)
             .await?;
-        if assistant_started || approval_boundary {
-            self.reclassify_deferred().await?;
-        }
-        Ok(())
+        Ok(assistant_started || approval_boundary)
     }
 
     async fn send_committed(

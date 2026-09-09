@@ -581,7 +581,12 @@ impl Runner {
     }
 
     async fn run(mut self, initial: AdmittedCommand) -> RunCompletion {
-        let mut result = match self.claim_ordered_initial(initial) {
+        let initial_claim = if self.core.recovered_tool_continuation.is_some() {
+            Ok(())
+        } else {
+            self.claim_ordered_initial(initial)
+        };
+        let mut result = match initial_claim {
             Ok(()) => self.run_inner().await,
             Err(failure) => Err(failure),
         };
@@ -634,9 +639,15 @@ impl Runner {
     }
 
     async fn run_inner(&mut self) -> Result<(), WorkerFailure> {
-        self.emit(AgentEvent::AgentStart).await?;
-        self.emit(AgentEvent::TurnStart).await?;
-        self.inject_in_flight().await?;
+        if let Some(continuation) = self.core.recovered_tool_continuation.take() {
+            if !continuation.turn_open {
+                self.start_next_turn().await?;
+            }
+        } else {
+            self.emit(AgentEvent::AgentStart).await?;
+            self.emit(AgentEvent::TurnStart).await?;
+            self.inject_in_flight().await?;
+        }
 
         loop {
             self.receive_control_safe_point().await?;

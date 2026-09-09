@@ -526,6 +526,13 @@ impl DurableBridge {
         self.output_audience() == command.envelope().provenance.output_audience()
     }
 
+    pub(super) fn resume_tool_continuation(binding: DurableRunBinding, turn_open: bool) -> Self {
+        let mut bridge = Self::new(binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = turn_open;
+        bridge
+    }
+
     pub(super) fn new(binding: DurableRunBinding) -> Self {
         let worker_command_id = binding.command_id.clone();
         let worker_command_seq = binding.command_seq;
