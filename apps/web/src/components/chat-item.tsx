@@ -65,14 +65,14 @@ export function ChatItemView({
       return (
         <Message
           from={item.source ? "assistant" : "user"}
-          className="max-w-full py-4"
+          className="max-w-full py-3"
         >
-          <div className="text-muted-foreground text-xs leading-5">
-            {item.source
-              ? `${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`
-              : "診断用の入力"}
-          </div>
-          <MessageContent className="whitespace-pre-wrap break-words text-base leading-7">
+          {item.source && (
+            <div className="text-muted-foreground text-xs leading-5">
+              {`${item.source.source.place.kind === "dm" ? "DM" : item.source.source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${item.source.source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${item.source.source.kind === "reply_later_due" ? " · リマインダー" : ""}`}
+            </div>
+          )}
+          <MessageContent className="whitespace-pre-wrap break-words text-base leading-relaxed">
             {item.text}
           </MessageContent>
           <MessageMetadata
@@ -94,8 +94,8 @@ export function ChatItemView({
       );
     case "prose":
       return (
-        <Message from="assistant" className="max-w-full py-4">
-          <MessageContent className="text-base leading-7">
+        <Message from="assistant" className="max-w-full py-3">
+          <MessageContent className="text-base leading-relaxed">
             <MessageResponse
               mode={item.streaming ? "streaming" : "static"}
               onRenderSettled={

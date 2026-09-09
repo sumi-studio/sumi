@@ -307,6 +307,42 @@ describe("ConversationVirtualizer", () => {
     });
   });
 
+  it.each([
+    "initial end",
+    "message",
+  ] as const)("retains an explicit offset restored during a %s flight and later appends", async (flight) => {
+    const handle = createRef<ConversationVirtualizerHandle>();
+    const view = render(
+      <ConversationVirtualizer
+        ref={handle}
+        items={makeMessages(100)}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    const viewport = screen.getByRole("region");
+    if (flight === "message") {
+      await settleProgrammaticScroll();
+      act(() => handle.current?.scrollToMessage("message-50"));
+    }
+    act(() => handle.current?.scrollToOffset(120));
+    await settleProgrammaticScroll();
+
+    expect(Math.abs(viewport.scrollTop - 120)).toBeLessThan(60);
+    expect(handle.current?.isAtEnd()).toBe(false);
+    view.rerender(
+      <ConversationVirtualizer
+        ref={handle}
+        items={makeMessages(101)}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    await settleProgrammaticScroll();
+    expect(Math.abs(viewport.scrollTop - 120)).toBeLessThan(60);
+    expect(handle.current?.isAtEnd()).toBe(false);
+  });
+
   it("cancels a stale programmatic end reconciliation after divergent user scrolling", async () => {
     let messages = makeMessages(100);
     const view = render(

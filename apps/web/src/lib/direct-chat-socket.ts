@@ -300,7 +300,13 @@ function isUserContent(value: unknown): boolean {
 function isToolCall(value: unknown): boolean {
   return (
     isRecord(value) &&
-    hasRequiredAndOnlyKeys(value, ["id", "name", "route", "arguments"]) &&
+    hasRequiredAndOnlyKeys(
+      value,
+      ["id", "name", "route", "arguments"],
+      ["id", "name", "route", "arguments", "provider_call_id"],
+    ) &&
+    (!("provider_call_id" in value) ||
+      typeof value.provider_call_id === "string") &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.route === "normal" || value.route === "elevated") &&
@@ -312,7 +318,13 @@ function isToolCall(value: unknown): boolean {
 function isRejectedToolCall(value: unknown): boolean {
   return (
     isRecord(value) &&
-    hasRequiredAndOnlyKeys(value, ["id", "name", "error"]) &&
+    hasRequiredAndOnlyKeys(
+      value,
+      ["id", "name", "error"],
+      ["id", "name", "error", "provider_call_id"],
+    ) &&
+    (!("provider_call_id" in value) ||
+      typeof value.provider_call_id === "string") &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     typeof value.error === "string" &&
@@ -553,15 +565,30 @@ function isPublicMessage(value: unknown): boolean {
   }
   if (value.role === "tool_result") {
     return (
-      hasRequiredAndOnlyKeys(value, [
-        "role",
-        "tool_call_id",
-        "tool_name",
-        "content",
-        "details",
-        "is_error",
-        "timestamp",
-      ]) &&
+      hasRequiredAndOnlyKeys(
+        value,
+        [
+          "role",
+          "tool_call_id",
+          "tool_name",
+          "content",
+          "details",
+          "is_error",
+          "timestamp",
+        ],
+        [
+          "role",
+          "tool_call_id",
+          "tool_name",
+          "content",
+          "details",
+          "is_error",
+          "timestamp",
+          "provider_call_id",
+        ],
+      ) &&
+      (!("provider_call_id" in value) ||
+        typeof value.provider_call_id === "string") &&
       typeof value.tool_call_id === "string" &&
       typeof value.tool_name === "string" &&
       (!("incoming_source" in value) ||
@@ -579,14 +606,28 @@ function isPublicMessage(value: unknown): boolean {
 function isToolResultPayload(value: unknown): boolean {
   return (
     isRecord(value) &&
-    hasRequiredAndOnlyKeys(value, [
-      "tool_call_id",
-      "tool_name",
-      "content",
-      "details",
-      "is_error",
-      "timestamp",
-    ]) &&
+    hasRequiredAndOnlyKeys(
+      value,
+      [
+        "tool_call_id",
+        "tool_name",
+        "content",
+        "details",
+        "is_error",
+        "timestamp",
+      ],
+      [
+        "tool_call_id",
+        "tool_name",
+        "content",
+        "details",
+        "is_error",
+        "timestamp",
+        "provider_call_id",
+      ],
+    ) &&
+    (!("provider_call_id" in value) ||
+      typeof value.provider_call_id === "string") &&
     typeof value.tool_call_id === "string" &&
     typeof value.tool_name === "string" &&
     Array.isArray(value.content) &&

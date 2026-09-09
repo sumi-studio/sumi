@@ -36,7 +36,7 @@ export function ChatPromptInput({
   onAbort,
   streaming,
   disabled = false,
-  placeholder = "Sumiへの診断用の指示…",
+  placeholder = "メッセージを入力…",
   className,
 }: ChatPromptInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -67,7 +67,12 @@ export function ChatPromptInput({
 
   return (
     <PromptInput
-      className={["flex items-end", className].filter(Boolean).join(" ")}
+      className={[
+        "flex items-end border-neutral-200/80 shadow-none focus-within:border-neutral-300",
+        className,
+      ]
+        .filter(Boolean)
+        .join(" ")}
       onSubmit={(event) => {
         event.preventDefault();
         if (canSend) onSend();
@@ -79,13 +84,13 @@ export function ChatPromptInput({
         rows={1}
         value={value}
         disabled={disabled}
-        aria-label="診断用の指示"
+        aria-label="メッセージ"
         placeholder={placeholder}
         enterKeyHint={isCoarsePointer ? "enter" : undefined}
         onChange={(event) => onValueChange(event.target.value)}
         onKeyDown={handleKeyDown}
       />
-      <PromptInputFooter className="shrink-0 pl-0 pr-2 pb-2">
+      <PromptInputFooter className="shrink-0 pl-0 pr-3 pb-3">
         <PromptInputTools>
           {streaming && (
             <PromptInputButton
