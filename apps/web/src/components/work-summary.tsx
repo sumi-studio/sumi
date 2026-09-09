@@ -201,6 +201,8 @@ function ToolTraceRow({
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
 }) {
+  const [localOpen, setLocalOpen] = useState(false);
+  const expanded = open ?? localOpen;
   const phase =
     event.status === "pending" || event.status === "running"
       ? "activity"
@@ -214,6 +216,13 @@ function ToolTraceRow({
     error: "失敗",
     cancelled: "中止",
   }[event.status];
+  const generatedLabel = [
+    `${event.name}を実行中`,
+    `${event.name}を完了`,
+    `${event.name}でエラー`,
+    `${event.name}を中止`,
+  ].includes(event.label);
+  const actionLabel = generatedLabel ? event.name : event.label || event.name;
   const resultText =
     phase === "activity"
       ? event.progress === undefined
@@ -225,16 +234,15 @@ function ToolTraceRow({
   const failed = event.status === "error" || event.status === "cancelled";
   const failure = failed ? toolFailureReason(event) : null;
   return (
-    <details
-      open={open}
-      onToggle={
-        onOpenChange
-          ? (event) => onOpenChange(event.currentTarget.open)
-          : undefined
-      }
-      className="direct-chat-tool group/tool min-w-0 text-base leading-relaxed open:pb-2"
+    <Collapsible
+      open={expanded}
+      onOpenChange={(nextOpen) => {
+        setLocalOpen(nextOpen);
+        onOpenChange?.(nextOpen);
+      }}
+      className="direct-chat-tool group/tool min-w-0 text-base leading-relaxed"
     >
-      <summary className="direct-chat-tool-summary flex min-w-0 cursor-pointer list-none items-center gap-1.5 rounded-md py-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
+      <CollapsibleTrigger className="direct-chat-tool-summary flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md py-0.5 text-left text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
         <Icon
           className={cn(
             "size-4 shrink-0 text-muted-foreground",
@@ -243,9 +251,9 @@ function ToolTraceRow({
         />
         <span
           className="min-w-0 max-w-[60%] shrink-0 truncate font-normal"
-          title={event.label || event.name}
+          title={actionLabel}
         >
-          {event.label || event.name}
+          {actionLabel}
         </span>
         <span
           className={cn(
@@ -263,30 +271,37 @@ function ToolTraceRow({
             {detail}
           </code>
         )}
-        <ChevronRight className="direct-chat-tool-chevron size-3.5 shrink-0 transition-transform group-open/tool:rotate-90 motion-reduce:transition-none" />
-      </summary>
-      <div className="space-y-3 pt-2 pl-6">
-        <Payload label="入力" text={displayValue(event.args)} />
-        {phase === "activity" && resultText !== null && (
-          <Payload label="進行状況" text={resultText} />
-        )}
-        {phase === "result" && (
-          <Payload
-            label={failed ? "理由" : "結果"}
-            text={
-              failure ??
-              resultText ??
-              (event.status === "running" || event.status === "pending"
-                ? "結果を待っています"
-                : "結果の本文は記録されていません")
-            }
-          />
-        )}
-        {failed && resultText !== null && (
-          <Payload label="結果" text={resultText} />
-        )}
-      </div>
-    </details>
+        <ChevronRight className="direct-chat-tool-chevron size-3.5 shrink-0 transition-transform motion-reduce:transition-none" />
+      </CollapsibleTrigger>
+      <CollapsibleContent
+        keepMounted
+        className="direct-chat-tool-panel"
+        aria-hidden={!expanded}
+        inert={!expanded}
+      >
+        <div className="space-y-3 pt-2 pb-2 pl-6">
+          <Payload label="入力" text={displayValue(event.args)} />
+          {phase === "activity" && resultText !== null && (
+            <Payload label="進行状況" text={resultText} />
+          )}
+          {phase === "result" && (
+            <Payload
+              label={failed ? "理由" : "結果"}
+              text={
+                failure ??
+                resultText ??
+                (event.status === "running" || event.status === "pending"
+                  ? "結果を待っています"
+                  : "結果の本文は記録されていません")
+              }
+            />
+          )}
+          {failed && resultText !== null && (
+            <Payload label="結果" text={resultText} />
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 

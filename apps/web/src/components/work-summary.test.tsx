@@ -2,11 +2,14 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRun } from "../agent/work-summary";
 import { TraceRow, WorkSummary } from "./work-summary";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function makeRun(status: AgentRun["status"]): AgentRun {
   return {
@@ -35,11 +38,11 @@ describe("WorkSummary", () => {
   it("keeps inspected work visible when the run ends", () => {
     const view = render(<WorkSummary run={makeRun("running")} />);
     expect(screen.getByText("作業中")).toBeVisible();
-    expect(screen.getByText("read_fileを完了")).toBeVisible();
+    expect(screen.getByText("read_file")).toBeVisible();
 
     view.rerender(<WorkSummary run={makeRun("complete")} />);
     expect(screen.getByText("作業が終了しました")).toBeVisible();
-    expect(screen.getByText("read_fileを完了")).toBeVisible();
+    expect(screen.getByText("read_file")).toBeVisible();
   });
 
   it("lets an explicit user toggle win over the automatic state", () => {
@@ -47,14 +50,14 @@ describe("WorkSummary", () => {
 
     // The user closes the section mid-run; it must not spring back open.
     fireEvent.click(screen.getByRole("button", { name: /作業中/ }));
-    expect(screen.queryByText("read_fileを完了")).toBeNull();
+    expect(screen.queryByText("read_file")).toBeNull();
 
     view.rerender(<WorkSummary run={makeRun("complete")} />);
-    expect(screen.queryByText("read_fileを完了")).toBeNull();
+    expect(screen.queryByText("read_file")).toBeNull();
 
     // Reopening after the run ended also sticks.
     fireEvent.click(screen.getByRole("button", { name: /作業が終了しました/ }));
-    expect(screen.getByText("read_fileを完了")).toBeVisible();
+    expect(screen.getByText("read_file")).toBeVisible();
   });
 });
 
@@ -76,17 +79,23 @@ describe("one tool execution", () => {
       status: "running" as const,
     };
     const view = render(<TraceRow event={running} open />);
-    const operation = view.container.querySelector("details");
-    expect(view.container.querySelectorAll("details")).toHaveLength(1);
+    const operation = view.container.querySelector('[data-slot="collapsible"]');
+    expect(
+      view.container.querySelectorAll('[data-slot="collapsible"]'),
+    ).toHaveLength(1);
     expect(screen.getByText("実行中")).toBeVisible();
     expect(screen.getByText("進行状況")).toBeVisible();
     expect(screen.getByText("入力")).toBeVisible();
     view.rerender(
       <TraceRow event={{ ...running, status, label: title, result }} open />,
     );
-    expect(view.container.querySelector("details")).toBe(operation);
-    expect(operation).toHaveAttribute("open");
-    expect(view.container.querySelectorAll("details")).toHaveLength(1);
+    expect(view.container.querySelector('[data-slot="collapsible"]')).toBe(
+      operation,
+    );
+    expect(screen.getByRole("button")).toHaveAttribute("aria-expanded", "true");
+    expect(
+      view.container.querySelectorAll('[data-slot="collapsible"]'),
+    ).toHaveLength(1);
     expect(screen.getByText(label)).toBeVisible();
     expect(screen.queryByText("実行中")).toBeNull();
     expect(screen.queryByText("進行状況")).toBeNull();
@@ -203,4 +212,127 @@ it("retains an ordinary top-level tool error when details contain only metadata"
   expect(screen.getByRole("region", { name: "理由" })).toHaveTextContent(
     "ファイルを更新できませんでした。接続が切れています。",
   );
+});
+
+it("keeps the latest reader choice through rapid toggles and result updates", () => {
+  const event = {
+    type: "tool" as const,
+    id: "rapid-call",
+    name: "read_file",
+    route: "normal" as const,
+    label: "read_fileを実行中",
+    args: { path: "notes/today.md" },
+    result: undefined,
+    status: "running" as const,
+  };
+  const view = render(<TraceRow event={event} />);
+  const trigger = screen.getByRole("button");
+  const panel = view.container.querySelector(
+    '[data-slot="collapsible-content"]',
+  );
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+  fireEvent.click(trigger);
+  fireEvent.click(trigger);
+  fireEvent.click(trigger);
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  expect(trigger).toHaveAttribute("aria-controls", panel?.id);
+  expect(panel).not.toHaveAttribute("inert");
+  view.rerender(
+    <TraceRow
+      event={{
+        ...event,
+        label: "read_fileを完了",
+        status: "done",
+        result: "file contents",
+      }}
+    />,
+  );
+  expect(screen.getByRole("button")).toBe(trigger);
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("region", { name: "結果" })).toHaveTextContent(
+    "file contents",
+  );
+
+  fireEvent.click(trigger);
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  expect(panel).toHaveAttribute("aria-hidden", "true");
+  expect(panel).toHaveAttribute("inert");
+  view.rerender(
+    <TraceRow
+      event={{
+        ...event,
+        label: "read_fileを完了",
+        status: "done",
+        result: "updated contents",
+      }}
+    />,
+  );
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+});
+
+it("keeps custom labels and presents generated status only once", () => {
+  const event = {
+    type: "tool" as const,
+    id: "label-call",
+    name: "read_file",
+    route: "normal" as const,
+    label: "read_fileを完了",
+    args: {},
+    result: undefined,
+    status: "done" as const,
+  };
+  const view = render(<TraceRow event={event} />);
+  expect(screen.getByRole("button")).toHaveTextContent("read_file完了");
+  expect(screen.getByRole("button")).not.toHaveTextContent("を完了");
+  view.rerender(
+    <TraceRow event={{ ...event, label: "会議メモを確認しました" }} />,
+  );
+  expect(screen.getByRole("button")).toHaveTextContent(
+    "会議メモを確認しました",
+  );
+});
+
+it("closes immediately when reduced motion removes panel transitions", () => {
+  // JSDOM does not evaluate media queries. Supply the computed result of
+  // the reduced-motion rule and exercise the actual Collapsible lifecycle.
+  const getComputedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
+    const style = getComputedStyle(element);
+    if (element.classList.contains("direct-chat-tool-panel")) {
+      Object.defineProperties(style, {
+        transitionDuration: { value: "0s" },
+        animationDuration: { value: "0s" },
+        animationName: { value: "none" },
+      });
+    }
+    return style;
+  });
+  const view = render(
+    <TraceRow
+      event={{
+        type: "tool",
+        id: "reduced-call",
+        name: "read_file",
+        route: "normal",
+        label: "read_fileを完了",
+        args: {},
+        result: "contents",
+        status: "done",
+      }}
+    />,
+  );
+  const trigger = screen.getByRole("button");
+  fireEvent.click(trigger);
+  expect(screen.getByRole("region", { name: "結果" })).toBeVisible();
+  fireEvent.click(trigger);
+  const panel = view.container.querySelector(
+    '[data-slot="collapsible-content"]',
+  );
+  expect(trigger).toHaveAttribute("aria-expanded", "false");
+  expect(panel).toHaveAttribute("hidden");
+  expect(panel).toHaveAttribute("inert");
+  // No transitionend event or duration timer is needed to settle the close.
+  fireEvent.click(trigger);
+  expect(screen.getByRole("region", { name: "結果" })).toBeVisible();
 });

@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, test } from "@playwright/test";
+import { parseDirectChatServerFrame } from "../src/lib/direct-chat-socket";
 
 const webURL = "http://127.0.0.1:4173";
 const directChatURL = `${webURL}/direct`;
@@ -24,6 +25,7 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
 }) => {
   if (!fixtureBuild) throw new Error("browser E2E fixture was not built");
 
+  const invalidFrames: string[] = [];
   let terminalFrames = 0;
   let toolStartFrames = 0;
   let toolEndFrames = 0;
@@ -33,9 +35,8 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     markReplaySettled = resolveReplay;
   });
   page.on("websocket", (socket) => {
-    if (new URL(socket.url()).pathname === "/direct-chat/ws") {
-      directChatSocketSeen = true;
-    }
+    if (new URL(socket.url()).pathname !== "/direct-chat/ws") return;
+    directChatSocketSeen = true;
     socket.on("framereceived", ({ payload }) => {
       if (typeof payload !== "string") return;
       try {
@@ -43,6 +44,18 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
           type?: string;
           envelope?: { event?: { type?: string; message?: unknown } };
         };
+        // Validate the actual public payload shape; the socket itself checks
+        // ordered sequence continuity across reconnects.
+        const sequence = (frame as { envelope?: { seq?: number } }).envelope
+          ?.seq;
+        if (
+          !parseDirectChatServerFrame(
+            frame,
+            sequence === undefined ? 0 : sequence - 1,
+          )
+        ) {
+          invalidFrames.push(payload);
+        }
         const event =
           frame.type === "event" ? frame.envelope?.event : undefined;
         if (
@@ -92,11 +105,17 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     await expect(
       page.getByText("streamed assistant", { exact: true }),
     ).toBeVisible();
-    // While the run is active the work section is expanded by default.
-    await expect(page.getByText("作業中", { exact: true })).toBeVisible();
-    await expect(
-      page.getByText("read_fileを完了", { exact: true }),
-    ).toBeVisible();
+    // The completed operation stays in the conversation as one disclosure.
+    const toolSummary = page.getByRole("button", { name: /read_file.*完了/ });
+    await expect(toolSummary).toHaveCount(1);
+    await expect(toolSummary).toBeVisible();
+    await toolSummary.focus();
+    await toolSummary.press("Enter");
+    await expect(toolSummary).toHaveAttribute("aria-expanded", "true");
+    const toolPanel = page.locator(".direct-chat-tool-panel");
+    await expect(toolPanel.getByText("ok", { exact: true })).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(toolSummary).not.toBeFocused();
     expect(toolStartFrames).toBe(1);
     expect(toolEndFrames).toBe(1);
 
@@ -144,10 +163,8 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     const completedSummary = page.getByText("作業が終了しました", {
       exact: true,
     });
-    await expect(completedSummary).toBeVisible();
-    await expect(
-      page.getByText("read_fileを完了", { exact: true }),
-    ).toBeHidden();
+    await expect(completedSummary).toHaveCount(0);
+    await expect(toolSummary).toBeVisible();
 
     const terminalRow = page
       .getByText("Terminal replay", { exact: true })
@@ -171,17 +188,38 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     await expect(
       page.getByText("Terminal replay", { exact: true }),
     ).toHaveCount(1);
-    await expect(completedSummary).toBeVisible();
-    await expect(
-      page.getByText("read_fileを完了", { exact: true }),
-    ).toBeHidden();
-    await completedSummary.click();
-    await expect(
-      page.getByText("read_fileを完了", { exact: true }),
-    ).toBeVisible();
+    await expect(completedSummary).toHaveCount(0);
+    await expect(toolSummary).toBeVisible();
+    await toolSummary.focus();
+    await toolSummary.press("Space");
+    await expect(toolSummary).toHaveAttribute("aria-expanded", "true");
+    await expect(toolPanel.getByText("ok", { exact: true })).toBeVisible();
+    const panelHandle = await toolPanel.elementHandle();
+    await toolSummary.press("Space");
+    await expect(toolSummary).toHaveAttribute("aria-expanded", "false");
+    await expect(toolPanel).toHaveAttribute("aria-hidden", "true");
+    await toolSummary.press("Space");
+    await expect(toolSummary).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await toolPanel.evaluate(
+        (panel, original) => panel === original,
+        panelHandle,
+      ),
+    ).toBe(true);
+    await panelHandle?.dispose();
     expect(terminalFrames).toBe(2);
+    expect(invalidFrames).toEqual([]);
+    expect(fixture.stderr).toEqual([]);
   } finally {
     await Promise.all([stop(vite), stop(fixture.process)]);
+    await test.info().attach("invalid-websocket-frames", {
+      body: JSON.stringify(invalidFrames, null, 2),
+      contentType: "application/json",
+    });
+    await test.info().attach("fixture-stderr", {
+      body: fixture.stderr.join(""),
+      contentType: "text/plain",
+    });
     await rm(fixture.runtimeDirectory, { recursive: true, force: true });
   }
 });
@@ -226,6 +264,8 @@ async function startFixture(binary: string, buildDirectory: string) {
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const stderr: string[] = [];
+  child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk.toString()));
   try {
     const url = await new Promise<string>((resolveURL, reject) => {
       const timeout = setTimeout(
@@ -245,7 +285,7 @@ async function startFixture(binary: string, buildDirectory: string) {
         resolveURL(match[1]);
       });
     });
-    return { process: child, runtimeDirectory, url };
+    return { process: child, runtimeDirectory, url, stderr };
   } catch (error) {
     await stop(child);
     await rm(runtimeDirectory, { recursive: true, force: true });
