@@ -98,6 +98,7 @@ func run(ctx context.Context) (runErr error) {
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
 	app.startChatGPTActivation()
+	app.startWarmReconciliation()
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()

@@ -165,10 +165,49 @@ func New(cfg Config) (*Manager, error) {
 	}, nil
 }
 
+// ReconcileWarm refreshes the persisted cost setting without recording activity.
+// Only an absent or cleanup-pending warm runtime needs ordinary lifecycle
+// admission. EnsureRunning owns coalescing, fenced cleanup, and shutdown races.
+func (m *Manager) ReconcileWarm(ctx context.Context, agentID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	warmth, err := m.cfg.Resolver.AgentWarmth(ctx, agentID)
+	if err != nil {
+		return fmt.Errorf("resolve warmth for %s: %w", agentID, err)
+	}
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return ErrManagerClosed
+	}
+	if m.skip[agentID] {
+		m.mu.Unlock()
+		return nil
+	}
+	rt := m.running[agentID]
+	if rt != nil {
+		rt.warmth = warmth
+	}
+	needsStart := warmth == WarmthWarm && (rt == nil || rt.cleanupPending)
+	m.mu.Unlock()
+	if !needsStart {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.ensureRunning(ctx, agentID, true)
+}
+
 // EnsureRunning starts the agent if it is not already running and records the
 // call as activity. It is called on 呼びかけ (direct-chat connection). Agents
 // in the SkipAgentIDs set are left to their external manager.
 func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
+	return m.ensureRunning(ctx, agentID, false)
+}
+
+func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bool) error {
 	for {
 		m.mu.Lock()
 		if m.closing {
@@ -199,8 +238,10 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 				}
 				continue
 			}
-			rt.lastActive = m.now()
-			rt.activityRevision++
+			if !warmOnly {
+				rt.lastActive = m.now()
+				rt.activityRevision++
+			}
 			m.mu.Unlock()
 			return nil
 		}
@@ -208,7 +249,12 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 			m.mu.Unlock()
 			select {
 			case <-attempt.done:
-				return attempt.err
+				if attempt.err != nil {
+					return attempt.err
+				}
+				// A warm-only start can settle without a process when the
+				// persisted setting became cold. Demand still needs admission.
+				continue
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -221,11 +267,11 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 		m.starting[agentID] = attempt
 		m.mu.Unlock()
 
-		runtime, err := m.startRuntime(startContext, agentID)
+		runtime, err := m.startRuntime(startContext, agentID, warmOnly)
 		cancelStart()
 		m.mu.Lock()
 		if !m.closing {
-			if err == nil {
+			if err == nil && runtime != nil {
 				m.running[agentID] = runtime
 			}
 			attempt.err = err
@@ -259,13 +305,16 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 	}
 }
 
-func (m *Manager) startRuntime(ctx context.Context, agentID string) (*agentRuntime, error) {
+func (m *Manager) startRuntime(ctx context.Context, agentID string, warmOnly bool) (*agentRuntime, error) {
 	warmth, err := m.cfg.Resolver.AgentWarmth(ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve warmth for %s: %w", agentID, err)
 	}
 	if warmth == "" {
 		warmth = WarmthCold
+	}
+	if warmOnly && warmth != WarmthWarm {
+		return nil, nil
 	}
 	wrappingKey, err := m.cfg.Resolver.AgentWrappingKey(ctx, agentID)
 	if err != nil {
