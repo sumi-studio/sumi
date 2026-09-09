@@ -370,7 +370,7 @@
       "content": [
         {
           "type": "text",
-          "text": "\u671d9\u6642\u306b\u304a\u9858\u3044\u3057\u307e\u3059\u3002"
+          "text": "朝9時にお願いします。"
         }
       ],
       "timestamp": "2026-07-25T20:00:00Z",
@@ -386,7 +386,7 @@
       "content": [
         {
           "type": "text",
-          "text": "\u671d9\u6642\u306b\u304a\u9858\u3044\u3057\u307e\u3059\u3002"
+          "text": "朝9時にお願いします。"
         }
       ],
       "timestamp": "2026-07-25T20:00:00Z",
@@ -990,6 +990,46 @@
       "content_index": 0,
       "content": "Provider-authored display summary.",
       "wire_item_index": 1
+    }
+  },
+  "external_reply": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "01992000-0000-7000-8000-000000000009",
+      "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+      "provenance": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "human",
+          "principal_id": "01992000-0000-7000-8000-000000000002",
+          "display_name": "Example Human"
+        },
+        "source": {
+          "surface": "messaging",
+          "event_id": "01992000-0000-7000-8000-000000000003",
+          "kind": "messaging_message",
+          "workspace_id": "01992000-0000-7000-8000-000000000004",
+          "installation_id": "01992000-0000-7000-8000-000000000005",
+          "authority_epoch": 1,
+          "place": {
+            "id": "01992000-0000-7000-8000-000000000006",
+            "kind": "channel",
+            "name": "General"
+          },
+          "message_id": "01992000-0000-7000-8000-000000000007",
+          "message_revision": 1,
+          "message_seq": 1,
+          "occurred_at": "2026-09-08T12:00:00Z",
+          "reply_to_message_id": "01992000-0000-7000-8000-000000000008"
+        }
+      },
+      "command": {
+        "type": "external_event",
+        "content": "Original source text"
+      }
     }
   }
 }

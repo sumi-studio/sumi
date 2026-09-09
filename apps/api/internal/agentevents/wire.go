@@ -240,19 +240,20 @@ type ProvenanceActor struct {
 }
 
 type ProvenanceSource struct {
-	Surface         string           `json:"surface"`
-	EventID         string           `json:"event_id,omitempty"`
-	Kind            string           `json:"kind,omitempty"`
-	WorkspaceID     string           `json:"workspace_id,omitempty"`
-	InstallationID  string           `json:"installation_id,omitempty"`
-	AuthorityEpoch  uint64           `json:"authority_epoch,omitempty"`
-	Place           *ProvenancePlace `json:"place,omitempty"`
-	MessageID       string           `json:"message_id,omitempty"`
-	MessageRevision uint64           `json:"message_revision,omitempty"`
-	MessageSeq      uint64           `json:"message_seq,omitempty"`
-	OccurredAt      string           `json:"occurred_at,omitempty"`
-	MarkerID        string           `json:"marker_id,omitempty"`
-	DueAt           string           `json:"due_at,omitempty"`
+	Surface          string           `json:"surface"`
+	EventID          string           `json:"event_id,omitempty"`
+	Kind             string           `json:"kind,omitempty"`
+	WorkspaceID      string           `json:"workspace_id,omitempty"`
+	InstallationID   string           `json:"installation_id,omitempty"`
+	AuthorityEpoch   uint64           `json:"authority_epoch,omitempty"`
+	Place            *ProvenancePlace `json:"place,omitempty"`
+	MessageID        string           `json:"message_id,omitempty"`
+	ReplyToMessageID string           `json:"reply_to_message_id,omitempty"`
+	MessageRevision  uint64           `json:"message_revision,omitempty"`
+	MessageSeq       uint64           `json:"message_seq,omitempty"`
+	OccurredAt       string           `json:"occurred_at,omitempty"`
+	MarkerID         string           `json:"marker_id,omitempty"`
+	DueAt            string           `json:"due_at,omitempty"`
 }
 
 var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
@@ -313,6 +314,9 @@ func (p IncomingProvenance) Validate() error {
 	if _, err := time.Parse(time.RFC3339Nano, source.OccurredAt); err != nil {
 		return errors.New("external source occurrence must be RFC3339")
 	}
+	if source.ReplyToMessageID != "" && ((source.Kind != "messaging_message" && source.Kind != "messaging_mention") || !canonicalUUIDRegexp.MatchString(source.ReplyToMessageID)) {
+		return errors.New("reply metadata requires a messaging event and canonical target UUID")
+	}
 	switch source.Kind {
 	case "messaging_mention", "messaging_message":
 		if source.MarkerID != "" || source.DueAt != "" {
@@ -359,6 +363,11 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 		for _, key := range []string{"surface", "event_id", "kind", "workspace_id", "installation_id", "authority_epoch", "place", "message_id", "message_revision", "message_seq", "occurred_at"} {
 			if raw, ok := fields.Source[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 				return fmt.Errorf("external source %s is required", key)
+			}
+		}
+		if raw, ok := fields.Source["reply_to_message_id"]; ok {
+			if (value.Source.Kind != "messaging_message" && value.Source.Kind != "messaging_mention") || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || value.Source.ReplyToMessageID == "" {
+				return errors.New("reply_to_message_id requires a messaging event and canonical target UUID")
 			}
 		}
 		if value.Source.Kind == "messaging_mention" {

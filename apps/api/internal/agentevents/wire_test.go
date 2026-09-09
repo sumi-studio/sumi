@@ -483,3 +483,37 @@ func TestHelloMarshalUsesCanonicalDecimalStrings(t *testing.T) {
 		t.Fatalf("hello wire mismatch\n got: %s\nwant: %s", got, want)
 	}
 }
+
+func TestReplyProvenanceMetadataRejectsMalformedTargets(t *testing.T) {
+	raw, err := os.ReadFile("../../../../contracts/agent-events-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures map[string]struct {
+		Wire struct {
+			Provenance json.RawMessage `json:"provenance"`
+		} `json:"wire"`
+	}
+	if err := json.Unmarshal(raw, &fixtures); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"external_reply", "external_mention", "external_reminder"} {
+		for _, target := range []any{nil, "", "not-a-uuid", "01992000-0000-7000-8000-000000000008"} {
+			var value map[string]any
+			if err := json.Unmarshal(fixtures[kind].Wire.Provenance, &value); err != nil {
+				t.Fatal(err)
+			}
+			value["source"].(map[string]any)["reply_to_message_id"] = target
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var provenance IncomingProvenance
+			err = json.Unmarshal(encoded, &provenance)
+			valid := target == "01992000-0000-7000-8000-000000000008" && kind != "external_reminder"
+			if (err == nil) != valid {
+				t.Fatalf("%s target=%v accepted=%v", kind, target, err == nil)
+			}
+		}
+	}
+}

@@ -846,6 +846,7 @@ export interface components {
             event_id: components["schemas"]["CanonicalUUID"];
             /** @enum {unknown} */
             kind: "messaging_mention" | "messaging_message";
+            reply_to_message_id?: components["schemas"]["CanonicalUUID"];
             workspace_id: components["schemas"]["CanonicalUUID"];
             installation_id: components["schemas"]["CanonicalUUID"];
             authority_epoch: components["schemas"]["JsonSafeInteger"];
