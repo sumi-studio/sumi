@@ -125,8 +125,9 @@ pub(crate) use memory_state::{
 };
 #[cfg(test)]
 pub(crate) use recovery::tests::{
-    assert_indeterminate_surface, open_boot_running_tools_store, setup_boot_running_tools,
-    setup_boot_running_tools_on_disk, setup_boot_running_tools_with_rowless_tail,
+    assert_indeterminate_surface, open_boot_running_tools_store, setup_boot_running_external_tool,
+    setup_boot_running_tools, setup_boot_running_tools_on_disk,
+    setup_boot_running_tools_with_rowless_tail,
 };
 #[allow(
     unused_imports,
@@ -134,8 +135,8 @@ pub(crate) use recovery::tests::{
 )]
 pub(crate) use recovery::{
     HydratedRunState, HydrationOutcome, LogicalRecoveryExecutor, PendingApprovalRecovery,
-    PendingErrorContextRecovery, ReceivedUserCommand, RecoveryStep, ResumeDirective,
-    SuffixRecovery,
+    PendingErrorContextRecovery, ReceivedUserCommand, RecoveredToolContinuation, RecoveryStep,
+    ResumeDirective, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -816,6 +817,54 @@ impl Store {
             intent_count: 0,
         };
 
+        let continuation = if let [
+            RecoveryStep::ContinueToolTurn {
+                command_id,
+                run_id,
+                turn_id,
+                turn_open,
+            },
+        ] = recovery_steps.as_slice()
+        {
+            let mut transaction = self.pool().begin().await?;
+            let row = sqlx::query("SELECT seq, received_at FROM inbound_commands WHERE command_id=? AND run_id=? AND status='applying' AND run_phase='assistant_started'")
+                .bind(command_id).bind(run_id).fetch_one(&mut *transaction).await?;
+            let seq = u64::try_from(row.try_get::<i64, _>("seq")?)?;
+            let received_at: String = row.try_get("received_at")?;
+            let provenance =
+                event_writer::authenticated_command_provenance(self, &mut transaction, command_id)
+                    .await?;
+            // Both UserMessage and ExternalEvent have the authenticated Store kind user_message.
+            let command = event_writer::load_authenticated_command(
+                self,
+                &mut transaction,
+                command_id,
+                seq,
+                "user_message",
+            )
+            .await?;
+            let continuation = RecoveredToolContinuation {
+                envelope: crate::gateway::CommandEnvelope {
+                    seq,
+                    command_id: crate::gateway::CommandId::parse(command_id)
+                        .map_err(anyhow::Error::msg)?,
+                    personality_agent_id: self.scope.personality_agent_id.clone(),
+                    provenance,
+                    command,
+                },
+                received_at: chrono::DateTime::parse_from_rfc3339(&received_at)?
+                    .with_timezone(&chrono::Utc),
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                turn_open: *turn_open,
+            };
+            transaction.commit().await?;
+            recovery_steps.clear();
+            Some(Box::new(continuation))
+        } else {
+            None
+        };
+
         if !recovery_steps.is_empty() {
             return Ok(HydrationOutcome::LogicalRecoveryRequired {
                 steps: recovery_steps,
@@ -836,6 +885,7 @@ impl Store {
             provider_context,
             memory,
             resume: ResumeDirective::AdmitCommands,
+            continuation,
             received_user_commands,
         }))
     }

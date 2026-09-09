@@ -12373,6 +12373,7 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
 }
 struct QueuedRecoveryDriver {
     identity: RpcIdentity,
+    hold_attempt: usize,
     starts: Mutex<Vec<(Vec<ContextMessage>, bool)>>,
     started: Notify,
     release: Notify,
@@ -12407,7 +12408,7 @@ impl RunDriver for QueuedRecoveryDriver {
             starts.len()
         };
         self.started.notify_one();
-        if count == 1 {
+        if count == self.hold_attempt {
             self.release.notified().await;
         }
         Ok(provider_attempt_stop(100 + count))
@@ -12619,7 +12620,9 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
         let (core, start) =
             SessionStartAuthority::from_hydrated(authority.clone(), &hydrated_again, broker)
                 .expect("bind recovered Session");
+        let continuation_attempts = usize::from(scenario == "tool_use");
         let driver = Arc::new(QueuedRecoveryDriver {
+            hold_attempt: 1 + continuation_attempts,
             identity: authority.rpc_identity().clone(),
             starts: Mutex::new(Vec::new()),
             started: Notify::new(),
@@ -12640,6 +12643,22 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
             "startup cannot call the provider before gateway replay"
         );
         let task = tokio::spawn(session.run());
+        if continuation_attempts == 1 {
+            tokio::time::timeout(Duration::from_secs(3), driver.started.notified())
+                .await
+                .expect("original owner resumes without replay");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if applied_acks(&frames).iter().any(|ack| ack.seq == 1) {
+                        break;
+                    }
+                    assert!(!task.is_finished(), "original continuation failed");
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original resumed owner finishes");
+        }
         commands.send(user(1)).await.expect("replay terminal owner");
         commands.send(user(2)).await.expect("replay queued command");
         tokio::time::timeout(Duration::from_secs(3), driver.started.notified())
@@ -12669,14 +12688,14 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
             let starts = driver.starts.lock().expect("provider starts");
             assert_eq!(
                 starts.len(),
-                1,
+                1 + continuation_attempts,
                 "duplicate replay cannot start or steer another attempt"
             );
             assert!(
-                !starts[0].1,
+                !starts[continuation_attempts].1,
                 "replayed receipt has no new monotonic timestamp"
             );
-            let users: Vec<_> = starts[0]
+            let users: Vec<_> = starts[continuation_attempts]
                 .0
                 .iter()
                 .map(crate::memory::overflow::context_message_to_public)
@@ -12859,5 +12878,440 @@ async fn queued_received_command_survives_owner_recovery_and_executes_once() {
         );
         pool.close().await;
         std::fs::remove_dir_all(directory).expect("remove crash fixture");
+    }
+}
+
+mod recovered_tool_continuity {
+    use super::*;
+    use crate::agent::run::BoundToolResult;
+    use crate::approval::authority::AuthorizedBoundInvocation;
+    use crate::approval::{
+        route_broker::RouteApprovalBroker, route_policy::RoutePolicy, route_reviewer::*,
+    };
+    use crate::tools::*;
+    use serde_json::json;
+
+    struct Review {
+        model: crate::approval::route_reviewer::ReviewerModelSpec,
+        seen: AtomicUsize,
+    }
+    #[async_trait]
+    impl ExecutionReviewerTransport for Review {
+        fn model_spec(&self) -> &crate::approval::route_reviewer::ReviewerModelSpec {
+            &self.model
+        }
+        async fn complete(
+            &self,
+            _prompt: &ExecutionReviewerPrompt,
+            _: usize,
+            _: ReviewerAttemptTrace,
+            _: CancellationToken,
+        ) -> std::result::Result<
+            ReviewerTransportOutput,
+            crate::approval::route_reviewer::ReviewerTransportError,
+        > {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(ReviewerTransportOutput { text: r#"{"outcome":"allow","risk":"low","rationale":"read the artifact after the unknown write"}"#.to_owned(), tool_trace: vec![] })
+        }
+    }
+    #[async_trait]
+    impl EscalationReviewerTransport for Review {
+        fn model_spec(&self) -> &crate::approval::route_reviewer::ReviewerModelSpec {
+            &self.model
+        }
+        async fn complete(
+            &self,
+            _: &EscalationReviewerPrompt,
+            _: usize,
+            _: ReviewerAttemptTrace,
+            _: CancellationToken,
+        ) -> std::result::Result<
+            ReviewerTransportOutput,
+            crate::approval::route_reviewer::ReviewerTransportError,
+        > {
+            panic!("normal read must not escalate")
+        }
+    }
+
+    struct ReadArtifact {
+        path: std::path::PathBuf,
+        reads: AtomicUsize,
+    }
+    #[async_trait]
+    impl Tool for ReadArtifact {
+        fn def(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "check_artifact".to_owned(),
+                description: "Read the existing artifact".to_owned(),
+                parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            }
+        }
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::ReadOnly
+        }
+        fn bound_adapter(self: Arc<Self>) -> Option<Arc<dyn BoundToolAdapter>> {
+            Some(self)
+        }
+        async fn execute(&self, _: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            panic!("raw execution is forbidden")
+        }
+    }
+    #[async_trait]
+    impl BoundToolAdapter for ReadArtifact {
+        fn identity(&self) -> AdapterIdentity {
+            AdapterIdentity::new("sumi.recovery_read", 1).unwrap()
+        }
+        async fn bind(
+            &self,
+            _: ToolBindCtx<'_>,
+        ) -> std::result::Result<ToolBinding, DescribeError> {
+            Ok(ToolBinding::new(
+                AppActionDescriptor::new(
+                    "artifact.read",
+                    CapabilityClass::Read,
+                    vec![ResourceScope::resource("workspace", "file", "artifact.txt")],
+                )?,
+                crate::tools::ReviewProjection::from_value(json!({"path":"artifact.txt"}))?,
+                BoundExecutionArguments::from_value(json!({}))?,
+            ))
+        }
+        async fn execute(
+            &self,
+            ctx: BoundToolCtx<'_>,
+        ) -> Result<BoundToolExecutionOutcome, ToolError> {
+            let receipt = ctx
+                .committed_effect_permit
+                .begin_local_effect()
+                .complete(|| async {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    let text = std::fs::read_to_string(&self.path)
+                        .expect("read actual recovered artifact");
+                    Ok::<_, ToolError>(text_output(text, json!({"path":"artifact.txt"})))
+                })
+                .await?;
+            Ok(BoundToolExecutionOutcome::without_live_post_commit(receipt))
+        }
+    }
+
+    struct Driver {
+        identity: RpcIdentity,
+        registry: Arc<ToolRegistry>,
+        workspace: WorkspacePaths,
+        contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    }
+    #[async_trait]
+    impl RunDriver for Driver {
+        fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+            assert_eq!(generation, self.identity.generation());
+            Ok(())
+        }
+        fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+            assert_eq!(identity, &self.identity);
+            Ok(())
+        }
+        async fn start_provider_for_command(
+            &self,
+            _: usize,
+            context: &[ContextMessage],
+            _: Option<Instant>,
+            _: CancellationToken,
+        ) -> Result<ProviderAttempt> {
+            let count = {
+                let mut seen = self.contexts.lock().unwrap();
+                seen.push(context.to_vec());
+                seen.len()
+            };
+            if count == 1 {
+                let inputs: Vec<_> = context
+                    .iter()
+                    .filter_map(|item| {
+                        match crate::memory::overflow::context_message_to_public(item) {
+                            PublicMessage::User(user) => Some(user),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    inputs.len(),
+                    1,
+                    "original external input must not be reinjected"
+                );
+                assert!(inputs[0].incoming_source.is_some());
+                assert!(context.iter().any(|item| matches!(crate::memory::overflow::context_message_to_public(item), PublicMessage::ToolResult(result) if result.details.get("error").and_then(Value::as_str)==Some("indeterminate"))));
+                Ok(provider_attempt_from_tool_call(
+                    701,
+                    ToolCall {
+                        id: "recovered-read".to_owned(),
+                        provider_call_id: None,
+                        name: "check_artifact".to_owned(),
+                        route: crate::provider::types::ToolInvocationRoute::Normal,
+                        arguments: serde_json::from_value(json!({})).unwrap(),
+                    },
+                ))
+            } else {
+                assert_eq!(
+                    count, 2,
+                    "one resumed inference and one response after the read"
+                );
+                assert!(context.iter().any(|item| matches!(crate::memory::overflow::context_message_to_public(item), PublicMessage::ToolResult(result) if result.tool_name=="check_artifact" && !result.is_error)));
+                let message = fixture_assistant_message(
+                    vec![AssistantContent::Text {
+                        text: "I checked the artifact; the earlier write completed.".to_owned(),
+                        wire_item_index: 0,
+                    }],
+                    StopReason::Stop,
+                );
+                let (tx, rx) = mpsc::channel(8);
+                tx.try_send(ProviderEvent::Start).unwrap();
+                tx.try_send(ProviderEvent::TextStart { content_index: 0 })
+                    .unwrap();
+                tx.try_send(ProviderEvent::TextDelta {
+                    content_index: 0,
+                    delta: "I checked the artifact; the earlier write completed.".to_owned(),
+                })
+                .unwrap();
+                tx.try_send(ProviderEvent::TextEnd {
+                    content_index: 0,
+                    content: "I checked the artifact; the earlier write completed.".to_owned(),
+                })
+                .unwrap();
+                tx.try_send(ProviderEvent::Done {
+                    reason: StopReason::Stop,
+                    output: ProviderOutput {
+                        message,
+                        provider_context: vec![],
+                    },
+                })
+                .unwrap();
+                drop(tx);
+                Ok(ProviderAttempt {
+                    message_id: "assistant-702".to_owned(),
+                    initial_message: public_initial_message(),
+                    uncalibrated_prompt_estimate: 0,
+                    events: ProviderEventStream::new(
+                        rx,
+                        CancellationToken::new(),
+                        "fixture",
+                        fixture_origin(),
+                    ),
+                })
+            }
+        }
+        async fn bind_tool_invocation(
+            &self,
+            flow: &str,
+            call: &ToolCall,
+        ) -> std::result::Result<SealedBoundToolInvocation, DescribeError> {
+            self.registry.bind(call, flow, &self.workspace).await
+        }
+        async fn execute_bound_tool_observed(
+            &self,
+            invocation: AuthorizedBoundInvocation,
+            cancel: CancellationToken,
+            update: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> std::result::Result<BoundToolResult, BoundExecutionError> {
+            let id = invocation.tool_call_id().to_owned();
+            let name = invocation.tool_name().to_owned();
+            let output = self
+                .registry
+                .execute_bound(invocation, cancel, update)
+                .await?;
+            Ok(BoundToolResult {
+                result: ToolResultMessage {
+                    tool_call_id: id,
+                    provider_call_id: None,
+                    tool_name: name,
+                    content: output.output.content,
+                    details: output.output.details,
+                    is_error: output.output.is_error,
+                    timestamp: chrono::Utc::now(),
+                },
+                live_post_commit: output.live_post_commit,
+            })
+        }
+        async fn execute_tool_observed(
+            &self,
+            _: &str,
+            _: &ToolCall,
+            _: CancellationToken,
+            _: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> Result<ToolResultMessage, ToolError> {
+            panic!("old write must never be replayed")
+        }
+        fn synthetic_error(&self, message: &str) -> PublicMessage {
+            panic!("unexpected recovery failure: {message}")
+        }
+        async fn plan_overflow_recovery(
+            &self,
+            _: &RunCore,
+            _: OverflowRecoveryRequest,
+            _: &[ContextMessage],
+        ) -> Result<OverflowRecoveryOutcome> {
+            bail!("no overflow in fixture")
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_write_resumes_same_command_through_normal_policy_read_without_user_resend() {
+        let (store, _) = crate::store::setup_boot_running_external_tool().await;
+        let authority = queued_recovery_authority(&store, 8);
+        let HydrationOutcome::PhysicalRecoveryRequired(intents) = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .unwrap()
+        else {
+            panic!("physical recovery required")
+        };
+        let attestation = crate::store::PhysicalReapAttestation::from_wire(
+            store.scope().personality_agent_id.as_str(),
+            8,
+            "queued-recovery-nonce".to_owned(),
+            7,
+        )
+        .unwrap();
+        SuffixRecovery::apply_boot_physical_receipt(
+            &store,
+            authority.lease(),
+            authority.fence(),
+            &attestation,
+            &intents,
+        )
+        .await
+        .unwrap();
+        let HydrationOutcome::Complete(hydrated) = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .unwrap()
+        else {
+            panic!("resume ready")
+        };
+        let original = hydrated.continuation.as_ref().unwrap().clone();
+        assert!(matches!(
+            original.envelope.command,
+            Command::ExternalEvent { .. }
+        ));
+        let directory =
+            std::env::temp_dir().join(format!("sumi-recovered-artifact-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("artifact.txt");
+        std::fs::write(&path, "completed before the old process died").unwrap();
+        let tool = Arc::new(ReadArtifact {
+            path,
+            reads: AtomicUsize::new(0),
+        });
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(tool.clone()).unwrap();
+        let model = crate::approval::route_reviewer::ReviewerModelSpec::new(
+            "recovery",
+            "fixture",
+            "https://reviewer.invalid",
+            "account",
+            "trust",
+            "policy",
+        );
+        let review = Arc::new(Review {
+            model: model.clone(),
+            seen: AtomicUsize::new(0),
+        });
+        let trust = crate::approval::route_reviewer::ReviewerTrustSet::new(vec![model.clone()]);
+        let broker = Arc::new(RouteApprovalBroker::new(
+            RoutePolicy::baseline_only_v1(),
+            Redactor::v1(),
+            Arc::new(
+                ExecutionReviewer::new(
+                    model.clone(),
+                    trust.clone(),
+                    review.clone(),
+                    ReviewerBudgetV1::execution(),
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                EscalationReviewer::new(
+                    model,
+                    trust,
+                    review.clone(),
+                    ReviewerBudgetV1::escalation(),
+                )
+                .unwrap(),
+            ),
+        ));
+        let (core, start) =
+            SessionStartAuthority::from_hydrated(authority.clone(), &hydrated, broker).unwrap();
+        let driver = Arc::new(Driver {
+            identity: authority.rpc_identity().clone(),
+            registry: Arc::new(builder.build()),
+            workspace: WorkspacePaths::new(&directory).unwrap(),
+            contexts: Mutex::new(vec![]),
+        });
+        let (gateway, commands, frames) = gateway();
+        let session = Session::start_hydrated(
+            store.as_ref().clone(),
+            gateway,
+            core,
+            Arc::new(SequentialRunWorker::new(driver.clone())),
+            start,
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn(session.run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM inbound_commands WHERE command_id=?")
+                        .bind(original.envelope.command_id.as_str())
+                        .fetch_one(store.pool())
+                        .await
+                        .unwrap();
+                if status == "applied" && frames.lock().unwrap().iter().any(|frame| matches!(frame, OutboundFrame::Event { envelope } if envelope.event.get("type").and_then(Value::as_str)==Some("message_end") && envelope.event.to_string().contains("I checked the artifact; the earlier write completed."))) {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "session ended before original command applied"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resumed command finishes without input");
+        assert_eq!(driver.contexts.lock().unwrap().len(), 2);
+        assert_eq!(
+            review.seen.load(Ordering::SeqCst),
+            0,
+            "baseline normal policy allows Read without AutoReview"
+        );
+        assert_eq!(tool.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbound_commands")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='agent_start'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='old-write' AND state='indeterminate'").fetch_one(store.pool()).await.unwrap(), 1);
+        drop(commands);
+        assert!(matches!(task.await.unwrap(), SessionResult::Completed(_)));
+        assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, OutboundFrame::Event { envelope } if envelope.event.get("type").and_then(Value::as_str)==Some("message_end") && envelope.event.to_string().contains("I checked the artifact; the earlier write completed."))));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT run_id FROM inbound_commands WHERE command_id=?"
+            )
+            .bind(original.envelope.command_id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            original.run_id
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

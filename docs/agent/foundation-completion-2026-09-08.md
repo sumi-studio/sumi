@@ -519,3 +519,28 @@ endpoint answers and a seeded later turn, not full Session command admission
 or real-model semantic fidelity. Initial runs stopped on sandbox loopback
 permission and a test-only wire-content parser assumption; neither established
 a product failure.
+
+## Interrupted undertaking: observed recovery gap
+
+The integrated attachment → poll → CSV undertaking did not complete. The
+first `write_file` emitted its start but no result; the file was absent on a
+read-only volume check. Its original stall cause is not established.
+Restoring the same PA recorded a truthful indeterminate result, then closed
+the original command without another inference. That is a continuation gap,
+not successful completion of the requested work.
+
+A single subsequent Human progress question reached the same Messaging DM.
+The PA checked the missing file and used a workspace process to create and
+read back the 90-byte CSV. The process succeeded and its container was removed.
+The diagnostic runner incorrectly rejected the resulting `process_completed`
+input as an extra command and stopped the PA during its next response. There
+was no delivered progress reply or attachment. This probe therefore does not
+establish end-to-end acceptance, and its original failure record is retained.
+
+The repair under verification resumes the original command after a recovered
+tool turn, retaining indeterminate results instead of replaying old effects.
+Continuation after a partial new assistant message, and recovery with
+unclassified controls mixed into the recovery steps, remain separate gaps.
+Graceful RuntimeShutdown also currently shares the explicit Abort closure path;
+its final Store writes need not appear in the disconnected API event tail.
+The tail alone therefore does not prove that command 33 remains open in Store.

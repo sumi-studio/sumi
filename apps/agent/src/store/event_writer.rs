@@ -6274,6 +6274,24 @@ impl BootstrapRecoveryGuard<'_> {
     /// inbound command's stored turn remains its original ownership evidence,
     /// but a continued provider/tool loop may have advanced the same run to a
     /// later turn before the process stopped.
+    /// A completed tool turn permits a fresh inference, never replay of its calls.
+    /// The marker is reconstructed from authenticated lifecycle events, and survives
+    /// a crash after the next TurnStart until that inference starts its message.
+    pub(in crate::store) fn authenticated_tool_continuation(
+        &self,
+        run_id: &str,
+    ) -> Option<(String, bool)> {
+        let lifecycle = &self.state.checkpoint.as_ref()?.lifecycle;
+        let closed = lifecycle.tool_continuations.get(run_id)?;
+        if !lifecycle.live_runs.contains(run_id) {
+            return None;
+        }
+        Some(match lifecycle.open_turns.get(run_id) {
+            Some(open) => (open.clone(), true),
+            None => (closed.clone(), false),
+        })
+    }
+
     pub(in crate::store) fn authenticated_open_turn(&self, run_id: &str) -> Result<&str> {
         let lifecycle = &self
             .state
@@ -12861,6 +12879,29 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
         .fetch_optional(&mut **transaction)
         .await?;
         let mut boundary = latest_turn.or(agent_start).unwrap_or(0);
+        // Before the first inference of a continuation, its immediately preceding
+        // tool turn is still a lifecycle dependency. Reconstruct that one turn so
+        // a second crash after TurnStart cannot lose the authenticated handoff.
+        if let Some(latest) = latest_turn {
+            let inference_started: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM agent_events WHERE seq>? AND event_type='message_start'
+                 AND json_extract(internal_metadata,'$.run_id')=?
+                 AND json_extract(envelope,'$.message.role')='assistant')",
+            ).bind(latest).bind(&run_id).fetch_one(&mut **transaction).await?;
+            if !inference_started {
+                let preceding_turn: Option<i64> = sqlx::query_scalar(
+                    "SELECT seq FROM agent_events WHERE seq<? AND event_type='turn_start'
+                     AND json_extract(internal_metadata,'$.run_id')=? ORDER BY seq DESC LIMIT 1",
+                )
+                .bind(latest)
+                .bind(&run_id)
+                .fetch_optional(&mut **transaction)
+                .await?;
+                if let Some(preceding) = preceding_turn {
+                    boundary = boundary.min(preceding);
+                }
+            }
+        }
         let dependency_turns: Vec<String> = sqlx::query_scalar(
             "SELECT turn_id FROM approval_log WHERE run_id=? AND state='pending'
              UNION SELECT c.turn_id FROM tool_executions t
@@ -12997,6 +13038,7 @@ fn apply_memory_projection_delta(
 #[derive(Clone, Default)]
 struct DurableLifecycleState {
     live_runs: HashSet<String>,
+    tool_continuations: HashMap<String, String>,
     open_turns: HashMap<String, String>,
     open_messages: HashMap<String, (String, String, String)>,
     seen_agent_starts: HashSet<String>,
@@ -13597,6 +13639,7 @@ fn apply_lifecycle_event(
             {
                 bail!("AgentEnd for {run_id} requires normal-form lifecycle closure");
             }
+            state.tool_continuations.remove(run_id);
             state.seen_agent_starts.remove(run_id);
             state
                 .seen_turn_starts
@@ -13727,6 +13770,17 @@ fn apply_lifecycle_event(
                     );
                 }
             }
+            if envelope
+                .get("tool_results")
+                .and_then(Value::as_array)
+                .is_some_and(|results| !results.is_empty())
+            {
+                state
+                    .tool_continuations
+                    .insert(run_id.clone(), turn_id.clone());
+            } else {
+                state.tool_continuations.remove(&run_id);
+            }
             state.open_turns.remove(&run_id);
             state
                 .seen_turn_starts
@@ -13754,6 +13808,7 @@ fn apply_lifecycle_event(
             let role = lifecycle_string(envelope.get("message").unwrap_or(&Value::Null), "role")?;
             if role == "assistant" {
                 let (run_id, turn_id) = lifecycle_binding(metadata, "assistant MessageStart")?;
+                state.tool_continuations.remove(&run_id);
                 if state.open_turns.get(&run_id) != Some(&turn_id) {
                     bail!(
                         "assistant MessageStart for {run_id}/{turn_id} requires that exact open turn"

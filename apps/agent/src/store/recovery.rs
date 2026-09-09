@@ -92,6 +92,12 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
+    ContinueToolTurn {
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        turn_open: bool,
+    },
     ResumeAssistantFromDurableEvents {
         command_id: String,
         run_id: String,
@@ -138,6 +144,8 @@ pub(crate) enum RecoveryStep {
 /// call a provider or tool: terminal calls reuse their exact durable result,
 /// rowless calls receive a synthetic pre-execution error, and a typed pending
 /// approval atomically becomes a cancelled prepared tool plus its error result.
+/// An ordinary tool turn stays owned by its command and hands off a fresh
+/// inference after its paired results; it never replays those calls.
 /// An Error terminal without tool calls closes the interrupted run while keeping
 /// its exact error in the transcript. This does not resume the old process's
 /// remaining automatic retries or turn the failed attempt into a success.
@@ -346,7 +354,8 @@ impl LogicalRecoveryExecutor {
             .await
             .context("failed to commit logical-recovery inspection")?;
 
-        snapshot.into_batch(executor_generation)
+        let continue_inference = expected_pending.is_none() && !snapshot.tool_results.is_empty();
+        snapshot.into_batch(executor_generation, continue_inference)
     }
 }
 
@@ -782,6 +791,7 @@ impl AssistantRecoverySnapshot {
     fn into_batch(
         self,
         executor_generation: crate::runtime::contracts::ProcessGeneration,
+        continue_inference: bool,
     ) -> Result<EventBatch> {
         let disposition_writes = self
             .missing_dispositions
@@ -897,14 +907,16 @@ impl AssistantRecoverySnapshot {
             )?),
             projections: Vec::new(),
         });
-        writes.push(EventWrite {
-            event: Some(super::DurableEvent::agent_end(&self.run_id)?),
-            projections: vec![Projection::CommandApplied {
-                command_id: self.command_id,
-                command_seq: self.command_seq,
-                run_id: Some(self.run_id),
-            }],
-        });
+        if !continue_inference {
+            writes.push(EventWrite {
+                event: Some(super::DurableEvent::agent_end(&self.run_id)?),
+                projections: vec![Projection::CommandApplied {
+                    command_id: self.command_id,
+                    command_seq: self.command_seq,
+                    run_id: Some(self.run_id),
+                }],
+            });
+        }
         Ok(EventBatch {
             writes,
             injected_commands: Vec::new(),
@@ -937,9 +949,19 @@ pub(crate) struct HydratedRunState {
     /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
     pub memory: HydratedMemoryRuntime,
     pub resume: ResumeDirective,
+    pub continuation: Option<Box<RecoveredToolContinuation>>,
     /// Still-unclassified inputs whose authenticated gateway replay must be
     /// admitted once by the new Session. They remain durably `received`.
     pub received_user_commands: Vec<ReceivedUserCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveredToolContinuation {
+    pub envelope: crate::gateway::CommandEnvelope,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub run_id: String,
+    pub turn_id: String,
+    pub turn_open: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1383,7 +1405,16 @@ impl SuffixRecovery {
                     turn_id: _,
                     ..
                 } => {
-                    if let Some((pending_turn_id, pending)) =
+                    if let Some((active_turn, turn_open)) =
+                        recovery.authenticated_tool_continuation(run_id)
+                    {
+                        step = RecoveryStep::ContinueToolTurn {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: active_turn,
+                            turn_open,
+                        };
+                    } else if let Some((pending_turn_id, pending)) =
                         pending_approval_for_recovery(store, recovery, run_id).await?
                     {
                         let active_turn_id = recovery.authenticated_open_turn(run_id)?.to_owned();
@@ -2487,11 +2518,50 @@ pub(crate) mod tests {
         assistant: PublicMessage,
         terminal_tools: &[(&str, &str, u32, bool)],
     ) {
+        seed_tool_use_restart_seam_with_input(
+            writer,
+            continuation_turn,
+            assistant,
+            terminal_tools,
+            false,
+        )
+        .await;
+    }
+
+    fn external_recovery_provenance() -> IncomingProvenance {
+        let mut value = serde_json::to_value(crate::gateway::test_messaging_provenance()).unwrap();
+        value["personality_agent_id"] = json!(test_personality_agent_id());
+        serde_json::from_value(value).unwrap()
+    }
+
+    async fn seed_tool_use_restart_seam_with_input(
+        writer: &EventWriter,
+        continuation_turn: bool,
+        assistant: PublicMessage,
+        terminal_tools: &[(&str, &str, u32, bool)],
+        external: bool,
+    ) {
         let append_to_l0 = !matches!(
             &assistant,
             PublicMessage::Assistant(message) if message.stop_reason == StopReason::Error
         );
-        persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
+        if external {
+            writer
+                .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                    seq: 1,
+                    command_id: crate::gateway::CommandId::parse(TOOL_USE_RECOVERY_COMMAND_ID)
+                        .unwrap(),
+                    personality_agent_id: test_personality_agent_id(),
+                    provenance: external_recovery_provenance(),
+                    command: Command::ExternalEvent {
+                        content: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                    },
+                }))
+                .await
+                .unwrap();
+        } else {
+            persist_user(writer, 1, TOOL_USE_RECOVERY_COMMAND_ID).await;
+        }
         writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
@@ -2518,7 +2588,7 @@ pub(crate) mod tests {
                 .await
                 .expect("ToolUse recovery command timestamp");
         let user = PublicMessage::User(UserMessage {
-            incoming_source: None,
+            incoming_source: external.then(external_recovery_provenance),
             incoming_timing: writer
                 .timing_for_command(TOOL_USE_RECOVERY_COMMAND_ID)
                 .await
@@ -2596,7 +2666,15 @@ pub(crate) mod tests {
                         ],
                     },
                 ],
-                injected_commands: vec![InjectedCommand::new(1, command_id, test_provenance())],
+                injected_commands: vec![InjectedCommand::new(
+                    1,
+                    command_id,
+                    if external {
+                        external_recovery_provenance()
+                    } else {
+                        test_provenance()
+                    },
+                )],
             })
             .await
             .expect("persist ToolUse recovery user turn");
@@ -2783,6 +2861,20 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) async fn setup_boot_running_external_tool() -> (Arc<Store>, EventWriter) {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam_with_input(
+            &writer,
+            false,
+            tool_use_recovery_assistant_with_calls(&[("old-write", "write_file", 0)]),
+            &[],
+            true,
+        )
+        .await;
+        persist_running_tool(&writer, "old-write", "write_file", 0).await;
+        (store, writer)
+    }
+
     pub(crate) async fn setup_boot_running_tools(
         calls: &[(&str, &str, u32)],
     ) -> (Arc<Store>, EventWriter) {
@@ -2844,7 +2936,7 @@ pub(crate) mod tests {
                 (SELECT COUNT(*) FROM physical_recovery_receipt_applications)
              FROM inbound_commands WHERE seq=1",
         ).fetch_one(store.pool()).await.expect("atomic receipt and preserved queue"),
-        ("applied".to_owned(), 2, 1, 1));
+        ("applying".to_owned(), 2, 0, 1));
     }
 
     /// Admitting the co-committed suffix widened what may sit inside a
@@ -3006,7 +3098,7 @@ pub(crate) mod tests {
             .await
             .expect("read the restarted state after the hard kill");
             let expected = if boundary == "after_commit" {
-                (1, "indeterminate".to_owned(), 1, 1, 1)
+                (1, "indeterminate".to_owned(), 1, 0, 0)
             } else {
                 (0, "running".to_owned(), 0, 0, 0)
             };
@@ -3591,24 +3683,107 @@ pub(crate) mod tests {
             .fetch_one(first_restart.pool())
             .await
             .expect("recovered lifecycle closure"),
-            ("applied".to_owned(), "finished".to_owned(), 1, 1, 3)
+            (
+                "applying".to_owned(),
+                "assistant_started".to_owned(),
+                1,
+                0,
+                3
+            )
         );
         first_restart.pool().close().await;
         drop(first_restart);
 
-        let second_restart = Store::open(&path, scope, provider)
+        let second_restart = Store::open(&path, scope.clone(), provider.clone())
             .await
             .expect("open second restart");
-        assert!(matches!(
-            second_restart
-                .hydrate(&lease, &fence)
-                .await
-                .expect("hydrate second restart"),
-            HydrationOutcome::Complete(_)
-        ));
+        let HydrationOutcome::Complete(hydrated) = second_restart
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate second restart")
+        else {
+            panic!("completed tool turn must hand off continuation")
+        };
+        let continuation = hydrated.continuation.expect("same-command continuation");
+        assert_eq!(
+            continuation.envelope.command_id.as_str(),
+            TOOL_USE_RECOVERY_COMMAND_ID
+        );
+        assert_eq!(continuation.run_id, TOOL_USE_RECOVERY_RUN_ID);
+        assert!(!continuation.turn_open);
+        let next_turn = "recovered-next-turn";
+        let writer = EventWriter::new(Arc::new(second_restart.clone()));
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        super::super::DurableEvent::turn_start(TOOL_USE_RECOVERY_RUN_ID, next_turn)
+                            .unwrap(),
+                    ),
+                    projections: vec![],
+                }],
+                injected_commands: vec![],
+            })
+            .await
+            .expect("next turn starts before another crash");
+        drop(writer);
+        second_restart.pool().close().await;
+        drop(second_restart);
+        let second_restart = Store::open(&path, scope, provider)
+            .await
+            .expect("reopen after continuation TurnStart");
+        let HydrationOutcome::Complete(hydrated) = second_restart
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate started continuation")
+        else {
+            panic!("started continuation must remain resumable")
+        };
+        let continuation = hydrated
+            .continuation
+            .expect("started same-command continuation");
+        assert!(continuation.turn_open);
+        assert_eq!(continuation.turn_id, next_turn);
         second_restart.pool().close().await;
         drop(second_restart);
         std::fs::remove_dir_all(root).expect("remove logical ToolUse recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn entirely_unstarted_tool_turn_continues_without_replaying_calls() {
+        let (store, writer) = setup().await;
+        seed_tool_use_restart_seam_with_assistant(
+            &writer,
+            false,
+            tool_use_recovery_assistant_with_calls(&[("never-started-write", "write_file", 0)]),
+            &[],
+        )
+        .await;
+        let (lease, fence, _) = boot_recovery_authority(&store);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } =
+            store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("unstarted call requires paired result")
+        };
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .unwrap();
+        let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("unstarted call must permit fresh inference")
+        };
+        assert!(hydrated.continuation.is_some());
+        assert!(hydrated.messages.iter().any(|item| matches!(crate::memory::overflow::context_message_to_public(item), PublicMessage::ToolResult(result) if result.tool_call_id == "never-started-write" && result.is_error)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4065,7 +4240,7 @@ pub(crate) mod tests {
             .fetch_one(store.pool())
             .await
             .expect("command status after rejected recovery"),
-            "applied"
+            "applying"
         );
     }
 
