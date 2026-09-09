@@ -176,9 +176,18 @@ pub(crate) struct DurableEvent {
     raw_json: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InferenceInterruptionReason {
+    RuntimeShutdown,
+    ProcessRestart,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableEventMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) inference_interruption: Option<InferenceInterruptionReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) audience: Option<OutputAudience>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,6 +217,14 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl DurableEvent {
+    pub(crate) fn with_inference_interruption(
+        mut self,
+        reason: Option<InferenceInterruptionReason>,
+    ) -> Self {
+        self.metadata.inference_interruption = reason;
+        self
+    }
+
     #[allow(
         dead_code,
         reason = "constructed by the T15 run loop through the T12-frozen boundary"
@@ -6274,15 +6291,16 @@ impl BootstrapRecoveryGuard<'_> {
     /// inbound command's stored turn remains its original ownership evidence,
     /// but a continued provider/tool loop may have advanced the same run to a
     /// later turn before the process stopped.
-    /// A completed tool turn permits a fresh inference, never replay of its calls.
+    /// A settled tool turn or marked provider interruption permits fresh inference,
+    /// never replay of earlier calls.
     /// The marker is reconstructed from authenticated lifecycle events, and survives
     /// a crash after the next TurnStart until that inference starts its message.
-    pub(in crate::store) fn authenticated_tool_continuation(
+    pub(in crate::store) fn authenticated_inference_continuation(
         &self,
         run_id: &str,
     ) -> Option<(String, bool)> {
         let lifecycle = &self.state.checkpoint.as_ref()?.lifecycle;
-        let closed = lifecycle.tool_continuations.get(run_id)?;
+        let closed = lifecycle.inference_continuations.get(run_id)?;
         if !lifecycle.live_runs.contains(run_id) {
             return None;
         }
@@ -6290,6 +6308,42 @@ impl BootstrapRecoveryGuard<'_> {
             Some(open) => (open.clone(), true),
             None => (closed.clone(), false),
         })
+    }
+
+    pub(in crate::store) fn authenticated_open_assistant(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Option<(String, PublicMessage)> {
+        let lifecycle = &self.state.checkpoint.as_ref()?.lifecycle;
+        lifecycle
+            .open_messages
+            .iter()
+            .find_map(|(id, (run, turn, role))| {
+                (run == run_id && turn == turn_id && role == "assistant")
+                    .then(|| {
+                        lifecycle
+                            .open_assistant_prefixes
+                            .get(id)
+                            .cloned()
+                            .map(|message| (id.clone(), message))
+                    })
+                    .flatten()
+            })
+    }
+
+    pub(in crate::store) fn authenticated_interruption(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Option<InferenceInterruptionReason> {
+        self.state
+            .checkpoint
+            .as_ref()?
+            .lifecycle
+            .interrupted_assistants
+            .get(&(run_id.to_owned(), turn_id.to_owned()))
+            .copied()
     }
 
     pub(in crate::store) fn authenticated_open_turn(&self, run_id: &str) -> Result<&str> {
@@ -12880,7 +12934,7 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
         .await?;
         let mut boundary = latest_turn.or(agent_start).unwrap_or(0);
         // Before the first inference of a continuation, its immediately preceding
-        // tool turn is still a lifecycle dependency. Reconstruct that one turn so
+        // turn is still a lifecycle dependency. Reconstruct that one turn so
         // a second crash after TurnStart cannot lose the authenticated handoff.
         if let Some(latest) = latest_turn {
             let inference_started: bool = sqlx::query_scalar(
@@ -13038,7 +13092,9 @@ fn apply_memory_projection_delta(
 #[derive(Clone, Default)]
 struct DurableLifecycleState {
     live_runs: HashSet<String>,
-    tool_continuations: HashMap<String, String>,
+    inference_continuations: HashMap<String, String>,
+    interrupted_assistants: HashMap<(String, String), InferenceInterruptionReason>,
+    open_assistant_prefixes: HashMap<String, PublicMessage>,
     open_turns: HashMap<String, String>,
     open_messages: HashMap<String, (String, String, String)>,
     seen_agent_starts: HashSet<String>,
@@ -13609,6 +13665,34 @@ fn apply_lifecycle_event(
     envelope: &Value,
     proposed: bool,
 ) -> Result<()> {
+    if metadata.inference_interruption.is_some() {
+        if !matches!(kind, "message_end" | "turn_end") {
+            bail!("inference interruption requires MessageEnd or TurnEnd");
+        }
+        let message = envelope
+            .get("message")
+            .ok_or_else(|| anyhow!("interruption requires assistant message"))?;
+        if message.get("role").and_then(Value::as_str) != Some("assistant")
+            || message.get("stop_reason").and_then(Value::as_str) != Some("aborted")
+            || message.get("interrupted").and_then(Value::as_bool) != Some(true)
+            || message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_none_or(|items| {
+                    items.iter().any(|item| {
+                        !matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("text" | "thinking")
+                        )
+                    })
+                })
+        {
+            bail!("inference interruption requires a partial assistant without tool calls");
+        }
+        if !state.pending_approvals.is_empty() || !state.approved_once.is_empty() {
+            bail!("inference interruption cannot restore pending approval authority");
+        }
+    }
     match kind {
         "agent_start" => {
             let run_id = metadata
@@ -13639,7 +13723,7 @@ fn apply_lifecycle_event(
             {
                 bail!("AgentEnd for {run_id} requires normal-form lifecycle closure");
             }
-            state.tool_continuations.remove(run_id);
+            state.inference_continuations.remove(run_id);
             state.seen_agent_starts.remove(run_id);
             state
                 .seen_turn_starts
@@ -13770,16 +13854,23 @@ fn apply_lifecycle_event(
                     );
                 }
             }
-            if envelope
-                .get("tool_results")
-                .and_then(Value::as_array)
-                .is_some_and(|results| !results.is_empty())
+            let interruption = state
+                .interrupted_assistants
+                .remove(&(run_id.clone(), turn_id.clone()));
+            if interruption != metadata.inference_interruption {
+                bail!("TurnEnd interruption reason must match assistant MessageEnd");
+            }
+            if interruption.is_some()
+                || envelope
+                    .get("tool_results")
+                    .and_then(Value::as_array)
+                    .is_some_and(|results| !results.is_empty())
             {
                 state
-                    .tool_continuations
+                    .inference_continuations
                     .insert(run_id.clone(), turn_id.clone());
             } else {
-                state.tool_continuations.remove(&run_id);
+                state.inference_continuations.remove(&run_id);
             }
             state.open_turns.remove(&run_id);
             state
@@ -13808,7 +13899,14 @@ fn apply_lifecycle_event(
             let role = lifecycle_string(envelope.get("message").unwrap_or(&Value::Null), "role")?;
             if role == "assistant" {
                 let (run_id, turn_id) = lifecycle_binding(metadata, "assistant MessageStart")?;
-                state.tool_continuations.remove(&run_id);
+                state.inference_continuations.remove(&run_id);
+                state
+                    .interrupted_assistants
+                    .remove(&(run_id.clone(), turn_id.clone()));
+                state.open_assistant_prefixes.insert(
+                    message_id.to_owned(),
+                    serde_json::from_value(envelope["message"].clone())?,
+                );
                 if state.open_turns.get(&run_id) != Some(&turn_id) {
                     bail!(
                         "assistant MessageStart for {run_id}/{turn_id} requires that exact open turn"
@@ -13862,6 +13960,12 @@ fn apply_lifecycle_event(
                     _ => bail!(
                         "assistant MessageEnd {message_id} does not close its exact open message"
                     ),
+                }
+                state.open_assistant_prefixes.remove(message_id);
+                if let Some(reason) = metadata.inference_interruption {
+                    state
+                        .interrupted_assistants
+                        .insert((run_id.clone(), turn_id.clone()), reason);
                 }
                 state.last_assistant_end.insert(
                     (run_id.clone(), turn_id.clone()),

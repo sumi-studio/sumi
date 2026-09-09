@@ -92,7 +92,7 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
-    ContinueToolTurn {
+    ContinueInference {
         command_id: String,
         run_id: String,
         turn_id: String,
@@ -193,6 +193,8 @@ struct AssistantRecoverySnapshot {
     assistant: PublicMessage,
     tool_results: Vec<ToolResultMessage>,
     missing_dispositions: Vec<MissingToolDisposition>,
+    interruption: Option<super::InferenceInterruptionReason>,
+    missing_assistant_end: Option<String>,
 }
 
 impl LogicalRecoveryExecutor {
@@ -347,6 +349,8 @@ impl LogicalRecoveryExecutor {
             &active_turn_id,
             expected_pending.as_ref(),
             pending_physical,
+            recovery.authenticated_open_assistant(run_id, &active_turn_id),
+            recovery.authenticated_interruption(run_id, &active_turn_id),
         )
         .await?;
         transaction
@@ -354,7 +358,8 @@ impl LogicalRecoveryExecutor {
             .await
             .context("failed to commit logical-recovery inspection")?;
 
-        let continue_inference = expected_pending.is_none() && !snapshot.tool_results.is_empty();
+        let continue_inference = expected_pending.is_none()
+            && (snapshot.interruption.is_some() || !snapshot.tool_results.is_empty());
         snapshot.into_batch(executor_generation, continue_inference)
     }
 }
@@ -373,6 +378,8 @@ impl AssistantRecoverySnapshot {
         active_turn_id: &str,
         expected_pending: Option<&PendingApprovalRecovery>,
         pending_physical: &HashMap<String, PendingPhysicalResolution>,
+        open_assistant: Option<(String, PublicMessage)>,
+        interruption: Option<super::InferenceInterruptionReason>,
     ) -> Result<Self> {
         let command = sqlx::query(
             "SELECT seq, command_kind, status, application_kind, run_id, turn_id, run_phase
@@ -409,6 +416,30 @@ impl AssistantRecoverySnapshot {
             bail!(
                 "logical-recovery command {command_id} is not the exact live assistant_started owner"
             );
+        }
+
+        if let Some((message_id, prefix)) = open_assistant {
+            let unsettled: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM tool_executions WHERE run_id=? AND state IN ('prepared','running')) +
+                 (SELECT COUNT(*) FROM approval_log WHERE run_id=? AND state='pending') +
+                 (SELECT COUNT(*) FROM inbound_commands WHERE command_id != ? AND status='applying')",
+            ).bind(run_id).bind(run_id).bind(command_id).fetch_one(&mut **transaction).await?;
+            if unsettled != 0 || expected_pending.is_some() || !pending_physical.is_empty() {
+                bail!(
+                    "open assistant recovery cannot supersede unresolved tool, approval or control work"
+                );
+            }
+            return Ok(Self {
+                command_id: command_id.to_owned(),
+                command_seq,
+                run_id: run_id.to_owned(),
+                turn_id: active_turn_id.to_owned(),
+                assistant: crate::agent::normalize_partial_assistant(prefix)?,
+                tool_results: Vec::new(),
+                missing_dispositions: Vec::new(),
+                interruption: Some(super::InferenceInterruptionReason::ProcessRestart),
+                missing_assistant_end: Some(message_id),
+            });
         }
 
         // Multiple assistant attempts may exist after retries. The latest
@@ -458,7 +489,7 @@ impl AssistantRecoverySnapshot {
         let PublicMessage::Assistant(assistant_message) = &assistant else {
             unreachable!("assistant transcript variant was matched")
         };
-        if assistant_message.stop_reason == StopReason::Error
+        if (assistant_message.stop_reason == StopReason::Error || interruption.is_some())
             && assistant_message.content.iter().all(|item| {
                 matches!(
                     item,
@@ -466,11 +497,10 @@ impl AssistantRecoverySnapshot {
                 )
             })
         {
-            // A completed provider failure can be followed by a process exit
-            // before the retry wait or normal TurnEnd/AgentEnd finishes. Close
-            // that exact interrupted attempt, without replaying an external
-            // effect or erasing the original error. Pending provider context is
-            // rejected by plan_batch until its disposition is implemented.
+            // A provider failure or marked runtime interruption can lose its
+            // TurnEnd to a process exit. Close only that exact attempt; marked
+            // interruptions retain the applying command for fresh inference.
+            // Pending Error context still requires its separate disposition.
             let unsettled: i64 = sqlx::query_scalar(
                 "SELECT
                     (SELECT COUNT(*) FROM tool_executions
@@ -489,9 +519,9 @@ impl AssistantRecoverySnapshot {
             .bind(active_turn_id)
             .fetch_one(&mut **transaction)
             .await
-            .context("failed to inspect the interrupted Error suffix")?;
+            .context("failed to inspect the interrupted provider suffix")?;
             if unsettled != 0 || expected_pending.is_some() || !pending_physical.is_empty() {
-                bail!("Error logical recovery cannot close unresolved work or a later attempt");
+                bail!("provider logical recovery cannot close unresolved work or a later attempt");
             }
             return Ok(Self {
                 command_id: command_id.to_owned(),
@@ -501,6 +531,8 @@ impl AssistantRecoverySnapshot {
                 assistant,
                 tool_results: Vec::new(),
                 missing_dispositions: Vec::new(),
+                interruption,
+                missing_assistant_end: None,
             });
         }
         if assistant_message.stop_reason != StopReason::ToolUse || assistant_message.interrupted {
@@ -785,6 +817,8 @@ impl AssistantRecoverySnapshot {
             assistant,
             tool_results,
             missing_dispositions,
+            interruption: None,
+            missing_assistant_end: None,
         })
     }
 
@@ -802,6 +836,28 @@ impl AssistantRecoverySnapshot {
             })
             .sum::<usize>();
         let mut writes = Vec::with_capacity(disposition_writes.saturating_add(2));
+        if let Some(message_id) = self.missing_assistant_end {
+            writes.push(EventWrite {
+                event: Some(
+                    super::DurableEvent::message_in_turn(
+                        "message_end",
+                        &message_id,
+                        &self.assistant,
+                        Some(self.run_id.clone()),
+                        Some(self.turn_id.clone()),
+                    )?
+                    .with_inference_interruption(self.interruption),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id,
+                    role: "assistant",
+                    message: self.assistant.clone(),
+                    append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
+                }],
+            });
+        }
         for disposition in self.missing_dispositions {
             match disposition {
                 MissingToolDisposition::ApprovalCancelled(cancelled) => {
@@ -899,12 +955,15 @@ impl AssistantRecoverySnapshot {
             }
         }
         writes.push(EventWrite {
-            event: Some(super::DurableEvent::turn_end(
-                &self.run_id,
-                &self.turn_id,
-                self.assistant,
-                self.tool_results,
-            )?),
+            event: Some(
+                super::DurableEvent::turn_end(
+                    &self.run_id,
+                    &self.turn_id,
+                    self.assistant,
+                    self.tool_results,
+                )?
+                .with_inference_interruption(self.interruption),
+            ),
             projections: Vec::new(),
         });
         if !continue_inference {
@@ -949,14 +1008,14 @@ pub(crate) struct HydratedRunState {
     /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
     pub memory: HydratedMemoryRuntime,
     pub resume: ResumeDirective,
-    pub continuation: Option<Box<RecoveredToolContinuation>>,
+    pub continuation: Option<Box<RecoveredInferenceContinuation>>,
     /// Still-unclassified inputs whose authenticated gateway replay must be
     /// admitted once by the new Session. They remain durably `received`.
     pub received_user_commands: Vec<ReceivedUserCommand>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RecoveredToolContinuation {
+pub(crate) struct RecoveredInferenceContinuation {
     pub envelope: crate::gateway::CommandEnvelope,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub run_id: String,
@@ -1406,9 +1465,9 @@ impl SuffixRecovery {
                     ..
                 } => {
                     if let Some((active_turn, turn_open)) =
-                        recovery.authenticated_tool_continuation(run_id)
+                        recovery.authenticated_inference_continuation(run_id)
                     {
-                        step = RecoveryStep::ContinueToolTurn {
+                        step = RecoveryStep::ContinueInference {
                             command_id: command_id.clone(),
                             run_id: run_id.clone(),
                             turn_id: active_turn,
@@ -2541,6 +2600,27 @@ pub(crate) mod tests {
         terminal_tools: &[(&str, &str, u32, bool)],
         external: bool,
     ) {
+        seed_assistant_restart_boundary(
+            writer,
+            continuation_turn,
+            assistant,
+            terminal_tools,
+            external,
+            true,
+            None,
+        )
+        .await;
+    }
+
+    async fn seed_assistant_restart_boundary(
+        writer: &EventWriter,
+        continuation_turn: bool,
+        assistant: PublicMessage,
+        terminal_tools: &[(&str, &str, u32, bool)],
+        external: bool,
+        close_assistant: bool,
+        interruption: Option<super::super::InferenceInterruptionReason>,
+    ) {
         let append_to_l0 = !matches!(
             &assistant,
             PublicMessage::Assistant(message) if message.stop_reason == StopReason::Error
@@ -2763,52 +2843,57 @@ pub(crate) mod tests {
         } else {
             TOOL_USE_RECOVERY_TURN_ID
         };
+        let mut writes = vec![
+            EventWrite {
+                event: Some(
+                    DurableEvent::message_in_turn(
+                        "message_start",
+                        TOOL_USE_RECOVERY_ASSISTANT_ID,
+                        &assistant,
+                        Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                        Some(active_turn_id.to_owned()),
+                    )
+                    .expect("ToolUse assistant MessageStart"),
+                ),
+                projections: if continuation_turn {
+                    Vec::new()
+                } else {
+                    vec![Projection::RunPhase {
+                        command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
+                        run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }]
+                },
+            },
+            EventWrite {
+                event: Some(
+                    DurableEvent::message_in_turn(
+                        "message_end",
+                        TOOL_USE_RECOVERY_ASSISTANT_ID,
+                        &assistant,
+                        Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
+                        Some(active_turn_id.to_owned()),
+                    )
+                    .expect("ToolUse assistant MessageEnd")
+                    .with_inference_interruption(interruption),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned(),
+                    role: "assistant",
+                    message: assistant,
+                    append_to_l0,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
+                }],
+            },
+        ];
+        if !close_assistant {
+            writes.pop();
+        }
         writer
             .apply(EventBatch {
-                writes: vec![
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::message_in_turn(
-                                "message_start",
-                                TOOL_USE_RECOVERY_ASSISTANT_ID,
-                                &assistant,
-                                Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
-                                Some(active_turn_id.to_owned()),
-                            )
-                            .expect("ToolUse assistant MessageStart"),
-                        ),
-                        projections: if continuation_turn {
-                            Vec::new()
-                        } else {
-                            vec![Projection::RunPhase {
-                                command_id: TOOL_USE_RECOVERY_COMMAND_ID.to_owned(),
-                                run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
-                                expected: RunPhase::UserCommitted,
-                                next: RunPhase::AssistantStarted,
-                            }]
-                        },
-                    },
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::message_in_turn(
-                                "message_end",
-                                TOOL_USE_RECOVERY_ASSISTANT_ID,
-                                &assistant,
-                                Some(TOOL_USE_RECOVERY_RUN_ID.to_owned()),
-                                Some(active_turn_id.to_owned()),
-                            )
-                            .expect("ToolUse assistant MessageEnd"),
-                        ),
-                        projections: vec![Projection::MessageEnd {
-                            message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.to_owned(),
-                            role: "assistant",
-                            message: assistant,
-                            append_to_l0,
-                            provider_context: Vec::new(),
-                            eviction_footprint_tokens: 0,
-                        }],
-                    },
-                ],
+                writes,
                 injected_commands: Vec::new(),
             })
             .await
@@ -3747,6 +3832,204 @@ pub(crate) mod tests {
         second_restart.pool().close().await;
         drop(second_restart);
         std::fs::remove_dir_all(root).expect("remove logical ToolUse recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn inference_interruption_requires_partial_message_and_matching_terminal_reason() {
+        use super::super::InferenceInterruptionReason::{ProcessRestart, RuntimeShutdown};
+        let (store, writer) = setup().await;
+        let prefix = tool_use_recovery_initial_assistant();
+        seed_assistant_restart_boundary(&writer, false, prefix.clone(), &[], false, false, None)
+            .await;
+        let end = |message: PublicMessage| EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::message_in_turn(
+                        "message_end",
+                        TOOL_USE_RECOVERY_ASSISTANT_ID,
+                        &message,
+                        Some(TOOL_USE_RECOVERY_RUN_ID.into()),
+                        Some(TOOL_USE_RECOVERY_TURN_ID.into()),
+                    )
+                    .unwrap()
+                    .with_inference_interruption(Some(RuntimeShutdown)),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id: TOOL_USE_RECOVERY_ASSISTANT_ID.into(),
+                    role: "assistant",
+                    message,
+                    append_to_l0: true,
+                    provider_context: vec![],
+                    eviction_footprint_tokens: 0,
+                }],
+            }],
+            injected_commands: vec![],
+        };
+        assert!(
+            writer.apply(end(prefix.clone())).await.is_err(),
+            "a successful response cannot become resumable"
+        );
+        assert!(
+            writer
+                .apply(end(tool_use_recovery_assistant()))
+                .await
+                .is_err(),
+            "tool calls cannot enter provider-only resumption"
+        );
+        let partial = crate::agent::normalize_partial_assistant(prefix).unwrap();
+        writer.apply(end(partial.clone())).await.unwrap();
+        for reason in [None, Some(ProcessRestart)] {
+            let result = writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                TOOL_USE_RECOVERY_RUN_ID,
+                                TOOL_USE_RECOVERY_TURN_ID,
+                                partial.clone(),
+                                vec![],
+                            )
+                            .unwrap()
+                            .with_inference_interruption(reason),
+                        ),
+                        projections: vec![],
+                    }],
+                    injected_commands: vec![],
+                })
+                .await;
+            assert!(
+                result.is_err(),
+                "TurnEnd must retain the exact MessageEnd reason"
+            );
+        }
+        let (lease, fence, _) = boot_recovery_authority(&store);
+        let HydrationOutcome::LogicalRecoveryRequired { steps } =
+            store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("failed writes must not close the marked attempt")
+        };
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .unwrap();
+        let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("exact reason recovers")
+        };
+        assert!(hydrated.continuation.is_some());
+    }
+
+    #[tokio::test]
+    async fn interrupted_provider_boundaries_reopen_without_duplicate_prefix_or_command() {
+        use super::super::InferenceInterruptionReason::{ProcessRestart, RuntimeShutdown};
+        for marked_end in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("sumi-interrupted-prefix-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("agent.db");
+            let store = open_boot_running_tools_store(&path).await;
+            let writer = EventWriter::new(store.clone());
+            let prefix = tool_use_recovery_initial_assistant();
+            let prefix = if marked_end {
+                crate::agent::normalize_partial_assistant(prefix).unwrap()
+            } else {
+                prefix
+            };
+            seed_assistant_restart_boundary(
+                &writer,
+                false,
+                prefix,
+                &[],
+                true,
+                marked_end,
+                marked_end.then_some(RuntimeShutdown),
+            )
+            .await;
+            drop(writer);
+            store.pool().close().await;
+            drop(store);
+
+            let store = open_boot_running_tools_store(&path).await;
+            let (lease, fence, _) = boot_recovery_authority(&store);
+            let HydrationOutcome::LogicalRecoveryRequired { steps } =
+                store.hydrate(&lease, &fence).await.unwrap()
+            else {
+                panic!("open provider suffix needs closure")
+            };
+            LogicalRecoveryExecutor
+                .execute(&store, &steps, &lease, &fence)
+                .await
+                .unwrap();
+            let observed: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM messages WHERE role='assistant'), (SELECT COUNT(*) FROM tool_executions), (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'), (SELECT COUNT(*) FROM inbound_commands WHERE status='applying')").fetch_one(store.pool()).await.unwrap();
+            assert_eq!(observed, (1, 0, 0, 1));
+            let reason: String = sqlx::query_scalar("SELECT json_extract(internal_metadata,'$.inference_interruption') FROM agent_events WHERE event_type='turn_end'").fetch_one(store.pool()).await.unwrap();
+            assert_eq!(
+                reason,
+                serde_json::to_value(if marked_end {
+                    RuntimeShutdown
+                } else {
+                    ProcessRestart
+                })
+                .unwrap()
+                .as_str()
+                .unwrap()
+            );
+            store.pool().close().await;
+            drop(store);
+            let store = open_boot_running_tools_store(&path).await;
+            let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+            else {
+                panic!("closed interrupted turn resumes")
+            };
+            let continuation = hydrated.continuation.unwrap();
+            assert_eq!(
+                continuation.envelope.command_id.as_str(),
+                TOOL_USE_RECOVERY_COMMAND_ID
+            );
+            assert_eq!(continuation.run_id, TOOL_USE_RECOVERY_RUN_ID);
+            assert!(!continuation.turn_open);
+            let writer = EventWriter::new(store.clone());
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(
+                                TOOL_USE_RECOVERY_RUN_ID,
+                                "next-interrupted-inference",
+                            )
+                            .unwrap(),
+                        ),
+                        projections: vec![],
+                    }],
+                    injected_commands: vec![],
+                })
+                .await
+                .unwrap();
+            drop(writer);
+            store.pool().close().await;
+            drop(store);
+            let store = open_boot_running_tools_store(&path).await;
+            let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+            else {
+                panic!("next TurnStart still resumes")
+            };
+            let continuation = hydrated.continuation.unwrap();
+            assert!(continuation.turn_open);
+            assert_eq!(continuation.turn_id, "next-interrupted-inference");
+            assert_eq!(
+                continuation.envelope.command_id.as_str(),
+                TOOL_USE_RECOVERY_COMMAND_ID
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='assistant'")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1);
+            store.pool().close().await;
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -199,6 +199,7 @@ mod run;
 #[cfg(test)]
 mod start_authority_tests;
 mod steer;
+pub(crate) use steer::normalize_partial_assistant;
 
 pub(crate) use durable_bridge::DurableRunBinding;
 
@@ -411,7 +412,7 @@ pub(crate) struct RunCore {
     /// `ContextAssembler::set_provider_context` calls.
     provider_context: Vec<ProviderContextItemWithFootprint>,
     durable_binding: Option<DurableRunBinding>,
-    recovered_tool_continuation: Option<Box<crate::store::RecoveredToolContinuation>>,
+    recovered_inference_continuation: Option<Box<crate::store::RecoveredInferenceContinuation>>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
     /// Session reserves the token around `bind_hard_steer` so the provider is
@@ -437,7 +438,7 @@ impl RunCore {
             runtime_context: Vec::new(),
             provider_context: Vec::new(),
             durable_binding: None,
-            recovered_tool_continuation: None,
+            recovered_inference_continuation: None,
             worker_phase: None,
             attempt_cancellation: None,
             runtime_shutdown: CancellationToken::new(),
@@ -583,7 +584,7 @@ impl SessionStartAuthority {
         let mut core = RunCore::new();
         core.runtime_context = hydrated.messages.clone();
         core.provider_context = hydrated.provider_context.clone();
-        core.recovered_tool_continuation = hydrated.continuation.clone();
+        core.recovered_inference_continuation = hydrated.continuation.clone();
         // Approval is a security-sensitive dependency of this exact RunCore.
         // Compose it before minting the binding; every later replacement goes
         // through `set_approval` and invalidates the binding.
@@ -737,6 +738,8 @@ pub(crate) enum WorkerPhase {
 }
 
 pub(crate) enum RunCompletion {
+    /// The original command remains applying; its next owner must hydrate.
+    Suspended,
     Completed(RunCore),
     Failed {
         core: RunCore,
@@ -891,9 +894,11 @@ fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
                 failure: WorkerFailure::EventChannelClosed,
             }
         }
-        RunCompletion::RehydrationRequired { .. } => RunCompletion::RehydrationRequired {
-            failure: WorkerFailure::EventChannelClosed,
-        },
+        RunCompletion::Suspended | RunCompletion::RehydrationRequired { .. } => {
+            RunCompletion::RehydrationRequired {
+                failure: WorkerFailure::EventChannelClosed,
+            }
+        }
     }
 }
 
@@ -948,6 +953,7 @@ pub(crate) enum RunOwnership {
     reason = "RunCore ownership stays allocation-free across every session termination path"
 )]
 pub(crate) enum SessionResult {
+    Suspended,
     Completed(RunCore),
     Failed {
         failure: SessionFailure,
@@ -1030,6 +1036,7 @@ pub(crate) struct Session<G: Gateway> {
     /// a post-receipt worker failure can leave it behind. Neither state is a
     /// recoverable life-log snapshot.
     durable_core_invalidated: bool,
+    suspended_inference: bool,
     /// The root of the cancellation lineage installed by `run` or
     /// `run_until_cancelled`. Workers receive children, so completing one run
     /// cannot cancel a later run or the Session itself.
@@ -1183,6 +1190,7 @@ impl<G: Gateway + 'static> Session<G> {
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             maintenance_ready_pending: false,
             durable_core_invalidated: false,
+            suspended_inference: false,
             runtime_shutdown: CancellationToken::new(),
             #[cfg(test)]
             active_take_observer: None,
@@ -1275,6 +1283,7 @@ impl<G: Gateway + 'static> Session<G> {
                 self.abort_writer().await;
                 match self.core.take() {
                     Some(core) => SessionResult::Completed(core),
+                    None if self.suspended_inference => SessionResult::Suspended,
                     None => SessionResult::Failed {
                         failure: SessionFailure::RuntimeShutdownOwnershipLost,
                         ownership: RunOwnership::Lost,
@@ -1304,7 +1313,7 @@ impl<G: Gateway + 'static> Session<G> {
         if let Some(continuation) = self
             .core
             .as_ref()
-            .and_then(|core| core.recovered_tool_continuation.clone())
+            .and_then(|core| core.recovered_inference_continuation.clone())
         {
             self.spawn_worker(AdmittedCommand::new(
                 continuation.envelope,
@@ -2193,7 +2202,7 @@ impl<G: Gateway + 'static> Session<G> {
         let continuation = self
             .core
             .as_ref()
-            .and_then(|core| core.recovered_tool_continuation.as_ref());
+            .and_then(|core| core.recovered_inference_continuation.as_ref());
         let binding = if let Some(continuation) = continuation {
             DurableRunBinding {
                 command_id: initial.envelope().command_id.to_string(),
@@ -2254,7 +2263,7 @@ impl<G: Gateway + 'static> Session<G> {
             completion_rx,
             join,
             bridge: match resumed_turn_open {
-                Some(open) => DurableBridge::resume_tool_continuation(binding, open),
+                Some(open) => DurableBridge::resume_inference(binding, open),
                 None => DurableBridge::new(binding),
             },
             attempt_cancellation,
@@ -2284,6 +2293,13 @@ impl<G: Gateway + 'static> Session<G> {
                 self.core = Some(core);
                 Some(failure)
             }
+            RunCompletion::Suspended => {
+                self.core = None;
+                self.durable_core_invalidated = true;
+                Some(WorkerFailure::Error(
+                    "suspended inference requires runtime rehydration".to_owned(),
+                ))
+            }
             RunCompletion::RehydrationRequired { failure } => {
                 self.core = None;
                 self.durable_core_invalidated = true;
@@ -2301,6 +2317,12 @@ impl<G: Gateway + 'static> Session<G> {
         // durable invalidation verdict. Install that ownership state before
         // the first await, while retaining ActiveRun through join and drain.
         let worker_failure = match completion {
+            Ok(RunCompletion::Suspended) if !route_after_completion => {
+                self.suspended_inference = true;
+                self.core = None;
+                self.durable_core_invalidated = true;
+                None
+            }
             Ok(completion) => self.install_run_completion_ownership(completion),
             Err(_) => {
                 let join_result = {

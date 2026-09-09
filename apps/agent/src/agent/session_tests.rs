@@ -499,6 +499,7 @@ impl GatewayWriter for ShutdownDrainWriter {
 
 fn completed(result: SessionResult) -> RunCore {
     match result {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(core) => core,
         SessionResult::Failed { failure, ownership } => {
             panic!("expected clean completion, got {failure:?} with {ownership:?}")
@@ -509,6 +510,7 @@ fn completed(result: SessionResult) -> RunCore {
 fn failed(result: SessionResult) -> (SessionFailure, RunOwnership) {
     match result {
         SessionResult::Failed { failure, ownership } => (failure, ownership),
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(core) => {
             panic!("expected failure, got core {}", core.ownership_id())
         }
@@ -7840,6 +7842,7 @@ async fn run_live_responses_segment(
         })
         .expect("live Responses Session join");
     match core {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(core) => {
             eprintln!("[{phase}] session completed cleanly");
             core
@@ -11307,6 +11310,7 @@ async fn expired_policy_grant_reenters_approval_before_stalled_tool_start() {
     wait_for_agent_end(&frames).await;
     drop(commands);
     match task.await.expect("session join") {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(_) => {}
         SessionResult::Failed { failure, .. } => panic!("session failed: {failure}"),
     }
@@ -11716,6 +11720,7 @@ async fn session_user_approve_always_persists_rule_and_executes() {
     wait_for_agent_end(&frames).await;
     drop(commands);
     match task.await.expect("session join") {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(_) => {}
         SessionResult::Failed { failure, .. } => panic!("approve-always session failed: {failure}"),
     }
@@ -11986,6 +11991,7 @@ async fn session_approve_always_normalization_matrix_is_durable_and_replayable()
         .expect("terminal replay ACK");
         drop(commands);
         match task.await.expect("session join") {
+            SessionResult::Suspended => panic!("unexpected runtime suspension"),
             SessionResult::Completed(_) => {}
             SessionResult::Failed { failure, .. } => {
                 panic!("{} session failed: {failure}", case.name)
@@ -12055,6 +12061,7 @@ async fn assert_pre_start_approval_control_race(store_name: &str, control: Inbou
             }
             if task.is_finished() {
                 match (&mut task).await.expect("session join") {
+                    SessionResult::Suspended => panic!("unexpected runtime suspension"),
                     SessionResult::Completed(_) => {
                         panic!("session completed before the winning control became terminal")
                     }
@@ -12165,6 +12172,7 @@ async fn assert_pre_start_approval_control_race(store_name: &str, control: Inbou
 
     drop(commands);
     match task.await.expect("session join") {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(_) => {}
         SessionResult::Failed { failure, .. } => {
             panic!("pre-start approval control race failed: {failure}")
@@ -12313,6 +12321,7 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
 
     drop(commands);
     match task.await.expect("session join") {
+        SessionResult::Suspended => panic!("unexpected runtime suspension"),
         SessionResult::Completed(_) => {}
         SessionResult::Failed { failure, .. } => {
             panic!("staged duplicate approval race failed: {failure}")
@@ -13313,5 +13322,365 @@ mod recovered_tool_continuity {
             original.run_id
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+mod interrupted_inference_continuity {
+    use super::*;
+
+    struct Driver {
+        identity: RpcIdentity,
+        prefix: String,
+        partial_tool: bool,
+        resume: bool,
+        contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    }
+
+    #[async_trait]
+    impl RunDriver for Driver {
+        fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
+            assert_eq!(identity, &self.identity);
+            Ok(())
+        }
+        fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+            assert_eq!(generation, self.identity.generation());
+            Ok(())
+        }
+        async fn start_provider_for_command(
+            &self,
+            _: usize,
+            context: &[ContextMessage],
+            _: Option<Instant>,
+            cancel: CancellationToken,
+        ) -> Result<ProviderAttempt> {
+            let mut contexts = self.contexts.lock().unwrap();
+            assert!(contexts.is_empty(), "one inference per runtime generation");
+            contexts.push(context.to_vec());
+            drop(contexts);
+            let (tx, rx) = mpsc::channel(16);
+            tx.try_send(ProviderEvent::Start)?;
+            let text = if self.resume {
+                "The same request is now complete."
+            } else {
+                &self.prefix
+            };
+            if !text.is_empty() {
+                tx.try_send(ProviderEvent::TextStart { content_index: 0 })?;
+                tx.try_send(ProviderEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.to_owned(),
+                })?;
+            }
+            if self.resume {
+                tx.try_send(ProviderEvent::TextEnd {
+                    content_index: 0,
+                    content: text.to_owned(),
+                })?;
+                tx.try_send(ProviderEvent::Done {
+                    reason: StopReason::Stop,
+                    output: ProviderOutput {
+                        message: fixture_assistant_message(
+                            vec![AssistantContent::Text {
+                                text: text.to_owned(),
+                                wire_item_index: 0,
+                            }],
+                            StopReason::Stop,
+                        ),
+                        provider_context: vec![],
+                    },
+                })?;
+            } else {
+                if self.partial_tool {
+                    tx.try_send(ProviderEvent::ToolCallStart { content_index: 1 })?;
+                    tx.try_send(ProviderEvent::ToolCallDelta {
+                        content_index: 1,
+                        delta: "{\"path\":\"unfinished".to_owned(),
+                    })?;
+                    // This public event follows the private argument delta, so
+                    // observing it proves the assembler consumed partial args.
+                    tx.try_send(ProviderEvent::TextEnd {
+                        content_index: 0,
+                        content: self.prefix.clone(),
+                    })?;
+                }
+                let end = cancel.clone();
+                tokio::spawn(async move {
+                    end.cancelled().await;
+                    drop(tx);
+                });
+            }
+            Ok(ProviderAttempt {
+                message_id: if self.resume {
+                    "resumed-assistant"
+                } else {
+                    "interrupted-assistant"
+                }
+                .to_owned(),
+                initial_message: public_initial_message(),
+                uncalibrated_prompt_estimate: 0,
+                events: ProviderEventStream::new(rx, cancel, "fixture", fixture_origin()),
+            })
+        }
+        async fn execute_tool_observed(
+            &self,
+            _: &str,
+            _: &ToolCall,
+            _: CancellationToken,
+            _: Arc<dyn Fn(Value) + Send + Sync>,
+        ) -> Result<ToolResultMessage, ToolError> {
+            panic!("interrupted arguments must never execute")
+        }
+        fn synthetic_error(&self, message: &str) -> PublicMessage {
+            panic!("unexpected provider failure: {message}")
+        }
+        async fn plan_overflow_recovery(
+            &self,
+            _: &RunCore,
+            _: OverflowRecoveryRequest,
+            _: &[ContextMessage],
+        ) -> Result<OverflowRecoveryOutcome> {
+            bail!("no fixture overflow")
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_human_abort_still_finishes_during_runtime_shutdown() {
+        let store = Store::session_test_store("abort-versus-runtime-shutdown")
+            .await
+            .unwrap();
+        let authority = queued_recovery_authority(&store, 73);
+        let driver = Arc::new(Driver {
+            identity: authority.rpc_identity().clone(),
+            prefix: "partial".into(),
+            partial_tool: false,
+            resume: false,
+            contexts: Mutex::new(vec![]),
+        });
+        let (gateway, _commands, _) = super::gateway();
+        let mut session = Session::start(
+            store.clone(),
+            gateway,
+            RunCore::fixture_with_unapproved_tools(),
+            Arc::new(SequentialRunWorker::new(driver)),
+            test_executor_generation(),
+        )
+        .await
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        session.runtime_shutdown = shutdown.clone();
+        session.admit_and_route(user(1)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = session.active.as_mut().unwrap().events_rx.recv().await.unwrap();
+                let started = matches!(&output.event, AgentEvent::MessageStart { message_id, .. } if message_id == "interrupted-assistant");
+                session.persist_active_event(output).await.unwrap();
+                if started { break; }
+            }
+            // Return only after the Human Abort is authenticated and durably bound.
+            session.admit_and_route(abort(2)).await.unwrap();
+        }).await.unwrap();
+        shutdown.cancel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.run_until_cancelled(shutdown),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, SessionResult::Completed(_)), "{result:?}");
+        let observed: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'), (SELECT COUNT(*) FROM agent_events WHERE json_extract(internal_metadata,'$.inference_interruption') IS NOT NULL), (SELECT COUNT(*) FROM inbound_commands WHERE status='applied')").fetch_one(store.pool()).await.unwrap();
+        assert_eq!(observed, (1, 0, 2));
+        let authority = queued_recovery_authority(&store, 74);
+        let HydrationOutcome::Complete(hydrated) = store
+            .hydrate(authority.lease(), authority.fence())
+            .await
+            .unwrap()
+        else {
+            panic!("Abort is already terminal")
+        };
+        assert!(hydrated.continuation.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_preserves_partial_and_resumes_same_external_command_after_reopen() {
+        for (prefix, partial_tool) in [
+            ("", false),
+            ("I have begun the report.", false),
+            ("I have begun the report.", true),
+        ] {
+            let directory =
+                std::env::temp_dir().join(format!("sumi-inference-shutdown-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("agent.db");
+            let store = open_kill_restart_store(&path).await;
+            let authority = queued_recovery_authority(&store, 73);
+            let driver = Arc::new(Driver {
+                identity: authority.rpc_identity().clone(),
+                prefix: prefix.into(),
+                partial_tool,
+                resume: false,
+                contexts: Mutex::new(vec![]),
+            });
+            let (gateway, commands, frames) = super::gateway();
+            let session = Session::start(
+                store.clone(),
+                gateway,
+                RunCore::fixture_with_unapproved_tools(),
+                Arc::new(SequentialRunWorker::new(driver.clone())),
+                test_executor_generation(),
+            )
+            .await
+            .unwrap();
+            let shutdown = CancellationToken::new();
+            let task = tokio::spawn(session.run_until_cancelled(shutdown.clone()));
+            let InboundCommand::Valid(mut input) = user(1) else {
+                unreachable!()
+            };
+            input.provenance = crate::gateway::test_messaging_provenance();
+            input.command = Command::ExternalEvent {
+                content: "Please finish the same report.".into(),
+            };
+            commands
+                .send(InboundCommand::Valid(input.clone()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let seen = frames.lock().unwrap().iter().any(|frame| matches!(frame, OutboundFrame::Event { envelope } if
+                        envelope.event.get("type").and_then(Value::as_str) == Some(if prefix.is_empty() { "message_start" } else { "message_update" }) &&
+                        envelope.event.to_string().contains(if prefix.is_empty() { "interrupted-assistant" } else { prefix }) &&
+                        (!partial_tool || envelope.event.to_string().contains("text_end"))));
+                    if seen { break; }
+                    assert!(!task.is_finished());
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            shutdown.cancel();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                SessionResult::Suspended
+            ));
+            drop(commands);
+            let owner: (String, String) =
+                sqlx::query_as("SELECT status, run_id FROM inbound_commands")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(owner.0, "applying");
+            let terminal: String = sqlx::query_scalar("SELECT envelope FROM agent_events WHERE event_type='message_end' AND json_extract(envelope,'$.message_id')='interrupted-assistant'").fetch_one(store.pool()).await.unwrap();
+            let terminal: Value = serde_json::from_str(&terminal).unwrap();
+            assert_eq!(
+                terminal
+                    .pointer("/message/interrupted")
+                    .and_then(Value::as_bool),
+                Some(true)
+            );
+            let content = terminal
+                .pointer("/message/content")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert!(content.iter().all(|item| item["type"] == "text"));
+            assert_eq!(
+                content
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<String>(),
+                prefix
+            );
+            let counts: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'), (SELECT COUNT(*) FROM tool_executions), (SELECT COUNT(*) FROM inbound_commands), (SELECT COUNT(*) FROM agent_events WHERE json_extract(internal_metadata,'$.inference_interruption')='runtime_shutdown')").fetch_one(store.pool()).await.unwrap();
+            assert_eq!(counts, (0, 0, 1, 2));
+            store.pool().close().await;
+            drop(store);
+
+            let store = open_kill_restart_store(&path).await;
+            let authority = queued_recovery_authority(&store, 74);
+            let HydrationOutcome::Complete(hydrated) = store
+                .hydrate(authority.lease(), authority.fence())
+                .await
+                .unwrap()
+            else {
+                panic!("marked turn must already be resumable")
+            };
+            let continuation = hydrated.continuation.as_ref().unwrap();
+            assert_eq!(continuation.envelope.command_id, input.command_id);
+            assert_eq!(continuation.envelope.provenance, input.provenance);
+            assert_eq!(continuation.run_id, owner.1);
+            assert!(matches!(
+                continuation.envelope.command,
+                Command::ExternalEvent { .. }
+            ));
+            let broker = Arc::new(ApprovalBroker::headless(
+                crate::approval::policy::Policy::new("/workspace"),
+                make_projector(),
+            ));
+            let (core, start) =
+                SessionStartAuthority::from_hydrated(authority.clone(), &hydrated, broker).unwrap();
+            let driver = Arc::new(Driver {
+                identity: authority.rpc_identity().clone(),
+                prefix: prefix.into(),
+                partial_tool: false,
+                resume: true,
+                contexts: Mutex::new(vec![]),
+            });
+            let (gateway, commands, _) = super::gateway();
+            let session = Session::start_hydrated(
+                store.clone(),
+                gateway,
+                core,
+                Arc::new(SequentialRunWorker::new(driver.clone())),
+                start,
+            )
+            .await
+            .unwrap();
+            let task = tokio::spawn(session.run());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status: String = sqlx::query_scalar("SELECT status FROM inbound_commands")
+                        .fetch_one(store.pool())
+                        .await
+                        .unwrap();
+                    if status == "applied" {
+                        break;
+                    }
+                    assert!(!task.is_finished());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(commands);
+            completed(task.await.unwrap());
+            let contexts = driver.contexts.lock().unwrap();
+            assert_eq!(contexts.len(), 1);
+            let messages: Vec<_> = contexts[0]
+                .iter()
+                .map(crate::memory::overflow::context_message_to_public)
+                .collect();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, PublicMessage::User(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(
+                        |message| matches!(message, PublicMessage::Assistant(a) if a.interrupted)
+                    )
+                    .count(),
+                1
+            );
+            drop(contexts);
+            let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM inbound_commands), (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_start'), (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end')").fetch_one(store.pool()).await.unwrap();
+            assert_eq!(counts, (1, 1, 1));
+            store.pool().close().await;
+            drop(store);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

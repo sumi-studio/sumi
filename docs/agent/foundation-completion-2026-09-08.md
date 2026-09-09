@@ -537,10 +537,22 @@ input as an extra command and stopped the PA during its next response. There
 was no delivered progress reply or attachment. This probe therefore does not
 establish end-to-end acceptance, and its original failure record is retained.
 
-The repair under verification resumes the original command after a recovered
+PR #403 was merged as `57ced374` after independent review and successful Rust,
+API/Postgres and Web CI. It resumes the original command after a recovered
 tool turn, retaining indeterminate results instead of replaying old effects.
+It has not yet been deployed to the shared environment.
 Continuation after a partial new assistant message, and recovery with
 unclassified controls mixed into the recovery steps, remain separate gaps.
 Graceful RuntimeShutdown also currently shares the explicit Abort closure path;
 its final Store writes need not appear in the disconnected API event tail.
 The tail alone therefore does not prove that command 33 remains open in Store.
+
+A subsequent read-only inspection of the stopped fixture's native Store
+confirmed commands 32 and 33 are both applied/finished. Events 809–812 contain
+MessageEnd, TurnEnd, AgentEnd and command disposition after the API tail at
+808. The original workspace CSV exists with 90 bytes and SHA-256
+`a5a91dcb315c5090fd9859e49ee73f843962ff29a966faf7bb7e633785d41dea`.
+Evidence: `/tmp/sumi-original-store-inspection.json`. The next acceptance uses
+an ordinary new correction in the same undertaking; it must not revive either
+historical command. The shared deployment remains `8fcf9945` pending the
+separate runtime-stop continuation repair and its acceptance.
