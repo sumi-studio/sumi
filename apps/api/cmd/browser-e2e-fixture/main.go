@@ -241,14 +241,14 @@ func (f *fixture) emitTerminalEvent() error {
 func (f *fixture) durable(event string) {
 	f.seq++
 	seq := f.seq
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
+	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Audience: agentevents.AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
 	if err != nil {
 		log.Printf("fixture durable event: %v", err)
 	}
 }
 
 func (f *fixture) volatile(event string) {
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
+	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Audience: agentevents.AudienceDirectChat, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
 	if err != nil {
 		log.Printf("fixture volatile event: %v", err)
 	}

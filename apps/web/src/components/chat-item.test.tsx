@@ -138,11 +138,8 @@ it("keeps operation input and complete failed output inspectable in place", () =
   };
   const view = render(<ChatItemView item={item} />);
   expect(screen.getByText("失敗")).toBeVisible();
-  const details = view.container.querySelector("details");
-  expect(details).not.toBeNull();
-  const summary = view.container.querySelector("summary");
-  if (!summary) throw new Error("missing operation summary");
-  fireEvent.click(summary);
+  const trigger = screen.getByRole("button");
+  fireEvent.click(trigger);
   expect(screen.getByRole("region", { name: "入力" })).toHaveTextContent(
     '"from": 2',
   );
@@ -154,7 +151,7 @@ it("keeps operation input and complete failed output inspectable in place", () =
       item={{ ...item, trace: { ...item.trace, label: "記録済みの失敗" } }}
     />,
   );
-  expect(details?.open).toBe(true);
+  expect(trigger).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByRole("region", { name: "結果" })).toHaveTextContent(
     "Permission denied",
   );
