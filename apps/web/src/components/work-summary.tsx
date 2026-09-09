@@ -224,9 +224,6 @@ function ToolTraceRow({
         : displayValue(event.result);
   const failed = event.status === "error" || event.status === "cancelled";
   const failure = failed ? toolFailureReason(event) : null;
-  const previewText =
-    failure ?? (phase === "result" ? previewValue(event.result) : resultText);
-  const preview = previewText?.slice(0, 240);
   return (
     <details
       open={open}
@@ -235,45 +232,40 @@ function ToolTraceRow({
           ? (event) => onOpenChange(event.currentTarget.open)
           : undefined
       }
-      className="group/tool min-w-0 bg-background text-sm leading-6 open:pb-3"
+      className="direct-chat-tool group/tool min-w-0 text-base leading-relaxed open:pb-2"
     >
-      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 py-1.5 [&::-webkit-details-marker]:hidden">
+      <summary className="direct-chat-tool-summary flex min-w-0 cursor-pointer list-none items-center gap-1.5 rounded-md py-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">
         <Icon
           className={cn(
             "size-4 shrink-0 text-muted-foreground",
             event.status === "running" && "animate-pulse",
           )}
         />
-        <span className="min-w-0 flex-1 break-words font-normal text-muted-foreground">
-          {phase === "activity" ? event.name : event.label}
+        <span
+          className="min-w-0 max-w-[60%] shrink-0 truncate font-normal"
+          title={event.label || event.name}
+        >
+          {event.label || event.name}
         </span>
         <span
           className={cn(
-            "text-xs",
+            "shrink-0 text-xs",
             failed ? "text-red-600" : "text-muted-foreground",
           )}
         >
           {status}
         </span>
-        <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open/tool:rotate-90 motion-reduce:transition-none" />
         {detail && (
-          <code className="w-full truncate pl-6 font-mono text-muted-foreground text-xs">
+          <code
+            className="min-w-0 flex-1 truncate font-mono text-xs"
+            title={detail}
+          >
             {detail}
           </code>
         )}
-        {preview && (
-          <p
-            className={cn(
-              "line-clamp-3 w-full whitespace-pre-wrap break-words pl-6 text-[13px] group-open/tool:hidden",
-              failed ? "text-red-600" : "text-muted-foreground",
-            )}
-          >
-            {preview}
-            {previewText && previewText.length > 240 ? "…" : ""}
-          </p>
-        )}
+        <ChevronRight className="direct-chat-tool-chevron size-3.5 shrink-0 transition-transform group-open/tool:rotate-90 motion-reduce:transition-none" />
       </summary>
-      <div className="space-y-3 pl-6">
+      <div className="space-y-3 pt-2 pl-6">
         <Payload label="入力" text={displayValue(event.args)} />
         {phase === "activity" && resultText !== null && (
           <Payload label="進行状況" text={resultText} />

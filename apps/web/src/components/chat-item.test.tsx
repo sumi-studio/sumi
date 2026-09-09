@@ -8,6 +8,24 @@ import { ChatItemView } from "./chat-item";
 afterEach(cleanup);
 
 describe("ChatItemView", () => {
+  it("does not add activity lifecycle banners to the conversation", () => {
+    const item = {
+      kind: "agent-run" as const,
+      audience: "direct_chat" as const,
+      id: "run-1",
+      startedSeq: 1,
+      endedSeq: null,
+      status: "running" as const,
+      trace: [],
+    };
+    const view = render(<ChatItemView item={item} />);
+    expect(view.container).toBeEmptyDOMElement();
+    view.rerender(
+      <ChatItemView item={{ ...item, status: "complete", endedSeq: 2 }} />,
+    );
+    expect(view.container).toBeEmptyDOMElement();
+  });
+
   it("keeps message actions in the tree without a reveal toggle", () => {
     render(
       <ChatItemView
