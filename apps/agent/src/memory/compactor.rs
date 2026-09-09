@@ -1589,7 +1589,7 @@ async fn apply_completed_job(store: Arc<Store>, job: &Job) -> Result<bool> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
     use crate::memory::{ThreeLayerMemory, estimate::eviction_footprint_for_payload};
@@ -1614,6 +1614,49 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
 
     const PERSONALITY_AGENT_ID: &str = "0198f0f4-9b72-7000-8000-000000000001";
+
+    // Exercise the production compactor and adapter without consulting credentials.
+    pub(crate) async fn compact_with_local_adapter(
+        store: Arc<Store>,
+        parent: ParentContextSnapshot,
+        cancel: CancellationToken,
+        terminal_codes: mpsc::UnboundedSender<Option<String>>,
+    ) -> Result<bool> {
+        struct LocalAdapter(mpsc::UnboundedSender<Option<String>>);
+        impl CompactProvider for LocalAdapter {
+            fn start(
+                &self,
+                spec: ModelSpec,
+                context: PromptContext,
+                options: RequestOptions,
+                cancel: CancellationToken,
+            ) -> ProviderEventStream {
+                let mut actual = crate::provider::stream_with_api_key_observed(
+                    spec.clone(),
+                    context,
+                    options,
+                    cancel.child_token(),
+                    Some("synthetic-memory-fixture".into()),
+                    None,
+                );
+                let (tx, rx) = mpsc::channel(32);
+                let codes = self.0.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = actual.recv().await {
+                        if let ProviderEvent::Error { output, .. } = &event {
+                            let _ = codes.send(output.message.provider_code.clone());
+                        }
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+            }
+        }
+        compact_next_memory_with_provider(store, parent, cancel, &LocalAdapter(terminal_codes))
+            .await
+    }
 
     fn timestamp() -> DateTime<Utc> {
         Utc.timestamp_nanos(1_700_000_000_123_456_789)
@@ -1651,7 +1694,7 @@ mod tests {
         }
     }
 
-    fn public_assistant(text: &str) -> PublicMessage {
+    pub(crate) fn public_assistant(text: &str) -> PublicMessage {
         let message = assistant(text, StopReason::Stop);
         PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![crate::provider::types::PublicAssistantContent::Text {
@@ -2184,7 +2227,7 @@ mod tests {
         )
         .expect("provenance")
     }
-    async fn seed_completed_authenticated_turn(
+    pub(crate) async fn seed_completed_authenticated_turn(
         store: &Arc<Store>,
         spec: &ModelSpec,
         user_text: &str,
@@ -2763,7 +2806,7 @@ mod tests {
         .await;
     }
 
-    async fn hydrate(store: &Store) -> crate::store::HydratedRunState {
+    pub(crate) async fn hydrate(store: &Store) -> crate::store::HydratedRunState {
         let lease = ProcessGenerationLease::new(
             store.scope().personality_agent_id.clone(),
             ProcessGeneration::from_wire(41).expect("generation"),
@@ -2781,7 +2824,9 @@ mod tests {
         }
     }
 
-    async fn real_parent_with_queued_target(store: &Arc<Store>) -> ParentContextSnapshot {
+    pub(crate) async fn real_parent_with_queued_target(
+        store: &Arc<Store>,
+    ) -> ParentContextSnapshot {
         let spec = chat_model();
         let repeated =
             "Observed path: /workspace/source. The value was unchanged on this read. ".repeat(1800);

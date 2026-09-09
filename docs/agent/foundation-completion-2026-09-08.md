@@ -165,11 +165,11 @@ still needed to close each row.
 
 | ID | Current assessment | Remaining acceptance |
 | --- | --- | --- |
-| M01 | L0→L1 runs; upper-layer replacement deployed through #381; staged real-provider evidence below | Verify actual selective replacement against [the user's chronological replacement boundary](memory-boundaries-2026-09-08.md) using the same parent context. L2-internal reintegration remains a distinct operation. |
+| M01 | L0→L1, L1→L2 and distinct L2-only reintegration are wired; staged real-provider evidence below | Stronger runtime-driven semantic acceptance must compare actual replacements and paginated original history against [the chronological boundary](memory-boundaries-2026-09-08.md). The prior staged run is not a natural long session. |
 | M02 | Full-parent fork and chronological replacement repaired; semantic quality partial | Evaluate meaning, uncertainty, corrections and unfinished details against originals; do not equate compression ratio with fidelity. |
-| M03 | Ordinary silent trimming repaired; capacity boundary remains | Accumulated L1 must not eventually make every subsequent request unrecoverable. |
+| M03 | Upper-layer capacity scheduling exists; ordinary silent trimming repaired | Verify recovery under repeated upper-layer pressure including a failed or non-shrinking attempt. Scheduling thresholds alone do not guarantee capacity or semantic retention. |
 | M04 | Original history read/search and optional files available | Establish voluntary revision/strategic forgetting and recoverable source references without imposing an automatic memory-rewriting ritual. |
-| M05 | Maintenance failure isolation implemented | Exercise timeout, later user input, and retry from the later full parent context. |
+| M05 | Maintenance timeout and later-parent retry verified through actual driver/adapter/store | Local HTTP integration covers unchanged target/settings, backoff, ordinary response and completed-only promotion. Real-model semantics and full Session ingress remain outside this test. |
 | A01 | Actual DM wake, ordinary reply and replay verified after request/approval repair | Broaden interruption and duplicate-delivery acceptance while retaining optional response and existing permissions. |
 | A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
@@ -501,3 +501,21 @@ results had not yet replaced the stale pending assessments:
 All three runs completed their owned-fixture cleanup. These are historical
 acceptances at their recorded revisions, not new reruns on #400. The earlier
 failed probes remain failed.
+
+## Maintenance timeout and later-parent retry
+
+`memory_adapter_timeout_retries_from_later_actual_parent` exercises a real
+Chat Completions adapter against a loopback server that stalls only the first
+maintenance request. The actual response-header timeout releases the memory
+job. A later authenticated turn is seeded, the parent still completes an
+ordinary adapter request, and the existing 30-second backoff prevents an
+immediate fork. The next retry uses the actual later parent snapshot, unchanged
+model/settings and the same selected target. A held retry cannot promote; its
+completed result can, while the later correction remains.
+
+The focused test passed in 31.17 seconds. Production retry timing and policy
+were unchanged. This is driver/adapter/store integration with synthetic
+endpoint answers and a seeded later turn, not full Session command admission
+or real-model semantic fidelity. Initial runs stopped on sandbox loopback
+permission and a test-only wire-content parser assumption; neither established
+a product failure.

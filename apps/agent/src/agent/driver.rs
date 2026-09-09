@@ -1361,6 +1361,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_adapter_timeout_retries_from_later_actual_parent() {
+        use crate::memory::compactor::tests::{
+            compact_with_local_adapter, hydrate, public_assistant, real_parent_with_queued_target,
+            seed_completed_authenticated_turn,
+        };
+        use sqlx::Row;
+
+        // Only the endpoint and credential ingress are synthetic. Both parent
+        // and maintenance requests traverse the real adapter; the latter uses
+        // the production job claim, timeout, retry and promotion path.
+        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+        let fork_count = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let handler_count = fork_count.clone();
+        let handler_release = release.clone();
+        let app = Router::new().route("/chat/completions", post(move |Json(body): Json<Value>| {
+            let tx = requests_tx.clone();
+            let count = handler_count.clone();
+            let release = handler_release.clone();
+            async move {
+                let is_fork = body["messages"].as_array().unwrap().last().unwrap()
+                    .to_string().contains("compact_target");
+                let ordinal = if is_fork { count.fetch_add(1, Ordering::SeqCst) } else { 0 };
+                tx.send((is_fork, body)).unwrap();
+                if is_fork && ordinal == 0 { pending::<()>().await; }
+                if is_fork { release.notified().await; }
+                let text = if is_fork { "Observed /workspace/source repeatedly; the original value was unchanged." }
+                    else { "Still here with the current conversation." };
+                Response::builder().header("content-type", "text/event-stream")
+                    .body(Body::from(format!("data: {}\n\ndata: [DONE]\n\n", json!({
+                        "id":"fixture", "object":"chat.completion.chunk",
+                        "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]
+                    })))).unwrap()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = Arc::new(
+            Store::session_test_store("memory-timeout-continuity")
+                .await
+                .unwrap(),
+        );
+        real_parent_with_queued_target(&store).await;
+        let restored = hydrate(&store).await;
+        let lease = ProcessGenerationLease::new(
+            store.scope().personality_agent_id.clone(),
+            generation(41),
+            "memory-test-lease",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "memory-test-fence").unwrap();
+        let (mut spec, prompt, registry, workspace) = dependencies();
+        spec.base_url = format!("http://{address}");
+        let options = RequestOptions {
+            temperature: Some(0.25),
+            max_tokens: Some(512),
+            session_id: Some("memory-timeout-continuity".into()),
+            ..RequestOptions::default()
+        };
+        let sent = Arc::new(Mutex::new(Vec::<PromptContext>::new()));
+        let sent_clone = sent.clone();
+        let starter: Arc<StreamStarter> =
+            Arc::new(move |spec, prompt, options, cancel, observer| {
+                sent_clone.lock().unwrap().push(prompt.clone());
+                stream_with_api_key_observed(
+                    spec,
+                    prompt,
+                    options,
+                    cancel,
+                    Some("synthetic-memory-fixture".into()),
+                    Some(observer),
+                )
+            });
+        let mut driver = InjectedRunDriver::with_stream_starter(
+            spec.clone(),
+            options.clone(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(41)),
+            starter,
+        )
+        .unwrap()
+        .with_hydrated_memory(store.clone(), &lease, &fence, &restored)
+        .unwrap();
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let captured = snapshots.clone();
+        let (codes_tx, mut codes_rx) = mpsc::unbounded_channel();
+        driver.memory_compactor = Arc::new(move |store, parent, cancel| {
+            captured.lock().unwrap().push(parent.clone());
+            Box::pin(compact_with_local_adapter(
+                store,
+                parent,
+                cancel,
+                codes_tx.clone(),
+            ))
+        });
+        async fn parent_completes(mut attempt: ProviderAttempt) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(event) = attempt.events.recv().await {
+                    match event {
+                        ProviderEvent::Done { reason: StopReason::Stop, output } => {
+                            assert!(output.message.content.iter().any(|part| matches!(part,
+                                AssistantContent::Text { text, .. } if text.contains("Still here"))));
+                            return;
+                        }
+                        ProviderEvent::Error { .. } => panic!("parent failed"),
+                        _ => {}
+                    }
+                }
+                panic!("parent did not complete");
+            }).await.expect("parent completion");
+        }
+        let first = driver
+            .start_provider_for_command(0, &restored.messages, None, CancellationToken::new())
+            .await
+            .unwrap();
+        parent_completes(first).await;
+        let mut first_wire = None;
+        for _ in 0..2 {
+            let (is_fork, body) = tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if is_fork {
+                first_wire = Some(body);
+            }
+        }
+        let first_wire = first_wire.expect("first maintenance request reached HTTP");
+        // Pause only after real I/O reaches its barrier. No database work is
+        // awaited while paused, preventing auto-advance from driving retries.
+        tokio::time::pause();
+        tokio::time::advance(crate::provider::RESPONSE_HEADER_TIMEOUT + Duration::from_secs(1))
+            .await;
+        let code = tokio::time::timeout(Duration::from_secs(5), codes_rx.recv()).await;
+        tokio::time::resume();
+        let code = code.expect("adapter timeout terminal").unwrap();
+        assert_eq!(code.as_deref(), Some("response_header_timeout"));
+        let task = driver.memory_task.lock().unwrap().take().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_at = driver
+            .memory_retry_after
+            .lock()
+            .unwrap()
+            .expect("failure backoff");
+        let job =
+            sqlx::query("SELECT id, status, attempts FROM memory_jobs ORDER BY batch_seq LIMIT 1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let job_id: String = job.get("id");
+        assert_eq!(job.get::<String, _>("status"), "pending");
+        assert_eq!(job.get::<i64, _>("attempts"), 1);
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+
+        let correction =
+            "Later correction: the value is now violet; the old observation was amber.";
+        seed_completed_authenticated_turn(
+            &store,
+            &spec,
+            correction,
+            "later-human",
+            public_assistant(&"Additional current observation. ".repeat(6000)),
+            vec![],
+        )
+        .await;
+        let later = hydrate(&store).await;
+        driver = driver
+            .with_hydrated_memory(store.clone(), &lease, &fence, &later)
+            .unwrap();
+        parent_completes(
+            driver
+                .start_provider_for_command(0, &later.messages, None, CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            snapshots.lock().unwrap().len(),
+            1,
+            "backoff prevents an immediate retry"
+        );
+        assert_eq!(fork_count.load(Ordering::SeqCst), 1);
+        assert!(
+            sent.lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| serde_json::to_string(message).unwrap().contains(correction))
+        );
+        assert_eq!(apply_ready_memory(store.clone()).await.unwrap(), 0);
+        // Production uses std::Instant for this 30s delay; keep its real policy.
+        tokio::time::sleep(
+            retry_at.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+        )
+        .await;
+        parent_completes(
+            driver
+                .start_provider_for_command(0, &later.messages, None, CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let retry_wire = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (fork, body) = requests_rx.recv().await.unwrap();
+                if fork {
+                    break body;
+                }
+            }
+        })
+        .await
+        .expect("retry reached HTTP");
+        {
+            let snapshots = snapshots.lock().unwrap();
+            assert_eq!(snapshots.len(), 2);
+            assert_eq!(snapshots[0].prompt(), &sent.lock().unwrap()[0]);
+            assert_eq!(snapshots[1].prompt(), sent.lock().unwrap().last().unwrap());
+            assert!(
+                !serde_json::to_string(snapshots[0].prompt())
+                    .unwrap()
+                    .contains(correction)
+            );
+            assert!(
+                serde_json::to_string(snapshots[1].prompt())
+                    .unwrap()
+                    .contains(correction)
+            );
+            assert_eq!(snapshots[1].spec(), &spec);
+            assert_eq!(snapshots[1].options().temperature, options.temperature);
+            assert_eq!(snapshots[1].options().max_tokens, options.max_tokens);
+            assert_eq!(snapshots[1].options().session_id, options.session_id);
+        }
+        fn target(body: &Value) -> Value {
+            let content = &body["messages"].as_array().unwrap().last().unwrap()["content"];
+            let text = content
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .find(|text| text.contains("{\"compact_target\""))
+                .expect("target text block in actual adapter request");
+            let start = text.find("{\"compact_target\"").expect("explicit target");
+            serde_json::from_str(&text[start..]).unwrap()
+        }
+        assert_eq!(
+            target(&first_wire),
+            target(&retry_wire),
+            "the original selected target is unchanged"
+        );
+        for field in ["model", "temperature", "max_tokens", "tools"] {
+            assert_eq!(first_wire[field], retry_wire[field], "wire setting {field}");
+        }
+        assert_eq!(
+            apply_ready_memory(store.clone()).await.unwrap(),
+            0,
+            "in-flight retry cannot promote"
+        );
+        release.notify_one();
+        let task = driver.memory_task.lock().unwrap().take().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(job.get::<String, _>("status"), "completed");
+        assert_eq!(job.get::<i64, _>("attempts"), 2);
+        assert!(
+            driver
+                .apply_idle_memory_maintenance(&mut RunCore::new())
+                .await
+                .unwrap()
+        );
+        let final_state = hydrate(&store).await;
+        let memory = ThreeLayerMemory::from_hydrated(final_state.memory).unwrap();
+        assert!(
+            memory
+                .l1()
+                .iter()
+                .any(|entry| entry.summary.expose().contains("/workspace/source"))
+        );
+        assert!(
+            serde_json::to_string(&final_state.messages)
+                .unwrap()
+                .contains(correction)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn hydrated_binding_rejects_same_generation_different_lease_or_fence() {
         let store = Arc::new(
             Store::session_test_store("injected-hydrated-authority")
