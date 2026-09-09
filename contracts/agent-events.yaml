@@ -843,6 +843,46 @@ $defs:
   MessagingEventSource:
     oneOf:
       - type: object
+        required: [surface, event_id, kind, workspace_id, installation_id, authority_epoch, place, message_id, message_revision, message_seq, occurred_at, poll_vote]
+        additionalProperties: false
+        properties:
+          surface: { const: messaging }
+          event_id: { $ref: '#/$defs/CanonicalUUID' }
+          kind: { const: messaging_poll_vote }
+          workspace_id: { $ref: '#/$defs/CanonicalUUID' }
+          installation_id: { $ref: '#/$defs/CanonicalUUID' }
+          authority_epoch: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          place:
+            type: object
+            required: [id, kind, name]
+            additionalProperties: false
+            properties:
+              id: { $ref: '#/$defs/CanonicalUUID' }
+              kind: { enum: [channel, thread, dm, group_dm] }
+              name: { type: string }
+          message_id: { $ref: '#/$defs/CanonicalUUID' }
+          message_revision: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          message_seq: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+          occurred_at: { type: string, format: date-time }
+          poll_vote:
+            type: object
+            required: [poll_revision, question, selected_options]
+            additionalProperties: false
+            properties:
+              poll_revision: { $ref: '#/$defs/JsonSafeInteger', minimum: 1 }
+              question: { type: string }
+              selected_options:
+                type: array
+                uniqueItems: true
+                $comment: Option IDs must be distinct; enforce ID-only uniqueness at runtime. Preserve poll order.
+                items:
+                  type: object
+                  required: [option_id, text]
+                  additionalProperties: false
+                  properties:
+                    option_id: { $ref: '#/$defs/CanonicalUUID' }
+                    text: { type: string }
+      - type: object
         required: [surface, event_id, kind, workspace_id, installation_id, authority_epoch, place, message_id, message_revision, message_seq, occurred_at]
         additionalProperties: false
         properties:

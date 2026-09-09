@@ -311,10 +311,17 @@ pub struct MessagingSource {
         skip_serializing_if = "Option::is_none"
     )]
     pub due_at: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_poll_vote",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub poll_vote: Option<PollVote>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessagingEventKind {
+    MessagingPollVote,
     MessagingMention,
     MessagingMessage,
     ReplyLaterDue,
@@ -336,6 +343,24 @@ pub enum MessagingPlaceKind {
 }
 fn present_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     String::deserialize(deserializer).map(Some)
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollVote {
+    pub poll_revision: u64,
+    pub question: String,
+    pub selected_options: Vec<PollVoteOption>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollVoteOption {
+    pub option_id: String,
+    pub text: String,
+}
+fn present_poll_vote<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PollVote>, D::Error> {
+    PollVote::deserialize(deserializer).map(Some)
 }
 impl MessagingSource {
     fn validate(&self) -> Result<(), RuntimeContractError> {
@@ -376,7 +401,32 @@ impl MessagingSource {
                 return Err(fail());
             }
         }
+        if self.kind != MessagingEventKind::MessagingPollVote && self.poll_vote.is_some() {
+            return Err(fail());
+        }
         match self.kind {
+            MessagingEventKind::MessagingPollVote
+                if self.marker_id.is_none() && self.due_at.is_none() =>
+            {
+                let vote = self.poll_vote.as_ref().ok_or_else(fail)?;
+                if vote.poll_revision == 0 || vote.poll_revision > 9_007_199_254_740_991 {
+                    return Err(fail());
+                }
+                let mut ids = std::collections::HashSet::new();
+                for option in &vote.selected_options {
+                    if !ids.insert(&option.option_id) {
+                        return Err(fail());
+                    }
+                    if Uuid::parse_str(&option.option_id)
+                        .map_err(|_| fail())?
+                        .hyphenated()
+                        .to_string()
+                        != option.option_id
+                    {
+                        return Err(fail());
+                    }
+                }
+            }
             MessagingEventKind::MessagingMention | MessagingEventKind::MessagingMessage
                 if self.marker_id.is_none() && self.due_at.is_none() =>
             {
@@ -906,6 +956,70 @@ mod tests {
             serde_json::to_value(crate::gateway::test_direct_chat_provenance()).unwrap();
         direct["source"]["event_id"] = raw["source"]["event_id"].clone();
         assert!(serde_json::from_value::<IncomingProvenance>(direct).is_err());
+    }
+
+    #[test]
+    fn poll_vote_provenance_preserves_order_and_rejects_invalid_payloads() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/agent-events-fixtures.json"
+        ))
+        .unwrap();
+        for key in ["external_poll_vote", "external_poll_withdrawal"] {
+            let envelope: crate::gateway::wire::WireCommandEnvelope =
+                serde_json::from_value(fixtures[key]["wire"].clone()).unwrap();
+            assert!(
+                matches!(envelope.command(), crate::gateway::wire::WireCommand::ExternalEvent { content } if content.is_empty())
+            );
+            let raw = fixtures[key]["wire"]["provenance"].clone();
+            let parsed: IncomingProvenance = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), raw);
+            assert!(parsed.authenticated_direct_chat_human().is_none());
+        }
+        let raw = fixtures["external_poll_vote"]["wire"]["provenance"].clone();
+        for (pointer, value) in [
+            ("/source/poll_vote", serde_json::Value::Null),
+            ("/source/poll_vote/poll_revision", serde_json::json!(0)),
+            (
+                "/source/poll_vote/poll_revision",
+                serde_json::json!(9_007_199_254_740_992u64),
+            ),
+            ("/source/poll_vote/question", serde_json::Value::Null),
+            (
+                "/source/poll_vote/selected_options",
+                serde_json::Value::Null,
+            ),
+            (
+                "/source/poll_vote/selected_options/0/option_id",
+                serde_json::json!("BAD-UUID"),
+            ),
+            ("/source/kind", serde_json::json!("messaging_mention")),
+        ] {
+            let mut bad = raw.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                serde_json::from_value::<IncomingProvenance>(bad).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut missing = raw.clone();
+        missing["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("poll_vote");
+        assert!(serde_json::from_value::<IncomingProvenance>(missing).is_err());
+        for field in ["reply_to_message_id", "marker_id", "due_at"] {
+            let mut bad = raw.clone();
+            bad["source"][field] = if field == "due_at" {
+                serde_json::json!("2026-09-08T13:00:00Z")
+            } else {
+                raw["source"]["message_id"].clone()
+            };
+            assert!(serde_json::from_value::<IncomingProvenance>(bad).is_err());
+        }
+        let mut duplicate = raw.clone();
+        duplicate["source"]["poll_vote"]["selected_options"][1]["option_id"] =
+            raw["source"]["poll_vote"]["selected_options"][0]["option_id"].clone();
+        assert!(serde_json::from_value::<IncomingProvenance>(duplicate).is_err());
     }
 
     #[test]

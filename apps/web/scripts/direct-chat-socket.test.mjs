@@ -377,6 +377,8 @@ test("log preserves strict external source metadata and rejects malformed varian
     "external_dm",
     "external_reminder",
     "external_reply",
+    "external_poll_vote",
+    "external_poll_withdrawal",
   ]) {
     const fixture = fixtures[key];
     if (!fixture) throw new Error(`missing ${key}`);
@@ -1973,5 +1975,50 @@ test("durable summary carries separate stream and canonical positions", () => {
     const invalid = structuredClone(frame);
     invalid.envelope.event[key] = -1;
     assert.equal(parseDirectChatServerFrame(invalid, 0), undefined);
+  }
+});
+
+test("poll source validates vote payload without creating utterance content", () => {
+  const fixtures = JSON.parse(
+    readFileSync(
+      new URL("../../../contracts/agent-events-fixtures.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const provenance = fixtures.external_poll_vote.wire.provenance;
+  const frame = event(1, {
+    type: "message_end",
+    message_id: "00000000-0000-4000-8000-000000000002",
+    message: {
+      role: "user",
+      content: [],
+      timestamp,
+      incoming_source: provenance,
+    },
+  });
+  frame.envelope.audience = "secretary";
+  assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+  for (const mutate of [
+    (s) => delete s.poll_vote,
+    (s) => (s.poll_vote = null),
+    (s) => (s.poll_vote.poll_revision = 0),
+    (s) => (s.poll_vote.poll_revision = Number.MAX_SAFE_INTEGER + 1),
+    (s) => (s.poll_vote.question = null),
+    (s) => (s.poll_vote.selected_options = null),
+    (s) => (s.poll_vote.selected_options[0].option_id = "NOT-A-UUID"),
+    (s) =>
+      s.poll_vote.selected_options.push({
+        ...s.poll_vote.selected_options[0],
+        text: "different",
+      }),
+    (s) => (s.poll_vote.extra = true),
+    (s) => (s.reply_to_message_id = s.message_id),
+    (s) => (s.marker_id = s.message_id),
+    (s) => (s.due_at = timestamp),
+    (s) => (s.kind = "messaging_mention"),
+  ]) {
+    const bad = structuredClone(frame);
+    mutate(bad.envelope.event.message.incoming_source.source);
+    assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
   }
 });

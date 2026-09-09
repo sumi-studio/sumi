@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -240,20 +241,21 @@ type ProvenanceActor struct {
 }
 
 type ProvenanceSource struct {
-	Surface          string           `json:"surface"`
-	EventID          string           `json:"event_id,omitempty"`
-	Kind             string           `json:"kind,omitempty"`
-	WorkspaceID      string           `json:"workspace_id,omitempty"`
-	InstallationID   string           `json:"installation_id,omitempty"`
-	AuthorityEpoch   uint64           `json:"authority_epoch,omitempty"`
-	Place            *ProvenancePlace `json:"place,omitempty"`
-	MessageID        string           `json:"message_id,omitempty"`
-	ReplyToMessageID string           `json:"reply_to_message_id,omitempty"`
-	MessageRevision  uint64           `json:"message_revision,omitempty"`
-	MessageSeq       uint64           `json:"message_seq,omitempty"`
-	OccurredAt       string           `json:"occurred_at,omitempty"`
-	MarkerID         string           `json:"marker_id,omitempty"`
-	DueAt            string           `json:"due_at,omitempty"`
+	Surface          string              `json:"surface"`
+	EventID          string              `json:"event_id,omitempty"`
+	Kind             string              `json:"kind,omitempty"`
+	WorkspaceID      string              `json:"workspace_id,omitempty"`
+	InstallationID   string              `json:"installation_id,omitempty"`
+	AuthorityEpoch   uint64              `json:"authority_epoch,omitempty"`
+	Place            *ProvenancePlace    `json:"place,omitempty"`
+	MessageID        string              `json:"message_id,omitempty"`
+	ReplyToMessageID string              `json:"reply_to_message_id,omitempty"`
+	PollVote         *ProvenancePollVote `json:"poll_vote,omitempty"`
+	MessageRevision  uint64              `json:"message_revision,omitempty"`
+	MessageSeq       uint64              `json:"message_seq,omitempty"`
+	OccurredAt       string              `json:"occurred_at,omitempty"`
+	MarkerID         string              `json:"marker_id,omitempty"`
+	DueAt            string              `json:"due_at,omitempty"`
 }
 
 var provenanceIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$`)
@@ -264,10 +266,54 @@ type ProvenancePlace struct {
 	Name string `json:"name"`
 }
 
+type ProvenancePollVote struct {
+	PollRevision    uint64                 `json:"poll_revision"`
+	Question        string                 `json:"question"`
+	SelectedOptions []ProvenancePollOption `json:"selected_options"`
+}
+
+type ProvenancePollOption struct {
+	OptionID string `json:"option_id"`
+	Text     string `json:"text"`
+}
+
+func (v *ProvenancePollVote) UnmarshalJSON(data []byte) error {
+	type wire ProvenancePollVote
+	var decoded wire
+	if err := unmarshalStrict(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, key := range []string{"poll_revision", "question", "selected_options"} {
+		if raw, ok := fields[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("poll vote %s is required", key)
+		}
+	}
+	var options []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["selected_options"], &options); err != nil {
+		return err
+	}
+	for _, option := range options {
+		for _, key := range []string{"option_id", "text"} {
+			if raw, ok := option[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return fmt.Errorf("poll option %s is required", key)
+			}
+		}
+	}
+	*v = ProvenancePollVote(decoded)
+	return nil
+}
+
 func (p IncomingProvenance) Equal(other IncomingProvenance) bool {
 	a, b := p.Source.Place, other.Source.Place
+	av, bv := p.Source.PollVote, other.Source.PollVote
 	p.Source.Place, other.Source.Place = nil, nil
-	return p == other && ((a == nil && b == nil) || (a != nil && b != nil && *a == *b))
+	p.Source.PollVote, other.Source.PollVote = nil, nil
+	return p == other && ((a == nil && b == nil) || (a != nil && b != nil && *a == *b)) &&
+		((av == nil && bv == nil) || (av != nil && bv != nil && av.PollRevision == bv.PollRevision && av.Question == bv.Question && slices.Equal(av.SelectedOptions, bv.SelectedOptions)))
 }
 
 func (p IncomingProvenance) Validate() error {
@@ -318,6 +364,18 @@ func (p IncomingProvenance) Validate() error {
 		return errors.New("reply metadata requires a messaging event and canonical target UUID")
 	}
 	switch source.Kind {
+	case "messaging_poll_vote":
+		v := source.PollVote
+		if v == nil || v.PollRevision == 0 || v.PollRevision > maxJSONSafeInteger || v.SelectedOptions == nil || source.MarkerID != "" || source.DueAt != "" {
+			return errors.New("poll vote requires a revision and selection, without reminder fields")
+		}
+		seen := make(map[string]bool, len(v.SelectedOptions))
+		for _, option := range v.SelectedOptions {
+			if !canonicalUUIDRegexp.MatchString(option.OptionID) || seen[option.OptionID] {
+				return errors.New("poll vote requires distinct canonical option identifiers")
+			}
+			seen[option.OptionID] = true
+		}
 	case "messaging_mention", "messaging_message":
 		if source.MarkerID != "" || source.DueAt != "" {
 			return errors.New("mention cannot carry reminder fields")
@@ -331,6 +389,9 @@ func (p IncomingProvenance) Validate() error {
 		}
 	default:
 		return errors.New("unknown external source kind")
+	}
+	if source.Kind != "messaging_poll_vote" && source.PollVote != nil {
+		return errors.New("poll vote metadata requires a poll vote event")
 	}
 	return nil
 }
@@ -368,6 +429,16 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 		if raw, ok := fields.Source["reply_to_message_id"]; ok {
 			if (value.Source.Kind != "messaging_message" && value.Source.Kind != "messaging_mention") || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || value.Source.ReplyToMessageID == "" {
 				return errors.New("reply_to_message_id requires a messaging event and canonical target UUID")
+			}
+		}
+		if raw, ok := fields.Source["poll_vote"]; ok && (value.Source.Kind != "messaging_poll_vote" || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
+			return errors.New("poll_vote requires a poll vote event and object")
+		}
+		if value.Source.Kind == "messaging_poll_vote" {
+			for _, key := range []string{"marker_id", "due_at"} {
+				if _, ok := fields.Source[key]; ok {
+					return errors.New("poll vote cannot carry reminder fields")
+				}
 			}
 		}
 		if value.Source.Kind == "messaging_mention" {

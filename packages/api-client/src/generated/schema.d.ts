@@ -844,6 +844,34 @@ export interface components {
             /** @constant */
             surface: "messaging";
             event_id: components["schemas"]["CanonicalUUID"];
+            /** @constant */
+            kind: "messaging_poll_vote";
+            workspace_id: components["schemas"]["CanonicalUUID"];
+            installation_id: components["schemas"]["CanonicalUUID"];
+            authority_epoch: components["schemas"]["JsonSafeInteger"];
+            place: {
+                id: components["schemas"]["CanonicalUUID"];
+                /** @enum {unknown} */
+                kind: "channel" | "thread" | "dm" | "group_dm";
+                name: string;
+            };
+            message_id: components["schemas"]["CanonicalUUID"];
+            message_revision: components["schemas"]["JsonSafeInteger"];
+            message_seq: components["schemas"]["JsonSafeInteger"];
+            /** Format: date-time */
+            occurred_at: string;
+            poll_vote: {
+                poll_revision: components["schemas"]["JsonSafeInteger"];
+                question: string;
+                selected_options: {
+                    option_id: components["schemas"]["CanonicalUUID"];
+                    text: string;
+                }[];
+            };
+        } | {
+            /** @constant */
+            surface: "messaging";
+            event_id: components["schemas"]["CanonicalUUID"];
             /** @enum {unknown} */
             kind: "messaging_mention" | "messaging_message";
             reply_to_message_id?: components["schemas"]["CanonicalUUID"];

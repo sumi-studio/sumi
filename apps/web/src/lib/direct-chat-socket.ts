@@ -478,6 +478,7 @@ function isIncomingSource(value: unknown): boolean {
         "marker_id",
         "due_at",
         "reply_to_message_id",
+        "poll_vote",
       ],
     )
   )
@@ -504,6 +505,37 @@ function isIncomingSource(value: unknown): boolean {
     return false;
   if ("reply_to_message_id" in source && !isUUID(source.reply_to_message_id))
     return false;
+  if (source.kind === "messaging_poll_vote") {
+    const vote = source.poll_vote;
+    return (
+      !("reply_to_message_id" in source) &&
+      !("marker_id" in source) &&
+      !("due_at" in source) &&
+      isRecord(vote) &&
+      hasRequiredAndOnlyKeys(vote, [
+        "poll_revision",
+        "question",
+        "selected_options",
+      ]) &&
+      isSafeSequence(vote.poll_revision) &&
+      vote.poll_revision > 0 &&
+      typeof vote.question === "string" &&
+      Array.isArray(vote.selected_options) &&
+      new Set(
+        vote.selected_options.map((option) =>
+          isRecord(option) ? option.option_id : undefined,
+        ),
+      ).size === vote.selected_options.length &&
+      vote.selected_options.every(
+        (option) =>
+          isRecord(option) &&
+          hasRequiredAndOnlyKeys(option, ["option_id", "text"]) &&
+          isUUID(option.option_id) &&
+          typeof option.text === "string",
+      )
+    );
+  }
+  if ("poll_vote" in source) return false;
   if (source.kind === "reply_later_due")
     return (
       !("reply_to_message_id" in source) &&

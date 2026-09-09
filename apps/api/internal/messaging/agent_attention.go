@@ -15,6 +15,7 @@ const (
 	AgentAttentionMessage  = "messaging_message"
 	AgentAttentionMention  = "messaging_mention"
 	AgentAttentionReminder = "reply_later_due"
+	AgentAttentionPollVote = "messaging_poll_vote"
 )
 
 // AgentAttentionEvent is frozen when the source is issued. It is private input
@@ -32,14 +33,28 @@ type AgentAttentionEvent struct {
 	MessageID          string              `json:"message_id"`
 	// ReplyRequired is an outbox-only authorization condition. DM/mention
 	// delivery does not depend on the continued existence of the parent.
-	ReplyRequired    bool       `json:"reply_required,omitempty"`
-	ReplyToMessageID string     `json:"reply_to_message_id,omitempty"`
-	MessageRevision  int64      `json:"message_revision"`
-	MessageSeq       int64      `json:"message_seq"`
-	OccurredAt       time.Time  `json:"occurred_at"`
-	Content          string     `json:"content"`
-	MarkerID         string     `json:"marker_id,omitempty"`
-	DueAt            *time.Time `json:"due_at,omitempty"`
+	ReplyRequired    bool                        `json:"reply_required,omitempty"`
+	ReplyToMessageID string                      `json:"reply_to_message_id,omitempty"`
+	MessageRevision  int64                       `json:"message_revision"`
+	MessageSeq       int64                       `json:"message_seq"`
+	OccurredAt       time.Time                   `json:"occurred_at"`
+	Content          string                      `json:"content"`
+	MarkerID         string                      `json:"marker_id,omitempty"`
+	DueAt            *time.Time                  `json:"due_at,omitempty"`
+	PollVote         *AgentAttentionPollVoteData `json:"poll_vote,omitempty"`
+}
+
+// The frozen complete selection at one poll revision, in poll display order.
+// Empty SelectedOptions is a withdrawal, not an absent projection.
+type AgentAttentionPollVoteData struct {
+	PollRevision    int64                      `json:"poll_revision"`
+	Question        string                     `json:"question"`
+	SelectedOptions []AgentAttentionPollOption `json:"selected_options"`
+}
+
+type AgentAttentionPollOption struct {
+	OptionID string `json:"option_id"`
+	Text     string `json:"text"`
 }
 
 type AgentAttentionActor struct {
@@ -188,6 +203,67 @@ func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Plac
 	err = s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
 		access.WorkspaceMemberID, access.PlaceMemberID, message.CreatedAt)
 	return parent.Author, err
+}
+
+// A vote is an action by the authenticated voter on the author's question.
+// It is not a message written by that voter or an instruction from the owner.
+func (s *ScopedStore) issueAgentPollVote(ctx context.Context, tx pgx.Tx, place Place, message Message, votedAt time.Time) error {
+	if message.Author.Kind != KindPersonalityAgent || message.Author == s.Scope.Actor {
+		return nil
+	}
+	members, err := s.activeMembersScoped(ctx, tx, place)
+	if err != nil {
+		return err
+	}
+	if place.Kind == PlaceThread {
+		members, err = s.threadNotificationMembers(ctx, tx, place.PlaceID, members)
+		if err != nil {
+			return err
+		}
+	}
+	present, voterName := false, ""
+	for _, member := range members {
+		present = present || member.Participant == message.Author
+		if member.Participant == s.Scope.Actor {
+			voterName = member.DisplayName
+		}
+	}
+	if !present {
+		return nil
+	}
+	settings, err := s.scopedNotificationSettingsFor(ctx, tx, place.PlaceID, []ParticipantRef{message.Author})
+	if err != nil {
+		return err
+	}
+	if settings[message.Author.Key()].level == NotifyLevelMute {
+		return nil
+	}
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, message.Author)
+	if err != nil {
+		return err
+	}
+	if message.Seq < access.VisibleFromSeq {
+		return nil
+	}
+	poll := message.Poll
+	if poll == nil || poll.Revision < 1 {
+		return errors.New("poll vote attention requires committed projection")
+	}
+	selected := make([]AgentAttentionPollOption, 0)
+	for _, option := range poll.Options {
+		for _, voter := range option.Voters {
+			if voter == s.Scope.Actor {
+				selected = append(selected, AgentAttentionPollOption{OptionID: option.OptionID, Text: option.Text})
+				break
+			}
+		}
+	}
+	event := s.attentionEvent(place, message, s.Scope.Actor, voterName)
+	event.Kind, event.PersonalityAgentID = AgentAttentionPollVote, message.Author.ID
+	event.Content, event.OccurredAt = "", votedAt
+	event.PollVote = &AgentAttentionPollVoteData{PollRevision: poll.Revision, Question: poll.Question, SelectedOptions: selected}
+	return s.insertAgentAttention(ctx, tx, event, message.MessageID, poll.Revision,
+		access.WorkspaceMemberID, access.PlaceMemberID, votedAt)
 }
 
 func (s *ScopedStore) issueAgentReminder(ctx context.Context, tx pgx.Tx, place Place, message Message, marker ReplyLaterMarker, access PlaceAccess) error {
@@ -422,6 +498,20 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 			return ErrMessageNotFound
 		}
 	}
+	if item.event.Kind == AgentAttentionPollVote {
+		if message.Author != s.Scope.Actor {
+			return ErrMessageNotFound
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM message_polls WHERE message_id=$1)", message.MessageID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrPollNotFound
+		}
+		// A vote accepted before closing remains an answer after its deadline.
+		// Later votes likewise do not rewrite this event's frozen selection.
+	}
 	if item.event.Kind == AgentAttentionReminder {
 		var due bool
 		if err := tx.QueryRow(ctx, `SELECT resolved_at IS NULL AND remind_at <= now()
@@ -441,7 +531,7 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 
 func attentionSourceUnavailable(err error) bool {
 	return errors.Is(err, ErrPlaceNotFound) || errors.Is(err, ErrMessageNotFound) ||
-		errors.Is(err, ErrMarkerNotFound) || errors.Is(err, ErrMessageDeleted) ||
+		errors.Is(err, ErrMarkerNotFound) || errors.Is(err, ErrPollNotFound) || errors.Is(err, ErrMessageDeleted) ||
 		errors.Is(err, applicationapps.ErrInstallationNotFound) ||
 		errors.Is(err, applicationapps.ErrAppDisabled) || errors.Is(err, applicationapps.ErrAuthorityEpochStale)
 }

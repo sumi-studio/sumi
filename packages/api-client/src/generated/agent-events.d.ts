@@ -87,6 +87,43 @@ export type MessagingEventSource =
   | {
       surface: "messaging";
       event_id: CanonicalUUID;
+      kind: "messaging_poll_vote";
+      workspace_id: CanonicalUUID;
+      installation_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      authority_epoch: number;
+      place: {
+        id: CanonicalUUID;
+        kind: "channel" | "thread" | "dm" | "group_dm";
+        name: string;
+      };
+      message_id: CanonicalUUID;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_revision: number;
+      /**
+       * non-negative integer representable exactly by JavaScript number clients
+       */
+      message_seq: number;
+      occurred_at: string;
+      poll_vote: {
+        /**
+         * non-negative integer representable exactly by JavaScript number clients
+         */
+        poll_revision: number;
+        question: string;
+        selected_options: {
+          option_id: CanonicalUUID;
+          text: string;
+        }[];
+      };
+    }
+  | {
+      surface: "messaging";
+      event_id: CanonicalUUID;
       kind: "messaging_mention" | "messaging_message";
       reply_to_message_id?: CanonicalUUID;
       workspace_id: CanonicalUUID;

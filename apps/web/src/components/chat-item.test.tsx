@@ -3,6 +3,8 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatItem } from "../agent/model";
+import { userItemText } from "../lib/user-item-text";
 import { ChatItemView } from "./chat-item";
 
 afterEach(cleanup);
@@ -155,4 +157,54 @@ it("keeps operation input and complete failed output inspectable in place", () =
   expect(screen.getByRole("region", { name: "結果" })).toHaveTextContent(
     "Permission denied",
   );
+});
+
+it("shows poll answers and withdrawals without inventing authored message text", () => {
+  const id = "01992000-0000-7000-8000-000000000008";
+  const item: Extract<ChatItem, { kind: "user" }> = {
+    kind: "user",
+    id: "poll-answer",
+    text: "",
+    attachments: [],
+    timestamp: "2026-09-09T08:00:00Z",
+    delivery: "durable",
+    source: {
+      version: 2,
+      tenant_id: "tenant",
+      personality_agent_id: id,
+      actor: { kind: "human", principal_id: id, display_name: "Yohaku" },
+      source: {
+        surface: "messaging",
+        kind: "messaging_poll_vote",
+        event_id: id,
+        workspace_id: id,
+        installation_id: id,
+        authority_epoch: 1,
+        place: { id, kind: "channel", name: "Planning" },
+        message_id: id,
+        message_revision: 1,
+        message_seq: 1,
+        occurred_at: "2026-09-09T08:00:00Z",
+        poll_vote: {
+          poll_revision: 2,
+          question: "いつにしますか？",
+          selected_options: [{ option_id: id, text: "午後" }],
+        },
+      },
+    },
+  };
+  const view = render(<ChatItemView item={item} />);
+  expect(screen.getByText(/Yohaku · 投票/)).toBeVisible();
+  expect(screen.getByText(/選択：午後/)).toBeVisible();
+  expect(userItemText(item)).toBe("いつにしますか？\n選択：午後");
+  if (item.source?.source.kind !== "messaging_poll_vote")
+    throw Error("Missing vote");
+  item.source.source.poll_vote = {
+    ...item.source.source.poll_vote,
+    selected_options: [],
+  };
+  view.rerender(<ChatItemView item={item} />);
+  expect(screen.getByText(/回答を撤回しました/)).toBeVisible();
+  expect(userItemText(item)).toBe("いつにしますか？\n回答を撤回しました");
+  expect(item.text).toBe("");
 });

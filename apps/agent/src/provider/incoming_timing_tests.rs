@@ -311,3 +311,50 @@ fn external_event_always_shows_receipt_but_direct_chat_keeps_existing_prefix() {
         Some("[Received 2026-09-08 00:00:00 UTC]")
     );
 }
+
+#[test]
+fn poll_vote_source_reaches_all_providers_without_fabricated_utterance() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../../contracts/agent-events-fixtures.json"
+    ))
+    .unwrap();
+    for key in ["external_poll_vote", "external_poll_withdrawal"] {
+        let raw = &fixtures[key]["wire"]["provenance"];
+        let user = UserMessage {
+            incoming_source: Some(serde_json::from_value(raw.clone()).unwrap()),
+            incoming_timing: None,
+            content: vec![UserContent::Text {
+                text: fixtures[key]["wire"]["command"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            }],
+            timestamp: timestamp(),
+        };
+        let prefix = user.incoming_timing_text().unwrap();
+        let metadata: Value = serde_json::from_str(
+            prefix
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("[Source ")
+                .unwrap()
+                .strip_suffix(']')
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["source"], raw["source"]);
+        assert_eq!(metadata["actor"], raw["actor"]);
+        for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+            let blocks = payload_blocks(preset, user.clone());
+            assert!(
+                blocks[1..].iter().all(|block| block["text"] == ""),
+                "{preset} fabricated utterance content"
+            );
+            assert_eq!(blocks[0]["text"], prefix);
+        }
+        let restored: UserMessage =
+            serde_json::from_value(serde_json::to_value(&user).unwrap()).unwrap();
+        assert_eq!(restored, user);
+    }
+}

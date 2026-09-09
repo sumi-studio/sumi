@@ -40,6 +40,15 @@ func (a *AgentAttentionGateway) input(event AgentAttentionEvent) (agentevents.In
 	if event.DueAt != nil {
 		source.DueAt = event.DueAt.UTC().Format(time.RFC3339Nano)
 	}
+	if event.PollVote != nil {
+		options := make([]agentevents.ProvenancePollOption, 0, len(event.PollVote.SelectedOptions))
+		for _, option := range event.PollVote.SelectedOptions {
+			options = append(options, agentevents.ProvenancePollOption{OptionID: option.OptionID, Text: option.Text})
+		}
+		source.PollVote = &agentevents.ProvenancePollVote{
+			PollRevision: uint64(event.PollVote.PollRevision), Question: event.PollVote.Question, SelectedOptions: options,
+		}
+	}
 	provenance := agentevents.IncomingProvenance{
 		Version: 2, TenantID: a.TenantID, PersonalityAgentID: event.PersonalityAgentID,
 		Actor:  agentevents.ProvenanceActor{Kind: event.Actor.Kind, PrincipalID: event.Actor.ID, DisplayName: event.Actor.DisplayName},
