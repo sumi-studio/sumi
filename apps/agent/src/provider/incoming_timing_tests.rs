@@ -40,10 +40,8 @@ fn payload_blocks(preset: &str, user: UserMessage) -> Vec<Value> {
         .unwrap()
         .iter()
         .find(|message| message["role"] == "user")
-        .unwrap()["content"]
-        .as_array()
-        .unwrap()
-        .clone()
+        .map(|message| message["content"].as_array().unwrap().clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -347,14 +345,67 @@ fn poll_vote_source_reaches_all_providers_without_fabricated_utterance() {
         assert_eq!(metadata["actor"], raw["actor"]);
         for preset in ["kimi-k3", "openai-responses", "anthropic"] {
             let blocks = payload_blocks(preset, user.clone());
+            assert_eq!(
+                blocks.len(),
+                1,
+                "{preset} emitted an empty or fabricated utterance block"
+            );
             assert!(
-                blocks[1..].iter().all(|block| block["text"] == ""),
-                "{preset} fabricated utterance content"
+                blocks
+                    .iter()
+                    .all(|block| block["text"].as_str().is_some_and(|text| !text.is_empty()))
             );
             assert_eq!(blocks[0]["text"], prefix);
         }
         let restored: UserMessage =
             serde_json::from_value(serde_json::to_value(&user).unwrap()).unwrap();
         assert_eq!(restored, user);
+    }
+}
+
+#[test]
+fn user_projection_omits_only_empty_strings_and_preserves_authored_whitespace() {
+    for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+        let mut user = UserMessage {
+            incoming_source: None,
+            incoming_timing: None,
+            content: vec![UserContent::Text {
+                text: String::new(),
+            }],
+            timestamp: timestamp(),
+        };
+        // Match the adapters' existing handling of a user with no content.
+        if preset == "anthropic" {
+            let spec = ModelSpec::preset(preset).unwrap();
+            let context = PromptContext::new(
+                String::new(),
+                vec![],
+                vec![ContextMessage::Synthetic {
+                    message: Message::User(user.clone()),
+                }],
+                vec![],
+                vec![],
+            );
+            assert!(
+                matches!(adapters::anthropic::build_request(&spec, &context, &RequestOptions::default()), Err(adapters::anthropic::AnthropicAdapterError::InvalidContext(reason)) if reason == "Anthropic request requires at least one conversation turn")
+            );
+        } else {
+            assert!(payload_blocks(preset, user.clone()).is_empty());
+        }
+        user.content.extend([
+            UserContent::Text {
+                text: " \n\t".into(),
+            },
+            UserContent::Text {
+                text: String::new(),
+            },
+            UserContent::Text {
+                text: "actual text".into(),
+            },
+        ]);
+        let blocks = payload_blocks(preset, user);
+        assert_eq!(blocks.len(), 2, "{preset}");
+        assert_eq!(blocks[0]["text"], " \n\t");
+        assert_eq!(blocks[1]["text"], "actual text");
     }
 }

@@ -454,6 +454,7 @@ const IMAGE_OMITTED_NOTE: &str = "(image omitted: model does not support image i
 fn convert_user_content(content: &[UserContent], supports_images: bool) -> Vec<Value> {
     content
         .iter()
+        .filter(|item| !matches!(item, UserContent::Text { text } if text.is_empty()))
         .map(|item| match item {
             UserContent::Text { text } => json!({"type": "text", "text": text}),
             UserContent::Image { data, mime_type } if supports_images => json!({
