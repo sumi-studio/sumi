@@ -1,0 +1,129 @@
+{
+  "status": "PASSED",
+  "startedAt": "2026-09-09T07:27:31.120713+00:00",
+  "finishedAt": "2026-09-09T07:33:23.979039+00:00",
+  "agent": "01a08510-9330-7c92-87c4-6b31c0c98836",
+  "human": "01a08510-9330-7cd9-8abb-1e1722ba3ae4",
+  "workspace": "01a08510-9443-74a2-b711-c80875c1b274",
+  "place": "01a08510-9464-7dbc-b6a8-810e03c7285d",
+  "deployment": {
+    "api": {
+      "image": "sha256:e10a65f85c76c36f6c88135d9a911cd5c3a0416d407d1e3fae25a9851ef00be3",
+      "revision": "47c9f01597e40e1de080d21983d69c2570291b38"
+    },
+    "web": {
+      "image": "sha256:0ffb5acb535247c7be56b7aaf644a7af4298c9f0f3eb6268426ad5b0e7d755ab",
+      "revision": "47c9f01597e40e1de080d21983d69c2570291b38"
+    },
+    "runtime-provisioner": {
+      "image": "sha256:fa807916394b7013aea367ca807e1c9a91e848685811426dcf94dfdaa6f69cb2",
+      "revision": "47c9f01597e40e1de080d21983d69c2570291b38"
+    },
+    "postgres": {
+      "image": "sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193",
+      "revision": null
+    }
+  },
+  "runtimeImage": "sha256:2992a7a4ff80e055614324c75386b56ed29af830775ada7c8f7b84160a137bd3",
+  "beforeRuntime": {
+    "container": "c475a687ab6f985cc2946fb1456fae72080792c2f6eb2f2f40a2a903e71421ce",
+    "image": "sha256:2992a7a4ff80e055614324c75386b56ed29af830775ada7c8f7b84160a137bd3",
+    "generation": 0,
+    "startedAt": "2026-09-09T07:27:38.589715713Z"
+  },
+  "stoppedAt": "2026-09-09T07:29:47.371206+00:00",
+  "afterRuntime": {
+    "container": "872f582665535d053db8a3b1b274f773184c09ce2ba50045c8261f0cb5757588",
+    "image": "sha256:2992a7a4ff80e055614324c75386b56ed29af830775ada7c8f7b84160a137bd3",
+    "generation": 1,
+    "startedAt": "2026-09-09T07:32:47.98259123Z"
+  },
+  "deliveries": [
+    {
+      "event_id": "01a08511-9fd9-7112-b70c-44ffd9edb9a2",
+      "source_id": "01a08511-9fd7-732c-9b71-6062f451fb3d",
+      "source_kind": "reply_later_due",
+      "available_at": "2026-09-09T07:32:39.887624+00:00",
+      "admitted_at": "2026-09-09T07:32:48.187218+00:00",
+      "admitted_command_id": "b4dbcd7a-308a-481e-bd38-a72b0a78ab6c",
+      "admitted_command_seq": 2,
+      "suppressed_at": null,
+      "suppression_reason": null
+    },
+    {
+      "event_id": "01a08512-0dc4-74dd-9203-f3254dd85140",
+      "source_id": "01a08512-0dc3-73ce-8d2c-9de80568100b",
+      "source_kind": "reply_later_due",
+      "available_at": "2026-09-09T07:33:08.030259+00:00",
+      "admitted_at": null,
+      "admitted_command_id": null,
+      "admitted_command_seq": null,
+      "suppressed_at": "2026-09-09T07:29:29.86255+00:00",
+      "suppression_reason": "source_unavailable"
+    }
+  ],
+  "admissionProof": [
+    {
+      "event_id": "01a08511-9fd9-7112-b70c-44ffd9edb9a2",
+      "source_id": "01a08511-9fd7-732c-9b71-6062f451fb3d",
+      "count": 1,
+      "commands": [
+        {
+          "seq": 2,
+          "command_id": "b4dbcd7a-308a-481e-bd38-a72b0a78ab6c",
+          "idempotency_key": "attention:01a08510-9330-7c92-87c4-6b31c0c98836:01a08511-9fd9-7112-b70c-44ffd9edb9a2"
+        }
+      ]
+    },
+    {
+      "event_id": "01a08512-0dc4-74dd-9203-f3254dd85140",
+      "source_id": "01a08512-0dc3-73ce-8d2c-9de80568100b",
+      "count": 0,
+      "commands": []
+    }
+  ],
+  "cleanupComplete": true,
+  "scope": "Synthetic real-model invitation acceptance, reminder creation/cancellation, Cold stop before deadline and Attention-owned restart. Admission acceptance, not semantic reminder response quality.",
+  "limitations": [
+    "No whole-WSL restart or admission/DB-ack crash-window injection.",
+    "10 unchanged admission observations; no general exactly-once external side-effect claim."
+  ],
+  "setupTools": [
+    {
+      "name": "workspace_invitation_list",
+      "id": "4bb02115-d12c-5208-bd2d-c08f836d1044",
+      "is_error": false,
+      "result_is_error": false
+    },
+    {
+      "name": "workspace_invitation_accept",
+      "id": "fd4e58a6-3d5c-57a9-89e7-5e5d74941b17",
+      "is_error": false,
+      "result_is_error": false
+    },
+    {
+      "name": "messaging",
+      "id": "d15acfd5-dd2f-587c-bf9c-09e9cc091c54",
+      "is_error": false,
+      "result_is_error": false
+    },
+    {
+      "name": "messaging",
+      "id": "7e5c8654-507b-5f14-bce5-f8e83b8df006",
+      "is_error": false,
+      "result_is_error": false
+    },
+    {
+      "name": "messaging",
+      "id": "91407455-d9a2-56ea-a3b9-5735402aa5ac",
+      "is_error": false,
+      "result_is_error": false
+    },
+    {
+      "name": "messaging",
+      "id": "e64f5595-c720-5292-87c0-05be71cff083",
+      "is_error": false,
+      "result_is_error": false
+    }
+  ]
+}
