@@ -942,6 +942,7 @@ impl ExecutionReviewerTransport for RunLoopExecutionReviewTransport {
         &self,
         prompt: &ExecutionReviewerPrompt,
         _tool_call_offset: usize,
+        _attempt_trace: crate::approval::route_reviewer::ReviewerAttemptTrace,
         _cancel: CancellationToken,
     ) -> std::result::Result<ReviewerTransportOutput, RouteReviewerTransportError> {
         self.prompts
@@ -970,6 +971,7 @@ impl EscalationReviewerTransport for RunLoopEscalationReviewTransport {
         &self,
         _prompt: &EscalationReviewerPrompt,
         _tool_call_offset: usize,
+        _attempt_trace: crate::approval::route_reviewer::ReviewerAttemptTrace,
         _cancel: CancellationToken,
     ) -> std::result::Result<ReviewerTransportOutput, RouteReviewerTransportError> {
         Ok(ReviewerTransportOutput {
