@@ -387,6 +387,56 @@ impl fmt::Debug for LocalControlTransport {
     }
 }
 
+#[async_trait]
+impl crate::apiclient::public_web::PublicWebApi for LocalControlHttpClient {
+    async fn read(
+        &self,
+        request: &crate::apiclient::public_web::PublicWebRequest,
+    ) -> Result<
+        crate::apiclient::public_web::PublicWebPage,
+        crate::apiclient::public_web::PublicWebError,
+    > {
+        use crate::apiclient::public_web::{
+            PublicWebError, PublicWebErrorCode as Code, PublicWebPage,
+        };
+        if !request.validate() {
+            return Err(PublicWebError::new(Code::InvalidUrl));
+        }
+        let (status, body) = self
+            .post_json_bounded_raw_with_timeout(
+                "/public-web/read",
+                request,
+                1024 * 1024,
+                Some(Duration::from_secs(20)),
+            )
+            .await
+            .map_err(|_| PublicWebError::new(Code::Unavailable))?;
+        if !status.is_success() {
+            if let Ok(error) = serde_json::from_slice::<PublicWebError>(&body)
+                && error.matches(request)
+            {
+                return Err(error);
+            }
+            return Err(PublicWebError::new(match status.as_u16() {
+                401 | 403 => Code::Unauthorized,
+                429 => Code::Busy,
+                _ => Code::InvalidResponse,
+            }));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| PublicWebError::new(Code::InvalidResponse))?;
+        if value.get("title").is_none() {
+            return Err(PublicWebError::new(Code::InvalidResponse));
+        }
+        let page: PublicWebPage = serde_json::from_value(value)
+            .map_err(|_| PublicWebError::new(Code::InvalidResponse))?;
+        if !page.matches(request) {
+            return Err(PublicWebError::new(Code::InvalidResponse));
+        }
+        Ok(page)
+    }
+}
+
 // Process requests use the same authenticated local-control transport. No
 // endpoint, credential, or acting PA can be selected by tool arguments.
 impl LocalControlHttpClient {
@@ -827,6 +877,20 @@ impl LocalControlHttpClient {
     where
         Request: Serialize + Sync,
     {
+        self.post_json_bounded_raw_with_timeout(path, body, max_response_bytes, None)
+            .await
+    }
+
+    async fn post_json_bounded_raw_with_timeout<Request>(
+        &self,
+        path: &str,
+        body: &Request,
+        max_response_bytes: usize,
+        timeout: Option<Duration>,
+    ) -> Result<(reqwest::StatusCode, Zeroizing<Vec<u8>>)>
+    where
+        Request: Serialize + Sync,
+    {
         self.credential.validate(&self.authority)?;
         let (http, unix_endpoint) = match &self.transport {
             LocalControlTransport::Unix(endpoint) => {
@@ -842,6 +906,9 @@ impl LocalControlHttpClient {
             .post(url)
             .bearer_auth(self.credential.token.as_str())
             .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if unix_endpoint.is_some() {
             request = request.header(reqwest::header::CONNECTION, "close");
         }
@@ -3957,6 +4024,73 @@ mod tests {
 
     fn authority() -> RuntimeEpochAuthority {
         authority_with(PAID, 7, "boot-a")
+    }
+
+    #[tokio::test]
+    async fn public_web_http_preserves_source_bounds_and_recoverable_errors() {
+        use crate::apiclient::public_web::{PublicWebApi, PublicWebErrorCode, PublicWebRequest};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/public-web/read", post(
+            |headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer control-secret");
+                assert_eq!(body.as_object().unwrap().len(), 1);
+                let url = body["url"].as_str().unwrap();
+                if url.ends_with("/failed") {
+                    return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"dns_failed"})));
+                }
+                let mut page = serde_json::json!({
+                    "requested_url":url, "fetched_url":url.split('#').next().unwrap(),
+                    "fetched_at":"2026-09-09T00:00:00Z", "status_code":200,
+                    "media_type":"text/plain", "title":null,
+                    "text":format!("observed{}", "\u{0001}".repeat(128 * 1024 - 8)),
+                    "body_bytes":128 * 1024, "body_sha256":"a".repeat(64), "text_truncated":false
+                });
+                if url.ends_with("/drift") { page["requested_url"] = serde_json::json!("https://other.example/"); }
+                if url.ends_with("/missing-title") { page.as_object_mut().unwrap().remove("title"); }
+                (StatusCode::OK, Json(page))
+            }
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        for (suffix, code) in [
+            ("failed", PublicWebErrorCode::DnsFailed),
+            ("drift", PublicWebErrorCode::InvalidResponse),
+            ("missing-title", PublicWebErrorCode::InvalidResponse),
+        ] {
+            let request = PublicWebRequest {
+                url: format!("https://example.com/{suffix}"),
+            };
+            assert_eq!(
+                PublicWebApi::read(&client, &request)
+                    .await
+                    .unwrap_err()
+                    .error,
+                code
+            );
+        }
+        let page = PublicWebApi::read(
+            &client,
+            &PublicWebRequest {
+                url: "https://example.com/page?q=1#section".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.text.len(), 128 * 1024);
+        assert_eq!(page.fetched_url, "https://example.com/page?q=1");
+        assert_eq!(page.requested_url, "https://example.com/page?q=1#section");
+        server.abort();
     }
 
     fn messaging_scope() -> ExactMessagingScope {

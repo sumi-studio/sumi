@@ -22,6 +22,7 @@ pub mod fs;
 pub(crate) mod memory;
 pub(crate) mod messaging;
 pub(crate) mod process;
+pub(crate) mod public_web;
 pub mod shell_capture;
 pub mod truncate;
 #[cfg(unix)]

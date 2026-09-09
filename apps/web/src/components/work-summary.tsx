@@ -12,6 +12,7 @@ import {
   ChevronRight,
   CircleAlert,
   FileSearch,
+  Globe,
   Pencil,
   ShieldAlert,
   ShieldCheck,
@@ -35,6 +36,7 @@ interface WorkSummaryProps {
 
 const TOOL_ICONS = {
   read_file: FileSearch,
+  public_url_read: Globe,
   edit_file: Pencil,
   bash: SquareTerminal,
 } as const;

@@ -1,0 +1,63 @@
+{
+  "scenario": "durable process completion returns to the same PA after a cold stop",
+  "deployed_revision": "661aa0ac74e8ea958eb0b6af72cb956085e09b86",
+  "model": "opencode-go/kimi-k2.7-code",
+  "operation_id": "e94c07e4d3b791b033052b1d6986835da3b0d72c48ee6d0fcc55ce31e8be03e5",
+  "cold_stop_while_running": true,
+  "artifact": {
+    "path": "t01-1c8deb23f716/artifact.txt",
+    "sha256": "7572d4b6a5e2f7bab23430bde890d697507df1b686a5d50cbaa12491649fdd26",
+    "executionCount": 1
+  },
+  "completion_source": {
+    "version": 2,
+    "tenant_id": "local",
+    "personality_agent_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+    "actor": {
+      "kind": "personality_agent",
+      "principal_id": "01a08510-9330-7c92-87c4-6b31c0c98836"
+    },
+    "source": {
+      "surface": "workspace_operation",
+      "kind": "process_completed",
+      "event_id": "01a085c7-a5be-7159-9a7b-1e6e537c2798",
+      "operation_id": "e94c07e4d3b791b033052b1d6986835da3b0d72c48ee6d0fcc55ce31e8be03e5",
+      "originating_tool_call_id": "38ce66d7-eff6-54de-ac40-cb54cbf07f2e",
+      "occurred_at": "2026-09-09T10:52:05.179560551Z",
+      "result": {
+        "state": "succeeded",
+        "exit_code": 0,
+        "stdout_bytes": 96,
+        "stderr_bytes": 0,
+        "output_truncated": false
+      }
+    }
+  },
+  "completion_receipt": {
+    "personality_agent_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+    "operation_id": "e94c07e4d3b791b033052b1d6986835da3b0d72c48ee6d0fcc55ce31e8be03e5",
+    "event_id": "01a085c7-a5be-7159-9a7b-1e6e537c2798",
+    "command_id": "db19407c-86df-45a5-9f8c-c273e301961f",
+    "command_seq": 22
+  },
+  "result_message": {
+    "message_id": "01a085cc-8173-723e-aa24-2d0f17f236fc",
+    "seq": 18,
+    "author_kind": "personality_agent",
+    "author_id": "01a08510-9330-7c92-87c4-6b31c0c98836",
+    "reply_to": null,
+    "content": "T01_1c8deb23f716: completed; sha256=7572d4b6a5e2f7bab23430bde890d697507df1b686a5d50cbaa12491649fdd26"
+  },
+  "reconnect": {
+    "status": "READY",
+    "helloOnly": true,
+    "commandsSent": 0,
+    "socketClosed": true
+  },
+  "cleanup_complete": true,
+  "limits": [
+    "One owned synthetic workspace and one process; not a universal reliability guarantee.",
+    "Native ChatGPT/Astra and physical iOS behavior were not exercised."
+  ],
+  "local_full_evidence": "/tmp/sumi-process-attention-4vm5i_fd/evidence.json"
+}

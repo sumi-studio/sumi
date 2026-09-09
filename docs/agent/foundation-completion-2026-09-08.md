@@ -174,7 +174,7 @@ still needed to close each row.
 | A02 | Receipt timestamp/delta and source projection implemented | Verify authenticated speaker, place, source identity and occurrence time through actual shared event delivery. |
 | A03 | Durable commands exist; undertaking continuity incomplete | An optional undertaking can retain request, correction, artifact, question and delivery outcome across interruptions. No compulsory task-record creation. |
 | A04 | Actual due reminder write/resolve and cancellation suppression verified | Exercise overdue markers across restart and verify a single admission without manufacturing a reply. |
-| T01 | Durable workspace processes deployed in #397; actual completion wake, output read and Messaging report observed | Finish reconnect/no-replay acceptance and repair opaque argument-error recovery. The first probe stopped on an overbroad polling assertion, so it is not a full pass. |
+| T01 | Durable workspace processes deployed through #398; same-PA cold-stop continuation, output read, report and reconnect/no-replay verified | Retain this opt-in real-model scenario. One synthetic process does not establish every failure or resource-limit case. |
 | T02 | Corrected artifact delivered and downloaded through the actual shared app | Real model created/corrected CSV and sent it to the owned channel; the Human downloaded exactly 20 matching bytes. Prior review cancellation produced a truthful failure and was repaired in #376. Retain these cases as repeatable opt-in acceptance. |
 | T03 | No production external connector | Use one authorized real external capability and continue unrelated conversation when it fails. Scope concrete credentials/resources before implementation. |
 | T04 | Messaging images/text supported; intake/formats incomplete | Actual UI upload and content-based answer; unsupported content must be distinguished from content actually read. |
@@ -399,3 +399,28 @@ The rejection content, however, only told the model to regenerate its arguments;
 internal diagnostic details were not included in the Chat Completions tool
 result text. Actionable rejection recovery and a fresh end-to-end acceptance
 remain required. This run used the configured Kimi model, not native Astra.
+
+### Successful rerun after #398
+
+The fresh run on `661aa0ac` passed the complete scenario, including a cold stop
+while the independent process was running, automatic completion delivery to the
+same PA, successful stdout read before the exact Messaging report, and independent
+artifact-byte/hash and single-execution checks. A hello-only reconnect sent no
+command; command identities and the completion receipt stayed unchanged, and the
+execution counter still contained one entry. The probe exited successfully after
+disabling its owned installations, revoking its session and stopping the owned
+generation. Stored history, artifact and completion receipt were retained.
+
+[Allowlisted evidence](evidence/workspace-process-2026-09-09.json) records this
+acceptance and its limits. Full local evidence is
+`/tmp/sumi-process-attention-4vm5i_fd/evidence.json`. The preceding failed record
+is unchanged. #398's 38 assembler tests, actual provider-schema checks, independent
+review and all three CI jobs passed before merge; the runtime check used Kimi,
+not native Astra.
+
+The deployment helper initially checked for stopped PA containers before their
+already-requested shutdowns had finished. It stopped before starting new services.
+Native container state was checked and deployment resumed from the stopped
+checkpoint, preserving all mounts and settings. The helper now waits a bounded
+time for that completion; this was a deployment-script correction, not a reason
+to weaken process isolation or remove data.
