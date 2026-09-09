@@ -1809,6 +1809,7 @@ mod tests {
             &self,
             prompt: &ExecutionReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: crate::approval::route_reviewer::ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> std::result::Result<
             crate::approval::route_reviewer::ReviewerTransportOutput,
@@ -1876,6 +1877,7 @@ mod tests {
             &self,
             prompt: &EscalationReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: crate::approval::route_reviewer::ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> std::result::Result<
             crate::approval::route_reviewer::ReviewerTransportOutput,

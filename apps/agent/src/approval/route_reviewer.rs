@@ -1108,6 +1108,39 @@ pub struct ReviewerTransportOutput {
     pub tool_trace: Vec<ReviewerToolTrace>,
 }
 
+/// Completed, already-redacted read evidence retained if an attempt is dropped.
+#[derive(Clone, Debug)]
+pub struct ReviewerAttemptTrace {
+    traces: Arc<Mutex<Vec<ReviewerToolTrace>>>,
+    capacity: usize,
+}
+
+impl ReviewerAttemptTrace {
+    fn new(tool_call_offset: usize) -> Self {
+        Self {
+            traces: Arc::new(Mutex::new(Vec::new())),
+            capacity: MAX_REVIEW_TOOL_CALLS.saturating_sub(tool_call_offset),
+        }
+    }
+
+    fn record(&self, trace: ReviewerToolTrace) {
+        let mut traces = self
+            .traces
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if traces.len() < self.capacity {
+            traces.push(trace);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ReviewerToolTrace> {
+        self.traces
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
 #[async_trait]
 pub trait ExecutionReviewerTransport: Send + Sync {
     fn model_spec(&self) -> &ReviewerModelSpec;
@@ -1116,6 +1149,7 @@ pub trait ExecutionReviewerTransport: Send + Sync {
         &self,
         prompt: &ExecutionReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
@@ -1128,6 +1162,7 @@ pub trait EscalationReviewerTransport: Send + Sync {
         &self,
         prompt: &EscalationReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
@@ -1184,6 +1219,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
         &self,
         prompt: &ExecutionReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
@@ -1196,6 +1232,7 @@ impl ExecutionReviewerTransport for ProviderExecutionReviewerTransport {
             prompt.output_schema.provider_schema(),
             prompt,
             tool_call_offset,
+            attempt_trace,
             cancel,
             stream,
         )
@@ -1242,6 +1279,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
         &self,
         prompt: &EscalationReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
         complete_provider_review(
@@ -1254,6 +1292,7 @@ impl EscalationReviewerTransport for ProviderEscalationReviewerTransport {
             prompt.output_schema.provider_schema(),
             prompt,
             tool_call_offset,
+            attempt_trace,
             cancel,
             stream,
         )
@@ -1309,6 +1348,7 @@ impl EscalationObjectionResponderTransport for ProviderEscalationObjectionRespon
             } else {
                 0
             },
+            ReviewerAttemptTrace::new(usize::MAX),
             cancel,
             stream,
         )
@@ -1330,6 +1370,7 @@ async fn complete_provider_review(
     output_schema: &StructuredOutputSchema,
     prompt: &impl ProviderReviewPrompt,
     tool_call_offset: usize,
+    attempt_trace: ReviewerAttemptTrace,
     cancel: CancellationToken,
     start_stream: fn(
         ModelSpec,
@@ -1419,6 +1460,7 @@ async fn complete_provider_review(
                         .execute(reviewer, ordinal, tool_call.clone(), cancel.child_token())
                         .await;
                     *tool_call = outcome.call;
+                    attempt_trace.record(outcome.trace.clone());
                     trace.push(outcome.trace);
                     results.push(outcome.result);
                 }
@@ -2674,6 +2716,7 @@ trait AttemptTransport<P>: Send + Sync {
         &self,
         prompt: &P,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError>;
 }
@@ -2684,9 +2727,11 @@ impl<T: ExecutionReviewerTransport + ?Sized> AttemptTransport<ExecutionReviewerP
         &self,
         prompt: &ExecutionReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
-        self.complete(prompt, tool_call_offset, cancel).await
+        self.complete(prompt, tool_call_offset, attempt_trace, cancel)
+            .await
     }
 }
 
@@ -2696,9 +2741,11 @@ impl<T: EscalationReviewerTransport + ?Sized> AttemptTransport<EscalationReviewe
         &self,
         prompt: &EscalationReviewerPrompt,
         tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
-        self.complete(prompt, tool_call_offset, cancel).await
+        self.complete(prompt, tool_call_offset, attempt_trace, cancel)
+            .await
     }
 }
 
@@ -2710,8 +2757,10 @@ impl<T: EscalationObjectionResponderTransport + ?Sized> AttemptTransport<Escalat
         &self,
         prompt: &EscalationObjectionPrompt,
         _tool_call_offset: usize,
+        attempt_trace: ReviewerAttemptTrace,
         cancel: CancellationToken,
     ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+        let _ = attempt_trace;
         self.complete(prompt, cancel).await
     }
 }
@@ -2731,18 +2780,22 @@ async fn run_attempt<P>(
     if deadline.is_zero() {
         return AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout, Vec::new());
     }
+    let attempt_trace = ReviewerAttemptTrace::new(tool_call_offset);
     let attempt_cancel = cancel.child_token();
     let response = tokio::select! {
         _ = cancel.cancelled() => {
             attempt_cancel.cancel();
-            return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, Vec::new());
+            return AttemptOutcome::Terminal(ReviewerTerminalClass::Cancelled, attempt_trace.snapshot());
         }
-        response = timeout(deadline, transport.call(prompt, tool_call_offset, attempt_cancel.clone())) => response,
+        response = timeout(deadline, transport.call(prompt, tool_call_offset, attempt_trace.clone(), attempt_cancel.clone())) => response,
     };
     match response {
         Err(_) => {
             attempt_cancel.cancel();
-            AttemptOutcome::Terminal(ReviewerTerminalClass::AttemptTimeout, Vec::new())
+            AttemptOutcome::Terminal(
+                ReviewerTerminalClass::AttemptTimeout,
+                attempt_trace.snapshot(),
+            )
         }
         Ok(Err(ReviewerTransportError::Transient(_))) => AttemptOutcome::RetryTransient(Vec::new()),
         Ok(Err(ReviewerTransportError::Fatal(_))) => {
@@ -3125,6 +3178,7 @@ mod tests {
             &self,
             _prompt: &ExecutionReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.0
@@ -3151,6 +3205,7 @@ mod tests {
             &self,
             _prompt: &EscalationReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.0
@@ -3180,6 +3235,7 @@ mod tests {
             &self,
             prompt: &ExecutionReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.prompts.lock().unwrap().push(prompt.clone());
@@ -3239,6 +3295,7 @@ mod tests {
             &self,
             prompt: &EscalationReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.prompts.lock().unwrap().push(prompt.clone());
@@ -3858,6 +3915,7 @@ mod tests {
                     prompt.output_schema.provider_schema(),
                     &prompt,
                     0,
+                    ReviewerAttemptTrace::new(0),
                     review_cancel,
                     local_stream,
                 )
@@ -5161,6 +5219,167 @@ mod tests {
         assert_eq!(transport.0.lock().unwrap().len(), 1);
     }
 
+    fn read_then_pending_stream(
+        spec: ModelSpec,
+        context: PromptContext,
+        _options: RequestOptions,
+        cancel: CancellationToken,
+    ) -> crate::provider::types::ProviderEventStream {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let pending = matches!(
+            context.messages.last(),
+            Some(ContextMessage::Synthetic {
+                message: Message::ToolResult(_)
+            })
+        );
+        let stream = crate::provider::types::ProviderEventStream::new(
+            rx,
+            cancel.clone(),
+            spec.provider.clone(),
+            spec.origin(),
+        );
+        if pending {
+            stream.own_producer(tokio::spawn(async move {
+                cancel.cancelled().await;
+                drop(tx);
+            }))
+        } else {
+            let mut terminal = provider_terminal("done", StopReason::ToolUse, None, None);
+            let ProviderEvent::Done { output, .. } = &mut terminal else {
+                unreachable!()
+            };
+            output.message.provider = spec.provider.clone();
+            output.message.model = spec.id.clone();
+            output.message.origin = spec.origin();
+            output.message.content.push(AssistantContent::ToolCall {
+                tool_call: reviewer_tool_call(),
+                wire_item_index: 0,
+            });
+            tx.try_send(ProviderEvent::Start).unwrap();
+            tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })
+                .unwrap();
+            tx.try_send(ProviderEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call: reviewer_tool_call(),
+            })
+            .unwrap();
+            tx.try_send(terminal).unwrap();
+            stream
+        }
+    }
+
+    struct PendingAfterReadTransport {
+        tools: ReviewerToolRuntime,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ExecutionReviewerTransport for PendingAfterReadTransport {
+        fn model_spec(&self) -> &ReviewerModelSpec {
+            &FIXTURE_REVIEWER_MODEL
+        }
+        async fn complete(
+            &self,
+            prompt: &ExecutionReviewerPrompt,
+            tool_call_offset: usize,
+            attempt_trace: ReviewerAttemptTrace,
+            cancel: CancellationToken,
+        ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            complete_provider_review(
+                &ModelSpec::preset("kimi-k3").unwrap(),
+                "pending-read-test",
+                None,
+                ReviewerKind::Execution,
+                Some(&self.tools),
+                prompt.system,
+                prompt.output_schema.provider_schema(),
+                prompt,
+                tool_call_offset,
+                attempt_trace,
+                cancel,
+                read_then_pending_stream,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_and_cancellation_retain_completed_redacted_read_without_retry() {
+        for cancelled in [false, true] {
+            let (tools, calls) = reviewer_tool_runtime(RoutePolicy::baseline_only_v1());
+            let transport = Arc::new(PendingAfterReadTransport {
+                tools,
+                attempts: AtomicUsize::new(0),
+            });
+            let model = reviewer_model();
+            let reviewer = ExecutionReviewer::new(
+                model.clone(),
+                reviewer_trust(&model),
+                transport.clone(),
+                ReviewerBudgetV1::execution(),
+            )
+            .unwrap();
+            let cancel = CancellationToken::new();
+            let review_cancel = cancel.clone();
+            let review =
+                tokio::spawn(
+                    async move { reviewer.review(execution_request(), review_cancel).await },
+                );
+            for _ in 0..100 {
+                if calls.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "read must finish before interruption"
+            );
+            if cancelled {
+                cancel.cancel();
+            } else {
+                tokio::time::advance(Duration::from_secs(60)).await;
+            }
+            let ExecutionReviewResult::Block(evidence) = review.await.unwrap() else {
+                panic!("unfinished review must block");
+            };
+            assert_eq!(
+                evidence.budget.terminal,
+                if cancelled {
+                    ReviewerTerminalClass::Cancelled
+                } else {
+                    ReviewerTerminalClass::AttemptTimeout
+                }
+            );
+            assert_eq!(evidence.budget.attempts, 1);
+            assert_eq!(transport.attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(evidence.tool_trace.len(), 1);
+            assert_eq!(evidence.tool_trace[0].tool, "inspect");
+            assert!(
+                !serde_json::to_string(&evidence.tool_trace)
+                    .unwrap()
+                    .contains("abcdefghijklmnop")
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_trace_respects_remaining_read_budget() {
+        for offset in [0, 3, 4, usize::MAX] {
+            let trace = ReviewerAttemptTrace::new(offset);
+            for ordinal in 0..8 {
+                trace.record(fixture_trace(ordinal));
+            }
+            assert_eq!(
+                trace.snapshot().len(),
+                MAX_REVIEW_TOOL_CALLS.saturating_sub(offset)
+            );
+        }
+    }
+
     struct ToolThenVerdictTransport {
         trace: ReviewerToolTrace,
     }
@@ -5175,8 +5394,10 @@ mod tests {
             &self,
             _prompt: &ExecutionReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            _attempt_trace.record(self.trace.clone());
             Ok(ReviewerTransportOutput {
                 text: r#"{"outcome":"allow","risk":"low","rationale":"verified by read"}"#
                     .to_owned(),
@@ -5195,8 +5416,10 @@ mod tests {
             &self,
             _prompt: &EscalationReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
+            _attempt_trace.record(self.trace.clone());
             Ok(ReviewerTransportOutput {
                 text: r#"{"outcome":"ask_human","risk":"low","misunderstanding":null,"rationale":"verified by read"}"#
                     .to_owned(),
@@ -5270,6 +5493,7 @@ mod tests {
             &self,
             _prompt: &ExecutionReviewerPrompt,
             tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             self.offsets.lock().unwrap().push(tool_call_offset);
@@ -5323,6 +5547,7 @@ mod tests {
             &self,
             _prompt: &ExecutionReviewerPrompt,
             _tool_call_offset: usize,
+            _attempt_trace: ReviewerAttemptTrace,
             _cancel: CancellationToken,
         ) -> Result<ReviewerTransportOutput, ReviewerTransportError> {
             Err(ReviewerTransportError::ToolCallLimit(
