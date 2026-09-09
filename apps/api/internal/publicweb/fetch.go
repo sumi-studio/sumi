@@ -141,11 +141,11 @@ func (f *Fetcher) Read(ctx context.Context, r Request, beforeSend func() bool) (
 	if err != nil {
 		return Result{}, err
 	}
-	if strings.TrimSpace(text) == "" {
-		return Result{}, fail("no_readable_text")
-	}
 	if ctx.Err() != nil {
 		return Result{}, networkFailure(ctx, ctx.Err(), "fetch_failed")
+	}
+	if strings.TrimSpace(text) == "" {
+		return Result{}, fail("no_readable_text")
 	}
 	digest := sha256.Sum256(body)
 	return Result{RequestedURL: r.URL, FetchedURL: networkURL(r.URL), FetchedAt: time.Now().UTC(), StatusCode: response.StatusCode, MediaType: media, Title: title, Text: text, BodyBytes: len(body), BodySHA256: hex.EncodeToString(digest[:]), TextTruncated: truncated}, nil
