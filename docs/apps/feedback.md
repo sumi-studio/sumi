@@ -75,3 +75,10 @@ Cookieや認証トークンは収集しない。全コンソールや全リク�
 同じ `request_id` で診断情報だけを変えた送信は、別内容の再試行として拒否する。
 ブラウザを開かずPAが投稿した場合、このブラウザ用スナップショットは付かない。
 サーバー／PAの詳細ログを自動採取する機能は、この版には含まれない。
+
+The new-report screen uses a document surface: its title wraps and both native
+textareas grow with their content. The document has one scroll area; the send
+footer occupies a separate opaque area, including the bottom safe area. Enter
+in the title moves to the body after IME composition finishes. Ordinary Enter
+in the body inserts a newline; Ctrl/Command+Enter submits. Diagnostic details
+show readable observations first, with the full JSON in a second disclosure.

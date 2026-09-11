@@ -175,6 +175,26 @@ describe("Feedback conversations", () => {
     fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
     await waitFor(() => expect(client.reply).toHaveBeenCalledTimes(1));
   });
+  it("moves from title to body without intercepting IME confirmation, and sends only with the shortcut", async () => {
+    const client = setupClient();
+    render(<App client={client} initial={{ compose: true }} />);
+    const title = await screen.findByRole("textbox", { name: "件名" });
+    const body = screen.getByRole("textbox", { name: "内容" });
+    fireEvent.change(title, { target: { value: "通知について" } });
+    fireEvent.change(body, { target: { value: "気づいたこと" } });
+    title.focus();
+    fireEvent.keyDown(title, { key: "Enter", isComposing: true });
+    expect(title).toHaveFocus();
+    fireEvent.keyDown(title, { key: "Enter", keyCode: 229 });
+    expect(title).toHaveFocus();
+    fireEvent.keyDown(title, { key: "Enter" });
+    expect(body).toHaveFocus();
+    fireEvent.keyDown(body, { key: "Enter" });
+    fireEvent.keyDown(body, { key: "Enter", metaKey: true, isComposing: true });
+    expect(client.create).not.toHaveBeenCalled();
+    fireEvent.keyDown(body, { key: "Enter", metaKey: true });
+    await waitFor(() => expect(client.create).toHaveBeenCalledTimes(1));
+  });
   it("keeps drafts isolated when another participant opens the same thread", async () => {
     const client = setupClient();
     const first = render(
@@ -224,7 +244,7 @@ describe("Feedback conversations", () => {
       <App client={client} initial={{ compose: true }} actor="empty-source" />,
     );
     expect(
-      document.querySelector(".feedback-diagnostics pre")?.textContent,
+      document.querySelector(".feedback-diagnostic-json pre")?.textContent,
     ).toContain('"path": "/direct"');
     first.unmount();
     recordFeedbackOrigin("/w/workspace-one/messaging", "workspace-one");
@@ -232,7 +252,7 @@ describe("Feedback conversations", () => {
       <App client={client} initial={{ compose: true }} actor="empty-source" />,
     );
     expect(
-      document.querySelector(".feedback-diagnostics pre")?.textContent,
+      document.querySelector(".feedback-diagnostic-json pre")?.textContent,
     ).toContain('"path": "/w/workspace-one/messaging"');
     await act(async () => {});
   });
