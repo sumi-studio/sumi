@@ -13,6 +13,7 @@ import {
 import {
   type CSSProperties,
   Fragment,
+  type ReactNode,
   type TextareaHTMLAttributes,
   useCallback,
   useEffect,
@@ -27,14 +28,18 @@ import {
   type Bootstrap,
   type Detail,
   errorMessage,
+  type FeedbackAttachment,
   type FeedbackClient,
   type Filter,
   feedbackClient,
+  readFeedbackServerObservation,
   type Thread,
 } from "./api";
+import { FeedbackAttachments, MediaPreview } from "./attachments";
 import { Diagnostics } from "./diagnostic-details";
 import {
   captureFeedbackDiagnostics,
+  type DiagnosticSelection,
   type FeedbackDiagnostics,
   readServedRelease,
 } from "./diagnostics";
@@ -390,13 +395,18 @@ export function FeedbackInbox({
     </div>
   );
 }
-function NewThread({
+export function NewThread({
   actor,
   recipient,
   enabled,
   client,
   onBack,
   onCreated,
+  draftNamespace = "new",
+  initialDiagnostics,
+  selection,
+  header,
+  onCaptureChange,
 }: {
   actor: string;
   recipient: string;
@@ -404,18 +414,29 @@ function NewThread({
   client: FeedbackClient;
   onBack(): void;
   onCreated(thread: Thread): void;
+  draftNamespace?: string;
+  initialDiagnostics?: FeedbackDiagnostics;
+  selection?: DiagnosticSelection;
+  header?: ReactNode;
+  onCaptureChange?(active: boolean): void;
 }) {
-  const key = draftKey(actor, "new");
+  const key = draftKey(actor, draftNamespace);
+  const inPlace = draftNamespace === "in-place";
+  const titleId = inPlace ? "feedback-mode-title" : "feedback-title";
+  const bodyId = inPlace ? "feedback-mode-body" : "feedback-body";
   const [draft, setDraft] = useState(() => {
     const existing = loadDraft(key);
     if (
       existing.submitted ||
-      (existing.diagnostics && (existing.title.trim() || existing.body.trim()))
+      (existing.diagnostics &&
+        (existing.title.trim() ||
+          existing.body.trim() ||
+          existing.attachments?.length))
     )
       return existing;
     let diagnostics: FeedbackDiagnostics | undefined;
     try {
-      diagnostics = captureFeedbackDiagnostics();
+      diagnostics = initialDiagnostics ?? captureFeedbackDiagnostics();
     } catch {
       /* A broken browser API must not block a report. */
     }
@@ -424,6 +445,46 @@ function NewThread({
     return next;
   });
   const submitted = useRef(Boolean(draft.submitted));
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!selection || busy) return;
+    setDraft((previous) => {
+      if (!previous.diagnostics || previous.diagnostics.selection === selection)
+        return previous;
+      submitted.current = false;
+      const next = {
+        ...previous,
+        submitted: false,
+        requestId: secureRandomUUID(),
+        diagnostics: { ...previous.diagnostics, selection },
+      };
+      saveDraft(key, next);
+      return next;
+    });
+  }, [selection, key, busy]);
+  useEffect(() => {
+    if (submitted.current || draft.diagnostics?.server_observation) return;
+    let active = true;
+    void readFeedbackServerObservation().then((observation) => {
+      if (!active || !observation || submitted.current) return;
+      setDraft((previous) => {
+        if (submitted.current || !previous.diagnostics) return previous;
+        const next = {
+          ...previous,
+          diagnostics: {
+            ...previous.diagnostics,
+            server_observation: observation,
+          },
+        };
+        saveDraft(key, next);
+        return next;
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, [key, draft.diagnostics?.server_observation]);
   useEffect(() => {
     if (submitted.current || draft.diagnostics?.served_release) return;
     let active = true;
@@ -443,7 +504,6 @@ function NewThread({
       active = false;
     };
   }, [key, draft.diagnostics?.served_release]);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const mounted = useRef(true);
   useEffect(() => {
@@ -453,12 +513,37 @@ function NewThread({
     };
   }, []);
   const update = (field: "title" | "body", value: string) => {
-    const next = { ...draft, [field]: value, requestId: secureRandomUUID() };
+    submitted.current = false;
+    const next = {
+      ...draft,
+      submitted: false,
+      [field]: value,
+      requestId: secureRandomUUID(),
+    };
     setDraft(next);
     saveDraft(key, next);
   };
+  const updateAttachments = (attachments: FeedbackAttachment[]) => {
+    submitted.current = false;
+    setDraft((previous) => {
+      const next = {
+        ...previous,
+        submitted: false,
+        attachments,
+        requestId: secureRandomUUID(),
+      };
+      saveDraft(key, next);
+      return next;
+    });
+  };
+  const canSubmit =
+    !busy &&
+    !attachmentBusy &&
+    enabled &&
+    Boolean(draft.body.trim() || (inPlace && draft.attachments?.length)) &&
+    Boolean(inPlace || draft.title.trim());
   async function submit() {
-    if (busy || !enabled || !draft.title.trim() || !draft.body.trim()) return;
+    if (!canSubmit) return;
     if ([...draft.title].length > 160 || [...draft.body].length > 20_000) {
       setError("件名は160文字、本文は20,000文字以内で入力してください。");
       return;
@@ -469,10 +554,13 @@ function NewThread({
     setError("");
     try {
       const thread = await client.create(
-        draft.title,
-        draft.body,
+        draft.title.trim() ||
+          draft.body.trim().split("\n")[0].slice(0, 80) ||
+          "画面からのフィードバック",
+        draft.body.trim() || "画面の状態を添付しました。",
         draft.requestId,
         draft.diagnostics,
+        draft.attachments?.map((attachment) => attachment.id),
       );
       clearDraft(key, draft.requestId);
       if (mounted.current) onCreated(thread);
@@ -484,17 +572,19 @@ function NewThread({
   }
   return (
     <>
-      <header className="feedback-detail-header">
-        <button
-          type="button"
-          className="feedback-icon-button"
-          aria-label="一覧に戻る"
-          onClick={onBack}
-        >
-          <ArrowLeft size={19} />
-        </button>
-        <span>新しいフィードバック</span>
-      </header>
+      {header ?? (
+        <header className="feedback-detail-header">
+          <button
+            type="button"
+            className="feedback-icon-button"
+            aria-label="一覧に戻る"
+            onClick={onBack}
+          >
+            <ArrowLeft size={19} />
+          </button>
+          <span>新しいフィードバック</span>
+        </header>
+      )}
       <form
         className="feedback-new"
         onKeyDown={(event) => {
@@ -514,14 +604,13 @@ function NewThread({
       >
         <div className="feedback-editor-scroll">
           <div className="feedback-document">
-            <div className="feedback-new-recipient">{recipient}へ</div>
-            <label htmlFor="feedback-title" className="sr-only">
+            <label htmlFor={titleId} className="sr-only">
               件名
             </label>
             <DocumentTextarea
-              id="feedback-title"
+              id={titleId}
               className="feedback-title-input"
-              placeholder="タイトル"
+              placeholder={inPlace ? "タイトル（省略可）" : "タイトル"}
               value={draft.title}
               disabled={busy}
               onChange={(event) => update("title", event.target.value)}
@@ -535,16 +624,16 @@ function NewThread({
                 ) {
                   event.preventDefault();
                   event.currentTarget.form
-                    ?.querySelector<HTMLTextAreaElement>("#feedback-body")
+                    ?.querySelector<HTMLTextAreaElement>(`#${bodyId}`)
                     ?.focus();
                 }
               }}
             />
-            <label htmlFor="feedback-body" className="sr-only">
+            <label htmlFor={bodyId} className="sr-only">
               内容
             </label>
             <DocumentTextarea
-              id="feedback-body"
+              id={bodyId}
               className="feedback-new-body"
               placeholder={
                 "気づいたこと、相談したいことを自由に。\n関連するページのリンクも貼れます。"
@@ -552,6 +641,13 @@ function NewThread({
               value={draft.body}
               disabled={busy}
               onChange={(event) => update("body", event.target.value)}
+            />
+            <FeedbackAttachments
+              attachments={draft.attachments ?? []}
+              onChange={updateAttachments}
+              disabled={busy}
+              onBusyChange={setAttachmentBusy}
+              onCaptureChange={onCaptureChange}
             />
             {draft.diagnostics ? (
               <Diagnostics details={draft.diagnostics} composing />
@@ -574,9 +670,7 @@ function NewThread({
               className="feedback-primary"
               type="submit"
               title="送信する（⌘ / Ctrl + Enter）"
-              disabled={
-                busy || !enabled || !draft.title.trim() || !draft.body.trim()
-              }
+              disabled={!canSubmit}
             >
               {busy ? "送信中…" : "送信する"}
               <ArrowUp size={16} />
@@ -859,6 +953,7 @@ function Conversation({
                 time={detail.thread.created_at}
               />
               <MessageBody>{detail.thread.body}</MessageBody>
+              <MediaPreview attachments={detail.thread.attachments ?? []} />
               {detail.thread.diagnostics && (
                 <Diagnostics details={detail.thread.diagnostics} />
               )}

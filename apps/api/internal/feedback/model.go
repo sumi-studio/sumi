@@ -45,6 +45,7 @@ type Author struct {
 	DisplayName string      `json:"display_name"`
 }
 type Thread struct {
+	Attachments   []Attachment `json:"attachments"`
 	Diagnostics   *Diagnostics `json:"diagnostics,omitempty"`
 	IsSummary     bool         `json:"is_summary,omitempty"`
 	ID            string       `json:"id"`

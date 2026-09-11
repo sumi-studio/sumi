@@ -547,11 +547,6 @@
   margin: 0 auto;
   padding: 48px 40px 40px;
 }
-.feedback-new-recipient {
-  color: var(--feedback-muted);
-  font-size: 12px;
-  margin-bottom: 20px;
-}
 .feedback-document textarea {
   display: block;
   width: 100%;

@@ -6,18 +6,25 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
 type Server struct {
-	Store          *Store
-	Sessions       agentevents.UserSessionAuthorizer
-	AllowedOrigins []string
+	Gateway                *agentevents.DurableGateway
+	Store                  *Store
+	Sessions               agentevents.UserSessionAuthorizer
+	AllowedOrigins         []string
+	attachmentTransferOnce sync.Once
+	attachmentTransfers    chan struct{}
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /feedback/diagnostics", s.public("diagnostics"))
+	mux.HandleFunc("POST /feedback/attachments", s.public("upload"))
+	mux.HandleFunc("GET /feedback/attachments/{attachment_id}", s.public("attachment"))
 	mux.HandleFunc("GET /feedback/bootstrap", s.public("bootstrap"))
 	mux.HandleFunc("GET /feedback/threads", s.public("list"))
 	mux.HandleFunc("POST /feedback/threads", s.public("create"))
@@ -66,7 +73,24 @@ func (s *Server) browser(w http.ResponseWriter, r *http.Request, op string) {
 	// Bind read/write admission to the authenticated session, including logout.
 	err = s.Sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
-		value, operationErr = s.dispatch(r, actor, op, false)
+		if op == "upload" || op == "attachment" {
+			release, err := s.acquireAttachmentTransfer()
+			if err != nil {
+				operationErr = err
+				return err
+			}
+			defer release()
+		}
+		switch op {
+		case "upload":
+			value, operationErr = s.uploadAttachment(w, r, actor)
+		case "attachment":
+			value, operationErr = s.downloadAttachment(w, r, actor)
+		case "diagnostics":
+			value, operationErr = s.captureDiagnostics(r, actor, claims.PersonalityAgentID)
+		default:
+			value, operationErr = s.dispatch(r, actor, op, false)
+		}
 		return operationErr
 	})
 	if !called {
@@ -92,6 +116,9 @@ func respond(w http.ResponseWriter, value any, err error, op string) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if op == "attachment" {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(value)
@@ -103,9 +130,9 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 func decode(r *http.Request, value any) error {
-	// 20k Unicode scalars can each occupy 12 bytes as escaped surrogate pairs.
-	raw, err := io.ReadAll(io.LimitReader(r.Body, (256<<10)+1))
-	if err != nil || len(raw) > 256<<10 {
+	// Allow escaped Unicode in both the 20k-scalar body and bounded diagnostics.
+	raw, err := io.ReadAll(io.LimitReader(r.Body, (512<<10)+1))
+	if err != nil || len(raw) > 512<<10 {
 		return ErrInvalid
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -179,15 +206,16 @@ func (s *Server) dispatch(r *http.Request, actor participant.Ref, op string, loc
 		return s.Store.Open(ctx, actor, p.ThreadID, p.Cursor)
 	case "create":
 		var p struct {
-			Diagnostics *Diagnostics `json:"diagnostics,omitempty"`
-			Title       string       `json:"title"`
-			Body        string       `json:"body"`
-			RequestID   string       `json:"request_id"`
+			AttachmentIDs []string     `json:"attachment_ids,omitempty"`
+			Diagnostics   *Diagnostics `json:"diagnostics,omitempty"`
+			Title         string       `json:"title"`
+			Body          string       `json:"body"`
+			RequestID     string       `json:"request_id"`
 		}
 		if err := decode(r, &p); err != nil {
 			return nil, err
 		}
-		return s.Store.Create(ctx, actor, p.Title, p.Body, p.RequestID, p.Diagnostics)
+		return s.Store.Create(ctx, actor, p.Title, p.Body, p.RequestID, p.Diagnostics, p.AttachmentIDs...)
 	case "reply":
 		var p struct {
 			ThreadID  string `json:"thread_id,omitempty"`

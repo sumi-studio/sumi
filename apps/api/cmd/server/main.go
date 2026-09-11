@@ -232,22 +232,23 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	chatGPTLogin             *chatgpt.LoginService
-	chatGPTActivation        *chatGPTActivationWorker
-	publicMux                *http.ServeMux
-	localMux                 *http.ServeMux
-	localListener            *localControlListenerConfig
-	store                    *agentevents.CommandStore
-	browser                  *agentevents.BrowserServer
-	database                 *db.Pool
-	spawnManager             *spawn.Manager
-	localRuntimes            *agentevents.LocalControlListenerRegistry
-	messagingServer          *messaging.Server
-	processOperations        *processoperations.Server
-	backgroundCtx            context.Context
-	deliverAttention         func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
-	deliverFeedbackAttention func(context.Context) error
-	attentionWorkers         sync.WaitGroup
+	chatGPTLogin               *chatgpt.LoginService
+	chatGPTActivation          *chatGPTActivationWorker
+	publicMux                  *http.ServeMux
+	localMux                   *http.ServeMux
+	localListener              *localControlListenerConfig
+	store                      *agentevents.CommandStore
+	browser                    *agentevents.BrowserServer
+	database                   *db.Pool
+	spawnManager               *spawn.Manager
+	localRuntimes              *agentevents.LocalControlListenerRegistry
+	messagingServer            *messaging.Server
+	processOperations          *processoperations.Server
+	backgroundCtx              context.Context
+	deliverAttention           func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	deliverFeedbackAttention   func(context.Context) error
+	cleanupFeedbackAttachments func(context.Context) error
+	attentionWorkers           sync.WaitGroup
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -438,7 +439,7 @@ func newApplicationFromEnv() (*application, error) {
 			log.Print("feedback destination disabled: SUMI_FEEDBACK_RECIPIENTS contains an invalid participant key")
 			feedbackRecipients = nil
 		}
-		feedbackServer = &feedback.Server{Store: feedback.New(database.Pool, feedbackRecipients), Sessions: messagingSessions, AllowedOrigins: browserOrigins}
+		feedbackServer = &feedback.Server{Store: feedback.New(database.Pool, feedbackRecipients), Gateway: runtime, Sessions: messagingSessions, AllowedOrigins: browserOrigins}
 		feedbackServer.RegisterRoutes(mux)
 		workspaceServer.AllowedOrigins = browserOrigins
 		workspaceServer.RegisterRoutes(mux)
@@ -606,27 +607,32 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 	var deliverFeedbackAttention func(context.Context) error
+	var cleanupFeedbackAttachments func(context.Context) error
+	if feedbackServer != nil {
+		cleanupFeedbackAttachments = feedbackServer.Store.CleanupAttachments
+	}
 	if feedbackServer != nil && spawnManager != nil {
 		delivery := &feedback.AttentionGateway{Gateway: runtime, Spawner: spawnManager, TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID"))}
 		deliverFeedbackAttention = func(ctx context.Context) error { return feedbackServer.Store.DeliverAttention(ctx, delivery, 25) }
 	}
 	return &application{
-		deliverFeedbackAttention: deliverFeedbackAttention,
-		processOperations:        processOperations,
-		chatGPTLogin:             chatGPTLogin,
-		chatGPTActivation:        chatGPTActivation,
-		deliverAttention:         deliverAttention,
-		publicMux:                mux,
-		localMux:                 localMux,
-		localListener:            localListener,
-		store:                    store,
-		browser:                  browser,
-		database:                 database,
-		spawnManager:             spawnManager,
-		localRuntimes:            localRuntimes,
-		messagingServer:          messagingServer,
-		backgroundCtx:            backgroundCtx,
-		stopBackground:           stopBackground,
+		cleanupFeedbackAttachments: cleanupFeedbackAttachments,
+		deliverFeedbackAttention:   deliverFeedbackAttention,
+		processOperations:          processOperations,
+		chatGPTLogin:               chatGPTLogin,
+		chatGPTActivation:          chatGPTActivation,
+		deliverAttention:           deliverAttention,
+		publicMux:                  mux,
+		localMux:                   localMux,
+		localListener:              localListener,
+		store:                      store,
+		browser:                    browser,
+		database:                   database,
+		spawnManager:               spawnManager,
+		localRuntimes:              localRuntimes,
+		messagingServer:            messagingServer,
+		backgroundCtx:              backgroundCtx,
+		stopBackground:             stopBackground,
 	}, nil
 }
 

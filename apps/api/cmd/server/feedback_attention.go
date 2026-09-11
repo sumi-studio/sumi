@@ -6,6 +6,27 @@ import (
 )
 
 func (a *application) startFeedbackAttention() {
+	if a.cleanupFeedbackAttachments != nil {
+		a.attentionWorkers.Add(1)
+		go func() {
+			defer a.attentionWorkers.Done()
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				if a.backgroundCtx.Err() != nil {
+					return
+				}
+				if err := a.cleanupFeedbackAttachments(a.backgroundCtx); err != nil && a.backgroundCtx.Err() == nil {
+					log.Print("feedback attachments: expiry cleanup failed; will retry")
+				}
+				select {
+				case <-a.backgroundCtx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	if a.deliverFeedbackAttention == nil {
 		return
 	}
