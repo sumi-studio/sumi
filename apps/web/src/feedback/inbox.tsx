@@ -13,6 +13,7 @@ import {
 import {
   type CSSProperties,
   Fragment,
+  type TextareaHTMLAttributes,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -31,6 +32,7 @@ import {
   feedbackClient,
   type Thread,
 } from "./api";
+import { Diagnostics } from "./diagnostic-details";
 import {
   captureFeedbackDiagnostics,
   type FeedbackDiagnostics,
@@ -495,65 +497,125 @@ function NewThread({
       </header>
       <form
         className="feedback-new"
+        onKeyDown={(event) => {
+          if (
+            event.key === "Enter" &&
+            (event.metaKey || event.ctrlKey) &&
+            !isImeComposing(event)
+          ) {
+            event.preventDefault();
+            void submit();
+          }
+        }}
         onSubmit={(event) => {
           event.preventDefault();
           void submit();
         }}
       >
-        <div className="feedback-new-recipient">
-          宛先 <strong>{recipient}</strong>
+        <div className="feedback-editor-scroll">
+          <div className="feedback-document">
+            <div className="feedback-new-recipient">{recipient}へ</div>
+            <label htmlFor="feedback-title" className="sr-only">
+              件名
+            </label>
+            <DocumentTextarea
+              id="feedback-title"
+              className="feedback-title-input"
+              placeholder="タイトル"
+              value={draft.title}
+              disabled={busy}
+              onChange={(event) => update("title", event.target.value)}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  !event.metaKey &&
+                  !event.ctrlKey &&
+                  !isImeComposing(event)
+                ) {
+                  event.preventDefault();
+                  event.currentTarget.form
+                    ?.querySelector<HTMLTextAreaElement>("#feedback-body")
+                    ?.focus();
+                }
+              }}
+            />
+            <label htmlFor="feedback-body" className="sr-only">
+              内容
+            </label>
+            <DocumentTextarea
+              id="feedback-body"
+              className="feedback-new-body"
+              placeholder={
+                "気づいたこと、相談したいことを自由に。\n関連するページのリンクも貼れます。"
+              }
+              value={draft.body}
+              disabled={busy}
+              onChange={(event) => update("body", event.target.value)}
+            />
+            {draft.diagnostics ? (
+              <Diagnostics details={draft.diagnostics} composing />
+            ) : (
+              <p className="feedback-diagnostics">
+                診断情報を取得できませんでした。本文だけ送信できます。
+              </p>
+            )}
+          </div>
         </div>
-        <label htmlFor="feedback-title" className="feedback-field-label">
-          件名
-        </label>
-        <input
-          id="feedback-title"
-          className="feedback-title-input"
-          placeholder="何について話しましょう？"
-          value={draft.title}
-          disabled={busy}
-          onChange={(event) => update("title", event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && isImeComposing(event))
-              event.preventDefault();
-          }}
-        />
-        <label htmlFor="feedback-body" className="feedback-field-label">
-          内容
-        </label>
-        <textarea
-          id="feedback-body"
-          className="feedback-new-body"
-          placeholder="気づいたことや相談したいことを自由に。関連するページのリンクも貼れます。"
-          value={draft.body}
-          disabled={busy}
-          onChange={(event) => update("body", event.target.value)}
-        />
-        {draft.diagnostics ? (
-          <Diagnostics details={draft.diagnostics} composing />
-        ) : (
-          <p className="feedback-diagnostics">
-            診断情報を取得できませんでした。本文だけ送信できます。
-          </p>
-        )}
-        <div className="feedback-compose-footer">
-          <span>共有先：あなた・{recipient}</span>
-          <button
-            className="feedback-primary"
-            type="submit"
-            disabled={
-              busy || !enabled || !draft.title.trim() || !draft.body.trim()
-            }
-          >
-            {busy ? "送信中…" : "送信する"}
-            <ArrowUp size={16} />
-          </button>
+        <div className="feedback-compose-dock">
+          {error && (
+            <div className="feedback-compose-error">
+              <Notice text={error} />
+            </div>
+          )}
+          <div className="feedback-compose-footer">
+            <span>{recipient}と共有</span>
+            <button
+              className="feedback-primary"
+              type="submit"
+              title="送信する（⌘ / Ctrl + Enter）"
+              disabled={
+                busy || !enabled || !draft.title.trim() || !draft.body.trim()
+              }
+            >
+              {busy ? "送信中…" : "送信する"}
+              <ArrowUp size={16} />
+            </button>
+          </div>
         </div>
-        {error && <Notice text={error} />}
       </form>
     </>
   );
 }
+/** Native text editing and IME, with one scroll surface for the document. */
+function DocumentTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const resize = useCallback(() => {
+    const node = ref.current;
+    if (!node) return;
+    const scroll = node.closest(".feedback-editor-scroll");
+    const top = scroll?.scrollTop ?? 0;
+    node.style.height = "0px";
+    node.style.height = `${node.scrollHeight}px`;
+    if (scroll) scroll.scrollTop = top;
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Measure after text changes, including restored drafts.
+  useLayoutEffect(resize, [resize, props.value]);
+  useLayoutEffect(() => {
+    const node = ref.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    let width = node.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (node.clientWidth === width) return;
+      width = node.clientWidth;
+      resize();
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [resize]);
+  return <textarea {...props} ref={ref} rows={1} />;
+}
+
 function Conversation({
   actor,
   id,
@@ -1046,24 +1108,4 @@ function shortDate(value: string, includeTime = false) {
       ? { hour: "2-digit", minute: "2-digit" }
       : {}),
   });
-}
-
-function Diagnostics({
-  details,
-  composing = false,
-}: {
-  details: FeedbackDiagnostics;
-  composing?: boolean;
-}) {
-  return (
-    <details className="feedback-diagnostics">
-      <summary>
-        {composing ? "診断情報を自動添付します" : "添付された診断情報"}
-      </summary>
-      <p>
-        開いていた画面・接続状態・ブラウザ環境を共有します。会話本文や認証情報は含みません。
-      </p>
-      <pre>{JSON.stringify(details, null, 2)}</pre>
-    </details>
-  );
 }

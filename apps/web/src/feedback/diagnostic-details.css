@@ -1,0 +1,141 @@
+.feedback-diagnostic-attachment {
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.65;
+}
+
+.feedback-diagnostic-attachment summary {
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 2rem;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 0.25rem;
+}
+
+.feedback-diagnostic-attachment summary::-webkit-details-marker {
+  display: none;
+}
+
+.feedback-diagnostic-attachment summary:hover {
+  color: var(--foreground);
+}
+
+.feedback-diagnostic-attachment summary:focus-visible,
+.feedback-diagnostic-json:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--foreground) 35%, transparent);
+  outline-offset: 3px;
+}
+
+.feedback-diagnostic-attachment summary svg {
+  flex-shrink: 0;
+  transition: transform 140ms ease;
+}
+
+.feedback-diagnostic-attachment[open] > summary svg,
+.feedback-diagnostic-raw[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.feedback-diagnostic-content {
+  padding: 0.5rem 0 0.5rem 1.25rem;
+}
+
+.feedback-diagnostic-description {
+  margin: 0 0 1rem;
+  max-width: 40rem;
+  text-wrap: pretty;
+}
+
+.feedback-diagnostic-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.625rem 1.25rem;
+  margin: 0;
+}
+
+.feedback-diagnostic-facts dt,
+.feedback-diagnostic-facts dd {
+  margin: 0;
+}
+
+.feedback-diagnostic-facts dd {
+  color: var(--foreground);
+  overflow-wrap: anywhere;
+}
+
+.feedback-diagnostic-facts code {
+  font-size: 0.75rem;
+}
+
+.feedback-diagnostic-path,
+.feedback-diagnostic-secondary {
+  display: block;
+  color: var(--muted-foreground);
+}
+
+.feedback-diagnostic-raw {
+  margin-top: 1rem;
+}
+
+.feedback-diagnostic-json {
+  margin: 0.5rem 0 0;
+  padding: 0.875rem 1rem;
+  border-radius: 0.5rem;
+  background: var(--muted);
+  color: var(--foreground);
+  max-height: 18rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.feedback-diagnostic-json pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+  line-height: 1.7;
+}
+
+@media (max-width: 480px) {
+  .feedback-diagnostic-content {
+    padding-left: 0;
+  }
+  .feedback-diagnostic-facts {
+    column-gap: 0.875rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feedback-diagnostic-attachment summary svg {
+    transition: none;
+  }
+}
+
+@supports (interpolate-size: allow-keywords) {
+  .feedback-diagnostic-attachment,
+  .feedback-diagnostic-raw {
+    interpolate-size: allow-keywords;
+  }
+  .feedback-diagnostic-attachment::details-content,
+  .feedback-diagnostic-raw::details-content {
+    block-size: 0;
+    overflow: clip;
+    transition:
+      block-size 180ms ease,
+      content-visibility 180ms allow-discrete;
+  }
+  .feedback-diagnostic-attachment[open]::details-content,
+  .feedback-diagnostic-raw[open]::details-content {
+    block-size: auto;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .feedback-diagnostic-attachment::details-content,
+  .feedback-diagnostic-raw::details-content {
+    transition: none;
+  }
+}
