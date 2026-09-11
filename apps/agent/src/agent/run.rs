@@ -139,6 +139,7 @@ impl Eq for ToolStartOutcome {}
 
 fn tool_start_outcome(result: ToolStartCommitResult) -> ToolStartOutcome {
     match result {
+        ToolStartCommitResult::Preempted => ToolStartOutcome::Preempted,
         ToolStartCommitResult::Committed => ToolStartOutcome::Started,
         ToolStartCommitResult::Reauthorize => ToolStartOutcome::Reauthorize,
         ToolStartCommitResult::RouteCommitted(authorized) => {
@@ -645,6 +646,8 @@ impl Runner {
 
     async fn run_inner(&mut self) -> Result<(), WorkerFailure> {
         if let Some(continuation) = self.core.recovered_inference_continuation.take() {
+            self.first_provider_call_after_user =
+                continuation.phase == crate::store::RunPhase::UserCommitted;
             if !continuation.turn_open {
                 self.start_next_turn().await?;
             }
@@ -3339,7 +3342,11 @@ impl Runner {
                 let result = result.map_err(|_| {
                     WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
                 })?;
-                Ok(tool_start_outcome(result))
+                let outcome = tool_start_outcome(result);
+                if outcome == ToolStartOutcome::Preempted {
+                    self.receive_control_safe_point().await?;
+                }
+                Ok(outcome)
             }
             control = self.controls.recv() => {
                 let Some(control) = control else {

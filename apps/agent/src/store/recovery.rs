@@ -137,10 +137,10 @@ pub(crate) enum RecoveryStep {
 
 /// Store-owned consumer for authenticated completed-assistant restart seams.
 ///
-/// This executor intentionally supports only a complete single-step assistant
-/// suffix: either `ResumeAssistantFromDurableEvents` or
-/// `CancelPendingApproval`. Every other logical-recovery shape remains NotReady
-/// until its own canonical consumer is implemented. The supported paths never
+/// This executor supports a complete assistant suffix, its exact classified
+/// soft-steer group, or `CancelPendingApproval`. The soft group atomically
+/// transfers ownership through the existing injection builder. Other recovery
+/// shapes remain NotReady until their canonical consumer is implemented. The supported paths never
 /// call a provider or tool: terminal calls reuse their exact durable result,
 /// rowless calls receive a synthetic pre-execution error, and a typed pending
 /// approval atomically becomes a cancelled prepared tool plus its error result.
@@ -231,11 +231,25 @@ impl LogicalRecoveryExecutor {
         executor_generation: crate::runtime::contracts::ProcessGeneration,
         pending_physical: &HashMap<String, PendingPhysicalResolution>,
     ) -> Result<EventBatch> {
-        let [step] = steps else {
-            bail!(
-                "Store LogicalRecoveryExecutor only supports one assistant logical-recovery step; received {} ordered step(s)",
+        let (step, soft_group) = match steps {
+            [step] => (step, None),
+            [
+                step @ RecoveryStep::ResumeAssistantFromDurableEvents {
+                    run_id,
+                    pending_error_context: None,
+                    ..
+                },
+                RecoveryStep::InjectStoredGroup {
+                    run_id: group_run,
+                    turn_id,
+                    application_kind: ApplicationKind::SoftSteer,
+                    command_ids,
+                },
+            ] if run_id == group_run => (step, Some((turn_id.as_str(), command_ids.as_slice()))),
+            _ => bail!(
+                "Store LogicalRecoveryExecutor only supports one assistant logical-recovery step or its exact soft-steer group; received {} ordered step(s)",
                 steps.len()
-            );
+            ),
         };
         let (command_id, run_id, expected_owner_turn_id, expected_pending, planned_active_turn_id) =
             match step {
@@ -358,10 +372,118 @@ impl LogicalRecoveryExecutor {
             .await
             .context("failed to commit logical-recovery inspection")?;
 
+        if let Some((group_turn, command_ids)) = soft_group {
+            return Self::soft_steer_batch(
+                store,
+                snapshot,
+                group_turn,
+                command_ids,
+                executor_generation,
+            )
+            .await;
+        }
         let continue_inference = expected_pending.is_none()
             && (snapshot.interruption.is_some() || !snapshot.tool_results.is_empty());
         snapshot.into_batch(executor_generation, continue_inference)
     }
+
+    async fn soft_steer_batch(
+        store: &Store,
+        snapshot: AssistantRecoverySnapshot,
+        group_turn: &str,
+        command_ids: &[String],
+        executor_generation: crate::runtime::contracts::ProcessGeneration,
+    ) -> Result<EventBatch> {
+        let expected = load_bounded_group(
+            store,
+            &snapshot.run_id,
+            group_turn,
+            ApplicationKind::SoftSteer,
+            RunPhase::Classified,
+        )
+        .await?;
+        if expected != command_ids || command_ids.is_empty() || group_turn == snapshot.turn_id {
+            bail!(
+                "soft-steer recovery must inject the exact classified group into its distinct turn"
+            );
+        }
+        let owner = load_recovery_input(store, &snapshot.command_id).await?;
+        let mut commands = Vec::with_capacity(command_ids.len());
+        for id in command_ids {
+            let command = load_recovery_input(store, id).await?;
+            if command.envelope().seq <= owner.envelope().seq
+                || command.envelope().provenance.output_audience()
+                    != owner.envelope().provenance.output_audience()
+            {
+                bail!(
+                    "soft-steer recovery cannot change the original command audience or ordering"
+                );
+            }
+            commands.push(command);
+        }
+        let group = crate::agent::SteerGroupSnapshot {
+            application_kind: ApplicationKind::SoftSteer,
+            run_id: snapshot.run_id.clone(),
+            turn_id: group_turn.to_owned(),
+            previous_owner: crate::agent::DurableRunBinding {
+                command_id: snapshot.command_id.clone(),
+                command_seq: snapshot.command_seq,
+                provenance: owner.envelope().provenance.clone(),
+                run_id: snapshot.run_id.clone(),
+                turn_id: snapshot.turn_id.clone(),
+                executor_generation,
+            },
+            commands,
+            closing_turn_message: Some(snapshot.assistant.clone()),
+            closing_tool_results: snapshot.tool_results.clone(),
+        };
+        // Settle old calls without dispatching them. The canonical injection
+        // supplies the same TurnEnd and the new owner in this one transaction.
+        let mut batch = snapshot.into_batch(executor_generation, true)?;
+        batch
+            .writes
+            .pop()
+            .expect("assistant recovery ends with TurnEnd");
+        let injection = crate::agent::steer_group_injection_batch(group)?;
+        batch.writes.extend(injection.writes);
+        batch.injected_commands = injection.injected_commands;
+        Ok(batch)
+    }
+}
+
+async fn load_recovery_input(
+    store: &Store,
+    command_id: &str,
+) -> Result<crate::agent::AdmittedCommand> {
+    let mut transaction = store.pool().begin().await?;
+    let seq: i64 = sqlx::query_scalar("SELECT seq FROM inbound_commands WHERE command_id=? AND command_kind='user_message' AND status='applying'")
+        .bind(command_id).fetch_one(&mut *transaction).await?;
+    let seq = u64::try_from(seq)?;
+    let command = super::event_writer::load_authenticated_command(
+        store,
+        &mut transaction,
+        command_id,
+        seq,
+        "user_message",
+    )
+    .await?;
+    let provenance =
+        super::event_writer::authenticated_command_provenance(store, &mut transaction, command_id)
+            .await?;
+    transaction.commit().await?;
+    let writer = EventWriter::new(Arc::new(store.clone()));
+    let (received_at, timing) = writer.timing_for_command(command_id).await?;
+    Ok(crate::agent::AdmittedCommand::new(
+        crate::gateway::CommandEnvelope {
+            seq,
+            command_id: crate::gateway::CommandId::parse(command_id).map_err(anyhow::Error::msg)?,
+            personality_agent_id: store.scope().personality_agent_id.clone(),
+            provenance,
+            command,
+        },
+        received_at,
+    )
+    .with_incoming_timing(timing))
 }
 
 impl AssistantRecoverySnapshot {
@@ -1021,6 +1143,7 @@ pub(crate) struct RecoveredInferenceContinuation {
     pub run_id: String,
     pub turn_id: String,
     pub turn_open: bool,
+    pub phase: RunPhase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3616,6 +3739,142 @@ pub(crate) mod tests {
             .await
             .expect("owner status"),
             "applying"
+        );
+    }
+
+    pub(crate) async fn seed_soft_steer_restart(store: &Arc<Store>, writer: &EventWriter) {
+        seed_tool_use_restart_seam(writer, true).await;
+        let steer_id = "00000000-0000-4000-8000-000000000092";
+        persist_user(writer, 2, steer_id).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: steer_id.to_owned(),
+                        application_kind: ApplicationKind::SoftSteer,
+                        run_id: TOOL_USE_RECOVERY_RUN_ID.to_owned(),
+                        turn_id: "recovered-soft-turn".to_owned(),
+                    }],
+                }],
+                injected_commands: vec![],
+            })
+            .await
+            .expect("classify same-run soft steer before tool start");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT run_phase FROM inbound_commands WHERE seq=1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            "assistant_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_steer_recovery_pairs_old_results_and_hands_off_exact_stored_input_once() {
+        let (store, writer) = setup().await;
+        seed_soft_steer_restart(&store, &writer).await;
+        let lease = ProcessGenerationLease::new(
+            test_personality_agent_id(),
+            test_generation(),
+            "soft-recovery",
+        )
+        .unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "soft-recovery-fence").unwrap();
+        let HydrationOutcome::LogicalRecoveryRequired { steps } =
+            store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("ordered recovery required")
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [
+                RecoveryStep::ResumeAssistantFromDurableEvents { .. },
+                RecoveryStep::InjectStoredGroup {
+                    application_kind: ApplicationKind::SoftSteer,
+                    ..
+                }
+            ]
+        ));
+        let mut forged = steps.clone();
+        if let RecoveryStep::InjectStoredGroup { command_ids, .. } = &mut forged[1] {
+            command_ids.clear();
+        }
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            LogicalRecoveryExecutor
+                .execute(&store, &forged, &lease, &fence)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            before
+        );
+        LogicalRecoveryExecutor
+            .execute(&store, &steps, &lease, &fence)
+            .await
+            .expect("atomic old-turn closure and exact group injection");
+        let HydrationOutcome::Complete(hydrated) = store.hydrate(&lease, &fence).await.unwrap()
+        else {
+            panic!("new stored input must reach inference handoff")
+        };
+        let continuation = hydrated.continuation.unwrap();
+        assert_eq!(continuation.envelope.seq, 2);
+        assert_eq!(continuation.run_id, TOOL_USE_RECOVERY_RUN_ID);
+        assert_eq!(continuation.turn_id, "recovered-soft-turn");
+        assert_eq!(continuation.phase, RunPhase::UserCommitted);
+        assert!(continuation.turn_open);
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status,run_phase FROM inbound_commands WHERE seq=1"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            ("applied".into(), "finished".into())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id='tool-rowless-messaging'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            "not_started"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let HydrationOutcome::Complete(again) = store.hydrate(&lease, &fence).await.unwrap() else {
+            panic!("repeat handoff")
+        };
+        assert_eq!(
+            again.continuation.unwrap().envelope.command_id,
+            continuation.envelope.command_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            count
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+            0
         );
     }
 

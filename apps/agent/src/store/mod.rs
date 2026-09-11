@@ -125,8 +125,8 @@ pub(crate) use memory_state::{
 };
 #[cfg(test)]
 pub(crate) use recovery::tests::{
-    assert_indeterminate_surface, open_boot_running_tools_store, setup_boot_running_external_tool,
-    setup_boot_running_tools, setup_boot_running_tools_on_disk,
+    assert_indeterminate_surface, open_boot_running_tools_store, seed_soft_steer_restart,
+    setup_boot_running_external_tool, setup_boot_running_tools, setup_boot_running_tools_on_disk,
     setup_boot_running_tools_with_rowless_tail,
 };
 #[allow(
@@ -817,18 +817,41 @@ impl Store {
             intent_count: 0,
         };
 
-        let continuation = if let [
-            RecoveryStep::ContinueInference {
+        let continuation_owner = match recovery_steps.as_slice() {
+            [
+                RecoveryStep::ContinueInference {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    turn_open,
+                },
+            ] => Some((
                 command_id,
                 run_id,
                 turn_id,
-                turn_open,
-            },
-        ] = recovery_steps.as_slice()
+                *turn_open,
+                RunPhase::AssistantStarted,
+            )),
+            [
+                RecoveryStep::StartAssistant {
+                    command_id,
+                    run_id,
+                    turn_id,
+                },
+            ] => {
+                if recovery.authenticated_open_turn(run_id)? != turn_id {
+                    bail!("committed user continuation must own the authenticated open turn");
+                }
+                Some((command_id, run_id, turn_id, true, RunPhase::UserCommitted))
+            }
+            _ => None,
+        };
+        let continuation = if let Some((command_id, run_id, turn_id, turn_open, phase)) =
+            continuation_owner
         {
             let mut transaction = self.pool().begin().await?;
-            let row = sqlx::query("SELECT seq, received_at FROM inbound_commands WHERE command_id=? AND run_id=? AND status='applying' AND run_phase='assistant_started'")
-                .bind(command_id).bind(run_id).fetch_one(&mut *transaction).await?;
+            let row = sqlx::query("SELECT seq, received_at FROM inbound_commands WHERE command_id=? AND run_id=? AND status='applying' AND run_phase=?")
+                .bind(command_id).bind(run_id).bind(phase.as_str()).fetch_one(&mut *transaction).await?;
             let seq = u64::try_from(row.try_get::<i64, _>("seq")?)?;
             let received_at: String = row.try_get("received_at")?;
             let provenance =
@@ -856,7 +879,8 @@ impl Store {
                     .with_timezone(&chrono::Utc),
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
-                turn_open: *turn_open,
+                turn_open,
+                phase,
             };
             transaction.commit().await?;
             recovery_steps.clear();

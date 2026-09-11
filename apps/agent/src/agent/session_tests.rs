@@ -12497,6 +12497,138 @@ async fn queued_received_restart_child() {
     panic!("SIGKILL must terminate the child");
 }
 
+#[tokio::test]
+async fn recovered_soft_steer_reopens_and_answers_once_without_resubmission() {
+    let directory = std::env::temp_dir().join(format!("sumi-soft-recovery-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("agent.db");
+    let scope = AgentScope {
+        personality_agent_id: "0198f0f4-9b72-7000-8000-000000000001".parse().unwrap(),
+    };
+    let provider = Arc::new(KillRestartKeyProvider(WrappingKey::new(
+        "soft-restart-key/v1",
+        [0x5a; DATA_KEY_BYTES],
+    )));
+    let store = Arc::new(
+        Store::open(&path, scope.clone(), provider.clone())
+            .await
+            .unwrap(),
+    );
+    let writer = EventWriter::new(store.clone());
+    crate::store::seed_soft_steer_restart(&store, &writer).await;
+    store.pool().close().await;
+    drop(writer);
+    drop(store);
+    let store = Store::open(&path, scope.clone(), provider.clone())
+        .await
+        .unwrap();
+    let authority = queued_recovery_authority(&store, 8);
+    let HydrationOutcome::LogicalRecoveryRequired { steps } = store
+        .hydrate(authority.lease(), authority.fence())
+        .await
+        .unwrap()
+    else {
+        panic!("saved soft steer requires repair")
+    };
+    crate::store::LogicalRecoveryExecutor
+        .execute(&store, &steps, authority.lease(), authority.fence())
+        .await
+        .unwrap();
+    let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+    // A second crash after the atomic injection must neither repeat its user
+    // message nor lose the new same-run inference owner.
+    let store = Store::open(&path, scope, provider).await.unwrap();
+    let authority = queued_recovery_authority(&store, 9);
+    let HydrationOutcome::Complete(hydrated) = store
+        .hydrate(authority.lease(), authority.fence())
+        .await
+        .unwrap()
+    else {
+        panic!("existing injected input resumes")
+    };
+    let owner = hydrated.continuation.as_ref().unwrap().clone();
+    assert_eq!(owner.envelope.seq, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        event_count
+    );
+    let pool = store.pool().clone();
+    let broker = Arc::new(ApprovalBroker::headless(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+    ));
+    let (core, start) =
+        SessionStartAuthority::from_hydrated(authority.clone(), &hydrated, broker).unwrap();
+    let driver = Arc::new(QueuedRecoveryDriver {
+        hold_attempt: usize::MAX,
+        identity: authority.rpc_identity().clone(),
+        starts: Mutex::new(vec![]),
+        started: Notify::new(),
+        release: Notify::new(),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start_hydrated(
+        store,
+        gateway,
+        core,
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        start,
+    )
+    .await
+    .unwrap();
+    let task = tokio::spawn(session.run());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if applied_acks(&frames).iter().any(|ack| ack.seq == 2) {
+                break;
+            }
+            assert!(
+                !task.is_finished(),
+                "recovered Session failed before applying steer"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saved steer finishes without new input");
+    drop(commands);
+    assert!(matches!(task.await.unwrap(), SessionResult::Completed(_)));
+    assert_eq!(driver.starts.lock().unwrap().len(), 1);
+    let messages: Vec<_> = driver.starts.lock().unwrap()[0]
+        .0
+        .iter()
+        .map(crate::memory::overflow::context_message_to_public)
+        .collect();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| matches!(m, PublicMessage::User(_)))
+            .count(),
+        2
+    );
+    assert!(messages.iter().any(|m| matches!(m, PublicMessage::ToolResult(r) if r.tool_call_id == "tool-rowless-messaging" && r.is_error)));
+    let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM inbound_commands), (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_start'), (SELECT COUNT(*) FROM agent_events WHERE event_type='agent_end'), (SELECT COUNT(*) FROM inbound_commands WHERE status='applied')").fetch_one(&pool).await.unwrap();
+    assert_eq!(counts, (2, 1, 1, 2));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM inbound_commands WHERE seq=2")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        owner.run_id
+    );
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start' AND json_extract(envelope,'$.tool_call_id')='tool-rowless-messaging'").fetch_one(&pool).await.unwrap(), 0);
+    pool.close().await;
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn queued_received_command_survives_owner_recovery_and_executes_once() {
