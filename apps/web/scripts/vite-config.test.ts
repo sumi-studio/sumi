@@ -75,6 +75,9 @@ test("Feedback API requests are proxied while its Inbox remains a page", () => {
     "/feedback/bootstrap",
     "/feedback/threads?status=all",
     "/feedback/threads/id/messages",
+    "/feedback/attachments",
+    "/feedback/attachments/id",
+    "/feedback/diagnostics",
   ]) {
     assert.equal(matches.test(path), true, path);
   }

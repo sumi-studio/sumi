@@ -10,7 +10,13 @@ import {
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
 import { useNavigate } from "@tanstack/react-router";
-import { Building2, Check, ChevronsUpDown, LayoutGrid } from "lucide-react";
+import {
+  Building2,
+  Check,
+  ChevronsUpDown,
+  LayoutGrid,
+  MessageSquarePlus,
+} from "lucide-react";
 import { preissuedSessionMode, useAuth } from "../auth/auth-context";
 import { SettingsPopover } from "../components/app-navigation";
 import {
@@ -29,11 +35,13 @@ export function AppRail({
   workspaceId,
   messagingPath,
   onOpenFeedback,
+  onReportFeedback,
 }: {
   activeAppId: string;
   workspaceId?: string;
   messagingPath?: string;
   onOpenFeedback?: () => void;
+  onReportFeedback?: () => void;
 }) {
   const navigate = useNavigate();
   const { authenticated, user } = useAuth();
@@ -241,7 +249,16 @@ export function AppRail({
           </RailButton>
         ) : null}
       </nav>
-      <div className="mt-auto px-2 pb-3">
+      <div className="mt-auto flex flex-col items-center gap-1 px-1 pb-3">
+        {feedbackEnabled && onReportFeedback && (
+          <RailButton
+            label="この画面からフィードバック（Alt + Shift + F）"
+            active={false}
+            onClick={onReportFeedback}
+          >
+            <MessageSquarePlus className="size-4" />
+          </RailButton>
+        )}
         <SettingsPopover />
       </div>
     </aside>

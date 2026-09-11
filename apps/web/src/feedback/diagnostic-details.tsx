@@ -13,6 +13,7 @@ export function Diagnostics({
   const states = source?.states;
   const connection = states?.agent_connection ?? states?.messaging_connection;
   const release = details.tab_release ?? details.served_release;
+  const observation = details.server_observation;
   return (
     <details className="feedback-diagnostic-attachment">
       <summary>
@@ -23,8 +24,8 @@ export function Diagnostics({
       </summary>
       <div className="feedback-diagnostic-content">
         <p className="feedback-diagnostic-description">
-          画面や接続の状態を、問題の手がかりとして共有します。
-          会話本文や認証情報は含みません。
+          画面や接続の状態、直前の操作とブラウザのエラーを共有します。
+          操作履歴に入力内容や会話本文は記録しません。
         </p>
         <dl className="feedback-diagnostic-facts">
           {source && (
@@ -95,6 +96,111 @@ export function Diagnostics({
             </>
           )}
         </dl>
+        {!!details.annotations?.length && (
+          <section
+            className="feedback-diagnostic-section"
+            aria-label="注釈を付けた箇所"
+          >
+            <h4>注釈を付けた箇所</h4>
+            <ol className="feedback-diagnostic-events">
+              {details.annotations.map((annotation) => (
+                <li key={annotation.number}>
+                  <span className="feedback-diagnostic-event-heading">
+                    <span>
+                      #{annotation.number} ·{" "}
+                      {annotation.kind === "region" ? "範囲" : "要素"}
+                    </span>
+                    <time dateTime={annotation.captured_at}>
+                      {displayTime(annotation.captured_at, details.time_zone)}
+                    </time>
+                  </span>
+                  <span>
+                    {annotation.label ||
+                      (annotation.kind === "region"
+                        ? "選択した範囲"
+                        : annotation.tag)}
+                  </span>
+                  <code className="feedback-diagnostic-path">
+                    {annotation.path}
+                  </code>
+                  <span className="feedback-diagnostic-secondary">
+                    位置 ({Math.round(annotation.rect.x)},{" "}
+                    {Math.round(annotation.rect.y)}) ·{" "}
+                    {Math.round(annotation.rect.width)} ×{" "}
+                    {Math.round(annotation.rect.height)} px
+                  </span>
+                  {annotation.selector && <code>{annotation.selector}</code>}
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
+        <section
+          className="feedback-diagnostic-section"
+          aria-label="ブラウザ内の直近の記録"
+        >
+          <h4>ブラウザ内の直近の記録</h4>
+          <p className="feedback-diagnostic-description">
+            このタブで記録した、最大24件の画面移動・操作・エラーです。
+          </p>
+          {details.client_events?.length ? (
+            <ol className="feedback-diagnostic-events">
+              {details.client_events.map((event, index) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: An attachment is an immutable snapshot; multiple events can share a timestamp.
+                <li key={`${event.at}-${index}`}>
+                  <span className="feedback-diagnostic-event-heading">
+                    <span>{eventName(event.kind)}</span>
+                    <time dateTime={event.at}>
+                      {displayTime(event.at, details.time_zone)}
+                    </time>
+                  </span>
+                  <span>{event.summary}</span>
+                  <code className="feedback-diagnostic-path">{event.path}</code>
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <p>記録はありません。</p>
+          )}
+        </section>
+        <section
+          className="feedback-diagnostic-section"
+          aria-label="サーバーで確認した状態"
+        >
+          <h4>サーバーで確認した状態</h4>
+          {observation ? (
+            <dl className="feedback-diagnostic-facts">
+              <dt>状態</dt>
+              <dd>{observationName(observation.status)}</dd>
+              <dt>確認時刻</dt>
+              <dd>{displayTime(observation.captured_at, details.time_zone)}</dd>
+              {observation.ready !== undefined && (
+                <>
+                  <dt>実行の準備</dt>
+                  <dd>{observation.ready ? "準備完了" : "未完了"}</dd>
+                </>
+              )}
+              {observation.run_in_flight !== undefined && (
+                <>
+                  <dt>処理</dt>
+                  <dd>{observation.run_in_flight ? "実行中" : "待機中"}</dd>
+                </>
+              )}
+              {observation.readiness_reason && (
+                <>
+                  <dt>準備状態の詳細</dt>
+                  <dd>{observation.readiness_reason}</dd>
+                </>
+              )}
+            </dl>
+          ) : (
+            <p>
+              {composing
+                ? "診断情報の添付時にサーバーの状態を確認します。"
+                : "サーバーの記録はありません。"}
+            </p>
+          )}
+        </section>
         <details className="feedback-diagnostic-raw">
           <summary>
             <ChevronRight size={13} aria-hidden="true" />
@@ -114,7 +220,31 @@ export function Diagnostics({
   );
 }
 
+function eventName(kind: string): string {
+  const labels: Record<string, string> = {
+    navigation: "画面移動",
+    click: "クリック",
+    error: "ブラウザエラー",
+    unhandledrejection: "非同期処理のエラー",
+  };
+  return labels[kind] ?? kind;
+}
+
+function observationName(status: string): string {
+  const labels: Record<string, string> = {
+    observed: "確認済み",
+    ok: "確認済み",
+    available: "確認済み",
+    unavailable: "確認できませんでした",
+    timeout: "確認がタイムアウトしました",
+    not_applicable: "この画面は確認対象外です",
+    not_requested: "確認していません",
+  };
+  return labels[status] ?? status;
+}
+
 function screenName(path: string): string {
+  if (path === "/feedback") return "Feedback";
   if (path === "/direct") return "Direct";
   if (path === "/") return "Workspace 一覧";
   if (/\/messaging\/dm\//.test(path)) return "Messaging · DM";

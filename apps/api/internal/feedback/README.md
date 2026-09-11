@@ -65,6 +65,38 @@ who changed them and when; stale revisions produce `revision_conflict` (409).
 Create/reply retries return the original committed response; reusing a nonce
 for another target or content produces `request_conflict` (409).
 
+## Reports from the original screen
+
+Browser `POST /feedback/diagnostics` with `{}` returns a timestamped safe
+runtime observation for the PA bound to the authenticated session: readiness,
+generation (decimal string), readiness reason and observed run state when
+available. It never starts the PA. Collection failure returns
+`status:"unavailable"` so writing feedback remains possible. The browser can
+include this response as `diagnostics.server_observation`; that submitted copy
+is author-supplied evidence, not authenticated server provenance or authority.
+Diagnostic JSON is bounded to 32 KiB, and accepts the browser's selected target,
+up to 24 navigation/click/error observations and scroll position. No raw server
+log contents are collected by this endpoint.
+
+Browser `POST /feedback/attachments` takes a multipart `file` and returns
+`{attachment:{id,name,mime_type,size,url}}`. PNG, JPEG, WebP, WebM and MP4 are
+recognized from the bytes, with a 20 MiB limit per file. Create accepts optional
+`attachment_ids` (up to five). Binding is atomic with thread creation, requires
+the author's own unexpired uploads, and participates in request deduplication.
+Full thread responses include attachment metadata. The attachment URL supports
+range requests; only the staging author or, after send, a current thread viewer
+with enabled Feedback can read the bytes. Messaging attachment ownership and
+storage are separate.
+
+Feedback attachment bytes use the database with a 1 GiB / 10,000 object cap for
+this deployment. A participant may stage at most 100 MiB / 20 uploads. Unsent
+uploads expire after 24 hours and are reclaimed on upload and by a minute
+background sweep. Expiry never deletes attachments already bound to a thread.
+Each server permits four combined uploads/downloads at a time. Further media
+requests return `503 attachment_transfer_busy` before reading the body or blob;
+callers can retry. Disabled installations are rejected before upload body reads
+and installation authority is checked again when the upload is stored.
+
 ## PA attention
 
 Create, reply and status mutations also write an immutable notification snapshot

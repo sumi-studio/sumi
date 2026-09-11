@@ -77,7 +77,8 @@ export function createDevServerConfig(
       "/api/model-connections": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
-      "^/feedback/(bootstrap|threads)(?:/|\\?|$)": apiProxy(target.origin),
+      "^/feedback/(bootstrap|threads|attachments|diagnostics)(?:/|\\?|$)":
+        apiProxy(target.origin),
       "/workspaces": apiProxy(target.origin),
       "/workspace-invites": apiProxy(target.origin),
       "/apps": apiProxy(target.origin),

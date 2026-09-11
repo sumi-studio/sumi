@@ -93,6 +93,7 @@ const threadColumns = `t.thread_id,t.title,t.body,t.status,t.author,t.created_at
 
 func scanThread(row pgx.Row) (Thread, error) {
 	var t Thread
+	t.Attachments = []Attachment{}
 	err := row.Scan(&t.ID, &t.Title, &t.Body, &t.Status, &t.Author, &t.CreatedAt, &t.UpdatedAt, &t.Revision, &t.Diagnostics, &t.Unread, &t.LatestMessage)
 	return t, err
 }
@@ -108,6 +109,10 @@ func (s *Store) thread(ctx context.Context, tx pgx.Tx, actor participant.Ref, id
 	if errors.Is(err, pgx.ErrNoRows) {
 		return t, ErrNotFound
 	}
+	if err != nil {
+		return t, err
+	}
+	t.Attachments, err = threadAttachments(ctx, tx, t.ID)
 	if err != nil {
 		return t, err
 	}
@@ -269,9 +274,9 @@ func markRead(ctx context.Context, tx pgx.Tx, actor participant.Ref, id string, 
 	_, err := tx.Exec(ctx, `INSERT INTO feedback_reads(thread_id,reader_key,revision) VALUES($1,$2,$3) ON CONFLICT(thread_id,reader_key) DO UPDATE SET revision=GREATEST(feedback_reads.revision,EXCLUDED.revision)`, id, actor.Key(), revision)
 	return err
 }
-func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, nonce string, diagnostics *Diagnostics) (Thread, error) {
+func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, nonce string, diagnostics *Diagnostics, attachmentIDs ...string) (Thread, error) {
 	var t Thread
-	if !validText(title, 160) || !validText(body, 20000) || !diagnostics.valid() {
+	if !validText(title, 160) || !validText(body, 20000) || !diagnostics.valid() || !validAttachmentIDs(attachmentIDs) {
 		return t, ErrInvalid
 	}
 	tx, err := s.begin(ctx, actor)
@@ -281,6 +286,10 @@ func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, 
 	defer tx.Rollback(ctx)
 	diagnosticJSON, _ := json.Marshal(diagnostics)
 	fingerprint := requestFingerprint("create", title, body, string(diagnosticJSON))
+	if len(attachmentIDs) > 0 {
+		ids, _ := json.Marshal(attachmentIDs)
+		fingerprint = requestFingerprint(fingerprint, string(ids))
+	}
 	hit, err := receipt(ctx, tx, actor, nonce, fingerprint, &t)
 	if err != nil || hit {
 		return t, err
@@ -298,6 +307,10 @@ func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, 
 	}
 	t = Thread{ID: newID(), Title: title, Body: body, Diagnostics: diagnostics, Status: "open", Author: a, Revision: 1}
 	err = tx.QueryRow(ctx, `INSERT INTO feedback_threads(thread_id,author_key,author,title,body,diagnostics) VALUES($1,$2,$3,$4,$5,$6) RETURNING created_at,updated_at`, t.ID, actor.Key(), a, title, body, diagnostics).Scan(&t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return t, err
+	}
+	t.Attachments, err = bindAttachments(ctx, tx, actor, t.ID, attachmentIDs)
 	if err != nil {
 		return t, err
 	}
@@ -420,6 +433,14 @@ func (s *Store) Read(ctx context.Context, actor participant.Ref, id string, revi
 // Avoid accidental exposure of internal database errors on either transport.
 func errorCode(err error) (int, string) {
 	switch {
+	case errors.Is(err, ErrAttachmentBusy):
+		return 503, err.Error()
+	case errors.Is(err, ErrAttachmentTooLarge):
+		return 413, err.Error()
+	case errors.Is(err, ErrAttachmentType):
+		return 415, err.Error()
+	case errors.Is(err, ErrAttachmentQuota):
+		return 409, err.Error()
 	case errors.Is(err, ErrInvalid):
 		return 400, err.Error()
 	case errors.Is(err, ErrNotFound):

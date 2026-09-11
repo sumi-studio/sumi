@@ -1,4 +1,14 @@
-import type { FeedbackDiagnostics } from "./diagnostics";
+import type {
+  DiagnosticServerObservation,
+  FeedbackDiagnostics,
+} from "./diagnostics";
+export interface FeedbackAttachment {
+  id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  url: string;
+}
 export interface Participant {
   kind: "human" | "personality_agent";
   human_id?: string;
@@ -25,6 +35,7 @@ export interface Thread {
   updated_at: string;
   revision: number;
   diagnostics?: FeedbackDiagnostics;
+  attachments?: FeedbackAttachment[];
   latest_message?: Message | null;
   unread: boolean;
 }
@@ -64,6 +75,7 @@ export interface FeedbackClient {
     body: string,
     requestId: string,
     diagnostics?: FeedbackDiagnostics,
+    attachmentIds?: string[],
   ): Promise<Thread>;
   reply(id: string, body: string, requestId: string): Promise<Message>;
   status(
@@ -118,8 +130,14 @@ export const feedbackClient: FeedbackClient = {
     request(
       `${threadPath(id)}${cursor ? `?${new URLSearchParams({ cursor })}` : ""}`,
     ),
-  create: (title, body, request_id, diagnostics) =>
-    request("threads", "POST", { title, body, request_id, diagnostics }),
+  create: (title, body, request_id, diagnostics, attachment_ids) =>
+    request("threads", "POST", {
+      title,
+      body,
+      request_id,
+      diagnostics,
+      attachment_ids,
+    }),
   reply: (id, body, request_id) =>
     request(`${threadPath(id)}/messages`, "POST", { body, request_id }),
   status: (id, status, revision) =>
@@ -127,6 +145,36 @@ export const feedbackClient: FeedbackClient = {
   read: (id, revision) =>
     request(`${threadPath(id)}/read`, "PUT", { revision }),
 };
+export async function readFeedbackServerObservation(): Promise<
+  DiagnosticServerObservation | undefined
+> {
+  try {
+    return await request<DiagnosticServerObservation>(
+      "diagnostics",
+      "POST",
+      {},
+    );
+  } catch {
+    return undefined;
+  }
+}
+export async function uploadFeedbackAttachment(
+  file: File,
+  signal?: AbortSignal,
+): Promise<FeedbackAttachment> {
+  const data = new FormData();
+  data.append("file", file);
+  const response = await fetch("/feedback/attachments", {
+    method: "POST",
+    credentials: "same-origin",
+    body: data,
+    signal,
+  });
+  if (!response.ok)
+    throw new FeedbackError(response.status, "attachment_upload_failed");
+  const result: { attachment: FeedbackAttachment } = await response.json();
+  return result.attachment;
+}
 export function errorMessage(error: unknown): string {
   if (error instanceof FeedbackError) {
     if (error.status === 401)

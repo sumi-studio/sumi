@@ -1,0 +1,144 @@
+.feedback-attachments {
+  margin-block: 10px;
+  min-width: 0;
+}
+.feedback-attachment-actions {
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  border: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.feedback-attachment-actions button,
+.feedback-attachment-retry button {
+  padding: 6px 8px;
+  border: 1px solid var(--feedback-line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}
+.feedback-attachment-actions span,
+.feedback-attachment-status,
+.feedback-attachment-retry {
+  color: var(--feedback-muted);
+  font-size: 12px;
+}
+.feedback-attachment-edit-list,
+.feedback-media-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+.feedback-attachment-edit {
+  position: relative;
+  margin-top: 10px;
+}
+.feedback-media {
+  margin: 0;
+  width: 150px;
+  min-width: 0;
+}
+.feedback-media:has(video) {
+  width: 230px;
+}
+.feedback-media img,
+.feedback-media video {
+  display: block;
+  width: 100%;
+  height: 100px;
+  object-fit: contain;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--foreground) 5%, var(--background));
+}
+.feedback-media video {
+  width: 230px;
+  max-width: 100%;
+}
+.feedback-media figcaption {
+  margin-top: 4px;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.feedback-media a {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+.feedback-attachment-remove {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--feedback-line);
+  border-radius: 50%;
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 20px;
+}
+.feedback-attachment-error {
+  color: var(--destructive, #b42318);
+  font-size: 12px;
+  margin: 8px 0;
+}
+.feedback-attachment-retry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.feedback-recording-controls {
+  position: fixed;
+  z-index: 2147483000;
+  left: 50%;
+  bottom: max(20px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  max-width: calc(100vw - 24px);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--foreground) 20%, transparent);
+  border-radius: 10px;
+  background: var(--background);
+  color: var(--foreground);
+  box-shadow: 0 4px 24px #0003;
+  font-size: 13px;
+}
+.feedback-recording-controls button {
+  padding: 7px 11px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  font: inherit;
+}
+.feedback-recording-controls button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+@media (max-width: 540px) {
+  .feedback-media {
+    width: 130px;
+  }
+  .feedback-attachment-actions button {
+    min-height: 40px;
+  }
+  .feedback-attachment-remove {
+    width: 32px;
+    height: 32px;
+  }
+}

@@ -1,9 +1,11 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import {
   recordFeedbackOrigin,
   resetFeedbackOrigin,
+  startFeedbackEvidence,
 } from "../feedback/diagnostics";
+import { FeedbackMode, openFeedbackMode } from "../feedback/mode";
 import { PushSubscriptionBridge } from "../messaging/components/push-bridge";
 import { MessagingTransport } from "../workspace/components/messaging-transport";
 import { useWorkspaceControl } from "../workspace/store";
@@ -54,16 +56,13 @@ export function AppShell() {
       setNavigation({ scopeKey });
     }
   }, [pathname, routeWorkspaceId, personalApp, scopeKey, navigation.scopeKey]);
-  const diagnosticScope = useRef(scopeKey);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Reset browser evidence when the authenticated session changes.
   useLayoutEffect(() => {
     resetFeedbackOrigin();
-    return resetFeedbackOrigin;
-  }, []);
+    return startFeedbackEvidence();
+  }, [scopeKey]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Re-seed current route after the session-scoped evidence reset.
   useLayoutEffect(() => {
-    if (diagnosticScope.current !== scopeKey) {
-      resetFeedbackOrigin();
-      diagnosticScope.current = scopeKey;
-    }
     recordFeedbackOrigin(pathname, workspaceId);
   }, [pathname, workspaceId, scopeKey]);
 
@@ -84,10 +83,12 @@ export function AppShell() {
         workspaceId={workspaceId}
         messagingPath={messagingPath}
         onOpenFeedback={() => recordFeedbackOrigin(pathname, workspaceId)}
+        onReportFeedback={openFeedbackMode}
       />
       <div className="min-w-0 flex-1">
         <Outlet />
       </div>
+      <FeedbackMode pathname={pathname} workspaceId={workspaceId} />
     </div>
   );
 }
