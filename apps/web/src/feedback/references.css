@@ -1,0 +1,129 @@
+.feedback-references {
+  margin: 12px 0 24px;
+}
+.feedback-references-heading {
+  margin: 0 0 8px;
+  color: var(--feedback-muted);
+  font-size: 12px;
+}
+.feedback-references ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+.feedback-references li {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 9px;
+  background: var(--muted);
+  padding: 4px 6px;
+  scroll-margin-block: 24px;
+}
+.feedback-references li:focus {
+  outline: 2px solid var(--feedback-muted);
+  outline-offset: 2px;
+}
+.feedback-reference-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+  padding: 5px 4px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: var(--foreground);
+}
+.feedback-reference-main:disabled {
+  cursor: default;
+  opacity: 1;
+}
+.feedback-reference-number {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 23px;
+  height: 23px;
+  border-radius: 7px;
+  background: var(--foreground);
+  color: var(--background);
+  font-size: 12px;
+  font-weight: 600;
+}
+.feedback-reference-label {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.feedback-reference-label small {
+  display: block;
+  color: var(--feedback-muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.feedback-reference-action {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 32px;
+  flex: 0 0 30px;
+  color: var(--feedback-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.feedback-reference-action:hover {
+  background: var(--background);
+  color: var(--foreground);
+}
+.feedback-reference-action:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+.feedback-reference-note {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--feedback-muted);
+  margin: 8px 0;
+}
+.feedback-reference-retry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+}
+.feedback-reference-retry button {
+  background: none;
+  border: none;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.feedback-message-body a[href^="#feedback-reference-"] {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  padding: 0 5px;
+  margin-inline: 2px;
+  border-radius: 5px;
+  background: var(--muted);
+  color: var(--foreground);
+  text-decoration: none;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+@media (pointer: coarse) {
+  .feedback-reference-action {
+    width: 36px;
+    height: 42px;
+    flex-basis: 36px;
+  }
+}

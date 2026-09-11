@@ -7,6 +7,7 @@ export interface Draft {
   requestId: string;
   diagnostics?: FeedbackDiagnostics;
   submitted?: boolean;
+  annotationNumber?: number;
   attachments?: FeedbackAttachment[];
 }
 const memory = new Map<string, Draft>();

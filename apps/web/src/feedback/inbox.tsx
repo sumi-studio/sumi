@@ -39,12 +39,17 @@ import { FeedbackAttachments, MediaPreview } from "./attachments";
 import { Diagnostics } from "./diagnostic-details";
 import {
   captureFeedbackDiagnostics,
+  type DiagnosticAnnotation,
   type DiagnosticSelection,
   type FeedbackDiagnostics,
+  MAX_FEEDBACK_ANNOTATIONS,
   readServedRelease,
 } from "./diagnostics";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "./drafts";
+import { AnnotationReferences } from "./references";
 import "./inbox.css";
+
+const NO_ANNOTATIONS: DiagnosticAnnotation[] = [];
 
 export interface InboxLocation {
   thread?: string;
@@ -407,6 +412,9 @@ export function NewThread({
   selection,
   header,
   onCaptureChange,
+  onAnnotationsChange,
+  onRevealAnnotation,
+  resolveAnnotation,
 }: {
   actor: string;
   recipient: string;
@@ -419,6 +427,11 @@ export function NewThread({
   selection?: DiagnosticSelection;
   header?: ReactNode;
   onCaptureChange?(active: boolean): void;
+  onAnnotationsChange?(annotations: DiagnosticAnnotation[]): void;
+  onRevealAnnotation?(annotation: DiagnosticAnnotation): void;
+  resolveAnnotation?(
+    annotation: DiagnosticAnnotation,
+  ): { x: number; y: number; width: number; height: number } | undefined;
 }) {
   const key = draftKey(actor, draftNamespace);
   const inPlace = draftNamespace === "in-place";
@@ -431,7 +444,8 @@ export function NewThread({
       (existing.diagnostics &&
         (existing.title.trim() ||
           existing.body.trim() ||
-          existing.attachments?.length))
+          existing.attachments?.length ||
+          existing.diagnostics.annotations?.length))
     )
       return existing;
     let diagnostics: FeedbackDiagnostics | undefined;
@@ -446,23 +460,56 @@ export function NewThread({
   });
   const submitted = useRef(Boolean(draft.submitted));
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [regionBusy, setRegionBusy] = useState(false);
   const [busy, setBusy] = useState(false);
+  const annotations = draft.diagnostics?.annotations ?? NO_ANNOTATIONS;
+  const consumedSelection = useRef<DiagnosticSelection | undefined>(undefined);
+  const [selectionError, setSelectionError] = useState("");
   useEffect(() => {
-    if (!selection || busy) return;
-    setDraft((previous) => {
-      if (!previous.diagnostics || previous.diagnostics.selection === selection)
-        return previous;
-      submitted.current = false;
-      const next = {
-        ...previous,
-        submitted: false,
-        requestId: secureRandomUUID(),
-        diagnostics: { ...previous.diagnostics, selection },
-      };
-      saveDraft(key, next);
-      return next;
+    onAnnotationsChange?.(annotations);
+  }, [annotations, onAnnotationsChange]);
+  useEffect(() => {
+    if (!selection || busy || consumedSelection.current === selection) return;
+    consumedSelection.current = selection;
+    const existing = draft.diagnostics?.annotations ?? [];
+    if (existing.length >= MAX_FEEDBACK_ANNOTATIONS) {
+      setSelectionError("一度に指定できる場所は10か所までです。");
+      return;
+    }
+    // Do not reuse a removed number: earlier prose may still refer to it.
+    const number =
+      Math.max(
+        draft.annotationNumber ?? 0,
+        ...existing.map((item) => item.number),
+        0,
+      ) + 1;
+    if (number > 9999) return;
+    const annotation: DiagnosticAnnotation = { ...selection, number };
+    const input = document.getElementById(bodyId) as HTMLTextAreaElement | null;
+    const start = input?.selectionStart ?? draft.body.length;
+    const end = input?.selectionEnd ?? start;
+    const mention = `[${number}] `;
+    submitted.current = false;
+    const next = {
+      ...draft,
+      submitted: false,
+      requestId: secureRandomUUID(),
+      annotationNumber: number,
+      body: draft.body.slice(0, start) + mention + draft.body.slice(end),
+      diagnostics: {
+        ...(draft.diagnostics ?? captureFeedbackDiagnostics()),
+        annotations: [...existing, annotation],
+      },
+    };
+    setDraft(next);
+    saveDraft(key, next);
+    setSelectionError("");
+    requestAnimationFrame(() => {
+      if (!input?.isConnected) return;
+      input?.focus({ preventScroll: true });
+      input?.setSelectionRange(start + mention.length, start + mention.length);
     });
-  }, [selection, key, busy]);
+  }, [selection, key, busy, bodyId, draft]);
   useEffect(() => {
     if (submitted.current || draft.diagnostics?.server_observation) return;
     let active = true;
@@ -539,6 +586,7 @@ export function NewThread({
   const canSubmit =
     !busy &&
     !attachmentBusy &&
+    !regionBusy &&
     enabled &&
     Boolean(draft.body.trim() || (inPlace && draft.attachments?.length)) &&
     Boolean(inPlace || draft.title.trim());
@@ -642,10 +690,72 @@ export function NewThread({
               disabled={busy}
               onChange={(event) => update("body", event.target.value)}
             />
+            <AnnotationReferences
+              draftStorageKey={key}
+              resolveAnnotation={resolveAnnotation}
+              annotations={annotations}
+              disabled={busy || attachmentBusy}
+              attachmentCount={draft.attachments?.length ?? 0}
+              onBusyChange={setRegionBusy}
+              onCaptureChange={onCaptureChange}
+              onReveal={onRevealAnnotation}
+              onMention={(annotation) => {
+                const input = document.getElementById(
+                  bodyId,
+                ) as HTMLTextAreaElement | null;
+                const start = input?.selectionStart ?? draft.body.length;
+                const end = input?.selectionEnd ?? start;
+                const mention = `[${annotation.number}] `;
+                update(
+                  "body",
+                  draft.body.slice(0, start) + mention + draft.body.slice(end),
+                );
+                requestAnimationFrame(() => {
+                  input?.focus({ preventScroll: true });
+                  input?.setSelectionRange(
+                    start + mention.length,
+                    start + mention.length,
+                  );
+                });
+              }}
+              onRemove={(annotation) => {
+                if (!draft.diagnostics) return;
+                submitted.current = false;
+                const next = {
+                  ...draft,
+                  submitted: false,
+                  requestId: secureRandomUUID(),
+                  body: draft.body.replaceAll(`[${annotation.number}]`, ""),
+                  diagnostics: {
+                    ...draft.diagnostics,
+                    annotations: annotations.filter(
+                      (item) => item.number !== annotation.number,
+                    ),
+                  },
+                };
+                setDraft(next);
+                saveDraft(key, next);
+              }}
+              onAttachment={(attachment) => {
+                submitted.current = false;
+                setDraft((previous) => {
+                  const next = {
+                    ...previous,
+                    submitted: false,
+                    requestId: secureRandomUUID(),
+                    attachments: [...(previous.attachments ?? []), attachment],
+                  };
+                  saveDraft(key, next);
+                  return next;
+                });
+              }}
+            />
+            {selectionError && <Notice text={selectionError} />}
             <FeedbackAttachments
+              draftStorageKey={key}
               attachments={draft.attachments ?? []}
               onChange={updateAttachments}
-              disabled={busy}
+              disabled={busy || regionBusy}
               onBusyChange={setAttachmentBusy}
               onCaptureChange={onCaptureChange}
             />
@@ -952,7 +1062,18 @@ function Conversation({
                 author={detail.thread.author}
                 time={detail.thread.created_at}
               />
-              <MessageBody>{detail.thread.body}</MessageBody>
+              <MessageBody
+                annotations={detail.thread.diagnostics?.annotations}
+                referencePrefix={`feedback-reference-${detail.thread.id}`}
+              >
+                {detail.thread.body}
+              </MessageBody>
+              <AnnotationReferences
+                annotations={
+                  detail.thread.diagnostics?.annotations ?? NO_ANNOTATIONS
+                }
+                idPrefix={`feedback-reference-${detail.thread.id}`}
+              />
               <MediaPreview attachments={detail.thread.attachments ?? []} />
               {detail.thread.diagnostics && (
                 <Diagnostics details={detail.thread.diagnostics} />
@@ -1164,10 +1285,45 @@ function AuthorLine({ author, time }: { author: Author; time: string }) {
     </div>
   );
 }
-function MessageBody({ children }: { children: string }) {
+function MessageBody({
+  children,
+  annotations,
+  referencePrefix,
+}: {
+  children: string;
+  annotations?: DiagnosticAnnotation[];
+  referencePrefix?: string;
+}) {
+  const references = annotations
+    ?.map((item) => `[${item.number}]: #${referencePrefix}-${item.number}`)
+    .join("\n");
   return (
-    <div className="feedback-message-body">
-      <CompactMessageResponse>{children}</CompactMessageResponse>
+    // biome-ignore lint/a11y/noStaticElementInteractions: Delegates native anchor activation, including keyboard Enter, without making the wrapper interactive.
+    // biome-ignore lint/a11y/useKeyWithClickEvents: Native links dispatch click for keyboard activation.
+    <div
+      className="feedback-message-body"
+      onClick={(event) => {
+        const link =
+          event.target instanceof Element ? event.target.closest("a") : null;
+        const href = link?.getAttribute("href");
+        if (
+          !referencePrefix ||
+          !href ||
+          !annotations?.some(
+            (item) => href === `#${referencePrefix}-${item.number}`,
+          )
+        )
+          return;
+        const target = document.getElementById(href.slice(1));
+        if (!target) return;
+        event.preventDefault();
+        target.scrollIntoView({ block: "nearest", behavior: "instant" });
+        target.focus({ preventScroll: true });
+      }}
+    >
+      <CompactMessageResponse>
+        {references ? `${children}\n\n${references}` : children}
+      </CompactMessageResponse>
     </div>
   );
 }

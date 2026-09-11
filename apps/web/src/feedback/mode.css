@@ -47,6 +47,55 @@
   background: var(--muted);
   color: var(--foreground);
 }
+.feedback-mode-heading button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.feedback-selection-surface {
+  position: fixed;
+  inset: 0;
+  z-index: 74;
+  touch-action: none;
+  user-select: none;
+  cursor: crosshair;
+}
+.feedback-annotation-marker {
+  position: fixed;
+  z-index: 69;
+  pointer-events: none;
+  border: 1px solid #4d86da66;
+  border-radius: 4px;
+}
+.feedback-annotation-marker > button {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 5px;
+  border: 1px solid #fff;
+  border-radius: 12px;
+  background: #315e9b;
+  color: #fff;
+  font: 600 12px / 1 sans-serif;
+  box-shadow: 0 1px 4px #0002;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.feedback-annotation-marker.is-revealed {
+  border: 2px solid #315e9b;
+  background: #4d86da12;
+}
+.feedback-reveal-notice {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 10px 20px;
+  font-size: 12px;
+  line-height: 1.6;
+  background: var(--muted);
+}
 .feedback-mode-panel .feedback-document {
   padding: 28px 24px;
 }

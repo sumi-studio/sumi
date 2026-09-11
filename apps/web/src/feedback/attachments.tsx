@@ -13,11 +13,15 @@ import "./attachments.css";
 
 const MAX_ATTACHMENTS = 5;
 const ACCEPT = "image/png,image/jpeg,image/webp,video/webm,video/mp4";
+// File objects survive panel unmounts in this page only. The caller supplies an
+// actor-scoped draft key; nothing is shared across keys or persisted to storage.
+const pendingFileDrafts = new Map<string, File[]>();
 
 interface Props {
   attachments: FeedbackAttachment[];
   onChange(attachments: FeedbackAttachment[]): void;
   disabled?: boolean;
+  draftStorageKey?: string;
   onBusyChange?(busy: boolean): void;
   onCaptureChange?(capturing: boolean): void;
 }
@@ -76,6 +80,19 @@ export function MediaPreview({
 }
 
 export function FeedbackAttachments(props: Props) {
+  return (
+    <AttachmentEditor
+      key={
+        props.draftStorageKey === undefined
+          ? "transient"
+          : `draft:${props.draftStorageKey}`
+      }
+      {...props}
+    />
+  );
+}
+
+function AttachmentEditor(props: Props) {
   const { attachments, disabled = false } = props;
   const latest = useRef(props);
   latest.current = props;
@@ -89,17 +106,31 @@ export function FeedbackAttachments(props: Props) {
     "idle" | "choosing" | "recording" | "uploading"
   >("idle");
   const [error, setError] = useState("");
-  const [retryFiles, setRetryFiles] = useState<File[]>([]);
-  const pendingFiles = useRef<File[]>([]);
+  const [retryFiles, setRetryFiles] = useState<File[]>(() =>
+    props.draftStorageKey === undefined
+      ? []
+      : [...(pendingFileDrafts.get(props.draftStorageKey) ?? [])],
+  );
+  const pendingFiles = useRef<File[]>(retryFiles);
   const pasteFiles = useEffectEvent((files: File[]) => addFiles(files));
 
   function rememberFiles(files: File[]) {
     pendingFiles.current = files;
+    if (props.draftStorageKey !== undefined) {
+      if (files.length)
+        pendingFileDrafts.set(props.draftStorageKey, [...files]);
+      else pendingFileDrafts.delete(props.draftStorageKey);
+    }
+    if (!mounted.current) return;
     setRetryFiles(files);
+    latest.current.onBusyChange?.(
+      operation.current !== null || files.length > 0,
+    );
   }
 
   useEffect(() => {
     mounted.current = true;
+    latest.current.onBusyChange?.(pendingFiles.current.length > 0);
     return () => {
       mounted.current = false;
       operation.current?.abort();
@@ -156,7 +187,7 @@ export function FeedbackAttachments(props: Props) {
     recording.current = null;
     setBusy(false);
     setPhase("idle");
-    latest.current.onBusyChange?.(false);
+    latest.current.onBusyChange?.(pendingFiles.current.length > 0);
     latest.current.onCaptureChange?.(false);
   }
 
@@ -175,16 +206,20 @@ export function FeedbackAttachments(props: Props) {
   async function upload(files: File[], controller: AbortController) {
     if (controller.signal.aborted) return;
     files = [...new Set([...pendingFiles.current, ...files])];
-    setPhase("uploading");
-    latest.current.onCaptureChange?.(false);
     const remaining = MAX_ATTACHMENTS - latest.current.attachments.length;
     if (files.length > remaining) {
       setError("添付できるファイルは5件までです。ファイルを減らしてください。");
       finish(controller);
       return;
     }
+    // Cache acquired captures before showing the panel, which may be closed while
+    // the upload is still in progress.
+    rememberFiles(files);
+    setPhase("uploading");
+    latest.current.onCaptureChange?.(false);
     const saved = [...latest.current.attachments];
     for (let index = 0; index < files.length; index++) {
+      if (controller.signal.aborted || !mounted.current) return;
       const file = files[index];
       try {
         if (!ACCEPT.split(",").includes(file.type.split(";")[0]))
@@ -202,6 +237,7 @@ export function FeedbackAttachments(props: Props) {
         if (controller.signal.aborted || !mounted.current) return;
         saved.push(attachment);
         latest.current.onChange([...saved]);
+        rememberFiles(files.slice(index + 1));
       } catch (reason) {
         if (controller.signal.aborted || !mounted.current) return;
         rememberFiles(files.slice(index));

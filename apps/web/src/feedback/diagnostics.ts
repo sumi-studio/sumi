@@ -15,12 +15,22 @@ export interface DiagnosticClientEvent {
   summary: string;
 }
 export interface DiagnosticSelection {
+  kind: "element" | "region";
   tag: string;
   selector: string;
   label: string;
   rect: { x: number; y: number; width: number; height: number };
   captured_at: string;
+  path: string;
+  scroll_x: number;
+  scroll_y: number;
+  viewport_width: number;
+  viewport_height: number;
 }
+export interface DiagnosticAnnotation extends DiagnosticSelection {
+  number: number;
+}
+export const MAX_FEEDBACK_ANNOTATIONS = 10;
 export interface DiagnosticServerObservation {
   captured_at: string;
   personality_agent_id?: string;
@@ -35,7 +45,7 @@ export interface FeedbackDiagnostics {
   captured_at: string;
   source?: DiagnosticSource;
   client_events?: DiagnosticClientEvent[];
-  selection?: DiagnosticSelection;
+  annotations?: DiagnosticAnnotation[];
   server_observation?: DiagnosticServerObservation;
   browser: string;
   language: string;

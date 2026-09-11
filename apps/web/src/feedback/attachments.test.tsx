@@ -167,6 +167,110 @@ it("aborts pending upload on unmount and ignores a late result", async () => {
   expect(onChange).not.toHaveBeenCalled();
 });
 
+it("restores an interrupted screenshot upload after reopening its draft", async () => {
+  mocks.supported = true;
+  const file = new File(["PNG"], "captured.png", { type: "image/png" });
+  mocks.screenshot.mockResolvedValueOnce(file);
+  let completeOriginal: ((value: FeedbackAttachment) => void) | undefined;
+  mocks.upload.mockReturnValueOnce(
+    new Promise<FeedbackAttachment>((resolve) => {
+      completeOriginal = resolve;
+    }),
+  );
+  const onChange = vi.fn();
+  const onBusyChange = vi.fn();
+  const props = {
+    attachments: [],
+    onChange,
+    onBusyChange,
+    draftStorageKey: "actor-capture:draft-interrupted",
+  };
+  const first = render(<FeedbackAttachments {...props} />);
+  fireEvent.click(screen.getByRole("button", { name: "画面を撮影" }));
+  await waitFor(() => expect(mocks.upload).toHaveBeenCalledOnce());
+  const signal = mocks.upload.mock.calls[0][1] as AbortSignal;
+  first.unmount();
+  expect(signal.aborted).toBe(true);
+  const reopened = render(<FeedbackAttachments {...props} />);
+  expect(screen.getByText("未添付: captured.png")).toBeInTheDocument();
+  expect(onBusyChange).toHaveBeenLastCalledWith(true);
+  expect(screen.getByRole("button", { name: "再試行" })).toBeEnabled();
+  mocks.upload.mockResolvedValueOnce({ ...attachment, name: "captured.png" });
+  fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+  await waitFor(() => expect(onChange).toHaveBeenCalledOnce());
+  expect(mocks.upload.mock.calls[1][0]).toBe(file);
+  expect(onBusyChange).toHaveBeenLastCalledWith(false);
+  await act(async () => completeOriginal?.(attachment));
+  expect(onChange).toHaveBeenCalledOnce();
+  reopened.unmount();
+  render(<FeedbackAttachments {...props} />);
+  expect(
+    screen.queryByRole("button", { name: "再試行" }),
+  ).not.toBeInTheDocument();
+});
+
+it("isolates pending files by actor and draft key and clears discarded files", async () => {
+  mocks.upload.mockRejectedValueOnce(new Error("接続が切れました"));
+  const props = { attachments: [], onChange: vi.fn() };
+  const { container, rerender } = render(
+    <FeedbackAttachments {...props} draftStorageKey="alice:identity-draft" />,
+  );
+  fireEvent.change(fileInput(container), {
+    target: { files: [new File(["data"], "alice.png", { type: "image/png" })] },
+  });
+  await screen.findByRole("alert");
+  rerender(
+    <FeedbackAttachments {...props} draftStorageKey="bob:identity-draft" />,
+  );
+  expect(screen.queryByText("未添付: alice.png")).not.toBeInTheDocument();
+  rerender(
+    <FeedbackAttachments {...props} draftStorageKey="alice:another-draft" />,
+  );
+  expect(screen.queryByText("未添付: alice.png")).not.toBeInTheDocument();
+  rerender(
+    <FeedbackAttachments {...props} draftStorageKey="alice:identity-draft" />,
+  );
+  expect(screen.getByText("未添付: alice.png")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "取り消す" }));
+  rerender(
+    <FeedbackAttachments {...props} draftStorageKey="bob:identity-draft" />,
+  );
+  rerender(
+    <FeedbackAttachments {...props} draftStorageKey="alice:identity-draft" />,
+  );
+  expect(
+    screen.queryByRole("button", { name: "再試行" }),
+  ).not.toBeInTheDocument();
+});
+
+it("restores only uncommitted files when a batch upload is interrupted", async () => {
+  mocks.upload
+    .mockResolvedValueOnce(attachment)
+    .mockReturnValueOnce(new Promise<FeedbackAttachment>(() => {}));
+  const props = {
+    attachments: [],
+    onChange: vi.fn(),
+    draftStorageKey: "actor-batch:partial-draft",
+  };
+  const first = render(<FeedbackAttachments {...props} />);
+  fireEvent.change(fileInput(first.container), {
+    target: {
+      files: [
+        new File(["data"], "one.png", { type: "image/png" }),
+        new File(["data"], "two.png", { type: "image/png" }),
+      ],
+    },
+  });
+  await waitFor(() => expect(mocks.upload).toHaveBeenCalledTimes(2));
+  first.unmount();
+  render(<FeedbackAttachments {...props} attachments={[attachment]} />);
+  expect(screen.getByText("未添付: two.png")).toBeInTheDocument();
+  expect(
+    screen.queryByText("未添付: one.png、two.png"),
+  ).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "取り消す" }));
+});
+
 it("starts capture in the click handler and keeps recording controls outside its parent", async () => {
   mocks.supported = true;
   const stop = vi.fn();

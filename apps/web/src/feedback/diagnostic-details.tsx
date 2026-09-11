@@ -96,14 +96,43 @@ export function Diagnostics({
             </>
           )}
         </dl>
-        {details.selection && (
+        {!!details.annotations?.length && (
           <section
             className="feedback-diagnostic-section"
-            aria-label="選択した箇所"
+            aria-label="注釈を付けた箇所"
           >
-            <h4>選択した箇所</h4>
-            <p>{details.selection.label || details.selection.tag}</p>
-            <code>{details.selection.selector}</code>
+            <h4>注釈を付けた箇所</h4>
+            <ol className="feedback-diagnostic-events">
+              {details.annotations.map((annotation) => (
+                <li key={annotation.number}>
+                  <span className="feedback-diagnostic-event-heading">
+                    <span>
+                      #{annotation.number} ·{" "}
+                      {annotation.kind === "region" ? "範囲" : "要素"}
+                    </span>
+                    <time dateTime={annotation.captured_at}>
+                      {displayTime(annotation.captured_at, details.time_zone)}
+                    </time>
+                  </span>
+                  <span>
+                    {annotation.label ||
+                      (annotation.kind === "region"
+                        ? "選択した範囲"
+                        : annotation.tag)}
+                  </span>
+                  <code className="feedback-diagnostic-path">
+                    {annotation.path}
+                  </code>
+                  <span className="feedback-diagnostic-secondary">
+                    位置 ({Math.round(annotation.rect.x)},{" "}
+                    {Math.round(annotation.rect.y)}) ·{" "}
+                    {Math.round(annotation.rect.width)} ×{" "}
+                    {Math.round(annotation.rect.height)} px
+                  </span>
+                  {annotation.selector && <code>{annotation.selector}</code>}
+                </li>
+              ))}
+            </ol>
           </section>
         )}
         <section

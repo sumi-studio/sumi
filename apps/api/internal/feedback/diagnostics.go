@@ -16,22 +16,22 @@ import (
 // Diagnostics is a bounded, client-observed snapshot. It is evidence supplied by
 // the author, never trusted authority or a substitute for server logs.
 type Diagnostics struct {
-	ServerObservation *ServerObservation   `json:"server_observation,omitempty"`
-	ClientEvents      []ClientEvent        `json:"client_events,omitempty"`
-	Selection         *DiagnosticSelection `json:"selection,omitempty"`
-	TabRelease        string               `json:"tab_release,omitempty"`
-	Version           int                  `json:"version"`
-	CapturedAt        time.Time            `json:"captured_at"`
-	Source            *DiagnosticSource    `json:"source,omitempty"`
-	Browser           string               `json:"browser"`
-	Language          string               `json:"language"`
-	TimeZone          string               `json:"time_zone"`
-	UTCOffsetMinutes  int                  `json:"utc_offset_minutes"`
-	Online            bool                 `json:"online"`
-	Visibility        string               `json:"visibility"`
-	Viewport          DiagnosticViewport   `json:"viewport"`
-	Assets            []string             `json:"assets"`
-	ServedRelease     string               `json:"served_release,omitempty"`
+	ServerObservation *ServerObservation     `json:"server_observation,omitempty"`
+	ClientEvents      []ClientEvent          `json:"client_events,omitempty"`
+	Annotations       []DiagnosticAnnotation `json:"annotations,omitempty"`
+	TabRelease        string                 `json:"tab_release,omitempty"`
+	Version           int                    `json:"version"`
+	CapturedAt        time.Time              `json:"captured_at"`
+	Source            *DiagnosticSource      `json:"source,omitempty"`
+	Browser           string                 `json:"browser"`
+	Language          string                 `json:"language"`
+	TimeZone          string                 `json:"time_zone"`
+	UTCOffsetMinutes  int                    `json:"utc_offset_minutes"`
+	Online            bool                   `json:"online"`
+	Visibility        string                 `json:"visibility"`
+	Viewport          DiagnosticViewport     `json:"viewport"`
+	Assets            []string               `json:"assets"`
+	ServedRelease     string                 `json:"served_release,omitempty"`
 }
 type DiagnosticSource struct {
 	Path        string            `json:"path"`
@@ -69,8 +69,22 @@ func (d *Diagnostics) valid() bool {
 			return false
 		}
 	}
-	if selection := d.Selection; selection != nil {
-		if selection.CapturedAt.IsZero() || len(selection.Tag) > 64 || len(selection.Selector) > 512 || utf8.RuneCountInString(selection.Label) > 200 || math.Abs(selection.Rect.X) > 1e8 || math.Abs(selection.Rect.Y) > 1e8 || selection.Rect.Width < 0 || selection.Rect.Width > 1e8 || selection.Rect.Height < 0 || selection.Rect.Height > 1e8 {
+	if len(d.Annotations) > 10 {
+		return false
+	}
+	numbers := make(map[int]bool, len(d.Annotations))
+	for _, annotation := range d.Annotations {
+		if annotation.Number < 1 || annotation.Number > 9999 || numbers[annotation.Number] || (annotation.Kind != "element" && annotation.Kind != "region") || !diagnosticPath(annotation.Path) {
+			return false
+		}
+		numbers[annotation.Number] = true
+		if math.Abs(annotation.ScrollX) > 1e8 || math.Abs(annotation.ScrollY) > 1e8 || annotation.ViewportWidth < 0 || annotation.ViewportWidth > 100000 || annotation.ViewportHeight < 0 || annotation.ViewportHeight > 100000 {
+			return false
+		}
+		if annotation.CapturedAt.IsZero() || len(annotation.Tag) > 64 || len(annotation.Selector) > 512 || utf8.RuneCountInString(annotation.Label) > 200 || math.Abs(annotation.Rect.X) > 1e8 || math.Abs(annotation.Rect.Y) > 1e8 || annotation.Rect.Width < 0 || annotation.Rect.Width > 1e8 || annotation.Rect.Height < 0 || annotation.Rect.Height > 1e8 {
+			return false
+		}
+		if annotation.Kind == "region" && (annotation.Rect.Width <= 0 || annotation.Rect.Height <= 0) {
 			return false
 		}
 	}
@@ -127,6 +141,16 @@ type DiagnosticSelection struct {
 	Label      string         `json:"label"`
 	Rect       DiagnosticRect `json:"rect"`
 	CapturedAt time.Time      `json:"captured_at"`
+}
+type DiagnosticAnnotation struct {
+	DiagnosticSelection
+	Number         int     `json:"number"`
+	Kind           string  `json:"kind"`
+	Path           string  `json:"path"`
+	ScrollX        float64 `json:"scroll_x"`
+	ScrollY        float64 `json:"scroll_y"`
+	ViewportWidth  int     `json:"viewport_width"`
+	ViewportHeight int     `json:"viewport_height"`
 }
 type DiagnosticRect struct {
 	X      float64 `json:"x"`

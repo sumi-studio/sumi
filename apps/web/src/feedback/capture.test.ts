@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  canCaptureRegionScreenshot,
+  captureRegionScreenshot,
   captureScreenshot,
   MAX_RECORDING_BYTES,
   MAX_RECORDING_DURATION_MS,
@@ -207,4 +209,222 @@ it("releases screenshot sharing if no first frame arrives", async () => {
   await rejected;
   expect(track.stop).toHaveBeenCalled();
   expect(vi.getTimerCount()).toBe(0);
+});
+
+describe("current-tab region screenshot", () => {
+  function setupRegion() {
+    const target = document.createElement("div");
+    target.style.cssText =
+      "position:fixed;pointer-events:none;background:transparent;width:100px;height:80px";
+    document.body.append(target);
+    vi.spyOn(target, "getBoundingClientRect").mockReturnValue({
+      left: 10,
+      top: 20,
+      right: 110,
+      bottom: 100,
+      width: 100,
+      height: 80,
+    } as DOMRect);
+    const cropTarget = {};
+    const fromElement = vi.fn().mockResolvedValue(cropTarget);
+    const cropTo = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("CropTarget", { fromElement });
+    vi.stubGlobal("BrowserCaptureMediaStreamTrack", { prototype: { cropTo } });
+    Object.assign(track, { cropTo });
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "readyState", "get").mockReturnValue(
+      2,
+    );
+    vi.spyOn(HTMLVideoElement.prototype, "videoWidth", "get").mockReturnValue(
+      200,
+    );
+    vi.spyOn(HTMLVideoElement.prototype, "videoHeight", "get").mockReturnValue(
+      160,
+    );
+    const context = {
+      drawImage: vi.fn(),
+      strokeRect: vi.fn(),
+      fillRect: vi.fn(),
+      fillText: vi.fn(),
+    };
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context as unknown as CanvasRenderingContext2D,
+    );
+    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation(
+      (callback) => {
+        expect(track.stop).toHaveBeenCalled();
+        callback(new Blob(["PNG"], { type: "image/png" }));
+      },
+    );
+    return { target, cropTarget, fromElement, cropTo, context };
+  }
+
+  afterEach(() => document.body.replaceChildren());
+
+  it("feature detects both target creation and track cropping", () => {
+    expect(canCaptureRegionScreenshot()).toBe(false);
+    setupRegion();
+    expect(canCaptureRegionScreenshot()).toBe(true);
+    vi.stubGlobal("BrowserCaptureMediaStreamTrack", { prototype: {} });
+    expect(canCaptureRegionScreenshot()).toBe(false);
+  });
+
+  it("opens the chooser synchronously but reads pixels only after native crop succeeds", async () => {
+    const { target, cropTarget, fromElement, cropTo, context } = setupRegion();
+    let finishCrop: (() => void) | undefined;
+    cropTo.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishCrop = resolve;
+      }),
+    );
+    const pending = captureRegionScreenshot(target, 13);
+    expect(getDisplayMedia).toHaveBeenCalledWith({
+      video: { displaySurface: "browser" },
+      audio: false,
+      preferCurrentTab: true,
+      surfaceSwitching: "exclude",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fromElement).toHaveBeenCalledWith(target);
+    expect(cropTo).toHaveBeenCalledWith(cropTarget);
+    expect(context.drawImage).not.toHaveBeenCalled();
+    finishCrop?.();
+    const file = await pending;
+    expect(file.name).toMatch(/^sumi-feedback-region-13-\d+\.png$/);
+    expect(file.type).toBe("image/png");
+    expect(context.drawImage).toHaveBeenCalledOnce();
+    expect(context.strokeRect).toHaveBeenCalledWith(1.5, 1.5, 197, 157);
+    expect(context.fillText).toHaveBeenCalledWith(
+      "13",
+      expect.any(Number),
+      expect.any(Number),
+      expect.any(Number),
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects another tab without using its uncropped pixels", async () => {
+    const { target, cropTo, context } = setupRegion();
+    cropTo.mockRejectedValue(new DOMException("Wrong tab", "NotAllowedError"));
+    await expect(captureRegionScreenshot(target, 1)).rejects.toThrow(
+      "このSumiのタブ",
+    );
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects source changes while the native chooser was open", async () => {
+    const { target, cropTo, context } = setupRegion();
+    let current = true;
+    let choose: ((value: MediaStream) => void) | undefined;
+    getDisplayMedia.mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        choose = resolve;
+      }),
+    );
+    const pending = captureRegionScreenshot(
+      target,
+      1,
+      undefined,
+      () => current,
+    );
+    current = false;
+    choose?.(stream);
+    await expect(pending).rejects.toThrow(
+      "撮影元のページや表示位置が変わりました",
+    );
+    expect(cropTo).not.toHaveBeenCalled();
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("revalidates source context after frame readiness immediately before reading pixels", async () => {
+    const { target, cropTo, context } = setupRegion();
+    let current = true;
+    const validate = vi.fn(() => current);
+    vi.mocked(HTMLMediaElement.prototype.play).mockImplementation(() => {
+      current = false;
+      return Promise.resolve();
+    });
+    await expect(
+      captureRegionScreenshot(target, 1, undefined, validate),
+    ).rejects.toThrow("撮影元のページや表示位置が変わりました");
+    expect(cropTo).toHaveBeenCalledOnce();
+    expect(validate.mock.results.map((result) => result.value)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects a window track without region capture support", async () => {
+    const { target, context } = setupRegion();
+    Object.assign(track, { cropTo: undefined });
+    await expect(captureRegionScreenshot(target, 1)).rejects.toThrow(
+      "ウィンドウや画面全体",
+    );
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("releases a chooser result that arrives after abort", async () => {
+    const { target, cropTo } = setupRegion();
+    let choose: ((value: MediaStream) => void) | undefined;
+    getDisplayMedia.mockReturnValue(
+      new Promise<MediaStream>((resolve) => {
+        choose = resolve;
+      }),
+    );
+    const abort = new AbortController();
+    const pending = captureRegionScreenshot(target, 1, abort.signal);
+    abort.abort();
+    choose?.(stream);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(cropTo).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("aborts a pending native crop immediately and releases tracks", async () => {
+    const { target, cropTo, context } = setupRegion();
+    cropTo.mockReturnValue(new Promise<void>(() => {}));
+    const abort = new AbortController();
+    const pending = captureRegionScreenshot(target, 1, abort.signal);
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    abort.abort();
+    await rejected;
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(track.stop).toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("times out pending crop setup without leaving sharing active", async () => {
+    const { target, fromElement } = setupRegion();
+    fromElement.mockReturnValue(new Promise<object>(() => {}));
+    const pending = captureRegionScreenshot(target, 1);
+    const rejected = expect(pending).rejects.toThrow(
+      "範囲の撮影が完了しませんでした",
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
+    expect(track.stop).toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects detached targets before requesting permission", async () => {
+    const { target } = setupRegion();
+    target.remove();
+    await expect(captureRegionScreenshot(target, 1)).rejects.toThrow(
+      "範囲を選び直して",
+    );
+    expect(getDisplayMedia).not.toHaveBeenCalled();
+  });
 });
