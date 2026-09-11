@@ -581,7 +581,7 @@
   margin: 0 0 24px;
 }
 .feedback-title-input::placeholder {
-  color: color-mix(in srgb, var(--foreground) 40%, var(--background));
+  color: color-mix(in srgb, var(--foreground) 30%, var(--background));
 }
 .feedback-new-body {
   min-height: 240px;
@@ -590,7 +590,7 @@
   margin-bottom: 28px;
 }
 .feedback-new-body::placeholder {
-  color: var(--feedback-muted);
+  color: color-mix(in srgb, var(--foreground) 40%, var(--background));
 }
 .feedback-compose-dock {
   flex: 0 0 auto;
