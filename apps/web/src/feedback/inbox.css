@@ -712,3 +712,29 @@
     scroll-behavior: auto;
   }
 }
+
+.feedback-diagnostics {
+  margin: 16px 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  min-width: 0;
+}
+.feedback-diagnostics summary {
+  cursor: pointer;
+  width: fit-content;
+}
+.feedback-diagnostics p {
+  margin: 10px 0;
+  line-height: 1.6;
+}
+.feedback-diagnostics pre {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 12px;
+  background: var(--muted);
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+}

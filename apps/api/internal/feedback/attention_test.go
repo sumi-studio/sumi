@@ -45,7 +45,7 @@ func TestFeedbackAttentionReconcilesLostAckWithOriginalSender(t *testing.T) {
 	if _, err := w.pool.Exec(ctx, `UPDATE humans SET display_name='Original developer' WHERE human_id=$1`, w.dev.ID); err != nil {
 		t.Fatal(err)
 	}
-	thread, err := w.s.Create(ctx, w.pa, "通知の相談", "Channel does not notify", uuid.NewString())
+	thread, err := w.s.Create(ctx, w.pa, "通知の相談", "Channel does not notify", uuid.NewString(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestFeedbackAttentionSuppressesUnavailableRecipientAndSelfEcho(t *testing.T
 	w := fixture(t)
 	ctx := context.Background()
 	w.s.recipients = append(w.s.recipients, w.pa)
-	thread, err := w.s.Create(ctx, w.pa, "相談", "Body", uuid.NewString())
+	thread, err := w.s.Create(ctx, w.pa, "相談", "Body", uuid.NewString(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestFeedbackAttentionSlowRecipientDoesNotStarveAnother(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.s.recipients = []participant.Ref{w.pa, other}
-	if _, err = w.s.Create(ctx, w.human, "相談", "内容", uuid.NewString()); err != nil {
+	if _, err = w.s.Create(ctx, w.human, "相談", "内容", uuid.NewString(), nil); err != nil {
 		t.Fatal(err)
 	}
 	d := &blockedFirstAttention{}

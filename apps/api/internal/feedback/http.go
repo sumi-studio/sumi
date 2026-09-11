@@ -179,14 +179,15 @@ func (s *Server) dispatch(r *http.Request, actor participant.Ref, op string, loc
 		return s.Store.Open(ctx, actor, p.ThreadID, p.Cursor)
 	case "create":
 		var p struct {
-			Title     string `json:"title"`
-			Body      string `json:"body"`
-			RequestID string `json:"request_id"`
+			Diagnostics *Diagnostics `json:"diagnostics,omitempty"`
+			Title       string       `json:"title"`
+			Body        string       `json:"body"`
+			RequestID   string       `json:"request_id"`
 		}
 		if err := decode(r, &p); err != nil {
 			return nil, err
 		}
-		return s.Store.Create(ctx, actor, p.Title, p.Body, p.RequestID)
+		return s.Store.Create(ctx, actor, p.Title, p.Body, p.RequestID, p.Diagnostics)
 	case "reply":
 		var p struct {
 			ThreadID  string `json:"thread_id,omitempty"`

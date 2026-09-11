@@ -17,6 +17,7 @@ import {
   FeedbackError,
   type Thread,
 } from "./api";
+import { recordFeedbackOrigin, resetFeedbackOrigin } from "./diagnostics";
 import { FeedbackInbox, type InboxLocation } from "./inbox";
 
 const author = {
@@ -78,6 +79,7 @@ function setupClient(): FeedbackClient {
 let actorNumber = 0;
 beforeEach(() => {
   localStorage.clear();
+  resetFeedbackOrigin();
   Object.defineProperty(document, "visibilityState", {
     value: "visible",
     configurable: true,
@@ -215,10 +217,42 @@ describe("Feedback conversations", () => {
     await act(async () => {});
     expect(client.read).not.toHaveBeenCalled();
   });
+  it("refreshes an abandoned empty draft's source when reporting from another app", async () => {
+    const client = setupClient();
+    recordFeedbackOrigin("/direct");
+    const first = render(
+      <App client={client} initial={{ compose: true }} actor="empty-source" />,
+    );
+    expect(
+      document.querySelector(".feedback-diagnostics pre")?.textContent,
+    ).toContain('"path": "/direct"');
+    first.unmount();
+    recordFeedbackOrigin("/w/workspace-one/messaging", "workspace-one");
+    render(
+      <App client={client} initial={{ compose: true }} actor="empty-source" />,
+    );
+    expect(
+      document.querySelector(".feedback-diagnostics pre")?.textContent,
+    ).toContain('"path": "/w/workspace-one/messaging"');
+    await act(async () => {});
+  });
   it("creates a discussion without forced choices and retains the title/body after failure", async () => {
+    let manifest!: (response: Response) => void;
+    vi.spyOn(globalThis, "fetch").mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          manifest = resolve;
+        }),
+    );
     const client = setupClient();
     vi.mocked(client.create).mockRejectedValueOnce(new TypeError("offline"));
-    render(<App client={client} initial={{ compose: true }} />);
+    const rendered = render(
+      <App
+        client={client}
+        initial={{ compose: true }}
+        actor="diagnostic-retry"
+      />,
+    );
     fireEvent.change(screen.getByRole("textbox", { name: "件名" }), {
       target: { value: "こんな使い方はどう？" },
     });
@@ -234,6 +268,28 @@ describe("Feedback conversations", () => {
       "こんな使い方はどう？",
     );
     const first = vi.mocked(client.create).mock.calls[0];
+    expect(first[3]).toMatchObject({
+      version: 1,
+      captured_at: expect.any(String),
+    });
+    await act(async () =>
+      manifest(
+        new Response(JSON.stringify({ release_sha: "a".repeat(40) }), {
+          status: 200,
+        }),
+      ),
+    );
+    rendered.unmount();
+    render(
+      <App
+        client={client}
+        initial={{ compose: true }}
+        actor="diagnostic-retry"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "送信する" })).toBeEnabled(),
+    );
     fireEvent.click(screen.getByRole("button", { name: "送信する" }));
     await waitFor(() => expect(client.create).toHaveBeenCalledTimes(2));
     expect(vi.mocked(client.create).mock.calls[1]).toEqual(first);

@@ -25,11 +25,23 @@ vi.mock("../auth/auth-context", () => ({
 vi.mock("./app-rail", async () => {
   const { useEffect } = await import("react");
   return {
-    AppRail: () => {
+    AppRail: ({
+      workspaceId,
+      messagingPath,
+    }: {
+      workspaceId?: string;
+      messagingPath?: string;
+    }) => {
       useEffect(() => {
         shellMarker.mounts += 1;
       }, []);
-      return <aside data-testid="shell-marker" />;
+      return (
+        <aside
+          data-testid="shell-marker"
+          data-workspace={workspaceId}
+          data-messaging-path={messagingPath}
+        />
+      );
     },
   };
 });
@@ -128,15 +140,30 @@ it("keeps one authenticated shell across app route transitions", async () => {
     path: "/direct",
     component: () => <main>direct</main>,
   });
+  const feedbackRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/feedback",
+    component: () => <main>feedback</main>,
+  });
+  const homeRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/",
+    component: () => <main>workspaces</main>,
+  });
   const messagingRoute = createRoute({
     getParentRoute: () => rootRoute,
-    path: "/w/$workspaceId/messaging",
+    path: "/w/$workspaceId/messaging/dm/$dmId",
     component: () => <main>messaging</main>,
   });
   const router = createRouter({
-    routeTree: rootRoute.addChildren([directRoute, messagingRoute]),
+    routeTree: rootRoute.addChildren([
+      directRoute,
+      messagingRoute,
+      feedbackRoute,
+      homeRoute,
+    ]),
     history: createMemoryHistory({
-      initialEntries: ["/w/workspace-1/messaging"],
+      initialEntries: ["/w/workspace-1/messaging/dm/dm-1"],
     }),
   });
   await router.load();
@@ -157,11 +184,25 @@ it("keeps one authenticated shell across app route transitions", async () => {
   expect(shellMarker.mounts).toBe(1);
   expect(bootstrap).toHaveBeenCalledTimes(1);
   expect(dispose).not.toHaveBeenCalled();
+  expect(marker).toHaveAttribute("data-workspace", "workspace-1");
+  expect(marker).toHaveAttribute(
+    "data-messaging-path",
+    "/w/workspace-1/messaging/dm/dm-1",
+  );
+
+  await act(async () => {
+    await router.navigate({ to: "/feedback" });
+  });
+  expect(marker).toHaveAttribute("data-workspace", "workspace-1");
+  expect(marker).toHaveAttribute(
+    "data-messaging-path",
+    "/w/workspace-1/messaging/dm/dm-1",
+  );
 
   await act(async () => {
     await router.navigate({
-      to: "/w/$workspaceId/messaging",
-      params: { workspaceId: "workspace-1" },
+      to: "/w/$workspaceId/messaging/dm/$dmId",
+      params: { workspaceId: "workspace-1", dmId: "dm-1" },
     });
   });
 
@@ -171,4 +212,13 @@ it("keeps one authenticated shell across app route transitions", async () => {
   expect(bootstrap).toHaveBeenCalledTimes(1);
   expect(dispose).not.toHaveBeenCalled();
   expect(useMessaging.getState().connection).not.toBe("reconnecting");
+
+  await act(async () => {
+    await router.navigate({ to: "/" });
+  });
+  await act(async () => {
+    await router.navigate({ to: "/feedback" });
+  });
+  expect(marker).not.toHaveAttribute("data-workspace");
+  expect(marker).not.toHaveAttribute("data-messaging-path");
 });
