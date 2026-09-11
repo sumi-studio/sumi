@@ -228,6 +228,7 @@ impl MessageCommitBarrier {
 }
 
 pub(crate) enum ToolStartCommitResult {
+    Preempted,
     Committed,
     Reauthorize,
     RouteCommitted(AuthorizedBoundInvocation),
@@ -358,6 +359,10 @@ impl ToolStartCommitBarrier {
             None => ToolStartCommitResult::Reauthorize,
         };
         let _ = self.sender.send(result);
+    }
+
+    pub(super) fn preempted(self) {
+        let _ = self.sender.send(ToolStartCommitResult::Preempted);
     }
 
     fn reauthorize(self) {
@@ -528,9 +533,13 @@ impl DurableBridge {
         self.output_audience() == command.envelope().provenance.output_audience()
     }
 
-    pub(super) fn resume_inference(binding: DurableRunBinding, turn_open: bool) -> Self {
+    pub(super) fn resume_inference(
+        binding: DurableRunBinding,
+        turn_open: bool,
+        phase: RunPhase,
+    ) -> Self {
         let mut bridge = Self::new(binding);
-        bridge.phase = RunPhase::AssistantStarted;
+        bridge.phase = phase;
         bridge.turn_open = turn_open;
         bridge
     }
@@ -1328,8 +1337,8 @@ impl DurableBridge {
                 // If a soft/retry steer group has already been durably bound,
                 // a `Steered` event has already been durably committed, or an
                 // abort has been durably bound, any not-yet-started tool is
-                // superseded. Drop this start so the worker can emit the
-                // skipped ToolResult instead.
+                // superseded. Explicitly acknowledge preemption so a dropped
+                // receipt still means commit failure to the worker.
                 if self.pending_steer_collecting
                     || self.pending_steer_group.is_some()
                     || self.phase == RunPhase::CancelRequested
@@ -1338,6 +1347,11 @@ impl DurableBridge {
                         self.approval_request_tools.get(req) == Some(&tool_call_id)
                     }) || self.pending_tool_calls.contains(&tool_call_id);
                     if superseded {
+                        output
+                            .commit_barrier
+                            .take()
+                            .expect("ToolExecutionStart barrier checked")
+                            .preempted();
                         return Ok(CommittedRunOutput {
                             outputs: Vec::new(),
                             tool_start_barrier: None,
@@ -6239,7 +6253,7 @@ mod tests {
             .await
             .expect("bind soft steer before tool start");
 
-        let (barrier, _) = ToolStartCommitBarrier::channel();
+        let (barrier, receipt) = ToolStartCommitBarrier::channel();
         let dropped = bridge
             .commit(
                 &writer,
@@ -6262,6 +6276,10 @@ mod tests {
             .await
             .expect("commit dropped ToolExecutionStart");
         assert!(dropped.outputs.is_empty(), "start must be dropped");
+        assert!(matches!(
+            receipt.await.expect("explicit preemption receipt"),
+            ToolStartCommitResult::Preempted
+        ));
 
         let start_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",

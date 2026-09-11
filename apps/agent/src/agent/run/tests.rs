@@ -5821,6 +5821,112 @@ async fn tool_start_barrier_held_by_soft_steer_preempts() {
     assert!(runner.core.next_followup().is_none());
 }
 
+// Both the tool-start receipt and the durable control ACK are ready before
+// the worker resumes: this is the Session's commit-then-release scheduling.
+#[tokio::test]
+async fn soft_steer_commit_and_preempted_start_ready_together_does_not_fail_worker() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let (barrier, mut receipt) = ToolStartCommitBarrier::channel();
+    let (accepted, accepted_rx) = oneshot::channel();
+    let (committed, control_receipt) = oneshot::channel();
+    committed.send(()).expect("durable soft-steer ACK");
+    barrier.preempted(); // Bridge explicitly distinguishes intentional preemption.
+    let outcome = runner
+        .apply_pre_start_control(
+            RunControl::SoftSteer {
+                command: admitted_user(2),
+                accepted,
+                committed: control_receipt,
+            },
+            &mut receipt,
+        )
+        .await
+        .expect("intentional start preemption must not fail the worker");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+    assert!(accepted_rx.await.expect("control accepted"));
+    assert_eq!(runner.in_flight_controls.len(), 1);
+}
+
+#[tokio::test]
+async fn preempted_start_receipt_first_still_injects_soft_steer_and_answers() {
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::ToolUse,
+            vec![AssistantContent::ToolCall {
+                tool_call: call("superseded"),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        )),
+        output(assistant(
+            StopReason::Stop,
+            vec![AssistantContent::Text {
+                text: "steered answer".into(),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        )),
+    ]));
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let task = tokio::spawn(worker.run(bound_core(1), admitted_user(1), control_rx, events_tx));
+    let mut next_seq = 1;
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(mut output) = events_rx.recv().await {
+            if let Some(barrier) = output.commit_barrier.take() {
+                let (accepted, acceptance) = oneshot::channel();
+                let (committed, commit_receipt) = oneshot::channel();
+                control_tx
+                    .send(RunControl::SoftSteer {
+                        command: admitted_user(2),
+                        accepted,
+                        committed: commit_receipt,
+                    })
+                    .await
+                    .unwrap();
+                // Both branches are ready when the worker polls; the explicit
+                // start receipt wins its biased select before queued control.
+                barrier.preempted();
+                assert!(acceptance.await.unwrap());
+                committed.send(()).unwrap();
+            }
+            resolve_message_output(&mut output, &mut next_seq);
+            events.push(output.event);
+        }
+    })
+    .await
+    .expect("preemption must retain live follow-up progress");
+    assert_completed(task.await.unwrap());
+    assert!(driver.tool_order.lock().unwrap().is_empty());
+    assert_eq!(driver.started_contexts.lock().unwrap().len(), 2);
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::MessageEnd { message_id, message } if message_id == &user_message_id(&user(2).command_id) && matches!(message.as_ref(), PublicMessage::User(_)))).count(), 1);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageEnd { message, .. } if matches!(message.as_ref(), PublicMessage::Assistant(a) if a.content.iter().any(|b| matches!(b, PublicAssistantContent::Text { text, .. } if text == "steered answer"))))));
+}
+
+#[tokio::test]
+async fn dropped_tool_start_receipt_remains_a_durability_failure() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let (barrier, mut receipt) = ToolStartCommitBarrier::channel();
+    drop(barrier);
+    let error = runner
+        .await_tool_start_commit(&mut receipt)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, WorkerFailure::Error(ref text) if text == "ToolExecutionStart durability commit failed")
+    );
+}
+
 /// Same race as `tool_start_barrier_held_by_soft_steer_preempts`, but with an
 /// abort control. The tool must not execute and the start output must not be
 /// durably committed.

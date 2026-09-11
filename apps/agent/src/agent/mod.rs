@@ -2215,7 +2215,8 @@ impl<G: Gateway + 'static> Session<G> {
         } else {
             DurableRunBinding::idle(&initial, self.executor_generation)
         };
-        let resumed_turn_open = continuation.map(|continuation| continuation.turn_open);
+        let resumed_turn_open =
+            continuation.map(|continuation| (continuation.turn_open, continuation.phase));
         if continuation.is_none() {
             self.writer
                 .apply(crate::store::EventBatch {
@@ -2263,7 +2264,7 @@ impl<G: Gateway + 'static> Session<G> {
             completion_rx,
             join,
             bridge: match resumed_turn_open {
-                Some(open) => DurableBridge::resume_inference(binding, open),
+                Some((open, phase)) => DurableBridge::resume_inference(binding, open, phase),
                 None => DurableBridge::new(binding),
             },
             attempt_cancellation,
