@@ -204,8 +204,21 @@ func TestAttachmentOwnershipAtomicBindingRetryAndExpiry(t *testing.T) {
 		t.Fatal(thread, err)
 	}
 	retry, err := w.s.Create(ctx, w.human, "test", "body", nonce, nil, a.ID)
-	if err != nil || !reflect.DeepEqual(thread, retry) {
-		t.Fatal("retry changed original response", err)
+	if err != nil {
+		t.Fatal("retry failed", err)
+	}
+	// Compare the complete response contract. Database timestamps and a JSON
+	// receipt can represent the same UTC instant with different Go Locations.
+	originalJSON, err := json.Marshal(thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryJSON, err := json.Marshal(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(originalJSON, retryJSON) {
+		t.Fatalf("retry changed original response: original=%s retry=%s", originalJSON, retryJSON)
 	}
 	if _, err = w.s.Create(ctx, w.human, "test", "body", nonce, nil); !errors.Is(err, ErrRequest) {
 		t.Fatal("retry accepted changed attachments", err)
