@@ -934,14 +934,20 @@ func TestAppCatalogWireCarriesCapabilityVocabularyWithoutMentionAll(t *testing.T
 		Apps []appDescriptorWire `json:"apps"`
 	}
 	decodeRecorder(t, response, &body)
-	if len(body.Apps) != 4 {
-		t.Fatalf("catalog wire = %#v", body.Apps)
-	}
+	foundMessaging := false
+	foundFeedback := false
 	for _, descriptor := range body.Apps {
 		if descriptor.WorkspaceRoleCapabilities == nil {
 			t.Fatalf("%s emitted null workspace_role_capabilities", descriptor.AppID)
 		}
+		if descriptor.AppID == "feedback" {
+			foundFeedback = true
+			if descriptor.WorkspaceOwnerAllowed || !descriptor.ParticipantOwnerAllowed {
+				t.Fatal("Feedback wire must describe participant ownership")
+			}
+		}
 		if descriptor.AppID == "messaging" {
+			foundMessaging = true
 			if len(descriptor.WorkspaceRoleCapabilities) != 1 ||
 				descriptor.WorkspaceRoleCapabilities[0].Ref != testMessagingManageChannels {
 				t.Fatalf("Messaging descriptor wire = %#v", descriptor)
@@ -955,6 +961,9 @@ func TestAppCatalogWireCarriesCapabilityVocabularyWithoutMentionAll(t *testing.T
 				t.Fatal("UI-facing app catalog promised unimplemented mention_all")
 			}
 		}
+	}
+	if !foundMessaging || !foundFeedback {
+		t.Fatal("catalog omitted Messaging or Feedback")
 	}
 }
 

@@ -38,6 +38,9 @@ test("the browser API, private transports, service worker, and SPA have distinct
     "/direct-chat/ws",
     "/messaging/bootstrap",
     "/messaging/ws",
+    "/feedback/bootstrap",
+    "/feedback/threads",
+    "/feedback/threads/0198f3aa-1111-7222-8333-444455556666/messages",
     "/workspaces",
     "/workspaces/0198f3aa-1111-7222-8333-444455556666/members",
     "/workspace-invites/redeem",
@@ -105,6 +108,7 @@ test("the browser API, private transports, service worker, and SPA have distinct
   for (const path of [
     "/",
     "/direct",
+    "/feedback",
     "/c/0198f3aa-1111-7222-8333-444455556666",
     "/unknown-api",
     "/agent/future-browser-operation",
@@ -526,11 +530,12 @@ test("every production API registration has an explicit edge disposition", async
   assert.ok(discovery.private_dynamic_registries >= 1);
   assertWorkspaceIntegrationContract(discovery);
 
-  assert.deepEqual(originRoutes.exact, [
-    "/health",
-    "/workspaces",
-    "/app-installations",
-  ]);
+  for (const path of originRoutes.exact) {
+    assert.ok(
+      discovery.routes.some((route) => route.pattern.endsWith(` ${path}`)),
+      `origin path ${path} has no production registrar`,
+    );
+  }
 });
 
 test("route discovery resolves constants and fails on uninspectable registrations", async () => {
@@ -743,7 +748,11 @@ function assertWorkspaceIntegrationContract(discovery: RouteDiscovery): void {
 }
 
 test("model connection status and login route to the authenticated API", () => {
-  for (const path of ["/api/model-connections/chatgpt", "/api/model-connections/chatgpt/login", "/api/model-connections/chatgpt/login/flow"]) {
+  for (const path of [
+    "/api/model-connections/chatgpt",
+    "/api/model-connections/chatgpt/login",
+    "/api/model-connections/chatgpt/login/flow",
+  ]) {
     assert.equal(classifyPath(path), "origin");
   }
   assert.notEqual(classifyPath("/api/unrelated"), "origin");

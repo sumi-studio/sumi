@@ -25,5 +25,7 @@ export function userItemSourceLabel(
   if (!item.source) return "あなた";
   const source = item.source.source;
   if (source.surface === "workspace_operation") return "ワークスペース処理";
+  if (source.surface === "feedback")
+    return `Feedback · ${source.title} · ${item.source.actor.display_name || item.source.actor.principal_id}`;
   return `${source.place.kind === "dm" ? "DM" : source.place.kind === "group_dm" ? "グループDM" : "Messaging"} · ${source.place.name} · ${item.source.actor.display_name || item.source.actor.principal_id}${source.kind === "messaging_poll_vote" ? " · 投票" : source.kind === "reply_later_due" ? " · リマインダー" : ""}`;
 }

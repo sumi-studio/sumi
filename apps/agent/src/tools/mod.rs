@@ -17,6 +17,7 @@ mod bash_non_linux_compile_check;
 pub(crate) mod bound;
 #[cfg(target_os = "linux")]
 pub mod executor;
+pub(crate) mod feedback;
 #[cfg(target_os = "linux")]
 pub mod fs;
 pub(crate) mod memory;

@@ -450,6 +450,30 @@ function isIncomingSource(value: unknown): boolean {
     ("display_name" in actor && typeof actor.display_name !== "string")
   )
     return false;
+  if (isRecord(source) && source.surface === "feedback") {
+    return (
+      hasRequiredAndOnlyKeys(source, [
+        "surface",
+        "kind",
+        "event_id",
+        "thread_id",
+        "title",
+        "revision",
+        "occurred_at",
+      ]) &&
+      ["feedback_created", "feedback_reply", "feedback_status"].includes(
+        String(source.kind),
+      ) &&
+      isUUIDv7(source.event_id) &&
+      isUUIDv7(source.thread_id) &&
+      typeof source.title === "string" &&
+      source.title.trim().length > 0 &&
+      [...source.title].length <= 160 &&
+      isSafeSequence(source.revision) &&
+      (source.revision as number) > 0 &&
+      isDateTime(source.occurred_at)
+    );
+  }
   if (isRecord(source) && source.surface === "workspace_operation") {
     const result = source.result;
     return (

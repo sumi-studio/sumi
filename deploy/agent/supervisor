@@ -1005,7 +1005,8 @@ long_lived_roles_match_expected_state() {
   local -A observed=()
   local state role
 
-  output="$(long_lived_role_states)" || return 1
+  output="$(long_lived_role_states)" ||
+    fail "cannot observe long-lived role states"
   [[ -n "${output}" ]] || return 1
   while IFS=$'\t' read -r container_id service state; do
     is_long_lived_role "${service}" || continue
@@ -1047,7 +1048,8 @@ prepared_project_containers_match_expected_roles() {
 
   output="$(run_external docker ps --all \
     --filter "label=com.docker.compose.project=${SUMI_COMPOSE_PROJECT}" \
-    --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" || return 1
+    --format '{{.ID}}\t{{.Label "com.docker.compose.service"}}' 2>/dev/null)" ||
+    fail "cannot observe prepared project roles"
   while IFS=$'\t' read -r container_id service; do
     [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ && -n "${service}" && \
       -n "${expected[${service}]+set}" && -z "${observed[${service}]+set}" ]] || return 1
@@ -1062,8 +1064,10 @@ prepared_project_containers_match_expected_roles() {
 
 prepared_containers_exist() {
   local allocator_id prepare_id
-  allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" || return 1
-  prepare_id="$(lifecycle_compose ps --all --quiet prepare 2>/dev/null)" || return 1
+  allocator_id="$(lifecycle_compose ps --all --quiet allocator 2>/dev/null)" ||
+    fail "cannot observe prepared allocator presence"
+  prepare_id="$(lifecycle_compose ps --all --quiet prepare 2>/dev/null)" ||
+    fail "cannot observe prepared runtime presence"
   [[ -n "${allocator_id//[[:space:]]/}" && -n "${prepare_id//[[:space:]]/}" ]]
 }
 

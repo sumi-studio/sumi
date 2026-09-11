@@ -117,9 +117,6 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 			break
 		}
 	}
-	if !mentioned && decision.Reason != NotifyReasonDM {
-		return nil
-	}
 	authorName := ""
 	for _, member := range members {
 		if member.Participant == message.Author {
@@ -128,9 +125,9 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 		}
 	}
 	event := s.attentionEvent(place, message, message.Author, authorName)
-	event.Kind, event.PersonalityAgentID = AgentAttentionMention, decision.Participant.ID
-	if decision.Reason == NotifyReasonDM {
-		event.Kind = AgentAttentionMessage
+	event.Kind, event.PersonalityAgentID = AgentAttentionMessage, decision.Participant.ID
+	if mentioned && decision.Reason != NotifyReasonDM {
+		event.Kind = AgentAttentionMention
 	}
 	// A mention may just have joined its recipient to this thread. The member
 	// profiles used to resolve names predate that join; capture the actual
@@ -190,9 +187,10 @@ func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Plac
 		if decision.Participant != parent.Author {
 			continue
 		}
-		if decision.Reason == NotifyReasonDM {
-			event.ReplyRequired = false
-		} else {
+		// Any independently selected notification still belongs to the recipient
+		// if the quoted parent disappears before delivery (all/keyword included).
+		event.ReplyRequired = false
+		if decision.Reason != NotifyReasonDM {
 			for _, mention := range message.Mentions {
 				if mention == parent.Author {
 					event.Kind, event.ReplyRequired = AgentAttentionMention, false

@@ -414,3 +414,27 @@ fn user_projection_omits_only_empty_strings_and_preserves_authored_whitespace() 
         assert_eq!(blocks[1]["text"], "actual text");
     }
 }
+
+#[test]
+fn feedback_source_preserves_sender_body_and_receipt_for_every_provider() {
+    let source = serde_json::json!({"version":2,"tenant_id":"test","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab",
+        "actor":{"kind":"human","principal_id":"original-author","display_name":"開発者"},
+        "source":{"surface":"feedback","kind":"feedback_reply","event_id":"018f47a2-9b3c-7def-8abc-0123456789ac","thread_id":"018f47a2-9b3c-7def-8abc-0123456789ad","title":"通知について","revision":2,"occurred_at":"2026-09-08T00:00:00Z"}});
+    let user = UserMessage {
+        incoming_source: Some(serde_json::from_value(source).unwrap()),
+        incoming_timing: None,
+        content: vec![UserContent::Text {
+            text: "修正しました。".into(),
+        }],
+        timestamp: timestamp(),
+    };
+    let prefix = user.incoming_timing_text().unwrap();
+    assert!(prefix.contains("original-author"));
+    assert!(prefix.contains("\"surface\":\"feedback\""));
+    assert!(prefix.ends_with("[Received 2026-09-08 00:00:00 UTC]"));
+    for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+        let blocks = payload_blocks(preset, user.clone());
+        assert_eq!(blocks[0]["text"], prefix);
+        assert_eq!(blocks[1]["text"], "修正しました。");
+    }
+}

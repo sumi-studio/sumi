@@ -12,12 +12,19 @@ export interface RouteDecision {
 }
 
 export const originRoutes = Object.freeze({
-  exact: Object.freeze(["/health", "/workspaces", "/app-installations"]),
+  exact: Object.freeze([
+    "/health",
+    "/workspaces",
+    "/app-installations",
+    "/feedback/bootstrap",
+    "/feedback/threads",
+  ]),
   prefixes: Object.freeze([
     "/auth/",
     "/api/model-connections/",
     "/direct-chat/",
     "/messaging/",
+    "/feedback/threads/",
     "/workspaces/",
     "/workspace-invites/",
     "/apps/",

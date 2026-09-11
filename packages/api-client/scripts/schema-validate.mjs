@@ -76,6 +76,38 @@ function describeErrors(errors) {
 const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
 let failed = false;
 
+const feedbackSource = {
+  version: 2,
+  tenant_id: "test",
+  personality_agent_id: "018f47a2-9b3c-7def-8abc-0123456789ab",
+  actor: { kind: "human", principal_id: "author", display_name: "開発者" },
+  source: {
+    surface: "feedback",
+    kind: "feedback_reply",
+    event_id: "018f47a2-9b3c-7def-8abc-0123456789ac",
+    thread_id: "018f47a2-9b3c-7def-8abc-0123456789ad",
+    title: "通知について",
+    revision: 2,
+    occurred_at: "2026-09-11T10:00:00Z",
+  },
+};
+const validateFeedback = getValidator("ExternalProvenanceV2");
+assert.ok(
+  validateFeedback(feedbackSource),
+  JSON.stringify(validateFeedback.errors),
+);
+for (const [key, value] of [
+  ["revision", 0],
+  ["thread_id", "invalid"],
+  ["title", " "],
+  ["workspace_id", null],
+  ["kind", "messaging_message"],
+]) {
+  const bad = structuredClone(feedbackSource);
+  bad.source[key] = value;
+  assert.equal(validateFeedback(bad), false, `feedback accepted ${key}`);
+}
+
 // Reply linkage is optional source metadata, never reminder metadata or text.
 for (const kind of [
   "external_reply",

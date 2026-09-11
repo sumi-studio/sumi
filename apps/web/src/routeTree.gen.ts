@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as FeedbackRouteImport } from './routes/feedback'
 import { Route as DirectRouteImport } from './routes/direct'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WWorkspaceIdRouteImport } from './routes/w.$workspaceId'
@@ -20,6 +21,11 @@ import { Route as WWorkspaceIdMessagingGroupDmIdRouteImport } from './routes/w.$
 import { Route as WWorkspaceIdMessagingDmDmIdRouteImport } from './routes/w.$workspaceId.messaging.dm.$dmId'
 import { Route as WWorkspaceIdMessagingCChannelIdRouteImport } from './routes/w.$workspaceId.messaging.c.$channelId'
 
+const FeedbackRoute = FeedbackRouteImport.update({
+  id: '/feedback',
+  path: '/feedback',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DirectRoute = DirectRouteImport.update({
   id: '/direct',
   path: '/direct',
@@ -79,6 +85,7 @@ const WWorkspaceIdMessagingCChannelIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
+  '/feedback': typeof FeedbackRoute
   '/w/$workspaceId': typeof WWorkspaceIdRouteWithChildren
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingRouteWithChildren
   '/w/$workspaceId/': typeof WWorkspaceIdIndexRoute
@@ -91,6 +98,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
+  '/feedback': typeof FeedbackRoute
   '/w/$workspaceId': typeof WWorkspaceIdIndexRoute
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingIndexRoute
   '/w/$workspaceId/messaging/c/$channelId': typeof WWorkspaceIdMessagingCChannelIdRoute
@@ -102,6 +110,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/direct': typeof DirectRoute
+  '/feedback': typeof FeedbackRoute
   '/w/$workspaceId': typeof WWorkspaceIdRouteWithChildren
   '/w/$workspaceId/messaging': typeof WWorkspaceIdMessagingRouteWithChildren
   '/w/$workspaceId/': typeof WWorkspaceIdIndexRoute
@@ -116,6 +125,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/direct'
+    | '/feedback'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/'
@@ -128,6 +138,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/direct'
+    | '/feedback'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/messaging/c/$channelId'
@@ -138,6 +149,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/direct'
+    | '/feedback'
     | '/w/$workspaceId'
     | '/w/$workspaceId/messaging'
     | '/w/$workspaceId/'
@@ -151,11 +163,19 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DirectRoute: typeof DirectRoute
+  FeedbackRoute: typeof FeedbackRoute
   WWorkspaceIdRoute: typeof WWorkspaceIdRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/feedback': {
+      id: '/feedback'
+      path: '/feedback'
+      fullPath: '/feedback'
+      preLoaderRoute: typeof FeedbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/direct': {
       id: '/direct'
       path: '/direct'
@@ -267,6 +287,7 @@ const WWorkspaceIdRouteWithChildren = WWorkspaceIdRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DirectRoute: DirectRoute,
+  FeedbackRoute: FeedbackRoute,
   WWorkspaceIdRoute: WWorkspaceIdRouteWithChildren,
 }
 export const routeTree = rootRouteImport

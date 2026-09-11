@@ -12,7 +12,9 @@ export function AppShell() {
     ? "messaging"
     : pathname === "/direct"
       ? "direct-chat"
-      : "workspace";
+      : pathname === "/feedback"
+        ? "feedback"
+        : "workspace";
 
   return (
     <div className="flex h-dvh bg-background text-foreground">

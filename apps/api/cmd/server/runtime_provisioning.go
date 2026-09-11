@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -447,12 +448,13 @@ type provisionedProcess struct {
 	monitorInterval time.Duration
 	// done wakes Wait after a teardown attempt; stopErr distinguishes incomplete
 	// cleanup from physical completion. Failures can be retried under stopMu.
-	done     chan struct{}
-	stopMu   sync.Mutex
-	doneOnce sync.Once
-	stopped  bool
-	retiring bool
-	stopErr  error
+	done          chan struct{}
+	stopMu        sync.Mutex
+	monitorCancel context.CancelFunc
+	doneOnce      sync.Once
+	stopped       bool
+	retiring      bool
+	stopErr       error
 }
 
 func (p *provisionedProcess) Wait() error {
@@ -460,15 +462,16 @@ func (p *provisionedProcess) Wait() error {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	// A single Inspect error is an observation gap (registry/DNS/docker blip),
-	// not a death observation. Fence→reap on one error would kill a healthy PA
-	// for a seconds-long network gap and leave its in-flight tools indeterminate.
-	// Ride through up to monitorInspectErrorThreshold consecutive errors before
-	// treating the host as unobservable; a not-active observation is a positive
-	// death signal and retires immediately. Sustained unobservability still
-	// fences and reaps so no unowned runtime survives the gap.
-	const monitorInspectErrorThreshold = 3
-	inspectFailures := 0
+	// Inspection availability is independent of runtime liveness. Keep lifecycle
+	// ownership while observation is unavailable; only a positive epoch loss or
+	// an explicit Stop retires the process. Returning from Wait would release
+	// manager ownership and allow an overlapping replacement.
+	observationLost := false
+	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
+	defer cancelMonitor()
+	p.stopMu.Lock()
+	p.monitorCancel = cancelMonitor
+	p.stopMu.Unlock()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -482,23 +485,44 @@ func (p *provisionedProcess) Wait() error {
 			}
 			return nil
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+			if monitorCtx.Err() != nil {
+				<-p.done
+				continue
+			}
+			select {
+			case <-p.done:
+				continue
+			default:
+			}
+			ctx, cancel := context.WithTimeout(monitorCtx, p.timeout)
 			inspection, err := p.provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
 				Version:            runtimeprovision.ProtocolVersion,
 				PersonalityAgentID: p.epoch.PersonalityAgentID,
 			})
 			cancel()
-			if err != nil {
-				inspectFailures++
-				if inspectFailures < monitorInspectErrorThreshold {
-					continue
-				}
-				return p.retireAfterMonitorFailure(fmt.Errorf("monitor provisioned runtime: %w", err))
+			if monitorCtx.Err() != nil {
+				<-p.done
+				continue
 			}
-			inspectFailures = 0
+			select {
+			case <-p.done:
+				continue // Stop owns teardown; report its result through p.done.
+			default:
+			}
+			if err != nil {
+				if !observationLost {
+					log.Printf("spawn: runtime observation unavailable: agent=%q; retaining runtime and retrying", p.epoch.PersonalityAgentID)
+					observationLost = true
+				}
+				continue
+			}
+			if observationLost {
+				log.Printf("spawn: runtime observation restored: agent=%q", p.epoch.PersonalityAgentID)
+				observationLost = false
+			}
 			if inspection.Phase != runtimeprovision.PhaseActive ||
 				inspection.Epoch == nil || *inspection.Epoch != p.epoch {
-				return p.retireAfterMonitorFailure(errors.New("provisioned runtime left its active epoch"))
+				return p.retireAfterMonitorFailure(spawn.ErrRuntimeEpochLost)
 			}
 		}
 	}
@@ -591,6 +615,12 @@ func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
 
 func (p *provisionedProcess) Stop() error {
 	p.stopMu.Lock()
+	// Release any read-only inspection before Stop asks the provisioner for
+	// the same per-PA lifecycle lock. Waiting for teardown to finish first
+	// would leave Stop blocked behind the observation it needs to cancel.
+	if p.monitorCancel != nil {
+		p.monitorCancel()
+	}
 	if p.retiring {
 		p.stopMu.Unlock()
 		return p.retireAfterMonitorFailure(nil)

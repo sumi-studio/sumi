@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -1034,4 +1035,44 @@ func TestActivateRejectsAReapAttestationNoDurableReceiptCovers(t *testing.T) {
 			t.Fatalf("observed reap receipt was refused on activation: %#v %v", inspection, err)
 		}
 	})
+}
+
+type inspectionCountingBackend struct {
+	*fakeBackend
+	inspections int
+}
+
+func (backend *inspectionCountingBackend) Inspect(ctx context.Context, paid string) (Inspection, error) {
+	backend.inspections++
+	return backend.fakeBackend.Inspect(ctx, paid)
+}
+
+func TestCanceledInspectionDoesNotExecuteAfterLifecycleLock(t *testing.T) {
+	backend := &inspectionCountingBackend{fakeBackend: newFakeBackend()}
+	service := newTestService(t, backend)
+	entry := service.entry(testPAID)
+	entry.mu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := service.Inspect(ctx, InspectRequest{Version: ProtocolVersion, PersonalityAgentID: testPAID})
+		result <- err
+	}()
+	<-started
+	cancel()
+	entry.mu.Unlock()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued inspection error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled queued inspection did not finish")
+	}
+	if backend.inspections != 0 {
+		t.Fatal("abandoned inspection invoked the backend after acquiring its lock")
+	}
 }

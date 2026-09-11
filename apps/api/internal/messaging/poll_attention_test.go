@@ -87,6 +87,10 @@ func TestPollAttentionRecipientAndDeliveryGuards(t *testing.T) {
 			author := pa
 			if scenario == "human-author" {
 				author = voter
+				// Isolate vote attention from the original channel message.
+				if _, err := pa.SetNotificationSetting(ctx, NotifyLevelMentions, nil, nil); err != nil {
+					t.Fatal(err)
+				}
 			}
 			q := appendTestPoll(t, ctx, author, ch.PlaceID, "guard", PollInput{Question: "Choose", Options: []string{"A", "B"}})
 			if scenario == "thread-left" {

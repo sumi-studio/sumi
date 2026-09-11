@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -55,6 +56,10 @@ type WrappingKeyMaterial struct {
 // ErrCleanupIncomplete means Wait ended without proving physical teardown.
 // Ordinary process exit errors do not carry this marker.
 var ErrCleanupIncomplete = errors.New("runtime cleanup incomplete")
+
+// Lifecycle causes carry only classification; underlying diagnostics can
+// contain private configuration and must not be written to process logs.
+var ErrRuntimeEpochLost = errors.New("runtime left its active epoch")
 
 // Process represents a running agent process.
 type Process interface {
@@ -348,6 +353,7 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string, warmOnly boo
 func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
 	err := runtime.process.Wait()
 	m.mu.Lock()
+	requested := m.closing || m.stopping[agentID] != nil || m.running[agentID] != runtime
 	if m.running[agentID] == runtime {
 		if errors.Is(err, ErrCleanupIncomplete) {
 			runtime.cleanupPending = true
@@ -356,6 +362,23 @@ func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
 		}
 	}
 	m.mu.Unlock()
+	log.Printf("spawn: runtime ended: agent=%q reason=%s cleanup_incomplete=%t",
+		agentID, runtimeEndReason(err, requested), errors.Is(err, ErrCleanupIncomplete))
+}
+
+func runtimeEndReason(err error, requested bool) string {
+	switch {
+	case errors.Is(err, ErrRuntimeEpochLost):
+		return "active_epoch_lost"
+	case errors.Is(err, ErrCleanupIncomplete):
+		return "cleanup_incomplete"
+	case requested:
+		return "requested_stop"
+	case err != nil:
+		return "process_failed"
+	default:
+		return "clean_exit"
+	}
 }
 
 // Touch records activity for a running agent (an open direct-chat connection).

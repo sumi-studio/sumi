@@ -69,7 +69,7 @@ export type JsonSafeInteger = number;
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ExternalProvenanceV2".
  */
-export type ExternalProvenanceV2 = MessagingProvenanceV2 | WorkspaceOperationProvenanceV2;
+export type ExternalProvenanceV2 = MessagingProvenanceV2 | WorkspaceOperationProvenanceV2 | FeedbackProvenanceV2;
 /**
  * opaque ASCII tenant identity
  *
@@ -662,6 +662,29 @@ export interface WorkspaceOperationProvenanceV2 {
       stderr_bytes: JsonSafeInteger;
       output_truncated: boolean;
     };
+  };
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "FeedbackProvenanceV2".
+ */
+export interface FeedbackProvenanceV2 {
+  version: 2;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: {
+    kind: "human" | "personality_agent";
+    principal_id: TenantId;
+    display_name?: string;
+  };
+  source: {
+    surface: "feedback";
+    kind: "feedback_created" | "feedback_reply" | "feedback_status";
+    event_id: string;
+    thread_id: string;
+    title: string;
+    revision: number;
+    occurred_at: string;
   };
 }
 /**

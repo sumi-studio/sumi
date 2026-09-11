@@ -28,6 +28,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
+	"github.com/sumi-studio/sumi/apps/api/internal/feedback"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -98,6 +99,7 @@ func run(ctx context.Context) (runErr error) {
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
+	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startChatGPTActivation()
 	app.startWarmReconciliation()
@@ -230,21 +232,22 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	chatGPTLogin      *chatgpt.LoginService
-	chatGPTActivation *chatGPTActivationWorker
-	publicMux         *http.ServeMux
-	localMux          *http.ServeMux
-	localListener     *localControlListenerConfig
-	store             *agentevents.CommandStore
-	browser           *agentevents.BrowserServer
-	database          *db.Pool
-	spawnManager      *spawn.Manager
-	localRuntimes     *agentevents.LocalControlListenerRegistry
-	messagingServer   *messaging.Server
-	processOperations *processoperations.Server
-	backgroundCtx     context.Context
-	deliverAttention  func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
-	attentionWorkers  sync.WaitGroup
+	chatGPTLogin             *chatgpt.LoginService
+	chatGPTActivation        *chatGPTActivationWorker
+	publicMux                *http.ServeMux
+	localMux                 *http.ServeMux
+	localListener            *localControlListenerConfig
+	store                    *agentevents.CommandStore
+	browser                  *agentevents.BrowserServer
+	database                 *db.Pool
+	spawnManager             *spawn.Manager
+	localRuntimes            *agentevents.LocalControlListenerRegistry
+	messagingServer          *messaging.Server
+	processOperations        *processoperations.Server
+	backgroundCtx            context.Context
+	deliverAttention         func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
+	deliverFeedbackAttention func(context.Context) error
+	attentionWorkers         sync.WaitGroup
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -418,6 +421,7 @@ func newApplicationFromEnv() (*application, error) {
 	// the direct-chat browser routes. sv is a concrete pointer, so guard the
 	// nil before it becomes a non-nil interface.
 	var messagingWS *messaging.WSServer
+	var feedbackServer *feedback.Server
 	if database != nil {
 		var messagingSessions agentevents.UserSessionAuthorizer
 		if sv != nil {
@@ -429,6 +433,13 @@ func newApplicationFromEnv() (*application, error) {
 			messagingSessions,
 			koseki.New(database.Pool),
 		)
+		feedbackRecipients, feedbackErr := feedback.ParseRecipients(os.Getenv("SUMI_FEEDBACK_RECIPIENTS"))
+		if feedbackErr != nil {
+			log.Print("feedback destination disabled: SUMI_FEEDBACK_RECIPIENTS contains an invalid participant key")
+			feedbackRecipients = nil
+		}
+		feedbackServer = &feedback.Server{Store: feedback.New(database.Pool, feedbackRecipients), Sessions: messagingSessions, AllowedOrigins: browserOrigins}
+		feedbackServer.RegisterRoutes(mux)
 		workspaceServer.AllowedOrigins = browserOrigins
 		workspaceServer.RegisterRoutes(mux)
 		log.Print("workspace and app lifecycle routes ready")
@@ -511,6 +522,12 @@ func newApplicationFromEnv() (*application, error) {
 			return nil, fmt.Errorf("register messaging local control routes: %w", err)
 		}
 	}
+	if localControl != nil && feedbackServer != nil {
+		if err := feedbackServer.RegisterLocalControlRoutes(localControl); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("register feedback local control routes: %w", err)
+		}
+	}
 	if localControl != nil && workspaceServer != nil {
 		if err := workspaceServer.RegisterLocalControlRoutes(localControl); err != nil {
 			closeOnError()
@@ -588,22 +605,28 @@ func newApplicationFromEnv() (*application, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
 		}
 	}
+	var deliverFeedbackAttention func(context.Context) error
+	if feedbackServer != nil && spawnManager != nil {
+		delivery := &feedback.AttentionGateway{Gateway: runtime, Spawner: spawnManager, TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID"))}
+		deliverFeedbackAttention = func(ctx context.Context) error { return feedbackServer.Store.DeliverAttention(ctx, delivery, 25) }
+	}
 	return &application{
-		processOperations: processOperations,
-		chatGPTLogin:      chatGPTLogin,
-		chatGPTActivation: chatGPTActivation,
-		deliverAttention:  deliverAttention,
-		publicMux:         mux,
-		localMux:          localMux,
-		localListener:     localListener,
-		store:             store,
-		browser:           browser,
-		database:          database,
-		spawnManager:      spawnManager,
-		localRuntimes:     localRuntimes,
-		messagingServer:   messagingServer,
-		backgroundCtx:     backgroundCtx,
-		stopBackground:    stopBackground,
+		deliverFeedbackAttention: deliverFeedbackAttention,
+		processOperations:        processOperations,
+		chatGPTLogin:             chatGPTLogin,
+		chatGPTActivation:        chatGPTActivation,
+		deliverAttention:         deliverAttention,
+		publicMux:                mux,
+		localMux:                 localMux,
+		localListener:            localListener,
+		store:                    store,
+		browser:                  browser,
+		database:                 database,
+		spawnManager:             spawnManager,
+		localRuntimes:            localRuntimes,
+		messagingServer:          messagingServer,
+		backgroundCtx:            backgroundCtx,
+		stopBackground:           stopBackground,
 	}, nil
 }
 

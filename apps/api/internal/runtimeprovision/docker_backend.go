@@ -870,7 +870,13 @@ func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentI
 	// Once accepted, a host lifecycle transition is atomic with respect to a
 	// caller disconnect. A bounded daemon-owned context lets the caller retry
 	// and recover the committed epoch instead of killing Compose mid-allocation.
-	operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	operationParent := context.WithoutCancel(ctx)
+	if action == "inspect-epoch" {
+		// Observation owns no lifecycle transition. Do not leave abandoned
+		// inspections running and holding the per-PA lock after caller timeout.
+		operationParent = ctx
+	}
+	operationContext, cancel := context.WithTimeout(operationParent, timeout)
 	defer cancel()
 	output, err := backend.runner.Run(operationContext, backend.supervisor, []string{action}, environment)
 	if err != nil {

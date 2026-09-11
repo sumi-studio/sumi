@@ -117,6 +117,47 @@ func TestAgentAttentionMentionFreezesSourceAndOnlyAdmitsOnce(t *testing.T) {
 	}
 }
 
+func TestAgentAttentionHonorsChannelNotificationPreferences(t *testing.T) {
+	for _, tc := range []struct {
+		name, level, content string
+		keywords             []string
+		want                 bool
+	}{
+		{"all", NotifyLevelAll, "共有しておきます", nil, true},
+		{"mentions only", NotifyLevelMentions, "共有しておきます", nil, false},
+		{"keyword", NotifyLevelMentions, "今日のリリース", []string{"リリース"}, true},
+		{"keyword absent", NotifyLevelMentions, "共有しておきます", []string{"リリース"}, false},
+		{"muted", NotifyLevelMute, "@Kuro 今日のリリース", []string{"リリース"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			w := newWorld(t, ctx)
+			ws, ch := w.workspaceWithChannel(t, ctx)
+			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+			if _, err := pa.SetNotificationSetting(ctx, tc.level, nil, tc.keywords); err != nil {
+				t.Fatal(err)
+			}
+			msg := w.send(t, ctx, ch.PlaceID, w.humanB, tc.content)
+			d := newAttentionDelivery()
+			stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if tc.want {
+				want = 1
+			}
+			if stats.Admitted != want || len(d.events) != want {
+				t.Fatalf("delivery: %+v events=%d", stats, len(d.events))
+			}
+			if tc.want && (d.events[0].Kind != AgentAttentionMessage || d.events[0].MessageID != msg.MessageID || d.events[0].PersonalityAgentID != w.agent.ID) {
+				t.Fatalf("wrong channel event: %+v", d.events[0])
+			}
+		})
+	}
+}
+
 func TestAgentAttentionResendsIdenticalEventAfterAdmissionAckFailure(t *testing.T) {
 	for _, afterFailure := range []string{"restart", "delete", "resolve"} {
 		t.Run(afterFailure, func(t *testing.T) {
@@ -127,6 +168,9 @@ func TestAgentAttentionResendsIdenticalEventAfterAdmissionAckFailure(t *testing.
 			sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA)
 			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
 			text := "@Kuro 再開して確認"
+			if _, err := pa.SetNotificationSetting(ctx, NotifyLevelMentions, nil, nil); err != nil {
+				t.Fatal(err)
+			}
 			if afterFailure == "resolve" {
 				text = "予約の元の話"
 			}
@@ -176,8 +220,11 @@ func TestAgentAttentionDueRemindersBelongToPAAndResolveSuppresses(t *testing.T) 
 	defer cancel()
 	w := newWorld(t, ctx)
 	ws, ch := w.workspaceWithChannel(t, ctx)
-	source := w.send(t, ctx, ch.PlaceID, w.humanA, "リマインダーの元の話")
 	pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
+	if _, err := pa.SetNotificationSetting(ctx, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	source := w.send(t, ctx, ch.PlaceID, w.humanA, "リマインダーの元の話")
 	human := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA)
 	due := time.Now().Add(-time.Hour).UTC()
 	if _, _, err := human.CreateReplyLater(ctx, ch.PlaceID, source.MessageID, "Human個人用", due); err != nil {
@@ -536,7 +583,7 @@ func TestAgentAttentionReplyReturnsToAuthorOnce(t *testing.T) {
 }
 
 func TestAgentAttentionReplyRespectsRecipientAndSource(t *testing.T) {
-	for _, scenario := range []string{"mute", "self", "unrelated", "deleted_before", "deleted_after", "left", "disabled", "mention_parent_deleted", "dm_parent_deleted"} {
+	for _, scenario := range []string{"mute", "self", "unrelated", "deleted_before", "deleted_after", "left", "disabled", "mention_parent_deleted", "dm_parent_deleted", "all_parent_deleted", "keyword_parent_deleted"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -544,6 +591,16 @@ func TestAgentAttentionReplyRespectsRecipientAndSource(t *testing.T) {
 			ws, place := w.workspaceWithChannel(t, ctx)
 			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)
 			sender := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanB)
+			level, keywords := NotifyLevelMentions, []string(nil)
+			if scenario == "all_parent_deleted" {
+				level = NotifyLevelAll
+			}
+			if scenario == "keyword_parent_deleted" {
+				keywords = []string{"回答"}
+			}
+			if _, err := pa.SetNotificationSetting(ctx, level, nil, keywords); err != nil {
+				t.Fatal(err)
+			}
 			if scenario == "dm_parent_deleted" {
 				var err error
 				place, _, err = sender.EnsureDM(ctx, w.agent)
@@ -579,7 +636,7 @@ func TestAgentAttentionReplyRespectsRecipientAndSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			switch scenario {
-			case "deleted_after", "mention_parent_deleted", "dm_parent_deleted":
+			case "deleted_after", "mention_parent_deleted", "dm_parent_deleted", "all_parent_deleted", "keyword_parent_deleted":
 				if _, err := pa.DeleteMessage(ctx, place.PlaceID, question.MessageID); err != nil {
 					t.Fatal(err)
 				}
@@ -598,7 +655,7 @@ func TestAgentAttentionReplyRespectsRecipientAndSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := 0
-			if scenario == "mention_parent_deleted" || scenario == "dm_parent_deleted" {
+			if scenario == "mention_parent_deleted" || scenario == "dm_parent_deleted" || scenario == "all_parent_deleted" || scenario == "keyword_parent_deleted" {
 				want = 1
 			}
 			if len(d.events) != want {
@@ -628,6 +685,10 @@ func TestAgentAttentionReplyAndOtherMentionHaveDistinctRecipients(t *testing.T) 
 				t.Fatal(err)
 			}
 			if _, err := w.store.pool.Exec(ctx, "UPDATE agents SET display_name='Shiro' WHERE personality_agent_id=$1", otherID); err != nil {
+				t.Fatal(err)
+			}
+			other := w.store.mustScope(t, ctx, ws.WorkspaceID, PersonalityAgent(otherID))
+			if _, err := other.SetNotificationSetting(ctx, NotifyLevelMentions, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			pa := w.store.mustScope(t, ctx, ws.WorkspaceID, w.agent)

@@ -63,6 +63,34 @@ test("the supported dev origin proxies every same-origin app API surface", () =>
   }
 });
 
+test("Feedback API requests are proxied while its Inbox remains a page", () => {
+  const server = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
+  const entries = Object.entries(server.proxy ?? {}).filter(([key]) =>
+    key.includes("feedback"),
+  );
+  assert.equal(entries.length, 1);
+  const [pattern, proxy] = entries[0];
+  const matches = new RegExp(pattern);
+  for (const path of [
+    "/feedback/bootstrap",
+    "/feedback/threads?status=all",
+    "/feedback/threads/id/messages",
+  ]) {
+    assert.equal(matches.test(path), true, path);
+  }
+  for (const path of [
+    "/feedback",
+    "/feedback?thread=id",
+    "/feedback/threads-other",
+  ]) {
+    assert.equal(matches.test(path), false, path);
+  }
+  assert.deepEqual(proxy, {
+    target: SUMI_DEV_API_ORIGIN,
+    changeOrigin: false,
+  });
+});
+
 test("the proxy target accepts only literal IPv4 or the exact Compose service", () => {
   const compose = createDevServerConfig(SUMI_COMPOSE_API_ORIGIN);
   const composeAuth = compose.proxy?.["/auth"];

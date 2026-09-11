@@ -16,7 +16,10 @@ import {
   Trash2,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import { DIRECT_CHAT_RENDERER } from "../shell/app-descriptors";
+import {
+  DIRECT_CHAT_RENDERER,
+  FEEDBACK_RENDERER,
+} from "../shell/app-descriptors";
 import type { AppDescriptor, AppInstallation } from "../workspace/model";
 import { participantInstallation, useParticipantApps } from "./app-store";
 
@@ -145,7 +148,9 @@ export function ParticipantAppsMenu() {
                 onOpen={
                   descriptor.appId === DIRECT_CHAT_RENDERER.appId
                     ? () => void navigate({ to: DIRECT_CHAT_RENDERER.route })
-                    : undefined
+                    : descriptor.appId === FEEDBACK_RENDERER.appId
+                      ? () => void navigate({ to: FEEDBACK_RENDERER.route })
+                      : undefined
                 }
               />
             ))}
@@ -293,6 +298,7 @@ function participantAppIcon(
   if (appId === DIRECT_CHAT_RENDERER.appId) {
     return DIRECT_CHAT_RENDERER.icon;
   }
+  if (appId === FEEDBACK_RENDERER.appId) return FEEDBACK_RENDERER.icon;
   return AppWindow;
 }
 
