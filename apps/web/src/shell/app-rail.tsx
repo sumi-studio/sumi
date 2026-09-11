@@ -27,9 +27,13 @@ import {
 export function AppRail({
   activeAppId,
   workspaceId,
+  messagingPath,
+  onOpenFeedback,
 }: {
   activeAppId: string;
   workspaceId?: string;
+  messagingPath?: string;
+  onOpenFeedback?: () => void;
 }) {
   const navigate = useNavigate();
   const { authenticated, user } = useAuth();
@@ -197,7 +201,12 @@ export function AppRail({
                   label={descriptor.displayName}
                   active={activeAppId === descriptor.appId}
                   onClick={() =>
-                    void navigate({ to: renderer.route(workspaceId) })
+                    void navigate({
+                      to:
+                        descriptor.appId === "messaging" && messagingPath
+                          ? messagingPath
+                          : renderer.route(workspaceId),
+                    })
                   }
                 >
                   <Icon className="size-4" />
@@ -205,6 +214,10 @@ export function AppRail({
               );
             })
           : null}
+
+        {workspaceId && (directChatEnabled || feedbackEnabled) ? (
+          <hr className="mx-2 my-1 border-0 border-border border-t" />
+        ) : null}
 
         {directChatEnabled ? (
           <RailButton
@@ -219,7 +232,10 @@ export function AppRail({
           <RailButton
             label={FEEDBACK_RENDERER.label}
             active={activeAppId === FEEDBACK_RENDERER.appId}
-            onClick={() => void navigate({ to: FEEDBACK_RENDERER.route })}
+            onClick={() => {
+              onOpenFeedback?.();
+              void navigate({ to: FEEDBACK_RENDERER.route });
+            }}
           >
             <FeedbackIcon className="size-4" />
           </RailButton>

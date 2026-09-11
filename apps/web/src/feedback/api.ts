@@ -1,3 +1,4 @@
+import type { FeedbackDiagnostics } from "./diagnostics";
 export interface Participant {
   kind: "human" | "personality_agent";
   human_id?: string;
@@ -23,6 +24,7 @@ export interface Thread {
   created_at: string;
   updated_at: string;
   revision: number;
+  diagnostics?: FeedbackDiagnostics;
   latest_message?: Message | null;
   unread: boolean;
 }
@@ -57,7 +59,12 @@ export interface FeedbackClient {
   bootstrap(): Promise<Bootstrap>;
   list(status: Filter, cursor?: string): Promise<ThreadPage>;
   open(id: string, cursor?: string): Promise<Detail>;
-  create(title: string, body: string, requestId: string): Promise<Thread>;
+  create(
+    title: string,
+    body: string,
+    requestId: string,
+    diagnostics?: FeedbackDiagnostics,
+  ): Promise<Thread>;
   reply(id: string, body: string, requestId: string): Promise<Message>;
   status(
     id: string,
@@ -111,8 +118,8 @@ export const feedbackClient: FeedbackClient = {
     request(
       `${threadPath(id)}${cursor ? `?${new URLSearchParams({ cursor })}` : ""}`,
     ),
-  create: (title, body, request_id) =>
-    request("threads", "POST", { title, body, request_id }),
+  create: (title, body, request_id, diagnostics) =>
+    request("threads", "POST", { title, body, request_id, diagnostics }),
   reply: (id, body, request_id) =>
     request(`${threadPath(id)}/messages`, "POST", { body, request_id }),
   status: (id, status, revision) =>

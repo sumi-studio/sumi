@@ -86,14 +86,14 @@ func author(ctx context.Context, q participant.QueryRower, actor participant.Ref
 	return a, err
 }
 
-const threadColumns = `t.thread_id,t.title,t.body,t.status,t.author,t.created_at,t.updated_at,t.revision,
+const threadColumns = `t.thread_id,t.title,t.body,t.status,t.author,t.created_at,t.updated_at,t.revision,t.diagnostics,
  COALESCE((SELECT r.revision FROM feedback_reads r WHERE r.thread_id=t.thread_id AND r.reader_key=$1),0)<t.revision,
  (SELECT jsonb_build_object('id',e.event_id::text,'author',e.author,'body',e.body,'created_at',e.created_at,'revision',e.revision)
  FROM feedback_events e WHERE e.thread_id=t.thread_id AND e.kind='message' ORDER BY e.revision DESC LIMIT 1)`
 
 func scanThread(row pgx.Row) (Thread, error) {
 	var t Thread
-	err := row.Scan(&t.ID, &t.Title, &t.Body, &t.Status, &t.Author, &t.CreatedAt, &t.UpdatedAt, &t.Revision, &t.Unread, &t.LatestMessage)
+	err := row.Scan(&t.ID, &t.Title, &t.Body, &t.Status, &t.Author, &t.CreatedAt, &t.UpdatedAt, &t.Revision, &t.Diagnostics, &t.Unread, &t.LatestMessage)
 	return t, err
 }
 func (s *Store) thread(ctx context.Context, tx pgx.Tx, actor participant.Ref, id string, lock bool) (Thread, error) {
@@ -149,6 +149,7 @@ func (s *Store) List(ctx context.Context, actor participant.Ref, status, cursor 
 			rows.Close()
 			return result, e
 		}
+		t.Diagnostics = nil // Full diagnostic context belongs to the opened thread, not list summaries.
 		result.Threads = append(result.Threads, t)
 	}
 	err = rows.Err()
@@ -268,9 +269,9 @@ func markRead(ctx context.Context, tx pgx.Tx, actor participant.Ref, id string, 
 	_, err := tx.Exec(ctx, `INSERT INTO feedback_reads(thread_id,reader_key,revision) VALUES($1,$2,$3) ON CONFLICT(thread_id,reader_key) DO UPDATE SET revision=GREATEST(feedback_reads.revision,EXCLUDED.revision)`, id, actor.Key(), revision)
 	return err
 }
-func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, nonce string) (Thread, error) {
+func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, nonce string, diagnostics *Diagnostics) (Thread, error) {
 	var t Thread
-	if !validText(title, 160) || !validText(body, 20000) {
+	if !validText(title, 160) || !validText(body, 20000) || !diagnostics.valid() {
 		return t, ErrInvalid
 	}
 	tx, err := s.begin(ctx, actor)
@@ -278,7 +279,8 @@ func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, 
 		return t, err
 	}
 	defer tx.Rollback(ctx)
-	fingerprint := requestFingerprint("create", title, body)
+	diagnosticJSON, _ := json.Marshal(diagnostics)
+	fingerprint := requestFingerprint("create", title, body, string(diagnosticJSON))
 	hit, err := receipt(ctx, tx, actor, nonce, fingerprint, &t)
 	if err != nil || hit {
 		return t, err
@@ -294,8 +296,8 @@ func (s *Store) Create(ctx context.Context, actor participant.Ref, title, body, 
 	if err != nil {
 		return t, err
 	}
-	t = Thread{ID: newID(), Title: title, Body: body, Status: "open", Author: a, Revision: 1}
-	err = tx.QueryRow(ctx, `INSERT INTO feedback_threads(thread_id,author_key,author,title,body) VALUES($1,$2,$3,$4,$5) RETURNING created_at,updated_at`, t.ID, actor.Key(), a, title, body).Scan(&t.CreatedAt, &t.UpdatedAt)
+	t = Thread{ID: newID(), Title: title, Body: body, Diagnostics: diagnostics, Status: "open", Author: a, Revision: 1}
+	err = tx.QueryRow(ctx, `INSERT INTO feedback_threads(thread_id,author_key,author,title,body,diagnostics) VALUES($1,$2,$3,$4,$5,$6) RETURNING created_at,updated_at`, t.ID, actor.Key(), a, title, body, diagnostics).Scan(&t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return t, err
 	}

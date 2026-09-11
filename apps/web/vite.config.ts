@@ -86,7 +86,16 @@ export function createDevServerConfig(
   };
 }
 
+// The tab keeps its own build identity even after the server serves a new release.
+const webRelease =
+  [process.env.SUMI_RELEASE_SHA, process.env.VITE_SUMI_RELEASE_SHA].find(
+    (value) => value !== undefined && /^[a-f0-9]{40}$/.test(value),
+  ) ?? "";
+
 export default defineConfig({
+  define: {
+    "import.meta.env.VITE_SUMI_RELEASE_SHA": JSON.stringify(webRelease),
+  },
   build: { outDir: productionOutputDirectory() },
   plugins: [
     tanstackRouter({ target: "react", autoCodeSplitting: true }),

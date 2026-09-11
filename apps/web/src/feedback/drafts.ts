@@ -1,8 +1,11 @@
 import { secureRandomUUID } from "../lib/random-uuid";
+import type { FeedbackDiagnostics } from "./diagnostics";
 export interface Draft {
   title: string;
   body: string;
   requestId: string;
+  diagnostics?: FeedbackDiagnostics;
+  submitted?: boolean;
 }
 const memory = new Map<string, Draft>();
 export function draftKey(actor: string, thread: string): string {

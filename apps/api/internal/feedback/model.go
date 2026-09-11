@@ -45,17 +45,18 @@ type Author struct {
 	DisplayName string      `json:"display_name"`
 }
 type Thread struct {
-	IsSummary     bool      `json:"is_summary,omitempty"`
-	ID            string    `json:"id"`
-	Title         string    `json:"title"`
-	Body          string    `json:"body"`
-	Status        string    `json:"status"`
-	Author        Author    `json:"author"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Revision      int64     `json:"revision"`
-	LatestMessage *Message  `json:"latest_message"`
-	Unread        bool      `json:"unread"`
+	Diagnostics   *Diagnostics `json:"diagnostics,omitempty"`
+	IsSummary     bool         `json:"is_summary,omitempty"`
+	ID            string       `json:"id"`
+	Title         string       `json:"title"`
+	Body          string       `json:"body"`
+	Status        string       `json:"status"`
+	Author        Author       `json:"author"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+	Revision      int64        `json:"revision"`
+	LatestMessage *Message     `json:"latest_message"`
+	Unread        bool         `json:"unread"`
 }
 type Message struct {
 	ID        string    `json:"id"`

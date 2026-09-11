@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -58,7 +60,7 @@ func TestFeedbackSharedConversationAndUnread(t *testing.T) {
 	if err != nil || !b.Available || !b.Enabled {
 		t.Fatalf("bootstrap: %+v %v", b, err)
 	}
-	thread, err := w.s.Create(ctx, w.pa, "Notification mismatch", "The channel says all, but only mentions arrive.", uuid.NewString())
+	thread, err := w.s.Create(ctx, w.pa, "Notification mismatch", "The channel says all, but only mentions arrive.", uuid.NewString(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +131,7 @@ func TestFeedbackRetryAndLifecycle(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			th, err := w.s.Create(ctx, w.human, "Question", "Can I suggest something?", nonce)
+			th, err := w.s.Create(ctx, w.human, "Question", "Can I suggest something?", nonce, nil)
 			ids <- th.ID
 			errs <- err
 		}()
@@ -149,7 +151,7 @@ func TestFeedbackRetryAndLifecycle(t *testing.T) {
 		}
 		id = next
 	}
-	if _, err := w.s.Create(ctx, w.human, "Different", "Can I suggest something?", nonce); !errors.Is(err, ErrRequest) {
+	if _, err := w.s.Create(ctx, w.human, "Different", "Can I suggest something?", nonce, nil); !errors.Is(err, ErrRequest) {
 		t.Fatalf("reused nonce %v", err)
 	}
 	rn := uuid.NewString()
@@ -192,10 +194,10 @@ func TestFeedbackBoundedPaginationAndAvailability(t *testing.T) {
 	if err != nil || b.Available {
 		t.Fatal("unconfigured available")
 	}
-	if _, err = off.Create(ctx, w.human, "No destination", "Please deliver", uuid.NewString()); !errors.Is(err, ErrUnavailable) {
+	if _, err = off.Create(ctx, w.human, "No destination", "Please deliver", uuid.NewString(), nil); !errors.Is(err, ErrUnavailable) {
 		t.Fatal(err)
 	}
-	t0, err := w.s.Create(ctx, w.human, "A long conversation", "Initial", uuid.NewString())
+	t0, err := w.s.Create(ctx, w.human, "A long conversation", "Initial", uuid.NewString(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +215,7 @@ func TestFeedbackBoundedPaginationAndAvailability(t *testing.T) {
 		t.Fatalf("older %+v %v", older, err)
 	}
 	for i := 0; i < 50; i++ {
-		if _, err = w.s.Create(ctx, w.human, fmt.Sprint("Report ", i), "Text", uuid.NewString()); err != nil {
+		if _, err = w.s.Create(ctx, w.human, fmt.Sprint("Report ", i), "Text", uuid.NewString(), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -224,5 +226,32 @@ func TestFeedbackBoundedPaginationAndAvailability(t *testing.T) {
 	rest, err := w.s.List(ctx, w.dev, "all", *list.NextCursor)
 	if err != nil || len(rest.Threads) != 1 || rest.NextCursor != nil {
 		t.Fatalf("rest %+v %v", rest, err)
+	}
+}
+
+func TestFeedbackDiagnosticSnapshotPersistsAndRetryCannotReplaceIt(t *testing.T) {
+	w := fixture(t)
+	ctx := context.Background()
+	diagnostic := &Diagnostics{Version: 1, CapturedAt: time.Now().UTC().Truncate(time.Millisecond), Browser: "test browser", Language: "ja", TimeZone: "Asia/Tokyo", UTCOffsetMinutes: 540, Online: true, Visibility: "visible", Viewport: DiagnosticViewport{Width: 390, Height: 800, Scale: 1, PixelRatio: 3}, Assets: []string{}, Source: &DiagnosticSource{Path: "/direct", CapturedAt: time.Now().UTC().Truncate(time.Millisecond), States: map[string]string{"agent_connection": "closed"}}}
+	nonce := uuid.NewString()
+	created, err := w.s.Create(ctx, w.human, "Disconnected", "Tools stopped", nonce, diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := w.s.Open(ctx, w.dev, created.ID, "")
+	if err != nil || !reflect.DeepEqual(detail.Thread.Diagnostics, diagnostic) {
+		t.Fatalf("snapshot not retained: %+v %v", detail.Thread.Diagnostics, err)
+	}
+	retry, err := w.s.Create(ctx, w.human, "Disconnected", "Tools stopped", nonce, diagnostic)
+	if err != nil || retry.ID != created.ID || !reflect.DeepEqual(retry.Diagnostics, diagnostic) {
+		t.Fatalf("retry changed snapshot: %+v %v", retry, err)
+	}
+	changed := *diagnostic
+	changed.Online = false
+	if _, err = w.s.Create(ctx, w.human, "Disconnected", "Tools stopped", nonce, &changed); !errors.Is(err, ErrRequest) {
+		t.Fatalf("changed diagnostic accepted: %v", err)
+	}
+	if _, err = w.s.Open(ctx, w.stranger, created.ID, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("diagnostics leaked: %v", err)
 	}
 }

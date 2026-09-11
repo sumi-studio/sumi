@@ -31,6 +31,11 @@ import {
   feedbackClient,
   type Thread,
 } from "./api";
+import {
+  captureFeedbackDiagnostics,
+  type FeedbackDiagnostics,
+  readServedRelease,
+} from "./diagnostics";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "./drafts";
 import "./inbox.css";
 
@@ -399,7 +404,43 @@ function NewThread({
   onCreated(thread: Thread): void;
 }) {
   const key = draftKey(actor, "new");
-  const [draft, setDraft] = useState(() => loadDraft(key));
+  const [draft, setDraft] = useState(() => {
+    const existing = loadDraft(key);
+    if (
+      existing.submitted ||
+      (existing.diagnostics && (existing.title.trim() || existing.body.trim()))
+    )
+      return existing;
+    let diagnostics: FeedbackDiagnostics | undefined;
+    try {
+      diagnostics = captureFeedbackDiagnostics();
+    } catch {
+      /* A broken browser API must not block a report. */
+    }
+    const next = { ...existing, diagnostics };
+    saveDraft(key, next);
+    return next;
+  });
+  const submitted = useRef(Boolean(draft.submitted));
+  useEffect(() => {
+    if (submitted.current || draft.diagnostics?.served_release) return;
+    let active = true;
+    void readServedRelease().then((release) => {
+      if (!active || submitted.current || !release) return;
+      setDraft((previous) => {
+        if (submitted.current || !previous.diagnostics) return previous;
+        const next = {
+          ...previous,
+          diagnostics: { ...previous.diagnostics, served_release: release },
+        };
+        saveDraft(key, next);
+        return next;
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, [key, draft.diagnostics?.served_release]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const mounted = useRef(true);
@@ -420,7 +461,8 @@ function NewThread({
       setError("件名は160文字、本文は20,000文字以内で入力してください。");
       return;
     }
-    saveDraft(key, draft);
+    submitted.current = true;
+    saveDraft(key, { ...draft, submitted: true });
     setBusy(true);
     setError("");
     try {
@@ -428,6 +470,7 @@ function NewThread({
         draft.title,
         draft.body,
         draft.requestId,
+        draft.diagnostics,
       );
       clearDraft(key, draft.requestId);
       if (mounted.current) onCreated(thread);
@@ -486,6 +529,13 @@ function NewThread({
           disabled={busy}
           onChange={(event) => update("body", event.target.value)}
         />
+        {draft.diagnostics ? (
+          <Diagnostics details={draft.diagnostics} composing />
+        ) : (
+          <p className="feedback-diagnostics">
+            診断情報を取得できませんでした。本文だけ送信できます。
+          </p>
+        )}
         <div className="feedback-compose-footer">
           <span>共有先：あなた・{recipient}</span>
           <button
@@ -747,6 +797,9 @@ function Conversation({
                 time={detail.thread.created_at}
               />
               <MessageBody>{detail.thread.body}</MessageBody>
+              {detail.thread.diagnostics && (
+                <Diagnostics details={detail.thread.diagnostics} />
+              )}
             </article>
             {detail.next_cursor && gapIndex === -1 && (
               <button
@@ -993,4 +1046,24 @@ function shortDate(value: string, includeTime = false) {
       ? { hour: "2-digit", minute: "2-digit" }
       : {}),
   });
+}
+
+function Diagnostics({
+  details,
+  composing = false,
+}: {
+  details: FeedbackDiagnostics;
+  composing?: boolean;
+}) {
+  return (
+    <details className="feedback-diagnostics">
+      <summary>
+        {composing ? "診断情報を自動添付します" : "添付された診断情報"}
+      </summary>
+      <p>
+        開いていた画面・接続状態・ブラウザ環境を共有します。会話本文や認証情報は含みません。
+      </p>
+      <pre>{JSON.stringify(details, null, 2)}</pre>
+    </details>
+  );
 }
