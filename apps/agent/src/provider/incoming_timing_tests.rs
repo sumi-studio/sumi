@@ -423,7 +423,9 @@ fn feedback_source_preserves_sender_body_and_receipt_for_every_provider() {
     let user = UserMessage {
         incoming_source: Some(serde_json::from_value(source).unwrap()),
         incoming_timing: None,
-        content: vec![UserContent::Text { text: "修正しました。".into() }],
+        content: vec![UserContent::Text {
+            text: "修正しました。".into(),
+        }],
         timestamp: timestamp(),
     };
     let prefix = user.incoming_timing_text().unwrap();
