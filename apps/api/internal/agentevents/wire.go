@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // maxJSONSafeInteger is the largest integer representable exactly by JavaScript's
@@ -241,6 +242,9 @@ type ProvenanceActor struct {
 }
 
 type ProvenanceSource struct {
+	ThreadID              string                     `json:"thread_id,omitempty"`
+	Title                 string                     `json:"title,omitempty"`
+	Revision              uint64                     `json:"revision,omitempty"`
 	OperationID           string                     `json:"operation_id,omitempty"`
 	OriginatingToolCallID string                     `json:"originating_tool_call_id,omitempty"`
 	Result                *ProvenanceOperationResult `json:"result,omitempty"`
@@ -384,6 +388,29 @@ func (p IncomingProvenance) Equal(other IncomingProvenance) bool {
 		((av == nil && bv == nil) || (av != nil && bv != nil && av.PollRevision == bv.PollRevision && av.Question == bv.Question && slices.Equal(av.SelectedOptions, bv.SelectedOptions)))
 }
 
+func (p IncomingProvenance) validateFeedback() error {
+	source := p.Source
+	if (p.Actor.Kind != "human" && p.Actor.Kind != "personality_agent") ||
+		!operationEventIDRegexp.MatchString(source.EventID) || !operationEventIDRegexp.MatchString(source.ThreadID) ||
+		strings.TrimSpace(source.Title) == "" || utf8.RuneCountInString(source.Title) > 160 ||
+		source.Revision == 0 || source.Revision > maxJSONSafeInteger {
+		return errors.New("invalid feedback source")
+	}
+	switch source.Kind {
+	case "feedback_created", "feedback_reply", "feedback_status":
+	default:
+		return errors.New("invalid feedback event kind")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, source.OccurredAt); err != nil {
+		return errors.New("feedback occurrence must be RFC3339")
+	}
+	source.Surface, source.Kind, source.EventID, source.ThreadID, source.Title, source.Revision, source.OccurredAt = "", "", "", "", "", 0, ""
+	if source != (ProvenanceSource{}) {
+		return errors.New("feedback cannot carry other source fields")
+	}
+	return nil
+}
+
 func (p IncomingProvenance) Validate() error {
 	if !provenanceIDRegexp.MatchString(p.TenantID) {
 		return errors.New("provenance tenant_id must be 1..256 ASCII identifier bytes")
@@ -399,6 +426,12 @@ func (p IncomingProvenance) Validate() error {
 			return errors.New("version 1 provenance requires direct-chat authenticated Human")
 		}
 		return nil
+	}
+	if p.Version == 2 && p.Source.Surface == "feedback" {
+		return p.validateFeedback()
+	}
+	if p.Source.ThreadID != "" || p.Source.Title != "" || p.Source.Revision != 0 {
+		return errors.New("feedback metadata requires feedback source")
 	}
 	if p.Version == 2 && p.Source.Surface == "workspace_operation" {
 		return p.validateWorkspaceOperation()
@@ -491,6 +524,18 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 		if len(fields.Actor) != 2 || len(fields.Source) != 1 {
 			return errors.New("version 1 provenance has external source fields")
 		}
+	} else if value.Version == 2 && value.Source.Surface == "feedback" {
+		if len(fields.Source) != 7 {
+			return errors.New("feedback source has missing or extra fields")
+		}
+		for _, key := range []string{"surface", "kind", "event_id", "thread_id", "title", "revision", "occurred_at"} {
+			if raw, ok := fields.Source[key]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				return fmt.Errorf("feedback source %s is required", key)
+			}
+		}
+		if raw, ok := fields.Actor["display_name"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("actor display_name must be a string")
+		}
 	} else if value.Version == 2 && value.Source.Surface == "workspace_operation" {
 		if len(fields.Source) != 7 {
 			return errors.New("workspace operation source has missing or extra fields")
@@ -504,7 +549,7 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 			return errors.New("actor display_name must be a string")
 		}
 	} else if value.Version == 2 {
-		for _, key := range []string{"operation_id", "originating_tool_call_id", "result"} {
+		for _, key := range []string{"operation_id", "originating_tool_call_id", "result", "thread_id", "title", "revision"} {
 			if _, ok := fields.Source[key]; ok {
 				return errors.New("operation metadata requires workspace_operation source")
 			}

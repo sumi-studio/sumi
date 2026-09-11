@@ -1,4 +1,4 @@
-import { DoorOpen, MessageCircle } from "lucide-react";
+import { DoorOpen, MessageCircle, MessageSquarePlus } from "lucide-react";
 import type { ComponentType } from "react";
 
 /**
@@ -28,4 +28,11 @@ export const DIRECT_CHAT_RENDERER = {
   label: "直通",
   icon: DoorOpen,
   route: "/direct",
+} as const;
+
+export const FEEDBACK_RENDERER = {
+  appId: "feedback",
+  label: "Feedback",
+  icon: MessageSquarePlus,
+  route: "/feedback",
 } as const;

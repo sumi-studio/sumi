@@ -958,7 +958,33 @@ export interface components {
                 };
             };
         };
-        ExternalProvenanceV2: components["schemas"]["MessagingProvenanceV2"] | components["schemas"]["WorkspaceOperationProvenanceV2"];
+        FeedbackProvenanceV2: {
+            /** @constant */
+            version: 2;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @enum {unknown} */
+                kind: "human" | "personality_agent";
+                principal_id: components["schemas"]["TenantId"];
+                display_name?: string;
+            };
+            source: {
+                /** @constant */
+                surface: "feedback";
+                /** @enum {unknown} */
+                kind: "feedback_created" | "feedback_reply" | "feedback_status";
+                /** Format: uuid */
+                event_id: string;
+                /** Format: uuid */
+                thread_id: string;
+                title: string;
+                revision: number;
+                /** Format: date-time */
+                occurred_at: string;
+            };
+        };
+        ExternalProvenanceV2: components["schemas"]["MessagingProvenanceV2"] | components["schemas"]["WorkspaceOperationProvenanceV2"] | components["schemas"]["FeedbackProvenanceV2"];
         UserMessage: {
             /** @constant */
             role: "user";

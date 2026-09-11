@@ -437,6 +437,50 @@ impl crate::apiclient::public_web::PublicWebApi for LocalControlHttpClient {
     }
 }
 
+// Feedback uses the lease-bound PA identity; arguments cannot choose credentials,
+// another author, or a remote endpoint.
+#[async_trait]
+impl crate::apiclient::feedback::FeedbackApi for LocalControlHttpClient {
+    async fn request(
+        &self,
+        request: &crate::apiclient::feedback::FeedbackRequest,
+    ) -> Result<serde_json::Value, crate::apiclient::feedback::FeedbackError> {
+        use crate::apiclient::feedback::FeedbackError;
+        if !request.validate() {
+            return Err(FeedbackError::new("invalid_request"));
+        }
+        let path = format!("/local-control/v1/feedback:{}", request.action());
+        let (status, body) = self
+            .post_json_bounded_raw_with_timeout(
+                &path,
+                &request.wire(),
+                // Opening a thread can return fifty 20k-character messages;
+                // account for JSON escaping while retaining a finite bound.
+                16 * 1024 * 1024,
+                Some(Duration::from_secs(20)),
+            )
+            .await
+            .map_err(|_| FeedbackError::new("transport_error"))?;
+        if !status.is_success() {
+            return Err(serde_json::from_slice::<FeedbackError>(&body)
+                .unwrap_or_else(|_| FeedbackError::new("invalid_response")));
+        }
+        if matches!(
+            request,
+            crate::apiclient::feedback::FeedbackRequest::Read { .. }
+        ) && status == reqwest::StatusCode::NO_CONTENT
+        {
+            return Ok(serde_json::json!({"read":true}));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| FeedbackError::new("invalid_response"))?;
+        if !value.is_object() {
+            return Err(FeedbackError::new("invalid_response"));
+        }
+        Ok(value)
+    }
+}
+
 // Process requests use the same authenticated local-control transport. No
 // endpoint, credential, or acting PA can be selected by tool arguments.
 impl LocalControlHttpClient {
@@ -4090,6 +4134,63 @@ mod tests {
         assert_eq!(page.text.len(), 128 * 1024);
         assert_eq!(page.fetched_url, "https://example.com/page?q=1");
         assert_eq!(page.requested_url, "https://example.com/page?q=1#section");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feedback_http_keeps_lease_actor_and_preserves_conflict_and_read_receipt() {
+        use crate::apiclient::feedback::{FeedbackApi, FeedbackRequest};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/local-control/v1/feedback:reply", post(
+                |headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer control-secret");
+                    assert_eq!(body, serde_json::json!({
+                        "thread_id":"0198f0f4-9b72-7000-8000-000000000201",
+                        "body":"具体的な返信", "request_id":"ad9c965b-8dbb-4a4a-96ad-77ba163b45cf"
+                    }));
+                    (StatusCode::CONFLICT, Json(serde_json::json!({"error":"request_conflict"})))
+                }))
+            .route("/local-control/v1/feedback:read", post(
+                |Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["revision"],3);
+                    StatusCode::NO_CONTENT
+                }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let expected = authority();
+        let credential =
+            LocalControlCredential::new("control-secret", expected.rpc_identity().clone()).unwrap();
+        let client = LocalControlHttpClient::new_loopback(
+            format!("http://{address}/"),
+            expected,
+            credential,
+        )
+        .unwrap();
+        let thread_id = "0198f0f4-9b72-7000-8000-000000000201".to_owned();
+        let error = FeedbackApi::request(
+            &client,
+            &FeedbackRequest::Reply {
+                thread_id: thread_id.clone(),
+                body: "具体的な返信".into(),
+                request_id: Some("ad9c965b-8dbb-4a4a-96ad-77ba163b45cf".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.error, "request_conflict");
+        let result = FeedbackApi::request(
+            &client,
+            &FeedbackRequest::Read {
+                thread_id,
+                revision: 3,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, serde_json::json!({"read":true}));
         server.abort();
     }
 

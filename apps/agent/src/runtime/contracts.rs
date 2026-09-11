@@ -214,6 +214,7 @@ impl IncomingProvenance {
                 }
                 source.validate()
             }
+            IncomingSource::Feedback(source) if self.version == 2 => source.validate(),
             IncomingSource::Messaging(source) if self.version == 2 => {
                 source.validate()?;
                 if source.kind == MessagingEventKind::ReplyLaterDue
@@ -288,6 +289,47 @@ pub enum IncomingSource {
     // every command/message and their async futures, including DirectChat.
     Messaging(Box<MessagingSource>),
     WorkspaceOperation(Box<WorkspaceOperationSource>),
+    Feedback(Box<FeedbackSource>),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackSource {
+    pub kind: FeedbackEventKind,
+    pub event_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub revision: u64,
+    pub occurred_at: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackEventKind {
+    FeedbackCreated,
+    FeedbackReply,
+    FeedbackStatus,
+}
+impl FeedbackSource {
+    fn validate(&self) -> Result<(), RuntimeContractError> {
+        for id in [&self.event_id, &self.thread_id] {
+            let parsed =
+                Uuid::parse_str(id).map_err(|_| RuntimeContractError::InvalidIncomingProvenance)?;
+            if parsed.hyphenated().to_string() != *id
+                || parsed.get_version_num() != 7
+                || parsed.get_variant() != uuid::Variant::RFC4122
+            {
+                return Err(RuntimeContractError::InvalidIncomingProvenance);
+            }
+        }
+        if self.title.trim().is_empty()
+            || self.title.chars().count() > 160
+            || self.revision == 0
+            || self.revision > 9_007_199_254_740_991
+            || chrono::DateTime::parse_from_rfc3339(&self.occurred_at).is_err()
+        {
+            return Err(RuntimeContractError::InvalidIncomingProvenance);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -831,6 +873,32 @@ fn validate_opaque(value: String, kind: &'static str) -> Result<String, RuntimeC
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn feedback_provenance_roundtrip_preserves_source_without_human_authority() {
+        let value = serde_json::json!({"version":2,"tenant_id":"test","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab",
+          "actor":{"kind":"human","principal_id":"author","display_name":"開発者"},
+          "source":{"surface":"feedback","kind":"feedback_reply","event_id":"018f47a2-9b3c-7def-8abc-0123456789ac","thread_id":"018f47a2-9b3c-7def-8abc-0123456789ad","title":"通知について","revision":2,"occurred_at":"2026-09-11T10:00:00Z"}});
+        let p: IncomingProvenance = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&p).unwrap(), value);
+        assert_eq!(p.output_audience(), OutputAudience::Secretary);
+        assert!(p.authenticated_direct_chat_human().is_none());
+        for (field, bad) in [
+            ("revision", serde_json::json!(0)),
+            ("thread_id", serde_json::json!("bad")),
+            ("title", serde_json::json!("  ")),
+            ("kind", serde_json::json!("messaging_message")),
+            ("occurred_at", serde_json::json!("yesterday")),
+            ("workspace_id", serde_json::json!("extra")),
+        ] {
+            let mut invalid = value.clone();
+            invalid["source"][field] = bad;
+            assert!(
+                serde_json::from_value::<IncomingProvenance>(invalid).is_err(),
+                "accepted {field}"
+            );
+        }
+    }
     use super::*;
 
     const PAID: &str = "0198f0f4-9b72-7000-8000-000000000001";

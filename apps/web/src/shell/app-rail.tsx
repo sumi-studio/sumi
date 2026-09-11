@@ -20,6 +20,7 @@ import {
 import { useWorkspaceControl } from "../workspace/store";
 import {
   DIRECT_CHAT_RENDERER,
+  FEEDBACK_RENDERER,
   WORKSPACE_APP_RENDERERS,
 } from "./app-descriptors";
 
@@ -74,6 +75,15 @@ export function AppRail({
       directInstallation !== "duplicate" &&
       directInstallation?.state === "enabled");
   const DirectIcon = DIRECT_CHAT_RENDERER.icon;
+  const feedbackInstallation = participantInstallation(
+    participantInstallations,
+    FEEDBACK_RENDERER.appId,
+  );
+  const feedbackEnabled =
+    exactHumanOwner &&
+    feedbackInstallation !== "duplicate" &&
+    feedbackInstallation?.state === "enabled";
+  const FeedbackIcon = FEEDBACK_RENDERER.icon;
 
   return (
     <aside className="app-sidebar flex h-dvh w-12 shrink-0 flex-col overflow-clip">
@@ -203,6 +213,15 @@ export function AppRail({
             onClick={() => void navigate({ to: DIRECT_CHAT_RENDERER.route })}
           >
             <DirectIcon className="size-4" />
+          </RailButton>
+        ) : null}
+        {feedbackEnabled ? (
+          <RailButton
+            label={FEEDBACK_RENDERER.label}
+            active={activeAppId === FEEDBACK_RENDERER.appId}
+            onClick={() => void navigate({ to: FEEDBACK_RENDERER.route })}
+          >
+            <FeedbackIcon className="size-4" />
           </RailButton>
         ) : null}
       </nav>

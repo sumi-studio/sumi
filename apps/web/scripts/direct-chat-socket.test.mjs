@@ -2062,3 +2062,44 @@ test("operation completion validates its own source and recipient", () => {
     assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
   }
 });
+
+test("feedback events retain their own origin and reject malformed sources", () => {
+  const source = {
+    version: 2,
+    tenant_id: "test",
+    personality_agent_id: "018f47a2-9b3c-7def-8abc-0123456789ab",
+    actor: { kind: "human", principal_id: "author", display_name: "開発者" },
+    source: {
+      surface: "feedback",
+      kind: "feedback_reply",
+      event_id: "018f47a2-9b3c-7def-8abc-0123456789ac",
+      thread_id: "018f47a2-9b3c-7def-8abc-0123456789ad",
+      title: "通知について",
+      revision: 2,
+      occurred_at: "2026-09-11T10:00:00Z",
+    },
+  };
+  const frame = event(1, {
+    type: "message_end",
+    message_id: "00000000-0000-4000-8000-000000000002",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: "修正しました" }],
+      timestamp,
+      incoming_source: source,
+    },
+  });
+  frame.envelope.audience = "secretary";
+  assert.deepEqual(parseDirectChatServerFrame(frame, 0), frame);
+  for (const [key, value] of [
+    ["revision", 0],
+    ["thread_id", "invalid"],
+    ["title", " "],
+    ["workspace_id", null],
+    ["kind", "messaging_message"],
+  ]) {
+    const bad = structuredClone(frame);
+    bad.envelope.event.message.incoming_source.source[key] = value;
+    assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
+  }
+});

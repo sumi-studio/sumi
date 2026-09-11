@@ -815,6 +815,36 @@ $defs:
     oneOf:
       - { $ref: '#/$defs/MessagingProvenanceV2' }
       - { $ref: '#/$defs/WorkspaceOperationProvenanceV2' }
+      - { $ref: '#/$defs/FeedbackProvenanceV2' }
+
+  FeedbackProvenanceV2:
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 2 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { enum: [human, personality_agent] }
+          principal_id: { $ref: '#/$defs/TenantId' }
+          display_name: { type: string }
+      source:
+        type: object
+        required: [surface, kind, event_id, thread_id, title, revision, occurred_at]
+        additionalProperties: false
+        properties:
+          surface: { const: feedback }
+          kind: { enum: [feedback_created, feedback_reply, feedback_status] }
+          event_id: { type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' }
+          thread_id: { type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' }
+          title: { type: string, minLength: 1, maxLength: 160, pattern: '\S' }
+          revision: { type: integer, minimum: 1, maximum: 9007199254740991 }
+          occurred_at: { type: string, format: date-time }
 
   WorkspaceOperationProvenanceV2:
     type: object
