@@ -3,6 +3,9 @@ package spawn
 import (
 	"context"
 	"errors"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -951,6 +954,51 @@ func TestOrdinaryProcessExitErrorDoesNotBecomePendingCleanup(t *testing.T) {
 	mgr.watchRuntime("agent", rt)
 	if len(mgr.running) != 0 {
 		t.Fatal("ordinary exited process retained")
+	}
+}
+
+func TestRuntimeExitRecordsSafeLifecycleReason(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "lifecycle-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	previous := log.Writer()
+	log.SetOutput(file)
+	defer log.SetOutput(previous)
+	for _, tc := range []struct {
+		name      string
+		err       error
+		requested bool
+		reason    string
+	}{
+		{"requested", nil, true, "requested_stop"},
+		{"requested signal", errors.New("signal: terminated"), true, "requested_stop"},
+		{"clean", nil, false, "clean_exit"},
+		{"failed", errors.New("private tool body and bearer secret"), false, "process_failed"},
+		{"epoch", ErrRuntimeEpochLost, false, "active_epoch_lost"},
+		{"cleanup", errors.Join(ErrCleanupIncomplete, ErrRuntimeEpochLost), false, "active_epoch_lost"},
+	} {
+		mgr, err := New(Config{Spawner: &sequenceSpawner{}, Resolver: fakeResolver{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt := &agentRuntime{process: &fakeProcess{waitErr: tc.err}}
+		mgr.running[tc.name] = rt
+		if tc.requested {
+			mgr.stopping[tc.name] = &stopAttempt{}
+		}
+		mgr.watchRuntime(tc.name, rt)
+		data, err := os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "agent=\""+tc.name+"\" reason="+tc.reason) || strings.Contains(string(data), "private tool body") || strings.Contains(string(data), "bearer secret") {
+			t.Fatalf("missing lifecycle reason or private diagnostics exposed: %s", data)
+		}
+		if errors.Is(tc.err, ErrCleanupIncomplete) && !rt.cleanupPending {
+			t.Fatal("logging changed pending cleanup ownership")
+		}
 	}
 }
 

@@ -722,3 +722,35 @@ func TestChatGPTActivationContainsIdentityButNoConversationCredential(t *testing
 		t.Fatal("native activation accepted fabricated absent account scope")
 	}
 }
+
+type contextCheckingRunner struct {
+	check func(context.Context)
+}
+
+func (runner contextCheckingRunner) Run(ctx context.Context, _ string, _ []string, _ []string) ([]byte, error) {
+	runner.check(ctx)
+	return nil, nil
+}
+
+func TestDockerBackendOnlyObservationFollowsCallerCancellation(t *testing.T) {
+	for _, action := range []string{"inspect-epoch", "prepare", "activate", "abort", "stop-epoch", "reconcile"} {
+		t.Run(action, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			backend := &DockerBackend{supervisor: "/fake/supervisor", runner: contextCheckingRunner{
+				check: func(operationCtx context.Context) {
+					cancel()
+					if got := operationCtx.Err(); (got != nil) != (action == "inspect-epoch") {
+						t.Fatalf("%s operation context after caller cancellation = %v", action, got)
+					}
+					if _, bounded := operationCtx.Deadline(); !bounded {
+						t.Fatal("supervisor operation has no deadline")
+					}
+				},
+			}}
+			if _, err := backend.run(ctx, action, testPAID, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

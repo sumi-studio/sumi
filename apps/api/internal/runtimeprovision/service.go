@@ -208,6 +208,9 @@ func (service *Service) Inspect(ctx context.Context, request InspectRequest) (In
 	entry := service.entry(request.PersonalityAgentID)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Inspection{}, err
+	}
 	inspection, err := service.backend.Inspect(ctx, request.PersonalityAgentID)
 	if err != nil {
 		return Inspection{}, err

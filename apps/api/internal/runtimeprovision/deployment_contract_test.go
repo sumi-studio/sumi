@@ -151,7 +151,7 @@ exec /usr/bin/stat "$@"
 	}
 }
 
-func TestSupervisorInspectEpochReturnsActiveWithoutPullingAllocatorImage(t *testing.T) {
+func TestSupervisorInspectEpochPreservesActiveAcrossObservationFailure(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")
 	}
@@ -159,17 +159,23 @@ func TestSupervisorInspectEpochReturnsActiveWithoutPullingAllocatorImage(t *test
 		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
 	}
 
-	testRoot := t.TempDir()
-	fakeDocker := filepath.Join(testRoot, "docker")
-	fakeStat := filepath.Join(testRoot, "stat")
-	dockerLog := filepath.Join(testRoot, "docker.log")
-	fakeDockerScript := `#!/bin/sh
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("first-query-fails=%t", failFirst), func(t *testing.T) {
+			testRoot := t.TempDir()
+			fakeDocker := filepath.Join(testRoot, "docker")
+			fakeStat := filepath.Join(testRoot, "stat")
+			dockerLog := filepath.Join(testRoot, "docker.log")
+			fakeDockerScript := `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
 case "$*" in
   "compose version")
     ;;
   "ps --all --filter label=com.docker.compose.project="*)
+    if [ "$SUMI_FAKE_FAIL_FIRST" = true ] && [ ! -f "$SUMI_FAKE_DOCKER_LOG.failed" ]; then
+      touch "$SUMI_FAKE_DOCKER_LOG.failed"
+      exit 42
+    fi
     printf 'aaaaaaaaaaaa\truntime\trunning\n'
     printf 'bbbbbbbbbbbb\texecutor\trunning\n'
     printf 'cccccccccccc\tbroker\trunning\n'
@@ -182,10 +188,10 @@ case "$*" in
     ;;
 esac
 `
-	if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	fakeStatScript := `#!/bin/sh
+			if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			fakeStatScript := `#!/bin/sh
 if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
   case "$2" in
     %u) printf '0\n'; exit 0 ;;
@@ -194,40 +200,53 @@ if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
 fi
 exec /usr/bin/stat "$@"
 `
-	if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
+			if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
 
-	supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	command := exec.Command(
-		"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
-		`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" inspect-epoch`,
-		"--", supervisor,
-	)
-	command.Env = []string{
-		"PATH=" + testRoot + ":/usr/bin:/bin",
-		"SUMI_CONFIG_FILE=/dev/null",
-		"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
-		"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
-	}
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("real supervisor active inspection failed: %v\n%s", err, output)
-	}
-	if !strings.Contains(string(output), `"phase":"active","generation":7,"rpc_boot_nonce":"active-nonce"`) {
-		t.Fatalf("active inspection did not confirm the running epoch: %s", output)
-	}
-	calls, err := os.ReadFile(dockerLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// --pull never is the registry-unreachable resilience: epoch identity must
-	// not attempt a pull that a DNS/registry gap would turn into a false death.
-	if !strings.Contains(string(calls), "compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator") {
-		t.Fatalf("epoch identity did not use --pull never:\n%s", calls)
+			supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(
+				"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+				`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" inspect-epoch`,
+				"--", supervisor,
+			)
+			command.Env = []string{
+				"PATH=" + testRoot + ":/usr/bin:/bin",
+				"SUMI_CONFIG_FILE=/dev/null",
+				"SUMI_FAKE_DOCKER_LOG=" + dockerLog,
+				"SUMI_FAKE_FAIL_FIRST=" + strconv.FormatBool(failFirst),
+				"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+			}
+			output, err := command.CombinedOutput()
+			if failFirst {
+				if err == nil || strings.Contains(string(output), `"phase":`) || !strings.Contains(string(output), "cannot observe long-lived role states") {
+					t.Fatalf("failed Docker observation became an epoch observation: err=%v output=%s", err, output)
+				}
+				// The next query succeeds. The failed query must not have been retried
+				// internally as presence and then misreported as a recovery/dead epoch.
+				retry := exec.Command(command.Path, command.Args[1:]...)
+				retry.Env = command.Env
+				output, err = retry.CombinedOutput()
+			}
+			if err != nil {
+				t.Fatalf("real supervisor active inspection failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), `"phase":"active","generation":7,"rpc_boot_nonce":"active-nonce"`) {
+				t.Fatalf("active inspection did not confirm the running epoch: %s", output)
+			}
+			calls, err := os.ReadFile(dockerLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// --pull never is the registry-unreachable resilience: epoch identity must
+			// not attempt a pull that a DNS/registry gap would turn into a false death.
+			if !strings.Contains(string(calls), "compose.prepare.yaml run --rm --no-deps --pull never --entrypoint /bin/bash allocator") {
+				t.Fatalf("epoch identity did not use --pull never:\n%s", calls)
+			}
+		})
 	}
 }
 

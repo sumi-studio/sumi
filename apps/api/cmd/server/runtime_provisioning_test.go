@@ -589,85 +589,119 @@ func TestProvisionedProcessMonitorFencesAndReconcilesRecoveryBeforeReturning(t *
 	}
 }
 
-func TestProvisionedProcessMonitorFencesAndReconcilesAfterInspectError(t *testing.T) {
-	spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
-	paid := provisionedTestPAIDs[0]
-	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	provisioner.mu.Lock()
-	provisioner.reconcileReaps[paid] = true
-	provisioner.mu.Unlock()
-	provisioner.inspectErr = errors.New("inspect unavailable")
-	provisioned := process.(*provisionedProcess)
-	provisioned.monitorInterval = time.Millisecond
-
-	inspectBaseline := 0
-	for _, call := range recorder.calls {
-		if call == "inspect:"+paid {
-			inspectBaseline++
-		}
-	}
-	if err := provisioned.Wait(); err == nil || !strings.Contains(err.Error(), "inspect unavailable") {
-		t.Fatalf("monitor error = %v, want inspect failure", err)
-	}
-	if authorizations.fences[paid] != 1 || listeners.active[paid] {
-		t.Fatalf("monitor retained local runtime authority: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
-	}
-	inspectCount := 0
-	for _, call := range recorder.calls {
-		if call == "inspect:"+paid {
-			inspectCount++
-		}
-	}
-	if got := inspectCount - inspectBaseline; got != 3 {
-		t.Fatalf("monitor retired after %d inspect errors, want the 3-error threshold", got)
-	}
-	if !containsOrdered(recorder.calls, []string{
-		"inspect:" + paid,
-		"fence:" + paid,
-		"unlisten:" + paid,
-		"reconcile:" + paid,
-		"reap:" + paid,
-	}) {
-		t.Fatalf("monitor inspect failure returned before fenced reconcile: %v", recorder.calls)
-	}
+type monitoringTestProvisioner struct {
+	mu sync.Mutex
+	*fakeRuntimeProvisioner
+	inspect func(context.Context, runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error)
 }
 
-func TestProvisionedProcessMonitorToleratesInspectErrorsBelowThreshold(t *testing.T) {
-	spawner, provisioner, authorizations, listeners, _ := newProvisioningTestSpawner(t)
-	paid := provisionedTestPAIDs[0]
-	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	provisioner.mu.Lock()
-	provisioner.inspectErr = errors.New("transient inspect gap")
-	provisioner.inspectErrLimit = 2 // one below the 3-error retire threshold
-	provisioner.mu.Unlock()
-	provisioned := process.(*provisionedProcess)
-	provisioned.monitorInterval = time.Millisecond
+func (p *monitoringTestProvisioner) Inspect(ctx context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inspect(ctx, request)
+}
 
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- provisioned.Wait() }()
+func (p *monitoringTestProvisioner) Stop(ctx context.Context, request runtimeprovision.StopRequest) (runtimeprovision.Inspection, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakeRuntimeProvisioner.Stop(ctx, request)
+}
 
-	// Two consecutive errors are ridden through; the third observation succeeds
-	// and the monitor must keep the healthy runtime alive.
-	select {
-	case err := <-waitErr:
-		t.Fatalf("monitor retired below the inspect-error threshold: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	if authorizations.fences[paid] != 0 || !listeners.active[paid] {
-		t.Fatalf("sub-threshold inspect errors fenced the runtime: fences=%d listener=%t", authorizations.fences[paid], listeners.active[paid])
-	}
-	if err := process.Stop(); err != nil {
-		t.Fatalf("stop after transient inspect errors = %v", err)
+func TestProvisionedProcessMonitorPreservesRuntimeDuringObservationLoss(t *testing.T) {
+	for _, recoverObservation := range []bool{true, false} {
+		t.Run(fmt.Sprintf("recover=%t", recoverObservation), func(t *testing.T) {
+			spawner, provisioner, authorizations, listeners, recorder := newProvisioningTestSpawner(t)
+			paid := provisionedTestPAIDs[0]
+			process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+				AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := process.(*provisionedProcess)
+			p.monitorInterval = time.Millisecond
+			p.timeout = time.Minute
+			epoch := p.epoch
+			recorder.calls = nil
+			observed := make(chan struct{})
+			attempts := 0
+			p.provisioner = &monitoringTestProvisioner{fakeRuntimeProvisioner: provisioner,
+				inspect: func(ctx context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
+					attempts++
+					if attempts <= 5 {
+						return runtimeprovision.Inspection{}, errors.New("private inspection failure")
+					}
+					if recoverObservation {
+						inspection, err := provisioner.Inspect(ctx, request)
+						if attempts == 6 {
+							close(observed)
+						}
+						return inspection, err
+					}
+					if attempts == 6 {
+						close(observed)
+					}
+					<-ctx.Done() // Stop must also interrupt an outstanding observation.
+					return runtimeprovision.Inspection{}, ctx.Err()
+				},
+			}
+			waitErr := make(chan error, 1)
+			go func() { waitErr <- p.Wait() }()
+			t.Cleanup(func() {
+				if p.monitorCancel != nil {
+					p.monitorCancel()
+				}
+				_ = p.Stop()
+			})
+			select {
+			case <-observed:
+			case err := <-waitErr:
+				t.Fatalf("monitor retired a runtime on observation failure: %v", err)
+			case <-time.After(time.Second):
+				t.Fatal("monitor stopped retrying observation")
+			}
+			provisioner.mu.Lock()
+			currentEpoch, stopped := provisioner.epochs[paid], provisioner.stops[paid]
+			provisioner.mu.Unlock()
+			if currentEpoch != epoch || stopped != 0 {
+				t.Fatal("observation failure replaced or stopped the runtime")
+			}
+			authorizations.mu.Lock()
+			fences := authorizations.fences[paid]
+			authorizations.mu.Unlock()
+			listeners.mu.Lock()
+			listening := listeners.active[paid]
+			listeners.mu.Unlock()
+			if fences != 0 || !listening {
+				t.Fatalf("observation failure removed authority: fences=%d listening=%t", fences, listening)
+			}
+			recorder.mu.Lock()
+			for _, call := range recorder.calls {
+				if call == "reconcile:"+paid || call == "stop:"+paid || call == "fence:"+paid {
+					recorder.mu.Unlock()
+					t.Fatalf("unexpected lifecycle action while observing: %s", call)
+				}
+			}
+			recorder.mu.Unlock()
+			stopErr := make(chan error, 1)
+			go func() { stopErr <- p.Stop() }()
+			select {
+			case err := <-stopErr:
+				if err != nil {
+					t.Fatalf("explicit stop during observation loss = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Stop waited for the inspection timeout instead of canceling observation")
+			}
+			select {
+			case err := <-waitErr:
+				if err != nil {
+					t.Fatalf("Wait after explicit stop = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("explicit stop did not release the monitor")
+			}
+		})
 	}
 }
 
