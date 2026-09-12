@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -365,9 +367,19 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 
 	t.Run("logout eagerly closes the registered socket", func(t *testing.T) {
 		cookie, conn := issueAndPrime(t)
+		jar, err := cookiejar.New(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin, err := url.Parse(ts.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jar.SetCookies(origin, []*http.Cookie{{Name: agentevents.BrowserSessionCookie, Value: cookie, Path: "/"}})
+		client := &http.Client{Jar: jar}
 		csrfRequest, _ := http.NewRequest(http.MethodGet, ts.URL+"/auth/csrf", nil)
 		csrfRequest.Header.Set("Origin", testOrigin)
-		csrfResponse, requestErr := http.DefaultClient.Do(csrfRequest)
+		csrfResponse, requestErr := client.Do(csrfRequest)
 		if requestErr != nil {
 			t.Fatal(requestErr)
 		}
@@ -378,21 +390,10 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 			t.Fatal(err)
 		}
 		_ = csrfResponse.Body.Close()
-		var csrfCookie *http.Cookie
-		for _, candidate := range csrfResponse.Cookies() {
-			if candidate.Name == agentevents.BrowserCSRFCookie {
-				csrfCookie = candidate
-			}
-		}
-		if csrfCookie == nil {
-			t.Fatal("missing CSRF cookie")
-		}
 		logoutRequest, _ := http.NewRequest(http.MethodPost, ts.URL+"/auth/logout", nil)
 		logoutRequest.Header.Set("Origin", testOrigin)
 		logoutRequest.Header.Set("X-CSRF-Token", csrfBody.Token)
-		logoutRequest.AddCookie(csrfCookie)
-		logoutRequest.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: cookie})
-		logoutResponse, requestErr := http.DefaultClient.Do(logoutRequest)
+		logoutResponse, requestErr := client.Do(logoutRequest)
 		if requestErr != nil {
 			t.Fatal(requestErr)
 		}
