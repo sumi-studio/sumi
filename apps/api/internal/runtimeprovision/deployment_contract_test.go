@@ -1672,14 +1672,27 @@ func repositoryFilePath(parts ...string) string {
 	return filepath.Join(pathParts...)
 }
 
-func TestSupervisorNativeChatGPTLaunchCredentialBoundary(t *testing.T) {
+func runSupervisorLaunchValidation(t *testing.T, env map[string]string) error {
+	t.Helper()
 	source := readDeploymentFile(t, "supervisor")
 	start := strings.Index(source, "require_launch_environment() {")
+	if start < 0 {
+		t.Fatal("launch validator missing")
+	}
 	end := strings.Index(source[start:], "\n}\n")
-	if start < 0 || end < 0 {
+	if end < 0 {
 		t.Fatal("launch validator missing")
 	}
 	script := "set -eu\nfail() { exit 23; }\nvalidate_local_control_socket() { :; }\n" + source[start:start+end+3] + "\nrequire_launch_environment\n"
+	command := exec.Command("bash", "-c", script)
+	command.Env = []string{"PATH=/usr/bin:/bin"}
+	for name, value := range env {
+		command.Env = append(command.Env, name+"="+value)
+	}
+	return command.Run()
+}
+
+func TestSupervisorNativeChatGPTLaunchCredentialBoundary(t *testing.T) {
 	base := testActivationConfig()
 	base.ModelPreset = "chatgpt-responses"
 	base.ModelID = "gpt-6-astra"
@@ -1710,12 +1723,7 @@ func TestSupervisorNativeChatGPTLaunchCredentialBoundary(t *testing.T) {
 			if tc.missingReviewer {
 				delete(env, "SUMI_EXECUTION_REVIEWER_API_KEY")
 			}
-			command := exec.Command("bash", "-c", script)
-			command.Env = []string{"PATH=/usr/bin:/bin"}
-			for name, value := range env {
-				command.Env = append(command.Env, name+"="+value)
-			}
-			err := command.Run()
+			err := runSupervisorLaunchValidation(t, env)
 			if (err == nil) != tc.pass {
 				t.Fatalf("unexpected launch validation outcome: %v", err)
 			}

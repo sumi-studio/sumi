@@ -19,6 +19,13 @@ func TestUserEndpointEnvironment(t *testing.T) {
 	if env["SUMI_MODEL_BASE_URL"] != c.ModelBaseURL || env["SUMI_MODEL_PUBLIC_ENDPOINT"] != "true" || env["SUMI_PROVIDER_API_KEY"] != "" || env["SUMI_API_CONNECTION_ID"] != "connection" || env["SUMI_API_CONNECTION_VERSION"] != "version" || env["SUMI_API_CONNECTION_HUMAN_ID"] != "human" {
 		t.Fatal("endpoint boundary lost")
 	}
+	if err := runSupervisorLaunchValidation(t, env); err != nil {
+		t.Fatalf("user API connection cannot pass the shipped supervisor launch gate: %v", err)
+	}
+	env["SUMI_PROVIDER_API_KEY"] = "unrelated-static-key"
+	if runSupervisorLaunchValidation(t, env) == nil {
+		t.Fatal("user API launch accepted an unrelated static credential")
+	}
 	c.ModelBaseURL = "http://localhost"
 	if c.Validate() == nil {
 		t.Fatal("public endpoint allowed HTTP")
