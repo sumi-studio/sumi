@@ -409,6 +409,12 @@ materialize_runtime_secrets() {
       run_external chmod 0400 "${path}"
     fi
   done
+  # Public configuration identity is separate from the secret files. It is
+  # required for adopting a live runtime after its API controller restarts.
+  [[ "${SUMI_RUNTIME_SELECTION_FINGERPRINT:-}" =~ ^[0-9a-f]{64}$ ]] || fail "runtime selection fingerprint is invalid"
+  path="${SUMI_RUNTIME_SECRET_HOST_DIR}/selection-fingerprint"
+  (umask 077; set -o noclobber; printf '%s' "${SUMI_RUNTIME_SELECTION_FINGERPRINT}" > "${path}") || fail "cannot materialize runtime selection fingerprint"
+  run_external chmod 0400 "${path}"
   RUNTIME_SECRET_TRUST_SNAPSHOT="$(runtime_secret_snapshot)"
 }
 
@@ -1210,6 +1216,45 @@ disarm_partial_generation_cleanup() {
 }
 
 action="${1:-inspect-epoch}"
+recover_local_control() {
+  local bearer_path bearer_size recovered_bearer secret_owner secret_group
+  local selection_path selection_owner selection_fingerprint
+  acquire_supervisor_lock
+  require_docker
+  require_expected_epoch
+  long_lived_roles_match_expected_state running || fail "local control recovery requires an active runtime"
+  set_runtime_secret_host_dir "${EPOCH_GENERATION}"
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}"
+  validate_runtime_secret_anchor "${RUNTIME_SECRET_HOST_ROOT}/${PAID_COMPACT}"
+  validate_runtime_secret_anchor "${SUMI_RUNTIME_SECRET_HOST_DIR}"
+  bearer_path="${SUMI_RUNTIME_SECRET_HOST_DIR}/sumi_local_control_bearer"
+  [[ -f "${bearer_path}" && ! -L "${bearer_path}" ]] || fail "local control credential is not a regular file"
+  [[ "$(run_external readlink -e -- "${bearer_path}")" == "${bearer_path}" ]] || fail "local control credential path is not canonical"
+  secret_owner="${RUNTIME_SECRET_UID}"
+  secret_group="${RUNTIME_SECRET_GID}"
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == true ]]; then
+    secret_owner="${EUID}"
+    secret_group="${EUID}"
+  fi
+  [[ "$(run_external stat -c '%u:%g:%a:%h' -- "${bearer_path}")" == "${secret_owner}:${secret_group}:400:1" ]] || fail "local control credential metadata is not trusted"
+  bearer_size="$(run_external stat -c '%s' -- "${bearer_path}")"
+  (( bearer_size >= 32 && bearer_size <= 1024 )) || fail "local control credential length is invalid"
+  recovered_bearer="$(<"${bearer_path}")"
+  # Length is bounded above using the file size. Large ERE repetition limits
+  # are not portable to the Alpine/musl Bash used by the provisioner image.
+  [[ "${recovered_bearer}" =~ ^[A-Za-z0-9_-]+$ && ${#recovered_bearer} -eq ${bearer_size} ]] || fail "local control credential encoding is invalid"
+  selection_path="${SUMI_RUNTIME_SECRET_HOST_DIR}/selection-fingerprint"
+  [[ -f "${selection_path}" && ! -L "${selection_path}" ]] || fail "runtime admitted configuration is unavailable"
+  selection_owner=0
+  if [[ "${SUMI_TEST_ALLOW_NONROOT_SECRET_ROOT:-false}" == true ]]; then selection_owner="${EUID}"; fi
+  [[ "$(run_external stat -c '%u:%g:%a:%h:%s' -- "${selection_path}")" == "${selection_owner}:${selection_owner}:400:1:64" ]] || fail "runtime admitted configuration metadata is not trusted"
+  selection_fingerprint="$(<"${selection_path}")"
+  [[ "${selection_fingerprint}" =~ ^[0-9a-f]{64}$ ]] || fail "runtime admitted configuration encoding is invalid"
+  printf '{"personality_agent_id":"%s","generation":%s,"rpc_boot_nonce":"%s","bearer":"%s","selection_fingerprint":"%s"}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}" "${recovered_bearer}" "${selection_fingerprint}"
+  unset recovered_bearer
+}
+
 case "${action}" in
   project-name)
     printf '%s\n' "${SUMI_COMPOSE_PROJECT}"
@@ -1334,6 +1379,9 @@ case "${action}" in
     require_docker
     inspect_epoch
     ;;
+  recover-local-control)
+    recover_local_control
+    ;;
   reconcile)
     acquire_supervisor_lock
     require_docker
@@ -1371,6 +1419,6 @@ case "${action}" in
     fi
     ;;
   *)
-    fail "usage: supervisor {prepare|activate|abort|inspect-epoch|reconcile|stop|status|logs|validate|project-name}"
+    fail "usage: supervisor {prepare|activate|abort|inspect-epoch|recover-local-control|reconcile|stop|status|logs|validate|project-name}"
     ;;
 esac

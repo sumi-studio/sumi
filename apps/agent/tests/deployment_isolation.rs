@@ -35,6 +35,8 @@ const LOCAL_CONTROL_GID: u32 = 10022;
 const TEST_WRAPPING_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_APPROVAL_DIGEST_KEY: &str =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TEST_RUNTIME_SELECTION_FINGERPRINT: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 /// Fixed base for every fixture-private root.  `TMPDIR` is deliberately not
 /// consulted: the private root is substituted verbatim into the supervisor's
@@ -235,6 +237,10 @@ fn launch_env(command: &mut Command, paid: &str) {
         .env("SUMI_PERSONALITY_AGENT_ID", paid)
         .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/agent")
         .env("SUMI_LOCAL_CONTROL_BEARER", "control-secret")
+        .env(
+            "SUMI_RUNTIME_SELECTION_FINGERPRINT",
+            TEST_RUNTIME_SELECTION_FINGERPRINT,
+        )
         .env("SUMI_AGENT_WRAPPING_KEY", TEST_WRAPPING_KEY)
         .env("SUMI_AGENT_WRAPPING_KEY_ID", "wrapping-key/v1")
         .env("SUMI_APPROVAL_SECRET_DIGEST_KEY", TEST_APPROVAL_DIGEST_KEY)
@@ -691,6 +697,10 @@ fn launch_owned_acceptance_env(command: &mut Command, fixture: &HostTrustFixture
         .env("SUMI_PERSONALITY_AGENT_ID", &fixture.paid)
         .env("SUMI_GATEWAY_URL", "wss://gateway.invalid/deployment-test")
         .env("SUMI_LOCAL_CONTROL_BEARER", credential("local-control"))
+        .env(
+            "SUMI_RUNTIME_SELECTION_FINGERPRINT",
+            TEST_RUNTIME_SELECTION_FINGERPRINT,
+        )
         .env("SUMI_AGENT_WRAPPING_KEY", hex_credential())
         .env("SUMI_AGENT_WRAPPING_KEY_ID", "deployment-test/wrapping")
         .env("SUMI_APPROVAL_SECRET_DIGEST_KEY", hex_credential())
@@ -1811,7 +1821,6 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
             "runtime-identity",
             "state",
             "${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}",
-            "${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock",
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_local_control_bearer",
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_agent_wrapping_key",
             "${SUMI_RUNTIME_SECRET_HOST_DIR:?SUMI_RUNTIME_SECRET_HOST_DIR is required}/sumi_approval_secret_digest_key",
@@ -1845,18 +1854,27 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         .as_sequence()
         .unwrap()
         .iter()
-        .find(|mount| mount["target"].as_str() == Some("/run/sumi/local-control/control.sock"))
-        .expect("runtime local-control bind mount");
+        .find(|mount| mount["target"].as_str() == Some("/run/sumi/local-control"))
+        .expect("runtime PAID-bound local-control directory bind mount");
+    assert_eq!(local_control_mount["type"].as_str(), Some("bind"));
     assert_eq!(
         local_control_mount["source"].as_str(),
-        Some(
-            "${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock"
-        )
+        Some("${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}")
     );
     assert_eq!(local_control_mount["read_only"].as_bool(), Some(true));
     assert_eq!(
         local_control_mount["bind"]["create_host_path"].as_bool(),
         Some(false)
+    );
+    assert!(
+        runtime["volumes"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .all(|mount| {
+                mount["target"].as_str() != Some("/run/sumi/local-control/control.sock")
+            }),
+        "a nested socket-file bind would pin the old API socket across reconnect"
     );
 
     assert_eq!(executor["network_mode"].as_str(), Some("none"));

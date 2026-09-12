@@ -175,6 +175,11 @@ type LocalControlServer struct {
 	extensions              map[string]localControlExtension
 }
 
+// ErrLocalRuntimeEpochTerminal proves that recovery found this exact epoch's
+// authenticated durable Shutdown record. It is prior stop authority, unlike
+// missing, mismatched, or unreadable runtime state.
+var ErrLocalRuntimeEpochTerminal = errors.New("exact runtime epoch is durably terminal")
+
 type localControlExtension struct {
 	handler       LocalAuthorizedHandler
 	stagedHandler LocalStagedAuthorizedHandler
@@ -388,6 +393,17 @@ func (s *LocalControlServer) InstallLocalRuntimeAuthorization(
 	ctx context.Context,
 	authorization LocalRuntimeAuthorization,
 ) error {
+	return s.installLocalRuntimeAuthorization(ctx, authorization, false)
+}
+
+// RecoverLocalRuntimeAuthorization restores an API attachment only when the
+// authenticated durable authority still names this exact nonterminal epoch.
+// Recovery may never initialize, advance, or revive a runtime generation.
+func (s *LocalControlServer) RecoverLocalRuntimeAuthorization(ctx context.Context, authorization LocalRuntimeAuthorization) error {
+	return s.installLocalRuntimeAuthorization(ctx, authorization, true)
+}
+
+func (s *LocalControlServer) installLocalRuntimeAuthorization(ctx context.Context, authorization LocalRuntimeAuthorization, recovering bool) error {
 	if s == nil || s.gateway == nil {
 		return errors.New("local control server is not initialized")
 	}
@@ -416,6 +432,14 @@ func (s *LocalControlServer) InstallLocalRuntimeAuthorization(
 	}
 	if state.present && state.LocalControl == nil {
 		return errors.New("existing runtime state is not owned by local control")
+	}
+	if recovering {
+		if !state.present || state.LocalControl == nil || state.Generation != normalized.Generation || state.LocalControl.RPCBootNonce != normalized.RPCBootNonce {
+			return errors.New("runtime recovery requires the exact nonterminal durable authority")
+		}
+		if state.LocalControl.Reason == LocalRuntimeShutdown {
+			return ErrLocalRuntimeEpochTerminal
+		}
 	}
 
 	// Ownership and any previous-key repair must be ready before the epoch is

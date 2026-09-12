@@ -385,6 +385,31 @@ bound each request. Gateway tokens minted through this connection retain their
 short expiry and must be refreshed on reconnect. See
 [issue #354](https://github.com/sumi-studio/sumi/issues/354).
 
+An API-only restart releases its transport and runtime monitoring ownership;
+it does not stop an established personality-agent runtime. The replacement API
+recovers the existing local-control bearer from the root provisioner for the
+exact active generation and nonce, verifies matching nonterminal durable
+authority, and then opens that agent's control socket. Recovery errors leave
+the existing compute running and are retried. The runtime keeps its Session,
+hydration receipt, generation lease, memory, and work while the gateway
+reconnects and catches up. Calls that need the unavailable API can still fail
+during the outage; this is process continuity, not uninterrupted API service.
+
+The root epoch artifact also records a fingerprint of the admitted public
+model-connection configuration. On adoption the API compares it with the
+durable current selection. An unchanged selection leaves the runtime alone;
+a changed selection uses the existing idle-only activation path after ongoing
+work finishes. Recovery never substitutes provider or wrapping credentials.
+
+The first rollout requires an idle runtime replacement: older containers bind
+the original socket inode and lack the admitted-configuration artifact.
+Keeping their process alive cannot change either property. The new deployment
+mounts the trusted agent directory read-only so the runtime can reach the API's
+replacement socket; it still verifies directory identity and socket ownership,
+permissions, and link count. Later API-only replacements preserve that runtime.
+Explicit runtime stops, real runtime failures, and terminal authorization
+revocation retain their existing lifecycle behavior.
+
 ## Workspace browser regression
 
 From `apps/web`, run the Workspace journey against a disposable, empty Postgres

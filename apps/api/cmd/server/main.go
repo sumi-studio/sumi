@@ -103,6 +103,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startChatGPTActivation()
+	app.startRuntimeRecovery()
 	app.startWarmReconciliation()
 	app.startPendingWorkReconciliation()
 	if app.spawnManager != nil {
@@ -257,6 +258,7 @@ type application struct {
 	stopBackground context.CancelFunc
 	closeOnce      sync.Once
 	closeErr       error
+	agentGateway   *agentevents.Server
 }
 
 type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
@@ -277,6 +279,9 @@ func (a *application) Close() error {
 		if a.stopBackground != nil {
 			a.stopBackground()
 		}
+		if a.spawnManager != nil {
+			a.closeErr = errors.Join(a.closeErr, a.spawnManager.DetachAll())
+		}
 		a.attentionWorkers.Wait()
 		if a.chatGPTLogin != nil {
 			a.chatGPTLogin.Close()
@@ -286,8 +291,10 @@ func (a *application) Close() error {
 			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
 			cancel()
 		}
-		if a.spawnManager != nil {
-			a.closeErr = errors.Join(a.closeErr, a.spawnManager.StopAll())
+		if a.agentGateway != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			a.closeErr = errors.Join(a.closeErr, a.agentGateway.ShutdownConnections(ctx))
+			cancel()
 		}
 		if a.localRuntimes != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -411,7 +418,7 @@ func newApplicationFromEnv() (*application, error) {
 			appStore,
 		)
 	}
-	mux, browser, _, err := agentevents.NewProductionMux(
+	mux, browser, agentGateway, err := agentevents.NewProductionMux(
 		store,
 		runtime,
 		tv,
@@ -613,7 +620,7 @@ func newApplicationFromEnv() (*application, error) {
 	if database != nil {
 		resolver = koseki.New(database.Pool)
 	}
-	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime, resolveModelActivation)
+	spawnManager, err := spawnManagerFromEnv(resolver, localControl, localRuntimes, runtime, resolveModelActivation, chatGPTActivation)
 	if err != nil {
 		if localRuntimes != nil {
 			_ = localRuntimes.Close(context.Background())
@@ -624,6 +631,7 @@ func newApplicationFromEnv() (*application, error) {
 	if spawnManager != nil {
 		if chatGPTActivation != nil {
 			chatGPTActivation.manager = spawnManager
+			chatGPTActivation.configurationCurrent = spawnManager.ConfigurationCurrent
 		}
 		browser.SetSpawner(spawnManager)
 		if processOperations != nil {
@@ -673,6 +681,7 @@ func newApplicationFromEnv() (*application, error) {
 		localListener:              localListener,
 		store:                      store,
 		browser:                    browser,
+		agentGateway:               agentGateway,
 		database:                   database,
 		spawnManager:               spawnManager,
 		pendingWorkGateway:         runtime,
@@ -2345,6 +2354,7 @@ func spawnManagerFromEnv(
 	listeners *agentevents.LocalControlListenerRegistry,
 	readiness runtimeReadinessController,
 	resolveModelActivation runtimeActivationResolver,
+	activationWorker *chatGPTActivationWorker,
 ) (*spawn.Manager, error) {
 	socketPath := strings.TrimSpace(os.Getenv("SUMI_RUNTIME_PROVISIONER_SOCKET"))
 	if socketPath == "" {
@@ -2474,6 +2484,22 @@ func spawnManagerFromEnv(
 	})
 	if err != nil {
 		return nil, err
+	}
+	if activationWorker != nil {
+		registry, ok := resolver.(warmAgentRegistry)
+		if !ok {
+			return nil, errors.New("runtime recovery requires current employer authority")
+		}
+		provisionedSpawner.config.OnRecovered = func(ctx context.Context, id string) error {
+			kind, employer, err := registry.CurrentEmployer(ctx, id)
+			if err != nil {
+				return err
+			}
+			if kind == "human" {
+				activationWorker.enqueue(employer)
+			}
+			return nil
+		}
 	}
 	idleTimeout := 5 * time.Minute
 	if v := os.Getenv("SUMI_SPAWN_IDLE_TIMEOUT"); v != "" {
