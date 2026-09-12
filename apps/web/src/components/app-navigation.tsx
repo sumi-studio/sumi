@@ -40,6 +40,7 @@ import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { ParticipantAppsMenu } from "../participant/app-menu";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 import { ModelProviderSettings } from "./model-provider-settings";
+import { EnrollmentInvitations } from "./enrollment-invitations";
 
 const THEME_OPTIONS: Array<{
   id: ThemePreference;
@@ -68,6 +69,12 @@ export function SettingsPopover() {
   const { authenticated, user, logout, updateProfile } = useAuth();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [invitationsOpen, setInvitationsOpen] = useState(false);
+  const [canInvite, setCanInvite] = useState(false);
+  useEffect(() => {
+    setCanInvite(false);
+    setInvitationsOpen(false);
+  }, [user?.id]);
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
@@ -401,6 +408,18 @@ export function SettingsPopover() {
                 ) : null}
               </form>
               <ProviderSettings humanId={user?.id ?? ""} />
+              {canInvite && (
+                <Button
+                  variant="ghost"
+                  className="w-full justify-start px-2.5"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    setInvitationsOpen(true);
+                  }}
+                >
+                  Sumiに招待する
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
@@ -434,6 +453,14 @@ export function SettingsPopover() {
           )}
         </PopoverContent>
       </Popover>
+      {authenticated && user?.id ? (
+        <EnrollmentInvitations
+          key={`invitations:${user.id}`}
+          open={invitationsOpen}
+          onOpenChange={setInvitationsOpen}
+          onCapabilityChange={setCanInvite}
+        />
+      ) : null}
       {authenticated && user?.id ? (
         <ModelProviderSettings
           key={user.id}

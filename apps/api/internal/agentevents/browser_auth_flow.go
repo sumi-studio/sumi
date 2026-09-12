@@ -9,6 +9,7 @@ import (
 )
 
 type StartBrowserAuthFlowRequest struct {
+	InviteToken  string `json:"invite_token,omitempty"`
 	Intent       string `json:"intent"`
 	Provider     string `json:"provider"`
 	Email        string `json:"email,omitempty"`
@@ -87,6 +88,7 @@ type ProviderOperationStatusResult struct {
 }
 
 var (
+	ErrBrowserEnrollmentInvite        = errors.New("enrollment invitation required")
 	ErrBrowserAuthFlowInvalid         = errors.New("invalid authentication flow")
 	ErrBrowserAuthFlowExpired         = errors.New("authentication flow expired")
 	ErrBrowserAuthFlowConsumed        = errors.New("authentication flow consumed")
@@ -113,6 +115,9 @@ type BrowserAuthFlowController interface {
 }
 
 func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAuthAllocation(w, r) {
+		return
+	}
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}
@@ -129,6 +134,9 @@ func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Re
 }
 
 func (s *BrowserAuthServer) serveResolveAuthFlow(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAuthAllocation(w, r) {
+		return
+	}
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}
@@ -160,6 +168,9 @@ func (s *BrowserAuthServer) serveResolveAuthFlow(w http.ResponseWriter, r *http.
 }
 
 func (s *BrowserAuthServer) serveConfirmAuthFlow(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAuthAllocation(w, r) {
+		return
+	}
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}
@@ -338,6 +349,8 @@ func decodeAuthJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 func writeFlowError(w http.ResponseWriter, err error) {
 	status, code := http.StatusBadRequest, "invalid_flow"
 	switch {
+	case errors.Is(err, ErrBrowserEnrollmentInvite):
+		status, code = http.StatusForbidden, "invitation_required"
 	case errors.Is(err, ErrBrowserAuthFlowExpired):
 		status, code = http.StatusGone, "flow_expired"
 	case errors.Is(err, ErrBrowserAuthFlowConsumed):

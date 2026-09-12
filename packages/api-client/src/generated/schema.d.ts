@@ -162,7 +162,7 @@ export interface paths {
         put?: never;
         /**
          * Create a single-use 24-hour opaque Workspace invite
-         * @description The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption.
+         * @description The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption. Bundled enrollment additionally requires Sumi enrollment administration; signup reserves this invitation for the new Human without joining the Workspace.
          */
         post: operations["createWorkspaceInvite"];
         delete?: never;
@@ -230,7 +230,11 @@ export interface paths {
          */
         get: operations["previewWorkspaceInvite"];
         put?: never;
-        post?: never;
+        /**
+         * Preview an invite without putting its secret in the URL
+         * @description Requires an allowed browser Origin. Does not consume either grant or reveal the bound email.
+         */
+        post: operations["previewWorkspaceInviteFromBody"];
         delete?: never;
         options?: never;
         head?: never;
@@ -541,6 +545,13 @@ export interface components {
             expires_at: string;
             /** Format: date-time */
             created_at: string;
+            enrollment_invitation?: {
+                id: components["schemas"]["UUIDv7"];
+                /** @description Enrollment secret returned only at creation. Share both secrets in the URL fragment. */
+                token: string;
+                /** Format: date-time */
+                expires_at: string;
+            };
         };
         WorkspaceCurrentAgentInviteRequest: Record<string, never>;
         WorkspaceInviteRecord: components["schemas"]["WorkspaceShareCodeInviteRecord"] | components["schemas"]["WorkspaceTargetedPersonalityAgentInviteRecord"];
@@ -569,6 +580,8 @@ export interface components {
             workspace_name: string;
             /** Format: date-time */
             expires_at: string;
+            /** @description True when explicit acceptance needs a verified email identity; the bound address is never disclosed. */
+            requires_email_verification?: boolean;
         };
         /**
          * @description Platform permission whose vocabulary and meaning are owned by Workspace.
@@ -1847,7 +1860,12 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": Record<string, never>;
+                "application/json": {
+                    /** @default false */
+                    include_enrollment?: boolean;
+                    /** @description Optional verified-email binding for bundled enrollment. */
+                    email?: string;
+                };
             };
         };
         responses: {
@@ -2006,6 +2024,35 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    previewWorkspaceInviteFromBody: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    code: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Minimal non-consuming invite preview */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceInvitePreview"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
     redeemWorkspaceInvite: {
         parameters: {
             query?: never;
@@ -2017,6 +2064,8 @@ export interface operations {
             content: {
                 "application/json": {
                     code: string;
+                    /** @description Firebase ID token required for an unreserved email-bound bundle; its verified email and UID must match the authenticated Human. */
+                    id_token?: string;
                 };
             };
         };
@@ -2033,6 +2082,13 @@ export interface operations {
             400: components["responses"]["InvalidRequest"];
             /** @description Missing, invalid, or concurrently revoked browser session */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden, or invitation_email_verification_required for missing or mismatched verified identity. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

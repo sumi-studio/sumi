@@ -47,6 +47,7 @@ var (
 )
 
 type StartAuthFlowRequest struct {
+	InviteToken      string
 	Intent           AuthIntent
 	Channel          string
 	ExpectedProvider string
@@ -57,6 +58,9 @@ type StartAuthFlowRequest struct {
 }
 
 type AuthFlow struct {
+	EnrollmentInviteID      string
+	VerifiedEmail           string
+	EmailVerified           bool
 	FlowID                  string
 	Intent                  AuthIntent
 	Channel                 string
@@ -143,30 +147,50 @@ func (s *Store) StartAuthFlow(ctx context.Context, request StartAuthFlowRequest)
 	if err != nil {
 		return AuthFlow{}, err
 	}
+	inviteID := ""
+	if request.InviteToken != "" {
+		hash, err := enrollmentTokenHash(request.InviteToken)
+		if err != nil {
+			return AuthFlow{}, err
+		}
+		// A retry of an existing flow remains recoverable after its invitation was
+		// consumed. The nonce and invitation must still identify that exact flow.
+		err = s.pool.QueryRow(ctx, `SELECT i.invite_id FROM enrollment_invites i WHERE token_hash=$1 AND (
+   (revoked_at IS NULL AND consumed_at IS NULL AND expires_at>now()) OR
+   EXISTS(SELECT 1 FROM auth_flows f WHERE f.nonce_hash=$2 AND f.enrollment_invite_id=i.invite_id))`, hash, nonceHash).Scan(&inviteID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AuthFlow{}, ErrEnrollmentInvite
+		}
+		if err != nil {
+			return AuthFlow{}, err
+		}
+	} else if request.Intent == IntentSignUp {
+		return AuthFlow{}, ErrEnrollmentInvite
+	}
 	flowID := newUUIDv7()
 	expiresAt := time.Now().UTC().Add(request.TTL)
 	var result AuthFlow
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO auth_flows
-			(flow_id, nonce_hash, intent, channel, expected_provider, normalized_email, continuation, expires_at)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8)
+			(flow_id, nonce_hash, intent, channel, expected_provider, normalized_email, continuation, expires_at, enrollment_invite_id)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, NULLIF($9,'')::uuid)
 		ON CONFLICT (nonce_hash) DO UPDATE SET nonce_hash = auth_flows.nonce_hash
 		RETURNING flow_id, intent, channel, expected_provider, COALESCE(normalized_email, ''),
 			continuation, status, COALESCE(confirmation_action, ''),
 			COALESCE(terminal_outcome, ''), COALESCE(human_id::text, ''),
-			COALESCE(personality_agent_id::text, ''), expires_at`,
+			COALESCE(personality_agent_id::text, ''), expires_at, COALESCE(enrollment_invite_id::text,'')`,
 		flowID, nonceHash, request.Intent, request.Channel, request.ExpectedProvider,
-		request.NormalizedEmail, request.Continuation, expiresAt,
+		request.NormalizedEmail, request.Continuation, expiresAt, inviteID,
 	).Scan(&result.FlowID, &result.Intent, &result.Channel, &result.ExpectedProvider,
 		&result.NormalizedEmail, &result.Continuation, &result.Status,
 		&result.ConfirmationAction, &result.TerminalOutcome, &result.HumanID,
-		&result.AgentID, &result.ExpiresAt)
+		&result.AgentID, &result.ExpiresAt, &result.EnrollmentInviteID)
 	if err != nil {
 		return AuthFlow{}, fmt.Errorf("start auth flow: %w", err)
 	}
 	// A nonce is the idempotency identity. Reusing it with changed semantics is
 	// rejected instead of accidentally continuing a different flow.
-	if result.Intent != request.Intent || result.Channel != request.Channel ||
+	if result.EnrollmentInviteID != inviteID || result.Intent != request.Intent || result.Channel != request.Channel ||
 		result.ExpectedProvider != request.ExpectedProvider ||
 		result.NormalizedEmail != request.NormalizedEmail || result.Continuation != request.Continuation {
 		return AuthFlow{}, ErrInvalidAuthFlow
@@ -272,14 +296,17 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 		case flow.Intent == IntentSignUp && !exists:
 			flow, err = s.provisionFromFlow(ctx, tx, flow, identity)
 		case flow.Intent == IntentSignIn && !exists:
+			if err := s.checkEnrollmentInviteProof(ctx, tx, flow, identity); err != nil {
+				return AuthFlow{}, err
+			}
 			flow.ConfirmationAction = ActionCreateAccount
 			flow.Status = "confirmation_required"
 			flow.VerifiedProviderSubject = identity.ProviderSubject
 			flow.VerifiedDisplayName = initialHumanDisplayName(identity.DisplayName)
 			_, err = tx.Exec(ctx, `UPDATE auth_flows SET status='confirmation_required',
 				confirmation_action=$2, firebase_uid=$3, provider_subject=NULLIF($4,''),
-				verified_display_name=NULLIF($5,''), proved_at=now() WHERE flow_id=$1`,
-				flow.FlowID, flow.ConfirmationAction, firebaseUID, identity.ProviderSubject, flow.VerifiedDisplayName)
+				verified_display_name=NULLIF($5,''), verified_email=NULLIF($6,''), email_verified=$7, proved_at=now() WHERE flow_id=$1`,
+				flow.FlowID, flow.ConfirmationAction, firebaseUID, identity.ProviderSubject, flow.VerifiedDisplayName, identity.NormalizedEmail, identity.EmailVerified)
 		case flow.Intent == IntentSignUp && exists:
 			flow.ConfirmationAction = ActionSignIn
 			flow.Status = "confirmation_required"
@@ -314,6 +341,7 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			flow, err = s.provisionFromFlow(ctx, tx, flow, VerifiedIdentity{
 				FirebaseUID: firebaseUID, SignInProvider: flow.ExpectedProvider,
 				ProviderSubject: flow.VerifiedProviderSubject, DisplayName: flow.VerifiedDisplayName,
+				NormalizedEmail: flow.VerifiedEmail, EmailVerified: flow.EmailVerified,
 			})
 		} else {
 			if !exists {
@@ -344,13 +372,13 @@ func scanAuthFlowForUpdate(ctx context.Context, tx pgx.Tx, flowID string, nonceH
 		COALESCE(confirmation_action, ''), COALESCE(terminal_outcome, ''),
 		COALESCE(human_id::text, ''), COALESCE(personality_agent_id::text, ''),
 		expires_at, COALESCE(firebase_uid, ''), COALESCE(provider_subject, ''),
-		COALESCE(verified_display_name, '') FROM auth_flows
+		COALESCE(verified_display_name, ''), COALESCE(enrollment_invite_id::text,''), COALESCE(verified_email,''), email_verified FROM auth_flows
 		WHERE flow_id=$1 AND nonce_hash=$2 FOR UPDATE`, flowID, nonceHash).Scan(
 		&flow.FlowID, &flow.Intent, &flow.Channel, &flow.ExpectedProvider,
 		&flow.NormalizedEmail, &flow.Continuation, &flow.Status,
 		&flow.ConfirmationAction, &flow.TerminalOutcome, &flow.HumanID,
 		&flow.AgentID, &flow.ExpiresAt, &firebaseUID, &flow.VerifiedProviderSubject,
-		&flow.VerifiedDisplayName)
+		&flow.VerifiedDisplayName, &flow.EnrollmentInviteID, &flow.VerifiedEmail, &flow.EmailVerified)
 	return flow, firebaseUID, err
 }
 
@@ -409,6 +437,9 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 			}
 			return AuthFlow{}, fmt.Errorf("provision confirmed Human and Secretary: %w", err)
 		}
+	}
+	if err := s.consumeEnrollmentInvite(ctx, tx, flow, identity, humanID); err != nil {
+		return AuthFlow{}, err
 	}
 	if flow.Channel == ChannelProvider {
 		if identity.ProviderSubject == "" {

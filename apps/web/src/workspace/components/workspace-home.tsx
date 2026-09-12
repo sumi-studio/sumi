@@ -17,6 +17,8 @@ import {
 } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { useAuth } from "../../auth/auth-context";
+import { buildWorkspaceInvitationLink } from "../../auth/enrollment-invitation-state";
+import { listEnrollmentInvitations } from "../../auth/enrollment-invitations";
 import { WORKSPACE_APP_RENDERERS } from "../../shell/app-descriptors";
 import { WorkspaceAPIError } from "../api-client";
 import type {
@@ -349,6 +351,23 @@ function MembersSection({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState("");
   const [failed, setFailed] = useState("");
+  const [enrollmentOwner, setEnrollmentOwner] = useState<string | null>(null);
+  const [includeEnrollment, setIncludeEnrollment] = useState(false);
+  const [recipientEmail, setRecipientEmail] = useState("");
+  useEffect(() => {
+    setIncludeEnrollment(false);
+    const controller = new AbortController();
+    if (canManage)
+      void listEnrollmentInvitations(controller.signal)
+        .then(() => {
+          if (!controller.signal.aborted) setEnrollmentOwner(userId);
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setEnrollmentOwner(null);
+        });
+    return () => controller.abort();
+  }, [canManage, userId]);
+  const canBundle = canManage && enrollmentOwner === userId;
   const targetedInvite =
     currentAgentInvite.status === "pending" ? currentAgentInvite.invite : null;
   const shareInvites = invites.filter((invite) => invite.kind === "share_code");
@@ -376,7 +395,12 @@ function MembersSection({
       if (!inviteSecret || !navigator.clipboard?.writeText) {
         throw new Error("clipboard_unavailable");
       }
-      await navigator.clipboard.writeText(inviteSecret.code);
+      await navigator.clipboard.writeText(
+        buildWorkspaceInvitationLink(
+          inviteSecret.code,
+          inviteSecret.enrollmentToken,
+        ),
+      );
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1200);
     } catch {
@@ -502,12 +526,48 @@ function MembersSection({
             className="mt-5"
             size="sm"
             disabled={!canManage || mutation !== null}
-            onClick={() => void run(createInvite)}
+            onClick={() =>
+              void run(() =>
+                createInvite(
+                  canBundle && includeEnrollment
+                    ? {
+                        includeEnrollment: true,
+                        ...(recipientEmail.trim()
+                          ? { email: recipientEmail.trim() }
+                          : {}),
+                      }
+                    : undefined,
+                ),
+              )
+            }
           >
             <Plus className="size-3.5" />
             招待を作成
           </Button>
         </div>
+        {canBundle ? (
+          <div className="mt-4 space-y-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={includeEnrollment}
+                onChange={(event) => setIncludeEnrollment(event.target.checked)}
+              />
+              Sumiを初めて使う人も登録できる招待リンクにする
+            </label>
+            {includeEnrollment ? (
+              <label className="block text-sm">
+                相手のメールアドレス（任意）
+                <input
+                  type="email"
+                  value={recipientEmail}
+                  onChange={(event) => setRecipientEmail(event.target.value)}
+                  className={INPUT_CLASS}
+                />
+              </label>
+            ) : null}
+          </div>
+        ) : null}
         {canManage && shareInvites.length === 0 ? (
           <p className="mt-4 text-muted-foreground text-xs">
             有効な招待はありません。
@@ -518,7 +578,10 @@ function MembersSection({
             {shareInvites.map((invite) => {
               const secret =
                 inviteSecret?.inviteId === invite.inviteId
-                  ? inviteSecret.code
+                  ? buildWorkspaceInvitationLink(
+                      inviteSecret.code,
+                      inviteSecret.enrollmentToken,
+                    )
                   : null;
               return (
                 <div
@@ -532,7 +595,7 @@ function MembersSection({
                   {secret ? (
                     <div className="mt-2 space-y-2">
                       <textarea
-                        aria-label="招待コード"
+                        aria-label="招待リンク"
                         readOnly
                         rows={2}
                         value={secret}

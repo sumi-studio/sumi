@@ -6,6 +6,11 @@ import { FcGoogle } from "react-icons/fc";
 import { type SignInProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
 import type { AuthIntent } from "./auth-flow-client";
+import { captureEnrollmentInvitation } from "./enrollment-invitation-state";
+import {
+  inspectEnrollmentInvitation,
+  isEnrollmentInvitationUnavailable,
+} from "./enrollment-invitations";
 
 const providers: Array<{ id: SignInProvider; label: string }> = [
   { id: "google", label: "Googleで続ける" },
@@ -28,7 +33,23 @@ export function LoginScreen() {
     sessionState,
     signIn,
   } = useAuth();
-  const [intent, setIntent] = useState<AuthIntent>("sign_in");
+  const [invitation, setInvitation] = useState(captureEnrollmentInvitation);
+  useEffect(() => {
+    const capture = () => {
+      const token = captureEnrollmentInvitation();
+      setInvitation(token);
+      if (token) setIntent("sign_up");
+    };
+    window.addEventListener("hashchange", capture);
+    return () => window.removeEventListener("hashchange", capture);
+  }, []);
+  const [invitationStatus, setInvitationStatus] = useState<
+    "checking" | "valid" | "invalid" | "error" | "none"
+  >(invitation ? "checking" : "none");
+  const [invitationAttempt, setInvitationAttempt] = useState(0);
+  const [intent, setIntent] = useState<AuthIntent>(
+    invitation ? "sign_up" : "sign_in",
+  );
   const [busy, setBusy] = useState<
     SignInProvider | "email" | "confirm" | "cancel" | null
   >(null);
@@ -36,6 +57,30 @@ export function LoginScreen() {
   const [email, setEmail] = useState("");
   const [emailSent, setEmailSent] = useState(false);
   const emailCallbackStarted = useRef(false);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: invitationAttempt explicitly retries inspection.
+  useEffect(() => {
+    if (!invitation) {
+      setInvitationStatus("none");
+      return;
+    }
+    let mounted = true;
+    setInvitationStatus("checking");
+    void inspectEnrollmentInvitation(invitation).then(
+      () => {
+        if (mounted) setInvitationStatus("valid");
+      },
+      (reason: unknown) => {
+        if (mounted)
+          setInvitationStatus(
+            isEnrollmentInvitationUnavailable(reason) ? "invalid" : "error",
+          );
+      },
+    );
+    return () => {
+      mounted = false;
+    };
+  }, [invitation, invitationAttempt]);
 
   useEffect(() => {
     if (
@@ -57,7 +102,11 @@ export function LoginScreen() {
   }, [completeEmailLink, configured, emailLinkCallbackPending, sessionState]);
 
   const handleSignIn = async (provider: SignInProvider) => {
-    if (busy || !configured) {
+    if (
+      busy ||
+      !configured ||
+      (intent === "sign_up" && invitationStatus !== "valid")
+    ) {
       return;
     }
     setBusy(provider);
@@ -73,7 +122,12 @@ export function LoginScreen() {
 
   const handleEmailLink = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || !configured) return;
+    if (
+      busy ||
+      !configured ||
+      (intent === "sign_up" && invitationStatus !== "valid")
+    )
+      return;
     setBusy("email");
     setError(null);
     setEmailSent(false);
@@ -135,7 +189,7 @@ export function LoginScreen() {
                     ? "続行方法の確認"
                     : intent === "sign_in"
                       ? "アカウントにログイン"
-                      : "アカウントを新規登録"}
+                      : "Sumiへようこそ"}
               </h1>
             </div>
 
@@ -237,25 +291,60 @@ export function LoginScreen() {
               </div>
             ) : (
               <>
-                <div className="mb-4 grid grid-cols-2 rounded-lg bg-muted p-1">
-                  {(
-                    [
-                      ["sign_in", "ログイン"],
-                      ["sign_up", "新規登録"],
-                    ] as const
-                  ).map(([value, label]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      aria-pressed={intent === value}
-                      onClick={() => setIntent(value)}
-                      disabled={busy !== null}
-                      className="rounded-md px-3 py-2 font-medium text-sm aria-pressed:bg-background aria-pressed:shadow-sm"
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
+                {invitationStatus === "valid" ? (
+                  <div className="mb-4 grid grid-cols-2 rounded-lg bg-muted p-1">
+                    {(
+                      [
+                        ["sign_in", "ログイン"],
+                        ["sign_up", "招待を受け取る"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        aria-pressed={intent === value}
+                        onClick={() => setIntent(value)}
+                        disabled={busy !== null}
+                        className="rounded-md px-3 py-2 font-medium text-sm aria-pressed:bg-background aria-pressed:shadow-sm"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p
+                    className="mb-5 text-muted-foreground text-sm leading-6"
+                    role="status"
+                  >
+                    {invitationStatus === "checking"
+                      ? "招待を確認しています…"
+                      : invitationStatus === "invalid"
+                        ? "この招待は期限切れ、取消済み、または使用済みです。招待した方に新しいリンクを依頼してください。"
+                        : invitationStatus === "error"
+                          ? "招待を確認できませんでした。接続を確認して、もう一度お試しください。"
+                          : "現在、Sumiの新規利用には招待が必要です。すでに利用している方はログインしてください。"}
+                    {invitationStatus === "error" && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setInvitationAttempt((value) => value + 1)
+                        }
+                      >
+                        再試行
+                      </Button>
+                    )}
+                    {invitationStatus === "invalid" && (
+                      <button
+                        type="button"
+                        className="mt-2 block underline underline-offset-4"
+                        onClick={() => setIntent("sign_in")}
+                      >
+                        既存のアカウントでログイン
+                      </button>
+                    )}
+                  </p>
+                )}
                 <form onSubmit={handleEmailLink} className="space-y-3">
                   <label htmlFor="sumi-auth-email" className="sr-only">
                     メールアドレス

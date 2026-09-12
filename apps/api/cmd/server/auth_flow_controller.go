@@ -47,7 +47,7 @@ func (c *kosekiAuthFlowController) Start(ctx context.Context, request agentevent
 		}
 	}
 	flow, err := c.store.StartAuthFlow(ctx, koseki.StartAuthFlowRequest{
-		Intent: koseki.AuthIntent(request.Intent), Channel: channel,
+		InviteToken: request.InviteToken, Intent: koseki.AuthIntent(request.Intent), Channel: channel,
 		ExpectedProvider: expectedProvider, NormalizedEmail: normalizedEmail,
 		Continuation: request.Continuation, Nonce: request.Nonce, TTL: authFlowTTL,
 	})
@@ -402,6 +402,8 @@ func validProviderFailureOutcome(outcome string) bool {
 
 func mapFlowError(err error) error {
 	switch {
+	case errors.Is(err, koseki.ErrEnrollmentInvite):
+		return agentevents.ErrBrowserEnrollmentInvite
 	case errors.Is(err, koseki.ErrAuthFlowExpired):
 		return agentevents.ErrBrowserAuthFlowExpired
 	case errors.Is(err, koseki.ErrAuthFlowConsumed):

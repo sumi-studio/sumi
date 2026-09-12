@@ -20,11 +20,13 @@ import (
 const maxControlPlaneRequestBytes = 64 * 1024
 
 type Server struct {
-	Store                    *Store
-	Apps                     *applicationapps.Store
-	Sessions                 agentevents.UserSessionAuthorizer
-	CurrentEmployerAuthority CurrentEmployerAuthority
-	AllowedOrigins           []string
+	EnrollmentIssuer          EnrollmentInviteIssuer
+	VerifyEnrollmentRecipient func(context.Context, agentevents.UserSessionClaims, string) (EnrollmentRecipientProof, error)
+	Store                     *Store
+	Apps                      *applicationapps.Store
+	Sessions                  agentevents.UserSessionAuthorizer
+	CurrentEmployerAuthority  CurrentEmployerAuthority
+	AllowedOrigins            []string
 	// MembershipClosed runs after a committed membership closure. It is a
 	// best-effort integration hook; durable Workspace authority never depends
 	// on an external transport succeeding.
@@ -59,6 +61,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /workspaces/{workspace_id}/invites/current-agent", s.serveCreateCurrentAgentInvite)
 	mux.HandleFunc("DELETE /workspaces/{workspace_id}/invites/{invite_id}", s.serveRevokeInvite)
 	mux.HandleFunc("GET /workspace-invites/preview", s.servePreviewInvite)
+	mux.HandleFunc("POST /workspace-invites/preview", s.servePreviewInvite)
 	mux.HandleFunc("POST /workspace-invites/redeem", s.serveRedeemInvite)
 	mux.HandleFunc("GET /workspaces/{workspace_id}/roles", s.serveRoles)
 	mux.HandleFunc("POST /workspaces/{workspace_id}/roles", s.serveCreateRole)
@@ -172,16 +175,17 @@ func roleToWire(item Role) roleWire {
 }
 
 type inviteWire struct {
-	InviteID    string    `json:"invite_id"`
-	WorkspaceID string    `json:"workspace_id"`
-	Code        string    `json:"code"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	CreatedAt   time.Time `json:"created_at"`
+	Enrollment  *EnrollmentBundleGrant `json:"enrollment_invitation,omitempty"`
+	InviteID    string                 `json:"invite_id"`
+	WorkspaceID string                 `json:"workspace_id"`
+	Code        string                 `json:"code"`
+	ExpiresAt   time.Time              `json:"expires_at"`
+	CreatedAt   time.Time              `json:"created_at"`
 }
 
 func inviteToWire(item Invite) inviteWire {
 	return inviteWire{
-		InviteID: item.InviteID, WorkspaceID: item.WorkspaceID, Code: item.Code,
+		Enrollment: item.Enrollment, InviteID: item.InviteID, WorkspaceID: item.WorkspaceID, Code: item.Code,
 		ExpiresAt: item.ExpiresAt, CreatedAt: item.CreatedAt,
 	}
 }
@@ -202,14 +206,15 @@ func inviteRecordToWire(item InviteRecord) inviteRecordWire {
 }
 
 type invitePreviewWire struct {
-	WorkspaceID   string    `json:"workspace_id"`
-	WorkspaceName string    `json:"workspace_name"`
-	ExpiresAt     time.Time `json:"expires_at"`
+	RequiresEmailVerification bool      `json:"requires_email_verification,omitempty"`
+	WorkspaceID               string    `json:"workspace_id"`
+	WorkspaceName             string    `json:"workspace_name"`
+	ExpiresAt                 time.Time `json:"expires_at"`
 }
 
 func invitePreviewToWire(item InvitePreview) invitePreviewWire {
 	return invitePreviewWire{
-		WorkspaceID: item.WorkspaceID, WorkspaceName: item.WorkspaceName,
+		RequiresEmailVerification: item.RequiresEmailVerification, WorkspaceID: item.WorkspaceID, WorkspaceName: item.WorkspaceName,
 		ExpiresAt: item.ExpiresAt,
 	}
 }
@@ -418,6 +423,10 @@ func writeAPIError(w http.ResponseWriter, status int, code string) {
 
 func writeDomainError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrInvalidEnrollmentInvitation):
+		writeAPIError(w, 400, "invalid_request")
+	case errors.Is(err, ErrInviteEmailVerification):
+		writeAPIError(w, 403, "invitation_email_verification_required")
 	case errors.Is(err, ErrNotFound), errors.Is(err, ErrRoleNotFound),
 		errors.Is(err, ErrInviteUnavailable),
 		errors.Is(err, applicationapps.ErrAppNotFound),

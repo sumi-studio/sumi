@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"os"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
+	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
 
 const (
@@ -217,6 +219,7 @@ func browserAuthServerFromEnvWithDB(
 			return nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
 		}
 		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID, directChatLifecycle...)
+		registrationStore.EnrollmentWorkspaceAuthority = workspacecontrol.New(pool)
 		bindings = newKosekiIdentityBindingResolver(registrationStore, tenantID, "firebase")
 	} else {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
@@ -285,6 +288,25 @@ func browserAuthServerFromEnvWithDB(
 	server.SessionTTL = ttl
 	if kosekiMode {
 		server.Profiles = registrationStore
+		server.EnrollmentInvitations = enrollmentInvitationAdapter{registrationStore}
+		server.EnrollmentAdmins = make(map[string]bool)
+		for _, raw := range strings.Split(os.Getenv("SUMI_ENROLLMENT_ADMIN_HUMAN_IDS"), ",") {
+			id := strings.TrimSpace(raw)
+			if id == "" {
+				continue
+			}
+			if _, err := uuid.Parse(id); err != nil {
+				return nil, false, errors.New("SUMI_ENROLLMENT_ADMIN_HUMAN_IDS must contain Human UUIDs")
+			}
+			var exists bool
+			if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM humans WHERE human_id=$1)", id).Scan(&exists); err != nil {
+				return nil, false, err
+			}
+			if !exists {
+				return nil, false, errors.New("enrollment admin Human does not exist")
+			}
+			server.EnrollmentAdmins[id] = true
+		}
 		server.Flows = newKosekiAuthFlowController(
 			registrationStore,
 			strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID")),

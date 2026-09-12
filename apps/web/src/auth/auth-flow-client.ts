@@ -1,4 +1,8 @@
 import {
+  clearEnrollmentInvitation,
+  readEnrollmentInvitation,
+} from "./enrollment-invitation-state";
+import {
   AuthAPIError,
   logoutSumiSession,
   postAuthJSON,
@@ -72,6 +76,8 @@ export async function startAuthFlow(
   if (request.provider === "email_link") {
     body.email = request.email ?? "";
   }
+  const invitation = readEnrollmentInvitation();
+  if (invitation) body.invite_token = invitation;
   const result = parseAuthFlowResult(await postAuthJSON("/auth/flows", body));
   if (result.outcome !== "proof_required") {
     throw new AuthAPIError("Invalid authentication flow response.", 0);
@@ -112,6 +118,8 @@ export async function resolveAuthFlow({
   if (result.outcome === "proof_required") {
     throw new AuthAPIError("Invalid authentication flow response.", 0);
   }
+  if (result.outcome === "signed_in" || result.outcome === "account_created")
+    clearEnrollmentInvitation();
   return result;
 }
 
@@ -149,6 +157,7 @@ export async function confirmAuthFlow({
   if (result.outcome !== "signed_in" && result.outcome !== "account_created") {
     throw new AuthAPIError("Invalid authentication flow response.", 0);
   }
+  clearEnrollmentInvitation();
   return result;
 }
 

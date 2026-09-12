@@ -20,6 +20,7 @@ export interface PendingEmailAuthFlow extends PendingAuthFlow {
   provider: "email_link";
   email: string;
   stage: "link_sent" | "firebase_complete";
+  workspaceInviteCode?: string;
   credentialRecovery?: PendingCredentialRecovery;
 }
 
@@ -235,6 +236,9 @@ function isPendingEmailFlow(value: unknown): value is PendingEmailAuthFlow {
     value.email.length <= 320 &&
     "stage" in value &&
     (value.stage === "link_sent" || value.stage === "firebase_complete") &&
+    (!("workspaceInviteCode" in value) ||
+      (typeof value.workspaceInviteCode === "string" &&
+        /^[A-Za-z0-9_-]{16,256}$/.test(value.workspaceInviteCode))) &&
     (!("credentialRecovery" in value) ||
       value.credentialRecovery === undefined ||
       isPendingCredentialRecovery(value.credentialRecovery, value.expiresAt))

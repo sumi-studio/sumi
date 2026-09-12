@@ -15,6 +15,11 @@ import {
   installationForApp,
 } from "./store";
 
+const invitationProof = vi.hoisted(() => vi.fn());
+vi.mock("./workspace-invitation-proof", () => ({
+  workspaceInvitationIdentityProof: invitationProof,
+}));
+
 const WORKSPACE_A_ID = "0198f0f4-9b72-7000-8000-000000000101";
 const WORKSPACE_B_ID = "0198f0f4-9b72-7000-8000-000000000102";
 const WORKSPACE_C_ID = "0198f0f4-9b72-7000-8000-000000000103";
@@ -397,6 +402,26 @@ describe("Workspace control store", () => {
     });
   });
 
+  it("redeems a manual email-bound invite with existing identity proof only after a challenge", async () => {
+    invitationProof.mockResolvedValueOnce("existing-proof");
+    const redeemInvite = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new WorkspaceAPIError("invitation_email_verification_required", 403),
+      )
+      .mockResolvedValueOnce(MEMBER_A);
+    const store = createWorkspaceControlStore(clientWith({ redeemInvite }));
+    store.getState().resetSession(HUMAN_ID, "binding-a");
+    await expect(store.getState().redeemInvite(INVITE_CODE)).resolves.toBe(
+      MEMBER_A,
+    );
+    expect(redeemInvite.mock.calls).toEqual([
+      [INVITE_CODE, undefined],
+      [INVITE_CODE, "existing-proof"],
+    ]);
+    expect(store.getState().selectedWorkspaceId).toBeNull();
+  });
+
   it("previews and redeems an invite without implicitly selecting its Workspace", async () => {
     const preview: WorkspaceInvitePreview = {
       workspaceId: WORKSPACE_A_ID,
@@ -424,7 +449,7 @@ describe("Workspace control store", () => {
     ).resolves.toBe(MEMBER_A);
 
     expect(previewInvite).toHaveBeenCalledWith(INVITE_CODE);
-    expect(redeemInvite).toHaveBeenCalledWith(INVITE_CODE);
+    expect(redeemInvite).toHaveBeenCalledWith(INVITE_CODE, undefined);
     expect(listWorkspaces).toHaveBeenCalledTimes(2);
     expect(store.getState()).toMatchObject({
       listStatus: "ready",

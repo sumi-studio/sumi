@@ -43,7 +43,13 @@ export interface WorkspaceMembership {
   leftAt: number | null;
 }
 
+export interface WorkspaceInviteOptions {
+  includeEnrollment?: boolean;
+  email?: string;
+}
+
 export interface WorkspaceInvite {
+  enrollmentInvitation?: { id: string; token: string; expiresAt: number };
   inviteId: string;
   workspaceId: string;
   code: string;
@@ -80,11 +86,13 @@ export type WorkspaceCurrentAgentInviteState =
     };
 
 export interface WorkspaceInviteSecret {
+  enrollmentToken?: string;
   inviteId: string;
   code: string;
 }
 
 export interface WorkspaceInvitePreview {
+  requiresEmailVerification?: boolean;
   workspaceId: string;
   workspaceName: string;
   expiresAt: number;

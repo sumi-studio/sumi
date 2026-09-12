@@ -434,6 +434,21 @@ func newApplicationFromEnv() (*application, error) {
 			messagingSessions,
 			koseki.New(database.Pool),
 		)
+		if authServer != nil {
+			workspaceStore.EnrollmentAdmin = authServer.IsEnrollmentAdmin
+			workspaceServer.EnrollmentIssuer = koseki.New(database.Pool)
+			workspaceServer.VerifyEnrollmentRecipient = func(ctx context.Context, claims agentevents.UserSessionClaims, token string) (workspacecontrol.EnrollmentRecipientProof, error) {
+				identity, err := authServer.Firebase.VerifyIDToken(ctx, token)
+				if err != nil {
+					return workspacecontrol.EnrollmentRecipientProof{}, err
+				}
+				email, err := koseki.NormalizeEmail(identity.Email)
+				if err != nil {
+					return workspacecontrol.EnrollmentRecipientProof{}, err
+				}
+				return workspacecontrol.EnrollmentRecipientProof{FirebaseUID: identity.UID, Email: email, EmailVerified: identity.EmailVerified}, nil
+			}
+		}
 		feedbackRecipients, feedbackErr := feedback.ParseRecipients(os.Getenv("SUMI_FEEDBACK_RECIPIENTS"))
 		if feedbackErr != nil {
 			log.Print("feedback destination disabled: SUMI_FEEDBACK_RECIPIENTS contains an invalid participant key")

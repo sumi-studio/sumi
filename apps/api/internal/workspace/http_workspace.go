@@ -199,16 +199,24 @@ func (s *Server) serveCreateInvite(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var request struct{}
+	var request struct {
+		IncludeEnrollment bool   `json:"include_enrollment"`
+		Email             string `json:"email,omitempty"`
+	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
 	}
 	var invite Invite
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var inviteErr error
-		invite, inviteErr = s.Store.CreateInvite(
-			r.Context(), r.PathValue("workspace_id"), actor,
-		)
+		if request.IncludeEnrollment {
+			invite, inviteErr = s.Store.CreateEnrollmentBundle(r.Context(), r.PathValue("workspace_id"), actor, request.Email, s.EnrollmentIssuer)
+		} else {
+			if request.Email != "" {
+				return ErrInviteUnavailable
+			}
+			invite, inviteErr = s.Store.CreateInvite(r.Context(), r.PathValue("workspace_id"), actor)
+		}
 		return inviteErr
 	})
 	if !done {
@@ -218,6 +226,7 @@ func (s *Server) serveCreateInvite(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, inviteToWire(invite))
 }
 
@@ -324,7 +333,21 @@ func (s *Server) serveRevokeInvite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) servePreviewInvite(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	code := r.URL.Query().Get("code")
+	if r.Method == http.MethodPost {
+		if !agentevents.BrowserOriginAllowed(r, s.AllowedOrigins) {
+			writeAPIError(w, 403, "origin_not_allowed")
+			return
+		}
+		var request struct {
+			Code string `json:"code"`
+		}
+		if !decodeStrictJSON(w, r, &request) {
+			return
+		}
+		code = request.Code
+	}
 	if code == "" || len(code) > 128 {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
@@ -343,7 +366,8 @@ func (s *Server) serveRedeemInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Code string `json:"code"`
+		Code    string `json:"code"`
+		IDToken string `json:"id_token,omitempty"`
 	}
 	if !decodeStrictJSON(w, r, &request) {
 		return
@@ -352,10 +376,23 @@ func (s *Server) serveRedeemInvite(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	var proof EnrollmentRecipientProof
+	if request.IDToken != "" {
+		if len(request.IDToken) > 16384 || s.VerifyEnrollmentRecipient == nil {
+			writeAPIError(w, 403, "invitation_email_verification_required")
+			return
+		}
+		var err error
+		proof, err = s.VerifyEnrollmentRecipient(r.Context(), claims, request.IDToken)
+		if err != nil {
+			writeAPIError(w, 403, "invitation_email_verification_required")
+			return
+		}
+	}
 	var membership Membership
 	done, err := s.browserMutation(w, r, claims, func() error {
 		var redeemErr error
-		membership, redeemErr = s.Store.RedeemInvite(r.Context(), request.Code, actor)
+		membership, redeemErr = s.Store.RedeemInviteWithEnrollmentProof(r.Context(), request.Code, actor, proof)
 		return redeemErr
 	})
 	if !done {

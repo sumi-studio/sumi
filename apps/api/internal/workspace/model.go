@@ -147,6 +147,7 @@ func (r Role) EffectiveCapabilities() PermissionSet {
 }
 
 type Invite struct {
+	Enrollment  *EnrollmentBundleGrant
 	InviteID    string
 	WorkspaceID string
 	Code        string
@@ -175,9 +176,10 @@ type InviteRecord struct {
 // unconsumed invite code reveals only enough information to make an informed
 // redemption choice; it is not a Workspace directory or membership view.
 type InvitePreview struct {
-	WorkspaceID   string
-	WorkspaceName string
-	ExpiresAt     time.Time
+	RequiresEmailVerification bool
+	WorkspaceID               string
+	WorkspaceName             string
+	ExpiresAt                 time.Time
 }
 
 // TargetedInvitation is the exact, non-secret intent visible to its target
