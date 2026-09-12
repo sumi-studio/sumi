@@ -577,6 +577,35 @@ async function verifyThemeBootstrapInBrowser(origin: string): Promise<void> {
     );
     assert.deepEqual(themeResponses, [200]);
     assert.deepEqual(cspErrors, []);
+    // Exercise the delivered CSP in Chromium. Firebase Auth loads this script
+    // for its popup/redirect helper; a same-origin-only policy breaks sign-in.
+    // Stub the script bytes so this policy check needs no external service.
+    const authScript = "https://apis.google.com/js/api.js?onload=sumiAuthProbe";
+    await page.route(authScript, (route) =>
+      route.fulfill({
+        contentType: "application/javascript",
+        body: 'document.documentElement.dataset.firebaseAuthScript = "loaded";',
+      }),
+    );
+    const authScriptLoaded = await page.evaluate(
+      (src) =>
+        new Promise<boolean>((resolveLoaded) => {
+          const script = document.createElement("script");
+          script.src = src;
+          script.onload = () => resolveLoaded(true);
+          script.onerror = () => resolveLoaded(false);
+          document.head.append(script);
+        }),
+      authScript,
+    );
+    assert.equal(authScriptLoaded, true, "CSP blocked Firebase Auth's helper");
+    assert.equal(
+      await page.evaluate(
+        () => document.documentElement.dataset.firebaseAuthScript,
+      ),
+      "loaded",
+    );
+    assert.deepEqual(cspErrors, []);
     await page.close();
     await verifyClosedTabGenericPush(browser, origin);
   } finally {
