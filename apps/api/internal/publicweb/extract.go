@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"mime"
+	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -66,7 +68,41 @@ func (b *textBuffer) writePre(raw string) {
 	b.value.WriteString(raw)
 }
 func (b *textBuffer) boundary() { b.newline = true }
+
+type linkCollector struct {
+	base      *url.URL
+	links     []Link
+	ids       map[string]int
+	bytes     int
+	truncated bool
+}
+
+func (c *linkCollector) add(raw string) int {
+	target, err := c.base.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	value := target.String()
+	if _, err := parseURL(value); err != nil {
+		return 0
+	}
+	if id := c.ids[value]; id != 0 {
+		return id
+	}
+	if len(c.links) >= MaxLinks || c.bytes+len(value) > MaxLinkURLBytes {
+		c.truncated = true
+		return 0
+	}
+	id := len(c.links) + 1
+	c.ids[value] = id
+	c.links = append(c.links, Link{ID: id, URL: value})
+	c.bytes += len(value)
+	return id
+}
 func extract(ctx context.Context, body []byte, media string) (string, *string, bool, error) {
+	return extractDocument(ctx, body, media, nil)
+}
+func extractDocument(ctx context.Context, body []byte, media string, links *linkCollector) (string, *string, bool, error) {
 	if media == "text/plain" {
 		if len(body) <= MaxTextBytes {
 			return string(body), nil, false, nil
@@ -83,6 +119,7 @@ func extract(ctx context.Context, body []byte, media string) (string, *string, b
 	ignored := ""
 	ignoredDepth := 0
 	inHead, inTitle, inPre := false, false, false
+	baseSeen := false
 	for {
 		if ctx.Err() != nil {
 			return "", nil, false, networkFailure(ctx, ctx.Err(), "fetch_failed")
@@ -90,7 +127,7 @@ func extract(ctx context.Context, body []byte, media string) (string, *string, b
 		kind := tokenizer.Next()
 		if kind == html.ErrorToken {
 			if tokenizer.Err() != io.EOF {
-				return "", nil, false, fail("unsupported_content")
+				return "", nil, false, &Failure{Code: "unsupported_content", Reason: "html_parse"}
 			}
 			break
 		}
@@ -112,11 +149,24 @@ func extract(ctx context.Context, body []byte, media string) (string, *string, b
 				}
 				continue
 			}
+			if links != nil && inHead && tag == "base" && !baseSeen {
+				for _, attr := range token.Attr {
+					if attr.Key == "href" {
+						baseSeen = true
+						if target, err := links.base.Parse(strings.TrimSpace(attr.Val)); err == nil {
+							// Resolution uses the document's base even when that
+							// scheme cannot be fetched. Validate the final link later.
+							links.base = target
+						}
+						break
+					}
+				}
+			}
 			if tag == "meta" {
 				content, httpEquiv := "", ""
 				for _, attribute := range token.Attr {
 					if attribute.Key == "charset" && !strings.EqualFold(attribute.Val, "utf-8") {
-						return "", nil, false, fail("unsupported_content")
+						return "", nil, false, &Failure{Code: "unsupported_content", Reason: "charset"}
 					}
 					if attribute.Key == "http-equiv" {
 						httpEquiv = attribute.Val
@@ -128,7 +178,17 @@ func extract(ctx context.Context, body []byte, media string) (string, *string, b
 				if strings.EqualFold(httpEquiv, "content-type") {
 					_, params, e := mime.ParseMediaType(content)
 					if e == nil && params["charset"] != "" && !strings.EqualFold(params["charset"], "utf-8") {
-						return "", nil, false, fail("unsupported_content")
+						return "", nil, false, &Failure{Code: "unsupported_content", Reason: "charset"}
+					}
+				}
+			}
+			if links != nil && !inHead && !text.truncated && tag == "a" {
+				for _, attr := range token.Attr {
+					if attr.Key == "href" {
+						if id := links.add(attr.Val); id != 0 {
+							text.write("[" + strconv.Itoa(id) + "] ")
+						}
+						break
 					}
 				}
 			}

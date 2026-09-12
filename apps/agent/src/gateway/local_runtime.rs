@@ -406,7 +406,7 @@ impl crate::apiclient::public_web::PublicWebApi for LocalControlHttpClient {
             .post_json_bounded_raw_with_timeout(
                 "/public-web/read",
                 request,
-                1024 * 1024,
+                crate::apiclient::public_web::MAX_RESPONSE_BYTES,
                 Some(Duration::from_secs(20)),
             )
             .await
@@ -4081,18 +4081,24 @@ mod tests {
                 assert_eq!(body.as_object().unwrap().len(), 1);
                 let url = body["url"].as_str().unwrap();
                 if url.ends_with("/failed") {
-                    return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"dns_failed"})));
+                    return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"dns_failed"}))).into_response();
                 }
                 let mut page = serde_json::json!({
                     "requested_url":url, "fetched_url":url.split('#').next().unwrap(),
                     "fetched_at":"2026-09-09T00:00:00Z", "status_code":200,
                     "media_type":"text/plain", "title":null,
+                    "links": (0..4).map(|i| serde_json::json!({"id":i+1,"url":format!("https://example.com/{i}?{}", "&".repeat(8100))})).collect::<Vec<_>>(),
+                    "links_truncated":false,
                     "text":format!("observed{}", "\u{0001}".repeat(128 * 1024 - 8)),
                     "body_bytes":128 * 1024, "body_sha256":"a".repeat(64), "text_truncated":false
                 });
                 if url.ends_with("/drift") { page["requested_url"] = serde_json::json!("https://other.example/"); }
                 if url.ends_with("/missing-title") { page.as_object_mut().unwrap().remove("title"); }
-                (StatusCode::OK, Json(page))
+                // Match Go encoding/json's HTML-sensitive escaping, not serde's
+                // smaller default representation.
+                let wire = serde_json::to_string(&page).unwrap().replace('&', "\\u0026");
+                if url.len() > 8000 { assert!(wire.len() > 1024 * 1024); }
+                (StatusCode::OK, [("content-type", "application/json")], wire).into_response()
             }
         ));
         let server = tokio::spawn(async move {
@@ -4134,6 +4140,12 @@ mod tests {
         assert_eq!(page.text.len(), 128 * 1024);
         assert_eq!(page.fetched_url, "https://example.com/page?q=1");
         assert_eq!(page.requested_url, "https://example.com/page?q=1#section");
+        let long_request = PublicWebRequest {
+            url: format!("https://example.com/?{}", "&".repeat(8100)),
+        };
+        let large_page = PublicWebApi::read(&client, &long_request).await.unwrap();
+        assert_eq!(large_page.links.len(), 4);
+        assert_eq!(large_page.requested_url, long_request.url);
         server.abort();
     }
 

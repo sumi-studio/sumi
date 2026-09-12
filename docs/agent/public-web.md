@@ -15,7 +15,14 @@ The reviewer cannot invoke this tool as an unreviewed read.
 
 The result includes the requested and fetched URLs, retrieval time, HTTP status,
 media type, optional title, extracted text, received-body byte count and SHA-256,
-and whether the extracted text was truncated. The hash describes the received
+and whether the extracted text was truncated. HTML anchors carry numbered `[n]`
+markers in the text and a `links` list of `{id, url}`. Relative links resolve
+against the page URL or the first base in its head; non-HTTPS bases still affect resolution, but
+non-HTTPS final targets are omitted. Repeated URLs
+share an ID. Only URLs accepted by this reader are listed; targets are not
+fetched or granted authority by extraction. Following one requires a normal
+reviewed call. Link evidence is bounded to 100 distinct URLs and 32 KiB of URL
+bytes, with `links_truncated` when that bound is reached. The hash describes the received
 body, not normalized HTML text. The durable tool result retains the observed text
 and source; it is not an archive of the complete original HTML.
 
@@ -64,3 +71,21 @@ Real-model shared acceptance is pending. The prepared opt-in probe reads
 with the answer, requests an unavailable `.invalid` name, and verifies subsequent
 conversation and reconnect without a new command. Unit-test success alone does
 not establish this journey or general browsing capability.
+
+## Diagnosing retrieval failures
+
+`unsupported_content` includes a bounded `reason`: `content_encoding`,
+`media_type`, `charset`, `invalid_utf8`, or `html_parse`. An explicit server
+`Cf-Mitigated: challenge` signal returns `access_challenge` with its HTTP status.
+An ordinary 403 remains `http_status`: it does not prove bot blocking. No
+challenge-solving, browser impersonation, response-header dumping, or automatic
+retry is performed. A challenge without this explicit signal may still be
+returned as page text; the reader does not guess from generic words in articles.
+
+Codex's [web extension](https://github.com/openai/codex/blob/main/codex-rs/ext/web-search/src/tool.rs)
+delegates to its hosted search service. Its navigable source references inform
+this reader, but Sumi does not claim access to that backend or its search index.
+
+The local-control JSON response has a separate 1,103,872-byte limit derived
+from worst-case escaping of the bounded text, links, title and two source URLs.
+The remote page body limit remains 1 MiB.

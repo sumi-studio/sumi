@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_URL_BYTES: usize = 8192;
 pub(crate) const MAX_TEXT_BYTES: usize = 128 * 1024;
+// Shared with Go publicweb: worst-case JSON escaping plus bounded metadata.
+pub(crate) const MAX_RESPONSE_BYTES: usize =
+    6 * (MAX_TEXT_BYTES + 32 * 1024 + 2 * MAX_URL_BYTES + 1024) + 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +98,16 @@ impl PublicWebRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PublicWebLink {
+    pub id: usize,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PublicWebPage {
+    pub links: Vec<PublicWebLink>,
+    pub links_truncated: bool,
     pub requested_url: String,
     pub fetched_url: String,
     pub fetched_at: DateTime<Utc>,
@@ -110,7 +122,16 @@ pub(crate) struct PublicWebPage {
 
 impl PublicWebPage {
     pub fn matches(&self, request: &PublicWebRequest) -> bool {
-        self.requested_url == request.url
+        self.links.len() <= 100
+            && self.links.iter().map(|link| link.url.len()).sum::<usize>() <= 32 * 1024
+            && self.links.iter().enumerate().all(|(index, link)| {
+                link.id == index + 1
+                    && PublicWebRequest {
+                        url: link.url.clone(),
+                    }
+                    .validate()
+            })
+            && self.requested_url == request.url
             && self.fetched_url == request.network_url()
             && (200..300).contains(&self.status_code)
             && matches!(self.media_type.as_str(), "text/html" | "text/plain")
@@ -136,6 +157,7 @@ pub(crate) enum PublicWebErrorCode {
     Timeout,
     TlsFailed,
     HttpStatus,
+    AccessChallenge,
     ResponseTooLarge,
     UnsupportedContent,
     NoReadableText,
@@ -150,8 +172,20 @@ pub(crate) enum PublicWebErrorCode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicWebContentReason {
+    ContentEncoding,
+    MediaType,
+    Charset,
+    InvalidUtf8,
+    HtmlParse,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublicWebError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PublicWebContentReason>,
     pub error: PublicWebErrorCode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_url: Option<String>,
@@ -164,6 +198,7 @@ pub(crate) struct PublicWebError {
 impl PublicWebError {
     pub fn new(error: PublicWebErrorCode) -> Self {
         Self {
+            reason: None,
             error,
             requested_url: None,
             status_code: None,
@@ -172,9 +207,11 @@ impl PublicWebError {
     }
 
     pub fn matches(&self, request: &PublicWebRequest) -> bool {
-        self.requested_url
-            .as_ref()
-            .is_none_or(|url| url == &request.url)
+        (self.reason.is_none() || self.error == PublicWebErrorCode::UnsupportedContent)
+            && self
+                .requested_url
+                .as_ref()
+                .is_none_or(|url| url == &request.url)
             && self
                 .status_code
                 .is_none_or(|status| (100..600).contains(&status))
@@ -200,6 +237,10 @@ mod tests {
             "../../../api/internal/publicweb/testdata/contract.json"
         ))
         .unwrap();
+        assert_eq!(
+            fixture["max_response_bytes"].as_u64().unwrap(),
+            MAX_RESPONSE_BYTES as u64
+        );
         for case in fixture["url_cases"].as_array().unwrap() {
             let request = PublicWebRequest {
                 url: case["url"].as_str().unwrap().into(),
@@ -220,6 +261,24 @@ mod tests {
         };
         assert!(page.matches(&request));
         assert_eq!(serde_json::to_value(page).unwrap(), fixture["success"]);
+        let linked: PublicWebPage =
+            serde_json::from_value(fixture["linked_success"].clone()).unwrap();
+        assert!(linked.matches(&request));
+        assert_eq!(
+            serde_json::to_value(&linked).unwrap(),
+            fixture["linked_success"]
+        );
+        let mut invalid = linked.clone();
+        invalid.links[0].id = 2;
+        assert!(!invalid.matches(&request));
+        invalid.links[0].id = 1;
+        invalid.links[0].url = "javascript:alert(1)".into();
+        assert!(!invalid.matches(&request));
+        for key in ["content_failure", "challenge_failure"] {
+            let error: PublicWebError = serde_json::from_value(fixture[key].clone()).unwrap();
+            assert!(error.matches(&request));
+            assert_eq!(serde_json::to_value(error).unwrap(), fixture[key]);
+        }
         let error: PublicWebError = serde_json::from_value(fixture["failure"].clone()).unwrap();
         assert!(error.matches(&request));
         assert_eq!(serde_json::to_value(error).unwrap(), fixture["failure"]);
