@@ -858,3 +858,137 @@ function captureBounded(stream: NodeJS.ReadableStream | null): void {
     }
   });
 }
+
+// Local service bindings exercise the same Fetcher boundary as VPC Services.
+// This validates workerd request/stream/WebSocket handling, not a real Tunnel.
+test("private origin binding preserves request and WebSocket in workerd", {
+  timeout: 45_000,
+}, async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "sumi-vpc-binding-"));
+  let server: ChildProcess | undefined;
+  try {
+    const port = await availablePort();
+    const config = resolve(directory, "wrangler.jsonc");
+    const originConfig = resolve(directory, "origin.jsonc");
+    await writeFile(
+      config,
+      JSON.stringify({
+        name: "sumi-vpc-test",
+        main: resolve(webDirectory, "cloudflare/worker.ts"),
+        compatibility_date: "2026-08-11",
+        compatibility_flags: [
+          "enable_request_signal",
+          "request_signal_passthrough",
+        ],
+        services: [{ binding: "SUMI_ORIGIN", service: "sumi-vpc-test-origin" }],
+      }),
+    );
+    await writeFile(
+      originConfig,
+      JSON.stringify({
+        name: "sumi-vpc-test-origin",
+        main: "origin.js",
+        compatibility_date: "2026-08-11",
+      }),
+    );
+    await writeFile(
+      resolve(directory, "origin.js"),
+      `export default { async fetch(request) {
+      if (request.headers.get("Upgrade") === "websocket") {
+        const pair = new WebSocketPair(); pair[1].accept();
+        pair[1].addEventListener("message", event => pair[1].send(event.data));
+        return new Response(null, {status:101, webSocket:pair[0]});
+      }
+      if (new URL(request.url).pathname === "/auth/redirect") return new Response(null, {status:302, headers:{Location:"https://login.example.org/"}});
+      const data = {url:request.url, method:request.method, headers:Object.fromEntries(request.headers), body:await request.text()};
+      return new Response(new ReadableStream({start(controller){ controller.enqueue(new TextEncoder().encode(JSON.stringify(data))); controller.close(); }}), {headers:{"Content-Type":"application/json", "Set-Cookie":"session=opaque; Secure; HttpOnly"}});
+    }};`,
+    );
+    server = spawn(
+      process.execPath,
+      [
+        wranglerEntry,
+        "dev",
+        "--local",
+        "--config",
+        config,
+        "--config",
+        originConfig,
+        "--ip",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--inspector-port",
+        String(await availablePort()),
+        "--log-level",
+        "error",
+        "--show-interactive-dev-session=false",
+      ],
+      {
+        cwd: directory,
+        detached: process.platform !== "win32",
+        env: { ...process.env, CI: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    captureBounded(server.stdout);
+    captureBounded(server.stderr);
+    const origin = `http://127.0.0.1:${port}`;
+    await waitUntilReady(origin, server);
+    const response = await fetch(`${origin}/auth/session?next=%2Fdirect`, {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        Cookie: "session=sent",
+        "X-Forwarded-Proto": "spoof",
+        "X-Forwarded-For": "spoof",
+      },
+      body: "hello",
+    });
+    assert.equal(response.status, 200);
+    assert.equal(
+      response.headers.get("Set-Cookie"),
+      "session=opaque; Secure; HttpOnly",
+    );
+    const result = (await response.json()) as {
+      url: string;
+      body: string;
+      headers: Record<string, string>;
+    };
+    assert.equal(result.url, `${origin}/auth/session?next=%2Fdirect`);
+    assert.equal(result.body, "hello");
+    assert.equal(result.headers.origin, origin);
+    assert.equal(result.headers.host, `127.0.0.1:${port}`);
+    assert.equal(result.headers["x-forwarded-proto"], "http");
+    assert.equal(result.headers["x-forwarded-for"], undefined);
+    assert.equal(
+      (await fetch(`${origin}/auth/redirect`, { redirect: "manual" })).status,
+      302,
+    );
+    await new Promise<void>((resolveSocket, rejectSocket) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/messaging/ws`);
+      const timeout = setTimeout(() => {
+        socket.close();
+        rejectSocket(new Error("WebSocket echo timeout"));
+      }, 5_000);
+      socket.addEventListener("open", () => socket.send("hello"));
+      socket.addEventListener("message", (event) => {
+        clearTimeout(timeout);
+        try {
+          assert.equal(event.data, "hello");
+          socket.close();
+          resolveSocket();
+        } catch (error) {
+          rejectSocket(error);
+        }
+      });
+      socket.addEventListener("error", () => {
+        clearTimeout(timeout);
+        rejectSocket(new Error("WebSocket failed"));
+      });
+    });
+  } finally {
+    if (server) await stopWrangler(server);
+    await rm(directory, { recursive: true, force: true });
+  }
+});

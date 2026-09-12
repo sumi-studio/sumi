@@ -16,6 +16,7 @@ export const originRoutes = Object.freeze({
     "/health",
     "/workspaces",
     "/app-installations",
+    "/api/model-connections",
     "/feedback/bootstrap",
     "/feedback/threads",
     "/feedback/attachments",

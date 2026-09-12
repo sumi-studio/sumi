@@ -760,3 +760,137 @@ test("model connection status and login route to the authenticated API", () => {
   }
   assert.notEqual(classifyPath("/api/unrelated"), "origin");
 });
+
+test("PWA manifest and icons are static assets, never SPA documents", () => {
+  for (const path of [
+    "/manifest.webmanifest",
+    "/icons/icon-192.png",
+    "/icons/icon-512.png",
+    "/icons/apple-touch-icon.png",
+  ]) {
+    assert.equal(classifyPath(path), "static-asset");
+  }
+});
+
+test("fixed-target VPC origin preserves public authority and streaming response without trusting proxy headers", async () => {
+  const cancellation = new AbortController();
+  const incoming = new Request(
+    "https://sumi-alpha.example.workers.dev/auth/session?next=%2Fdirect",
+    {
+      method: "POST",
+      body: "opaque body",
+      signal: cancellation.signal,
+      headers: {
+        Host: "attacker.invalid",
+        Origin: "https://sumi-alpha.example.workers.dev",
+        Cookie: "session=opaque",
+        "X-CSRF-Token": "token",
+        Forwarded: "host=attacker.invalid",
+        "X-Forwarded-Proto": "ftp",
+        "X-Forwarded-For": "spoof",
+        "X-Real-IP": "spoof",
+      },
+    },
+  );
+  const response = new Response(new ReadableStream(), {
+    headers: { "Set-Cookie": "session=next; Secure; HttpOnly" },
+  });
+  let forwarded: Request | undefined;
+  let options: RequestInit | undefined;
+  const actual = await handleRequest(
+    incoming,
+    {
+      ASSETS: { fetch: () => assert.fail("assets used") },
+      SUMI_ORIGIN: {
+        async fetch(request, init) {
+          forwarded = request;
+          options = init;
+          return response;
+        },
+      },
+    },
+    async () => assert.fail("global fetch must not handle VPC origin"),
+  );
+  assert.equal(actual, response);
+  assert.equal(
+    forwarded?.url,
+    "http://sumi-alpha.example.workers.dev/auth/session?next=%2Fdirect",
+  );
+  assert.equal(
+    forwarded?.headers.get("Host"),
+    "sumi-alpha.example.workers.dev",
+  );
+  assert.equal(
+    forwarded?.headers.get("Origin"),
+    "https://sumi-alpha.example.workers.dev",
+  );
+  assert.equal(forwarded?.headers.get("Cookie"), "session=opaque");
+  assert.equal(forwarded?.headers.get("X-CSRF-Token"), "token");
+  assert.equal(forwarded?.headers.get("X-Forwarded-Proto"), "https");
+  assert.equal(
+    forwarded?.headers.get("X-Forwarded-Host"),
+    "sumi-alpha.example.workers.dev",
+  );
+  assert.equal(forwarded?.headers.get("Forwarded"), null);
+  assert.equal(forwarded?.headers.get("X-Forwarded-For"), null);
+  assert.equal(forwarded?.headers.get("X-Real-IP"), null);
+  assert.equal(await forwarded?.text(), "opaque body");
+  assert.equal(options?.signal, incoming.signal);
+  assert.equal(options?.redirect, "manual");
+  cancellation.abort();
+  assert.equal(forwarded?.signal.aborted, true);
+  assert.equal(actual.bodyUsed, false);
+  await actual.body?.cancel();
+});
+
+test("VPC WebSocket response and HTTP redirects pass through by identity", async () => {
+  for (const response of [
+    { status: 101, webSocket: {} } as Response,
+    new Response(null, {
+      status: 302,
+      headers: { Location: "https://login.example.org" },
+    }),
+  ]) {
+    const incoming = new Request(
+      "https://sumi-alpha.example.workers.dev/messaging/ws",
+      {
+        headers: {
+          Upgrade: "websocket",
+          Origin: "https://sumi-alpha.example.workers.dev",
+        },
+      },
+    );
+    assert.equal(
+      await handleRequest(incoming, {
+        ASSETS: { fetch: () => assert.fail() },
+        SUMI_ORIGIN_PROTOCOL: "https",
+        SUMI_ORIGIN: {
+          async fetch(request) {
+            assert.equal(request.url, incoming.url);
+            assert.equal(request.headers.get("Upgrade"), "websocket");
+            return response;
+          },
+        },
+      }),
+      response,
+    );
+  }
+});
+
+test("failed VPC origin does not retry through public fetch or assets", async () => {
+  const response = await handleRequest(
+    new Request("https://sumi-alpha.example.workers.dev/auth/session"),
+    {
+      ASSETS: { fetch: () => assert.fail("asset fallback") },
+      SUMI_ORIGIN: {
+        fetch: async () => {
+          throw new Error("private service unavailable");
+        },
+      },
+    },
+    async () => assert.fail("public origin fallback"),
+  );
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(await response.json(), { error: "origin_unavailable" });
+});
