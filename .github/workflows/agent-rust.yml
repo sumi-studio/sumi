@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      RUST_BACKTRACE: 1
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -32,7 +33,7 @@ jobs:
         run: cargo +1.88.0 fmt --all -- --check
 
       - name: Run agent regressions
-        run: cargo +1.88.0 test --locked --bin sumi-agent -- --test-threads=2
+        run: cargo +1.88.0 test --locked --bin sumi-agent -- --test-threads=2 --nocapture
 
       # Actual-image Docker and real-provider scenarios are separate opt-in
       # acceptance checks. A passing unit job does not claim they ran here.
