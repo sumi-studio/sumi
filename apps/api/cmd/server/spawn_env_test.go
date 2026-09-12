@@ -35,7 +35,7 @@ func (r fakeAgentResolver) AgentWarmth(_ context.Context, agentID string) (strin
 func TestSpawnManagerFromEnvDisabledWithoutProvisioner(t *testing.T) {
 	t.Setenv("SUMI_RUNTIME_PROVISIONER_SOCKET", "")
 	t.Setenv("SUMI_AGENT_BINARY", "")
-	mgr, err := spawnManagerFromEnv(fakeAgentResolver{}, nil, nil, nil, nil)
+	mgr, err := spawnManagerFromEnv(fakeAgentResolver{}, nil, nil, nil, nil, nil)
 	if err != nil || mgr != nil {
 		t.Fatalf("disabled spawn manager: manager=%v err=%v", mgr, err)
 	}
@@ -43,7 +43,7 @@ func TestSpawnManagerFromEnvDisabledWithoutProvisioner(t *testing.T) {
 
 func TestSpawnManagerFromEnvRequiresResolver(t *testing.T) {
 	t.Setenv("SUMI_RUNTIME_PROVISIONER_SOCKET", "/run/sumi/runtime-provisioner/control.sock")
-	if _, err := spawnManagerFromEnv(nil, nil, nil, nil, nil); err == nil {
+	if _, err := spawnManagerFromEnv(nil, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected error for nil resolver")
 	}
 }
@@ -51,7 +51,7 @@ func TestSpawnManagerFromEnvRequiresResolver(t *testing.T) {
 func TestSpawnManagerFromEnvRejectsHostExecSpawner(t *testing.T) {
 	t.Setenv("SUMI_RUNTIME_PROVISIONER_SOCKET", "")
 	t.Setenv("SUMI_AGENT_BINARY", "/usr/local/bin/sumi-agent")
-	if _, err := spawnManagerFromEnv(fakeAgentResolver{}, nil, nil, nil, nil); err == nil {
+	if _, err := spawnManagerFromEnv(fakeAgentResolver{}, nil, nil, nil, nil, nil); err == nil {
 		t.Fatal("expected host ExecSpawner configuration to be rejected")
 	}
 }

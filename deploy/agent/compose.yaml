@@ -158,19 +158,11 @@ services:
         read_only: true
         volume:
           nocopy: true
-      # Preserve the PAID directory's trusted 0750 ownership while the nested
-      # exact socket-file bind below pins the validated socket inode.
+      # Keep the trusted PAID directory visible across API socket rebinding.
+      # The runtime revalidates ownership and metadata before each request.
       - type: bind
         source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}
         target: /run/sumi/local-control
-        read_only: true
-        bind:
-          create_host_path: false
-      # Bind the checked pre-existing socket itself, not its mutable host
-      # directory. Runtime receives connect-only access; no TCP route.
-      - type: bind
-        source: ${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}/control.sock
-        target: /run/sumi/local-control/control.sock
         read_only: true
         bind:
           create_host_path: false

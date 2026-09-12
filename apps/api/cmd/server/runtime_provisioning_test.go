@@ -5,9 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -77,6 +74,18 @@ func newFakeRuntimeProvisioner(recorder *provisioningRecorder) *fakeRuntimeProvi
 		recovery:       make(map[string]bool),
 		reconcileReaps: make(map[string]bool),
 	}
+}
+
+func (p *fakeRuntimeProvisioner) RecoverLocalControl(_ context.Context, request runtimeprovision.RecoverLocalControlRequest) (runtimeprovision.RecoveredLocalControl, error) {
+	p.recorder.add("recover:" + request.PersonalityAgentID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	epoch, ok := p.epochs[request.PersonalityAgentID]
+	if !ok || epoch != request.PreparedEpoch || p.recovery[request.PersonalityAgentID] || p.reconcileReaps[request.PersonalityAgentID] {
+		return runtimeprovision.RecoveredLocalControl{}, runtimeprovision.ErrConflict
+	}
+	activation := p.activations[request.PersonalityAgentID]
+	return runtimeprovision.RecoveredLocalControl{PreparedEpoch: epoch, Bearer: activation.LocalControlBearer, SelectionFingerprint: activation.SelectionFingerprint()}, nil
 }
 
 func (p *fakeRuntimeProvisioner) Prepare(_ context.Context, request runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error) {
@@ -218,7 +227,7 @@ func (p *fakeRuntimeProvisioner) Inspect(_ context.Context, request runtimeprovi
 		return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: runtimeprovision.PhaseUnknown}, nil
 	}
 	phase := runtimeprovision.PhaseActive
-	if p.recovery[request.PersonalityAgentID] {
+	if p.recovery[request.PersonalityAgentID] || p.reconcileReaps[request.PersonalityAgentID] {
 		phase = runtimeprovision.PhaseRecovery
 	}
 	return runtimeprovision.Inspection{PersonalityAgentID: request.PersonalityAgentID, Phase: phase, Epoch: &epoch}, nil
@@ -237,6 +246,10 @@ func (c *fakeAuthorizationController) InstallLocalRuntimeAuthorization(_ context
 	defer c.mu.Unlock()
 	c.current[authorization.PersonalityAgentID] = authorization
 	return nil
+}
+
+func (c *fakeAuthorizationController) RecoverLocalRuntimeAuthorization(ctx context.Context, authorization agentevents.LocalRuntimeAuthorization) error {
+	return c.InstallLocalRuntimeAuthorization(ctx, authorization)
 }
 
 func (c *fakeAuthorizationController) FenceLocalRuntimeAuthorization(_ context.Context, paid string, generation uint64, nonce string) error {
@@ -705,7 +718,7 @@ func TestProvisionedProcessMonitorPreservesRuntimeDuringObservationLoss(t *testi
 	}
 }
 
-func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t *testing.T) {
+func TestProvisionedRuntimeSpawnerAdoptsSurvivingActiveEpochAfterRestart(t *testing.T) {
 	spawner, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
 	paid := provisionedTestPAIDs[0]
 	if _, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
@@ -733,39 +746,19 @@ func TestProvisionedRuntimeSpawnerReconcilesSurvivingActiveEpochBeforeRestart(t 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := provisioner.epochs[paid].Generation; got != 1 {
-		t.Fatalf("reconciled restart generation=%d, want 1", got)
+	if got := provisioner.epochs[paid].Generation; got != 0 {
+		t.Fatalf("adopted generation=%d, want unchanged 0", got)
 	}
-	if provisioner.stops[paid] != 1 || freshAuthorizations.fences[paid] != 1 {
-		t.Fatalf("surviving active epoch was not fenced/stopped: stops=%d fences=%d", provisioner.stops[paid], freshAuthorizations.fences[paid])
+	if provisioner.stops[paid] != 0 || freshAuthorizations.fences[paid] != 0 {
+		t.Fatal("adoption retired the existing runtime")
 	}
-	activation := provisioner.activations[paid]
-	if activation.ReapAttestation == nil ||
-		activation.ReapAttestation.PersonalityAgentID != paid ||
-		activation.ReapAttestation.EpochGeneration != 1 ||
-		activation.ReapAttestation.RPCBootNonce != provisioner.epochs[paid].RPCBootNonce ||
-		activation.ReapAttestation.ReapedThroughGeneration != 0 {
-		t.Fatalf("replacement activation omitted or misbound verified reap attestation: %#v", activation.ReapAttestation)
+	if freshAuthorizations.current[paid].BearerToken != provisioner.activations[paid].LocalControlBearer {
+		t.Fatal("adoption changed the live bearer")
 	}
-	want := []string{
-		"inspect:" + paid,
-		"fence:" + paid,
-		"unlisten:" + paid,
-		"reconcile:" + paid,
-		"stop:" + paid,
-		"prepare:" + paid,
+	if !containsOrdered(recorder.calls, []string{"recover:" + paid, "authorize:" + paid, "listen:" + paid}) {
+		t.Fatalf("adoption did not authorize before listening: %v", recorder.calls)
 	}
-	// Match the second lifecycle suffix rather than the initial reconciliation.
-	secondStart := 0
-	for i, call := range recorder.calls {
-		if call == "activate:"+paid {
-			secondStart = i + 1
-			break
-		}
-	}
-	if !containsOrdered(recorder.calls[secondStart:], want) {
-		t.Fatalf("reconcile ordering mismatch: %v", recorder.calls)
-	}
+
 }
 
 func TestProvisionedRuntimeSpawnerFencesBeforeReconcileReapsActiveProjectWithOrphan(t *testing.T) {
@@ -834,6 +827,8 @@ func TestProvisionedRuntimeSpawnerRejectsTeardownWithoutObservedEmptyReceipt(t *
 		t.Fatal(err)
 	}
 	provisioner.omitReapReceipt = true
+	provisioner.recovery[paid] = true
+	provisioner.reconcileReaps[paid] = true
 	freshAuthorizations := &fakeAuthorizationController{recorder: recorder, current: make(map[string]agentevents.LocalRuntimeAuthorization), fences: make(map[string]int)}
 	freshListeners := &fakeListenerController{recorder: recorder, active: make(map[string]bool)}
 	restarted, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
@@ -857,7 +852,7 @@ func TestProvisionedRuntimeSpawnerRejectsTeardownWithoutObservedEmptyReceipt(t *
 	}
 }
 
-func TestProvisionedRuntimeSpawnerFreshProcessReconcilesThreePAIDs(t *testing.T) {
+func TestProvisionedRuntimeSpawnerFreshProcessAdoptsThreePAIDs(t *testing.T) {
 	first, provisioner, _, _, recorder := newProvisioningTestSpawner(t)
 	for _, paid := range provisionedTestPAIDs {
 		if _, err := first.Spawn(context.Background(), spawn.AgentRuntimeConfig{
@@ -884,100 +879,9 @@ func TestProvisionedRuntimeSpawnerFreshProcessReconcilesThreePAIDs(t *testing.T)
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if provisioner.epochs[paid].Generation != 1 || provisioner.stops[paid] != 1 || freshAuthorizations.fences[paid] != 1 || !freshListeners.active[paid] {
+		if provisioner.epochs[paid].Generation != 0 || provisioner.stops[paid] != 0 || freshAuthorizations.fences[paid] != 0 || !freshListeners.active[paid] {
 			t.Fatalf("fresh-process reconcile failed for %s: epoch=%#v stops=%d fences=%d listener=%v", paid, provisioner.epochs[paid], provisioner.stops[paid], freshAuthorizations.fences[paid], freshListeners.active[paid])
 		}
-	}
-}
-
-func TestProvisionedRuntimeSpawnerReconcileUsesFreshDurableControlPlaneAndListenerRegistry(t *testing.T) {
-	recorder := &provisioningRecorder{}
-	provisioner := newFakeRuntimeProvisioner(recorder)
-	commandDir := t.TempDir()
-	runtimeDir := privateRuntimeDir(t)
-	root, err := os.MkdirTemp("/tmp", "lc-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	if err := os.Chmod(root, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	newProcessSide := func() (*agentevents.CommandStore, *agentevents.LocalControlServer, *agentevents.LocalControlListenerRegistry) {
-		store, err := agentevents.OpenCommandStore(commandDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		gateway, err := agentevents.OpenDurableGateway(runtimeDir, store)
-		if err != nil {
-			t.Fatal(err)
-		}
-		control, err := agentevents.NewLocalControlServer(gateway, []byte("fresh-process-signing-secret-32-bytes"), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		registry, err := agentevents.NewLocalControlListenerRegistry(control, agentevents.LocalControlListenerRegistryConfig{
-			RootDir: root, SocketGID: os.Getegid(),
-			OpenListener: func(socketPath string, _ int, _ string) (net.Listener, error) {
-				if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return nil, err
-				}
-				listener, err := net.Listen("unix", socketPath)
-				if err == nil {
-					err = os.Chmod(socketPath, 0o660)
-				}
-				return listener, err
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return store, control, registry
-	}
-	newSpawner := func(control *agentevents.LocalControlServer, registry *agentevents.LocalControlListenerRegistry) *provisionedRuntimeSpawner {
-		spawner, err := newProvisionedRuntimeSpawner(provisionedRuntimeSpawnerConfig{
-			Provisioner: provisioner, Authorizations: control, Listeners: registry,
-			Readiness: &fakeRuntimeReadiness{ready: true},
-			TenantID:  "tenant", Audience: agentevents.DefaultAgentAudience(), Delivery: agentevents.LocalDeliveryRaw,
-			LifecycleTimeout: time.Second, TeardownTimeout: time.Second,
-			Activation: runtimeprovision.ActivationConfig{LocalControlServerUID: uint32(os.Geteuid() + 1), LocalControlSocketGID: uint32(os.Getegid() + 1), AgentWrappingKeyID: "key", ApprovalSecretDigestKey: provisionedTestApprovalKey, ProviderAPIKey: "provider", ExecutionReviewerAPIKey: "execution-reviewer-key", ExecutionReviewerModelPreset: "kimi-k3", EscalationReviewerAPIKey: "escalation-reviewer-key", EscalationReviewerModelPreset: "glm-5.2"},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return spawner
-	}
-	paid := provisionedTestPAIDs[0]
-	firstStore, firstControl, firstRegistry := newProcessSide()
-	if _, err := newSpawner(firstControl, firstRegistry).Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := firstRegistry.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := firstStore.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	secondStore, secondControl, secondRegistry := newProcessSide()
-	defer secondStore.Close()
-	defer secondRegistry.Close(context.Background())
-	if _, err := newSpawner(secondControl, secondRegistry).Spawn(context.Background(), spawn.AgentRuntimeConfig{
-		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if provisioner.epochs[paid].Generation != 1 || provisioner.stops[paid] != 1 {
-		t.Fatalf("fresh process did not reconcile host epoch: epoch=%#v stops=%d", provisioner.epochs[paid], provisioner.stops[paid])
-	}
-	socketPath, err := agentevents.LocalControlSocketPath(root, paid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info, err := os.Stat(filepath.Clean(socketPath)); err != nil || info.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("fresh registry did not bind replacement socket: info=%v err=%v", info, err)
 	}
 }
 

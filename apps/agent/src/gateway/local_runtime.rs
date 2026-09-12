@@ -608,27 +608,16 @@ struct TrustedUnixEndpoint {
     path: PathBuf,
     expected_server_uid: u32,
     expected_socket_gid: u32,
-    identity: UnixEndpointIdentity,
+    identity: UnixParentIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct UnixEndpointIdentity {
+struct UnixParentIdentity {
     parent_dev: u64,
     parent_ino: u64,
-    parent_nlink: u64,
     parent_uid: u32,
     parent_gid: u32,
     parent_mode: u32,
-    parent_ctime: i64,
-    parent_ctime_nsec: i64,
-    socket_dev: u64,
-    socket_ino: u64,
-    socket_nlink: u64,
-    socket_uid: u32,
-    socket_gid: u32,
-    socket_mode: u32,
-    socket_ctime: i64,
-    socket_ctime_nsec: i64,
 }
 
 impl fmt::Debug for LocalControlHttpClient {
@@ -960,9 +949,9 @@ impl LocalControlHttpClient {
         if let Some(endpoint) = unix_endpoint {
             // reqwest's sealed Unix connector accepts only a path and does not
             // expose the connected stream for SO_PEERCRED validation. Recheck
-            // the original identity at the last synchronous point before
-            // execute(); the 0750 parent remains mutable only by its trusted
-            // owner during the remaining connect syscall window.
+            // the pinned parent and current socket at the last synchronous
+            // point before execute(); the 0750 parent remains mutable only by
+            // its trusted owner during the remaining connect syscall window.
             endpoint.revalidate()?;
         }
         let response = http
@@ -3263,13 +3252,17 @@ fn validate_unix_socket_path(
 
 impl TrustedUnixEndpoint {
     fn revalidate(&self) -> Result<()> {
+        // API restart replaces the socket inode and changes directory ctime.
+        // Trust the stable service-owned directory, not that one socket's
+        // lifetime. Inspection still validates the new socket's ownership,
+        // permissions, type and link count before any credential is sent.
         let current = inspect_unix_socket_identity(
             &self.path,
             self.expected_server_uid,
             self.expected_socket_gid,
         )?;
         if current != self.identity {
-            bail!("local control Unix socket identity changed after client construction");
+            bail!("local control Unix socket parent identity changed after client construction");
         }
         Ok(())
     }
@@ -3279,7 +3272,7 @@ fn inspect_unix_socket_identity(
     value: &Path,
     expected_server_uid: u32,
     expected_socket_gid: u32,
-) -> Result<UnixEndpointIdentity> {
+) -> Result<UnixParentIdentity> {
     let parent = value
         .parent()
         .context("local control Unix socket must have a parent")?;
@@ -3323,23 +3316,12 @@ fn inspect_unix_socket_identity(
     if euid != socket_metadata.uid() && !process_has_group(socket_metadata.gid())? {
         bail!("local control Unix socket group is not assigned to this runtime");
     }
-    Ok(UnixEndpointIdentity {
+    Ok(UnixParentIdentity {
         parent_dev: parent_metadata.dev(),
         parent_ino: parent_metadata.ino(),
-        parent_nlink: parent_metadata.nlink(),
         parent_uid: parent_metadata.uid(),
         parent_gid: parent_metadata.gid(),
         parent_mode: parent_metadata.mode(),
-        parent_ctime: parent_metadata.ctime(),
-        parent_ctime_nsec: parent_metadata.ctime_nsec(),
-        socket_dev: socket_metadata.dev(),
-        socket_ino: socket_metadata.ino(),
-        socket_nlink: socket_metadata.nlink(),
-        socket_uid: socket_metadata.uid(),
-        socket_gid: socket_metadata.gid(),
-        socket_mode: socket_metadata.mode(),
-        socket_ctime: socket_metadata.ctime(),
-        socket_ctime_nsec: socket_metadata.ctime_nsec(),
     })
 }
 
@@ -5132,7 +5114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_epoch_control_credential_remints_on_reconnect_and_obeys_server_revocation() {
+    async fn unix_epoch_control_credential_survives_api_socket_rebind_and_obeys_revocation() {
         let directory = TestSocketDir::new();
         let socket_path = directory.socket("control.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -5142,7 +5124,9 @@ mod tests {
         )
         .unwrap();
 
+        let restart_socket_path = socket_path.clone();
         let server = tokio::spawn(async move {
+            let mut listener = listener;
             let mut previous_request_id = None;
             for attempt in 0..3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -5159,6 +5143,19 @@ mod tests {
                 assert_eq!(request.audience, LOCAL_AGENT_AUDIENCE);
                 assert_ne!(previous_request_id.as_ref(), Some(&request.request_id));
                 previous_request_id = Some(request.request_id.clone());
+                if attempt == 0 {
+                    // The API restarts under its original service account. Keep
+                    // the runtime and its credential provider alive across an
+                    // actual unlink/bind of the control endpoint.
+                    drop(listener);
+                    std::fs::remove_file(&restart_socket_path).unwrap();
+                    listener = tokio::net::UnixListener::bind(&restart_socket_path).unwrap();
+                    std::fs::set_permissions(
+                        &restart_socket_path,
+                        std::fs::Permissions::from_mode(TRUSTED_UNIX_SOCKET_MODE),
+                    )
+                    .unwrap();
+                }
                 if attempt == 2 {
                     stream
                         .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
@@ -5302,7 +5299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_client_rejects_socket_replacement_before_sending_bearer_or_body() {
+    async fn unix_client_rejects_parent_replacement_before_sending_bearer_or_body() {
         let directory = TestSocketDir::new();
         let socket_path = directory.socket("control.sock");
         let original = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -5326,9 +5323,14 @@ mod tests {
         .unwrap();
 
         drop(original);
-        let old_inode = directory.socket("old-inode.sock");
-        std::fs::hard_link(&socket_path, &old_inode).unwrap();
-        std::fs::remove_file(&socket_path).unwrap();
+        let old_directory = TestSocketDir(directory.0.with_extension("old"));
+        std::fs::rename(&directory.0, &old_directory.0).unwrap();
+        std::fs::create_dir(&directory.0).unwrap();
+        std::fs::set_permissions(
+            &directory.0,
+            std::fs::Permissions::from_mode(TRUSTED_UNIX_PARENT_MODE),
+        )
+        .unwrap();
         let replacement = tokio::net::UnixListener::bind(&socket_path).unwrap();
         std::fs::set_permissions(
             &socket_path,

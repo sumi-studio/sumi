@@ -61,10 +61,24 @@ var ErrCleanupIncomplete = errors.New("runtime cleanup incomplete")
 // contain private configuration and must not be written to process logs.
 var ErrRuntimeEpochLost = errors.New("runtime left its active epoch")
 
+// ErrRuntimeDetached ends API observation without claiming physical process exit.
+var ErrRuntimeDetached = errors.New("runtime observation detached")
+
 // Process represents a running agent process.
 type Process interface {
 	Wait() error
 	Stop() error
+}
+
+// DetachedProcess is owned by an external runtime service. Detach only joins
+// this API's observation; Stop remains the explicit physical stop operation.
+type DetachedProcess interface {
+	Process
+	Detach() error
+}
+
+type RuntimeRestorer interface {
+	Restore(context.Context, AgentRuntimeConfig) (Process, error)
 }
 
 // ProcessSpawner starts an agent process for the given config. The context
@@ -106,16 +120,17 @@ type Config struct {
 
 // Manager owns the per-agent runtime lifecycle.
 type Manager struct {
-	cfg      Config
-	mu       sync.Mutex
-	running  map[string]*agentRuntime
-	starting map[string]*startAttempt
-	stopping map[string]*stopAttempt
-	closing  bool
-	now      func() time.Time
-	idleStop time.Duration
-	stopWait time.Duration
-	skip     map[string]bool
+	cfg       Config
+	mu        sync.Mutex
+	running   map[string]*agentRuntime
+	starting  map[string]*startAttempt
+	stopping  map[string]*stopAttempt
+	closing   bool
+	detaching bool
+	now       func() time.Time
+	idleStop  time.Duration
+	stopWait  time.Duration
+	skip      map[string]bool
 }
 
 type agentRuntime struct {
@@ -212,7 +227,28 @@ func (m *Manager) EnsureRunning(ctx context.Context, agentID string) error {
 	return m.ensureRunning(ctx, agentID, false)
 }
 
+// RestoreRunning adopts an existing external runtime without creating one.
+func (m *Manager) RestoreRunning(ctx context.Context, agentID string) error {
+	return m.ensureRuntime(ctx, agentID, false, true)
+}
+
+func (m *Manager) ConfigurationCurrent(ctx context.Context, agentID string) (bool, error) {
+	if !m.Running(agentID) {
+		return false, nil
+	}
+	if checker, ok := m.cfg.Spawner.(interface {
+		ConfigurationCurrent(context.Context, string) (bool, error)
+	}); ok {
+		return checker.ConfigurationCurrent(ctx, agentID)
+	}
+	return true, nil
+}
+
 func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bool) error {
+	return m.ensureRuntime(ctx, agentID, warmOnly, false)
+}
+
+func (m *Manager) ensureRuntime(ctx context.Context, agentID string, warmOnly, restoreOnly bool) error {
 	for {
 		m.mu.Lock()
 		if m.closing {
@@ -243,7 +279,7 @@ func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bo
 				}
 				continue
 			}
-			if !warmOnly {
+			if !warmOnly && !restoreOnly {
 				rt.lastActive = m.now()
 				rt.activityRevision++
 			}
@@ -272,7 +308,7 @@ func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bo
 		m.starting[agentID] = attempt
 		m.mu.Unlock()
 
-		runtime, err := m.startRuntime(startContext, agentID, warmOnly)
+		runtime, err := m.startRuntime(startContext, agentID, warmOnly, restoreOnly)
 		cancelStart()
 		m.mu.Lock()
 		if !m.closing {
@@ -288,12 +324,13 @@ func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bo
 			}
 			return err
 		}
+		detaching := m.detaching
 		m.mu.Unlock()
 
-		// StopAll won the publication race. A spawner that returned success after
-		// manager cancellation must not escape shutdown or become available for work.
+		// API shutdown won publication. Release this controller's ownership using
+		// the chosen detach/stop mode; late completion cannot reopen admission.
 		if runtime != nil {
-			if stopErr := runtime.process.Stop(); stopErr != nil {
+			if stopErr := releaseProcess(runtime.process, detaching); stopErr != nil {
 				attempt.cleanupErr = fmt.Errorf("stop late agent %s: %w", agentID, stopErr)
 			}
 		}
@@ -310,7 +347,7 @@ func (m *Manager) ensureRunning(ctx context.Context, agentID string, warmOnly bo
 	}
 }
 
-func (m *Manager) startRuntime(ctx context.Context, agentID string, warmOnly bool) (*agentRuntime, error) {
+func (m *Manager) startRuntime(ctx context.Context, agentID string, warmOnly, restoreOnly bool) (*agentRuntime, error) {
 	warmth, err := m.cfg.Resolver.AgentWarmth(ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve warmth for %s: %w", agentID, err)
@@ -320,6 +357,17 @@ func (m *Manager) startRuntime(ctx context.Context, agentID string, warmOnly boo
 	}
 	if warmOnly && warmth != WarmthWarm {
 		return nil, nil
+	}
+	if restoreOnly {
+		restorer, ok := m.cfg.Spawner.(RuntimeRestorer)
+		if !ok {
+			return nil, nil
+		}
+		process, err := restorer.Restore(ctx, AgentRuntimeConfig{AgentID: agentID, Warmth: warmth, GatewayURL: m.cfg.GatewayURL})
+		if err != nil || process == nil {
+			return nil, err
+		}
+		return &agentRuntime{process: process, lastActive: m.now(), warmth: warmth}, nil
 	}
 	wrappingKey, err := m.cfg.Resolver.AgentWrappingKey(ctx, agentID)
 	if err != nil {
@@ -368,6 +416,8 @@ func (m *Manager) watchRuntime(agentID string, runtime *agentRuntime) {
 
 func runtimeEndReason(err error, requested bool) string {
 	switch {
+	case errors.Is(err, ErrRuntimeDetached):
+		return "api_detached"
 	case errors.Is(err, ErrRuntimeEpochLost):
 		return "active_epoch_lost"
 	case errors.Is(err, ErrCleanupIncomplete):
@@ -582,8 +632,29 @@ func (m *Manager) Warmth(agentID string) string {
 // spawner that returns success after the wait bound is still fenced by the
 // closing state: its process is stopped instead of being registered.
 func (m *Manager) StopAll() error {
+	return m.close(false)
+}
+
+// DetachAll closes API admission and joins external runtime observations while
+// leaving established work and its durable authorization epoch intact.
+func (m *Manager) DetachAll() error {
+	return m.close(true)
+}
+
+func releaseProcess(process Process, detach bool) error {
+	if detach {
+		if external, ok := process.(DetachedProcess); ok {
+			return external.Detach()
+		}
+		return errors.New("runtime does not support detachment")
+	}
+	return process.Stop()
+}
+
+func (m *Manager) close(detach bool) error {
 	m.mu.Lock()
 	m.closing = true
+	m.detaching = detach
 	ids := make([]string, 0, len(m.running))
 	for id := range m.running {
 		ids = append(ids, id)
@@ -603,7 +674,18 @@ func (m *Manager) StopAll() error {
 	}
 	var errs []error
 	for _, id := range ids {
-		if err := m.Stop(id); err != nil {
+		var err error
+		if detach {
+			m.mu.Lock()
+			rt := m.running[id]
+			m.mu.Unlock()
+			if rt != nil {
+				err = releaseProcess(rt.process, true)
+			}
+		} else {
+			err = m.Stop(id)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("stop agent %s: %w", id, err))
 		}
 	}

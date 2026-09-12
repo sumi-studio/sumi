@@ -753,6 +753,7 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 	values := map[string]string{
 		"SUMI_GATEWAY_URL":                           config.GatewayURL,
 		"SUMI_LOCAL_CONTROL_BEARER":                  config.LocalControlBearer,
+		"SUMI_RUNTIME_SELECTION_FINGERPRINT":         config.SelectionFingerprint(),
 		"SUMI_LOCAL_CONTROL_SERVER_UID":              fmt.Sprint(config.LocalControlServerUID),
 		"SUMI_LOCAL_CONTROL_SOCKET_GID":              fmt.Sprint(config.LocalControlSocketGID),
 		"SUMI_AGENT_WRAPPING_KEY":                    config.AgentWrappingKey,
@@ -878,7 +879,7 @@ func (backend *DockerBackend) run(ctx context.Context, action, personalityAgentI
 	// caller disconnect. A bounded daemon-owned context lets the caller retry
 	// and recover the committed epoch instead of killing Compose mid-allocation.
 	operationParent := context.WithoutCancel(ctx)
-	if action == "inspect-epoch" {
+	if action == "inspect-epoch" || action == "recover-local-control" {
 		// Observation owns no lifecycle transition. Do not leave abandoned
 		// inspections running and holding the per-PA lock after caller timeout.
 		operationParent = ctx
@@ -905,6 +906,7 @@ var reservedEnvironment = map[string]bool{
 }
 
 var allowedActivationEnvironment = map[string]bool{
+	"SUMI_RUNTIME_SELECTION_FINGERPRINT":           true,
 	"SUMI_MODEL_REASONING_EFFORT":                  true,
 	"SUMI_MODEL_ACCOUNT_SCOPE":                     true,
 	"SUMI_CHATGPT_CONNECTION_ID":                   true,

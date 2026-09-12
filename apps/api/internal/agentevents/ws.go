@@ -189,6 +189,9 @@ type Server struct {
 	connections   map[string]*agentConnectionEpoch
 	attempts      map[string]uint64
 	nextAttempt   uint64
+	closing       bool
+	handlers      map[*websocket.Conn]context.CancelFunc
+	handlerWait   sync.WaitGroup
 }
 
 type agentConnectionEpoch struct {
@@ -291,7 +294,15 @@ func NewServerWithTokenVerifier(tv TokenVerifier) *Server {
 
 // ServeHTTP implements http.Handler for GET /agent/ws.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	s.connectionsMu.Lock()
+	closing := s.closing
+	s.connectionsMu.Unlock()
+	if closing {
+		http.Error(w, "gateway is restarting", http.StatusServiceUnavailable)
+		return
+	}
 
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
@@ -314,6 +325,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	s.connectionsMu.Lock()
+	if s.closing {
+		s.connectionsMu.Unlock()
+		return
+	}
+	if s.handlers == nil {
+		s.handlers = make(map[*websocket.Conn]context.CancelFunc)
+	}
+	s.handlers[conn] = cancel
+	s.handlerWait.Add(1)
+	s.connectionsMu.Unlock()
+	defer func() {
+		s.connectionsMu.Lock()
+		delete(s.handlers, conn)
+		s.connectionsMu.Unlock()
+		s.handlerWait.Done()
+	}()
 
 	if err := s.run(ctx, conn, claims); err != nil {
 		if !errors.Is(err, context.Canceled) {
@@ -324,6 +352,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "gateway closed"),
 			s.writeDeadline())
+	}
+}
+
+// ShutdownConnections drains this API's transport ownership. Runtime Ready,
+// generation, and credentials remain valid for reconnect to the next API.
+func (s *Server) ShutdownConnections(ctx context.Context) error {
+	s.connectionsMu.Lock()
+	s.closing = true
+	for conn, cancel := range s.handlers {
+		cancel()
+		_ = conn.Close()
+	}
+	s.connectionsMu.Unlock()
+	done := make(chan struct{})
+	go func() { s.handlerWait.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

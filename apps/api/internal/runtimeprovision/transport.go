@@ -36,6 +36,18 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		return
 	}
 	switch request.URL.Path {
+	case "/v1/recover-local-control":
+		var input RecoverLocalControlRequest
+		if !decodeRequest(response, request, &input) {
+			return
+		}
+		recovered, err := handler.service.RecoverLocalControl(request.Context(), input)
+		if err != nil {
+			writeServiceError(response, err)
+			return
+		}
+		response.Header().Set("Cache-Control", "no-store")
+		writeJSON(response, http.StatusOK, recovered)
 	case "/v1/prepare":
 		var input PrepareRequest
 		if !decodeRequest(response, request, &input) {

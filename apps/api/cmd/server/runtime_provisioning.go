@@ -26,11 +26,13 @@ type runtimeProvisioner interface {
 	Inspect(context.Context, runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error)
 	Stop(context.Context, runtimeprovision.StopRequest) (runtimeprovision.Inspection, error)
 	Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error)
+	RecoverLocalControl(context.Context, runtimeprovision.RecoverLocalControlRequest) (runtimeprovision.RecoveredLocalControl, error)
 }
 
 type localRuntimeAuthorizationController interface {
 	InstallLocalRuntimeAuthorization(context.Context, agentevents.LocalRuntimeAuthorization) error
 	FenceLocalRuntimeAuthorization(context.Context, string, uint64, string) error
+	RecoverLocalRuntimeAuthorization(context.Context, agentevents.LocalRuntimeAuthorization) error
 }
 
 type localRuntimeListenerController interface {
@@ -55,13 +57,16 @@ type provisionedRuntimeSpawnerConfig struct {
 	StartupReadyTimeout time.Duration
 	Activation          runtimeprovision.ActivationConfig
 	ResolveActivation   runtimeActivationResolver
+	OnRecovered         func(context.Context, string) error
 }
 
 // provisionedRuntimeSpawner is the only production lazy-spawn implementation.
 // It cannot execute host processes or reach Docker: its sole host capability is
 // the typed root-provisioner Unix protocol.
 type provisionedRuntimeSpawner struct {
-	config provisionedRuntimeSpawnerConfig
+	config      provisionedRuntimeSpawnerConfig
+	selectionMu sync.Mutex
+	selections  map[string]string
 }
 
 func newProvisionedRuntimeSpawner(config provisionedRuntimeSpawnerConfig) (*provisionedRuntimeSpawner, error) {
@@ -84,7 +89,7 @@ func newProvisionedRuntimeSpawner(config provisionedRuntimeSpawnerConfig) (*prov
 	if config.StartupReadyTimeout <= 0 {
 		config.StartupReadyTimeout = defaultProvisionedStartupReadyTimeout
 	}
-	return &provisionedRuntimeSpawner{config: config}, nil
+	return &provisionedRuntimeSpawner{config: config, selections: make(map[string]string)}, nil
 }
 
 func (s *provisionedRuntimeSpawner) Spawn(
@@ -93,6 +98,9 @@ func (s *provisionedRuntimeSpawner) Spawn(
 ) (spawn.Process, error) {
 	if err := runtimeprovision.ValidatePersonalityAgentID(config.AgentID); err != nil {
 		return nil, err
+	}
+	if process, err := s.Restore(ctx, config); err != nil || process != nil {
+		return process, err
 	}
 	if err := runtimeprovision.ValidateAgentWrappingKey(config.WrappingKey.Bytes); err != nil {
 		return nil, err
@@ -232,7 +240,14 @@ func (s *provisionedRuntimeSpawner) Spawn(
 	if err := s.awaitRuntimeReady(ctx, epoch); err != nil {
 		return nil, retireActive(fmt.Errorf("runtime failed startup readiness: %w", err))
 	}
+	s.selectionMu.Lock()
+	s.selections[epoch.PersonalityAgentID] = activation.SelectionFingerprint()
+	s.selectionMu.Unlock()
 
+	return s.process(epoch), nil
+}
+
+func (s *provisionedRuntimeSpawner) process(epoch runtimeprovision.PreparedEpoch) *provisionedProcess {
 	return &provisionedProcess{
 		provisioner:     s.config.Provisioner,
 		authorizations:  s.config.Authorizations,
@@ -242,7 +257,86 @@ func (s *provisionedRuntimeSpawner) Spawn(
 		teardownTimeout: s.config.TeardownTimeout,
 		monitorInterval: 5 * time.Second,
 		done:            make(chan struct{}),
-	}, nil
+	}
+}
+
+// Restore never fences or retires a live process on recovery failure. The root
+// service remains its physical owner while the next API attempt can retry.
+func (s *provisionedRuntimeSpawner) Restore(ctx context.Context, config spawn.AgentRuntimeConfig) (spawn.Process, error) {
+	inspection, err := s.config.Provisioner.Inspect(ctx, runtimeprovision.InspectRequest{
+		Version: runtimeprovision.ProtocolVersion, PersonalityAgentID: config.AgentID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("inspect runtime for API attachment: %w", err)
+	}
+	if inspection.Phase != runtimeprovision.PhaseActive {
+		return nil, nil
+	}
+	if inspection.Epoch == nil || inspection.PersonalityAgentID != config.AgentID {
+		return nil, errors.New("runtime attachment inspection has no coherent epoch")
+	}
+	epoch := *inspection.Epoch
+	recovered, err := s.config.Provisioner.RecoverLocalControl(ctx, runtimeprovision.RecoverLocalControlRequest{
+		Version: runtimeprovision.ProtocolVersion, PreparedEpoch: epoch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("recover active runtime attachment: %w", err)
+	}
+	if recovered.PreparedEpoch != epoch || recovered.SelectionFingerprint == "" {
+		return nil, errors.New("runtime attachment has no exact admitted configuration")
+	}
+	if err := s.config.Authorizations.RecoverLocalRuntimeAuthorization(ctx, agentevents.LocalRuntimeAuthorization{
+		BearerToken: recovered.Bearer, TenantID: s.config.TenantID,
+		PersonalityAgentID: epoch.PersonalityAgentID, Generation: epoch.Generation,
+		RPCBootNonce: epoch.RPCBootNonce, Audience: s.config.Audience,
+		DeliveryAuthorization: s.config.Delivery,
+	}); err != nil {
+		if errors.Is(err, agentevents.ErrLocalRuntimeEpochTerminal) {
+			// The previous API already committed an exact terminal stop fence.
+			// Finish only that physical cleanup; never reinterpret an arbitrary
+			// recovery failure as authority to stop established work.
+			if stopErr := s.process(epoch).Stop(); stopErr != nil {
+				return nil, fmt.Errorf("finish durably requested runtime stop: %w", stopErr)
+			}
+			return nil, nil
+		}
+		return nil, fmt.Errorf("restore runtime authority: %w", err)
+	}
+	// The bearer and durable generation are installed before the socket is
+	// reachable; no reconnect sees an empty authorization registry.
+	if err := s.config.Listeners.EnsureLocalRuntime(config.AgentID); err != nil {
+		return nil, fmt.Errorf("restore runtime listener: %w", err)
+	}
+	if err := s.requireExactActiveEpoch(ctx, epoch); err != nil {
+		return nil, err
+	}
+	s.selectionMu.Lock()
+	s.selections[config.AgentID] = recovered.SelectionFingerprint
+	s.selectionMu.Unlock()
+	if s.config.OnRecovered != nil {
+		if err := s.config.OnRecovered(ctx, config.AgentID); err != nil {
+			return nil, err
+		}
+	}
+	return s.process(epoch), nil
+}
+
+func (s *provisionedRuntimeSpawner) ConfigurationCurrent(ctx context.Context, agentID string) (bool, error) {
+	s.selectionMu.Lock()
+	fingerprint, known := s.selections[agentID]
+	s.selectionMu.Unlock()
+	if !known {
+		return false, nil
+	}
+	activation := s.config.Activation
+	if s.config.ResolveActivation != nil {
+		var err error
+		activation, err = s.config.ResolveActivation(ctx, agentID, activation)
+		if err != nil {
+			return false, err
+		}
+	}
+	return activation.SelectionFingerprint() == fingerprint, nil
 }
 
 func (s *provisionedRuntimeSpawner) awaitRuntimeReady(
@@ -314,6 +408,9 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 	if err != nil {
 		return nil, fmt.Errorf("inspect previous runtime before reconcile: %w", err)
 	}
+	if inspection.Phase == runtimeprovision.PhaseActive {
+		return nil, errors.New("active runtime appeared during startup; retry API attachment")
+	}
 	var fencedEpoch *runtimeprovision.PreparedEpoch
 	if inspection.Epoch != nil {
 		epoch := *inspection.Epoch
@@ -332,6 +429,9 @@ func (s *provisionedRuntimeSpawner) reconcilePreviousRuntime(ctx context.Context
 	}
 	if inspection.Phase == runtimeprovision.PhaseUnknown {
 		if inspection.ReapedThroughGeneration == nil {
+			if fencedEpoch != nil {
+				return nil, errors.New("reconciled runtime did not return an observed-empty reap receipt")
+			}
 			return nil, nil
 		}
 		reaped := *inspection.ReapedThroughGeneration
@@ -453,6 +553,7 @@ type provisionedProcess struct {
 	monitorCancel context.CancelFunc
 	doneOnce      sync.Once
 	stopped       bool
+	detached      bool
 	retiring      bool
 	stopErr       error
 }
@@ -479,9 +580,13 @@ func (p *provisionedProcess) Wait() error {
 		case <-p.done:
 			p.stopMu.Lock()
 			err := p.stopErr
+			detached := p.detached
 			p.stopMu.Unlock()
 			if err != nil {
 				return errors.Join(spawn.ErrCleanupIncomplete, err)
+			}
+			if detached {
+				return spawn.ErrRuntimeDetached
 			}
 			return nil
 		case <-ticker.C:
@@ -536,6 +641,9 @@ func (p *provisionedProcess) Wait() error {
 func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
 	p.stopMu.Lock()
 	defer p.stopMu.Unlock()
+	if p.detached {
+		return nil
+	}
 	if p.stopped {
 		return cause
 	}
@@ -613,8 +721,23 @@ func (p *provisionedProcess) retireAfterMonitorFailure(cause error) error {
 	return cause
 }
 
+func (p *provisionedProcess) Detach() error {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	p.detached = true
+	if p.monitorCancel != nil {
+		p.monitorCancel()
+	}
+	p.doneOnce.Do(func() { close(p.done) })
+	return nil
+}
+
 func (p *provisionedProcess) Stop() error {
 	p.stopMu.Lock()
+	if p.detached {
+		p.stopMu.Unlock()
+		return errors.New("runtime observation is detached")
+	}
 	// Release any read-only inspection before Stop asks the provisioner for
 	// the same per-PA lifecycle lock. Waiting for teardown to finish first
 	// would leave Stop blocked behind the observation it needs to cancel.

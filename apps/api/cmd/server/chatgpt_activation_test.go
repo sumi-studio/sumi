@@ -101,3 +101,30 @@ func TestChatGPTActivationKeepsNewSelectionArrivingDuringRestart(t *testing.T) {
 		t.Fatal("completed old apply erased newer model selection")
 	}
 }
+
+func TestRecoveredRuntimeSelectionOnlyReplacesChangedConfigurationAfterIdle(t *testing.T) {
+	worker := newChatGPTActivationWorker(&activationTestEmployer{})
+	manager := &activationTestManager{idle: true}
+	worker.manager = manager
+	current := true
+	var observationErr error
+	worker.configurationCurrent = func(context.Context, string) (bool, error) { return current, observationErr }
+	if done, err := worker.apply(context.Background(), "human"); err != nil || !done || manager.stops != 0 {
+		t.Fatal("unchanged adopted runtime was stopped")
+	}
+	current = false
+	manager.idle = false
+	if done, err := worker.apply(context.Background(), "human"); err != nil || done || manager.starts != 0 {
+		t.Fatal("changed selection interrupted ongoing work")
+	}
+	observationErr = errors.New("selection store unavailable")
+	stops := manager.stops
+	if done, err := worker.apply(context.Background(), "human"); err == nil || done || manager.stops != stops {
+		t.Fatal("unavailable desired selection stopped work")
+	}
+	observationErr = nil
+	manager.idle = true
+	if done, err := worker.apply(context.Background(), "human"); err != nil || !done || manager.starts != 1 {
+		t.Fatal("changed selection was not applied after idle")
+	}
+}
