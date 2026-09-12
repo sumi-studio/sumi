@@ -1361,6 +1361,10 @@ function flushConnectionMicrotasks(): Promise<void> {
 }
 
 class FakeTransport implements DirectChatTransport {
+  readonly replayCursors: number[] = [];
+  setReplayCursor(seq: number) {
+    this.replayCursors.push(seq);
+  }
   readonly sent: Array<{ command: unknown; idempotencyKey?: string }> = [];
   sendResult = true;
   connectCalls = 0;
@@ -1433,3 +1437,263 @@ class FakeTransport implements DirectChatTransport {
     for (const listener of this.frameListeners) listener(frame);
   }
 }
+
+test("history opens newest snapshot before socket and merges older pages without replacing live state", async () => {
+  const transport = new FakeTransport();
+  const requests: unknown[] = [];
+  const user = (seq: number) => ({
+    seq,
+    audience: "direct_chat" as const,
+    event: {
+      type: "message_end" as const,
+      message_id: `message-${seq}`,
+      message: {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: `Message ${seq}` }],
+        timestamp: Timestamp,
+      },
+    },
+  });
+  const index = [10, 90].map((seq) => ({
+    id: `message-${seq}`,
+    seq,
+    title: `Message ${seq}`,
+  }));
+  const store = createConversationStore({
+    transport,
+    historyAPI: {
+      async page(_binding, query) {
+        requests.push(query);
+        const older = query.beforeSeq !== undefined;
+        return {
+          events: [user(older ? 10 : 90)],
+          context: [],
+          latestSeq: 100,
+          beforeSeq: older ? 10 : 90,
+          hasMore: !older,
+          index,
+          activeRun: null,
+          pendingApprovals: [],
+        };
+      },
+    },
+  });
+  const release = store.getState().acquireConnection(InstallationBinding);
+  await flushConnectionMicrotasks();
+  await flushConnectionMicrotasks();
+  assert.deepEqual(transport.replayCursors, [100]);
+  assert.equal(transport.connectCalls, 1);
+  assert.ok(store.getState().conversation.entries["message-90"]);
+  assert.equal(store.getState().conversation.entries["message-10"], undefined);
+  const stableIndex = store.getState().history.index;
+  transport.emit({
+    type: "event",
+    envelope: {
+      seq: 101,
+      audience: "direct_chat",
+      event: { type: "agent_start" },
+    },
+  });
+  const live = store.getState().running;
+  await store.getState().loadOlder();
+  assert.equal(store.getState().running, live);
+  assert.equal(store.getState().history.index, stableIndex);
+  assert.ok(store.getState().conversation.entries["message-10"]);
+  assert.equal(store.getState().history.hasMore, false);
+  assert.deepEqual(requests, [{}, { beforeSeq: 90, includeIndex: false }]);
+  release();
+});
+
+test("unmounted snapshot cannot reconnect or publish another authority's history", async () => {
+  const transport = new FakeTransport();
+  let resolve!: (
+    value: import("../lib/direct-chat-history").DirectChatHistoryPage,
+  ) => void;
+  const store = createConversationStore({
+    transport,
+    historyAPI: {
+      page: () =>
+        new Promise((r) => {
+          resolve = r;
+        }),
+    },
+  });
+  const release = store.getState().acquireConnection(InstallationBinding);
+  await flushConnectionMicrotasks();
+  assert.equal(await store.getState().loadAround("unloaded"), false);
+  release();
+  resolve({
+    events: [],
+    context: [],
+    latestSeq: 100,
+    beforeSeq: null,
+    hasMore: false,
+    index: [],
+    activeRun: null,
+    pendingApprovals: [],
+  });
+  await flushConnectionMicrotasks();
+  assert.equal(transport.connectCalls, 0);
+  assert.equal(store.getState().history.initialized, false);
+  assert.deepEqual(store.getState().conversation.entryOrder, []);
+});
+
+test("around jumps retain newest bodies and expose then fill the unloaded gap", async () => {
+  const transport = new FakeTransport();
+  const rows = [10, 50, 90];
+  const index = rows.map((seq) => ({
+    id: `message-${seq}`,
+    seq,
+    title: String(seq),
+  }));
+  const store = createConversationStore({
+    transport,
+    historyAPI: {
+      async page(_binding, query) {
+        const seq = query.aroundMessageId ? 10 : query.beforeSeq ? 50 : 90;
+        return {
+          events: [
+            {
+              seq,
+              audience: "direct_chat",
+              event: {
+                type: "message_end",
+                message_id: `message-${seq}`,
+                message: {
+                  role: "user",
+                  content: [{ type: "text", text: String(seq) }],
+                  timestamp: Timestamp,
+                },
+              },
+            },
+          ],
+          context: [],
+          latestSeq: 100,
+          beforeSeq: seq === 50 ? 10 : seq,
+          hasMore: true,
+          index,
+          activeRun: null,
+          pendingApprovals: [],
+        };
+      },
+    },
+  });
+  const release = store.getState().acquireConnection(InstallationBinding);
+  await flushConnectionMicrotasks();
+  await flushConnectionMicrotasks();
+  assert.equal(await store.getState().loadAround("message-10"), true);
+  assert.ok(store.getState().conversation.entries["message-90"]);
+  assert.deepEqual(store.getState().history.gaps, [
+    { anchorItemId: "message-90", beforeSeq: 90, afterSeq: 10 },
+  ]);
+  await store.getState().loadGap(90);
+  assert.deepEqual(store.getState().history.gaps, []);
+  assert.ok(store.getState().conversation.entries["message-50"]);
+  release();
+});
+
+test("history retry repeats the failed around query while retaining loaded conversation", async () => {
+  const transport = new FakeTransport();
+  let fail = true;
+  const queries: unknown[] = [];
+  const store = createConversationStore({
+    transport,
+    historyAPI: {
+      async page(_binding, query) {
+        queries.push(query);
+        if (query.aroundMessageId && fail) {
+          fail = false;
+          throw new Error("fixture history failure");
+        }
+        return {
+          events: [],
+          context: [],
+          latestSeq: 10,
+          beforeSeq: null,
+          hasMore: false,
+          index: [],
+          activeRun: null,
+          pendingApprovals: [],
+        };
+      },
+    },
+  });
+  const release = store.getState().acquireConnection(InstallationBinding);
+  await flushConnectionMicrotasks();
+  await flushConnectionMicrotasks();
+  const conversation = store.getState().conversation;
+  await store.getState().loadAround("target");
+  assert.equal(store.getState().history.error, "fixture history failure");
+  assert.equal(store.getState().conversation, conversation);
+  await store.getState().retryHistory();
+  assert.deepEqual(queries, [
+    {},
+    { aroundMessageId: "target", includeIndex: false },
+    { aroundMessageId: "target", includeIndex: false },
+  ]);
+  assert.equal(store.getState().history.error, null);
+  assert.equal(transport.connectCalls, 1);
+  release();
+});
+
+test("snapshot recovers rejected and superseded admitted text outside the body window before socket catchup", async () => {
+  for (const status of ["rejected", "superseded"] as const) {
+    const storage = new MemoryStorage();
+    const saved = new PrivateOutbox(storage);
+    saved.putPending("old-command", "Unsent recoverable text");
+    saved.admit("old-command", CommandId, 4);
+    const transport = new FakeTransport();
+    const queries: unknown[] = [];
+    const store = createConversationStore({
+      transport,
+      outbox: new PrivateOutbox(storage),
+      historyAPI: {
+        async page(_binding, query) {
+          queries.push(query);
+          return {
+            events: [],
+            context: [],
+            latestSeq: 400,
+            beforeSeq: 301,
+            hasMore: true,
+            index: [],
+            activeRun: null,
+            pendingApprovals: [],
+            commandDispositions: [
+              {
+                seq: 5,
+                audience: "direct_chat",
+                event: {
+                  type: "command_disposition",
+                  command_id: CommandId,
+                  command_seq: 4,
+                  ...(status === "rejected"
+                    ? {
+                        status: "rejected" as const,
+                        reject_reason: "not_allowed" as const,
+                      }
+                    : { status: "superseded" as const }),
+                },
+              },
+            ],
+          };
+        },
+      },
+    });
+    const release = store.getState().acquireConnection(InstallationBinding);
+    await flushConnectionMicrotasks();
+    await flushConnectionMicrotasks();
+    assert.deepEqual(queries, [{ commandIds: [CommandId] }]);
+    assert.equal(
+      store.getState().recoverableDrafts[0].text,
+      "Unsent recoverable text",
+    );
+    assert.equal(
+      store.getState().recoverableDrafts[0].reason,
+      status === "rejected" ? "not_allowed" : "superseded",
+    );
+    assert.deepEqual(transport.replayCursors, [400]);
+    assert.equal(transport.sent.length, 0);
+    release();
+  }
+});

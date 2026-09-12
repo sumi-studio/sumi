@@ -1,6 +1,12 @@
 import type { ApprovalDecision, BrowserEventEnvelope } from "@sumi/api-client";
 import { create } from "zustand";
 import {
+  createDirectChatHistoryAPI,
+  type DirectChatHistoryAPI,
+  type DirectChatHistoryQuery,
+  type DirectChatIndexEntry,
+} from "../lib/direct-chat-history";
+import {
   type DirectChatConnectionState,
   type DirectChatInstallationBinding,
   type DirectChatReadyState,
@@ -8,12 +14,14 @@ import {
   DirectChatSocket,
 } from "../lib/direct-chat-socket";
 import { secureRandomUUID } from "../lib/random-uuid";
+import { mergeHistory, projectHistory } from "./history";
 import type {
   ConversationEntry,
   ConversationModel,
   RecoverableDraft,
 } from "./model";
 import { PrivateOutbox, type PrivateOutboxEntry } from "./private-outbox";
+import { projectConversation } from "./projection";
 import {
   type AgentSession,
   createAgentSession,
@@ -29,6 +37,7 @@ export interface DirectChatTransport {
   connect(): void;
   close(): void;
   resetAuthority?(): void;
+  setReplayCursor?(seq: number): void;
   sendCommand(command: unknown, idempotencyKey?: string): boolean;
   onFrame(listener: (frame: DirectChatServerFrame) => void): () => void;
   onConnection(
@@ -37,8 +46,41 @@ export interface DirectChatTransport {
   onReady(listener: (state: DirectChatReadyState) => void): () => void;
 }
 
+export interface DirectChatHistoryGap {
+  anchorItemId: string;
+  beforeSeq: number;
+  afterSeq: number;
+}
+export interface DirectChatHistoryState {
+  initialized: boolean;
+  loading: boolean;
+  loadingOlder: boolean;
+  loadingAround: string | null;
+  error: string | null;
+  hasMore: boolean;
+  beforeSeq: number | null;
+  index: DirectChatIndexEntry[];
+  gaps: DirectChatHistoryGap[];
+}
+const emptyHistory = (): DirectChatHistoryState => ({
+  initialized: false,
+  loading: false,
+  loadingOlder: false,
+  loadingAround: null,
+  error: null,
+  hasMore: false,
+  beforeSeq: null,
+  index: [],
+  gaps: [],
+});
+
 export interface ConversationState {
   conversation: ConversationModel;
+  history: DirectChatHistoryState;
+  loadOlder: () => Promise<void>;
+  loadAround: (messageId: string) => Promise<boolean>;
+  loadGap: (beforeSeq: number) => Promise<void>;
+  retryHistory: () => Promise<void>;
   status: AgentSession["status"];
   running: boolean;
   approval: AgentSession["approval"];
@@ -63,6 +105,7 @@ export interface ConversationState {
 
 export interface ConversationStoreDependencies {
   transport: DirectChatTransport;
+  historyAPI?: DirectChatHistoryAPI;
   outbox?: PrivateOutbox;
   idempotencyKey?: () => string;
   reducerId?: () => string;
@@ -75,11 +118,21 @@ type PrivateReconciliation =
 
 export function createConversationStore({
   transport,
+  historyAPI,
   outbox = new PrivateOutbox(),
   idempotencyKey = secureRandomUUID,
   reducerId = secureRandomUUID,
 }: ConversationStoreDependencies) {
   let session = createAgentSession();
+  let history = emptyHistory();
+  let historyRequest: AbortController | null = null;
+  let failedHistory: {
+    query: DirectChatHistoryQuery;
+    mode: "initial" | "older" | "around" | "gap";
+  } | null = null;
+  const entrySequences = new Map<string, number>();
+  let ranges: { start: number; end: number; anchorItemId: string }[] = [];
+
   let connection: DirectChatConnectionState = "connecting";
   let ready: DirectChatReadyState = "unknown";
   let started = false;
@@ -107,6 +160,7 @@ export function createConversationStore({
     const publish = (lastError?: string | null) => {
       set((state) => ({
         conversation: session.conversation,
+        history,
         status: session.status,
         running: session.status === "streaming",
         approval: session.approval,
@@ -121,6 +175,193 @@ export function createConversationStore({
           ? []
           : outbox.recoverableDrafts(),
       }));
+    };
+
+    const cancelHistory = () => {
+      historyRequest?.abort();
+      historyRequest = null;
+      history = {
+        ...history,
+        loading: false,
+        loadingOlder: false,
+        loadingAround: null,
+      };
+    };
+    const mergeIndex = (incoming: DirectChatIndexEntry[]) => {
+      const rows = new Map(history.index.map((row) => [row.id, row]));
+      for (const row of incoming) rows.set(row.id, row);
+      const index = [...rows.values()].sort((a, b) => a.seq - b.seq);
+      return JSON.stringify(index) === JSON.stringify(history.index)
+        ? history.index
+        : index;
+    };
+    const recordRange = (start: number, end: number, anchorItemId: string) => {
+      const ordered = [...ranges, { start, end, anchorItemId }].sort(
+        (a, b) => a.start - b.start,
+      );
+      ranges = [];
+      for (const range of ordered) {
+        const last = ranges.at(-1);
+        if (last && range.start <= last.end) {
+          last.end = Math.max(last.end, range.end);
+          if (!last.anchorItemId) last.anchorItemId = range.anchorItemId;
+        } else ranges.push({ ...range });
+      }
+      return ranges.slice(1).flatMap((range, i) =>
+        range.anchorItemId
+          ? [
+              {
+                anchorItemId: range.anchorItemId,
+                beforeSeq: range.start,
+                afterSeq: ranges[i].end,
+              },
+            ]
+          : [],
+      );
+    };
+    const loadHistoryPage = async (
+      query: DirectChatHistoryQuery,
+      mode: "initial" | "older" | "around" | "gap",
+    ): Promise<boolean> => {
+      if (!historyAPI || !boundInstallation) return false;
+      if (mode !== "initial" && !history.initialized) return false;
+      if (historyRequest) {
+        if (mode !== "around") return false;
+        cancelHistory();
+      }
+      failedHistory = null;
+      const binding = { ...boundInstallation };
+      const controller = new AbortController();
+      historyRequest = controller;
+      history = {
+        ...history,
+        loading: mode === "initial",
+        loadingOlder: mode === "older" || mode === "gap",
+        loadingAround:
+          mode === "around" ? (query.aroundMessageId ?? null) : null,
+        error: null,
+      };
+      publish();
+      try {
+        const admittedIds = [
+          ...new Set(
+            [...outbox.entries(), ...undurableAdmissions.values()].flatMap(
+              (entry) => (entry.state === "admitted" ? [entry.commandId] : []),
+            ),
+          ),
+        ];
+        const requestQuery =
+          mode === "initial"
+            ? {
+                ...query,
+                ...(admittedIds.length ? { commandIds: admittedIds } : {}),
+              }
+            : { ...query, includeIndex: false };
+        const page = await historyAPI.page(
+          binding,
+          requestQuery,
+          controller.signal,
+        );
+        if (
+          controller.signal.aborted ||
+          historyRequest !== controller ||
+          !sameInstallationBinding(boundInstallation, binding)
+        )
+          return false;
+        const projected = projectHistory(page);
+        for (const [id, seq] of projected.entrySeq)
+          if (!entrySequences.has(id)) entrySequences.set(id, seq);
+        session =
+          mode === "initial"
+            ? projected.session
+            : mergeHistory(session, projected.session, entrySequences);
+        const firstVisibleSeq = Math.min(
+          ...page.events.map((event) => event.seq),
+        );
+        const firstRow = projectConversation(
+          projected.session.conversation,
+        ).find(
+          (row) =>
+            row.kind !== "agent-run" &&
+            (projected.entrySeq.get(row.id) ??
+              (row.kind === "trace"
+                ? projected.entrySeq.get(
+                    `trace:${row.runId}:${row.traceId}:result`,
+                  )
+                : undefined) ??
+              -1) >= firstVisibleSeq,
+        );
+        const start = page.hasMore ? (page.beforeSeq ?? 0) : 0;
+        const end =
+          mode === "initial"
+            ? page.latestSeq
+            : (query.beforeSeq ??
+              Math.max(0, ...page.events.map((event) => event.seq)));
+        const gaps = recordRange(start, end, firstRow?.id ?? "");
+        const advancesOldest =
+          history.beforeSeq === null ||
+          page.beforeSeq === null ||
+          page.beforeSeq < history.beforeSeq;
+        history = {
+          ...history,
+          initialized: true,
+          loading: false,
+          loadingOlder: false,
+          loadingAround: null,
+          error: null,
+          index: mergeIndex(page.index),
+          gaps,
+          ...(mode === "initial" || advancesOldest
+            ? { beforeSeq: page.beforeSeq, hasMore: page.hasMore }
+            : {}),
+        };
+        if (mode === "initial") {
+          if (!transport.setReplayCursor)
+            throw new Error("履歴の接続を開始できませんでした。");
+          for (const event of [
+            ...page.events,
+            ...(page.commandDispositions ?? []),
+          ]) {
+            if (event.event.type === "command_disposition") {
+              const result = applyDisposition(event.event);
+              if (result.kind === "error") throw new Error(result.message);
+            }
+          }
+          for (const row of page.index) {
+            const result = reconcileCanonicalMessage(row.id);
+            if (result.kind === "error") throw new Error(result.message);
+          }
+          transport.setReplayCursor(page.latestSeq);
+        }
+        historyRequest = null;
+        publish(null);
+        return (
+          !query.aroundMessageId ||
+          !!session.conversation.entries[query.aroundMessageId]
+        );
+      } catch (error) {
+        if (controller.signal.aborted || historyRequest !== controller)
+          return false;
+        historyRequest = null;
+        failedHistory = { query, mode };
+        history = {
+          ...history,
+          loading: false,
+          loadingOlder: false,
+          loadingAround: null,
+          error:
+            error instanceof Error
+              ? error.message
+              : "会話の履歴を読み込めませんでした。",
+        };
+        if (mode === "initial") {
+          started = false;
+          connection = "closed";
+          history = { ...history, initialized: false };
+        }
+        publish(mode === "initial" ? history.error : undefined);
+        return false;
+      }
     };
 
     const cancelPendingConnection = () => {
@@ -140,10 +381,15 @@ export function createConversationStore({
       connection = "connecting";
       ready = "unknown";
       publish(null);
-      transport.connect();
+      if (historyAPI && !history.initialized) {
+        void loadHistoryPage({}, "initial").then((ok) => {
+          if (ok && started && boundInstallation) transport.connect();
+        });
+      } else transport.connect();
     };
 
     const stopConnection = () => {
+      cancelHistory();
       const wasStarted = started;
       started = false;
       if (wasStarted) transport.close();
@@ -409,10 +655,37 @@ export function createConversationStore({
         // DirectChatSocket has already structurally validated the generated
         // browser contract before exposing this frame.
         const envelope = frame.envelope as unknown as BrowserEventEnvelope;
+        const beforeEntries = session.conversation.entries;
         const reduced = reduceEnvelope(session, envelope, {
           id: reducerId,
         });
         session = reduced.session;
+        for (const id of session.conversation.entryOrder)
+          if (!beforeEntries[id] && !entrySequences.has(id))
+            entrySequences.set(
+              id,
+              "seq" in envelope ? envelope.seq : session.lastDurableSeq + 0.5,
+            );
+        if (
+          "seq" in envelope &&
+          envelope.event.type === "message_end" &&
+          envelope.event.message.role === "user" &&
+          envelope.event.message.incoming_source?.source.surface !==
+            "approval_operation"
+        ) {
+          const title = envelope.event.message.content
+            .filter((item) => item.type === "text")
+            .map((item) => item.text)
+            .join("")
+            .slice(0, 160);
+          history = {
+            ...history,
+            index: mergeIndex([
+              { id: envelope.event.message_id, seq: envelope.seq, title },
+            ]),
+          };
+        }
+
         let reconciliation: PrivateReconciliation = { kind: "unmatched" };
         if (reduced.kind === "applied") {
           if (envelope.event.type === "approval_resolved") {
@@ -543,6 +816,27 @@ export function createConversationStore({
     });
 
     return {
+      history,
+      async loadOlder() {
+        if (history.hasMore && history.beforeSeq !== null)
+          await loadHistoryPage({ beforeSeq: history.beforeSeq }, "older");
+      },
+      async loadAround(messageId) {
+        if (session.conversation.entries[messageId]) return true;
+        return loadHistoryPage({ aroundMessageId: messageId }, "around");
+      },
+      async retryHistory() {
+        const failed = failedHistory;
+        if (!failed) return;
+        if (failed.mode === "initial") {
+          startConnection();
+          return;
+        }
+        await loadHistoryPage(failed.query, failed.mode);
+      },
+      async loadGap(beforeSeq) {
+        await loadHistoryPage({ beforeSeq }, "gap");
+      },
       conversation: session.conversation,
       status: session.status,
       running: false,
@@ -586,6 +880,11 @@ export function createConversationStore({
         if (boundInstallation !== null) scheduleMountedConnection();
       },
       resetAuthority() {
+        cancelHistory();
+        history = emptyHistory();
+        failedHistory = null;
+        entrySequences.clear();
+        ranges = [];
         cancelPendingConnection();
         started = false;
         if (transport.resetAuthority) {
@@ -756,4 +1055,5 @@ function isCanonicalUserMessage(
 
 export const useConversation = createConversationStore({
   transport: new DirectChatSocket(),
+  historyAPI: createDirectChatHistoryAPI(),
 });

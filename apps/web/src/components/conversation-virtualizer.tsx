@@ -46,6 +46,8 @@ export interface ConversationVirtualizerProps<
   renderItem: (item: TItem, index: number) => ReactNode;
   /** Rendered only while the user has explicitly opened the full transcript. */
   renderTranscriptItem?: (item: TItem, index: number) => ReactNode;
+  /** False when earlier records are available through pagination. */
+  transcriptComplete?: boolean;
   /** Floating controls kept inside the scroll viewport so wheel input reaches it. */
   footerOverlay?: ReactNode;
   estimateSize?: (item: TItem, index: number) => number;
@@ -63,6 +65,8 @@ export interface ConversationVirtualizerProps<
   contentClassName?: string;
   onAtEndChange?: (atEnd: boolean) => void;
   onVisibleMessageIdsChange?: (ids: string[]) => void;
+  /** Request older rows as the reader approaches the loaded history boundary. */
+  onReachStart?: () => void;
 }
 
 const DEFAULT_ESTIMATED_ITEM_SIZE = 96;
@@ -87,6 +91,7 @@ export function ConversationVirtualizer<
   items,
   renderItem,
   renderTranscriptItem,
+  transcriptComplete = true,
   footerOverlay,
   estimateSize,
   overscan = DEFAULT_OVERSCAN,
@@ -98,6 +103,7 @@ export function ConversationVirtualizer<
   contentClassName,
   onAtEndChange,
   onVisibleMessageIdsChange,
+  onReachStart,
 }: ConversationVirtualizerProps<TItem>) {
   const viewportRef = useRef<HTMLElement>(null);
   const itemsRef = useRef(items);
@@ -300,6 +306,16 @@ export function ConversationVirtualizer<
   const handleViewportScrollCapture = () => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // Initial end anchoring and jumps must not accidentally drain all history.
+    // The owner coalesces requests while one page is loading.
+    if (
+      didInitialEndAnchorRef.current &&
+      !followRef.current &&
+      !flightRef.current.active &&
+      viewport.scrollTop < 300
+    ) {
+      onReachStart?.();
+    }
     const active = document.activeElement;
     const focusedRow =
       active instanceof HTMLElement
@@ -346,7 +362,7 @@ export function ConversationVirtualizer<
         aria-haspopup="dialog"
         onClick={() => setTranscriptOpen(true)}
       >
-        会話の全文を開く
+        {transcriptComplete ? "会話の全文を開く" : "読み込み済みの記録を開く"}
       </button>
       <section
         ref={viewportRef}
@@ -424,7 +440,7 @@ export function ConversationVirtualizer<
             ref={transcriptDialogRef}
             role="dialog"
             aria-modal="true"
-            aria-label={`${ariaLabel}の全文`}
+            aria-label={`${ariaLabel}の${transcriptComplete ? "全文" : "読み込み済みの記録"}`}
             tabIndex={-1}
             onKeyDown={(event) => {
               if (event.key === "Escape") {
@@ -441,7 +457,9 @@ export function ConversationVirtualizer<
             className="flex max-h-full w-full max-w-3xl flex-col rounded-xl bg-background p-4 shadow-xl"
           >
             <div className="mb-3 flex items-center justify-between gap-4">
-              <h2 className="font-semibold">会話の全文</h2>
+              <h2 className="font-semibold">
+                {transcriptComplete ? "会話の全文" : "読み込み済みの記録"}
+              </h2>
               <button
                 ref={transcriptCloseRef}
                 type="button"
@@ -452,7 +470,7 @@ export function ConversationVirtualizer<
             </div>
             <div
               role="log"
-              aria-label={`${ariaLabel}の全文`}
+              aria-label={`${ariaLabel}の${transcriptComplete ? "全文" : "読み込み済みの記録"}`}
               className="overflow-y-auto"
             >
               {items.map((item, index) => {

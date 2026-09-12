@@ -633,6 +633,10 @@ pub enum WireAgentEvent {
         result: Value,
         is_error: bool,
     },
+    ApprovalOperationOutcome {
+        #[serde(flatten)]
+        outcome: crate::runtime::contracts::ApprovalOperationSource,
+    },
     ApprovalRequested {
         request: WireApprovalRequest,
     },
@@ -706,6 +710,7 @@ impl WireAgentEvent {
             Self::ToolExecutionStart { .. } => "tool_execution_start",
             Self::ToolExecutionUpdate { .. } => "tool_execution_update",
             Self::ToolExecutionEnd { .. } => "tool_execution_end",
+            Self::ApprovalOperationOutcome { .. } => "approval_operation_outcome",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ApprovalResolved { .. } => "approval_resolved",
             Self::Steered { .. } => "steered",

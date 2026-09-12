@@ -2103,3 +2103,114 @@ test("feedback events retain their own origin and reject malformed sources", () 
     assert.equal(parseDirectChatServerFrame(bad, 0), undefined);
   }
 });
+
+test("approval operation outcomes validate identity and terminal semantics in live and history frames", () => {
+  const result = {
+    tool_call_id: "call-original",
+    tool_name: "bash",
+    content: [{ type: "text", text: "Outcome" }],
+    details: { exit_code: 0 },
+    is_error: false,
+    timestamp: "2026-09-12T00:00:00Z",
+  };
+  const outcome = {
+    type: "approval_operation_outcome",
+    operation_id: "operation-1",
+    tool_call_id: "call-original",
+    status: "succeeded",
+    executed: true,
+    result,
+  };
+  assert.ok(parseDirectChatServerFrame(event(1, outcome), 0));
+  for (const patch of [
+    { executed: false },
+    { status: "pending" },
+    { tool_call_id: "another-call" },
+    { operation_id: "" },
+    { result: { ...result, is_error: true } },
+    { unexpected: true },
+  ]) {
+    assert.equal(
+      parseDirectChatServerFrame(event(1, { ...outcome, ...patch }), 0),
+      undefined,
+    );
+  }
+  for (const status of [
+    "failed",
+    "denied",
+    "expired",
+    "cancelled",
+    "indeterminate",
+  ]) {
+    const next = {
+      ...outcome,
+      status,
+      executed: status === "indeterminate" ? null : status === "failed",
+      result: { ...result, is_error: true },
+    };
+    assert.ok(parseDirectChatServerFrame(event(1, next), 0));
+  }
+  const pa = "0198f0f4-9b72-7000-8000-000000000201";
+  const source = {
+    version: 2,
+    tenant_id: "test",
+    personality_agent_id: pa,
+    actor: { kind: "personality_agent", principal_id: pa },
+    source: {
+      surface: "approval_operation",
+      operation_id: outcome.operation_id,
+      tool_call_id: outcome.tool_call_id,
+      status: outcome.status,
+      executed: outcome.executed,
+      result,
+    },
+  };
+  const historical = (incoming_source) =>
+    event(1, {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000003",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: JSON.stringify(outcome) }],
+        timestamp: result.timestamp,
+        incoming_source,
+      },
+    });
+  assert.ok(parseDirectChatServerFrame(historical(source), 0));
+  assert.equal(
+    parseDirectChatServerFrame(
+      historical({ ...source, actor: { kind: "human", principal_id: pa } }),
+      0,
+    ),
+    undefined,
+  );
+  assert.equal(
+    parseDirectChatServerFrame(
+      historical({
+        ...source,
+        actor: {
+          kind: "personality_agent",
+          principal_id: "0198f0f4-9b72-7000-8000-000000000202",
+        },
+      }),
+      0,
+    ),
+    undefined,
+  );
+});
+
+test("snapshot cursor starts socket at the bounded history head", () => {
+  const socket = new DirectChatSocket();
+  socket.bindInstallation(binding);
+  socket.setReplayCursor(250);
+  assert.throws(() => socket.setReplayCursor(249));
+  socket.connect();
+  assert.throws(() => socket.setReplayCursor(251));
+  const wire = FakeWebSocket.instances.at(-1);
+  wire.open();
+  assert.deepEqual(JSON.parse(wire.sent[0]), {
+    type: "hello",
+    last_event_seq: 250,
+  });
+  socket.close();
+});

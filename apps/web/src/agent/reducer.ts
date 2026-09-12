@@ -1,8 +1,11 @@
 import type {
   AnyJSON,
   ApprovalDecision,
+  ApprovalOperationOutcomeEvent,
+  ApprovalOperationProvenanceV2,
   ApprovalRequest,
   BrowserEventEnvelope,
+  ExternalProvenanceV2,
   PublicMessage,
   PublicStreamEvent,
   ReviewProjection,
@@ -32,7 +35,16 @@ export interface AgentSession {
   messageRunIds: Record<string, string | null>;
   toolRunIds: Record<string, string>;
   approvalRunIds: Record<string, string>;
+  approvalOperations: Record<
+    string,
+    { toolCallId: string; completed: boolean }
+  >;
   messageStreams: Record<string, MessageStream>;
+  unresolvedToolOutcomes: Record<
+    string,
+    { result: AnyJSON; isError: boolean; toolName?: string }
+  >;
+  unresolvedApprovalOutcomes: Record<string, ApprovalOperationOutcomeEvent>;
 }
 
 export interface ReducerContext {
@@ -56,7 +68,10 @@ export function createAgentSession(
     messageRunIds: {},
     toolRunIds: {},
     approvalRunIds: {},
+    approvalOperations: {},
     messageStreams: {},
+    unresolvedToolOutcomes: {},
+    unresolvedApprovalOutcomes: {},
   };
 }
 
@@ -183,6 +198,9 @@ export function reduceEnvelope(
         event.is_error,
       );
       break;
+    case "approval_operation_outcome":
+      session = applyApprovalOperationOutcome(session, event);
+      break;
     case "approval_requested":
       session = applyApprovalRequested(session, event.request);
       break;
@@ -241,7 +259,7 @@ export function reduceEnvelope(
       break;
   }
 
-  return { kind: "applied", session };
+  return { kind: "applied", session: reconcileDeferredTools(session) };
 }
 
 function applyMessage(
@@ -251,6 +269,15 @@ function applyMessage(
   complete: boolean,
 ): AgentSession {
   if (message.role === "user") {
+    const source = message.incoming_source;
+    if (source && isApprovalOperationSource(source)) {
+      return complete
+        ? applyApprovalOperationOutcome(session, {
+            type: "approval_operation_outcome",
+            ...source.source,
+          })
+        : session;
+    }
     const entry: ConversationEntry = {
       kind: "user",
       id: messageId,
@@ -258,7 +285,7 @@ function applyMessage(
       attachments: [],
       timestamp: message.timestamp,
       delivery: "durable",
-      ...(message.incoming_source ? { source: message.incoming_source } : {}),
+      ...(source ? { source } : {}),
     };
     return {
       ...session,
@@ -271,7 +298,7 @@ function applyMessage(
   if (message.role === "tool_result") {
     // Pre-execution review denials have a durable result message but no
     // ToolExecutionEnd. Admit its actual public receipt into the same call.
-    return complete && session.toolRunIds[message.tool_call_id]
+    return complete
       ? applyToolEnd(
           session,
           message.tool_call_id,
@@ -548,9 +575,17 @@ function applyToolEnd(
   result: AnyJSON,
   isError: boolean,
   toolName?: string,
+  operationFinal = false,
 ): AgentSession {
-  const runId = session.toolRunIds[toolCallId] ?? session.activeRunId;
-  if (!runId) return session;
+  const runId = session.toolRunIds[toolCallId];
+  if (!runId)
+    return {
+      ...session,
+      unresolvedToolOutcomes: {
+        ...session.unresolvedToolOutcomes,
+        [toolCallId]: { result, isError, ...(toolName ? { toolName } : {}) },
+      },
+    };
   const existing = findTrace(session.conversation, runId, toolCallId);
   const tool =
     existing?.type === "tool"
@@ -565,16 +600,30 @@ function applyToolEnd(
           label: toolCallId,
           status: "running" as const,
         };
+  const operationId =
+    operationFinal || isError ? null : awaitingApprovalOperation(result);
+  if (operationId && session.approvalOperations[operationId]?.completed)
+    return session;
+  if (operationId)
+    session = {
+      ...session,
+      approvalOperations: {
+        ...session.approvalOperations,
+        [operationId]: { toolCallId, completed: false },
+      },
+    };
   let conversation = upsertTrace(session.conversation, runId, {
     ...tool,
     progress: undefined,
     result,
-    label:
-      resultLabel(result) ?? `${tool.name}${isError ? "でエラー" : "を完了"}`,
-    status: isError ? "error" : "done",
+    label: operationId
+      ? "承認待ち"
+      : (resultLabel(result) ??
+        `${tool.name}${isError ? "でエラー" : "を完了"}`),
+    status: operationId ? "pending" : isError ? "error" : "done",
   });
   const parsed = sduiResult(result);
-  if (!isError && parsed) {
+  if (!operationId && !isError && parsed) {
     const cardId = `card:${toolCallId}`;
     conversation = upsertTrace(conversation, runId, {
       type: "artifact",
@@ -595,6 +644,135 @@ function applyToolEnd(
     toolRunIds: { ...session.toolRunIds, [toolCallId]: runId },
     conversation,
   };
+}
+
+function isApprovalOperationSource(
+  source: ExternalProvenanceV2 | ApprovalOperationProvenanceV2,
+): source is ApprovalOperationProvenanceV2 {
+  return source.source.surface === "approval_operation";
+}
+function awaitingApprovalOperation(result: AnyJSON): string | null {
+  if (typeof result !== "object" || !result || Array.isArray(result))
+    return null;
+  const details = result.details;
+  return typeof details === "object" &&
+    details !== null &&
+    !Array.isArray(details) &&
+    details.status === "awaiting_approval" &&
+    details.executed === false &&
+    typeof details.operation_id === "string" &&
+    details.operation_id.length > 0
+    ? details.operation_id
+    : null;
+}
+function applyApprovalOperationOutcome(
+  session: AgentSession,
+  outcome: ApprovalOperationOutcomeEvent,
+): AgentSession {
+  const known = session.approvalOperations[outcome.operation_id];
+  const belongsToAnotherOperation = Object.entries(
+    session.approvalOperations,
+  ).some(
+    ([id, operation]) =>
+      operation.toolCallId === outcome.tool_call_id &&
+      id !== outcome.operation_id,
+  );
+  if (
+    belongsToAnotherOperation ||
+    known?.completed ||
+    (known && known.toolCallId !== outcome.tool_call_id)
+  )
+    return session;
+  if (!session.toolRunIds[outcome.tool_call_id])
+    return {
+      ...session,
+      unresolvedApprovalOutcomes: {
+        ...session.unresolvedApprovalOutcomes,
+        [outcome.operation_id]: outcome,
+      },
+    };
+  const next = applyToolEnd(
+    session,
+    outcome.tool_call_id,
+    {
+      content: outcome.result.content,
+      details: outcome.result.details,
+      ...(outcome.status === "indeterminate"
+        ? { label: "実行結果を確認できません" }
+        : {}),
+    },
+    outcome.result.is_error,
+    outcome.result.tool_name,
+    true,
+  );
+  // A terminal operation also closes a pending decision card during history
+  // replay, without inventing a Human decision that was never supplied.
+  const approvalStatus =
+    outcome.status === "denied"
+      ? "denied"
+      : outcome.status === "cancelled" || outcome.status === "expired"
+        ? "cancelled"
+        : "allowed";
+  let conversation = patchEntry(
+    next.conversation,
+    `approval:${outcome.operation_id}`,
+    (entry) =>
+      entry.kind === "approval" && entry.status === "pending"
+        ? { ...entry, status: approvalStatus }
+        : entry,
+  );
+  const approvalRunId = next.approvalRunIds[outcome.operation_id];
+  if (approvalRunId)
+    conversation = patchRun(conversation, approvalRunId, (run) => ({
+      ...run,
+      trace: run.trace.map((trace) =>
+        trace.type === "approval" &&
+        trace.id === outcome.operation_id &&
+        trace.status === "pending"
+          ? { ...trace, status: approvalStatus }
+          : trace,
+      ),
+    }));
+  return {
+    ...next,
+    conversation,
+    approval: next.approval?.id === outcome.operation_id ? null : next.approval,
+    approvalOperations: {
+      ...next.approvalOperations,
+      [outcome.operation_id]: {
+        toolCallId: outcome.tool_call_id,
+        completed: true,
+      },
+    },
+  };
+}
+
+export function reconcileDeferredTools(session: AgentSession): AgentSession {
+  let next = session;
+  for (const [callId, payload] of Object.entries(next.unresolvedToolOutcomes)) {
+    if (!next.toolRunIds[callId]) continue;
+    const { [callId]: _resolved, ...unresolvedToolOutcomes } =
+      next.unresolvedToolOutcomes;
+    next = applyToolEnd(
+      { ...next, unresolvedToolOutcomes },
+      callId,
+      payload.result,
+      payload.isError,
+      payload.toolName,
+    );
+  }
+  for (const [operationId, outcome] of Object.entries(
+    next.unresolvedApprovalOutcomes,
+  )) {
+    if (!next.toolRunIds[outcome.tool_call_id]) continue;
+    const { [operationId]: _resolved, ...unresolvedApprovalOutcomes } =
+      next.unresolvedApprovalOutcomes;
+    next = applyApprovalOperationOutcome(
+      { ...next, unresolvedApprovalOutcomes },
+      outcome,
+    );
+  }
+  return next;
 }
 
 function applyApprovalRequested(

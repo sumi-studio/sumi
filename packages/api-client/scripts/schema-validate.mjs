@@ -74,6 +74,22 @@ function describeErrors(errors) {
 }
 
 const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
+
+// Recorded runtime evidence cannot be replayed as external input or approval.
+const approvalHistory = fixtures.approval_operation_recorded_history.wire;
+for (const command of [
+  { type: "external_event", content: "done" },
+  { type: "approval_decision", request_id: "request", decision: { type: "approve_once" } },
+]) {
+  assert.equal(getValidator("CommandEnvelope")({
+    seq: 1,
+    command_id: "01992000-0000-7000-8000-000000000009",
+    personality_agent_id: approvalHistory.incoming_source.personality_agent_id,
+    provenance: approvalHistory.incoming_source,
+    command,
+  }), false, "runtime approval evidence admitted as command");
+}
+
 let failed = false;
 
 const feedbackSource = {

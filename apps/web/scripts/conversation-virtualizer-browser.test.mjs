@@ -89,6 +89,13 @@ function App() {
         ...old,
         { id: "row-" + old.length, height: 96, text: "A later event." },
       ]),
+    prepend: () => setItems((old) => [
+      ...Array.from({length: 100}, (_, i) => ({
+        id: "older-" + i, height: 64 + (i % 3) * 24,
+        text: "An older observation. ".repeat((i % 4) + 1),
+      })),
+      ...old,
+    ]),
     detail: (id) =>
       setItems((old) =>
         old.map((r, i) => (r.id === id ? { ...r, height: r.height + 160 } : r)),
@@ -220,6 +227,15 @@ createRoot(document.getElementById("root")).render(<App />);
       assert.ok(
         Math.abs(after.top - anchor.top) < 3,
         JSON.stringify({ width, anchor, after }),
+      );
+      await page.evaluate(() => window.fixture.prepend());
+      await page.waitForTimeout(600);
+      const prependedTop = await page
+        .locator(`[data-message-id="${anchor.id}"]`)
+        .evaluate((e) => e.getBoundingClientRect().top);
+      assert.ok(
+        Math.abs(prependedTop - anchor.top) < 3,
+        JSON.stringify({ width, anchor, prependedTop }),
       );
       await page.evaluate((id) => window.fixture.detail(id), anchor.id);
       await page.waitForTimeout(500);

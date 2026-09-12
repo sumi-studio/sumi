@@ -242,6 +242,7 @@ type ProvenanceActor struct {
 }
 
 type ProvenanceSource struct {
+	ApprovalOperation     *ApprovalOperationOutcome  `json:"-"`
 	ThreadID              string                     `json:"thread_id,omitempty"`
 	Title                 string                     `json:"title,omitempty"`
 	Revision              uint64                     `json:"revision,omitempty"`
@@ -378,6 +379,11 @@ func (v *ProvenancePollVote) UnmarshalJSON(data []byte) error {
 }
 
 func (p IncomingProvenance) Equal(other IncomingProvenance) bool {
+	aa, ba := p.Source.ApprovalOperation, other.Source.ApprovalOperation
+	p.Source.ApprovalOperation, other.Source.ApprovalOperation = nil, nil
+	if !equalApprovalOperation(aa, ba) {
+		return false
+	}
 	a, b := p.Source.Place, other.Source.Place
 	av, bv := p.Source.PollVote, other.Source.PollVote
 	p.Source.Place, other.Source.Place = nil, nil
@@ -426,6 +432,21 @@ func (p IncomingProvenance) Validate() error {
 			return errors.New("version 1 provenance requires direct-chat authenticated Human")
 		}
 		return nil
+	}
+	if p.Version == 2 && p.Source.Surface == "approval_operation" {
+		source := p.Source
+		if p.Actor.Kind != "personality_agent" || p.Actor.PrincipalID != p.PersonalityAgentID || source.ApprovalOperation == nil {
+			return errors.New("approval operation requires recipient PA actor")
+		}
+		outcome := source.ApprovalOperation
+		source.Surface, source.ApprovalOperation = "", nil
+		if source != (ProvenanceSource{}) {
+			return errors.New("approval operation cannot carry other source fields")
+		}
+		return outcome.Validate()
+	}
+	if p.Source.ApprovalOperation != nil {
+		return errors.New("approval outcome requires approval_operation source")
 	}
 	if p.Version == 2 && p.Source.Surface == "feedback" {
 		return p.validateFeedback()
@@ -523,6 +544,10 @@ func (p *IncomingProvenance) UnmarshalJSON(data []byte) error {
 	if value.Version == 1 {
 		if len(fields.Actor) != 2 || len(fields.Source) != 1 {
 			return errors.New("version 1 provenance has external source fields")
+		}
+	} else if value.Version == 2 && value.Source.Surface == "approval_operation" {
+		if raw, ok := fields.Actor["display_name"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("actor display_name must be a string")
 		}
 	} else if value.Version == 2 && value.Source.Surface == "feedback" {
 		if len(fields.Source) != 7 {
@@ -757,6 +782,9 @@ type ExternalEventCommand struct {
 }
 
 func validateIncomingCommand(provenance IncomingProvenance, raw json.RawMessage) error {
+	if provenance.Source.Surface == "approval_operation" {
+		return errors.New("approval operation outcome is runtime evidence, not an incoming command")
+	}
 	if err := provenance.Validate(); err != nil {
 		return err
 	}

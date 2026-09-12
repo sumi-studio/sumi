@@ -15,7 +15,7 @@
     "test:edge:runtime": "tsx --test scripts/cloudflare-runtime.test.ts",
     "test:unit": "pnpm run test:ui && pnpm run test:runtime",
     "test:ui": "vitest run",
-    "test:runtime": "tsx --test src/agent/reducer.test.ts src/agent/store.test.ts",
+    "test:runtime": "tsx --test src/agent/reducer.test.ts src/agent/store.test.ts src/agent/history.test.ts",
     "test:socket": "tsx --test scripts/direct-chat-socket.test.mjs",
     "test:config": "tsx --test scripts/vite-config.test.ts scripts/real-agent-provider.test.ts",
     "test:e2e": "playwright test",
