@@ -464,6 +464,8 @@ require_launch_environment() {
     fail "SUMI_MODEL_ID must not be empty when set"
   fi
   for name in \
+    SUMI_REFLEX_MODEL_ID \
+    SUMI_REFLEX_REASONING_EFFORT \
     SUMI_EXECUTION_REVIEWER_MODEL_ID \
     SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \
     SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE \

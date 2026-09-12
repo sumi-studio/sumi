@@ -28,7 +28,40 @@ pub struct Config {
     pub system_prompt: String,
     pub model: ModelConfig,
     pub reviewers: ReviewerModelsConfig,
+    pub reflex: ReflexModelConfig,
     pub chatgpt_connection_id: Option<String>,
+}
+
+/// Notification assessment overrides only model ID and effort on the parent's
+/// authenticated connection. No preset, endpoint, account or credential fallback.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReflexModelConfig {
+    pub model_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl ReflexModelConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(id) = &self.model_id {
+            if id.is_empty()
+                || id.len() > 256
+                || id.chars().any(char::is_whitespace)
+                || id.chars().any(char::is_control)
+            {
+                bail!("reflex.model_id must be a nonempty model ID without whitespace");
+            }
+        }
+        if self.reasoning_effort.as_deref().is_some_and(|effort| {
+            !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        }) {
+            bail!("unsupported reflex.reasoning_effort");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -92,6 +125,7 @@ struct FileConfig {
     system_prompt_file: Option<PathBuf>,
     model: ModelConfig,
     reviewers: ReviewerModelsConfig,
+    reflex: ReflexModelConfig,
     chatgpt_connection_id: Option<String>,
 }
 
@@ -110,6 +144,8 @@ struct EnvOverrides {
     model_account_scope: Option<String>,
     chatgpt_connection_id: Option<String>,
     model_reasoning_effort: Option<String>,
+    reflex_model_id: Option<String>,
+    reflex_reasoning_effort: Option<String>,
     execution_reviewer: ModelEnvOverrides,
     escalation_reviewer: ModelEnvOverrides,
 }
@@ -315,6 +351,13 @@ impl Config {
             .escalation_reviewer
             .apply_to(&mut file.reviewers.escalation);
 
+        if let Some(id) = overrides.reflex_model_id {
+            file.reflex.model_id = Some(id);
+        }
+        if let Some(effort) = overrides.reflex_reasoning_effort {
+            file.reflex.reasoning_effort = Some(effort);
+        }
+        file.reflex.validate()?;
         Ok(Self {
             personality_agent_id: overrides
                 .personality_agent_id
@@ -332,6 +375,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
             model: file.model,
             reviewers: file.reviewers,
+            reflex: file.reflex,
             chatgpt_connection_id: overrides
                 .chatgpt_connection_id
                 .or(file.chatgpt_connection_id),
@@ -511,7 +555,10 @@ impl ModelEnvOverrides {
     }
 }
 
-fn resolved_reasoning_effort(spec: &ModelSpec, effort: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn resolved_reasoning_effort(
+    spec: &ModelSpec,
+    effort: Option<&str>,
+) -> Result<Option<String>> {
     let effort = effort.or_else(|| {
         (spec.backend == ProviderBackend::ChatGpt && spec.id == "gpt-6-astra").then_some("medium")
     });
@@ -702,6 +749,8 @@ impl EnvOverrides {
             model_account_scope: env::var("SUMI_MODEL_ACCOUNT_SCOPE").ok(),
             chatgpt_connection_id: env::var("SUMI_CHATGPT_CONNECTION_ID").ok(),
             model_reasoning_effort: env::var("SUMI_MODEL_REASONING_EFFORT").ok(),
+            reflex_model_id: env::var("SUMI_REFLEX_MODEL_ID").ok(),
+            reflex_reasoning_effort: env::var("SUMI_REFLEX_REASONING_EFFORT").ok(),
             execution_reviewer: ModelEnvOverrides::from_env("SUMI_EXECUTION_REVIEWER_MODEL"),
             escalation_reviewer: ModelEnvOverrides::from_env("SUMI_ESCALATION_REVIEWER_MODEL"),
         })
@@ -1660,6 +1709,7 @@ default_output_tokens = 16000
                     ..ModelConfig::default()
                 },
                 reviewers: ReviewerModelsConfig::default(),
+                reflex: ReflexModelConfig::default(),
                 chatgpt_connection_id: None,
             };
             assert!(config.model_spec().is_err(), "{base_url}");
@@ -1851,5 +1901,33 @@ default_output_tokens = 16000
             resolved_reasoning_effort(&ModelSpec::preset("anthropic").unwrap(), Some("high"))
                 .is_err()
         );
+    }
+    #[test]
+    fn reflex_selection_is_opt_in_and_env_overrides_only_selected_fields() {
+        let file: FileConfig =
+            toml::from_str("[reflex]\nmodel_id = 'small-model'\nreasoning_effort = 'low'").unwrap();
+        let mut overrides = identity_overrides();
+        overrides.reflex_reasoning_effort = Some("minimal".into());
+        let config = Config::resolve(file, overrides).unwrap();
+        assert_eq!(config.reflex.model_id.as_deref(), Some("small-model"));
+        assert_eq!(config.reflex.reasoning_effort.as_deref(), Some("minimal"));
+        let default = Config::resolve(FileConfig::default(), identity_overrides()).unwrap();
+        assert_eq!(default.reflex, ReflexModelConfig::default());
+        assert_eq!(config.model, default.model);
+        for key in ["base_url", "api_key_env", "account_scope", "preset"] {
+            assert!(toml::from_str::<FileConfig>(&format!("[reflex]\n{key} = 'other'")).is_err());
+        }
+        for config in [
+            ReflexModelConfig {
+                model_id: Some(" ".into()),
+                ..Default::default()
+            },
+            ReflexModelConfig {
+                reasoning_effort: Some("ultra".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
     }
 }

@@ -1736,13 +1736,13 @@ func TestNativeChatGPTEntrypointForwardsIdentityWithoutProviderCredential(t *tes
 	// Execute the shipped environment builder; other launch values are synthetic.
 	script := "set -e\nfail() { exit 23; }\n" + source[start:start+end] + "\nprintf '%s\\n' \"${runtime_environment[@]}\"\n"
 	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "SUMI_MODEL_PRESET=chatgpt-responses", "SUMI_MODEL_ID=gpt-6-astra", "SUMI_CHATGPT_CONNECTION_ID=connection", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account", "SUMI_MODEL_REASONING_EFFORT=medium", "SUMI_PROVIDER_API_KEY=must-not-forward", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer"}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "SUMI_MODEL_PRESET=chatgpt-responses", "SUMI_MODEL_ID=gpt-6-astra", "SUMI_CHATGPT_CONNECTION_ID=connection", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account", "SUMI_MODEL_REASONING_EFFORT=medium", "SUMI_REFLEX_MODEL_ID=small-model", "SUMI_REFLEX_REASONING_EFFORT=low", "SUMI_PROVIDER_API_KEY=must-not-forward", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer"}
 	output, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(output)
-	for _, expected := range []string{"SUMI_CHATGPT_CONNECTION_ID=connection\n", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account\n", "SUMI_MODEL_REASONING_EFFORT=medium\n", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer\n"} {
+	for _, expected := range []string{"SUMI_CHATGPT_CONNECTION_ID=connection\n", "SUMI_MODEL_ACCOUNT_SCOPE=actual-account\n", "SUMI_MODEL_REASONING_EFFORT=medium\n", "SUMI_REFLEX_MODEL_ID=small-model\n", "SUMI_REFLEX_REASONING_EFFORT=low\n", "SUMI_EXECUTION_REVIEWER_API_KEY=reviewer\n"} {
 		if !strings.Contains(text, expected) {
 			t.Fatal("native identity/reviewer environment lost")
 		}

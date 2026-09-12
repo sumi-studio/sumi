@@ -67,9 +67,9 @@ pub(crate) enum ReflexError {
     InvalidOutput,
 }
 
-/// Same model, provider and parent context. The fork has its own output contract:
+/// Same connection and parent context; explicit model selection is optional. The fork has its own output contract:
 /// parent tool requirements and response schemas must not constrain the assessment.
-/// No cross-model replay, reasoning removal or effort change is performed here.
+/// Unsupported cross-model replay returns an error for ordinary soft fallback.
 /// Callers impose a deadline by cancelling their own child token, if desired.
 pub(crate) async fn evaluate(
     parent: &ParentContextSnapshot,
@@ -80,11 +80,63 @@ pub(crate) async fn evaluate(
     if cancel.is_cancelled() {
         return Err(ReflexError::Cancelled);
     }
-    let prompt = fork_prompt(parent, event, limits)?;
-    let options = fork_options(parent);
-    let events =
-        crate::provider::stream(parent.spec().clone(), prompt, options, cancel.child_token());
+    evaluate_selected(
+        parent,
+        event,
+        limits,
+        &crate::config::ReflexModelConfig::default(),
+        cancel,
+    )
+    .await
+}
+
+pub(crate) async fn evaluate_selected(
+    parent: &ParentContextSnapshot,
+    event: &UserMessage,
+    limits: ReflexLimits,
+    selection: &crate::config::ReflexModelConfig,
+    cancel: CancellationToken,
+) -> Result<ReflexDecision, ReflexError> {
+    if cancel.is_cancelled() {
+        return Err(ReflexError::Cancelled);
+    }
+    let (spec, prompt, options) = selected_request(parent, event, limits, selection)?;
+    let events = crate::provider::stream(spec, prompt, options, cancel.child_token());
     collect(events, limits, cancel).await
+}
+
+fn selected_request(
+    parent: &ParentContextSnapshot,
+    event: &UserMessage,
+    limits: ReflexLimits,
+    selection: &crate::config::ReflexModelConfig,
+) -> Result<
+    (
+        crate::provider::ModelSpec,
+        PromptContext,
+        crate::provider::RequestOptions,
+    ),
+    ReflexError,
+> {
+    selection
+        .validate()
+        .map_err(|e| ReflexError::InvalidInput(e.to_string()))?;
+    let mut spec = parent.spec().clone();
+    if let Some(id) = &selection.model_id {
+        spec.id = id.clone();
+    }
+    let mut prompt = fork_prompt(parent, event, limits)?;
+    if spec.id != parent.spec().id {
+        prompt = prompt
+            .with_reflex_model_destination(&parent.spec().origin(), &spec.origin())
+            .map_err(ReflexError::InvalidInput)?;
+    }
+    let mut options = fork_options(parent);
+    if let Some(effort) = &selection.reasoning_effort {
+        options.reasoning_effort = crate::config::resolved_reasoning_effort(&spec, Some(effort))
+            .map_err(|e| ReflexError::InvalidInput(e.to_string()))?;
+    }
+    Ok((spec, prompt, options))
 }
 
 fn fork_options(parent: &ParentContextSnapshot) -> crate::provider::RequestOptions {
@@ -379,5 +431,115 @@ mod tests {
             Err(ReflexError::Cancelled)
         ));
         assert!(!parent.is_cancelled());
+    }
+    #[test]
+    fn explicit_reflex_model_changes_only_selection_and_keeps_parent_context() {
+        let mut spec = ModelSpec::preset("chatgpt-responses").unwrap();
+        spec.account_scope = "same-user-connection".into();
+        let options = RequestOptions {
+            reasoning_effort: Some("high".into()),
+            session_id: Some("same-pa".into()),
+            ..Default::default()
+        };
+        let event = UserMessage {
+            incoming_source: Some(crate::gateway::test_messaging_provenance()),
+            incoming_timing: None,
+            timestamp: Utc::now(),
+            content: vec![UserContent::Text {
+                text: "original event".into(),
+            }],
+        };
+        let prompt = PromptContext::new("same system".into(), vec![], vec![], vec![], vec![]);
+        let parent = ParentContextSnapshot::capture(&prompt, &spec, &options);
+        let before = parent.clone();
+        let selection = crate::config::ReflexModelConfig {
+            model_id: Some("configured-small-model".into()),
+            reasoning_effort: Some("low".into()),
+        };
+        let (actual, fork, opts) = selected_request(
+            &parent,
+            &event,
+            ReflexLimits { max_defer_ms: 1000 },
+            &selection,
+        )
+        .unwrap();
+        let mut expected = spec.clone();
+        expected.id = "configured-small-model".into();
+        assert_eq!(actual, expected); // includes connection, backend, credential sources and protocol
+        assert_eq!(opts.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(opts.session_id, options.session_id);
+        assert_eq!(fork.system_prompt, parent.prompt().system_prompt);
+        assert_eq!(fork.tools, parent.prompt().tools);
+        assert_eq!(parent, before);
+        let (default_spec, _, default_options) = selected_request(
+            &parent,
+            &event,
+            ReflexLimits { max_defer_ms: 1000 },
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(default_spec, spec);
+        assert_eq!(default_options.reasoning_effort, options.reasoning_effort);
+    }
+    #[tokio::test]
+    async fn selected_reflex_uses_the_same_live_credential_resolver_and_never_falls_back() {
+        use crate::provider::chatgpt::{
+            ChatGptAccess, ChatGptAuthError, ChatGptCredentialResolver, ChatGptCredentialSource,
+        };
+        use std::sync::{Arc, Mutex};
+        struct RevokedConnection(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl ChatGptCredentialResolver for RevokedConnection {
+            async fn resolve(
+                &self,
+                connection: &str,
+                _: Option<&str>,
+            ) -> Result<ChatGptAccess, ChatGptAuthError> {
+                self.0.lock().unwrap().push(connection.to_owned());
+                Err(ChatGptAuthError::Disconnected)
+            }
+        }
+        let resolver = Arc::new(RevokedConnection(Mutex::new(vec![])));
+        let mut spec = ModelSpec::preset("chatgpt-responses").unwrap();
+        spec.account_scope = "same-user-account".into();
+        spec.chatgpt_credentials = Some(ChatGptCredentialSource::new(
+            "same-connection".into(),
+            resolver.clone(),
+        ));
+        let prompt = PromptContext::new("same system".into(), vec![], vec![], vec![], vec![]);
+        let parent = ParentContextSnapshot::capture(&prompt, &spec, &RequestOptions::default());
+        let before = parent.clone();
+        let event = UserMessage {
+            incoming_source: Some(crate::gateway::test_messaging_provenance()),
+            incoming_timing: None,
+            timestamp: Utc::now(),
+            content: vec![UserContent::Text {
+                text: "event".into(),
+            }],
+        };
+        for selection in [
+            Default::default(),
+            crate::config::ReflexModelConfig {
+                model_id: Some("explicit-small-model".into()),
+                reasoning_effort: Some("low".into()),
+            },
+        ] {
+            assert!(
+                evaluate_selected(
+                    &parent,
+                    &event,
+                    ReflexLimits { max_defer_ms: 1000 },
+                    &selection,
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            *resolver.0.lock().unwrap(),
+            ["same-connection", "same-connection"]
+        );
+        assert_eq!(parent, before);
     }
 }

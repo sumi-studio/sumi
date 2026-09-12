@@ -784,6 +784,8 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 		"SUMI_API_CONNECTION_HUMAN_ID":                 config.APIConnectionHumanID,
 		"SUMI_MODEL_BASE_URL":                          config.ModelBaseURL,
 		"SUMI_MODEL_REASONING_EFFORT":                  config.ModelReasoningEffort,
+		"SUMI_REFLEX_MODEL_ID":                         config.ReflexModelID,
+		"SUMI_REFLEX_REASONING_EFFORT":                 config.ReflexReasoningEffort,
 		"SUMI_MODEL_ACCOUNT_SCOPE":                     config.ModelAccountScope,
 		"SUMI_CHATGPT_CONNECTION_ID":                   config.ChatGPTConnectionID,
 		"SUMI_EXECUTION_REVIEWER_MODEL_ID":             config.ExecutionReviewerModelID,
@@ -906,6 +908,8 @@ var reservedEnvironment = map[string]bool{
 
 var allowedActivationEnvironment = map[string]bool{
 	"SUMI_MODEL_REASONING_EFFORT":                  true,
+	"SUMI_REFLEX_MODEL_ID":                         true,
+	"SUMI_REFLEX_REASONING_EFFORT":                 true,
 	"SUMI_MODEL_ACCOUNT_SCOPE":                     true,
 	"SUMI_CHATGPT_CONNECTION_ID":                   true,
 	"SUMI_GATEWAY_URL":                             true,

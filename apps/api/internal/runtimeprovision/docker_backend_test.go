@@ -754,3 +754,32 @@ func TestDockerBackendOnlyObservationFollowsCallerCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestReflexActivationKeepsConnectionAndPassesOnlySelection(t *testing.T) {
+	config := testActivationConfig()
+	config.ReflexModelID = "small-model"
+	config.ReflexReasoningEffort = "low"
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	env := activationEnvironment(config)
+	if env["SUMI_REFLEX_MODEL_ID"] != "small-model" || env["SUMI_REFLEX_REASONING_EFFORT"] != "low" || env["SUMI_PROVIDER_API_KEY"] != config.ProviderAPIKey {
+		t.Fatal("reflex metadata or original credentials changed")
+	}
+	if _, err := mergeEnvironment(nil, env, nil, testPAID); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"ultra", "secret\nvalue"} {
+		config.ReflexReasoningEffort = bad
+		if config.Validate() == nil {
+			t.Fatal("invalid reflex effort accepted")
+		}
+	}
+	absent := activationEnvironment(testActivationConfig())
+	if _, ok := absent["SUMI_REFLEX_MODEL_ID"]; ok {
+		t.Fatal("invented default reflex model")
+	}
+	if _, ok := absent["SUMI_REFLEX_REASONING_EFFORT"]; ok {
+		t.Fatal("invented default reflex effort")
+	}
+}

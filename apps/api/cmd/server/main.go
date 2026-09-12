@@ -2442,6 +2442,8 @@ func spawnManagerFromEnv(
 		Audience:          audience,
 		Delivery:          delivery,
 		Activation: runtimeprovision.ActivationConfig{
+			ReflexModelID:                strings.TrimSpace(os.Getenv("SUMI_REFLEX_MODEL_ID")),
+			ReflexReasoningEffort:        strings.TrimSpace(os.Getenv("SUMI_REFLEX_REASONING_EFFORT")),
 			LocalControlServerUID:        uint32(os.Geteuid()),
 			LocalControlSocketGID:        uint32(gid),
 			ApprovalSecretDigestKey:      approvalKey,
