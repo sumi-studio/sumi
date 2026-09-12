@@ -715,6 +715,13 @@ pub(super) fn fail_stop_teardown_deadline(owner: &'static str, timeout: Duration
         timeout_millis = timeout.as_millis(),
         "owned runtime teardown deadline elapsed"
     );
+    #[cfg(test)]
+    eprintln!(
+        "runtime abort diagnostic: phase=teardown deadline owner={} thread={:?} backtrace={}",
+        owner,
+        std::thread::current().name(),
+        std::backtrace::Backtrace::force_capture()
+    );
     std::process::abort();
 }
 
@@ -744,12 +751,26 @@ pub(super) fn settle_finished_or_fail_stop_runtime_task(
                 );
             }
         }
+        #[cfg(test)]
+        eprintln!(
+            "runtime abort diagnostic: phase=finished task failure owner={} thread={:?} backtrace={}",
+            owner,
+            std::thread::current().name(),
+            std::backtrace::Backtrace::force_capture()
+        );
         std::process::abort();
     }
 
     // Drop cannot asynchronously settle this owner. Continuing would detach
     // cleanup from the runtime root, so make the ownership failure explicit.
     tracing::error!(owner, "runtime task owner dropped before a retained join");
+    #[cfg(test)]
+    eprintln!(
+        "runtime abort diagnostic: phase=unsettled owner drop owner={} thread={:?} backtrace={}",
+        owner,
+        std::thread::current().name(),
+        std::backtrace::Backtrace::force_capture()
+    );
     std::process::abort();
 }
 
