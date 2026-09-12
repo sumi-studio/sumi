@@ -128,20 +128,21 @@ func TestFeedbackAttentionSuppressesUnavailableRecipientAndSelfEcho(t *testing.T
 	}
 }
 
-type blockedFirstAttention struct {
+type timedOutFirstAttention struct {
 	fakeAttention
-	first bool
+	failedRecipient string
 }
 
-func (d *blockedFirstAttention) Prepare(ctx context.Context, _ string) (func(), error) {
-	if !d.first {
-		d.first = true
-		<-ctx.Done()
-		return nil, ctx.Err()
+func (d *timedOutFirstAttention) Prepare(ctx context.Context, id string) (func(), error) {
+	if d.failedRecipient == "" {
+		d.failedRecipient = id
+		// Inject the runtime preparation timeout without imposing a short
+		// wall-clock deadline on unrelated real database operations.
+		return nil, context.DeadlineExceeded
 	}
-	return func() {}, nil
+	return d.fakeAttention.Prepare(ctx, id)
 }
-func TestFeedbackAttentionSlowRecipientDoesNotStarveAnother(t *testing.T) {
+func TestFeedbackAttentionTimedOutRecipientDoesNotStarveAnother(t *testing.T) {
 	w := fixture(t)
 	ctx := context.Background()
 	paid, err := koseki.New(w.pool).MintSecretary(ctx, w.dev.ID)
@@ -156,15 +157,22 @@ func TestFeedbackAttentionSlowRecipientDoesNotStarveAnother(t *testing.T) {
 	if _, err = w.s.Create(ctx, w.human, "相談", "内容", uuid.NewString(), nil); err != nil {
 		t.Fatal(err)
 	}
-	d := &blockedFirstAttention{}
-	if err = w.s.deliverAttention(ctx, d, 10, 100*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+	var deliveryStartedAt time.Time
+	if err = w.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&deliveryStartedAt); err != nil {
+		t.Fatal(err)
+	}
+	d := &timedOutFirstAttention{}
+	if err = w.s.DeliverAttention(ctx, d, 10); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout: %v", err)
 	}
-	if len(d.events) != 1 {
-		t.Fatalf("healthy recipient did not receive: %d", len(d.events))
+	if len(d.events) != 1 || d.prepared != 1 {
+		t.Fatalf("healthy recipient admissions=%d preparations=%d", len(d.events), d.prepared)
+	}
+	if d.events[0].PersonalityAgentID == d.failedRecipient {
+		t.Fatal("timed-out recipient was admitted instead of the healthy recipient")
 	}
 	var delayed, admitted int
-	if err = w.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE next_attempt_at>now() AND finished_at IS NULL),count(*) FILTER (WHERE outcome='admitted') FROM feedback_attention_outbox`).Scan(&delayed, &admitted); err != nil {
+	if err = w.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE recipient_paid=$1 AND next_attempt_at >= $2::timestamptz+interval '15 seconds' AND finished_at IS NULL),count(*) FILTER (WHERE recipient_paid=$3 AND outcome='admitted') FROM feedback_attention_outbox`, d.failedRecipient, deliveryStartedAt, d.events[0].PersonalityAgentID).Scan(&delayed, &admitted); err != nil {
 		t.Fatal(err)
 	}
 	if delayed != 1 || admitted != 1 {
