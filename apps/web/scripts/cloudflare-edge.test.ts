@@ -760,3 +760,190 @@ test("model connection status and login route to the authenticated API", () => {
   }
   assert.notEqual(classifyPath("/api/unrelated"), "origin");
 });
+
+test("PWA manifest and icons are static assets, never SPA documents", () => {
+  for (const path of [
+    "/manifest.webmanifest",
+    "/icons/icon-192.png",
+    "/icons/icon-512.png",
+    "/icons/apple-touch-icon.png",
+  ]) {
+    assert.equal(classifyPath(path), "static-asset");
+  }
+});
+
+test("fixed-target VPC origin preserves public authority and streaming response without trusting proxy headers", async () => {
+  const cancellation = new AbortController();
+  const incoming = new Request(
+    "https://sumi-alpha.example.workers.dev/auth/session?next=%2Fdirect",
+    {
+      method: "POST",
+      body: "opaque body",
+      signal: cancellation.signal,
+      headers: {
+        Host: "attacker.invalid",
+        Origin: "https://sumi-alpha.example.workers.dev",
+        Cookie: "session=opaque",
+        "X-CSRF-Token": "token",
+        Forwarded: "host=attacker.invalid",
+        "X-Forwarded-Proto": "ftp",
+        "X-Forwarded-For": "spoof",
+        "X-Real-IP": "spoof",
+      },
+    },
+  );
+  const response = new Response(new ReadableStream(), {
+    headers: { "Set-Cookie": "session=next; Secure; HttpOnly" },
+  });
+  let forwarded: Request | undefined;
+  let options: RequestInit | undefined;
+  const actual = await handleRequest(
+    incoming,
+    {
+      ASSETS: { fetch: () => assert.fail("assets used") },
+      SUMI_ORIGIN: {
+        async fetch(request, init) {
+          forwarded = request;
+          options = init;
+          return response;
+        },
+      },
+    },
+    async () => assert.fail("global fetch must not handle VPC origin"),
+  );
+  assert.equal(actual, response);
+  assert.equal(
+    forwarded?.url,
+    "http://sumi-alpha.example.workers.dev/auth/session?next=%2Fdirect",
+  );
+  assert.equal(
+    forwarded?.headers.get("Host"),
+    "sumi-alpha.example.workers.dev",
+  );
+  assert.equal(
+    forwarded?.headers.get("Origin"),
+    "https://sumi-alpha.example.workers.dev",
+  );
+  assert.equal(forwarded?.headers.get("Cookie"), "session=opaque");
+  assert.equal(forwarded?.headers.get("X-CSRF-Token"), "token");
+  assert.equal(forwarded?.headers.get("X-Forwarded-Proto"), "https");
+  assert.equal(
+    forwarded?.headers.get("X-Forwarded-Host"),
+    "sumi-alpha.example.workers.dev",
+  );
+  assert.equal(forwarded?.headers.get("Forwarded"), null);
+  assert.equal(forwarded?.headers.get("X-Forwarded-For"), null);
+  assert.equal(forwarded?.headers.get("X-Real-IP"), null);
+  assert.equal(await forwarded?.text(), "opaque body");
+  assert.equal(options?.signal, incoming.signal);
+  assert.equal(options?.redirect, "manual");
+  cancellation.abort();
+  assert.equal(forwarded?.signal.aborted, true);
+  assert.equal(actual.bodyUsed, false);
+  await actual.body?.cancel();
+});
+
+test("VPC WebSocket response and HTTP redirects pass through by identity", async () => {
+  for (const response of [
+    { status: 101, webSocket: {} } as Response,
+    new Response(null, {
+      status: 302,
+      headers: { Location: "https://login.example.org" },
+    }),
+  ]) {
+    const incoming = new Request(
+      "https://sumi-alpha.example.workers.dev/messaging/ws",
+      {
+        headers: {
+          Upgrade: "websocket",
+          Origin: "https://sumi-alpha.example.workers.dev",
+        },
+      },
+    );
+    assert.equal(
+      await handleRequest(incoming, {
+        ASSETS: { fetch: () => assert.fail() },
+        SUMI_ORIGIN_PROTOCOL: "https",
+        SUMI_ORIGIN: {
+          async fetch(request) {
+            assert.equal(request.url, incoming.url);
+            assert.equal(request.headers.get("Upgrade"), "websocket");
+            return response;
+          },
+        },
+      }),
+      response,
+    );
+  }
+});
+
+test("failed VPC origin does not retry through public fetch or assets", async () => {
+  const response = await handleRequest(
+    new Request("https://sumi-alpha.example.workers.dev/auth/session"),
+    {
+      ASSETS: { fetch: () => assert.fail("asset fallback") },
+      SUMI_ORIGIN: {
+        fetch: async () => {
+          throw new Error("private service unavailable");
+        },
+      },
+    },
+    async () => assert.fail("public origin fallback"),
+  );
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(await response.json(), { error: "origin_unavailable" });
+});
+
+test("HTTPS VPC termination secures each cookie without folding attributes or buffering", async () => {
+  const cookies = [
+    "session=opaque; Path=/; HttpOnly; SameSite=Lax",
+    "csrf=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; SameSite=Strict",
+    "already=yes; sEcUrE; HttpOnly",
+    "secure=value; Path=/secure; HttpOnly",
+  ];
+  const headers = new Headers({
+    Location: "/direct",
+    "Cache-Control": "no-store",
+  });
+  for (const cookie of cookies) headers.append("Set-Cookie", cookie);
+  const body = new ReadableStream();
+  const upstream = new Response(body, { status: 302, headers });
+  const result = await handleRequest(
+    new Request("https://sumi-alpha.example.workers.dev/auth/session"),
+    {
+      ASSETS: { fetch: () => assert.fail() },
+      SUMI_ORIGIN: { fetch: async () => upstream },
+    },
+  );
+  assert.equal(result.body, body);
+  assert.equal(result.bodyUsed, false);
+  assert.equal(result.status, 302);
+  assert.equal(result.headers.get("Location"), "/direct");
+  assert.equal(result.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(
+    result.headers.getSetCookie(),
+    cookies.map((cookie, index) =>
+      index === 2 ? cookie : `${cookie}; Secure`,
+    ),
+  );
+  assert.deepEqual(upstream.headers.getSetCookie(), cookies);
+  await result.body?.cancel();
+});
+
+test("HTTP VPC and direct origin routing leave local development cookies unchanged", async () => {
+  for (const vpc of [true, false]) {
+    const upstream = new Response(null, {
+      headers: { "Set-Cookie": "session=local; HttpOnly" },
+    });
+    const result = await handleRequest(
+      new Request(`${vpc ? "http" : "https"}://localhost/auth/session`),
+      {
+        ASSETS: { fetch: () => assert.fail() },
+        ...(vpc ? { SUMI_ORIGIN: { fetch: async () => upstream } } : {}),
+      },
+      async () => upstream,
+    );
+    assert.equal(result, upstream);
+  }
+});

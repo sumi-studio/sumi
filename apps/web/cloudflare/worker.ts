@@ -6,6 +6,12 @@ interface AssetFetcher {
 
 export interface CloudflareEnvironment {
   ASSETS: AssetFetcher;
+  /** A fixed-target VPC Service binding, never a VPC Network binding. */
+  SUMI_ORIGIN?: {
+    fetch(request: Request, init?: RequestInit): Promise<Response>;
+  };
+  /** Transport to the registered private service; public Origin stays intact. */
+  SUMI_ORIGIN_PROTOCOL?: "http" | "https";
 }
 
 interface CloudflareRequestInit extends RequestInit {
@@ -41,6 +47,74 @@ function originRequestInit(request: Request): CloudflareRequestInit {
     // override is supplied as a separate RequestInit object.
     signal: request.signal,
   };
+}
+
+async function fetchPrivateService(
+  request: Request,
+  environment: CloudflareEnvironment,
+): Promise<Response> {
+  const binding = environment.SUMI_ORIGIN;
+  if (!binding) throw new Error("Private service is not configured");
+  const publicUrl = new URL(request.url);
+  const protocol = environment.SUMI_ORIGIN_PROTOCOL ?? "http";
+  if (protocol !== "http" && protocol !== "https")
+    throw new Error("Invalid private transport");
+  const privateUrl = new URL(publicUrl);
+  // VPC Service configuration pins the actual host/port. The fetch URL host
+  // supplies Host/SNI, while its scheme selects plaintext or TLS transport.
+  privateUrl.protocol = `${protocol}:`;
+  const forwarded = new Request(privateUrl, request);
+  // Caller-supplied proxy metadata must never describe our trusted hop.
+  for (const key of [...forwarded.headers.keys()]) {
+    if (
+      key.toLowerCase() === "forwarded" ||
+      key.toLowerCase().startsWith("x-forwarded-") ||
+      key.toLowerCase() === "x-real-ip"
+    )
+      forwarded.headers.delete(key);
+  }
+  forwarded.headers.set("Host", publicUrl.host);
+  forwarded.headers.set("X-Forwarded-Host", publicUrl.host);
+  forwarded.headers.set("X-Forwarded-Proto", publicUrl.protocol.slice(0, -1));
+  forwarded.headers.set(
+    "X-Forwarded-Port",
+    publicUrl.port || (publicUrl.protocol === "https:" ? "443" : "80"),
+  );
+  // Return redirects to the browser, without replaying cookies/body to a new
+  // destination. WebSocket upgrades retain their exact response identity.
+  const response = await binding.fetch(forwarded, {
+    signal: request.signal,
+    redirect: "manual",
+  });
+  return publicUrl.protocol === "https:"
+    ? secureOriginCookies(response)
+    : response;
+}
+
+function secureOriginCookies(response: Response): Response {
+  if (response.status === 101 || !response.headers.has("Set-Cookie"))
+    return response;
+  const cookies = response.headers.getSetCookie();
+  const secured = cookies.map((cookie) =>
+    cookie
+      .split(";")
+      .slice(1)
+      .some((attribute) => attribute.trim().toLowerCase() === "secure")
+      ? cookie
+      : `${cookie}; Secure`,
+  );
+  if (secured.every((cookie, index) => cookie === cookies[index]))
+    return response;
+  const headers = new Headers(response.headers);
+  headers.delete("Set-Cookie");
+  for (const cookie of secured) headers.append("Set-Cookie", cookie);
+  // HTTPS termination is here; the same API still serves local HTTP clients.
+  // Reuse the untouched stream, without cloning, reading, or buffering it.
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function unavailable(): Response {
@@ -213,7 +287,9 @@ export async function handleRequest(
     // global_fetch_private_origin sends the incoming Request to the DNS origin
     // behind the named Tunnel. Returning the exact Response preserves multiple
     // Set-Cookie fields, streaming bodies, and WebSocket 101 state.
-    const response = await originFetch(request, originRequestInit(request));
+    const response = environment.SUMI_ORIGIN
+      ? await fetchPrivateService(request, environment)
+      : await originFetch(request, originRequestInit(request));
     if (unavailableOriginStatuses.has(response.status)) return unavailable();
     return response;
   } catch {

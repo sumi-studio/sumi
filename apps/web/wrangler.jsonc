@@ -15,5 +15,25 @@
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": true
+  },
+  "env": {
+    "alpha": {
+      "name": "sumi-alpha",
+      "workers_dev": true,
+      "preview_urls": false,
+      "compatibility_flags": [
+        "enable_request_signal",
+        "request_signal_passthrough"
+      ],
+      "vpc_services": [
+        {
+          "binding": "SUMI_ORIGIN",
+          "service_id": "01a09449-94f3-7fc3-b6db-daaffb98df22"
+        }
+      ],
+      "vars": {
+        "SUMI_ORIGIN_PROTOCOL": "http"
+      }
+    }
   }
 }
