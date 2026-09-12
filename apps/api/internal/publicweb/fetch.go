@@ -101,6 +101,9 @@ func (f *Fetcher) Read(ctx context.Context, r Request, beforeSend func() bool) (
 		return Result{}, networkFailure(ctx, err, "fetch_failed")
 	}
 	defer response.Body.Close()
+	if strings.EqualFold(strings.TrimSpace(response.Header.Get("Cf-Mitigated")), "challenge") {
+		return Result{}, &Failure{Code: "access_challenge", StatusCode: response.StatusCode}
+	}
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		result := &Failure{Code: "redirect_requires_new_request", StatusCode: response.StatusCode}
 		if location, e := response.Location(); e == nil {
@@ -115,14 +118,14 @@ func (f *Fetcher) Read(ctx context.Context, r Request, beforeSend func() bool) (
 		return Result{}, &Failure{Code: "http_status", StatusCode: response.StatusCode}
 	}
 	if encoding := strings.TrimSpace(response.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return Result{}, fail("unsupported_content")
+		return Result{}, &Failure{Code: "unsupported_content", Reason: "content_encoding"}
 	}
 	media, params, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || (media != "text/html" && media != "text/plain") {
-		return Result{}, fail("unsupported_content")
+		return Result{}, &Failure{Code: "unsupported_content", Reason: "media_type"}
 	}
 	if charset := params["charset"]; charset != "" && !strings.EqualFold(charset, "utf-8") {
-		return Result{}, fail("unsupported_content")
+		return Result{}, &Failure{Code: "unsupported_content", Reason: "charset"}
 	}
 	if response.ContentLength > MaxBodyBytes {
 		return Result{}, fail("response_too_large")
@@ -135,9 +138,10 @@ func (f *Fetcher) Read(ctx context.Context, r Request, beforeSend func() bool) (
 		return Result{}, fail("response_too_large")
 	}
 	if !utf8.Valid(body) {
-		return Result{}, fail("unsupported_content")
+		return Result{}, &Failure{Code: "unsupported_content", Reason: "invalid_utf8"}
 	}
-	text, title, truncated, err := extract(ctx, body, media)
+	links := &linkCollector{base: u, links: []Link{}, ids: map[string]int{}}
+	text, title, truncated, err := extractDocument(ctx, body, media, links)
 	if err != nil {
 		return Result{}, err
 	}
@@ -148,7 +152,7 @@ func (f *Fetcher) Read(ctx context.Context, r Request, beforeSend func() bool) (
 		return Result{}, fail("no_readable_text")
 	}
 	digest := sha256.Sum256(body)
-	return Result{RequestedURL: r.URL, FetchedURL: networkURL(r.URL), FetchedAt: time.Now().UTC(), StatusCode: response.StatusCode, MediaType: media, Title: title, Text: text, BodyBytes: len(body), BodySHA256: hex.EncodeToString(digest[:]), TextTruncated: truncated}, nil
+	return Result{Links: links.links, LinksTruncated: links.truncated, RequestedURL: r.URL, FetchedURL: networkURL(r.URL), FetchedAt: time.Now().UTC(), StatusCode: response.StatusCode, MediaType: media, Title: title, Text: text, BodyBytes: len(body), BodySHA256: hex.EncodeToString(digest[:]), TextTruncated: truncated}, nil
 }
 func networkFailure(ctx context.Context, err error, fallback string) *Failure {
 	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {

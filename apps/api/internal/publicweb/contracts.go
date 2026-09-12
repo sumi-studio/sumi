@@ -13,24 +13,38 @@ const MaxURLBytes = 8192
 const MaxBodyBytes = 1 << 20
 const MaxTextBytes = 128 << 10
 const maxTitleBytes = 1024
+const MaxLinks = 100
+const MaxLinkURLBytes = 32 << 10
+
+// JSON may escape one source byte into six bytes (including HTML-sensitive
+// characters). Include both source URLs, all link URLs and fixed-field headroom.
+const MaxResponseBytes = 6*(MaxTextBytes+MaxLinkURLBytes+2*MaxURLBytes+maxTitleBytes) + (16 << 10)
 
 type Request struct {
 	URL string `json:"url"`
 }
+type Link struct {
+	ID  int    `json:"id"`
+	URL string `json:"url"`
+}
+
 type Result struct {
-	RequestedURL  string    `json:"requested_url"`
-	FetchedURL    string    `json:"fetched_url"`
-	FetchedAt     time.Time `json:"fetched_at"`
-	StatusCode    int       `json:"status_code"`
-	MediaType     string    `json:"media_type"`
-	Title         *string   `json:"title"`
-	Text          string    `json:"text"`
-	BodyBytes     int       `json:"body_bytes"`
-	BodySHA256    string    `json:"body_sha256"`
-	TextTruncated bool      `json:"text_truncated"`
+	Links          []Link    `json:"links"`
+	LinksTruncated bool      `json:"links_truncated"`
+	RequestedURL   string    `json:"requested_url"`
+	FetchedURL     string    `json:"fetched_url"`
+	FetchedAt      time.Time `json:"fetched_at"`
+	StatusCode     int       `json:"status_code"`
+	MediaType      string    `json:"media_type"`
+	Title          *string   `json:"title"`
+	Text           string    `json:"text"`
+	BodyBytes      int       `json:"body_bytes"`
+	BodySHA256     string    `json:"body_sha256"`
+	TextTruncated  bool      `json:"text_truncated"`
 }
 type Failure struct {
 	Code         string `json:"error"`
+	Reason       string `json:"reason,omitempty"`
 	RequestedURL string `json:"requested_url,omitempty"`
 	StatusCode   int    `json:"status_code,omitempty"`
 	RedirectURL  string `json:"redirect_url,omitempty"`

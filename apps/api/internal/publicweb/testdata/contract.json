@@ -11,9 +11,9 @@
       "fetched_url": "HTTPS://Example.COM:443/a%2fb?q=1&q=2"
     },
     {
-      "url": "https://example.com/資料?x=一#章",
+      "url": "https://example.com/\u8cc7\u6599?x=\u4e00#\u7ae0",
       "valid": true,
-      "fetched_url": "https://example.com/資料?x=一"
+      "fetched_url": "https://example.com/\u8cc7\u6599?x=\u4e00"
     },
     {
       "url": "https://example.com.",
@@ -76,7 +76,7 @@
       "valid": false
     },
     {
-      "url": "https://例え.example",
+      "url": "https://\u4f8b\u3048.example",
       "valid": false
     },
     {
@@ -106,12 +106,44 @@
     "text": "Observed public text.",
     "body_bytes": 21,
     "body_sha256": "3b285684d48788eefe5d283d5f057284c5a6015ed8dbfbaf46bfb47e5fb3c58a",
-    "text_truncated": false
+    "text_truncated": false,
+    "links": [],
+    "links_truncated": false
   },
   "failure": {
     "error": "redirect_requires_new_request",
     "requested_url": "https://example.com/docs#part",
     "status_code": 302,
     "redirect_url": "https://example.com/new?q=2#part"
-  }
+  },
+  "linked_success": {
+    "requested_url": "https://example.com/docs#part",
+    "fetched_url": "https://example.com/docs",
+    "fetched_at": "2026-09-09T12:00:00Z",
+    "status_code": 200,
+    "media_type": "text/html",
+    "title": null,
+    "text": "Read [1] documentation.",
+    "body_bytes": 21,
+    "body_sha256": "3b285684d48788eefe5d283d5f057284c5a6015ed8dbfbaf46bfb47e5fb3c58a",
+    "text_truncated": false,
+    "links": [
+      {
+        "id": 1,
+        "url": "https://example.com/guide#section"
+      }
+    ],
+    "links_truncated": false
+  },
+  "content_failure": {
+    "error": "unsupported_content",
+    "reason": "charset",
+    "requested_url": "https://example.com/docs#part"
+  },
+  "challenge_failure": {
+    "error": "access_challenge",
+    "status_code": 403,
+    "requested_url": "https://example.com/docs#part"
+  },
+  "max_response_bytes": 1103872
 }

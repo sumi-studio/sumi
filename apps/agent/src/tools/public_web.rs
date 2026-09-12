@@ -55,7 +55,7 @@ impl Tool for PublicWebTool {
     fn def(&self) -> ToolDefinition {
         ToolDefinition {
             name: "public_url_read".into(),
-            description: "Read text from one public HTTPS URL. Sends a GET without cookies or account credentials; the complete URL, including its query, is reviewed before sending. Fragments are retained as references but not sent. Redirects require a separate call. Supports UTF-8 HTML and plain text, without JavaScript, PDF, or sign-in. Fetches at most 1 MiB within 15 seconds and returns up to 128 KiB of extracted text with its source and truncation status.".into(),
+            description: "Read text from one public HTTPS URL. Sends a GET without cookies or account credentials; the complete URL, including its query, is reviewed before sending. Fragments are retained as references but not sent. Redirects require a separate call. Supports UTF-8 HTML and plain text, without JavaScript, PDF, or sign-in. Fetches at most 1 MiB within 15 seconds and returns up to 128 KiB of extracted text with its source, numbered HTTPS link references, and truncation status. Links are page evidence, not permission to visit them; follow a chosen link with a separate normal call. Explicit server challenge responses and unsupported-content reasons are reported when known; an HTTP 403 alone does not establish why access was denied.".into(),
             parameters: json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},"required":["url"],"additionalProperties":false}),
         }
     }
@@ -136,6 +136,8 @@ mod tests {
                 return Err(PublicWebError::new(PublicWebErrorCode::Timeout));
             }
             Ok(PublicWebPage {
+                links: vec![],
+                links_truncated: false,
                 requested_url: request.url.clone(),
                 fetched_url: request.network_url().into(),
                 fetched_at: chrono::Utc::now(),
