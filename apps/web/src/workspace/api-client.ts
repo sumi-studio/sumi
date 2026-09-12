@@ -7,6 +7,7 @@ import type {
   Workspace,
   WorkspaceCurrentAgentInviteState,
   WorkspaceInvite,
+  WorkspaceInviteOptions,
   WorkspaceInvitePreview,
   WorkspaceInviteRecord,
   WorkspaceMembership,
@@ -62,7 +63,10 @@ export interface WorkspaceControlClient {
   listMembers(workspaceId: string): Promise<WorkspaceMembership[]>;
   leaveWorkspace(workspaceId: string): Promise<void>;
   removeMember(workspaceId: string, workspaceMemberId: string): Promise<void>;
-  createInvite(workspaceId: string): Promise<WorkspaceInvite>;
+  createInvite(
+    workspaceId: string,
+    options?: WorkspaceInviteOptions,
+  ): Promise<WorkspaceInvite>;
   listInvites(workspaceId: string): Promise<WorkspaceInviteRecord[]>;
   getCurrentAgentInvite(
     workspaceId: string,
@@ -72,7 +76,7 @@ export interface WorkspaceControlClient {
   ): Promise<WorkspaceTargetedPersonalityAgentInviteRecord>;
   revokeInvite(workspaceId: string, inviteId: string): Promise<void>;
   previewInvite(code: string): Promise<WorkspaceInvitePreview>;
-  redeemInvite(code: string): Promise<WorkspaceMembership>;
+  redeemInvite(code: string, idToken?: string): Promise<WorkspaceMembership>;
   listRoles(workspaceId: string): Promise<WorkspaceRole[]>;
   createRole(
     workspaceId: string,
@@ -186,11 +190,20 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
     );
   }
 
-  async createInvite(workspaceId: string): Promise<WorkspaceInvite> {
+  async createInvite(
+    workspaceId: string,
+    options?: WorkspaceInviteOptions,
+  ): Promise<WorkspaceInvite> {
     return parseInvite(
       await this.request(
         `/workspaces/${encodeURIComponent(workspaceId)}/invites`,
-        { method: "POST", body: {} },
+        {
+          method: "POST",
+          body: {
+            ...(options?.includeEnrollment ? { include_enrollment: true } : {}),
+            ...(options?.email ? { email: options.email } : {}),
+          },
+        },
       ),
     );
   }
@@ -248,17 +261,22 @@ export class WorkspaceApiClient implements WorkspaceControlClient {
   }
 
   async previewInvite(code: string): Promise<WorkspaceInvitePreview> {
-    const query = new URLSearchParams({ code });
     return parseInvitePreview(
-      await this.request(`/workspace-invites/preview?${query}`),
+      await this.request("/workspace-invites/preview", {
+        method: "POST",
+        body: { code },
+      }),
     );
   }
 
-  async redeemInvite(code: string): Promise<WorkspaceMembership> {
+  async redeemInvite(
+    code: string,
+    idToken?: string,
+  ): Promise<WorkspaceMembership> {
     return parseMembership(
       await this.request("/workspace-invites/redeem", {
         method: "POST",
-        body: { code },
+        body: { code, ...(idToken ? { id_token: idToken } : {}) },
       }),
     );
   }
@@ -451,10 +469,23 @@ function parseMembership(value: unknown): WorkspaceMembership {
 
 function parseInvite(value: unknown): WorkspaceInvite {
   const wire = asRecord(value);
+  const enrollment =
+    wire.enrollment_invitation === undefined
+      ? undefined
+      : asRecord(wire.enrollment_invitation);
   return {
     inviteId: asString(wire.invite_id),
     workspaceId: asString(wire.workspace_id),
     code: asString(wire.code),
+    ...(enrollment
+      ? {
+          enrollmentInvitation: {
+            id: asString(enrollment.id),
+            token: asString(enrollment.token),
+            expiresAt: asTimestamp(enrollment.expires_at),
+          },
+        }
+      : {}),
     expiresAt: asTimestamp(wire.expires_at),
     createdAt: asTimestamp(wire.created_at),
   };
@@ -492,6 +523,9 @@ function parseInvitePreview(value: unknown): WorkspaceInvitePreview {
   return {
     workspaceId: asString(wire.workspace_id),
     workspaceName: asString(wire.workspace_name),
+    ...(wire.requires_email_verification === true
+      ? { requiresEmailVerification: true }
+      : {}),
     expiresAt: asTimestamp(wire.expires_at),
   };
 }

@@ -172,17 +172,20 @@ type BrowserSessionConnectionCloser interface {
 // BrowserAuthServer exchanges verified Firebase identities for the same
 // opaque HttpOnly session consumed by targetless direct-chat routes.
 type BrowserAuthServer struct {
-	Firebase       FirebaseIDTokenVerifier
-	Bindings       IdentityBindingResolver
-	Sessions       browserSessionManager
-	AllowedOrigins []string
-	SecureCookies  bool
-	SessionTTL     time.Duration
-	Connections    BrowserSessionConnectionCloser
-	Flows          BrowserAuthFlowController
-	Profiles       HumanProfileReader
-	random         io.Reader
-	sessionMu      sync.Mutex
+	EnrollmentInvitations EnrollmentInvitationStore
+	EnrollmentAdmins      map[string]bool
+	authAllocations       authAllocationLimiter
+	Firebase              FirebaseIDTokenVerifier
+	Bindings              IdentityBindingResolver
+	Sessions              browserSessionManager
+	AllowedOrigins        []string
+	SecureCookies         bool
+	SessionTTL            time.Duration
+	Connections           BrowserSessionConnectionCloser
+	Flows                 BrowserAuthFlowController
+	Profiles              HumanProfileReader
+	random                io.Reader
+	sessionMu             sync.Mutex
 }
 
 func NewBrowserAuthServer(
@@ -217,6 +220,9 @@ func NewBrowserAuthServer(
 // RegisterRoutes attaches the browser authentication boundary. Callers should
 // omit registration entirely when authentication is not configured.
 func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
+	if s.EnrollmentInvitations != nil {
+		s.registerEnrollmentRoutes(mux)
+	}
 	mux.HandleFunc("GET /auth/csrf", s.serveCSRF)
 	if s.Flows == nil {
 		mux.HandleFunc("POST /auth/session", s.serveSessionExchange)
@@ -249,6 +255,9 @@ func (s *BrowserAuthServer) serveCSRF(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAuthAllocation(w, r) {
+		return
+	}
 	if !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
 	}

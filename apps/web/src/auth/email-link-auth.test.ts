@@ -3,6 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beginEmailLinkAuth, completeEmailLinkAuth } from "./email-link-auth";
 
+import {
+  captureEnrollmentInvitation,
+  clearWorkspaceInvitation,
+  readWorkspaceInvitation,
+  workspaceInvitationChanged,
+} from "./enrollment-invitation-state";
+
 const emailMocks = vi.hoisted(() => ({
   auth: {
     currentUser: null as null | {
@@ -41,6 +48,7 @@ vi.mock("./auth-flow-client", async (importOriginal) => ({
 
 beforeEach(() => {
   localStorage.clear();
+  clearWorkspaceInvitation();
   history.replaceState(null, "", "/");
   emailMocks.auth.currentUser = null;
   emailMocks.getFirebaseAuth.mockReturnValue(emailMocks.auth);
@@ -73,8 +81,17 @@ describe("Firebase email-link Koseki flow", () => {
   });
 
   it("returns confirmation_required without silently creating an account", async () => {
+    const workspaceCode = "w".repeat(43);
+    history.replaceState(null, "", `/#workspace_invite=${workspaceCode}`);
+    captureEnrollmentInvitation();
     await beginEmailLinkAuth("human@example.com", "sign_in");
     const settings = emailMocks.sendSignInLinkToEmail.mock.calls[0]?.[2];
+    expect(settings.url).not.toContain(workspaceCode);
+    clearWorkspaceInvitation(); // A newly opened tab has no invitation session state.
+    const restored = vi.fn();
+    window.addEventListener(workspaceInvitationChanged, restored, {
+      once: true,
+    });
     const state = new URL(settings.url).searchParams.get("sumi_auth_state");
     history.replaceState(
       null,
@@ -100,6 +117,8 @@ describe("Firebase email-link Koseki flow", () => {
 
     const completion = await completeEmailLinkAuth();
 
+    expect(readWorkspaceInvitation()).toBe(workspaceCode);
+    expect(restored).toHaveBeenCalledOnce();
     expect(completion.flow.intent).toBe("sign_in");
     expect(completion.result).toMatchObject({
       outcome: "confirmation_required",

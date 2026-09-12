@@ -12,6 +12,7 @@ import type {
   Workspace,
   WorkspaceCurrentAgentInviteState,
   WorkspaceInvite,
+  WorkspaceInviteOptions,
   WorkspaceInvitePreview,
   WorkspaceInviteRecord,
   WorkspaceInviteSecret,
@@ -26,6 +27,7 @@ import {
   participantKey,
   WORKSPACE_PERMISSIONS,
 } from "./model";
+import { redeemWorkspaceInvitation } from "./redeem-workspace-invitation";
 
 export type WorkspaceListStatus = "idle" | "loading" | "ready" | "error";
 const INVITE_AUTHORITY_CONTRADICTION =
@@ -66,12 +68,12 @@ export interface WorkspaceControlState {
   transferOwnership(workspaceMemberId: string): Promise<Workspace>;
   leaveWorkspace(): Promise<void>;
   removeMember(workspaceMemberId: string): Promise<void>;
-  createInvite(): Promise<WorkspaceInvite>;
+  createInvite(options?: WorkspaceInviteOptions): Promise<WorkspaceInvite>;
   createCurrentAgentInvite(): Promise<WorkspaceTargetedPersonalityAgentInviteRecord>;
   clearCreatedInviteSecret(): void;
   revokeInvite(inviteId: string): Promise<void>;
   previewInvite(code: string): Promise<WorkspaceInvitePreview>;
-  redeemInvite(code: string): Promise<WorkspaceMembership>;
+  redeemInvite(code: string, idToken?: string): Promise<WorkspaceMembership>;
   createRole(input: WorkspaceRoleInput): Promise<WorkspaceRole>;
   updateRole(roleId: string, input: WorkspaceRoleInput): Promise<WorkspaceRole>;
   deleteRole(roleId: string): Promise<void>;
@@ -641,15 +643,15 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         }
       },
 
-      async createInvite() {
+      async createInvite(options) {
         const token = beginMutation("create_invite");
         try {
-          const invite = await client.createInvite(token.workspaceId);
+          const invite = await client.createInvite(token.workspaceId, options);
           if (!isCurrentScope(token)) return invite;
           if (invite.workspaceId !== token.workspaceId) {
             throw new Error("Invite belongs to a different Workspace");
           }
-          const { code, ...record } = invite;
+          const { code, enrollmentInvitation, ...record } = invite;
           const shareRecord: WorkspaceInviteRecord = {
             ...record,
             kind: "share_code",
@@ -661,7 +663,13 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
               ),
               shareRecord,
             ],
-            createdInviteSecret: { inviteId: shareRecord.inviteId, code },
+            createdInviteSecret: {
+              inviteId: shareRecord.inviteId,
+              code,
+              ...(enrollmentInvitation
+                ? { enrollmentToken: enrollmentInvitation.token }
+                : {}),
+            },
           }));
           endMutation(token);
           return invite;
@@ -738,7 +746,7 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
           : Promise.reject(new Error("Invite code is required"));
       },
 
-      async redeemInvite(code) {
+      async redeemInvite(code, idToken) {
         const { sessionIdentity: identity, sessionScopeKey: scopeKey } = get();
         const generation = sessionGeneration;
         if (!identity || !scopeKey) {
@@ -751,7 +759,15 @@ export function createWorkspaceControlStore(client: WorkspaceControlClient) {
         }
         set({ mutation: "redeem_invite", errorCode: null });
         try {
-          const membership = await client.redeemInvite(trimmed);
+          const membership = idToken
+            ? await client.redeemInvite(trimmed, idToken)
+            : await redeemWorkspaceInvitation(
+                (proof) => client.redeemInvite(trimmed, proof),
+                () =>
+                  sessionGeneration === generation &&
+                  get().sessionIdentity === identity &&
+                  get().sessionScopeKey === scopeKey,
+              );
           if (
             sessionGeneration !== generation ||
             get().sessionIdentity !== identity ||

@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceAPIError } from "../api-client";
 import type { WorkspaceControlState } from "../store";
@@ -27,6 +33,7 @@ const currentInvite = {
 };
 
 const mocks = vi.hoisted(() => ({
+  enrollmentList: vi.fn(),
   createCurrentAgentInvite: vi.fn(),
   navigate: vi.fn(),
   revokeInvite: vi.fn(),
@@ -35,6 +42,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => mocks.navigate,
+}));
+
+vi.mock("../../auth/enrollment-invitations", () => ({
+  listEnrollmentInvitations: mocks.enrollmentList,
 }));
 
 vi.mock("../../auth/auth-context", () => ({
@@ -124,6 +135,7 @@ function renderMembers() {
 }
 
 beforeEach(() => {
+  mocks.enrollmentList.mockRejectedValue(new Error("not_admin"));
   mocks.createCurrentAgentInvite.mockResolvedValue(currentInvite);
   mocks.revokeInvite.mockResolvedValue(undefined);
   mocks.state = workspaceState({ status: "none" });
@@ -232,4 +244,44 @@ describe("workspaceMutationErrorMessage", () => {
       workspaceMutationErrorMessage(new Error("database detail")),
     ).not.toContain("database detail");
   });
+});
+
+it("offers bundled issuance only with both admin and manage-members capability", async () => {
+  mocks.enrollmentList.mockResolvedValue({ canInvite: true, invitations: [] });
+  renderMembers();
+  const option = await screen.findByRole("checkbox", {
+    name: "Sumiを初めて使う人も登録できる招待リンクにする",
+  });
+  fireEvent.click(option);
+  fireEvent.change(
+    screen.getByRole("textbox", { name: "相手のメールアドレス（任意）" }),
+    { target: { value: "tester@example.com" } },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "招待を作成" }));
+  expect(mocks.state.createInvite).toHaveBeenCalledWith({
+    includeEnrollment: true,
+    email: "tester@example.com",
+  });
+  cleanup();
+  mocks.state.members = mocks.state.members.map((member) => ({
+    ...member,
+    owner: false,
+  }));
+  renderMembers();
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Sumiを初めて使う人も登録できる招待リンクにする",
+      }),
+    ).toBeNull(),
+  );
+});
+it("does not offer Sumi registration when only Workspace authority is present", async () => {
+  renderMembers();
+  await waitFor(() => expect(mocks.enrollmentList).toHaveBeenCalled());
+  expect(
+    screen.queryByRole("checkbox", {
+      name: "Sumiを初めて使う人も登録できる招待リンクにする",
+    }),
+  ).toBeNull();
 });

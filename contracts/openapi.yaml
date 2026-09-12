@@ -240,7 +240,7 @@ paths:
     post:
       operationId: createWorkspaceInvite
       summary: Create a single-use 24-hour opaque Workspace invite
-      description: The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption.
+      description: The plaintext code is returned once. Its issuing membership tenure and manage_members authority are rechecked at redemption. Bundled enrollment additionally requires Sumi enrollment administration; signup reserves this invitation for the new Human without joining the Workspace.
       security:
         - sumiSession: []
       requestBody:
@@ -250,6 +250,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
+              properties:
+                include_enrollment:
+                  type: boolean
+                  default: false
+                email:
+                  type: string
+                  description: Optional verified-email binding for bundled enrollment.
       responses:
         "201":
           description: Invite created
@@ -374,6 +381,36 @@ paths:
           $ref: "#/components/responses/InvalidRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+    post:
+      operationId: previewWorkspaceInviteFromBody
+      summary: Preview an invite without putting its secret in the URL
+      description: Requires an allowed browser Origin. Does not consume either grant or reveal the bound email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              additionalProperties: false
+              properties:
+                code:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+      responses:
+        "200":
+          description: Minimal non-consuming invite preview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceInvitePreview"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /workspace-invites/redeem:
     post:
       operationId: redeemWorkspaceInvite
@@ -394,6 +431,10 @@ paths:
                   type: string
                   minLength: 1
                   maxLength: 128
+                id_token:
+                  type: string
+                  maxLength: 16384
+                  description: Firebase ID token required for an unreserved email-bound bundle; its verified email and UID must match the authenticated Human.
       responses:
         "200":
           description: New membership or the exact prior redemption result
@@ -405,6 +446,8 @@ paths:
           $ref: "#/components/responses/InvalidRequest"
         "401":
           description: Missing, invalid, or concurrently revoked browser session
+        "403":
+          description: Forbidden, or invitation_email_verification_required for missing or mismatched verified identity.
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -1086,6 +1129,21 @@ components:
         created_at:
           type: string
           format: date-time
+        enrollment_invitation:
+          type: object
+          required: [id, token, expires_at]
+          additionalProperties: false
+          properties:
+            id:
+              $ref: "#/components/schemas/UUIDv7"
+            token:
+              type: string
+              minLength: 43
+              maxLength: 43
+              description: Enrollment secret returned only at creation. Share both secrets in the URL fragment.
+            expires_at:
+              type: string
+              format: date-time
     WorkspaceCurrentAgentInviteRequest:
       type: object
       additionalProperties: false
@@ -1141,6 +1199,9 @@ components:
         expires_at:
           type: string
           format: date-time
+        requires_email_verification:
+          type: boolean
+          description: True when explicit acceptance needs a verified email identity; the bound address is never disclosed.
     WorkspacePermission:
       type: string
       description: Platform permission whose vocabulary and meaning are owned by Workspace.

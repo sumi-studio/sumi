@@ -318,12 +318,9 @@ describe("WorkspaceApiClient", () => {
       {},
     );
     expectRequest(fetcher, 1, `/workspaces/${WORKSPACE_A_ID}/invites`, "GET");
-    expectRequest(
-      fetcher,
-      2,
-      `/workspace-invites/preview?code=${INVITE_CODE}`,
-      "GET",
-    );
+    expectRequest(fetcher, 2, "/workspace-invites/preview", "POST", {
+      code: INVITE_CODE,
+    });
     expectRequest(fetcher, 3, "/workspace-invites/redeem", "POST", {
       code: INVITE_CODE,
     });
@@ -723,3 +720,60 @@ function expectRequest(
     signal: expect.any(AbortSignal),
   });
 }
+
+it("issues one bundled link grant, keeps enrollment metadata distinct, and sends proof only on explicit redemption", async () => {
+  const fetcher = fetchSequence(
+    json(
+      {
+        invite_id: INVITE_ID,
+        workspace_id: WORKSPACE_A_ID,
+        code: INVITE_CODE,
+        expires_at: "2026-09-19T00:00:00Z",
+        created_at: "2026-09-12T00:00:00Z",
+        enrollment_invitation: {
+          id: INVITE_ID,
+          token: "e".repeat(43),
+          expires_at: "2026-09-19T00:00:00Z",
+        },
+      },
+      201,
+    ),
+    json({
+      workspace_id: WORKSPACE_A_ID,
+      workspace_name: "Atelier",
+      expires_at: "2026-09-19T00:00:00Z",
+      requires_email_verification: true,
+    }),
+    json({
+      workspace_member_id: MEMBER_B_ID,
+      workspace_id: WORKSPACE_A_ID,
+      participant: { kind: "human", human_id: HUMAN_A_ID },
+      display_name: "Yohaku",
+      owner: false,
+      role_ids: [],
+      joined_at: "2026-09-12T00:00:00Z",
+      left_at: null,
+    }),
+  );
+  const client = new WorkspaceApiClient(fetcher);
+  const invite = await client.createInvite(WORKSPACE_A_ID, {
+    includeEnrollment: true,
+    email: "tester@example.com",
+  });
+  expect(invite.enrollmentInvitation?.token).toBe("e".repeat(43));
+  expectRequest(fetcher, 0, `/workspaces/${WORKSPACE_A_ID}/invites`, "POST", {
+    include_enrollment: true,
+    email: "tester@example.com",
+  });
+  expect(
+    (await client.previewInvite(INVITE_CODE)).requiresEmailVerification,
+  ).toBe(true);
+  expectRequest(fetcher, 1, "/workspace-invites/preview", "POST", {
+    code: INVITE_CODE,
+  });
+  await client.redeemInvite(INVITE_CODE, "current-identity-proof");
+  expectRequest(fetcher, 2, "/workspace-invites/redeem", "POST", {
+    code: INVITE_CODE,
+    id_token: "current-identity-proof",
+  });
+});

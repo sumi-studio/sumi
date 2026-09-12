@@ -48,10 +48,11 @@ const employmentAuthorityLockDomain = "sumi:employment-authority:v1:"
 // Store is the trusted provisioning boundary for the 戸籍. All minting and
 // credential binding flows through it; no other component writes the registry.
 type Store struct {
-	pool                *pgxpool.Pool
-	wrappingKeyID       string
-	directChatLifecycle *directchat.LifecycleFence
-	directChatApps      *applicationapps.Store
+	EnrollmentWorkspaceAuthority EnrollmentWorkspaceAuthority
+	pool                         *pgxpool.Pool
+	wrappingKeyID                string
+	directChatLifecycle          *directchat.LifecycleFence
+	directChatApps               *applicationapps.Store
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to a

@@ -32,10 +32,11 @@ const (
 )
 
 type Store struct {
-	pool      *pgxpool.Pool
-	now       func() time.Time
-	random    io.Reader
-	inviteTTL time.Duration
+	EnrollmentAdmin func(string) bool
+	pool            *pgxpool.Pool
+	now             func() time.Time
+	random          io.Reader
+	inviteTTL       time.Duration
 }
 
 // CurrentEmployerAuthority is the canonical Koseki seam used to compose an
@@ -901,14 +902,15 @@ func (s *Store) PreviewInvite(ctx context.Context, code string) (InvitePreview, 
 	hash := sha256.Sum256([]byte(code))
 	var preview InvitePreview
 	err := s.pool.QueryRow(ctx, `
-		SELECT w.workspace_id, w.name, wi.expires_at
+		SELECT w.workspace_id, w.name, wi.expires_at,
+ EXISTS(SELECT 1 FROM enrollment_invites ei WHERE ei.workspace_invite_id=wi.invite_id AND ei.email IS NOT NULL AND wi.reserved_human_id IS NULL)
 		FROM workspace_invites wi
 		JOIN workspaces w ON w.workspace_id = wi.workspace_id
 		WHERE wi.code_hash = $1
 		  AND wi.revoked_at IS NULL
 		  AND wi.redeemed_at IS NULL
 		  AND wi.expires_at > $2`, hash[:], s.now().UTC(),
-	).Scan(&preview.WorkspaceID, &preview.WorkspaceName, &preview.ExpiresAt)
+	).Scan(&preview.WorkspaceID, &preview.WorkspaceName, &preview.ExpiresAt, &preview.RequiresEmailVerification)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return InvitePreview{}, ErrInviteUnavailable
 	}
@@ -919,6 +921,9 @@ func (s *Store) PreviewInvite(ctx context.Context, code string) (InvitePreview, 
 }
 
 func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant.Ref) (Membership, error) {
+	return s.RedeemInviteWithEnrollmentProof(ctx, code, actor, EnrollmentRecipientProof{})
+}
+func (s *Store) RedeemInviteWithEnrollmentProof(ctx context.Context, code string, actor participant.Ref, proof EnrollmentRecipientProof) (Membership, error) {
 	if code == "" || len(code) > 128 {
 		return Membership{}, ErrInviteUnavailable
 	}
@@ -989,6 +994,9 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 	if revokedAt != nil || !expiresAt.After(now) {
 		return Membership{}, ErrInviteUnavailable
 	}
+	if err := requireBundleRecipient(ctx, tx, hash[:], actor, proof); err != nil {
+		return Membership{}, err
+	}
 	if err := requireInviteIssuerAuthority(ctx, tx, workspaceID, issuerMembershipID); err != nil {
 		return Membership{}, err
 	}
@@ -1002,7 +1010,24 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 		return Membership{}, fmt.Errorf("check existing workspace membership: %w", err)
 	}
 	if already {
-		return Membership{}, ErrAlreadyMember
+		var bundled bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM enrollment_invites ei JOIN workspace_invites wi ON wi.invite_id=ei.workspace_invite_id WHERE wi.code_hash=$1)`, hash[:]).Scan(&bundled); err != nil {
+			return Membership{}, err
+		}
+		if !bundled {
+			return Membership{}, ErrAlreadyMember
+		}
+		membership, err := s.ActiveMembershipInTx(ctx, tx, workspaceID, actor)
+		if err != nil {
+			return Membership{}, err
+		}
+		if err := finishShareInvite(ctx, tx, hash[:], actor, membership, now); err != nil {
+			return Membership{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Membership{}, err
+		}
+		return membership, nil
 	}
 	membership := Membership{
 		WorkspaceMemberID: newUUIDv7(), WorkspaceID: workspaceID,
@@ -1033,13 +1058,8 @@ func (s *Store) RedeemInvite(ctx context.Context, code string, actor participant
 	); err != nil {
 		return Membership{}, err
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE workspace_invites
-		SET redeemed_by_kind = $2, redeemed_by_id = $3,
-		    redeemed_workspace_member_id = $4, redeemed_at = $5
-		WHERE code_hash = $1`, hash[:], actor.Kind, actor.ID,
-		membership.WorkspaceMemberID, now); err != nil {
-		return Membership{}, fmt.Errorf("consume workspace invite: %w", err)
+	if err := finishShareInvite(ctx, tx, hash[:], actor, membership, now); err != nil {
+		return Membership{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Membership{}, fmt.Errorf("commit invite redemption: %w", err)
@@ -1313,6 +1333,9 @@ func (s *Store) RevokeInvite(ctx context.Context, workspaceID, inviteID string, 
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrInviteUnavailable
+	}
+	if _, err = tx.Exec(ctx, `UPDATE enrollment_invites SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE workspace_invite_id=$1 AND consumed_at IS NULL`, inviteID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit invite revocation: %w", err)

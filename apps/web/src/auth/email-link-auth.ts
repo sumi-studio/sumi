@@ -26,6 +26,10 @@ import {
   type SerializedOAuthCredential,
   savePendingEmailFlow,
 } from "./auth-flow-state";
+import {
+  readWorkspaceInvitation,
+  restoreWorkspaceInvitation,
+} from "./enrollment-invitation-state";
 import { getFirebaseAuth } from "./firebase";
 import { AuthAPIError } from "./session-client";
 
@@ -69,6 +73,7 @@ export async function beginEmailLinkAuth(
     continuation,
     nonce,
   });
+  const workspaceInviteCode = readWorkspaceInvitation();
   const pending: PendingEmailAuthFlow = {
     flowId: started.flowId,
     nonce,
@@ -77,6 +82,7 @@ export async function beginEmailLinkAuth(
     email,
     expiresAt: started.expiresAt,
     stage: "link_sent",
+    ...(workspaceInviteCode ? { workspaceInviteCode } : {}),
     ...(recovery
       ? {
           credentialRecovery: boundedRecovery(recovery, started.expiresAt),
@@ -152,6 +158,9 @@ export async function completeEmailLinkAuth(): Promise<EmailLinkFlowCompletion> 
     nonce: pending.nonce,
     idToken,
   });
+  if (pending.workspaceInviteCode) {
+    restoreWorkspaceInvitation(pending.workspaceInviteCode);
+  }
   if (!consumesCredential) clearPendingEmailFlow(state);
   clearEmailFlowLocation();
   return {

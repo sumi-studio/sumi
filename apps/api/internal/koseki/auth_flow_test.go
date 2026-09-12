@@ -41,7 +41,7 @@ func startEmailFlow(t *testing.T, ctx context.Context, store *Store, intent Auth
 		t.Fatal(err)
 	}
 	flow, err := store.StartAuthFlow(ctx, StartAuthFlowRequest{
-		Intent: intent, Channel: ChannelEmailLink, ExpectedProvider: "password",
+		InviteToken: enrollmentTestToken(t, ctx, store, nonce), Intent: intent, Channel: ChannelEmailLink, ExpectedProvider: "password",
 		NormalizedEmail: normalized, Continuation: "/direct-chat", Nonce: nonce,
 		TTL: 10 * time.Minute,
 	})
@@ -188,7 +188,7 @@ func assertEnabledDirectChatInstallation(t *testing.T, ctx context.Context, stor
 func assertRegistryCounts(t *testing.T, ctx context.Context, store *Store, humans, agents int) {
 	t.Helper()
 	var gotHumans, gotAgents int
-	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM humans").Scan(&gotHumans); err != nil {
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM humans WHERE human_id<>'"+enrollmentTestIssuer+"'").Scan(&gotHumans); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM agents").Scan(&gotAgents); err != nil {
@@ -228,11 +228,11 @@ func TestAuthFlowRejectsMismatchReplayAndChangedIdempotency(t *testing.T) {
 	}
 	assertRegistryCounts(t, ctx, store, 1, 1)
 
-	same, err := store.StartAuthFlow(ctx, StartAuthFlowRequest{Intent: IntentSignUp, Channel: ChannelEmailLink, ExpectedProvider: "password", NormalizedEmail: "bound@example.com", Continuation: "/direct-chat", Nonce: nonce, TTL: 10 * time.Minute})
+	same, err := store.StartAuthFlow(ctx, StartAuthFlowRequest{InviteToken: nonce, Intent: IntentSignUp, Channel: ChannelEmailLink, ExpectedProvider: "password", NormalizedEmail: "bound@example.com", Continuation: "/direct-chat", Nonce: nonce, TTL: 10 * time.Minute})
 	if err != nil || same.FlowID != flow.FlowID {
 		t.Fatalf("idempotent start: %+v %v", same, err)
 	}
-	_, err = store.StartAuthFlow(ctx, StartAuthFlowRequest{Intent: IntentSignIn, Channel: ChannelEmailLink, ExpectedProvider: "password", NormalizedEmail: "bound@example.com", Continuation: "/direct-chat", Nonce: nonce, TTL: 10 * time.Minute})
+	_, err = store.StartAuthFlow(ctx, StartAuthFlowRequest{InviteToken: nonce, Intent: IntentSignIn, Channel: ChannelEmailLink, ExpectedProvider: "password", NormalizedEmail: "bound@example.com", Continuation: "/direct-chat", Nonce: nonce, TTL: 10 * time.Minute})
 	if !errors.Is(err, ErrInvalidAuthFlow) {
 		t.Fatalf("changed nonce semantics: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestProviderAuthFlowBindsSubjectWithoutUsingEmail(t *testing.T) {
 	store, ctx := authFlowStore(t)
 	nonce := testNonce(t)
 	flow, err := store.StartAuthFlow(ctx, StartAuthFlowRequest{
-		Intent: IntentSignUp, Channel: ChannelProvider, ExpectedProvider: "github.com",
+		InviteToken: enrollmentTestToken(t, ctx, store, nonce), Intent: IntentSignUp, Channel: ChannelProvider, ExpectedProvider: "github.com",
 		Continuation: "/direct-chat", Nonce: nonce, TTL: 10 * time.Minute,
 	})
 	if err != nil {
