@@ -14,3 +14,6 @@ CREATE TABLE enrollment_invites (
 ALTER TABLE auth_flows ADD COLUMN enrollment_invite_id uuidv7 REFERENCES enrollment_invites(invite_id);
 ALTER TABLE auth_flows ADD COLUMN verified_email text;
 ALTER TABLE auth_flows ADD COLUMN email_verified boolean NOT NULL DEFAULT false;
+
+ALTER TABLE enrollment_invites ADD COLUMN workspace_invite_id uuidv7 UNIQUE REFERENCES workspace_invites(invite_id);
+ALTER TABLE workspace_invites ADD COLUMN reserved_human_id uuidv7 REFERENCES humans(human_id);
