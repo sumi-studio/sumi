@@ -7,7 +7,7 @@ import {
 } from "@sumi/ui/components/sheet";
 import { cn } from "@sumi/ui/lib/utils";
 import { FileText } from "lucide-react";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import type { ChatItem } from "../agent/model";
 
 export interface ScrubberTick {
@@ -54,12 +54,14 @@ export function TimelineScrubber({
   onJump,
   className,
 }: TimelineScrubberProps) {
-  const [hovered, setHovered] = useState<number | null>(null);
-  const containerRef = useRef<HTMLElement>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const hoveredIndex = ticks.findIndex((tick) => tick.id === hoveredId);
+  const hovered = hoveredIndex < 0 ? null : hoveredIndex;
+  const [container, setContainer] = useState<HTMLElement | null>(null);
   const [containerHeight, setContainerHeight] = useState(0);
 
   useLayoutEffect(() => {
-    const el = containerRef.current;
+    const el = container;
     if (!el) {
       return;
     }
@@ -69,7 +71,7 @@ export function TimelineScrubber({
     observer.observe(el);
     setContainerHeight(el.clientHeight);
     return () => observer.disconnect();
-  }, []);
+  }, [container]);
 
   if (ticks.length === 0) {
     return null;
@@ -83,11 +85,33 @@ export function TimelineScrubber({
         )
       : MAX_SPACING;
 
+  const capacity = Math.max(2, Math.floor(containerHeight / MIN_SPACING));
+  const dense = ticks.length > capacity;
+  const selected = hovered ?? visibleRange?.[0] ?? 0;
+  const indexAt = (clientY: number) => {
+    const rect = container?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return selected;
+    return Math.round(
+      Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)) *
+        (ticks.length - 1),
+    );
+  };
+  const marks = dense
+    ? Array.from({ length: capacity }, (_, index) =>
+        Math.round((index * (ticks.length - 1)) / (capacity - 1)),
+      )
+    : [];
+
   const widthOf = (i: number): number => {
     if (hovered === null) {
       return BASE_WIDTH;
     }
-    const falloff = Math.max(0, 1 - Math.abs(i - hovered) / PEAK_FALLOFF);
+    const falloff = Math.max(
+      0,
+      1 -
+        Math.abs(i - hovered) /
+          (PEAK_FALLOFF * (dense ? (ticks.length - 1) / (capacity - 1) : 1)),
+    );
     return BASE_WIDTH + (PEAK_WIDTH - BASE_WIDTH) * falloff;
   };
 
@@ -103,57 +127,157 @@ export function TimelineScrubber({
 
   return (
     <nav
-      ref={containerRef}
+      ref={setContainer}
       className={cn(
         "flex h-full w-6 flex-col items-start justify-center",
         className,
       )}
-      onMouseLeave={() => setHovered(null)}
+      onMouseLeave={() => setHoveredId(null)}
       aria-label="会話タイムライン"
     >
-      {ticks.map((tick, i) => (
+      {dense ? (
         <div
-          key={tick.id}
-          className="relative flex items-center"
-          style={{ height: spacing }}
+          role="slider"
+          tabIndex={0}
+          aria-label="会話の位置"
+          aria-orientation="vertical"
+          aria-valuemin={1}
+          aria-valuemax={ticks.length}
+          aria-valuenow={selected + 1}
+          aria-valuetext={`${selected + 1} / ${ticks.length} — ${ticks[selected]?.title || "添付のみ"}`}
+          className="relative h-full w-6 outline-none focus-visible:ring-2 focus-visible:ring-neutral-300"
+          onPointerMove={(event) =>
+            setHoveredId(ticks[indexAt(event.clientY)].id)
+          }
+          onFocus={() => setHoveredId(ticks[selected].id)}
+          onBlur={() => setHoveredId(null)}
+          onClick={(event) => {
+            const index = indexAt(event.clientY);
+            setHoveredId(ticks[index].id);
+            onJump(index);
+          }}
+          onKeyDown={(event) => {
+            const next =
+              event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? ticks.length - 1
+                  : event.key === "ArrowDown" || event.key === "ArrowRight"
+                    ? Math.min(ticks.length - 1, selected + 1)
+                    : event.key === "ArrowUp" || event.key === "ArrowLeft"
+                      ? Math.max(0, selected - 1)
+                      : event.key === "PageDown"
+                        ? Math.min(ticks.length - 1, selected + 10)
+                        : event.key === "PageUp"
+                          ? Math.max(0, selected - 10)
+                          : event.key === "Enter" || event.key === " "
+                            ? selected
+                            : null;
+            if (next === null) return;
+            event.preventDefault();
+            setHoveredId(ticks[next].id);
+            onJump(next);
+          }}
         >
-          <Button
-            variant="ghost"
-            aria-label={`「${tick.title.slice(0, 20)}」へ移動`}
-            onMouseEnter={() => setHovered(i)}
-            onFocus={() => setHovered(i)}
-            onClick={() => onJump(i)}
-            className="h-full w-6 justify-start rounded-none p-0 hover:bg-transparent"
-          >
+          {marks.map((index) => (
             <span
+              key={ticks[index].id}
+              aria-hidden="true"
               className={cn(
-                "h-[2px] rounded-full transition-[width,background-color] duration-150",
-                colorOf(i),
+                "pointer-events-none absolute left-0 h-[2px] -translate-y-1/2 rounded-full transition-[width,background-color] duration-150",
+                colorOf(index),
               )}
-              style={{ width: widthOf(i) }}
+              style={{
+                top: `${(index / (ticks.length - 1)) * 100}%`,
+                width: widthOf(index),
+              }}
             />
-          </Button>
-
-          {hovered === i && (
-            <div className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-8 z-10 w-72 rounded-xl border border-neutral-200 bg-white p-3.5 shadow-[0_4px_24px_rgba(0,0,0,0.08)]">
+          ))}
+          {hovered !== null && (
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute left-0 h-[2px] -translate-y-1/2 rounded-full bg-neutral-800"
+              style={{
+                top: `${(hovered / (ticks.length - 1)) * 100}%`,
+                width: PEAK_WIDTH,
+              }}
+            />
+          )}
+          {visibleRange && hovered === null && (
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute left-0 min-h-[2px] rounded-full bg-neutral-500"
+              style={{
+                top: `${(visibleRange[0] / (ticks.length - 1)) * 100}%`,
+                height: `${((visibleRange[1] - visibleRange[0]) / (ticks.length - 1)) * 100}%`,
+                width: BASE_WIDTH,
+              }}
+            />
+          )}
+          {hovered !== null && (
+            <div
+              className="pointer-events-none absolute left-8 z-10 w-72 -translate-y-1/2 rounded-xl border border-neutral-200 bg-white p-3.5 shadow-[0_4px_24px_rgba(0,0,0,0.08)]"
+              style={{ top: `${(hovered / (ticks.length - 1)) * 100}%` }}
+            >
               <p className="line-clamp-2 font-medium text-[13px] text-neutral-900 leading-5">
-                {tick.title || "(添付のみ)"}
+                {ticks[hovered].title || "(添付のみ)"}
               </p>
-              {tick.preview && (
+              {ticks[hovered].preview && (
                 <p className="mt-1.5 line-clamp-3 text-[13px] text-neutral-500 leading-5">
-                  {tick.preview}
+                  {ticks[hovered].preview}
                 </p>
               )}
-              {tick.chip && (
-                <p className="mt-2.5 flex items-center gap-1.5 text-[13px] text-neutral-600">
-                  <FileText className="size-3.5 shrink-0 text-neutral-400" />
-                  <span className="truncate">{tick.chip}</span>
-                </p>
-              )}
+              <p className="mt-1.5 text-[11px] text-neutral-400">
+                {hovered + 1} / {ticks.length}
+              </p>
             </div>
           )}
         </div>
-      ))}
+      ) : (
+        ticks.map((tick, i) => (
+          <div
+            key={tick.id}
+            className="relative flex items-center"
+            style={{ height: spacing }}
+          >
+            <Button
+              variant="ghost"
+              aria-label={`「${tick.title.slice(0, 20)}」へ移動`}
+              onMouseEnter={() => setHoveredId(tick.id)}
+              onFocus={() => setHoveredId(tick.id)}
+              onClick={() => onJump(i)}
+              className="h-full w-6 justify-start rounded-none p-0 hover:bg-transparent"
+            >
+              <span
+                className={cn(
+                  "h-[2px] rounded-full transition-[width,background-color] duration-150",
+                  colorOf(i),
+                )}
+                style={{ width: widthOf(i) }}
+              />
+            </Button>
+
+            {hovered === i && (
+              <div className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-8 z-10 w-72 rounded-xl border border-neutral-200 bg-white p-3.5 shadow-[0_4px_24px_rgba(0,0,0,0.08)]">
+                <p className="line-clamp-2 font-medium text-[13px] text-neutral-900 leading-5">
+                  {tick.title || "(添付のみ)"}
+                </p>
+                {tick.preview && (
+                  <p className="mt-1.5 line-clamp-3 text-[13px] text-neutral-500 leading-5">
+                    {tick.preview}
+                  </p>
+                )}
+                {tick.chip && (
+                  <p className="mt-2.5 flex items-center gap-1.5 text-[13px] text-neutral-600">
+                    <FileText className="size-3.5 shrink-0 text-neutral-400" />
+                    <span className="truncate">{tick.chip}</span>
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        ))
+      )}
     </nav>
   );
 }
@@ -215,6 +339,7 @@ interface Exchange {
 export function createConversationTimeline(
   items: ChatItem[],
   visibleMessageIds: string[],
+  historyIndex?: readonly ScrubberTick[],
 ): ConversationTimeline {
   const exchanges: Exchange[] = [];
   const itemIndexById = new Map<string, number>();
@@ -251,14 +376,34 @@ export function createConversationTimeline(
     })
     .sort((a, b) => a - b);
 
+  const localRange = computeVisibleRange(
+    exchanges,
+    visibleIndexes[0],
+    visibleIndexes.at(-1),
+  );
+  if (historyIndex?.length) {
+    // Navigation represents the conversation, not the currently loaded body
+    // window. Keep server index entries stable when an older page arrives.
+    const known = new Set(historyIndex.map((tick) => tick.id));
+    const ticks = [
+      ...historyIndex,
+      ...exchanges
+        .filter(({ tick }) => !known.has(tick.id))
+        .map(({ tick }) => tick),
+    ];
+    const positions = new Map(ticks.map((tick, index) => [tick.id, index]));
+    const start = localRange && positions.get(exchanges[localRange[0]].tick.id);
+    const end = localRange && positions.get(exchanges[localRange[1]].tick.id);
+    return {
+      ticks,
+      messageIds: ticks.map((tick) => tick.id),
+      visibleRange: start != null && end != null ? [start, end] : null,
+    };
+  }
   return {
     ticks: exchanges.map((exchange) => exchange.tick),
     messageIds: exchanges.map((exchange) => exchange.tick.id),
-    visibleRange: computeVisibleRange(
-      exchanges,
-      visibleIndexes[0],
-      visibleIndexes.at(-1),
-    ),
+    visibleRange: localRange,
   };
 }
 

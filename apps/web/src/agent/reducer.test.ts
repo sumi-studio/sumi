@@ -317,8 +317,11 @@ test("durable tool start and end upsert without volatile tool-call events", () =
     assert.deepEqual(first.args, { path: "README.md" });
     assert.deepEqual(first.result, { content: "ok" });
   }
-  assert.equal(second?.type, "tool");
-  if (second?.type === "tool") assert.equal(second.status, "error");
+  assert.equal(second, undefined);
+  assert.equal(
+    session.unresolvedToolOutcomes["end-without-start"].isError,
+    true,
+  );
 });
 
 test("valid SDUI materializes while adversarial SDUI validation stays inert", () => {
@@ -390,10 +393,20 @@ test("valid SDUI materializes while adversarial SDUI validation stays inert", ()
       seq: 60,
       event: { type: "agent_start" },
     });
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 61,
+      event: {
+        type: "tool_execution_start",
+        tool_call_id: `call-${name}`,
+        tool_name: "show",
+        args: {},
+      },
+    });
     assert.doesNotThrow(() => {
       session = apply(session, {
         audience: "direct_chat",
-        seq: 61,
+        seq: 62,
         event: {
           type: "tool_execution_end",
           tool_call_id: `call-${name}`,
@@ -1340,4 +1353,230 @@ test("canonical receipt after execution end updates the known original call acro
   assert.deepEqual(rows[0].trace.args, { path: "note" });
   assert.equal(session.conversation.runs["run:5"].trace.length, 0);
   assert.equal(apply(session, canonical), session);
+});
+
+test("approval receipts stay pending and later outcomes update the original operation once", () => {
+  for (const status of [
+    "succeeded",
+    "failed",
+    "denied",
+    "expired",
+    "cancelled",
+    "indeterminate",
+  ] as const) {
+    let session = createAgentSession();
+    let seq = 0;
+    const send = (
+      event: Extract<BrowserEventEnvelope, { seq: number }>["event"],
+    ) => {
+      session = apply(session, { audience: "direct_chat", seq: ++seq, event });
+    };
+    send({ type: "agent_start" });
+    send({
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: assistantToolCall("operation-call"),
+    });
+    send({
+      type: "approval_requested",
+      request: approvalRequest("operation-1", "operation-call"),
+    });
+    const receipt = {
+      content: [{ type: "text", text: "Approval requested" }],
+      details: {
+        status: "awaiting_approval",
+        operation_id: "operation-1",
+        executed: false,
+      },
+    };
+    send({
+      type: "tool_execution_end",
+      tool_call_id: "operation-call",
+      result: receipt,
+      is_error: false,
+    });
+    assert.equal(session.conversation.runs["run:1"].trace[0].type, "tool");
+    assert.equal(session.conversation.runs["run:1"].trace[0].status, "pending");
+    send({ type: "agent_end" });
+    send({ type: "agent_start" });
+    send({
+      type: "message_end",
+      message_id: CommandId,
+      message: assistantMessage("Other work continued"),
+    });
+    const before = [...session.conversation.entryOrder];
+    const outcome = {
+      type: "approval_operation_outcome" as const,
+      operation_id: "operation-1",
+      tool_call_id: "operation-call",
+      status,
+      executed:
+        status === "indeterminate"
+          ? null
+          : status === "succeeded" || status === "failed",
+      result: {
+        tool_call_id: "operation-call",
+        tool_name: "bash",
+        content: [{ type: "text" as const, text: "Actual outcome" }],
+        details: { reason: status },
+        is_error: status !== "succeeded",
+        timestamp: Timestamp,
+      },
+    };
+    send({ ...outcome, operation_id: "unrelated-operation" });
+    assert.equal(session.conversation.runs["run:1"].trace[0].status, "pending");
+    send(outcome);
+    const trace = session.conversation.runs["run:1"].trace[0];
+    assert.equal(trace.type, "tool");
+    assert.equal(trace.status, status === "succeeded" ? "done" : "error");
+    if (status === "indeterminate")
+      assert.equal(trace.label, "実行結果を確認できません");
+    assert.deepEqual(
+      session.conversation.entryOrder.slice(0, before.length),
+      before,
+    );
+    const after = [...session.conversation.entryOrder];
+    // The PA perception record is also persisted for history. It is not a human message.
+    send({
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000003",
+      message: {
+        role: "user",
+        timestamp: Timestamp,
+        content: [{ type: "text", text: JSON.stringify(outcome) }],
+        incoming_source: {
+          version: 2,
+          tenant_id: "test",
+          personality_agent_id: "0198f0f4-9b72-7000-8000-000000000201",
+          actor: {
+            kind: "personality_agent",
+            principal_id: "0198f0f4-9b72-7000-8000-000000000201",
+          },
+          source: {
+            surface: "approval_operation",
+            operation_id: outcome.operation_id,
+            tool_call_id: outcome.tool_call_id,
+            status,
+            executed: outcome.executed,
+            result: outcome.result,
+          },
+        },
+      },
+    });
+    assert.deepEqual(session.conversation.entryOrder, after);
+    assert.equal(
+      projectConversation(session.conversation).filter(
+        (row) => row.kind === "trace" && row.trace.type === "tool",
+      ).length,
+      1,
+    );
+    assert.equal(
+      projectConversation(session.conversation).filter(
+        (row) => row.kind === "user",
+      ).length,
+      0,
+    );
+    assert.equal(
+      projectConversation(session.conversation).filter(
+        (row) => row.kind === "approval",
+      ).length,
+      0,
+    );
+    send({
+      type: "tool_execution_end",
+      tool_call_id: "operation-call",
+      result: receipt,
+      is_error: false,
+    });
+    assert.equal(
+      session.conversation.runs["run:1"].trace[0].status,
+      status === "succeeded" ? "done" : "error",
+    );
+  }
+});
+
+test("history-only approval perception resolves a pending operation without a user bubble", () => {
+  let session = createAgentSession();
+  session = apply(session, {
+    audience: "secretary",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    audience: "secretary",
+    seq: 2,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: assistantToolCall("historical-call"),
+    },
+  });
+  session = apply(session, {
+    audience: "secretary",
+    seq: 3,
+    event: {
+      type: "message_end",
+      message_id: CommandId,
+      message: {
+        role: "tool_result",
+        tool_call_id: "historical-call",
+        tool_name: "bash",
+        content: [],
+        details: {
+          status: "awaiting_approval",
+          operation_id: "historical-op",
+          executed: false,
+        },
+        is_error: false,
+        timestamp: Timestamp,
+      },
+    },
+  });
+  const result = {
+    tool_call_id: "historical-call",
+    tool_name: "bash",
+    content: [{ type: "text" as const, text: "Restored outcome" }],
+    details: {},
+    is_error: false,
+    timestamp: Timestamp,
+  };
+  session = apply(session, {
+    audience: "secretary",
+    seq: 4,
+    event: {
+      type: "message_end",
+      message_id: "00000000-0000-4000-8000-000000000003",
+      message: {
+        role: "user",
+        timestamp: Timestamp,
+        content: [],
+        incoming_source: {
+          version: 2,
+          tenant_id: "test",
+          personality_agent_id: "0198f0f4-9b72-7000-8000-000000000201",
+          actor: {
+            kind: "personality_agent",
+            principal_id: "0198f0f4-9b72-7000-8000-000000000201",
+          },
+          source: {
+            surface: "approval_operation",
+            operation_id: "historical-op",
+            tool_call_id: "historical-call",
+            status: "succeeded",
+            executed: true,
+            result,
+          },
+        },
+      },
+    },
+  });
+  const restored = session.conversation.runs["run:1"].trace[0];
+  assert.equal(restored.type, "tool");
+  assert.equal(restored.status, "done");
+  assert.equal(
+    projectConversation(session.conversation).filter(
+      (row) => row.kind === "user",
+    ).length,
+    0,
+  );
 });

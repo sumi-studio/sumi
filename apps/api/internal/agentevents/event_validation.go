@@ -121,6 +121,10 @@ func validateEvent(raw json.RawMessage) error {
 		}
 		return nil
 
+	case "approval_operation_outcome":
+		_, err := decodeApprovalOperation(obj, "type")
+		return err
+
 	case "approval_requested":
 		if err := requireAndAllow(obj, []string{"type", "request"}, []string{"type", "request"}); err != nil {
 			return err

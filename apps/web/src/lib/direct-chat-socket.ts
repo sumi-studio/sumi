@@ -101,6 +101,7 @@ const DurableEventTypes = new Set([
   "tool_execution_end",
   "approval_requested",
   "approval_resolved",
+  "approval_operation_outcome",
   "steered",
   "memory_maintenance",
   "retry_scheduled",
@@ -450,6 +451,13 @@ function isIncomingSource(value: unknown): boolean {
     ("display_name" in actor && typeof actor.display_name !== "string")
   )
     return false;
+  if (isRecord(source) && source.surface === "approval_operation") {
+    return (
+      actor.kind === "personality_agent" &&
+      actor.principal_id === value.personality_agent_id &&
+      isApprovalOperationOutcome(source, "surface")
+    );
+  }
   if (isRecord(source) && source.surface === "feedback") {
     return (
       hasRequiredAndOnlyKeys(source, [
@@ -706,6 +714,50 @@ function isPublicMessage(value: unknown): boolean {
     );
   }
   return false;
+}
+
+function isApprovalOperationOutcome(
+  value: unknown,
+  discriminator: "type" | "surface" = "type",
+): boolean {
+  if (
+    !isRecord(value) ||
+    !hasRequiredAndOnlyKeys(value, [
+      discriminator,
+      "operation_id",
+      "tool_call_id",
+      "status",
+      "executed",
+      "result",
+    ]) ||
+    value[discriminator] !==
+      (discriminator === "type"
+        ? "approval_operation_outcome"
+        : "approval_operation") ||
+    typeof value.operation_id !== "string" ||
+    value.operation_id.length === 0 ||
+    typeof value.tool_call_id !== "string" ||
+    value.tool_call_id.length === 0 ||
+    ![
+      "succeeded",
+      "failed",
+      "denied",
+      "expired",
+      "cancelled",
+      "indeterminate",
+    ].includes(String(value.status)) ||
+    !isToolResultPayload(value.result) ||
+    !isRecord(value.result)
+  )
+    return false;
+  return (
+    value.executed ===
+      (value.status === "indeterminate"
+        ? null
+        : value.status === "succeeded" || value.status === "failed") &&
+    value.result.is_error === (value.status !== "succeeded") &&
+    value.result.tool_call_id === value.tool_call_id
+  );
 }
 
 function isToolResultPayload(value: unknown): boolean {
@@ -995,6 +1047,8 @@ function isSafeEventForUI(
       (value.mode === "hard" || value.mode === "soft")
     );
   }
+  if (value.type === "approval_operation_outcome")
+    return isApprovalOperationOutcome(value);
   if (value.type === "approval_requested") {
     return (
       hasRequiredAndOnlyKeys(value, ["type", "request"]) &&
@@ -1395,6 +1449,17 @@ export class DirectChatSocket {
     this.socket = undefined;
     this.admissionReady = false;
     socket?.close();
+  }
+
+  /** The HTTP snapshot and subsequent socket suffix share one durable cursor. */
+  setReplayCursor(seq: number) {
+    if (
+      !Number.isSafeInteger(seq) ||
+      seq < this.lastEventSeq ||
+      (this.socket && this.socket.readyState !== WebSocket.CLOSED)
+    )
+      throw new Error("Invalid direct chat history cursor");
+    this.lastEventSeq = seq;
   }
 
   /**

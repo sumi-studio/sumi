@@ -206,6 +206,14 @@ impl IncomingProvenance {
             {
                 Ok(())
             }
+            IncomingSource::ApprovalOperation(source) if self.version == 2 => {
+                if self.actor.kind != ActorKind::PersonalityAgent
+                    || self.actor.principal_id != self.personality_agent_id.as_str()
+                {
+                    return Err(RuntimeContractError::InvalidIncomingProvenance);
+                }
+                source.validate()
+            }
             IncomingSource::WorkspaceOperation(source) if self.version == 2 => {
                 if self.actor.kind != ActorKind::PersonalityAgent
                     || self.actor.principal_id != self.personality_agent_id.as_str()
@@ -289,7 +297,51 @@ pub enum IncomingSource {
     // every command/message and their async futures, including DirectChat.
     Messaging(Box<MessagingSource>),
     WorkspaceOperation(Box<WorkspaceOperationSource>),
+    ApprovalOperation(Box<ApprovalOperationSource>),
     Feedback(Box<FeedbackSource>),
+}
+/// An observed operation outcome, never a human instruction or a second tool output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalOperationSource {
+    pub operation_id: String,
+    pub tool_call_id: String,
+    pub status: ApprovalOperationStatus,
+    pub executed: Option<bool>,
+    pub result: serde_json::Value,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOperationStatus {
+    Succeeded,
+    Failed,
+    Denied,
+    Expired,
+    Cancelled,
+    Indeterminate,
+}
+impl ApprovalOperationSource {
+    pub(crate) fn validate(&self) -> Result<(), RuntimeContractError> {
+        let result: crate::provider::types::ToolResultMessage =
+            serde_json::from_value(self.result.clone())
+                .map_err(|_| RuntimeContractError::InvalidIncomingProvenance)?;
+        if self.operation_id.is_empty()
+            || self.tool_call_id.is_empty()
+            || result.tool_call_id != self.tool_call_id
+            || self.executed
+                != match self.status {
+                    ApprovalOperationStatus::Succeeded | ApprovalOperationStatus::Failed => {
+                        Some(true)
+                    }
+                    ApprovalOperationStatus::Indeterminate => None,
+                    _ => Some(false),
+                }
+            || result.is_error != (self.status != ApprovalOperationStatus::Succeeded)
+        {
+            return Err(RuntimeContractError::InvalidIncomingProvenance);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

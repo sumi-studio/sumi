@@ -6,6 +6,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -55,7 +56,8 @@ const CONVERSATION_BOTTOM_PADDING = 24;
 
 type ConversationRow =
   | ChatItem
-  | { id: typeof WAITING_ROW_ID; kind: "waiting" };
+  | { id: typeof WAITING_ROW_ID; kind: "waiting" }
+  | { id: string; kind: "history-gap"; beforeSeq: number };
 
 function ChatScreenContent({
   installationId,
@@ -79,6 +81,11 @@ function ChatScreenContent({
     restoreDraft,
     abort,
     decideApproval,
+    history,
+    loadOlder,
+    loadAround,
+    loadGap,
+    retryHistory,
   } = useConversation();
   const [draft, setDraft] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
@@ -88,6 +95,8 @@ function ChatScreenContent({
   >({});
   const [visibleMessageIds, setVisibleMessageIds] = useState<string[]>([]);
   const conversationRef = useRef<ConversationVirtualizerHandle>(null);
+  const jumpRequestRef = useRef(0);
+  const [pendingJump, setPendingJump] = useState<string | null>(null);
   const items = useMemo(
     () => projectConversation(conversation),
     [conversation],
@@ -97,8 +106,8 @@ function ChatScreenContent({
     [conversation],
   );
   const timeline = useMemo(
-    () => createConversationTimeline(items, visibleMessageIds),
-    [items, visibleMessageIds],
+    () => createConversationTimeline(items, visibleMessageIds, history?.index),
+    [items, visibleMessageIds, history?.index],
   );
 
   useEffect(() => {
@@ -131,32 +140,81 @@ function ChatScreenContent({
       (lastItem.kind === "agent-run" && !hasInspectableTrace(lastItem.trace)));
   const rows = useMemo<ConversationRow[]>(() => {
     if (items.length === 0) return [];
-    const nextRows: ConversationRow[] = items.filter(
-      (item) => item.kind !== "agent-run",
-    );
+    const gaps = new Map(history?.gaps.map((gap) => [gap.anchorItemId, gap]));
+    const nextRows: ConversationRow[] = [];
+    for (const item of items) {
+      if (item.kind === "agent-run") continue;
+      const gap = gaps.get(item.id);
+      if (gap)
+        nextRows.push({
+          id: `history-gap:${gap.beforeSeq}`,
+          kind: "history-gap",
+          beforeSeq: gap.beforeSeq,
+        });
+      nextRows.push(item);
+    }
     if (waitingForFirstToken) {
       nextRows.push({ id: WAITING_ROW_ID, kind: "waiting" });
     }
     return nextRows;
-  }, [items, waitingForFirstToken]);
+  }, [items, waitingForFirstToken, history?.gaps]);
   const onVisibleRowsChange = useCallback(
     (ids: string[]) => {
       const messageIds = new Set(items.map((item) => item.id));
       setVisibleMessageIds(ids.filter((id) => messageIds.has(id)));
+      if (
+        !history?.loadingOlder &&
+        !history?.loadingAround &&
+        !history?.error
+      ) {
+        const gap = rows.find(
+          (row) => row.kind === "history-gap" && ids.includes(row.id),
+        );
+        if (gap?.kind === "history-gap") void loadGap(gap.beforeSeq);
+      }
     },
-    [items],
+    [
+      items,
+      rows,
+      history?.loadingOlder,
+      history?.loadingAround,
+      history?.error,
+      loadGap,
+      retryHistory,
+    ],
   );
   const scrollToEnd = useCallback((behavior: "smooth" | "auto" = "smooth") => {
     conversationRef.current?.scrollToEnd({ behavior });
   }, []);
   const scrollToMessage = useCallback(
-    (messageId: string) =>
-      conversationRef.current?.scrollToMessage(messageId, {
-        align: "start",
-        behavior: "smooth",
-      }),
-    [],
+    async (messageId: string) => {
+      const request = ++jumpRequestRef.current;
+      setPendingJump(null);
+      if (
+        conversationRef.current?.scrollToMessage(messageId, {
+          align: "start",
+          behavior: "smooth",
+        })
+      )
+        return;
+      if (await loadAround(messageId)) {
+        if (jumpRequestRef.current === request) setPendingJump(messageId);
+      }
+    },
+    [loadAround],
   );
+  useLayoutEffect(() => {
+    if (!pendingJump || !rows.some((row) => row.id === pendingJump)) return;
+    // The store promise precedes React's commit. Wait until the new rows are
+    // actually available to the virtualizer before asking it to jump.
+    if (
+      conversationRef.current?.scrollToMessage(pendingJump, {
+        align: "start",
+        behavior: "auto",
+      })
+    )
+      setPendingJump(null);
+  }, [pendingJump, rows]);
   const lastAssistantMessage = items.findLast(
     (item) => item.kind === "prose" && item.agentMessageFinal,
   );
@@ -211,11 +269,16 @@ function ChatScreenContent({
             ref={conversationRef}
             items={rows}
             busy={running}
+            transcriptComplete={!history?.hasMore && !history?.gaps.length}
             paddingEnd={CONVERSATION_BOTTOM_PADDING}
             ariaLabel="Sumiの活動記録"
             className="scroll-fade-b scrollbar-ui scrollbar-gutter-stable size-full min-h-0 min-w-0 overscroll-contain contain-content"
             onAtEndChange={setAtEnd}
             onVisibleMessageIdsChange={onVisibleRowsChange}
+            onReachStart={() => {
+              if (history?.hasMore && !history.loadingOlder && !history.error)
+                void loadOlder();
+            }}
             renderTranscriptItem={(row) => {
               const text = transcriptText(row);
               return text === null ? null : (
@@ -223,6 +286,22 @@ function ChatScreenContent({
               );
             }}
             renderItem={(row) => {
+              if (row.kind === "history-gap") {
+                return (
+                  <div className="mx-auto flex max-w-3xl justify-center px-4 py-5">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={history?.loadingOlder}
+                      onClick={() => void loadGap(row.beforeSeq)}
+                    >
+                      {history?.loadingOlder
+                        ? "記録を読み込んでいます…"
+                        : "この間の記録を読み込む"}
+                    </Button>
+                  </div>
+                );
+              }
               if (row.kind === "waiting") {
                 return (
                   <div
@@ -265,6 +344,30 @@ function ChatScreenContent({
               );
             }}
           />
+          {(history?.loading ||
+            history?.loadingOlder ||
+            history?.loadingAround ||
+            history?.error) && (
+            <div
+              className="absolute top-2 right-4 z-20 flex items-center gap-2 rounded-md bg-background px-3 py-1.5 text-muted-foreground text-xs shadow-sm"
+              role="status"
+            >
+              {history.error ? (
+                <>
+                  <span>記録を読み込めませんでした</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void retryHistory()}
+                  >
+                    再試行
+                  </Button>
+                </>
+              ) : (
+                <span>記録を読み込んでいます…</span>
+              )}
+            </div>
+          )}
           {items.length === 0 && (
             <div className="pointer-events-none absolute inset-0">
               <EmptyState available={available} />
@@ -412,6 +515,8 @@ function ChatScreenContent({
 }
 
 function transcriptText(row: ConversationRow): string | null {
+  if (row.kind === "history-gap")
+    return "（この間の記録はまだ読み込まれていません）";
   if (row.kind === "waiting") return null;
   switch (row.kind) {
     case "trace":

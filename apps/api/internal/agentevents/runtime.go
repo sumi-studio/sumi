@@ -30,6 +30,8 @@ import (
 )
 
 type DurableGateway struct {
+	historyMu sync.Mutex
+	history map[string]*browserHistoryIndex
 	dir      string
 	commands *CommandStore
 	mu       sync.Mutex

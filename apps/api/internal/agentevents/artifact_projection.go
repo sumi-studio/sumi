@@ -101,6 +101,17 @@ func transformPublicMessageArtifactReferences(value any, owner string, project b
 		return nil, errors.New("public message must be an object")
 	}
 	if message["role"] == "user" {
+		// User text is byte-faithful, but the attached operation result is
+		// runtime-authored and follows the same ownership rules as its event.
+		provenance, _ := message["incoming_source"].(map[string]any)
+		source, _ := provenance["source"].(map[string]any)
+		if source["surface"] == "approval_operation" {
+			result, err := transformArtifactReferenceValue(source["result"], owner, project)
+			if err != nil {
+				return nil, err
+			}
+			source["result"] = result
+		}
 		return value, nil
 	}
 	return transformArtifactReferenceValue(value, owner, project)

@@ -1200,5 +1200,240 @@
         "content": ""
       }
     }
+  },
+  "approval_operation_succeeded": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "succeeded",
+      "executed": true,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": false,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
+  },
+  "approval_operation_recorded_history": {
+    "kind": "public_message",
+    "wire": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Operation completed"
+        }
+      ],
+      "timestamp": "2026-09-12T00:00:00Z",
+      "incoming_source": {
+        "version": 2,
+        "tenant_id": "tenant-example",
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "actor": {
+          "kind": "personality_agent",
+          "principal_id": "01992000-0000-7000-8000-000000000001"
+        },
+        "source": {
+          "surface": "approval_operation",
+          "operation_id": "op-approval",
+          "tool_call_id": "call-approval",
+          "status": "succeeded",
+          "executed": true,
+          "result": {
+            "provider_call_id": "provider-original",
+            "tool_call_id": "call-approval",
+            "tool_name": "bash",
+            "content": [
+              {
+                "type": "text",
+                "text": "Original operation result"
+              }
+            ],
+            "details": {
+              "operation_id": "op-approval"
+            },
+            "is_error": false,
+            "timestamp": "2026-09-12T00:00:00Z"
+          }
+        }
+      }
+    }
+  },
+  "approval_operation_durable": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 1,
+        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
+        "audience": "direct_chat",
+        "event": {
+          "type": "approval_operation_outcome",
+          "operation_id": "op-approval",
+          "tool_call_id": "call-approval",
+          "status": "succeeded",
+          "executed": true,
+          "result": {
+            "provider_call_id": "provider-original",
+            "tool_call_id": "call-approval",
+            "tool_name": "bash",
+            "content": [
+              {
+                "type": "text",
+                "text": "Original operation result"
+              }
+            ],
+            "details": {
+              "operation_id": "op-approval"
+            },
+            "is_error": false,
+            "timestamp": "2026-09-12T00:00:00Z"
+          }
+        }
+      }
+    }
+  },
+  "approval_operation_failed": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "failed",
+      "executed": true,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": true,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
+  },
+  "approval_operation_denied": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "denied",
+      "executed": false,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": true,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
+  },
+  "approval_operation_expired": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "expired",
+      "executed": false,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": true,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
+  },
+  "approval_operation_cancelled": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "cancelled",
+      "executed": false,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": true,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
+  },
+  "approval_operation_indeterminate": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_operation_outcome",
+      "operation_id": "op-approval",
+      "tool_call_id": "call-approval",
+      "status": "indeterminate",
+      "executed": null,
+      "result": {
+        "provider_call_id": "provider-original",
+        "tool_call_id": "call-approval",
+        "tool_name": "bash",
+        "content": [
+          {
+            "type": "text",
+            "text": "Original operation result"
+          }
+        ],
+        "details": {
+          "operation_id": "op-approval"
+        },
+        "is_error": true,
+        "timestamp": "2026-09-12T00:00:00Z"
+      }
+    }
   }
 }

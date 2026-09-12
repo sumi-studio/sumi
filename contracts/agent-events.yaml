@@ -251,6 +251,18 @@ $defs:
       type: { const: error }
       message: { type: string }
 
+  ApprovalOperationOutcomeEvent:
+    type: object
+    required: [type, operation_id, tool_call_id, status, executed, result]
+    additionalProperties: false
+    properties:
+      type: { const: approval_operation_outcome }
+      operation_id: { type: string, minLength: 1 }
+      tool_call_id: { type: string, minLength: 1 }
+      status: { enum: [succeeded, failed, denied, expired, cancelled, indeterminate] }
+      executed: { type: [boolean, 'null'] }
+      result: { $ref: '#/$defs/ToolResultPayload' }
+
   AgentEvent:
     oneOf:
       - { $ref: '#/$defs/AgentStartEvent' }
@@ -266,6 +278,7 @@ $defs:
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
       - { $ref: '#/$defs/ApprovalRequestedEvent' }
       - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/ApprovalOperationOutcomeEvent' }
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
@@ -285,6 +298,7 @@ $defs:
       - { $ref: '#/$defs/ToolExecutionEndEvent' }
       - { $ref: '#/$defs/ApprovalRequestedEvent' }
       - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/ApprovalOperationOutcomeEvent' }
       - { $ref: '#/$defs/SteeredEvent' }
       - { $ref: '#/$defs/MemoryMaintenanceEvent' }
       - { $ref: '#/$defs/RetryScheduledEvent' }
@@ -410,7 +424,10 @@ $defs:
         items: { $ref: '#/$defs/UserContent' }
       timestamp: { type: string, format: date-time }
       incoming_timing: { $ref: '#/$defs/IncomingEventTiming' }
-      incoming_source: { $ref: '#/$defs/ExternalProvenanceV2' }
+      incoming_source:
+        oneOf:
+          - { $ref: '#/$defs/ExternalProvenanceV2' }
+          - { $ref: '#/$defs/ApprovalOperationProvenanceV2' }
 
   IncomingEventTiming:
     description: Server-authored receipt timing; absent for messages without an incoming event.
@@ -810,12 +827,42 @@ $defs:
     oneOf:
       - { $ref: '#/$defs/DirectChatProvenanceV1' }
       - { $ref: '#/$defs/ExternalProvenanceV2' }
+      - { $ref: '#/$defs/ApprovalOperationProvenanceV2' }
 
   ExternalProvenanceV2:
     oneOf:
       - { $ref: '#/$defs/MessagingProvenanceV2' }
       - { $ref: '#/$defs/WorkspaceOperationProvenanceV2' }
       - { $ref: '#/$defs/FeedbackProvenanceV2' }
+
+  ApprovalOperationProvenanceV2:
+    description: Runtime-authored terminal operation evidence; never accepted as an incoming command or a human approval decision.
+    type: object
+    required: [version, tenant_id, personality_agent_id, actor, source]
+    additionalProperties: false
+    properties:
+      version: { const: 2 }
+      tenant_id: { $ref: '#/$defs/TenantId' }
+      personality_agent_id: { $ref: '#/$defs/PersonalityAgentId' }
+      actor:
+        type: object
+        required: [kind, principal_id]
+        additionalProperties: false
+        properties:
+          kind: { const: personality_agent }
+          principal_id: { $ref: '#/$defs/PersonalityAgentId' }
+          display_name: { type: string }
+      source:
+        type: object
+        required: [surface, operation_id, tool_call_id, status, executed, result]
+        additionalProperties: false
+        properties:
+          surface: { const: approval_operation }
+          operation_id: { type: string, minLength: 1 }
+          tool_call_id: { type: string, minLength: 1 }
+          status: { enum: [succeeded, failed, denied, expired, cancelled, indeterminate] }
+          executed: { type: [boolean, 'null'] }
+          result: { $ref: '#/$defs/ToolResultPayload' }
 
   FeedbackProvenanceV2:
     type: object

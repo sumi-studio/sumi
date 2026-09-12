@@ -54,6 +54,7 @@ func NewProductionMux(
 	browser.Authorizer = authorizer
 	browser.LifecycleFence = lifecycleFence
 	mux.Handle("GET /direct-chat/ws", browser)
+	mux.HandleFunc("GET /direct-chat/history", browser.ServeHistory)
 
 	return mux, browser, agent, nil
 }

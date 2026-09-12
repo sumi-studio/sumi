@@ -35,6 +35,7 @@ export type DurableAgentEvent =
   | ToolExecutionEndEvent
   | ApprovalRequestedEvent
   | ApprovalResolvedEvent
+  | ApprovalOperationOutcomeEvent
   | SteeredEvent
   | MemoryMaintenanceEvent
   | RetryScheduledEvent
@@ -187,6 +188,21 @@ export type MessagingEventSource =
  */
 export type CanonicalUUID = string;
 /**
+ * any JSON value
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AnyJSON".
+ */
+export type AnyJSON =
+  | {
+      [k: string]: AnyJSON;
+    }
+  | AnyJSON[]
+  | string
+  | number
+  | boolean
+  | null;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicAssistantContent".
  */
@@ -212,21 +228,6 @@ export type PublicAssistantContent =
       rejected: RejectedToolCall;
       wire_item_index: JsonSafeInteger;
     };
-/**
- * any JSON value
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "AnyJSON".
- */
-export type AnyJSON =
-  | {
-      [k: string]: AnyJSON;
-    }
-  | AnyJSON[]
-  | string
-  | number
-  | boolean
-  | null;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ToolArgumentError".
@@ -439,6 +440,7 @@ export type AgentEvent =
   | ToolExecutionEndEvent
   | ApprovalRequestedEvent
   | ApprovalResolvedEvent
+  | ApprovalOperationOutcomeEvent
   | SteeredEvent
   | MemoryMaintenanceEvent
   | RetryScheduledEvent
@@ -471,7 +473,7 @@ export type Command =
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "IncomingProvenance".
  */
-export type IncomingProvenance = DirectChatProvenanceV1 | ExternalProvenanceV2;
+export type IncomingProvenance = DirectChatProvenanceV1 | ExternalProvenanceV2 | ApprovalOperationProvenanceV2;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "CommandEnvelope".
@@ -606,7 +608,7 @@ export interface UserMessage {
   content: UserContent[];
   timestamp: string;
   incoming_timing?: IncomingEventTiming;
-  incoming_source?: ExternalProvenanceV2;
+  incoming_source?: ExternalProvenanceV2 | ApprovalOperationProvenanceV2;
 }
 /**
  * Server-authored receipt timing; absent for messages without an incoming event.
@@ -688,6 +690,45 @@ export interface FeedbackProvenanceV2 {
   };
 }
 /**
+ * Runtime-authored terminal operation evidence; never accepted as an incoming command or a human approval decision.
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalOperationProvenanceV2".
+ */
+export interface ApprovalOperationProvenanceV2 {
+  version: 2;
+  tenant_id: TenantId;
+  personality_agent_id: PersonalityAgentId;
+  actor: {
+    kind: "personality_agent";
+    principal_id: PersonalityAgentId;
+    display_name?: string;
+  };
+  source: {
+    surface: "approval_operation";
+    operation_id: string;
+    tool_call_id: string;
+    status: "succeeded" | "failed" | "denied" | "expired" | "cancelled" | "indeterminate";
+    executed: boolean | null;
+    result: ToolResultPayload;
+  };
+}
+/**
+ * tool result nested in TurnEnd; the enclosing event supplies its type
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ToolResultPayload".
+ */
+export interface ToolResultPayload {
+  tool_call_id: string;
+  provider_call_id?: string;
+  tool_name: string;
+  content: UserContent[];
+  details: AnyJSON;
+  is_error: boolean;
+  timestamp: string;
+}
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicAssistantMessage".
  */
@@ -757,21 +798,6 @@ export interface Usage {
  */
 export interface ToolResultMessage {
   role: "tool_result";
-  tool_call_id: string;
-  provider_call_id?: string;
-  tool_name: string;
-  content: UserContent[];
-  details: AnyJSON;
-  is_error: boolean;
-  timestamp: string;
-}
-/**
- * tool result nested in TurnEnd; the enclosing event supplies its type
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ToolResultPayload".
- */
-export interface ToolResultPayload {
   tool_call_id: string;
   provider_call_id?: string;
   tool_name: string;
@@ -885,6 +911,18 @@ export interface ApprovalResolvedEvent {
   type: "approval_resolved";
   request_id: string;
   resolution: ApprovalResolution;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalOperationOutcomeEvent".
+ */
+export interface ApprovalOperationOutcomeEvent {
+  type: "approval_operation_outcome";
+  operation_id: string;
+  tool_call_id: string;
+  status: "succeeded" | "failed" | "denied" | "expired" | "cancelled" | "indeterminate";
+  executed: boolean | null;
+  result: ToolResultPayload;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

@@ -985,6 +985,44 @@ export interface components {
             };
         };
         ExternalProvenanceV2: components["schemas"]["MessagingProvenanceV2"] | components["schemas"]["WorkspaceOperationProvenanceV2"] | components["schemas"]["FeedbackProvenanceV2"];
+        /** @description any JSON value */
+        AnyJSON: {
+            [key: string]: components["schemas"]["AnyJSON"];
+        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
+        /** @description tool result nested in TurnEnd; the enclosing event supplies its type */
+        ToolResultPayload: {
+            tool_call_id: string;
+            provider_call_id?: string;
+            tool_name: string;
+            content: components["schemas"]["UserContent"][];
+            details: components["schemas"]["AnyJSON"];
+            is_error: boolean;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        /** @description Runtime-authored terminal operation evidence; never accepted as an incoming command or a human approval decision. */
+        ApprovalOperationProvenanceV2: {
+            /** @constant */
+            version: 2;
+            tenant_id: components["schemas"]["TenantId"];
+            personality_agent_id: components["schemas"]["PersonalityAgentId"];
+            actor: {
+                /** @constant */
+                kind: "personality_agent";
+                principal_id: components["schemas"]["PersonalityAgentId"];
+                display_name?: string;
+            };
+            source: {
+                /** @constant */
+                surface: "approval_operation";
+                operation_id: string;
+                tool_call_id: string;
+                /** @enum {unknown} */
+                status: "succeeded" | "failed" | "denied" | "expired" | "cancelled" | "indeterminate";
+                executed: boolean | null;
+                result: components["schemas"]["ToolResultPayload"];
+            };
+        };
         UserMessage: {
             /** @constant */
             role: "user";
@@ -992,12 +1030,8 @@ export interface components {
             /** Format: date-time */
             timestamp: string;
             incoming_timing?: components["schemas"]["IncomingEventTiming"];
-            incoming_source?: components["schemas"]["ExternalProvenanceV2"];
+            incoming_source?: components["schemas"]["ExternalProvenanceV2"] | components["schemas"]["ApprovalOperationProvenanceV2"];
         };
-        /** @description any JSON value */
-        AnyJSON: {
-            [key: string]: components["schemas"]["AnyJSON"];
-        } | components["schemas"]["AnyJSON"][] | string | number | boolean | null;
         ToolCall: {
             id: string;
             provider_call_id?: string;
@@ -1084,17 +1118,6 @@ export interface components {
             timestamp: string;
         };
         PublicMessage: components["schemas"]["UserMessage"] | components["schemas"]["PublicAssistantMessage"] | components["schemas"]["ToolResultMessage"];
-        /** @description tool result nested in TurnEnd; the enclosing event supplies its type */
-        ToolResultPayload: {
-            tool_call_id: string;
-            provider_call_id?: string;
-            tool_name: string;
-            content: components["schemas"]["UserContent"][];
-            details: components["schemas"]["AnyJSON"];
-            is_error: boolean;
-            /** Format: date-time */
-            timestamp: string;
-        };
         TurnEndEvent: {
             /** @constant */
             type: "turn_end";
@@ -1197,6 +1220,16 @@ export interface components {
             request_id: string;
             resolution: components["schemas"]["ApprovalResolution"];
         };
+        ApprovalOperationOutcomeEvent: {
+            /** @constant */
+            type: "approval_operation_outcome";
+            operation_id: string;
+            tool_call_id: string;
+            /** @enum {unknown} */
+            status: "succeeded" | "failed" | "denied" | "expired" | "cancelled" | "indeterminate";
+            executed: boolean | null;
+            result: components["schemas"]["ToolResultPayload"];
+        };
         /** @enum {string} */
         SteerMode: "hard" | "soft";
         SteeredEvent: {
@@ -1247,7 +1280,7 @@ export interface components {
             status: "rejected";
             reject_reason: components["schemas"]["CommandRejectReason"];
         };
-        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ReasoningSummaryEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
+        DurableAgentEvent: components["schemas"]["AgentStartEvent"] | components["schemas"]["AgentEndEvent"] | components["schemas"]["TurnStartEvent"] | components["schemas"]["TurnEndEvent"] | components["schemas"]["MessageStartEvent"] | components["schemas"]["MessageEndEvent"] | components["schemas"]["ReasoningSummaryEvent"] | components["schemas"]["ToolExecutionStartEvent"] | components["schemas"]["ToolExecutionEndEvent"] | components["schemas"]["ApprovalRequestedEvent"] | components["schemas"]["ApprovalResolvedEvent"] | components["schemas"]["ApprovalOperationOutcomeEvent"] | components["schemas"]["SteeredEvent"] | components["schemas"]["MemoryMaintenanceEvent"] | components["schemas"]["RetryScheduledEvent"] | components["schemas"]["CommandDispositionEvent"];
         /** @description non-negative index representable exactly by JavaScript number clients */
         ContentIndex: number;
         PublicStreamEvent: {
@@ -1384,7 +1417,7 @@ export interface components {
             type: "external_event";
             content: string;
         };
-        IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["ExternalProvenanceV2"];
+        IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["ExternalProvenanceV2"] | components["schemas"]["ApprovalOperationProvenanceV2"];
         DurableEnvelope: {
             personality_agent_id: components["schemas"]["PersonalityAgentId"];
             audience: components["schemas"]["OutputAudience"];
