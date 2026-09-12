@@ -95,6 +95,125 @@ fn reflex_notification(seq: u64) -> InboundCommand {
     InboundCommand::Valid(command)
 }
 
+#[tokio::test]
+async fn soft_reflex_waiting_before_assistant_start_does_not_interrupt_generation() {
+    let store = Store::session_test_store("soft-reflex-assistant-start")
+        .await
+        .unwrap();
+    let pool = store.pool().clone();
+    let (gateway, _commands, _) = gateway();
+    let driver = Arc::new(SaturatedTerminalTailDriver::new());
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .unwrap();
+    // Both notifications belong to the same Messaging audience. Keep the first
+    // provider running, with its lifecycle events not yet observed by Session.
+    session
+        .admit_and_route(reflex_notification(1))
+        .await
+        .unwrap();
+    let incoming = reflex_notification(2);
+    let receipt = session
+        .admission
+        .receive_with_origin(&session.writer, &incoming)
+        .await
+        .unwrap();
+    let InboundCommand::Valid(envelope) = incoming else {
+        unreachable!()
+    };
+    // Reuse the durable assessment path: the restored decision must be soft,
+    // even when assistant_start later makes a hard steer mechanically possible.
+    session
+        .writer
+        .store()
+        .record_reflex_decision(
+            &envelope,
+            ReflexDecision::Soft {
+                interpretation: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        session
+            .begin_reflex(
+                AdmittedCommand::new(envelope, receipt.received_at)
+                    .with_incoming_timing(receipt.incoming_timing),
+            )
+            .await
+            .unwrap()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(3), session.reflex_jobs.join_next())
+        .await
+        .unwrap();
+    session.finish_reflex(result).await.unwrap();
+    assert_eq!(session.deferred_commands.len(), 1);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !session
+            .active
+            .as_ref()
+            .unwrap()
+            .bridge
+            .steer_stage()
+            .eq(&SteerStage::AssistantGeneration)
+        {
+            let output = session
+                .active
+                .as_mut()
+                .unwrap()
+                .events_rx
+                .recv()
+                .await
+                .unwrap();
+            session.persist_active_event(output).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    driver.release_terminal_tail.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while session.active.is_some() {
+            drive_active_to_completion(&mut session).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    session.wait_outbound_idle().await;
+    let states: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT seq, application_kind, status FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    session.abort_writer().await;
+    assert_eq!(
+        states,
+        vec![
+            (1, "idle_run".into(), "applied".into()),
+            (2, "idle_run".into(), "applied".into()),
+        ],
+        "a soft notification must wait for the current response, never turn into a hard steer"
+    );
+    let first: (String, i64, String) = sqlx::query_as(
+        "SELECT json_extract(payload, '$.stop_reason'), interrupted, json_extract(payload, '$.content[0].text') FROM messages WHERE id='saturated-terminal-tail-assistant-0'"
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        first,
+        (
+            "stop".into(),
+            0,
+            (0..61).map(|n| format!("{n:02}")).collect::<String>()
+        )
+    );
+    assert_eq!(driver.starts.load(Ordering::SeqCst), 2);
+}
+
 async fn stop_reflex_fixture(session: &mut Session<MockGateway>) {
     session.reflex_jobs.abort_all();
     if let Some(active) = session.active.take() {
