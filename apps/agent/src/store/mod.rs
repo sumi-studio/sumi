@@ -13,6 +13,7 @@ mod provider_context;
 mod recall;
 mod recovery;
 mod redactor;
+mod reflex;
 mod sizer;
 mod transcript;
 
@@ -135,8 +136,8 @@ pub(crate) use recovery::tests::{
 )]
 pub(crate) use recovery::{
     HydratedRunState, HydrationOutcome, LogicalRecoveryExecutor, PendingApprovalRecovery,
-    PendingErrorContextRecovery, ReceivedUserCommand, RecoveredInferenceContinuation, RecoveryStep,
-    ResumeDirective, SuffixRecovery,
+    PendingErrorContextRecovery, ReceivedUserCommand, RecoveredInferenceContinuation,
+    RecoveredPendingOperation, RecoveryStep, ResumeDirective, SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -785,7 +786,7 @@ impl Store {
             .commit()
             .await
             .context("failed to commit hydration snapshot transaction")?;
-        let (mut recovery_steps, received_user_commands) =
+        let (mut recovery_steps, received_user_commands, received_approval_commands) =
             SuffixRecovery::plan_boot_recovery(self, &recovery).await?;
         if let Some(pending_error_context) = pending_error_context {
             let mut matching_steps = recovery_steps.iter_mut().filter(|step| {
@@ -895,6 +896,11 @@ impl Store {
             });
         }
 
+        let pending_operations = self.hydrate_pending_operations(&recovery).await?;
+        let has_unobserved_operation_outcome = continuation.as_ref().is_some_and(|continuation| {
+            recovery.has_unobserved_operation_outcome(&continuation.run_id)
+        });
+
         self.post_commit_feed
             .record_hydrated_epoch(lease, fence)
             .await
@@ -910,8 +916,143 @@ impl Store {
             memory,
             resume: ResumeDirective::AdmitCommands,
             continuation,
+            pending_operations,
+            has_unobserved_operation_outcome,
             received_user_commands,
+            received_approval_commands,
         }))
+    }
+
+    async fn hydrate_pending_operations(
+        &self,
+        recovery: &event_writer::BootstrapRecoveryGuard<'_>,
+    ) -> Result<Vec<RecoveredPendingOperation>> {
+        let authenticated = recovery.authenticated_pending_operations()?;
+        let mut transaction = self.pool().begin().await?;
+        let rows = sqlx::query(
+            "SELECT a.*, t.state AS tool_state, t.run_id AS tool_run_id, t.command_id AS original_command_id
+            FROM approval_log a LEFT JOIN tool_executions t ON t.tool_call_id=a.tool_call_id
+            WHERE a.state='pending' AND a.receipt_message_id IS NOT NULL ORDER BY a.id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        if rows.len() != authenticated.len() {
+            bail!("pending operation projections disagree with authenticated lifecycle");
+        }
+        let mut result = Vec::new();
+        for row in rows {
+            let request_id: String = row.try_get("id")?;
+            let tool_call_id: String = row.try_get("tool_call_id")?;
+            let run_id: String = row.try_get("run_id")?;
+            let original_turn_id: String = row.try_get("turn_id")?;
+            let (_, _, _, _, assistant_message_id) = authenticated
+                .iter()
+                .find(|(r, c, run, t, _)| {
+                    r == &request_id
+                        && c == &tool_call_id
+                        && run == &run_id
+                        && t == &original_turn_id
+                })
+                .ok_or_else(|| anyhow!("pending operation has no exact authenticated origin"))?;
+            if row.try_get::<Option<String>, _>("tool_state")?.as_deref() != Some("prepared")
+                || row.try_get::<Option<String>, _>("tool_run_id")?.as_deref()
+                    != Some(run_id.as_str())
+            {
+                bail!("pending operation has no exact prepared tool");
+            }
+            let original_command_id: String = row.try_get("original_command_id")?;
+            let provenance = event_writer::authenticated_command_provenance(
+                self,
+                &mut transaction,
+                &original_command_id,
+            )
+            .await?;
+            let receipt_message_id: String = row.try_get("receipt_message_id")?;
+            let messages = self
+                .hydrate_messages_for_ids(
+                    &mut transaction,
+                    &[assistant_message_id.clone(), receipt_message_id.clone()],
+                )
+                .await?;
+            let call = messages
+                .iter()
+                .find_map(|message| {
+                    let ContextMessage::Persisted {
+                        id,
+                        message: crate::provider::types::Message::Assistant(assistant),
+                        ..
+                    } = message
+                    else {
+                        return None;
+                    };
+                    if id != assistant_message_id {
+                        return None;
+                    }
+                    assistant.content.iter().find_map(|part| match part {
+                        crate::provider::types::AssistantContent::ToolCall {
+                            tool_call, ..
+                        } if tool_call.id == tool_call_id => Some(tool_call.clone()),
+                        _ => None,
+                    })
+                })
+                .ok_or_else(|| anyhow!("pending operation has no original canonical tool call"))?;
+            let receipt_valid = messages.iter().any(|message| matches!(message,
+                ContextMessage::Persisted { id, message: crate::provider::types::Message::ToolResult(receipt), .. }
+                if id == &receipt_message_id && receipt.tool_call_id == tool_call_id
+                && crate::approval::operation::PendingOperationReceipt::from_result(receipt)
+                    .is_some_and(|receipt| receipt.operation_id == request_id)));
+            if !receipt_valid {
+                bail!("pending operation receipt does not identify the original operation");
+            }
+            let bound: BoundToolInvocation = self
+                .decrypt_route_evidence(
+                    &mut transaction,
+                    "approval_log.bound_invocation",
+                    &request_id,
+                    &row.try_get::<String, _>("bound_invocation_key_ref")?,
+                    &row.try_get::<Vec<u8>, _>("bound_invocation_ciphertext")?,
+                )
+                .await?;
+            let policy: PolicySnapshot = self
+                .decrypt_route_evidence(
+                    &mut transaction,
+                    "approval_log.policy_snapshot",
+                    &request_id,
+                    &row.try_get::<String, _>("policy_snapshot_key_ref")?,
+                    &row.try_get::<Vec<u8>, _>("policy_snapshot_ciphertext")?,
+                )
+                .await?;
+            let escalation_review: EscalationReviewEvidence = self
+                .decrypt_route_evidence(
+                    &mut transaction,
+                    "approval_log.escalation_review",
+                    &request_id,
+                    &row.try_get::<String, _>("escalation_review_key_ref")?,
+                    &row.try_get::<Vec<u8>, _>("escalation_review_ciphertext")?,
+                )
+                .await?;
+            // Full evidence digests and actor binding were verified before suffix recovery.
+            if bound.tool_call_id != tool_call_id || bound.tool_name != call.name {
+                bail!("pending operation private evidence does not match canonical call");
+            }
+            result.push(RecoveredPendingOperation {
+                original_command_id,
+                provenance,
+                request_id,
+                tool_call_id,
+                run_id,
+                original_turn_id,
+                assistant_message_id: assistant_message_id.clone(),
+                call,
+                evidence: crate::approval::route_broker::DurablePendingApprovalEvidence {
+                    bound,
+                    policy,
+                    escalation_review,
+                },
+            });
+        }
+        transaction.commit().await?;
+        Ok(result)
     }
 
     async fn decrypt_route_evidence<T: serde::de::DeserializeOwned>(

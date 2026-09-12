@@ -30,8 +30,7 @@ use crate::{
         },
         route_broker::{
             ApprovalPrincipalScope, CurrentCallResolution, PendingApproval as RoutePendingApproval,
-            RouteApprovalBroker, RouteApprovalOutcome, WaiterResult as RouteWaiterResult,
-            normal_reauthorization_exhausted,
+            RouteApprovalBroker, RouteApprovalOutcome, normal_reauthorization_exhausted,
         },
     },
     gateway::Command,
@@ -183,6 +182,18 @@ pub(crate) struct ProviderCallAttempt {
 /// unit fixtures can remain transport- and credential-free.
 #[async_trait]
 pub(crate) trait RunDriver: Send + Sync + 'static {
+    fn latest_reflex_snapshot(&self) -> Option<crate::provider::types::ParentContextSnapshot> {
+        None
+    }
+    async fn assemble_reflex_snapshot(
+        &self,
+        _context: &[ContextMessage],
+        _provider_context: &[ProviderContextItemWithFootprint],
+        _call: ProviderCallAttempt,
+    ) -> Result<Option<crate::provider::types::ParentContextSnapshot>> {
+        Ok(None)
+    }
+
     /// Fail closed unless the driver can prove that its immutable executor
     /// client is bound to the exact authenticated runtime identity.
     fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
@@ -352,6 +363,37 @@ impl SequentialRunWorker {
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn latest_reflex_snapshot(&self) -> Option<crate::provider::types::ParentContextSnapshot> {
+        self.driver.latest_reflex_snapshot()
+    }
+
+    fn idle_reflex_snapshot<'a>(
+        &'a self,
+        core: &'a RunCore,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<crate::provider::types::ParentContextSnapshot>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // No newly injected input or provider execution: assemble the
+            // secretary's current context, including the completed last turn.
+            self.driver
+                .assemble_reflex_snapshot(
+                    &core.runtime_context,
+                    &core.provider_context,
+                    ProviderCallAttempt {
+                        attempt_sequence: 0,
+                        user_turn_attempt: 1,
+                        trigger: ProviderCallTrigger::Continuation,
+                    },
+                )
+                .await
+        })
+    }
+
     fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
         self.driver.validate_runtime_identity(identity)
     }
@@ -389,7 +431,15 @@ impl RunWorker for SequentialRunWorker {
     }
 }
 
+struct DeferredRouteCall {
+    _pending: Option<RoutePendingApproval>,
+    expired_reason: Option<String>,
+    assistant_message_id: String,
+    call: ToolCall,
+}
+
 struct Runner {
+    deferred_route_calls: HashMap<String, DeferredRouteCall>,
     core: RunCore,
     driver: Arc<dyn RunDriver>,
     controls: mpsc::Receiver<RunControl>,
@@ -523,7 +573,6 @@ enum RouteApprovalWaitOutcome {
         reason: String,
         command: Box<AdmittedCommand>,
     },
-    Cancelled,
 }
 
 #[expect(
@@ -558,6 +607,7 @@ impl Runner {
         let provider_context = std::mem::take(&mut core.provider_context);
         let cancel = core.runtime_shutdown.child_token();
         Self {
+            deferred_route_calls: HashMap::new(),
             core,
             driver,
             controls,
@@ -599,6 +649,15 @@ impl Runner {
         self.core.runtime_context = std::mem::take(&mut self.context);
         self.core.provider_context = std::mem::take(&mut self.provider_context);
         self.core.mark_mutated();
+        if !self.deferred_route_calls.is_empty() {
+            return RunCompletion::RehydrationRequired {
+                failure: result.err().unwrap_or_else(|| {
+                    WorkerFailure::Error(
+                        "pending operations require durable continuation".to_owned(),
+                    )
+                }),
+            };
+        }
         match result {
             Ok(()) if self.inference_suspended && !self.durable_terminal_pending => {
                 RunCompletion::Suspended
@@ -644,12 +703,74 @@ impl Runner {
         }
     }
 
+    async fn restore_pending_operations(&mut self) -> Result<(), WorkerFailure> {
+        let operations = std::mem::take(&mut self.core.recovered_pending_operations);
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let broker = self
+            .core
+            .approval
+            .as_ref()
+            .and_then(super::ApprovalRuntime::route)
+            .cloned()
+            .ok_or_else(|| {
+                WorkerFailure::Error("restored operations have no route approval broker".into())
+            })?;
+        for operation in operations {
+            let scope = ApprovalPrincipalScope {
+                tenant_id: operation.provenance.tenant_id().to_owned(),
+                personality_agent_id: operation.provenance.personality_agent_id().to_string(),
+                human_principal_id: operation
+                    .provenance
+                    .authenticated_direct_chat_human()
+                    .map(str::to_owned),
+            };
+            let restored = match self
+                .driver
+                .bind_tool_invocation(&operation.assistant_message_id, &operation.call)
+                .await
+            {
+                Ok(sealed) => broker.restore_pending_operation(&operation, sealed, scope),
+                Err(error) => Err(anyhow::anyhow!(
+                    "operation binding is no longer available: {error}"
+                )),
+            };
+            let (pending, expired_reason) = match restored {
+                Ok(pending) => (Some(pending), None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "Pending operation was not executed because its original authorization could not be restored: {error}"
+                    )),
+                ),
+            };
+            self.deferred_route_calls.insert(
+                operation.request_id,
+                DeferredRouteCall {
+                    _pending: pending,
+                    expired_reason,
+                    assistant_message_id: operation.assistant_message_id,
+                    call: operation.call,
+                },
+            );
+        }
+        Ok(())
+    }
+
     async fn run_inner(&mut self) -> Result<(), WorkerFailure> {
+        self.restore_pending_operations().await?;
         if let Some(continuation) = self.core.recovered_inference_continuation.take() {
             self.first_provider_call_after_user =
                 continuation.phase == crate::store::RunPhase::UserCommitted;
+            let unobserved_outcome =
+                std::mem::take(&mut self.core.has_unobserved_operation_outcome);
             if !continuation.turn_open {
-                self.start_next_turn().await?;
+                if self.deferred_route_calls.is_empty() || unobserved_outcome {
+                    self.start_next_turn().await?;
+                } else if !self.advance_followup().await? {
+                    return Ok(());
+                }
             }
         } else {
             self.emit(AgentEvent::AgentStart).await?;
@@ -659,6 +780,7 @@ impl Runner {
 
         loop {
             self.receive_control_safe_point().await?;
+            self.resolve_deferred_approvals().await?;
             let outcome = self.provider_attempt().await?;
             self.attempt_sequence = self.attempt_sequence.saturating_add(1);
             self.user_turn_attempt = self.user_turn_attempt.saturating_add(1);
@@ -1709,156 +1831,44 @@ impl Runner {
                         receipts.push(self.await_message_receipt(waiter).await?);
                         results.push(result);
                     }
-                    RouteCallDisposition::Pending { mut pending } => {
+                    RouteCallDisposition::Pending { pending } => {
                         let request = pending.request().clone();
                         self.emit_route_approval_requested(
                             request.public_request(),
                             pending.durable_evidence().clone(),
                         )
                         .await?;
-                        self.phase.send(WorkerPhase::Approval).ok();
-                        match self
-                            .wait_for_route_approval(
-                                broker.clone(),
+                        let details = serde_json::to_value(
+                            crate::approval::operation::PendingOperationReceipt::new(
                                 request.id.clone(),
-                                pending.receiver_mut(),
-                            )
-                            .await?
-                        {
-                            RouteApprovalWaitOutcome::Approved {
-                                grant,
-                                decision,
-                                command,
-                            } => {
-                                self.emit_route_approval_resolved(
-                                    request.id.clone(),
-                                    crate::agent::events::ApprovalResolution::Decision(
-                                        crate::gateway::ApprovalDecision::ApproveOnce,
-                                    ),
-                                    Some(*command),
-                                    Some(decision),
-                                )
-                                .await?;
-                                match self
-                                    .start_and_execute_route_call(assistant_message_id, call, grant)
-                                    .await?
-                                {
-                                    RouteExecutionDisposition::Completed { result, receipt } => {
-                                        receipts.push(receipt);
-                                        results.push(result);
-                                    }
-                                    RouteExecutionDisposition::Preempted { reason } => {
-                                        self.emit(AgentEvent::ApprovalResolved {
-                                            request_id: request.id.clone(),
-                                            resolution:
-                                                crate::agent::events::ApprovalResolution::Cancelled,
-                                        })
-                                        .await?;
-                                        let result = error_tool_result(call, &reason);
-                                        let waiter = self
-                                            .emit_result_message(
-                                                assistant_message_id,
-                                                &result,
-                                                None,
-                                                Some(call.id.clone()),
-                                            )
-                                            .await?;
-                                        receipts.push(self.await_message_receipt(waiter).await?);
-                                        results.push(result);
-                                        cancel_reason = Some(reason);
-                                    }
-                                    RouteExecutionDisposition::Reauthorize { .. } => {
-                                        self.emit_route_approval_resolved(
-                                            request.id.clone(),
-                                            crate::agent::events::ApprovalResolution::Rejected {
-                                                decision:
-                                                    crate::gateway::ApprovalDecision::ApproveOnce,
-                                            },
-                                            None,
-                                            None,
-                                        )
-                                        .await?;
-                                        let reason = "The approved operation was rejected because its authority changed before execution";
-                                        let result = error_tool_result(call, reason);
-                                        let waiter = self
-                                            .emit_human_rejected_result_message(
-                                                assistant_message_id,
-                                                &result,
-                                            )
-                                            .await?;
-                                        receipts.push(self.await_message_receipt(waiter).await?);
-                                        results.push(result);
-                                    }
-                                }
-                            }
-                            RouteApprovalWaitOutcome::Denied { decision, command } => {
-                                self.emit_route_approval_resolved(
-                                    request.id.clone(),
-                                    crate::agent::events::ApprovalResolution::Decision(
-                                        crate::gateway::ApprovalDecision::DenyOnce,
-                                    ),
-                                    Some(*command),
-                                    Some(decision),
-                                )
-                                .await?;
-                                let result = error_tool_result(call, "Approval denied");
-                                let waiter = self
-                                    .emit_result_message(
-                                        assistant_message_id,
-                                        &result,
-                                        Some(call.id.clone()),
-                                        None,
-                                    )
-                                    .await?;
-                                receipts.push(self.await_message_receipt(waiter).await?);
-                                results.push(result);
-                            }
-                            RouteApprovalWaitOutcome::Rejected {
-                                decision,
-                                reason,
-                                command,
-                            } => {
-                                self.emit_route_approval_resolved(
-                                    request.id.clone(),
-                                    crate::agent::events::ApprovalResolution::Cancelled,
-                                    Some(*command),
-                                    Some(decision),
-                                )
-                                .await?;
-                                let result = error_tool_result(call, &reason);
-                                let waiter = self
-                                    .emit_result_message(
-                                        assistant_message_id,
-                                        &result,
-                                        None,
-                                        Some(call.id.clone()),
-                                    )
-                                    .await?;
-                                receipts.push(self.await_message_receipt(waiter).await?);
-                                results.push(result);
-                            }
-                            RouteApprovalWaitOutcome::Cancelled => {
-                                self.emit(AgentEvent::ApprovalResolved {
-                                    request_id: request.id.clone(),
-                                    resolution: crate::agent::events::ApprovalResolution::Cancelled,
-                                })
-                                .await?;
-                                let reason = "Tool execution cancelled".to_owned();
-                                let result = error_tool_result(call, &reason);
-                                let waiter = self
-                                    .emit_result_message(
-                                        assistant_message_id,
-                                        &result,
-                                        None,
-                                        Some(call.id.clone()),
-                                    )
-                                    .await?;
-                                receipts.push(self.await_message_receipt(waiter).await?);
-                                results.push(result);
-                                cancel_reason = Some(reason);
-                            }
-                        }
-                        self.phase.send(WorkerPhase::Active).ok();
+                            ),
+                        )
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        let result = ToolResultMessage {
+                            provider_call_id: call.provider_call_id.clone(),
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            content: vec![UserContent::Text {
+                                text: details.to_string(),
+                            }],
+                            details,
+                            is_error: false,
+                            timestamp: Utc::now(),
+                        };
+                        let waiter = self
+                            .emit_result_message(assistant_message_id, &result, None, None)
+                            .await?;
+                        receipts.push(self.await_message_receipt(waiter).await?);
+                        results.push(result);
+                        self.deferred_route_calls.insert(
+                            request.id.clone(),
+                            DeferredRouteCall {
+                                _pending: Some(pending),
+                                expired_reason: None,
+                                assistant_message_id: assistant_message_id.to_owned(),
+                                call: call.clone(),
+                            },
+                        );
                     }
                 }
                 break 'authorize;
@@ -1983,186 +1993,282 @@ impl Runner {
         })
     }
 
-    async fn wait_for_route_approval(
+    /// Consume answers only between provider attempts, after the preceding
+    /// assistant/results have been retained in durable sequence order.
+    async fn resolve_deferred_approvals(&mut self) -> Result<bool, WorkerFailure> {
+        if self.deferred_route_calls.is_empty() {
+            return Ok(false);
+        }
+        let expired = self
+            .deferred_route_calls
+            .iter()
+            .filter_map(|(id, pending)| {
+                pending
+                    .expired_reason
+                    .as_ref()
+                    .map(|reason| (id.clone(), pending.call.clone(), reason.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (id, call, reason) in expired {
+            self.emit(AgentEvent::ApprovalResolved {
+                request_id: id.clone(),
+                resolution: crate::agent::events::ApprovalResolution::Cancelled,
+            })
+            .await?;
+            self.emit_operation_outcome(
+                &id,
+                &error_tool_result(&call, &reason),
+                crate::runtime::contracts::ApprovalOperationStatus::Expired,
+                Some(call.id.clone()),
+            )
+            .await?;
+            self.deferred_route_calls.remove(&id);
+        }
+        let Some(broker) = self
+            .core
+            .approval
+            .as_ref()
+            .and_then(super::ApprovalRuntime::route)
+            .cloned()
+        else {
+            return Err(WorkerFailure::Error(
+                "pending route approval lost its broker".into(),
+            ));
+        };
+        let mut decisions = Vec::new();
+        let mut other = Vec::new();
+        while let Some(command) = self.core.next_followup() {
+            if matches!(&command.envelope().command,
+                Command::ApprovalDecision { request_id, .. } if self.deferred_route_calls.contains_key(request_id))
+            {
+                decisions.push(command);
+            } else {
+                other.push(command);
+            }
+        }
+        for command in other {
+            self.core
+                .queue_followup(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        let mut decisions = decisions.into_iter();
+        let first = decisions.next();
+        for command in decisions {
+            self.core
+                .queue_followup(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        let mut resumed = false;
+        if let Some(command) = first {
+            let Command::ApprovalDecision {
+                request_id,
+                decision,
+            } = &command.envelope().command
+            else {
+                unreachable!()
+            };
+            let request_id = request_id.clone();
+            let current = match decision {
+                crate::gateway::ApprovalDecision::ApproveOnce => CurrentCallDecision::ApproveOnce,
+                crate::gateway::ApprovalDecision::DenyOnce => CurrentCallDecision::DenyOnce,
+                #[cfg(test)]
+                crate::gateway::ApprovalDecision::ApproveAlways { .. } => return Ok(false),
+            };
+            let provenance = &command.envelope().provenance;
+            let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
+                return Ok(false);
+            };
+            let authenticated = AuthenticatedCurrentCallDecision {
+                command_id: command.envelope().command_id.to_string(),
+                command_seq: command.envelope().seq,
+                tenant_id: provenance.tenant_id().to_owned(),
+                personality_agent_id: provenance.personality_agent_id().to_string(),
+                human_principal_id: human_principal_id.to_owned(),
+                decision: current,
+                received_at: command.received_at(),
+            };
+            let outcome = match broker.resolve(&request_id, authenticated).await {
+                Some(CurrentCallResolution::Approved { grant, decision }) => {
+                    RouteApprovalWaitOutcome::Approved {
+                        grant,
+                        decision,
+                        command: Box::new(command),
+                    }
+                }
+                Some(CurrentCallResolution::Denied { decision }) => {
+                    RouteApprovalWaitOutcome::Denied {
+                        decision,
+                        command: Box::new(command),
+                    }
+                }
+                Some(CurrentCallResolution::Rejected { decision, reason }) => {
+                    RouteApprovalWaitOutcome::Rejected {
+                        decision,
+                        reason,
+                        command: Box::new(command),
+                    }
+                }
+                Some(CurrentCallResolution::Ignored) | None => return Ok(false),
+            };
+            let deferred = self
+                .deferred_route_calls
+                .get(&request_id)
+                .expect("matched pending operation");
+            let assistant_message_id = deferred.assistant_message_id.clone();
+            let call = deferred.call.clone();
+            self.durable_terminal_pending = true;
+            self.finish_route_approval(&assistant_message_id, &call, &request_id, outcome)
+                .await?;
+            self.durable_terminal_pending = false;
+            self.deferred_route_calls.remove(&request_id);
+            resumed = true;
+        }
+        Ok(resumed)
+    }
+
+    async fn finish_route_approval(
         &mut self,
-        broker: Arc<RouteApprovalBroker>,
-        request_id: String,
-        receiver: &mut oneshot::Receiver<RouteWaiterResult>,
-    ) -> Result<RouteApprovalWaitOutcome, WorkerFailure> {
-        let runtime_cancel = self.cancel.clone();
-        loop {
-            tokio::select! {
-                _ = runtime_cancel.cancelled() => {
-                    broker.cancel(&request_id);
-                    return Err(WorkerFailure::Cancelled);
-                }
-                result = &mut *receiver => {
-                    return match result {
-                        Ok(RouteWaiterResult::Resolved) => Err(WorkerFailure::Error(
-                            "route approval resolved without its authenticated command path"
-                                .to_owned(),
-                        )),
-                        Ok(RouteWaiterResult::Cancelled) | Err(_) => {
-                            Ok(RouteApprovalWaitOutcome::Cancelled)
-                        }
-                    };
-                }
-                control = self.controls.recv() => {
-                    match control {
-                        Some(RunControl::Command(command)) => {
-                            match &command.envelope().command {
-                                Command::ApprovalDecision { request_id: rid, decision }
-                                    if rid == &request_id =>
-                                {
-                                    let current = match decision {
-                                        crate::gateway::ApprovalDecision::ApproveOnce => {
-                                            CurrentCallDecision::ApproveOnce
-                                        }
-                                        crate::gateway::ApprovalDecision::DenyOnce => {
-                                            CurrentCallDecision::DenyOnce
-                                        }
-                                        #[cfg(test)]
-                                        crate::gateway::ApprovalDecision::ApproveAlways { .. } => {
-                                            return Err(WorkerFailure::Error(
-                                                "standing policy mutation cannot resolve a current-call approval"
-                                                    .to_owned(),
-                                            ));
-                                        }
-                                    };
-                                    let provenance = &command.envelope().provenance;
-                                    let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
-                                        continue;
-                                    };
-                                    let authenticated = AuthenticatedCurrentCallDecision {
-                                        command_id: command.envelope().command_id.to_string(),
-                                        command_seq: command.envelope().seq,
-                                        tenant_id: provenance.tenant_id().to_owned(),
-                                        personality_agent_id: provenance
-                                            .personality_agent_id()
-                                            .to_string(),
-                                        human_principal_id: human_principal_id.to_owned(),
-                                        decision: current,
-                                        received_at: command.received_at(),
-                                    };
-                                    let resolution = broker.resolve(rid, authenticated).await;
-                                    if matches!(resolution, Some(CurrentCallResolution::Ignored)) {
-                                        continue;
-                                    }
-                                    return Ok(match resolution {
-                                        Some(CurrentCallResolution::Approved {
-                                            grant,
-                                            decision,
-                                        }) => {
-                                            RouteApprovalWaitOutcome::Approved {
-                                                grant,
-                                                decision,
-                                                command: Box::new(command),
-                                            }
-                                        }
-                                        Some(CurrentCallResolution::Denied { decision }) => {
-                                            RouteApprovalWaitOutcome::Denied {
-                                                decision,
-                                                command: Box::new(command),
-                                            }
-                                        }
-                                        Some(CurrentCallResolution::Rejected {
-                                            decision,
-                                            reason,
-                                        }) => RouteApprovalWaitOutcome::Rejected {
-                                            decision,
-                                            reason,
-                                            command: Box::new(command),
-                                        },
-                                        Some(CurrentCallResolution::Ignored) => unreachable!(
-                                            "ignored resolutions continue without projection"
-                                        ),
-                                        None => RouteApprovalWaitOutcome::Cancelled,
-                                    });
-                                }
-                                Command::ApprovalDecision { request_id: rid, decision } => {
-                                    let current = match decision {
-                                        crate::gateway::ApprovalDecision::ApproveOnce => {
-                                            Some(CurrentCallDecision::ApproveOnce)
-                                        }
-                                        crate::gateway::ApprovalDecision::DenyOnce => {
-                                            Some(CurrentCallDecision::DenyOnce)
-                                        }
-                                        #[cfg(test)]
-                                        crate::gateway::ApprovalDecision::ApproveAlways { .. } => {
-                                            None
-                                        }
-                                    };
-                                    if let Some(current) = current {
-                                        let provenance = &command.envelope().provenance;
-                                        let Some(human_principal_id) = provenance.authenticated_direct_chat_human() else {
-                                            continue;
-                                        };
-                                        let authenticated = AuthenticatedCurrentCallDecision {
-                                            command_id: command.envelope().command_id.to_string(),
-                                            command_seq: command.envelope().seq,
-                                            tenant_id: provenance.tenant_id().to_owned(),
-                                            personality_agent_id: provenance
-                                                .personality_agent_id()
-                                                .to_string(),
-                                            human_principal_id: human_principal_id.to_owned(),
-                                            decision: current,
-                                            received_at: command.received_at(),
-                                        };
-                                        let _ = broker.resolve(rid, authenticated).await;
-                                    }
-                                    continue;
-                                }
-                                Command::ExternalEvent { .. } => {
-                                    self.core.queue_followup(command).map_err(|error| {
-                                        WorkerFailure::Error(error.to_string())
-                                    })?;
-                                    continue;
-                                }
-                                Command::UserMessage { .. } | Command::Abort {} => {
-                                    broker.cancel_all();
-                                    self.core.queue_followup(command).map_err(|error| {
-                                        WorkerFailure::Error(error.to_string())
-                                    })?;
-                                    return Ok(RouteApprovalWaitOutcome::Cancelled);
-                                }
-                            }
-                        }
-                        Some(RunControl::RetrySteer { accepted, .. })
-                        | Some(RunControl::HardSteer { accepted, .. }) => {
-                            let _ = accepted.send(false);
-                        }
-                        Some(RunControl::SoftSteer {
-                            command,
-                            accepted,
-                            committed,
-                        }) => {
-                            if self
-                                .accept_steer_control(command, accepted, committed)
-                                .await?
-                            {
-                                broker.cancel(&request_id);
-                                return Ok(RouteApprovalWaitOutcome::Cancelled);
-                            }
-                        }
-                        Some(RunControl::Abort {
-                            accepted,
-                            committed,
-                            ..
-                        }) => {
-                            if self.accept_abort_control(accepted, committed).await? {
-                                self.abort_requested = true;
-                                broker.cancel(&request_id);
-                                return Ok(RouteApprovalWaitOutcome::Cancelled);
-                            }
-                        }
-                        None => {
-                            broker.cancel(&request_id);
-                            return Ok(RouteApprovalWaitOutcome::Cancelled);
-                        }
+        assistant_message_id: &str,
+        call: &ToolCall,
+        request_id: &str,
+        outcome: RouteApprovalWaitOutcome,
+    ) -> Result<(), WorkerFailure> {
+        use crate::agent::events::ApprovalResolution;
+        use crate::runtime::contracts::ApprovalOperationStatus as Status;
+        let (result, status, cancelled) = match outcome {
+            RouteApprovalWaitOutcome::Approved {
+                grant,
+                decision,
+                command,
+            } => {
+                self.emit_route_approval_resolved(
+                    request_id.to_owned(),
+                    ApprovalResolution::Decision(crate::gateway::ApprovalDecision::ApproveOnce),
+                    Some(*command),
+                    Some(decision),
+                )
+                .await?;
+                match self
+                    .start_and_execute_route_call(assistant_message_id, call, grant)
+                    .await?
+                {
+                    RouteExecutionDisposition::Completed { .. } => return Ok(()),
+                    RouteExecutionDisposition::Preempted { reason } => {
+                        self.emit(AgentEvent::ApprovalResolved {
+                            request_id: request_id.to_owned(),
+                            resolution: ApprovalResolution::Cancelled,
+                        })
+                        .await?;
+                        (error_tool_result(call, &reason), Status::Cancelled, true)
+                    }
+                    RouteExecutionDisposition::Reauthorize { .. } => {
+                        self.emit_route_approval_resolved(
+                            request_id.to_owned(),
+                            ApprovalResolution::Rejected {
+                                decision: crate::gateway::ApprovalDecision::ApproveOnce,
+                            },
+                            None,
+                            None,
+                        )
+                        .await?;
+                        (
+                            error_tool_result(
+                                call,
+                                "The approved operation was not executed because its authority changed before execution",
+                            ),
+                            Status::Expired,
+                            false,
+                        )
                     }
                 }
             }
-        }
+            RouteApprovalWaitOutcome::Denied { decision, command } => {
+                self.emit_route_approval_resolved(
+                    request_id.to_owned(),
+                    ApprovalResolution::Decision(crate::gateway::ApprovalDecision::DenyOnce),
+                    Some(*command),
+                    Some(decision),
+                )
+                .await?;
+                (
+                    error_tool_result(call, "Approval denied; the operation was not executed"),
+                    Status::Denied,
+                    false,
+                )
+            }
+            RouteApprovalWaitOutcome::Rejected {
+                decision,
+                reason,
+                command,
+            } => {
+                self.emit_route_approval_resolved(
+                    request_id.to_owned(),
+                    ApprovalResolution::Cancelled,
+                    Some(*command),
+                    Some(decision),
+                )
+                .await?;
+                (error_tool_result(call, &reason), Status::Expired, true)
+            }
+        };
+        self.emit_operation_outcome(
+            request_id,
+            &result,
+            status,
+            cancelled.then(|| call.id.clone()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn emit_operation_outcome(
+        &mut self,
+        operation_id: &str,
+        result: &ToolResultMessage,
+        status: crate::runtime::contracts::ApprovalOperationStatus,
+        cancelled: Option<String>,
+    ) -> Result<MessageCommitReceipt, WorkerFailure> {
+        use crate::runtime::contracts::{ApprovalOperationSource, ApprovalOperationStatus};
+        let outcome = ApprovalOperationSource {
+            operation_id: operation_id.to_owned(),
+            tool_call_id: result.tool_call_id.clone(),
+            status,
+            executed: Some(matches!(
+                status,
+                ApprovalOperationStatus::Succeeded | ApprovalOperationStatus::Failed
+            )),
+            result: serde_json::to_value(result)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+        };
+        let binding =
+            self.core.durable_binding.as_ref().ok_or_else(|| {
+                WorkerFailure::Error("operation outcome has no durable owner".into())
+            })?;
+        let provenance = binding
+            .provenance
+            .approval_operation(outcome.clone())
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        let message = PublicMessage::User(crate::provider::types::UserMessage {
+            incoming_source: Some(provenance),
+            incoming_timing: None,
+            content: vec![UserContent::Text {
+                text: serde_json::to_string(&outcome)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+            }],
+            timestamp: result.timestamp,
+        });
+        let message_id = outcome.message_id();
+        self.emit(AgentEvent::MessageStart {
+            message_id: message_id.clone(),
+            message: Box::new(message.clone()),
+        })
+        .await?;
+        let waiter = self
+            .emit_message_end(message_id, message.clone(), None, cancelled)
+            .await?;
+        let receipt = self.await_message_receipt(waiter).await?;
+        self.retain_committed(receipt.clone(), &message)?;
+        Ok(receipt)
     }
 
     async fn emit_route_approval_requested(
@@ -2270,7 +2376,28 @@ impl Runner {
                     ),
                 };
                 result.provider_call_id = call.provider_call_id.clone();
-                let receipt = self.emit_tool_result(assistant_message_id, &result).await?;
+                let operation_id = self
+                    .deferred_route_calls
+                    .iter()
+                    .find_map(|(id, pending)| (pending.call.id == call.id).then(|| id.clone()));
+                let receipt = if let Some(operation_id) = operation_id {
+                    self.emit(AgentEvent::ToolExecutionEnd {
+                        tool_call_id: call.id.clone(),
+                        result: serde_json::to_value(&result)
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                        is_error: result.is_error,
+                    })
+                    .await?;
+                    let status = if result.is_error {
+                        crate::runtime::contracts::ApprovalOperationStatus::Failed
+                    } else {
+                        crate::runtime::contracts::ApprovalOperationStatus::Succeeded
+                    };
+                    self.emit_operation_outcome(&operation_id, &result, status, None)
+                        .await?
+                } else {
+                    self.emit_tool_result(assistant_message_id, &result).await?
+                };
                 if let Some(post_commit) = live_post_commit {
                     let maintenance_started = std::time::Instant::now();
                     tracing::info!(tool_call_id = %call.id, stage = "post_result_maintenance_start", "tool dispatch progress");
@@ -3606,13 +3733,68 @@ impl Runner {
     }
 
     async fn advance_followup(&mut self) -> Result<bool, WorkerFailure> {
-        self.receive_control_safe_point().await?;
-        if !self.claim_pending_user()? {
-            return Ok(false);
+        loop {
+            self.receive_control_safe_point().await?;
+            if self.abort_requested {
+                return Err(WorkerFailure::Cancelled);
+            }
+            let has_answer = self.core.pending_controls.iter().any(|command| {
+                matches!(&command.envelope().command,
+                    Command::ApprovalDecision { request_id, .. } if self.deferred_route_calls.contains_key(request_id))
+            });
+            let has_input = self.claim_pending_user()?;
+            if has_input
+                || has_answer
+                || self
+                    .deferred_route_calls
+                    .values()
+                    .any(|pending| pending.expired_reason.is_some())
+            {
+                self.start_next_turn().await?;
+                self.resolve_deferred_approvals().await?;
+                if self.claim_pending_user()? {
+                    self.inject_in_flight().await?;
+                }
+                return Ok(true);
+            }
+            if self.deferred_route_calls.is_empty() {
+                return Ok(false);
+            }
+            // The final answer is complete, but only the pending operations
+            // wait. No provider polling and no AgentEnd around live approvals.
+            let control = tokio::select! {
+                _ = self.cancel.cancelled() => return Err(WorkerFailure::Cancelled),
+                control = self.controls.recv() => control.ok_or(WorkerFailure::Cancelled)?,
+            };
+            match control {
+                RunControl::Command(command) => self
+                    .core
+                    .queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::HardSteer { accepted, .. }
+                | RunControl::RetrySteer { accepted, .. } => {
+                    let _ = accepted.send(false);
+                }
+                RunControl::SoftSteer {
+                    command,
+                    accepted,
+                    committed,
+                } => {
+                    self.accept_steer_control(command, accepted, committed)
+                        .await?;
+                }
+                RunControl::Abort {
+                    accepted,
+                    committed,
+                    ..
+                } => {
+                    if self.accept_abort_control(accepted, committed).await? {
+                        self.abort_requested = true;
+                        return Err(WorkerFailure::Cancelled);
+                    }
+                }
+            }
         }
-        self.start_next_turn().await?;
-        self.inject_in_flight().await?;
-        Ok(true)
     }
 
     fn claim_pending_user(&mut self) -> Result<bool, WorkerFailure> {

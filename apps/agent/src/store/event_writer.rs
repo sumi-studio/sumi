@@ -58,8 +58,8 @@ use crate::{
         },
     },
     runtime::contracts::{
-        GenerationRecoveryFence, IncomingProvenance, OutputAudience, PersonalityAgentId,
-        ProcessGeneration, ProcessGenerationLease,
+        ApprovalOperationSource, GenerationRecoveryFence, IncomingProvenance, OutputAudience,
+        PersonalityAgentId, ProcessGeneration, ProcessGenerationLease,
     },
     tools::BoundToolInvocation,
 };
@@ -514,6 +514,14 @@ impl DurableEvent {
         )
     }
 
+    pub(crate) fn approval_operation_outcome(outcome: ApprovalOperationSource) -> Result<Self> {
+        outcome.validate()?;
+        Self::from_parts(
+            AgentEvent::ApprovalOperationOutcome { outcome },
+            DurableEventMetadata::default(),
+        )
+    }
+
     #[allow(dead_code, reason = "T15 consumes the T12-frozen approval builder")]
     pub(crate) fn approval_requested(request: ApprovalRequest) -> Result<Self> {
         Self::from_parts(
@@ -749,6 +757,7 @@ impl DurableEvent {
             AgentEvent::ToolExecutionStart { .. } => empty("tool_execution_start"),
             AgentEvent::ToolExecutionEnd { .. } => empty("tool_execution_end"),
             AgentEvent::ApprovalRequested { .. } => empty("approval_requested"),
+            AgentEvent::ApprovalOperationOutcome { .. } => empty("approval_operation_outcome"),
             AgentEvent::ApprovalResolved { .. } => empty("approval_resolved"),
             AgentEvent::Steered { .. } => DurableEventIdentity {
                 command_id: self.metadata.command_id.as_deref(),
@@ -1243,6 +1252,13 @@ pub(crate) enum Projection {
     },
     ToolExecution(ToolExecutionMutation),
     Approval(ApprovalMutation),
+    /// The original tool protocol has returned a pending receipt, while the
+    /// exact operation remains prepared and its approval remains unresolved.
+    ApprovalReceipt {
+        request_id: String,
+        tool_call_id: String,
+        message_id: String,
+    },
     /// ADR 0013 pending approval plus its private exact-operation and
     /// Escalation AutoReview evidence. EventWriter encrypts the private
     /// values and commits them with the prepared tool/request lifecycle.
@@ -3737,6 +3753,9 @@ impl EventWriter {
                     }
                 }
                 AgentEvent::ApprovalRequested { request } => Some(request.tool_call_id.as_str()),
+                AgentEvent::ApprovalOperationOutcome { outcome } => {
+                    Some(outcome.tool_call_id.as_str())
+                }
                 _ => None,
             };
             if let AgentEvent::ApprovalResolved { request_id, .. } = &event.value {
@@ -3831,11 +3850,62 @@ impl EventWriter {
                 }
             }
         }
-        let injected_provenance: HashMap<String, IncomingProvenance> = batch
+        let mut injected_provenance: HashMap<String, IncomingProvenance> = batch
             .injected_commands
             .iter()
             .map(|command| (command.message_id.clone(), command.provenance.clone()))
             .collect();
+        // Runtime outcomes inherit the authenticated original command's audience and identity.
+        // The batch validator binds their complete content to a terminal execution below.
+        for write in &batch.writes {
+            if let Some(DurableEvent {
+                value: AgentEvent::ApprovalOperationOutcome { outcome },
+                ..
+            }) = &write.event
+            {
+                let mut tx = self.store.pool().begin().await?;
+                let command_id: String = sqlx::query_scalar(
+                    "SELECT command_id FROM tool_executions WHERE tool_call_id=?",
+                )
+                .bind(&outcome.tool_call_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let provenance =
+                    authenticated_command_provenance(self.store.as_ref(), &mut tx, &command_id)
+                        .await?
+                        .approval_operation(outcome.clone())?;
+                let id = outcome.message_id();
+                for candidate in &batch.writes {
+                    if let Some(DurableEvent {
+                        value:
+                            AgentEvent::MessageStart {
+                                message_id,
+                                message,
+                            }
+                            | AgentEvent::MessageEnd {
+                                message_id,
+                                message,
+                            },
+                        ..
+                    }) = &candidate.event
+                    {
+                        if message_id == &id {
+                            let PublicMessage::User(user) = message.as_ref() else {
+                                bail!("approval outcome must be a user event");
+                            };
+                            if user.incoming_source.as_ref() != Some(&provenance) {
+                                bail!(
+                                    "approval outcome provenance differs from its original command"
+                                );
+                            }
+                        }
+                    }
+                }
+                if injected_provenance.insert(id, provenance).is_some() {
+                    bail!("duplicate runtime outcome identity");
+                }
+            }
+        }
         let batch_run = batch
             .writes
             .iter()
@@ -3973,6 +4043,13 @@ impl EventWriter {
                     } else {
                         None
                     };
+                    let admitted_audience = admitted_audience.or_else(|| {
+                        event
+                            .metadata
+                            .direct_chat_provenance
+                            .as_ref()
+                            .map(IncomingProvenance::output_audience)
+                    });
                     let audience = match admitted_audience {
                         Some(audience) => audience,
                         None => {
@@ -5872,8 +5949,18 @@ impl EventWriter {
                     matches
                 }
                 Command::ExternalEvent { content } => {
+                    let assessment = self
+                        .store
+                        .reflex_decision_in_transaction(transaction, command.command_id.as_str())
+                        .await?;
+                    let rendered = Zeroizing::new(crate::agent::reflex::render_event_content(
+                        content,
+                        assessment
+                            .as_ref()
+                            .and_then(|record| record.decision.interpretation()),
+                    ));
                     let matches = command.provenance.is_external()
-                        && content.as_str() == expected.text.as_str();
+                        && rendered.as_str() == expected.text.as_str();
                     content.zeroize();
                     matches
                 }
@@ -6391,7 +6478,7 @@ impl BootstrapRecoveryGuard<'_> {
                     "authenticated pending approval {request_id} references unknown ToolCall {tool_call_id}"
                 )
             })?;
-            if origin.run_id != run_id {
+            if origin.run_id != run_id || lifecycle.pending_receipts.contains(tool_call_id) {
                 continue;
             }
             if matching.is_some() {
@@ -6406,6 +6493,115 @@ impl BootstrapRecoveryGuard<'_> {
             ));
         }
         Ok(matching)
+    }
+
+    /// Receipt-backed operations are independent of the current inference turn.
+    /// Identities come from authenticated events, not mutable projection rows.
+    pub(in crate::store) fn authenticated_pending_operations(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap recovery initializes the lifecycle checkpoint")
+            .lifecycle;
+        let mut result = Vec::new();
+        for (request_id, call_id) in &lifecycle.pending_approvals {
+            if !lifecycle.pending_receipts.contains(call_id) {
+                continue;
+            }
+            let origin = lifecycle.tool_call_origins.get(call_id).ok_or_else(|| {
+                anyhow!("receipt-backed approval has no authenticated tool origin")
+            })?;
+            result.push((
+                request_id.clone(),
+                call_id.clone(),
+                origin.run_id.clone(),
+                origin.turn_id.clone(),
+                origin.assistant_message_id.clone(),
+            ));
+        }
+        result.sort();
+        Ok(result)
+    }
+
+    /// An operation continuation can have a TurnStart and outcome but no
+    /// provider attempt yet. It needs inference, not a fabricated assistant end.
+    pub(in crate::store) fn authenticated_outcome_only_turn(&self, run_id: &str) -> Option<String> {
+        let lifecycle = &self.state.checkpoint.as_ref()?.lifecycle;
+        if !self.has_unobserved_operation_outcome(run_id) || !lifecycle.live_runs.contains(run_id) {
+            return None;
+        }
+        let turn = lifecycle.open_turns.get(run_id)?;
+        let key = (run_id.to_owned(), turn.clone());
+        if lifecycle.assistant_attempt_starts.contains_key(&key)
+            || lifecycle.last_assistant_end.contains_key(&key)
+            || lifecycle
+                .open_messages
+                .values()
+                .any(|(run, open_turn, role)| {
+                    run == run_id && open_turn == turn && role == "assistant"
+                })
+        {
+            return None;
+        }
+        Some(turn.clone())
+    }
+
+    pub(in crate::store) fn has_unobserved_operation_outcome(&self, run_id: &str) -> bool {
+        self.state.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .lifecycle
+                .unobserved_operation_outcomes
+                .get(run_id)
+                .is_some_and(|operations| !operations.is_empty())
+        })
+    }
+
+    pub(in crate::store) fn authenticated_receipted_operations(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap lifecycle")
+            .lifecycle;
+        let mut result = Vec::new();
+        for (call, operation) in &lifecycle.receipt_operations {
+            let origin = lifecycle
+                .tool_call_origins
+                .get(call)
+                .ok_or_else(|| anyhow!("receipt operation lost authenticated origin"))?;
+            result.push((
+                operation.clone(),
+                call.clone(),
+                origin.run_id.clone(),
+                origin.turn_id.clone(),
+                origin.assistant_message_id.clone(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(in crate::store) fn authenticated_operation_wait(&self, run_id: &str) -> bool {
+        let lifecycle = &self
+            .state
+            .checkpoint
+            .as_ref()
+            .expect("bootstrap recovery initializes lifecycle")
+            .lifecycle;
+        lifecycle.live_runs.contains(run_id)
+            && !lifecycle.open_turns.contains_key(run_id)
+            && (self.has_unobserved_operation_outcome(run_id)
+                || lifecycle.pending_approvals.values().any(|call| {
+                    lifecycle.pending_receipts.contains(call)
+                        && lifecycle
+                            .tool_call_origins
+                            .get(call)
+                            .is_some_and(|origin| origin.run_id == run_id)
+                }))
     }
 
     pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
@@ -7569,6 +7765,24 @@ fn validate_batch_shape_with_recovery(
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
+    let mut approval_receipts = HashMap::<String, (String, String)>::new();
+    let mut approval_outcomes = HashMap::<String, (ApprovalOperationSource, usize)>::new();
+    for (position, write) in batch.writes.iter().enumerate() {
+        if let Some(DurableEvent {
+            value: AgentEvent::ApprovalOperationOutcome { outcome },
+            ..
+        }) = &write.event
+        {
+            outcome.validate()?;
+            if approval_outcomes
+                .insert(outcome.tool_call_id.clone(), (outcome.clone(), position))
+                .is_some()
+            {
+                bail!("duplicate approval outcome");
+            }
+        }
+    }
+    let mut outcome_messages = HashSet::new();
     let mut route_tool_denials = HashMap::new();
     let mut approval_mutation_ids = HashSet::new();
     let mut approval_pending_mutation_ids: HashSet<String> = HashSet::new();
@@ -7839,6 +8053,7 @@ fn validate_batch_shape_with_recovery(
                         bail!("summary requires run/turn and JSON-safe index");
                     }
                 }
+                AgentEvent::ApprovalOperationOutcome { .. } => {}
                 AgentEvent::MemoryMaintenance { kind } => {
                     if kind.as_str().is_empty() {
                         bail!("durable MemoryMaintenance kind must not be empty");
@@ -7924,6 +8139,22 @@ fn validate_batch_shape_with_recovery(
             {
                 superseded_runs.insert(run_id.clone());
             }
+            if let Projection::ApprovalReceipt {
+                request_id,
+                tool_call_id,
+                message_id,
+            } = projection
+            {
+                if approval_receipts
+                    .insert(
+                        tool_call_id.clone(),
+                        (request_id.clone(), message_id.clone()),
+                    )
+                    .is_some()
+                {
+                    bail!("duplicate approval receipt for {tool_call_id}");
+                }
+            }
             if let Projection::Approval(mutation) = projection {
                 let request_id = match mutation {
                     ApprovalMutation::Pending { request_id, .. }
@@ -7987,7 +8218,43 @@ fn validate_batch_shape_with_recovery(
                 if *role != actual_role {
                     bail!("MessageEnd role {role} does not match its {actual_role} message");
                 }
-                if *role == "user" {
+                if let Some(outcome) = ApprovalOperationSource::from_message(message) {
+                    let (expected, outcome_position) = approval_outcomes
+                        .get(&outcome.tool_call_id)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "runtime outcome user message requires its same-batch outcome event"
+                            )
+                        })?;
+                    let PublicMessage::User(user) = message else {
+                        unreachable!()
+                    };
+                    let result: ToolResultMessage = serde_json::from_value(outcome.result.clone())?;
+                    let expected_id = outcome.message_id();
+                    let expected_content = vec![crate::provider::types::UserContent::Text {
+                        text: serde_json::to_string(outcome)?,
+                    }];
+                    if outcome != expected
+                        || message_id != &expected_id
+                        || user.content != expected_content
+                        || user.timestamp != result.timestamp
+                        || !*append_to_l0
+                        || user.incoming_timing.is_some()
+                        || !outcome_messages.insert(outcome.tool_call_id.clone())
+                    {
+                        bail!("runtime outcome message differs from canonical outcome");
+                    }
+                    let start = message_start_positions
+                        .get(message_id.as_str())
+                        .ok_or_else(|| anyhow!("outcome needs same-batch MessageStart"))?;
+                    if outcome_position >= start
+                        || start >= &write_position
+                        || message_start_event_digests.get(message_id.as_str())
+                            != Some(&Some(serde_json::to_value(message)?))
+                    {
+                        bail!("outcome must precede matching user MessageStart and MessageEnd");
+                    }
+                } else if *role == "user" {
                     let command = batch
                         .injected_commands
                         .get(expected_injections.len())
@@ -8444,7 +8711,23 @@ fn validate_batch_shape_with_recovery(
         "ToolExecution Finish mutation",
         &tool_finish_mutation_ids,
     )?;
+    for (call, (_, outcome_position)) in &approval_outcomes {
+        if !outcome_messages.contains(call)
+            || !tool_finish_mutation_ids.contains(call)
+            || tool_result_ids.contains(call.as_str())
+            || tool_end_positions
+                .get(call.as_str())
+                .is_none_or(|end| end >= outcome_position)
+        {
+            bail!(
+                "approval outcome needs prior same-batch terminal execution and canonical user message, without another tool result"
+            );
+        }
+    }
     for tool_call_id in &tool_finish_mutation_ids {
+        if approval_outcomes.contains_key(tool_call_id) {
+            continue;
+        }
         let Some(message_id) = tool_result_message_ids.get(tool_call_id.as_str()) else {
             bail!(
                 "terminal tool mutation for {tool_call_id} requires its tool-result MessageEnd in the same EventBatch"
@@ -8474,6 +8757,11 @@ fn validate_batch_shape_with_recovery(
         })?;
         validate_typed_route_denial_tool_result(result, error_code, denial)?;
     }
+    for call in approval_receipts.keys() {
+        if !tool_result_positions.contains_key(call.as_str()) {
+            bail!("approval receipt {call} requires its same-batch canonical tool result");
+        }
+    }
     for (tool_call_id, (message_id, result_position, is_error)) in &tool_result_positions {
         let Some(start_position) = message_start_positions.get(message_id) else {
             bail!("tool-result MessageEnd for {tool_call_id} requires its same-batch MessageStart");
@@ -8489,6 +8777,18 @@ fn validate_batch_shape_with_recovery(
                 bail!(
                     "ToolExecutionEnd for {tool_call_id} must precede its result MessageStart/MessageEnd"
                 );
+            }
+        } else if let Some((request_id, receipt_message_id)) = approval_receipts.get(*tool_call_id)
+        {
+            let result = tool_result_messages
+                .get(*tool_call_id)
+                .ok_or_else(|| anyhow!("approval receipt requires its exact tool result"))?;
+            let receipt = crate::approval::operation::PendingOperationReceipt::from_result(result)
+                .ok_or_else(|| {
+                    anyhow!("approval receipt must say awaiting_approval and executed=false")
+                })?;
+            if receipt.operation_id != *request_id || *message_id != receipt_message_id {
+                bail!("approval receipt identity differs from the pending operation");
             }
         } else if tool_skip_mutation_ids.contains(*tool_call_id) {
             if !*is_error {
@@ -8524,6 +8824,33 @@ fn validate_batch_shape_with_recovery(
         }
         if mutation.expected == "prepared" && mutation.state != "cancelled" {
             bail!("only cancellation may terminate a prepared tool");
+        }
+        if let Some((outcome, _)) = approval_outcomes.get(tool_call_id) {
+            let result: ToolResultMessage = serde_json::from_value(outcome.result.clone())?;
+            let state_matches = match outcome.executed {
+                Some(true) => {
+                    mutation.expected == "running"
+                        && event.state
+                            == if result.is_error {
+                                "failed"
+                            } else {
+                                "succeeded"
+                            }
+                }
+                Some(false) => mutation.expected == "prepared" && event.state == "cancelled",
+                None => {
+                    physical_recovery.is_some()
+                        && mutation.expected == "running"
+                        && event.state == "indeterminate"
+                }
+            };
+            if event.result != outcome.result || event.is_error != result.is_error || !state_matches
+            {
+                bail!(
+                    "approval outcome result or execution status differs from terminal execution"
+                );
+            }
+            continue;
         }
         let message_id = tool_result_message_ids
             .get(tool_call_id.as_str())
@@ -9813,6 +10140,14 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 .saturating_add(turn_id.len())
                 .saturating_add(idempotency_key.len()),
         },
+        Projection::ApprovalReceipt {
+            request_id,
+            tool_call_id,
+            message_id,
+        } => request_id
+            .len()
+            .saturating_add(tool_call_id.len())
+            .saturating_add(message_id.len()),
         Projection::Approval(mutation) => match mutation {
             ApprovalMutation::Pending {
                 request_id,
@@ -10577,6 +10912,37 @@ async fn load_prepared_tool_binding(
     .transpose()
 }
 
+// A receipted operation retains its original command and authority, while a hard
+// input can hand the same run to a new inference owner. Only that validated
+// handoff (old command applied, exact receipted tool and same run) permits the
+// successor's phase to govern scheduling. Ordinary calls remain owner-bound.
+async fn tool_scheduling_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    command_id: &str,
+    run_id: &str,
+) -> Result<(String, String)> {
+    let rows = sqlx::query(
+        "SELECT current.command_id, current.run_phase FROM inbound_commands current
+         WHERE current.run_id=? AND current.command_kind='user_message' AND current.status='applying'
+           AND (current.command_id=? OR EXISTS(
+             SELECT 1 FROM tool_executions t JOIN approval_log a ON a.tool_call_id=t.tool_call_id
+             JOIN inbound_commands original ON original.command_id=t.command_id
+             WHERE t.tool_call_id=? AND t.command_id=? AND t.run_id=current.run_id
+               AND a.run_id=t.run_id AND a.receipt_message_id IS NOT NULL
+               AND original.run_id=t.run_id AND original.status='applied'))"
+    ).bind(run_id).bind(command_id).bind(tool_call_id).bind(command_id).fetch_all(&mut **transaction).await?;
+    if rows.len() != 1 {
+        bail!(
+            "tool {tool_call_id} requires one live original or receipted successor owner in run {run_id}"
+        );
+    }
+    Ok((
+        rows[0].try_get("command_id")?,
+        rows[0].try_get("run_phase")?,
+    ))
+}
+
 async fn require_tool_owner_binding(
     transaction: &mut Transaction<'_, Sqlite>,
     tool_call_id: &str,
@@ -10586,24 +10952,11 @@ async fn require_tool_owner_binding(
     operation: &str,
     cancellation_cleanup: bool,
 ) -> Result<()> {
-    let stored_phase: Option<String> = sqlx::query_scalar(
-        "SELECT run_phase
-         FROM inbound_commands
-         WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
-           AND status = 'applying'",
-    )
-    .bind(command_id)
-    .bind(run_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let Some(stored_phase) = stored_phase else {
-        bail!(
-            "prepared tool {tool_call_id} has no matching durable owner command {command_id} in run {run_id}"
-        );
-    };
+    let (scheduling_owner, stored_phase) =
+        tool_scheduling_owner(transaction, tool_call_id, command_id, run_id).await?;
     let mut final_phase = RunPhase::parse(&stored_phase)?;
     for (transition_command, transition_run, expected, next) in batch_state.phase_transitions {
-        if *transition_command != command_id || *transition_run != run_id {
+        if *transition_command != scheduling_owner || *transition_run != run_id {
             continue;
         }
         if final_phase != *expected {
@@ -10620,7 +10973,7 @@ async fn require_tool_owner_binding(
             .applied_controls
             .iter()
             .any(|(applied_command, _, applied_run, _)| {
-                *applied_command == command_id && *applied_run == Some(run_id)
+                *applied_command == scheduling_owner && *applied_run == Some(run_id)
             });
     if cancellation_cleanup {
         if !matches!(
@@ -10671,23 +11024,11 @@ async fn validate_tool_finish_owner(
         );
     }
 
-    let stored_phase: String = sqlx::query_scalar(
-        "SELECT run_phase FROM inbound_commands
-         WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
-           AND status = 'applying'",
-    )
-    .bind(&command_id)
-    .bind(&run_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or_else(|| {
-        anyhow!(
-            "ToolExecutionEnd for {tool_call_id} has no live durable owner {command_id} in run {run_id}"
-        )
-    })?;
+    let (scheduling_owner, stored_phase) =
+        tool_scheduling_owner(transaction, tool_call_id, &command_id, &run_id).await?;
     let mut final_phase = RunPhase::parse(&stored_phase)?;
     for (transition_command, transition_run, expected, next) in batch_state.phase_transitions {
-        if *transition_command != command_id || *transition_run != run_id {
+        if *transition_command != scheduling_owner || *transition_run != run_id {
             continue;
         }
         if final_phase != *expected {
@@ -10704,7 +11045,7 @@ async fn validate_tool_finish_owner(
             .applied_controls
             .iter()
             .any(|(applied_command, _, applied_run, _)| {
-                *applied_command == command_id && *applied_run == Some(run_id.as_str())
+                *applied_command == scheduling_owner && *applied_run == Some(run_id.as_str())
             });
 
     match finish.expected {
@@ -10770,6 +11111,7 @@ async fn validate_owner_active_work_terminalized(
     tool_finishes: &HashMap<&str, ToolFinishBinding<'_>>,
     approval_pendings: &[(&str, &str, &str)],
     approval_resolutions: &HashMap<&str, (&str, &str)>,
+    surviving_receipts: &HashSet<String>,
 ) -> Result<()> {
     let rows = sqlx::query(
         "SELECT tool_call_id, state FROM tool_executions
@@ -10797,6 +11139,11 @@ async fn validate_owner_active_work_terminalized(
         }
     }
     for (tool_call_id, state) in &active_tools {
+        if surviving_receipts.contains(tool_call_id)
+            && !tool_finishes.contains_key(tool_call_id.as_str())
+        {
+            continue;
+        }
         let finish = tool_finishes.get(tool_call_id.as_str()).ok_or_else(|| {
             anyhow!(
                 "owner {command_id} cannot close run {run_id} with active {state} tool {tool_call_id}"
@@ -10832,6 +11179,11 @@ async fn validate_owner_active_work_terminalized(
         }
     }
     for (request_id, tool_call_id) in pending_approvals {
+        if surviving_receipts.contains(&tool_call_id)
+            && !approval_resolutions.contains_key(request_id.as_str())
+        {
+            continue;
+        }
         let resolution = approval_resolutions.get(request_id.as_str()).ok_or_else(|| {
             anyhow!(
                 "owner {command_id} cannot close run {run_id} with pending approval {request_id} for {tool_call_id}"
@@ -11807,6 +12159,23 @@ async fn validate_required_projection_sets(
         bail!("approval rule insert requires its active ApproveAlways CommandApplied");
     }
     for (command_id, run_id) in &user_owner_closes {
+        let surviving_receipts =
+            if !has_durable_event(prepared, "agent_end", None, Some(run_id), None, None) {
+                lifecycle
+                    .pending_receipts
+                    .iter()
+                    .filter(|call| {
+                        lifecycle
+                            .tool_call_origins
+                            .get(*call)
+                            .is_some_and(|origin| origin.run_id == *run_id)
+                            && lifecycle.receipt_operations.contains_key(*call)
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
         validate_owner_active_work_terminalized(
             transaction,
             command_id,
@@ -11816,6 +12185,7 @@ async fn validate_required_projection_sets(
             &tool_finishes,
             &approval_pendings,
             &approval_resolutions,
+            &surviving_receipts,
         )
         .await?;
     }
@@ -12342,6 +12712,11 @@ pub(super) async fn authenticate_running_tool_intent(
          WHERE event.event_type = 'message_end'
            AND json_extract(event.internal_metadata, '$.run_id') = ?
            AND event.seq >= COALESCE((
+               SELECT e.seq FROM approval_log a JOIN agent_events e
+                 ON e.event_type='turn_start' AND json_extract(e.internal_metadata,'$.run_id')=a.run_id
+                 AND json_extract(e.internal_metadata,'$.turn_id')=a.turn_id
+               WHERE a.tool_call_id=? AND a.run_id=? AND a.receipt_message_id IS NOT NULL
+           ), (
                SELECT seq FROM agent_events WHERE event_type='turn_start'
                  AND json_extract(internal_metadata,'$.run_id')=? AND seq<=?
                  ORDER BY seq DESC LIMIT 1
@@ -12352,6 +12727,8 @@ pub(super) async fn authenticate_running_tool_intent(
            AND json_extract(content.value, '$.tool_call.id') = ?
          ORDER BY event.seq",
     )
+    .bind(run_id)
+    .bind(tool_call_id)
     .bind(run_id)
     .bind(run_id)
     .bind(sequences[0])
@@ -12957,12 +13334,26 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
             }
         }
         let dependency_turns: Vec<String> = sqlx::query_scalar(
-            "SELECT turn_id FROM approval_log WHERE run_id=? AND state='pending'
+            "SELECT a.turn_id FROM approval_log a WHERE a.run_id=? AND
+                (a.state='pending' OR (a.receipt_message_id IS NOT NULL AND (
+                    EXISTS(SELECT 1 FROM tool_executions t WHERE t.tool_call_id=a.tool_call_id
+                        AND t.state IN ('prepared','running'))
+                    OR NOT EXISTS(SELECT 1 FROM agent_events e WHERE e.event_type='approval_operation_outcome'
+                        AND json_extract(e.envelope,'$.operation_id')=a.id AND EXISTS(
+                            SELECT 1 FROM agent_events done JOIN agent_events started
+                              ON started.event_type='message_start'
+                              AND json_extract(started.envelope,'$.message_id')=json_extract(done.envelope,'$.message_id')
+                            WHERE done.event_type='message_end' AND started.seq>e.seq AND done.seq<?
+                              AND json_extract(done.internal_metadata,'$.run_id')=a.run_id
+                              AND json_extract(done.envelope,'$.message.role')='assistant'
+                              AND json_extract(done.envelope,'$.message.stop_reason')!='error'
+                              AND json_extract(done.internal_metadata,'$.inference_interruption') IS NULL)))))
              UNION SELECT c.turn_id FROM tool_executions t
                JOIN inbound_commands c ON c.command_id=t.command_id
                WHERE t.run_id=? AND t.state IN ('prepared','running') AND c.turn_id IS NOT NULL",
         )
         .bind(&run_id)
+        .bind(boundary)
         .bind(&run_id)
         .fetch_all(&mut **transaction)
         .await?;
@@ -13107,6 +13498,10 @@ struct DurableLifecycleState {
     tool_call_origins: HashMap<String, ToolCallOrigin>,
     inferred_owner_turns: HashSet<String>,
     pending_approvals: HashMap<String, String>,
+    pending_receipts: HashSet<String>,
+    receipt_operations: HashMap<String, String>,
+    unobserved_operation_outcomes: HashMap<String, HashSet<String>>,
+    observing_operation_outcomes: HashMap<String, (String, HashSet<String>)>,
     approved_once: HashMap<String, String>,
 }
 
@@ -13496,7 +13891,9 @@ fn require_canonical_tool_call_origin(
             origin.run_id
         );
     }
-    if state.open_turns.get(run_id) != Some(&origin.turn_id) {
+    if state.open_turns.get(run_id) != Some(&origin.turn_id)
+        && !(state.pending_receipts.contains(tool_call_id) && state.open_turns.contains_key(run_id))
+    {
         bail!(
             "{operation} for {tool_call_id} does not bind the exact open turn {} from assistant MessageEnd {}",
             origin.turn_id,
@@ -13689,7 +14086,12 @@ fn apply_lifecycle_event(
         {
             bail!("inference interruption requires a partial assistant without tool calls");
         }
-        if !state.pending_approvals.is_empty() || !state.approved_once.is_empty() {
+        if state
+            .pending_approvals
+            .values()
+            .any(|call| !state.pending_receipts.contains(call))
+            || !state.approved_once.is_empty()
+        {
             bail!("inference interruption cannot restore pending approval authority");
         }
     }
@@ -13886,9 +14288,11 @@ fn apply_lifecycle_event(
             state
                 .assistant_attempt_starts
                 .remove(&(run_id.clone(), turn_id.clone()));
-            state
-                .tool_call_origins
-                .retain(|_, origin| origin.run_id != run_id || origin.turn_id != turn_id);
+            state.tool_call_origins.retain(|call, origin| {
+                origin.run_id != run_id
+                    || origin.turn_id != turn_id
+                    || state.pending_receipts.contains(call)
+            });
             state.tool_results.clear();
         }
         "message_start" => {
@@ -13900,6 +14304,11 @@ fn apply_lifecycle_event(
             if role == "assistant" {
                 let (run_id, turn_id) = lifecycle_binding(metadata, "assistant MessageStart")?;
                 state.inference_continuations.remove(&run_id);
+                if let Some(operations) = state.unobserved_operation_outcomes.get(&run_id) {
+                    state
+                        .observing_operation_outcomes
+                        .insert(message_id.to_owned(), (run_id.clone(), operations.clone()));
+                }
                 state
                     .interrupted_assistants
                     .remove(&(run_id.clone(), turn_id.clone()));
@@ -13962,6 +14371,16 @@ fn apply_lifecycle_event(
                     ),
                 }
                 state.open_assistant_prefixes.remove(message_id);
+                if let Some((run, observed)) = state.observing_operation_outcomes.remove(message_id)
+                {
+                    if metadata.inference_interruption.is_none()
+                        && message.get("stop_reason").and_then(Value::as_str) != Some("error")
+                    {
+                        if let Some(pending) = state.unobserved_operation_outcomes.get_mut(&run) {
+                            pending.retain(|operation| !observed.contains(operation));
+                        }
+                    }
+                }
                 if let Some(reason) = metadata.inference_interruption {
                     state
                         .interrupted_assistants
@@ -14002,6 +14421,25 @@ fn apply_lifecycle_event(
                 }
             } else if role == "tool_result" {
                 let tool_call_id = lifecycle_string(message, "tool_call_id")?;
+                if let Some(details) = message.get("details") {
+                    if let Ok(receipt) = serde_json::from_value::<
+                        crate::approval::operation::PendingOperationReceipt,
+                    >(details.clone())
+                    {
+                        if !receipt.executed
+                            && state
+                                .pending_approvals
+                                .get(&receipt.operation_id)
+                                .map(String::as_str)
+                                == Some(tool_call_id)
+                        {
+                            state.pending_receipts.insert(tool_call_id.to_owned());
+                            state
+                                .receipt_operations
+                                .insert(tool_call_id.to_owned(), receipt.operation_id.clone());
+                        }
+                    }
+                }
                 if state
                     .tool_results
                     .insert(tool_call_id.to_owned(), message.clone())
@@ -14026,6 +14464,33 @@ fn apply_lifecycle_event(
             {
                 bail!("duplicate ApprovalRequested lifecycle event for {request_id}");
             }
+        }
+        "approval_operation_outcome" => {
+            let mut payload = envelope.clone();
+            payload
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("outcome must be an object"))?
+                .remove("type");
+            let outcome: ApprovalOperationSource = serde_json::from_value(payload)?;
+            outcome.validate()?;
+            if !state.pending_receipts.contains(&outcome.tool_call_id)
+                || state.receipt_operations.get(&outcome.tool_call_id)
+                    != Some(&outcome.operation_id)
+                || !state.tool_call_origins.contains_key(&outcome.tool_call_id)
+            {
+                bail!("approval outcome requires its authenticated original pending receipt");
+            }
+            let run = state.tool_call_origins[&outcome.tool_call_id]
+                .run_id
+                .clone();
+            state
+                .unobserved_operation_outcomes
+                .entry(run)
+                .or_default()
+                .insert(outcome.operation_id.clone());
+            state.pending_receipts.remove(&outcome.tool_call_id);
+            state.receipt_operations.remove(&outcome.tool_call_id);
+            state.tool_call_origins.remove(&outcome.tool_call_id);
         }
         "approval_resolved" => {
             let request_id = lifecycle_string(envelope, "request_id")?;
@@ -15034,6 +15499,25 @@ async fn apply_plain_projection(
         Projection::ToolExecution(mutation) => {
             apply_tool_mutation(transaction, mutation).await?;
         }
+        Projection::ApprovalReceipt {
+            request_id,
+            tool_call_id,
+            message_id,
+        } => {
+            let result = sqlx::query(
+                "UPDATE approval_log SET receipt_message_id=?
+                 WHERE id=? AND tool_call_id=? AND state='pending' AND receipt_message_id IS NULL
+                   AND EXISTS (SELECT 1 FROM tool_executions t
+                     WHERE t.tool_call_id=approval_log.tool_call_id
+                       AND t.run_id=approval_log.run_id AND t.state='prepared')",
+            )
+            .bind(&message_id)
+            .bind(&request_id)
+            .bind(&tool_call_id)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "pending operation receipt")?;
+        }
         Projection::Approval(mutation) => {
             apply_approval_mutation(transaction, mutation).await?;
         }
@@ -15866,6 +16350,9 @@ fn sqlite_u64(value: i64, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    mod reflex_injection_tests {
+        include!("reflex_injection_tests.rs");
+    }
     use std::{path::Path, sync::Arc};
 
     use anyhow::{Result, bail};
@@ -17545,6 +18032,144 @@ mod tests {
                 turn_id: "turn-1".to_owned(),
             })],
         }
+    }
+
+    #[test]
+    fn approval_outcome_requires_receipt_identity_and_is_consumed_once() {
+        let PublicMessage::ToolResult(result) = tool_result("call", "done", false) else {
+            unreachable!()
+        };
+        let outcome = ApprovalOperationSource {
+            operation_id: "operation".into(),
+            tool_call_id: "call".into(),
+            status: crate::runtime::contracts::ApprovalOperationStatus::Succeeded,
+            executed: Some(true),
+            result: serde_json::to_value(result).unwrap(),
+        };
+        let mut envelope = serde_json::to_value(&outcome).unwrap();
+        envelope["type"] = json!("approval_operation_outcome");
+        let mut state = DurableLifecycleState::default();
+        state.pending_receipts.insert("call".into());
+        state
+            .receipt_operations
+            .insert("call".into(), "other".into());
+        state.tool_call_origins.insert(
+            "call".into(),
+            ToolCallOrigin {
+                run_id: "run".into(),
+                turn_id: "turn".into(),
+                assistant_message_id: "assistant".into(),
+            },
+        );
+        assert!(
+            apply_lifecycle_event(
+                &mut state,
+                "approval_operation_outcome",
+                &DurableEventMetadata::default(),
+                &envelope,
+                true
+            )
+            .is_err()
+        );
+        assert!(state.pending_receipts.contains("call"));
+        state
+            .receipt_operations
+            .insert("call".into(), "operation".into());
+        apply_lifecycle_event(
+            &mut state,
+            "approval_operation_outcome",
+            &DurableEventMetadata::default(),
+            &envelope,
+            true,
+        )
+        .unwrap();
+        assert!(!state.pending_receipts.contains("call"));
+        assert!(
+            apply_lifecycle_event(
+                &mut state,
+                "approval_operation_outcome",
+                &DurableEventMetadata::default(),
+                &envelope,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn approval_outcome_batch_pairs_terminal_with_external_message_without_second_tool_result() {
+        let PublicMessage::ToolResult(result) = tool_result("call", "done", false) else {
+            unreachable!()
+        };
+        let outcome = ApprovalOperationSource {
+            operation_id: "operation".into(),
+            tool_call_id: "call".into(),
+            status: crate::runtime::contracts::ApprovalOperationStatus::Succeeded,
+            executed: Some(true),
+            result: serde_json::to_value(&result).unwrap(),
+        };
+        let message = PublicMessage::User(UserMessage {
+            incoming_source: Some(
+                test_provenance()
+                    .approval_operation(outcome.clone())
+                    .unwrap(),
+            ),
+            incoming_timing: None,
+            content: vec![UserContent::Text {
+                text: serde_json::to_string(&outcome).unwrap(),
+            }],
+            timestamp: result.timestamp,
+        });
+        let id = outcome.message_id();
+        let mut batch = EventBatch {
+            writes: vec![
+                EventWrite {
+                    event: Some(
+                        DurableEvent::tool_execution_end(
+                            "call".into(),
+                            outcome.result.clone(),
+                            false,
+                            "succeeded".into(),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: "call".into(),
+                        expected: "running",
+                        state: "succeeded",
+                        error_code: None,
+                    })],
+                },
+                EventWrite {
+                    event: Some(DurableEvent::approval_operation_outcome(outcome).unwrap()),
+                    projections: vec![],
+                },
+                EventWrite {
+                    event: Some(DurableEvent::message("message_start", &id, &message).unwrap()),
+                    projections: vec![],
+                },
+                EventWrite {
+                    event: Some(DurableEvent::message("message_end", &id, &message).unwrap()),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: id.into(),
+                        role: "user",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![],
+                        eviction_footprint_tokens: 0,
+                    }],
+                },
+            ],
+            injected_commands: vec![],
+        };
+        let redactor = Redactor::v1();
+        validate_batch_shape(&redactor, &batch).unwrap();
+        batch.writes.swap(0, 1);
+        assert!(validate_batch_shape(&redactor, &batch).is_err());
+        batch.writes.swap(0, 1);
+        batch.writes.remove(1);
+        assert!(validate_batch_shape(&redactor, &batch).is_err());
     }
 
     fn tool_result(tool_call_id: &str, text: &str, is_error: bool) -> PublicMessage {
@@ -25412,17 +26037,28 @@ mod tests {
                 idempotency_key: "idem-wrong-owner".to_owned(),
             }),
         );
-        let wrong_owner = wrong_owner_writer
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(wrong_owner_store.pool())
+            .await
+            .expect("seeded event count");
+        wrong_owner_writer
             .apply(EventBatch {
                 writes: vec![pending],
                 injected_commands: Vec::new(),
             })
             .await
             .expect_err("prepared tool must name the durable run owner command");
-        assert!(
-            wrong_owner
-                .to_string()
-                .contains("no matching durable owner command")
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT (SELECT COUNT(*) FROM approval_log),
+                        (SELECT COUNT(*) FROM tool_executions),
+                        (SELECT COUNT(*) FROM agent_events)",
+            )
+            .fetch_one(wrong_owner_store.pool())
+            .await
+            .expect("wrong-owner rollback counts"),
+            (0, 0, events_before),
+            "rejecting another command's tool must leave no approval, execution, or event",
         );
     }
 

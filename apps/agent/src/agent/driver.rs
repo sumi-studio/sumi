@@ -172,6 +172,7 @@ pub(crate) struct InjectedRunDriver {
     memory_retry_after: Arc<Mutex<Option<Instant>>>,
     send_view_progress: Mutex<SendViewProgress>,
     personality_agent_context: Option<PersonalityAgentPromptContextHandle>,
+    reflex_snapshot: Mutex<Option<ParentContextSnapshot>>,
 }
 
 struct HydratedMemoryMaintenance {
@@ -254,6 +255,7 @@ impl InjectedRunDriver {
             memory_retry_after: Arc::new(Mutex::new(None)),
             send_view_progress: Mutex::new(SendViewProgress::default()),
             personality_agent_context: None,
+            reflex_snapshot: Mutex::new(None),
         })
     }
 
@@ -361,6 +363,17 @@ impl InjectedRunDriver {
         {
             options.tool_choice = None;
         }
+        // Publish every actual request, independent of memory maintenance state.
+        // A concurrent memory job must never freeze notification context.
+        *self.reflex_snapshot.lock().expect("reflex snapshot lock") = Some(
+            ParentContextSnapshot::capture_with_memory(
+                &prompt,
+                &self.spec,
+                &options,
+                &assembled.visible_memory,
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
         self.start_memory_fork(&prompt, &options, &assembled.visible_memory);
         let (observer, observations) = timing_observation_channel();
         let timing_cancel = cancel.clone();
@@ -481,6 +494,49 @@ impl InjectedRunDriver {
 
 #[async_trait]
 impl RunDriver for InjectedRunDriver {
+    fn latest_reflex_snapshot(&self) -> Option<ParentContextSnapshot> {
+        self.reflex_snapshot
+            .lock()
+            .expect("reflex snapshot lock")
+            .clone()
+    }
+
+    async fn assemble_reflex_snapshot(
+        &self,
+        context: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
+        call: ProviderCallAttempt,
+    ) -> Result<Option<ParentContextSnapshot>> {
+        self.assembler
+            .set_provider_context(provider_context.to_vec());
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, call.trigger)
+            .await?;
+        if assembled.prompt.tools != self.registry.definitions() {
+            bail!("reflex prompt tools diverged from the frozen registry");
+        }
+        let mut options = self.options.clone();
+        if call.user_turn_attempt > 0
+            && options
+                .tool_choice
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                == Some("required")
+        {
+            options.tool_choice = None;
+        }
+        Ok(Some(
+            ParentContextSnapshot::capture_with_memory(
+                &assembled.prompt,
+                &self.spec,
+                &options,
+                &assembled.visible_memory,
+            )
+            .map_err(anyhow::Error::msg)?,
+        ))
+    }
+
     fn validate_runtime_identity(&self, identity: &RpcIdentity) -> Result<()> {
         if identity.generation() != self.executor_generation {
             bail!(
@@ -1058,6 +1114,73 @@ mod tests {
             drop(tx);
             ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
         })
+    }
+
+    #[tokio::test]
+    async fn reflex_context_updates_without_memory_and_idle_assembly_does_not_infer() {
+        let (spec, prompt, registry, workspace) = dependencies();
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(1)),
+            inert_starter(),
+        )
+        .unwrap();
+        assert!(driver.memory_maintenance.is_none());
+        assert!(driver.latest_reflex_snapshot().is_none());
+        let first = ContextMessage::Persisted {
+            id: "u1".into(),
+            seq: 1,
+            message: Message::User(UserMessage {
+                incoming_source: None,
+                incoming_timing: None,
+                content: vec![UserContent::Text {
+                    text: "first".into(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        let attempt = driver
+            .start_provider_for_command(0, &[first.clone()], None, CancellationToken::new())
+            .await
+            .unwrap();
+        drop(attempt);
+        let sent = driver.latest_reflex_snapshot().unwrap();
+        assert!(sent.prompt().messages.contains(&first));
+        let second = ContextMessage::Persisted {
+            id: "u2".into(),
+            seq: 2,
+            message: Message::User(UserMessage {
+                incoming_source: None,
+                incoming_timing: None,
+                content: vec![UserContent::Text {
+                    text: "later context".into(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        let fresh = driver
+            .assemble_reflex_snapshot(
+                &[first, second.clone()],
+                &[],
+                ProviderCallAttempt {
+                    attempt_sequence: 1,
+                    user_turn_attempt: 1,
+                    trigger: ProviderCallTrigger::Continuation,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fresh.prompt().messages.contains(&second));
+        assert_eq!(
+            driver.latest_reflex_snapshot().unwrap(),
+            sent,
+            "assembly alone is not an actual parent dispatch"
+        );
     }
 
     #[test]

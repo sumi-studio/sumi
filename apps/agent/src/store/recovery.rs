@@ -382,8 +382,15 @@ impl LogicalRecoveryExecutor {
             )
             .await;
         }
+        let has_pending_operations = recovery
+            .authenticated_pending_operations()?
+            .iter()
+            .any(|(_, _, owner, _, _)| owner == run_id);
         let continue_inference = expected_pending.is_none()
-            && (snapshot.interruption.is_some() || !snapshot.tool_results.is_empty());
+            && (snapshot.interruption.is_some()
+                || !snapshot.tool_results.is_empty()
+                || has_pending_operations
+                || recovery.has_unobserved_operation_outcome(run_id));
         snapshot.into_batch(executor_generation, continue_inference)
     }
 
@@ -542,8 +549,8 @@ impl AssistantRecoverySnapshot {
 
         if let Some((message_id, prefix)) = open_assistant {
             let unsettled: i64 = sqlx::query_scalar(
-                "SELECT (SELECT COUNT(*) FROM tool_executions WHERE run_id=? AND state IN ('prepared','running')) +
-                 (SELECT COUNT(*) FROM approval_log WHERE run_id=? AND state='pending') +
+                "SELECT (SELECT COUNT(*) FROM tool_executions t WHERE run_id=? AND (state='running' OR (state='prepared' AND NOT EXISTS (SELECT 1 FROM approval_log a WHERE a.tool_call_id=t.tool_call_id AND a.state='pending' AND a.receipt_message_id IS NOT NULL)))) +
+                 (SELECT COUNT(*) FROM approval_log WHERE run_id=? AND state='pending' AND receipt_message_id IS NULL) +
                  (SELECT COUNT(*) FROM inbound_commands WHERE command_id != ? AND status='applying')",
             ).bind(run_id).bind(run_id).bind(command_id).fetch_one(&mut **transaction).await?;
             if unsettled != 0 || expected_pending.is_some() || !pending_physical.is_empty() {
@@ -611,7 +618,10 @@ impl AssistantRecoverySnapshot {
         let PublicMessage::Assistant(assistant_message) = &assistant else {
             unreachable!("assistant transcript variant was matched")
         };
-        if (assistant_message.stop_reason == StopReason::Error || interruption.is_some())
+        if (matches!(
+            assistant_message.stop_reason,
+            StopReason::Error | StopReason::Stop
+        ) || interruption.is_some())
             && assistant_message.content.iter().all(|item| {
                 matches!(
                     item,
@@ -625,10 +635,10 @@ impl AssistantRecoverySnapshot {
             // Pending Error context still requires its separate disposition.
             let unsettled: i64 = sqlx::query_scalar(
                 "SELECT
-                    (SELECT COUNT(*) FROM tool_executions
-                     WHERE run_id = ? AND state IN ('prepared', 'running')) +
+                    (SELECT COUNT(*) FROM tool_executions t
+                     WHERE run_id = ? AND (state='running' OR (state='prepared' AND NOT EXISTS (SELECT 1 FROM approval_log a WHERE a.tool_call_id=t.tool_call_id AND a.state='pending' AND a.receipt_message_id IS NOT NULL)))) +
                     (SELECT COUNT(*) FROM approval_log
-                     WHERE run_id = ? AND state = 'pending') +
+                     WHERE run_id = ? AND state = 'pending' AND receipt_message_id IS NULL) +
                     (SELECT COUNT(*) FROM agent_events
                      WHERE event_type = 'message_start' AND seq > ?
                        AND json_extract(internal_metadata, '$.run_id') = ?
@@ -727,7 +737,7 @@ impl AssistantRecoverySnapshot {
             .await
             .with_context(|| format!("failed to inspect ToolCall {}", call.id))?;
             let approval_row = sqlx::query(
-                "SELECT id, run_id, turn_id, state FROM approval_log
+                "SELECT id, run_id, turn_id, state, receipt_message_id FROM approval_log
                  WHERE tool_call_id = ? LIMIT 1",
             )
             .bind(&call.id)
@@ -754,8 +764,32 @@ impl AssistantRecoverySnapshot {
                     );
                 }
                 let approval_state: String = approval.try_get("state")?;
+                let approval_id: String = approval.try_get("id")?;
+                if let Some(receipt_id) =
+                    approval.try_get::<Option<String>, _>("receipt_message_id")?
+                {
+                    let (message_id, _, receipt) =
+                        persisted_results.remove(call.id.as_str()).ok_or_else(|| {
+                            anyhow::anyhow!("pending operation has no durable receipt")
+                        })?;
+                    let valid_receipt =
+                        crate::approval::operation::PendingOperationReceipt::from_result(&receipt)
+                            .is_some_and(|receipt| receipt.operation_id == approval_id);
+                    let tool = tool_row
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("pending operation lacks prepared tool"))?;
+                    if message_id != receipt_id
+                        || !valid_receipt
+                        || (tool.try_get::<String, _>("state")? == "running"
+                            && !pending_physical.contains_key(call.id.as_str()))
+                        || tool.try_get::<String, _>("run_id")? != run_id
+                    {
+                        bail!("pending operation does not match durable receipt and prepared tool");
+                    }
+                    tool_results.push(receipt);
+                    continue;
+                }
                 if approval_state == "pending" {
-                    let approval_id: String = approval.try_get("id")?;
                     let Some(expected) = expected_pending else {
                         bail!(
                             "Store LogicalRecoveryExecutor does not support unplanned pending approval for ToolCall {}",
@@ -1131,9 +1165,26 @@ pub(crate) struct HydratedRunState {
     pub memory: HydratedMemoryRuntime,
     pub resume: ResumeDirective,
     pub continuation: Option<Box<RecoveredInferenceContinuation>>,
+    pub pending_operations: Vec<RecoveredPendingOperation>,
+    pub has_unobserved_operation_outcome: bool,
     /// Still-unclassified inputs whose authenticated gateway replay must be
     /// admitted once by the new Session. They remain durably `received`.
     pub received_user_commands: Vec<ReceivedUserCommand>,
+    pub received_approval_commands: Vec<crate::gateway::CommandEnvelope>,
+}
+
+/// Original operation and private evidence. Contains no executable grant.
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveredPendingOperation {
+    pub original_command_id: String,
+    pub provenance: crate::runtime::contracts::IncomingProvenance,
+    pub request_id: String,
+    pub tool_call_id: String,
+    pub run_id: String,
+    pub original_turn_id: String,
+    pub assistant_message_id: String,
+    pub call: crate::provider::types::ToolCall,
+    pub evidence: crate::approval::route_broker::DurablePendingApprovalEvidence,
 }
 
 #[derive(Clone, Debug)]
@@ -1263,24 +1314,13 @@ impl SuffixRecovery {
             .context("event-log head is outside the physical recovery sequence range")?
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("physical recovery first sequence overflow"))?;
-        let physical_event_count = requests
-            .len()
-            .checked_mul(3)
-            .ok_or_else(|| anyhow::anyhow!("physical recovery event count overflow"))?;
-
-        let mut writes = Vec::with_capacity(physical_event_count);
+        let receipted_operations = recovery.authenticated_receipted_operations()?;
+        let mut writes = Vec::with_capacity(requests.len() * 4);
         let mut intents = Vec::with_capacity(requests.len());
         let mut pending_physical = HashMap::with_capacity(requests.len());
-        for (index, request) in requests.iter().enumerate() {
+        for request in requests {
             let terminal_seq = first_seq
-                .checked_add(
-                    u64::try_from(index)
-                        .context("physical recovery intent index exceeds u64")?
-                        .checked_mul(3)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("physical recovery terminal sequence overflow")
-                        })?,
-                )
+                .checked_add(u64::try_from(writes.len())?)
                 .ok_or_else(|| anyhow::anyhow!("physical recovery terminal sequence overflow"))?;
             let result = ToolResultMessage {
                 provider_call_id: request.provider_call_id.clone(),
@@ -1297,53 +1337,173 @@ impl SuffixRecovery {
                 is_error: true,
                 timestamp: Utc::now(),
             };
-            let message = PublicMessage::ToolResult(result.clone());
-            let message_id =
-                tool_result_message_id(&request.assistant_message_id, &request.tool_call_id);
-            writes.extend([
-                EventWrite {
-                    event: Some(super::DurableEvent::tool_execution_end(
-                        request.tool_call_id.clone(),
-                        serde_json::to_value(&result)?,
-                        true,
-                        "indeterminate".to_owned(),
-                        Some("indeterminate".to_owned()),
-                    )?),
-                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
-                        tool_call_id: request.tool_call_id.clone(),
-                        expected: "running",
-                        state: "indeterminate",
-                        error_code: Some("indeterminate"),
-                    })],
-                },
-                EventWrite {
-                    event: Some(super::DurableEvent::message(
-                        "message_start",
-                        &message_id,
-                        &message,
-                    )?),
-                    projections: Vec::new(),
-                },
-                EventWrite {
-                    event: Some(super::DurableEvent::message(
-                        "message_end",
-                        &message_id,
-                        &message,
-                    )?),
-                    projections: vec![Projection::MessageEnd {
-                        message_id: message_id.clone(),
-                        role: "tool_result",
-                        message,
-                        append_to_l0: true,
-                        provider_context: Vec::new(),
-                        eviction_footprint_tokens: 0,
+            let receipt_operation =
+                receipted_operations
+                    .iter()
+                    .find(|(_, call, run, _turn, assistant)| {
+                        call == &request.tool_call_id
+                            && run == &request.run_id
+                            && assistant == &request.assistant_message_id
+                    });
+            let (message_id, retained_result) = if let Some((operation_id, _, _, _, _)) =
+                receipt_operation
+            {
+                let mut transaction = store.pool().begin().await?;
+                let row = sqlx::query("SELECT receipt_message_id FROM approval_log WHERE id=? AND tool_call_id=? AND run_id=?")
+                    .bind(operation_id).bind(&request.tool_call_id).bind(&request.run_id)
+                    .fetch_one(&mut *transaction).await?;
+                let receipt_id: String = row.try_get("receipt_message_id")?;
+                let messages = store
+                    .hydrate_messages_for_ids(&mut transaction, &[receipt_id.clone()])
+                    .await?;
+                let original_receipt = messages
+                    .into_iter()
+                    .find_map(|message| match message {
+                        ContextMessage::Persisted {
+                            id,
+                            message: Message::ToolResult(result),
+                            ..
+                        } if id == receipt_id && result.tool_call_id == request.tool_call_id => {
+                            Some(result)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("receipted physical recovery lost original result")
+                    })?;
+                if !crate::approval::operation::PendingOperationReceipt::from_result(
+                    &original_receipt,
+                )
+                .is_some_and(|receipt| receipt.operation_id == *operation_id)
+                {
+                    bail!("physical recovery operation receipt mismatch");
+                }
+                let source = crate::runtime::contracts::ApprovalOperationSource {
+                    operation_id: operation_id.clone(),
+                    tool_call_id: request.tool_call_id.clone(),
+                    status: crate::runtime::contracts::ApprovalOperationStatus::Indeterminate,
+                    executed: None,
+                    result: serde_json::to_value(&result)?,
+                };
+                let provenance = super::event_writer::authenticated_command_provenance(
+                    store,
+                    &mut transaction,
+                    &request.command_id,
+                )
+                .await?
+                .approval_operation(source.clone())?;
+                transaction.commit().await?;
+                let message_id = source.message_id();
+                let message = PublicMessage::User(crate::provider::types::UserMessage {
+                    incoming_source: Some(provenance),
+                    incoming_timing: None,
+                    content: vec![UserContent::Text {
+                        text: serde_json::to_string(&source)?,
                     }],
-                },
-            ]);
+                    timestamp: result.timestamp,
+                });
+                writes.extend([
+                    EventWrite {
+                        event: Some(super::DurableEvent::tool_execution_end(
+                            request.tool_call_id.clone(),
+                            serde_json::to_value(&result)?,
+                            true,
+                            "indeterminate".into(),
+                            Some("indeterminate".into()),
+                        )?),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: request.tool_call_id.clone(),
+                                expected: "running",
+                                state: "indeterminate",
+                                error_code: Some("indeterminate"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(super::DurableEvent::approval_operation_outcome(source)?),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_start",
+                            &message_id,
+                            &message,
+                        )?),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_end",
+                            &message_id,
+                            &message,
+                        )?),
+                        projections: vec![Projection::MessageEnd {
+                            message_id,
+                            role: "user",
+                            message,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ]);
+                (receipt_id, original_receipt)
+            } else {
+                let message = PublicMessage::ToolResult(result.clone());
+                let message_id =
+                    tool_result_message_id(&request.assistant_message_id, &request.tool_call_id);
+                writes.extend([
+                    EventWrite {
+                        event: Some(super::DurableEvent::tool_execution_end(
+                            request.tool_call_id.clone(),
+                            serde_json::to_value(&result)?,
+                            true,
+                            "indeterminate".to_owned(),
+                            Some("indeterminate".to_owned()),
+                        )?),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: request.tool_call_id.clone(),
+                                expected: "running",
+                                state: "indeterminate",
+                                error_code: Some("indeterminate"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_start",
+                            &message_id,
+                            &message,
+                        )?),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(super::DurableEvent::message(
+                            "message_end",
+                            &message_id,
+                            &message,
+                        )?),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: message_id.clone(),
+                            role: "tool_result",
+                            message,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ]);
+                (message_id, result.clone())
+            };
             if pending_physical
                 .insert(
                     request.tool_call_id.clone(),
-                    PendingPhysicalResolution { message_id, result },
+                    PendingPhysicalResolution {
+                        message_id,
+                        result: retained_result,
+                    },
                 )
                 .is_some()
             {
@@ -1361,12 +1521,28 @@ impl SuffixRecovery {
             });
         }
 
+        let physical_event_count = writes.len();
+
         // Plan the rest of the suffix against the state this batch is about to
         // create. `plan_one_command` classifies from the durable command phase
         // and event evidence, and the physical terminals change neither, so this
         // is the same plan the next hydration would produce - it just reaches
         // SQLite in the same transaction instead of a later one.
-        let (steps, _) = Self::plan_boot_recovery(store, recovery).await?;
+        // Receipt-backed operations may belong to an earlier turn while a
+        // different assistant attempt is open. Settle the physical evidence
+        // first; bootstrap's next hydration then restores that independent
+        // attempt against the committed terminal state. This also keeps the
+        // original tool receipt untouched throughout both recovery phases.
+        let has_operation_outcome = requests.iter().any(|request| {
+            receipted_operations
+                .iter()
+                .any(|(_, call, run, _, _)| call == &request.tool_call_id && run == &request.run_id)
+        });
+        let steps = if has_operation_outcome {
+            Vec::new()
+        } else {
+            Self::plan_boot_recovery(store, recovery).await?.0
+        };
         if !steps.is_empty() {
             let suffix = LogicalRecoveryExecutor::plan_batch(
                 store,
@@ -1584,10 +1760,24 @@ impl SuffixRecovery {
                 RecoveryStep::ResumeAssistantFromDurableEvents {
                     command_id,
                     run_id,
-                    turn_id: _,
+                    turn_id,
                     ..
                 } => {
-                    if let Some((active_turn, turn_open)) =
+                    if let Some(active_turn) = recovery.authenticated_outcome_only_turn(run_id) {
+                        step = RecoveryStep::ContinueInference {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: active_turn,
+                            turn_open: true,
+                        };
+                    } else if recovery.authenticated_operation_wait(run_id) {
+                        step = RecoveryStep::ContinueInference {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            turn_open: false,
+                        };
+                    } else if let Some((active_turn, turn_open)) =
                         recovery.authenticated_inference_continuation(run_id)
                     {
                         step = RecoveryStep::ContinueInference {
@@ -1671,11 +1861,49 @@ impl SuffixRecovery {
     pub(crate) async fn plan_boot_recovery(
         store: &Store,
         recovery: &super::event_writer::BootstrapRecoveryGuard<'_>,
-    ) -> Result<(Vec<RecoveryStep>, Vec<ReceivedUserCommand>)> {
+    ) -> Result<(
+        Vec<RecoveryStep>,
+        Vec<ReceivedUserCommand>,
+        Vec<crate::gateway::CommandEnvelope>,
+    )> {
         let steps = Self::plan_full_suffix(store, recovery).await?;
         let mut repairs = Vec::new();
         let mut received = Vec::new();
+        let mut approvals = Vec::new();
         for step in steps {
+            if let RecoveryStep::ApplyControl { command_id } = &step {
+                let mut transaction = store.pool().begin().await?;
+                let seq: Option<i64> = sqlx::query_scalar("SELECT seq FROM inbound_commands WHERE command_id=? AND command_kind='approval_decision' AND status='received' AND run_phase='received'")
+                    .bind(command_id).fetch_optional(&mut *transaction).await?;
+                if let Some(seq) = seq {
+                    let seq = u64::try_from(seq)?;
+                    let command = super::event_writer::load_authenticated_command(
+                        store,
+                        &mut transaction,
+                        command_id,
+                        seq,
+                        "approval_decision",
+                    )
+                    .await?;
+                    let provenance = super::event_writer::authenticated_command_provenance(
+                        store,
+                        &mut transaction,
+                        command_id,
+                    )
+                    .await?;
+                    approvals.push(crate::gateway::CommandEnvelope {
+                        seq,
+                        command_id: crate::gateway::CommandId::parse(command_id)
+                            .map_err(anyhow::Error::msg)?,
+                        personality_agent_id: store.scope().personality_agent_id.clone(),
+                        provenance,
+                        command,
+                    });
+                    transaction.commit().await?;
+                    continue;
+                }
+                transaction.commit().await?;
+            }
             if let RecoveryStep::Reclassify { command_id } = step {
                 // plan_full_suffix authenticated the bounded pending window.
                 // The bootstrap guard keeps this row stable through handoff.
@@ -1697,7 +1925,7 @@ impl SuffixRecovery {
                 repairs.push(step);
             }
         }
-        Ok((repairs, received))
+        Ok((repairs, received, approvals))
     }
 
     async fn plan_next_without_history_scan(
@@ -1744,7 +1972,7 @@ async fn pending_approval_for_recovery(
                 t.run_id AS tool_run_id
          FROM approval_log a
          LEFT JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
-         WHERE a.run_id = ? AND a.state = 'pending'
+         WHERE a.run_id = ? AND a.state = 'pending' AND a.receipt_message_id IS NULL
          ORDER BY a.created_at, a.id",
     )
     .bind(run_id)
@@ -3101,6 +3329,266 @@ pub(crate) mod tests {
         let writer = EventWriter::new(store.clone());
         seed_boot_running_tools(&writer, calls).await;
         (store, writer)
+    }
+
+    #[tokio::test]
+    async fn received_approval_is_handed_back_without_losing_the_human_decision() {
+        let (store, writer) = setup().await;
+        let envelope = CommandEnvelope {
+            seq: 1,
+            command_id: crate::gateway::CommandId::parse("00000000-0000-4000-8000-000000000002")
+                .unwrap(),
+            personality_agent_id: test_personality_agent_id(),
+            provenance: test_provenance(),
+            command: Command::ApprovalDecision {
+                request_id: "original-request".into(),
+                decision: ApprovalDecision::ApproveOnce,
+            },
+        };
+        writer
+            .persist_inbound(&InboundCommand::Valid(envelope.clone()))
+            .await
+            .unwrap();
+        let (lease, fence, _) = boot_recovery_authority(&store);
+        let HydrationOutcome::Complete(hydrated) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("received decision must not block hydration")
+        else {
+            panic!("decision requires Session routing, not logical repair");
+        };
+        assert_eq!(hydrated.received_approval_commands.len(), 1);
+        assert_eq!(hydrated.received_approval_commands[0], envelope);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM inbound_commands WHERE seq=1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            "received"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipted_running_operation_restart_emits_unknown_outcome_once() {
+        let root =
+            std::env::temp_dir().join(format!("sumi-receipted-crash-{}", uuid::Uuid::now_v7()));
+        let path = root.join("agent.db");
+        let store = open_boot_running_tools_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let call_id = "tool-rowless-messaging";
+        seed_tool_use_restart_seam_with_assistant(
+            &writer,
+            false,
+            tool_use_recovery_assistant_with_calls(&[(call_id, "messaging", 2)]),
+            &[],
+        )
+        .await;
+        seed_pending_messaging_approval(&writer, TOOL_USE_RECOVERY_TURN_ID).await;
+        let receipt_id = tool_result_message_id(TOOL_USE_RECOVERY_ASSISTANT_ID, call_id);
+        let receipt = crate::approval::operation::PendingOperationReceipt::new(
+            TOOL_USE_RECOVERY_APPROVAL_ID.into(),
+        );
+        let message = PublicMessage::ToolResult(ToolResultMessage {
+            provider_call_id: None,
+            tool_call_id: call_id.into(),
+            tool_name: "messaging".into(),
+            content: vec![UserContent::Text {
+                text: serde_json::to_string(&receipt).unwrap(),
+            }],
+            details: serde_json::to_value(receipt).unwrap(),
+            is_error: false,
+            timestamp: Utc::now(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &receipt_id, &message).unwrap(),
+                        ),
+                        projections: vec![],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &receipt_id, &message).unwrap(),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: receipt_id.clone(),
+                                role: "tool_result",
+                                message,
+                                append_to_l0: true,
+                                provider_context: vec![],
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::ApprovalReceipt {
+                                request_id: TOOL_USE_RECOVERY_APPROVAL_ID.into(),
+                                tool_call_id: call_id.into(),
+                                message_id: receipt_id.clone(),
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![],
+            })
+            .await
+            .expect("persist truthful receipt");
+        let decision_id = "00000000-0000-4000-8000-000000000002";
+        let actor = test_provenance()
+            .authenticated_direct_chat_human()
+            .unwrap()
+            .to_owned();
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 2,
+                command_id: crate::gateway::CommandId::parse(decision_id).unwrap(),
+                personality_agent_id: test_personality_agent_id(),
+                provenance: test_provenance(),
+                command: Command::ApprovalDecision {
+                    request_id: TOOL_USE_RECOVERY_APPROVAL_ID.into(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            }))
+            .await
+            .unwrap();
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::approval_resolved(
+                                TOOL_USE_RECOVERY_APPROVAL_ID.into(),
+                                ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                                actor.clone(),
+                            )
+                            .unwrap(),
+                        ),
+                        projections: vec![
+                            Projection::Approval(ApprovalMutation::Resolve {
+                                request_id: TOOL_USE_RECOVERY_APPROVAL_ID.into(),
+                                state: "approved_once",
+                                actor: actor.clone(),
+                            }),
+                            Projection::CommandApplied {
+                                command_id: decision_id.into(),
+                                command_seq: 2,
+                                run_id: Some(TOOL_USE_RECOVERY_RUN_ID.into()),
+                            },
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::tool_execution_start(
+                                call_id.into(),
+                                "messaging".into(),
+                                json!({"slot":2}),
+                                TOOL_USE_RECOVERY_COMMAND_ID.into(),
+                                TOOL_USE_RECOVERY_RUN_ID.into(),
+                                test_generation(),
+                            )
+                            .unwrap(),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Start {
+                                tool_call_id: call_id.into(),
+                                run_id: TOOL_USE_RECOVERY_RUN_ID.into(),
+                            },
+                        )],
+                    },
+                ],
+                injected_commands: vec![],
+            })
+            .await
+            .expect("commit execution start before simulated crash");
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+        let restarted = open_boot_running_tools_store(&path).await;
+        let (lease, fence, attestation) = boot_recovery_authority(&restarted);
+        let HydrationOutcome::PhysicalRecoveryRequired(intents) = restarted
+            .hydrate(&lease, &fence)
+            .await
+            .expect("authenticate crashed operation")
+        else {
+            panic!("running operation requires recovery");
+        };
+        SuffixRecovery::apply_boot_physical_receipt(
+            &restarted,
+            &lease,
+            &fence,
+            &attestation,
+            &intents,
+        )
+        .await
+        .expect("recover without a second tool result");
+        if let HydrationOutcome::LogicalRecoveryRequired { steps } = restarted
+            .hydrate(&lease, &fence)
+            .await
+            .expect("plan remaining independent recovery")
+        {
+            LogicalRecoveryExecutor
+                .execute(&restarted, &steps, &lease, &fence)
+                .await
+                .expect("restore independent inference after physical terminal");
+        }
+        let HydrationOutcome::Complete(hydrated) = restarted
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate recovered operation")
+        else {
+            panic!("recovery must reach fixed point");
+        };
+        let messages = hydrated
+            .messages
+            .iter()
+            .map(crate::memory::overflow::context_message_to_public)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, PublicMessage::ToolResult(r) if r.tool_call_id==call_id))
+                .count(),
+            1
+        );
+        let outcomes = messages
+            .iter()
+            .filter_map(crate::runtime::contracts::ApprovalOperationSource::from_message)
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].status,
+            crate::runtime::contracts::ApprovalOperationStatus::Indeterminate
+        );
+        assert_eq!(outcomes[0].executed, None);
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(restarted.pool())
+            .await
+            .unwrap();
+        restarted.pool().close().await;
+        drop(restarted);
+        let reopened = open_boot_running_tools_store(&path).await;
+        let (lease, fence, _) = boot_recovery_authority(&reopened);
+        assert!(matches!(
+            reopened.hydrate(&lease, &fence).await.unwrap(),
+            HydrationOutcome::Complete(_)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'"
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap(),
+            1,
+            "uncertain effects must never replay"
+        );
     }
 
     #[tokio::test]
