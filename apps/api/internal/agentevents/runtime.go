@@ -1832,6 +1832,16 @@ func (g *DurableGateway) ClaimIdleRuntime(ctx context.Context, personalityAgentI
 	return claim(), nil
 }
 
+// HasPendingRuntimeWork reconstructs accepted, nonterminal commands and unclosed
+// runs from durable evidence. The idle probe is read-only: it neither reserves
+// a stop nor publishes activity. A concurrent completion can make this hint
+// stale; the caller must use ordinary fenced runtime admission, never replay
+// commands or effects itself.
+func (g *DurableGateway) HasPendingRuntimeWork(ctx context.Context, personalityAgentID string) (bool, error) {
+	idle, err := g.ClaimIdleRuntime(ctx, personalityAgentID, func() bool { return true })
+	return !idle, err
+}
+
 // IsRunInFlight reports whether a durable agent_start has not yet been closed
 // by agent_end. It is used by the browser command guard to reject meaningless
 // aborts without closing the window during tool execution, continuation calls,

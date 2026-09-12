@@ -103,6 +103,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startProcessAttention()
 	app.startChatGPTActivation()
 	app.startWarmReconciliation()
+	app.startPendingWorkReconciliation()
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()
@@ -241,6 +242,7 @@ type application struct {
 	browser                    *agentevents.BrowserServer
 	database                   *db.Pool
 	spawnManager               *spawn.Manager
+	pendingWorkGateway         pendingWorkGateway
 	localRuntimes              *agentevents.LocalControlListenerRegistry
 	messagingServer            *messaging.Server
 	processOperations          *processoperations.Server
@@ -644,6 +646,7 @@ func newApplicationFromEnv() (*application, error) {
 		browser:                    browser,
 		database:                   database,
 		spawnManager:               spawnManager,
+		pendingWorkGateway:         runtime,
 		localRuntimes:              localRuntimes,
 		messagingServer:            messagingServer,
 		backgroundCtx:              backgroundCtx,
