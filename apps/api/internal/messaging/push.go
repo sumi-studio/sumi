@@ -33,7 +33,6 @@ const (
 	pushDeliveryTimeout          = 20 * time.Second
 	pushEndpointDeliveryTimeout  = 10 * time.Second
 	pushFanoutConcurrency        = 4
-	pushSessionCleanupTimeout    = 500 * time.Millisecond
 )
 
 type VAPIDKeys struct {
@@ -44,7 +43,7 @@ type VAPIDKeys struct {
 type PushSubscription struct {
 	SubscriptionID  string
 	Human           ParticipantRef
-	Session         agentevents.BrowserSessionIdentity
+	DeviceID        string
 	Endpoint        string
 	P256dh          string
 	Auth            string
@@ -89,11 +88,11 @@ func (s *Store) EnsureVAPIDKeys(ctx context.Context) (VAPIDKeys, error) {
 
 func (s *ScopedStore) SavePushSubscription(
 	ctx context.Context,
-	session agentevents.BrowserSessionIdentity,
+	deviceID string,
 	endpoint, p256dh, auth string,
 ) (PushSubscription, error) {
 	owner := s.Scope.Actor
-	if owner.Kind != KindHuman || session.ID == "" || session.ExpiresAt.IsZero() {
+	if owner.Kind != KindHuman || deviceID == "" {
 		return PushSubscription{}, ErrInvalidPushSubscription
 	}
 	endpoint = strings.TrimSpace(endpoint)
@@ -116,13 +115,24 @@ func (s *ScopedStore) SavePushSubscription(
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", owner.ID); err != nil {
 		return PushSubscription{}, fmt.Errorf("lock push owner: %w", err)
 	}
+	if ok, err := lockPushDevice(ctx, tx, deviceID, owner.ID); err != nil {
+		return PushSubscription{}, err
+	} else if !ok {
+		return PushSubscription{}, ErrInvalidPushSubscription
+	}
 	if err := lockAndPurgeExpiredPushSubscriptions(ctx, tx, owner.ID, endpoint); err != nil {
 		return PushSubscription{}, err
+	}
+	// Endpoint waits may outlive the device grant.
+	if ok, err := lockPushDevice(ctx, tx, deviceID, owner.ID); err != nil {
+		return PushSubscription{}, err
+	} else if !ok {
+		return PushSubscription{}, ErrInvalidPushSubscription
 	}
 	var otherEndpoints int
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*) FROM push_subscriptions
-		WHERE human_id = $1 AND endpoint <> $2 AND session_expires_at > now()`, owner.ID, endpoint).
+		WHERE human_id = $1 AND endpoint <> $2 AND device_id IN (SELECT device_id FROM push_devices WHERE expires_at > clock_timestamp())`, owner.ID, endpoint).
 		Scan(&otherEndpoints); err != nil {
 		return PushSubscription{}, fmt.Errorf("count push subscriptions: %w", err)
 	}
@@ -132,38 +142,36 @@ func (s *ScopedStore) SavePushSubscription(
 	subscription := PushSubscription{
 		SubscriptionID: newUUIDv7(),
 		Human:          owner,
-		Session:        session,
+		DeviceID:       deviceID,
 		Endpoint:       endpoint,
 		P256dh:         p256dh,
 		Auth:           auth,
 	}
 	err = tx.QueryRow(ctx, `
 		INSERT INTO push_subscriptions
-		  (subscription_id, human_id, browser_session_id, session_expires_at,
+		  (subscription_id, human_id, device_id,
 		   endpoint, p256dh, auth)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (endpoint) DO UPDATE SET
 		  human_id = EXCLUDED.human_id,
-		  browser_session_id = EXCLUDED.browser_session_id,
-		  session_expires_at = EXCLUDED.session_expires_at,
+		  device_id = EXCLUDED.device_id,
 		  p256dh = EXCLUDED.p256dh,
 		  auth = EXCLUDED.auth,
 		  owner_generation = CASE
 		    WHEN push_subscriptions.human_id = EXCLUDED.human_id
-		     AND push_subscriptions.browser_session_id = EXCLUDED.browser_session_id
+		     AND push_subscriptions.device_id = EXCLUDED.device_id
 		    THEN push_subscriptions.owner_generation
 		    ELSE push_subscriptions.owner_generation + 1
 		  END,
 		  updated_at = now()
 		WHERE (push_subscriptions.human_id = EXCLUDED.human_id
-		       AND push_subscriptions.browser_session_id = EXCLUDED.browser_session_id)
+		       AND push_subscriptions.device_id = EXCLUDED.device_id)
 		   OR (push_subscriptions.p256dh = EXCLUDED.p256dh
 		       AND push_subscriptions.auth = EXCLUDED.auth)
 		RETURNING subscription_id, owner_generation, created_at`,
 		subscription.SubscriptionID,
 		owner.ID,
-		session.ID,
-		session.ExpiresAt,
+		deviceID,
 		endpoint,
 		p256dh,
 		auth,
@@ -194,7 +202,7 @@ func lockAndPurgeExpiredPushSubscriptions(
 ) error {
 	rows, err := tx.Query(ctx, `
 		SELECT endpoint FROM push_subscriptions
-		WHERE human_id = $1 AND session_expires_at <= now()
+		WHERE human_id = $1 AND device_id IN (SELECT device_id FROM push_devices WHERE expires_at <= clock_timestamp())
 		ORDER BY endpoint`, humanID)
 	if err != nil {
 		return fmt.Errorf("list expired push subscriptions: %w", err)
@@ -228,8 +236,8 @@ func lockAndPurgeExpiredPushSubscriptions(
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM push_subscriptions
-		WHERE session_expires_at <= now()
-		  AND (human_id = $1 OR endpoint = $2)`, humanID, currentEndpoint); err != nil {
+		WHERE device_id IN (SELECT device_id FROM push_devices WHERE expires_at <= clock_timestamp())
+		  AND endpoint = ANY($1)`, endpoints); err != nil {
 		return fmt.Errorf("purge expired push subscriptions: %w", err)
 	}
 	return nil
@@ -237,12 +245,12 @@ func lockAndPurgeExpiredPushSubscriptions(
 
 func (s *ScopedStore) DeletePushSubscription(
 	ctx context.Context,
-	session agentevents.BrowserSessionIdentity,
+	deviceID string,
 	endpoint string,
 ) error {
 	owner := s.Scope.Actor
 	endpoint = strings.TrimSpace(endpoint)
-	if owner.Kind != KindHuman || session.ID == "" || endpoint == "" || len(endpoint) > maxPushEndpointBytes {
+	if owner.Kind != KindHuman || deviceID == "" || endpoint == "" || len(endpoint) > maxPushEndpointBytes {
 		return ErrInvalidPushSubscription
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -253,74 +261,24 @@ func (s *ScopedStore) DeletePushSubscription(
 	if _, err := s.authorizeMutationInTx(ctx, tx); err != nil {
 		return err
 	}
+	if ok, err := lockPushDevice(ctx, tx, deviceID, owner.ID); err != nil {
+		return err
+	} else if !ok {
+		return ErrInvalidPushSubscription
+	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint); err != nil {
 		return fmt.Errorf("lock push endpoint: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM push_subscriptions
-		WHERE human_id = $1 AND browser_session_id = $2 AND endpoint = $3`,
-		owner.ID, session.ID, endpoint); err != nil {
+		WHERE human_id = $1 AND device_id = $2 AND endpoint = $3`,
+		owner.ID, deviceID, endpoint); err != nil {
 		return fmt.Errorf("delete push subscription: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit push subscription delete: %w", err)
 	}
 	return nil
-}
-
-// CloseBrowserSession removes delivery rows for the exact retired session.
-// Correctness does not depend on this best-effort cleanup: every send is also
-// admitted through the durable session lease. Keep cleanup bounded so it can
-// never silently hold logout or session rotation open.
-func (s *Store) CloseBrowserSession(sessionID string) {
-	if s == nil || sessionID == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), pushSessionCleanupTimeout)
-	defer cancel()
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		log.Printf("messaging push: begin retired-session cleanup: %v", err)
-		return
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	rows, err := tx.Query(ctx, `
-		SELECT endpoint FROM push_subscriptions
-		WHERE browser_session_id = $1 ORDER BY endpoint`, sessionID)
-	if err != nil {
-		log.Printf("messaging push: list retired-session endpoints: %v", err)
-		return
-	}
-	var endpoints []string
-	for rows.Next() {
-		var endpoint string
-		if err := rows.Scan(&endpoint); err != nil {
-			rows.Close()
-			log.Printf("messaging push: scan retired-session endpoint: %v", err)
-			return
-		}
-		endpoints = append(endpoints, endpoint)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		log.Printf("messaging push: iterate retired-session endpoints: %v", err)
-		return
-	}
-	rows.Close()
-	for _, endpoint := range endpoints {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint); err != nil {
-			log.Printf("messaging push: lock retired-session endpoint: %v", err)
-			return
-		}
-	}
-	if _, err := tx.Exec(ctx,
-		"DELETE FROM push_subscriptions WHERE browser_session_id = $1", sessionID); err != nil {
-		log.Printf("messaging push: delete retired-session subscriptions: %v", err)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("messaging push: commit retired-session cleanup: %v", err)
-	}
 }
 
 func (s *Store) pushSubscriptionsForWith(
@@ -339,10 +297,10 @@ func (s *Store) pushSubscriptionsForWith(
 		return out, nil
 	}
 	rows, err := q.Query(ctx, `
-		SELECT subscription_id, human_id, browser_session_id, session_expires_at,
+		SELECT subscription_id, human_id, device_id,
 		       endpoint, p256dh, auth, owner_generation, created_at
 		FROM push_subscriptions
-		WHERE human_id = ANY($1) AND session_expires_at > now()
+		WHERE human_id = ANY($1) AND device_id IN (SELECT device_id FROM push_devices WHERE expires_at > clock_timestamp())
 		ORDER BY created_at`, humanIDs)
 	if err != nil {
 		return nil, fmt.Errorf("query push subscriptions: %w", err)
@@ -354,8 +312,7 @@ func (s *Store) pushSubscriptionsForWith(
 		if err := rows.Scan(
 			&subscription.SubscriptionID,
 			&humanID,
-			&subscription.Session.ID,
-			&subscription.Session.ExpiresAt,
+			&subscription.DeviceID,
 			&subscription.Endpoint,
 			&subscription.P256dh,
 			&subscription.Auth,
@@ -400,7 +357,6 @@ type pushHTTPClient interface {
 
 type PushDispatcher struct {
 	store           *Store
-	sessions        agentevents.BrowserSessionIdentityAuthorizer
 	keys            VAPIDKeys
 	subject         string
 	client          pushHTTPClient
@@ -410,11 +366,10 @@ type PushDispatcher struct {
 func NewPushDispatcher(
 	ctx context.Context,
 	store *Store,
-	sessions agentevents.BrowserSessionIdentityAuthorizer,
 	subject string,
 ) (*PushDispatcher, error) {
-	if store == nil || sessions == nil {
-		return nil, errors.New("push dispatcher requires store and session authorization")
+	if store == nil {
+		return nil, errors.New("push dispatcher requires store")
 	}
 	normalized, err := normalizeVAPIDSubject(subject)
 	if err != nil {
@@ -428,7 +383,7 @@ func NewPushDispatcher(
 		return nil, err
 	}
 	return &PushDispatcher{
-		store: store, sessions: sessions, keys: keys,
+		store: store, keys: keys,
 		subject: normalized, client: newPushHTTPClient(),
 		endpointTimeout: pushEndpointDeliveryTimeout,
 	}, nil
@@ -684,6 +639,13 @@ func (d *PushDispatcher) acquirePushSendLease(
 		lease.release()
 		return nil, false, nil
 	}
+	if ok, err := lockPushDevice(ctx, tx, delivery.subscription.DeviceID, delivery.subscription.Human.ID); err != nil {
+		lease.release()
+		return nil, false, err
+	} else if !ok {
+		lease.release()
+		return nil, false, nil
+	}
 	if _, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtext($1))",
 		delivery.subscription.Endpoint,
@@ -695,11 +657,12 @@ func (d *PushDispatcher) acquirePushSendLease(
 	err = tx.QueryRow(ctx, `
 		SELECT 1 FROM push_subscriptions
 		WHERE endpoint = $1 AND subscription_id = $2 AND human_id = $3
-		  AND browser_session_id = $4 AND owner_generation = $5`,
+		  AND device_id = $4 AND owner_generation = $5
+          AND device_id IN (SELECT device_id FROM push_devices WHERE expires_at > clock_timestamp())`,
 		delivery.subscription.Endpoint,
 		delivery.subscription.SubscriptionID,
 		delivery.subscription.Human.ID,
-		delivery.subscription.Session.ID,
+		delivery.subscription.DeviceID,
 		delivery.subscription.OwnerGeneration,
 	).Scan(&present)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -800,43 +763,12 @@ func (d *PushDispatcher) send(ctx context.Context, delivery pushDelivery) {
 	if !ok {
 		return
 	}
-	var response *http.Response
-	var sendErr error
-	attempted := false
-	authorizeErr := d.sessions.AuthorizeBrowserSessionIdentity(
-		ctx,
-		delivery.subscription.Session,
-		func() error {
-			attempted = true
-			response, sendErr = webpush.SendNotificationWithContext(
-				ctx,
-				delivery.payload,
-				&webpush.Subscription{
-					Endpoint: delivery.subscription.Endpoint,
-					Keys: webpush.Keys{
-						P256dh: delivery.subscription.P256dh,
-						Auth:   delivery.subscription.Auth,
-					},
-				},
-				&webpush.Options{
-					HTTPClient:      d.client,
-					Subscriber:      d.subject,
-					VAPIDPublicKey:  d.keys.Public,
-					VAPIDPrivateKey: d.keys.Private,
-					TTL:             pushTTL,
-					Urgency:         webpush.UrgencyHigh,
-				},
-			)
-			return nil
-		},
-	)
-	if authorizeErr != nil {
-		lease.release()
-		if attempted {
-			log.Printf("messaging push: session delivery lease: %v", authorizeErr)
-		}
-		return
-	}
+	response, sendErr := webpush.SendNotificationWithContext(ctx, delivery.payload,
+		&webpush.Subscription{Endpoint: delivery.subscription.Endpoint,
+			Keys: webpush.Keys{P256dh: delivery.subscription.P256dh, Auth: delivery.subscription.Auth}},
+		&webpush.Options{HTTPClient: d.client, Subscriber: d.subject,
+			VAPIDPublicKey: d.keys.Public, VAPIDPrivateKey: d.keys.Private,
+			TTL: pushTTL, Urgency: webpush.UrgencyHigh})
 	if sendErr != nil {
 		lease.release()
 		if pushDialWasRefused(sendErr) {
@@ -856,11 +788,11 @@ func (d *PushDispatcher) send(ctx context.Context, delivery pushDelivery) {
 		if _, err := lease.tx.Exec(ctx, `
 			DELETE FROM push_subscriptions
 			WHERE endpoint = $1 AND subscription_id = $2 AND human_id = $3
-			  AND browser_session_id = $4 AND owner_generation = $5`,
+			  AND device_id = $4 AND owner_generation = $5`,
 			delivery.subscription.Endpoint,
 			delivery.subscription.SubscriptionID,
 			delivery.subscription.Human.ID,
-			delivery.subscription.Session.ID,
+			delivery.subscription.DeviceID,
 			delivery.subscription.OwnerGeneration,
 		); err != nil {
 			log.Printf("messaging push: delete expired endpoint: %v", err)
@@ -934,11 +866,16 @@ func (s *Server) serveSavePushSubscription(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	deviceID, err := agentevents.BrowserPushDeviceID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication_required")
+		return
+	}
 	store := scopedStoreForRequest(r)
 	done, err := s.mutate(w, r, claims, func() error {
 		_, saveErr := store.SavePushSubscription(
 			r.Context(),
-			claims.BrowserSessionIdentity(),
+			deviceID,
 			request.Endpoint,
 			request.Keys.P256dh,
 			request.Keys.Auth,
@@ -970,11 +907,16 @@ func (s *Server) serveDeletePushSubscription(w http.ResponseWriter, r *http.Requ
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	deviceID, err := agentevents.BrowserPushDeviceID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication_required")
+		return
+	}
 	store := scopedStoreForRequest(r)
 	done, err := s.mutate(w, r, claims, func() error {
 		return store.DeletePushSubscription(
 			r.Context(),
-			claims.BrowserSessionIdentity(),
+			deviceID,
 			request.Endpoint,
 		)
 	})

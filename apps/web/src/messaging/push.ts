@@ -8,6 +8,198 @@ export const PUSH_PLATFORM_TIMEOUT_MS = 3_000;
 export const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
 let pushGeneration = 0;
+let pushOwner = "";
+export type DevicePushState =
+  | "idle"
+  | "enabling"
+  | "enabled"
+  | "disabled"
+  | "error"
+  | "disabling"
+  | "disable-error";
+let deviceState: DevicePushState = "idle";
+const listeners = new Set<() => void>();
+let pendingEnable: Promise<boolean> | null = null;
+let pendingEnableGeneration = -1;
+let pendingEnableSignal: AbortSignal | null = null;
+const disabledOwners = new Set<string>();
+const preferenceKey = (owner: string) => `sumi:device-push:off:${owner}`;
+function isDisabled(): boolean {
+  try {
+    return localStorage.getItem(preferenceKey(pushOwner)) === "true";
+  } catch {
+    return disabledOwners.has(pushOwner);
+  }
+}
+function setDisabled(disabled: boolean): void {
+  if (disabled) disabledOwners.add(pushOwner);
+  else disabledOwners.delete(pushOwner);
+  try {
+    if (disabled) localStorage.setItem(preferenceKey(pushOwner), "true");
+    else localStorage.removeItem(preferenceKey(pushOwner));
+  } catch {
+    /* The current page still remembers the preference. */
+  }
+}
+function publishState(state: DevicePushState): void {
+  deviceState = state;
+  for (const listener of listeners) listener();
+}
+export const getDevicePushState = () => deviceState;
+export function subscribeDevicePush(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+export function setDevicePushOwner(owner: string): void {
+  if (pushOwner === owner) return;
+  ++pushGeneration;
+  pushOwner = owner;
+  publishState("idle");
+}
+
+export function refreshDevicePushPreference(): void {
+  ++pushGeneration;
+  publishState("idle");
+}
+
+/** Reconciliation never overrides an explicit choice to disable this device. */
+export async function enablePushSubscription(
+  explicit = false,
+): Promise<boolean> {
+  if (explicit) setDisabled(false);
+  if (isDisabled()) {
+    if (
+      deviceState !== "disabled" &&
+      deviceState !== "disable-error" &&
+      deviceState !== "disabling"
+    )
+      await disablePushSubscription();
+    return false;
+  }
+  let signal: AbortSignal;
+  try {
+    signal = requireActiveMessagingBoundary().signal;
+  } catch {
+    return false;
+  }
+  if (
+    pendingEnable &&
+    pendingEnableGeneration === pushGeneration &&
+    pendingEnableSignal === signal &&
+    !signal.aborted
+  )
+    return pendingEnable;
+  const owner = pushOwner;
+  const operation = performEnablePushSubscription().catch(() => false);
+  pendingEnable = operation;
+  const generation = pushGeneration;
+  pendingEnableGeneration = generation;
+  pendingEnableSignal = signal;
+  publishState("enabling");
+  try {
+    const enabled = await operation;
+    if (generation === pushGeneration && owner === pushOwner)
+      publishState(enabled ? "enabled" : "error");
+    return enabled;
+  } catch {
+    if (generation === pushGeneration && owner === pushOwner)
+      publishState("error");
+    return false;
+  } finally {
+    if (pendingEnable === operation) pendingEnable = null;
+  }
+}
+
+export async function disablePushSubscription(): Promise<boolean> {
+  setDisabled(true);
+  const generation = ++pushGeneration;
+  const owner = pushOwner;
+  publishState("disabling");
+  let boundary: ReturnType<typeof requireActiveMessagingBoundary> | null = null;
+  try {
+    boundary = requireActiveMessagingBoundary();
+    // Let a previously posted registration settle before deleting the endpoint.
+    await pendingEnable;
+    if (
+      generation !== pushGeneration ||
+      owner !== pushOwner ||
+      boundary.signal.aborted
+    )
+      return false;
+    const registrationResult = await boundedPlatformCall(
+      navigator.serviceWorker
+        .getRegistration(SW_URL)
+        .then((value) => ({ value })),
+    );
+    if (!registrationResult)
+      throw new Error("Cannot inspect browser registration");
+    const registration = registrationResult.value;
+    const subscriptionResult = registration
+      ? await boundedPlatformCall(
+          registration.pushManager
+            .getSubscription()
+            .then((value) => ({ value })),
+        )
+      : { value: null };
+    if (!subscriptionResult)
+      throw new Error("Cannot inspect browser subscription");
+    const subscription = subscriptionResult.value;
+    if (
+      generation !== pushGeneration ||
+      owner !== pushOwner ||
+      boundary.signal.aborted
+    )
+      return false;
+    if (!subscription) {
+      publishState("disabled");
+      return true;
+    }
+    const request = requestSignal(boundary.signal);
+    let removed = false;
+    try {
+      const response = await fetch(
+        scopedMessagingPath(SUBSCRIPTIONS_PATH, boundary.scope),
+        {
+          method: "DELETE",
+          credentials: "include",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: subscription.endpoint }),
+          signal: request.signal,
+        },
+      );
+      removed = response.ok;
+    } finally {
+      request.dispose();
+    }
+    if (
+      generation !== pushGeneration ||
+      owner !== pushOwner ||
+      boundary.signal.aborted
+    )
+      return false;
+    // Server removal is authoritative. Physical browser cleanup is best effort.
+    if (removed) await boundedPlatformCall(subscription.unsubscribe());
+    if (generation === pushGeneration && owner === pushOwner)
+      publishState(removed ? "disabled" : "disable-error");
+    return removed;
+  } catch {
+    if (generation === pushGeneration && owner === pushOwner)
+      publishState("disable-error");
+    return false;
+  } finally {
+    // A workspace boundary can retire while browser operations are pending.
+    // Keep the user's off preference but allow the replacement scope to retry.
+    if (
+      boundary?.signal.aborted &&
+      generation === pushGeneration &&
+      owner === pushOwner
+    )
+      publishState("idle");
+  }
+}
 
 export function decodeApplicationServerKey(base64url: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(base64url)) {
@@ -44,7 +236,7 @@ export async function registerPushServiceWorker(): Promise<ServiceWorkerRegistra
   );
 }
 
-export async function enablePushSubscription(): Promise<boolean> {
+async function performEnablePushSubscription(): Promise<boolean> {
   if (
     !isPushSupported() ||
     typeof Notification === "undefined" ||

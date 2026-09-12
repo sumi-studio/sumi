@@ -28,21 +28,6 @@ const (
 	testPushAuth   = "lRvaLEgVKoLGOxRND8ZCTA"
 )
 
-type testPushSessionAuthorizer struct {
-	allow bool
-}
-
-func (a testPushSessionAuthorizer) AuthorizeBrowserSessionIdentity(
-	_ context.Context,
-	_ agentevents.BrowserSessionIdentity,
-	operation func() error,
-) error {
-	if !a.allow {
-		return errors.New("retired browser session")
-	}
-	return operation()
-}
-
 type recordingPushClient struct {
 	mu        sync.Mutex
 	endpoints []string
@@ -122,11 +107,13 @@ func TestPushEndpointEgressRejectsPrivateAndMixedResolution(t *testing.T) {
 	}
 }
 
-func testPushSession(id string) agentevents.BrowserSessionIdentity {
-	return agentevents.BrowserSessionIdentity{
-		ID:        id,
-		ExpiresAt: time.Now().Add(time.Hour),
+func testPushDevice(t *testing.T, ctx context.Context, store *Store, human ParticipantRef, id string) string {
+	t.Helper()
+	chosen, err := store.RefreshBrowserPushDevice(ctx, "", id, human.ID, time.Now().Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
 	}
+	return chosen
 }
 
 func notificationDecisionFor(
@@ -230,15 +217,15 @@ func TestGenericPushPayloadContainsOnlyRoutingPointer(t *testing.T) {
 	}
 }
 
-func TestPushSubscriptionOwnershipAndSessionCleanup(t *testing.T) {
+func TestPushSubscriptionOwnershipAndDeviceRevocation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	workspace, place := w.workspaceWithChannel(t, ctx)
 	configureTestPushEgress(w.store.Store)
 	endpoint := "https://push.example.test/device"
-	firstSession := testPushSession(strings.Repeat("A", 43))
-	secondSession := testPushSession(strings.Repeat("B", 43))
+	firstSession := testPushDevice(t, ctx, w.store.Store, w.humanA, strings.Repeat("A", 43))
+	secondSession := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("B", 43))
 
 	first := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
 	saved, err := first.SavePushSubscription(
@@ -268,7 +255,7 @@ func TestPushSubscriptionOwnershipAndSessionCleanup(t *testing.T) {
 	}
 	staleClient := &recordingPushClient{}
 	stale, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -287,15 +274,17 @@ func TestPushSubscriptionOwnershipAndSessionCleanup(t *testing.T) {
 	}
 	var ownerID, sessionID string
 	if err := w.store.pool.QueryRow(ctx, `
-		SELECT human_id, browser_session_id FROM push_subscriptions
+		SELECT human_id, device_id FROM push_subscriptions
 		WHERE endpoint = $1`, endpoint).Scan(&ownerID, &sessionID); err != nil {
 		t.Fatalf("stale owner deleted current subscription: %v", err)
 	}
-	if ownerID != w.humanB.ID || sessionID != secondSession.ID {
+	if ownerID != w.humanB.ID || sessionID != secondSession {
 		t.Fatalf("current owner/session = %s/%s", ownerID, sessionID)
 	}
 
-	w.store.CloseBrowserSession(secondSession.ID)
+	if err := w.store.RevokeBrowserPushDevice(ctx, secondSession); err != nil {
+		t.Fatal(err)
+	}
 	var remaining int
 	if err := w.store.pool.QueryRow(ctx,
 		"SELECT count(*) FROM push_subscriptions WHERE endpoint = $1", endpoint).
@@ -322,19 +311,26 @@ func TestPushSubscriptionSavePurgesExpiredRowsAndRecoversEndpoint(t *testing.T) 
 	for index, endpoint := range oldEndpoints {
 		sessionID := strings.Repeat(string(rune('F'+index)), 43)
 		if _, err := owner.SavePushSubscription(
-			ctx, testPushSession(sessionID), endpoint, testPushP256dh, testPushAuth,
+			ctx, testPushDevice(t, ctx, w.store.Store, w.humanB, sessionID), endpoint, testPushP256dh, testPushAuth,
 		); err != nil {
 			t.Fatalf("save old subscription %d: %v", index, err)
 		}
 	}
 	if _, err := w.store.pool.Exec(ctx, `
-		UPDATE push_subscriptions
-		SET session_expires_at = now() - interval '1 minute'
+		UPDATE push_devices
+		SET expires_at = now() - interval '1 minute'
 		WHERE human_id = $1`, w.humanB.ID); err != nil {
 		t.Fatalf("expire subscriptions: %v", err)
 	}
 
-	freshSession := testPushSession(strings.Repeat("N", 43))
+	freshSession := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("N", 43))
+	var devices int
+	if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if devices != 1 {
+		t.Fatalf("expired device registrations accumulate: %d", devices)
+	}
 	if _, err := owner.SavePushSubscription(
 		ctx,
 		freshSession,
@@ -347,26 +343,26 @@ func TestPushSubscriptionSavePurgesExpiredRowsAndRecoversEndpoint(t *testing.T) 
 	var count int
 	var sessionID, p256dh, auth string
 	if err := w.store.pool.QueryRow(ctx, `
-		SELECT count(*), min(browser_session_id), min(p256dh), min(auth)
+		SELECT count(*), min(device_id), min(p256dh), min(auth)
 		FROM push_subscriptions WHERE human_id = $1`, w.humanB.ID).Scan(
 		&count, &sessionID, &p256dh, &auth,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || sessionID != freshSession.ID ||
+	if count != 1 || sessionID != freshSession ||
 		p256dh != "rotated-p256dh" || auth != "rotated-auth" {
 		t.Fatalf("post-expiry subscriptions = count %d session %q keys %q/%q", count, sessionID, p256dh, auth)
 	}
 }
 
-func TestPushSessionCleanupTimeoutNeverWedgesLogout(t *testing.T) {
+func TestPushDeviceRevocationHonorsCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
 	workspace, _ := w.workspaceWithChannel(t, ctx)
 	configureTestPushEgress(w.store.Store)
 	endpoint := "https://push.example.test/blocked-cleanup"
-	session := testPushSession(strings.Repeat("E", 43))
+	session := testPushDevice(t, ctx, w.store.Store, w.humanA, strings.Repeat("E", 43))
 	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
 	if _, err := owner.SavePushSubscription(
 		ctx, session, endpoint, testPushP256dh, testPushAuth,
@@ -380,13 +376,17 @@ func TestPushSessionCleanupTimeoutNeverWedgesLogout(t *testing.T) {
 	}
 	defer func() { _ = blocker.Rollback(context.Background()) }()
 	if _, err := blocker.Exec(
-		ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", endpoint,
+		ctx, "SELECT device_id FROM push_devices WHERE device_id=$1 FOR SHARE", session,
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	started := time.Now()
-	w.store.CloseBrowserSession(session.ID)
+	bounded, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer stop()
+	if err := w.store.RevokeBrowserPushDevice(bounded, session); err == nil {
+		t.Fatal("blocked revocation silently succeeded")
+	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("blocked session cleanup held logout for %v", elapsed)
 	}
@@ -403,7 +403,9 @@ func TestPushSessionCleanupTimeoutNeverWedgesLogout(t *testing.T) {
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	w.store.CloseBrowserSession(session.ID)
+	if err := w.store.RevokeBrowserPushDevice(ctx, session); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.store.pool.QueryRow(ctx,
 		"SELECT count(*) FROM push_subscriptions WHERE endpoint = $1", endpoint,
 	).Scan(&remaining); err != nil {
@@ -414,7 +416,7 @@ func TestPushSessionCleanupTimeoutNeverWedgesLogout(t *testing.T) {
 	}
 }
 
-func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
+func TestPushReauthorizesAudienceAndDurableDeviceBeforeSend(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -423,7 +425,7 @@ func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
 	scope := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	_, err := scope.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("C", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("C", 43)),
 		"https://push.example.test/recipient",
 		testPushP256dh,
 		testPushAuth,
@@ -439,15 +441,15 @@ func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
 
 	rejectedClient := &recordingPushClient{}
 	rejected, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: false}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rejected.client = rejectedClient
 	rejected.deliver(ctx, scope.Scope, place, decision)
-	if rejectedClient.count() != 0 {
-		t.Fatal("retired browser session reached push transport")
+	if rejectedClient.count() != 1 {
+		t.Fatal("durable device without a live HTTP session did not reach transport")
 	}
 
 	if err := w.store.RemoveWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
@@ -455,7 +457,7 @@ func TestPushReauthorizesAudienceAndBrowserSessionBeforeSend(t *testing.T) {
 	}
 	audienceClient := &recordingPushClient{}
 	audience, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -476,7 +478,7 @@ func TestPushIntentCannotCrossWorkspaceRejoinTenure(t *testing.T) {
 	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	if _, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("R", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("R", 43)),
 		"https://push.example.test/rejoin",
 		testPushP256dh,
 		testPushAuth,
@@ -504,7 +506,7 @@ func TestPushIntentCannotCrossWorkspaceRejoinTenure(t *testing.T) {
 
 	client := &recordingPushClient{}
 	dispatcher, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -546,7 +548,7 @@ func TestPushSendLeaseFencesConcurrentWorkspaceRemoval(t *testing.T) {
 	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	if _, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("L", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("L", 43)),
 		"https://push.example.test/lease",
 		testPushP256dh,
 		testPushAuth,
@@ -559,7 +561,7 @@ func TestPushSendLeaseFencesConcurrentWorkspaceRemoval(t *testing.T) {
 
 	client := &blockingPushClient{started: make(chan struct{}), release: make(chan struct{})}
 	dispatcher, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -614,7 +616,7 @@ func TestPushSendLeaseRejectsDisabledAndReenabledInstallationEpoch(t *testing.T)
 	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	subscription, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("I", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("I", 43)),
 		"https://push.example.test/installation-epoch",
 		testPushP256dh,
 		testPushAuth,
@@ -628,7 +630,7 @@ func TestPushSendLeaseRejectsDisabledAndReenabledInstallationEpoch(t *testing.T)
 	delivery := pushDeliveryFor(sender.Scope, place, decision, subscription)
 
 	dispatcher, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -668,7 +670,7 @@ func TestPushSendLeaseFencesConcurrentInstallationDisable(t *testing.T) {
 	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	subscription, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("J", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("J", 43)),
 		"https://push.example.test/installation-lease",
 		testPushP256dh,
 		testPushAuth,
@@ -683,7 +685,7 @@ func TestPushSendLeaseFencesConcurrentInstallationDisable(t *testing.T) {
 
 	client := &blockingPushClient{started: make(chan struct{}), release: make(chan struct{})}
 	dispatcher, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -741,7 +743,7 @@ func TestPushSendErrorsNeverLogEndpointOrTransportDetails(t *testing.T) {
 	endpoint := "https://push.example.test/leaky-endpoint-token"
 	subscription, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("S", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("S", 43)),
 		endpoint,
 		testPushP256dh,
 		testPushAuth,
@@ -762,7 +764,7 @@ func TestPushSendErrorsNeverLogEndpointOrTransportDetails(t *testing.T) {
 	}
 	index := 0
 	dispatcher, err := NewPushDispatcher(
-		ctx, w.store.Store, testPushSessionAuthorizer{allow: true}, "mailto:test@example.com",
+		ctx, w.store.Store, "mailto:test@example.com",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -805,7 +807,7 @@ func TestPushSendErrorsNeverLogEndpointOrTransportDetails(t *testing.T) {
 	}
 }
 
-func TestPushMutationRequiresApplicationJSON(t *testing.T) {
+func TestPushMutationRequiresApplicationJSONAndDeviceCookie(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	w := newWorld(t, ctx)
@@ -825,7 +827,7 @@ func TestPushMutationRequiresApplicationJSON(t *testing.T) {
 	}.Encode()
 
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
-		for _, contentType := range []string{"", "text/plain"} {
+		for _, contentType := range []string{"", "text/plain", "application/json"} {
 			request, err := http.NewRequest(
 				method,
 				testServer.URL+"/messaging/push-subscriptions?"+query,
@@ -847,8 +849,12 @@ func TestPushMutationRequiresApplicationJSON(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = response.Body.Close()
-			if response.StatusCode != http.StatusUnsupportedMediaType {
-				t.Fatalf("%s Content-Type %q = %d, want 415", method, contentType, response.StatusCode)
+			expected := http.StatusUnsupportedMediaType
+			if contentType == "application/json" {
+				expected = http.StatusUnauthorized
+			}
+			if response.StatusCode != expected {
+				t.Fatalf("%s Content-Type %q without device cookie = %d, want %d", method, contentType, response.StatusCode, expected)
 			}
 		}
 	}
@@ -992,7 +998,7 @@ func TestPublishMessageCreatedDeliversPushWithoutWebSocketHub(t *testing.T) {
 	recipient := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
 	if _, err := recipient.SavePushSubscription(
 		ctx,
-		testPushSession(strings.Repeat("D", 43)),
+		testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("D", 43)),
 		"https://push.example.test/closed-tab",
 		testPushP256dh,
 		testPushAuth,
@@ -1004,7 +1010,6 @@ func TestPublishMessageCreatedDeliversPushWithoutWebSocketHub(t *testing.T) {
 	dispatcher, err := NewPushDispatcher(
 		ctx,
 		w.store.Store,
-		testPushSessionAuthorizer{allow: true},
 		"mailto:test@example.com",
 	)
 	if err != nil {
@@ -1023,5 +1028,141 @@ func TestPublishMessageCreatedDeliversPushWithoutWebSocketHub(t *testing.T) {
 	}
 	if client.count() != 1 {
 		t.Fatalf("hubless publish sent %d pushes, want one", client.count())
+	}
+}
+
+func TestPushDeviceRefreshAndAccountSwitchRetireQueuedDelivery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, place := w.workspaceWithChannel(t, ctx)
+	configureTestPushEgress(w.store.Store)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	device := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("V", 43))
+	subscription, err := owner.SavePushSubscription(ctx, device, "https://push.example.test/durable", testPushP256dh, testPushAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := pushDeliveryFor(owner.Scope, place, NotificationDecision{Participant: w.humanB, workspaceMemberID: activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.humanB)}, subscription)
+	renewed, err := w.store.RefreshBrowserPushDevice(ctx, device, strings.Repeat("W", 43), w.humanB.ID, time.Now().Add(31*24*time.Hour))
+	if err != nil || renewed != device {
+		t.Fatalf("same-human refresh = %q, %v", renewed, err)
+	}
+	dispatcher, err := NewPushDispatcher(ctx, w.store.Store, "mailto:test@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingPushClient{}
+	dispatcher.client = client
+	dispatcher.send(ctx, delivery)
+	if client.count() != 1 {
+		t.Fatal("same-human refresh lost saved device delivery")
+	}
+	// A valid HTTP principal cannot operate on another Human's device grant.
+	other := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	if _, err := other.SavePushSubscription(ctx, device, subscription.Endpoint, testPushP256dh, testPushAuth); !errors.Is(err, ErrInvalidPushSubscription) {
+		t.Fatalf("cross-human device save = %v", err)
+	}
+	if err := other.DeletePushSubscription(ctx, device, subscription.Endpoint); !errors.Is(err, ErrInvalidPushSubscription) {
+		t.Fatalf("cross-human device delete = %v", err)
+	}
+	replacement, err := w.store.RefreshBrowserPushDevice(ctx, device, strings.Repeat("X", 43), w.humanA.ID, time.Now().Add(30*24*time.Hour))
+	if err != nil || replacement == device {
+		t.Fatalf("account switch = %q, %v", replacement, err)
+	}
+	dispatcher.send(ctx, delivery)
+	if client.count() != 1 {
+		t.Fatal("queued send crossed account switch")
+	}
+	var remaining int
+	if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_subscriptions WHERE device_id=$1`, device).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("old device subscriptions = %d, %v", remaining, err)
+	}
+}
+
+func TestPushDeviceRevocationFencesInFlightAndQueuedSend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, place := w.workspaceWithChannel(t, ctx)
+	configureTestPushEgress(w.store.Store)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	device := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("Z", 43))
+	subscription, err := owner.SavePushSubscription(ctx, device, "https://push.example.test/revoke", testPushP256dh, testPushAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := pushDeliveryFor(owner.Scope, place, NotificationDecision{Participant: w.humanB, workspaceMemberID: activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.humanB)}, subscription)
+	dispatcher, err := NewPushDispatcher(ctx, w.store.Store, "mailto:test@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &blockingPushClient{started: make(chan struct{}), release: make(chan struct{})}
+	dispatcher.client = client
+	sent := make(chan struct{})
+	go func() { dispatcher.send(ctx, delivery); close(sent) }()
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	bounded, stop := context.WithTimeout(ctx, 100*time.Millisecond)
+	if err := w.store.RevokeBrowserPushDevice(bounded, device); err == nil {
+		t.Fatal("revocation completed while send lease was in flight")
+	}
+	stop()
+	close(client.release)
+	select {
+	case <-sent:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := w.store.RevokeBrowserPushDevice(ctx, device); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingPushClient{}
+	dispatcher.client = recorder
+	dispatcher.send(ctx, delivery)
+	if recorder.count() != 0 {
+		t.Fatal("queued send crossed completed logout")
+	}
+	if _, err := owner.SavePushSubscription(ctx, device, subscription.Endpoint, testPushP256dh, testPushAuth); !errors.Is(err, ErrInvalidPushSubscription) {
+		t.Fatalf("revoked device re-registered: %v", err)
+	}
+}
+
+func TestPushQueuedDeliveryChecksCurrentDeviceExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, place := w.workspaceWithChannel(t, ctx)
+	configureTestPushEgress(w.store.Store)
+	owner := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanB)
+	device := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("Q", 43))
+	subscription, err := owner.SavePushSubscription(ctx, device, "https://push.example.test/expiry", testPushP256dh, testPushAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := pushDeliveryFor(owner.Scope, place, NotificationDecision{Participant: w.humanB, workspaceMemberID: activeMembershipID(t, ctx, w, workspace.WorkspaceID, w.humanB)}, subscription)
+	if _, err := w.store.pool.Exec(ctx, `UPDATE push_devices SET expires_at=clock_timestamp()-interval '1 second' WHERE device_id=$1`, device); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, err := NewPushDispatcher(ctx, w.store.Store, "mailto:test@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingPushClient{}
+	dispatcher.client = client
+	dispatcher.send(ctx, delivery)
+	if client.count() != 0 {
+		t.Fatal("expired queued device reached transport")
+	}
+	replacement, err := w.store.RefreshBrowserPushDevice(ctx, device, strings.Repeat("U", 43), w.humanB.ID, time.Now().Add(30*24*time.Hour))
+	if err != nil || replacement == device {
+		t.Fatalf("expired device was revived: %q %v", replacement, err)
+	}
+	dispatcher.send(ctx, delivery)
+	if client.count() != 0 {
+		t.Fatal("renewed expired device revived queued delivery")
 	}
 }

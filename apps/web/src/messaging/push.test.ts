@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   decodeApplicationServerKey,
+  disablePushSubscription,
   enablePushSubscription,
+  getDevicePushState,
   PUSH_PLATFORM_TIMEOUT_MS,
+  setDevicePushOwner,
   startPushSubscriptionLogoutCleanup,
 } from "./push";
 import { setActiveMessagingScope } from "./scope";
@@ -62,6 +65,7 @@ function installPushPlatform(
 
 describe("generic Web Push subscription", () => {
   beforeEach(() => {
+    setDevicePushOwner(`test-${Math.random()}`);
     setActiveMessagingScope(scope);
     vi.stubGlobal("fetch", vi.fn());
   });
@@ -70,6 +74,116 @@ describe("generic Web Push subscription", () => {
     setActiveMessagingScope(null);
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("keeps a failed registration retryable rather than claiming enabled", async () => {
+    installPushPlatform({ subscription: fakeSubscription() });
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 503 }));
+    expect(await enablePushSubscription()).toBe(false);
+    expect(getDevicePushState()).toBe("error");
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await enablePushSubscription(true)).toBe(true);
+    expect(getDevicePushState()).toBe("enabled");
+  });
+
+  it("deletes the server registration before physical unsubscribe and keeps off across reconciliation", async () => {
+    const subscription = fakeSubscription();
+    installPushPlatform({ subscription });
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    expect(await disablePushSubscription()).toBe(true);
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("push-subscriptions"),
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(subscription.unsubscribe).toHaveBeenCalledOnce();
+    vi.mocked(fetch).mockClear();
+    expect(await enablePushSubscription()).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+    setDevicePushOwner("a-different-human");
+    expect(await enablePushSubscription()).toBe(true);
+  });
+
+  it("waits for an in-flight server registration before deleting it", async () => {
+    installPushPlatform({ subscription: fakeSubscription() });
+    const response = deferred<Response>();
+    vi.mocked(fetch)
+      .mockReturnValueOnce(response.promise)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const enabling = enablePushSubscription();
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const disabling = disablePushSubscription();
+    expect(fetch).toHaveBeenCalledOnce();
+    response.resolve(new Response(null, { status: 204 }));
+    expect(await enabling).toBe(false);
+    expect(await disabling).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.map((call) => call[1]?.method)).toEqual([
+      "POST",
+      "DELETE",
+    ]);
+    expect(getDevicePushState()).toBe("disabled");
+  });
+
+  it("retries an interrupted disable under the replacement scope", async () => {
+    const platform = installPushPlatform({ subscription: fakeSubscription() });
+    const registration = deferred<ServiceWorkerRegistration>();
+    platform.serviceWorker.getRegistration.mockReturnValueOnce(
+      registration.promise,
+    );
+    const disabling = disablePushSubscription();
+    await vi.waitFor(() =>
+      expect(platform.serviceWorker.getRegistration).toHaveBeenCalled(),
+    );
+    setActiveMessagingScope({ ...scope, authorityEpoch: "2" });
+    registration.resolve(platform.registration);
+    expect(await disabling).toBe(false);
+    expect(getDevicePushState()).toBe("idle");
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await enablePushSubscription()).toBe(false);
+    expect(getDevicePushState()).toBe("disabled");
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("authority_epoch=2"),
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("uses another tab's latest on preference instead of stale memory", async () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    });
+    installPushPlatform({ subscription: fakeSubscription() });
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    expect(await disablePushSubscription()).toBe(true);
+    values.clear(); // Another tab explicitly enabled this device.
+    expect(await enablePushSubscription()).toBe(true);
+    expect(getDevicePushState()).toBe("enabled");
+  });
+
+  it("retains failed disable for retry without re-registering", async () => {
+    const subscription = fakeSubscription();
+    installPushPlatform({ subscription });
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 503 }));
+    expect(await disablePushSubscription()).toBe(false);
+    expect(getDevicePushState()).toBe("disable-error");
+    expect(subscription.unsubscribe).not.toHaveBeenCalled();
+    expect(await enablePushSubscription()).toBe(false);
+    expect(getDevicePushState()).toBe("disable-error");
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await disablePushSubscription()).toBe(true);
+  });
+
+  it("does not publish an old account's completion after identity changes", async () => {
+    installPushPlatform({ subscription: fakeSubscription() });
+    const response = deferred<Response>();
+    vi.mocked(fetch).mockReturnValue(response.promise);
+    const enabling = enablePushSubscription();
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+    setDevicePushOwner("replacement-human");
+    response.resolve(new Response(null, { status: 204 }));
+    expect(await enabling).toBe(false);
+    expect(getDevicePushState()).toBe("idle");
   });
 
   it("decodes the VAPID base64url alphabet", () => {
