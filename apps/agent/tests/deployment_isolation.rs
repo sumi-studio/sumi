@@ -1859,9 +1859,7 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
     assert_eq!(local_control_mount["type"].as_str(), Some("bind"));
     assert_eq!(
         local_control_mount["source"].as_str(),
-        Some(
-            "${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}"
-        )
+        Some("${SUMI_LOCAL_CONTROL_HOST_DIR:?SUMI_LOCAL_CONTROL_HOST_DIR is required}")
     );
     assert_eq!(local_control_mount["read_only"].as_bool(), Some(true));
     assert_eq!(
@@ -1869,9 +1867,13 @@ fn data_socket_network_and_credentials_follow_the_role_graph() {
         Some(false)
     );
     assert!(
-        runtime["volumes"].as_sequence().unwrap().iter().all(|mount| {
-            mount["target"].as_str() != Some("/run/sumi/local-control/control.sock")
-        }),
+        runtime["volumes"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .all(|mount| {
+                mount["target"].as_str() != Some("/run/sumi/local-control/control.sock")
+            }),
         "a nested socket-file bind would pin the old API socket across reconnect"
     );
 
