@@ -1103,6 +1103,7 @@ async fn run_with_context(mut context: BootstrapContext) -> Result<()> {
         public_web_api,
         feedback_api,
         workspace_invitation_api,
+        Arc::new(control_client.clone()),
         Arc::new(control_client),
         executor_call_authority_private_key,
         &publisher,
@@ -1120,6 +1121,7 @@ async fn run_after_not_ready(
     feedback_api: Arc<dyn FeedbackApi>,
     workspace_invitation_api: Arc<dyn WorkspaceInvitationApi>,
     chatgpt_resolver: Arc<dyn ChatGptCredentialResolver>,
+    api_resolver: Arc<dyn crate::provider::api_credentials::ApiCredentialResolver>,
     executor_call_authority_private_key: Zeroizing<[u8; 32]>,
     publisher: &LocalRuntimePublisher,
 ) -> Result<()> {
@@ -1140,7 +1142,9 @@ async fn run_after_not_ready(
         if config.database_path != context.state_dir.join("agent.db") {
             bail!("config state directory does not match SUMI_STATE_DIR");
         }
+        let api_binding = crate::provider::api_credentials::ApiCredentialBinding::from_env()?;
         let mut model_spec = config.model_spec().context("resolve production provider")?;
+        configure_api_credentials(&mut model_spec, api_binding.as_ref(), api_resolver.clone())?;
         validate_production_provider_endpoint(&model_spec.base_url)?;
         configure_provider_credentials(
             &mut model_spec,
@@ -1174,6 +1178,7 @@ async fn run_after_not_ready(
         ] {
             validate_production_provider_endpoint(&spec.base_url)
                 .with_context(|| format!("validate {label} provider endpoint"))?;
+            configure_api_credentials(spec, api_binding.as_ref(), api_resolver.clone())?;
             configure_provider_credentials(
                 spec,
                 config.chatgpt_connection_id.as_deref(),
@@ -2214,12 +2219,37 @@ fn validate_provider_credential(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn configure_api_credentials(
+    spec: &mut ModelSpec,
+    binding: Option<&crate::provider::api_credentials::ApiCredentialBinding>,
+    resolver: Arc<dyn crate::provider::api_credentials::ApiCredentialResolver>,
+) -> Result<()> {
+    if !spec.public_endpoint {
+        return Ok(());
+    }
+    let binding = binding.context("user API backend requires connection identity")?;
+    if spec.backend != ProviderBackend::ApiKey || spec.account_scope != binding.account_scope() {
+        bail!("user API credential does not match the configured connection");
+    }
+    spec.api_credentials = Some(crate::provider::api_credentials::ApiCredentialSource::new(
+        binding.clone(),
+        resolver,
+    ));
+    Ok(())
+}
+
 fn configure_provider_credentials(
     spec: &mut ModelSpec,
     connection_id: Option<&str>,
     resolver: Arc<dyn ChatGptCredentialResolver>,
 ) -> Result<()> {
     if spec.backend == ProviderBackend::ApiKey {
+        if spec.api_credentials.is_some() {
+            return Ok(());
+        }
+        if spec.public_endpoint {
+            bail!("user API backend requires a credential resolver");
+        }
         return validate_provider_credential(&spec.api_key_env);
     }
     let connection_id = connection_id
@@ -3109,6 +3139,55 @@ mod tests {
         api.api_key_env = "SUMI_TEST_INTENTIONALLY_ABSENT_NATIVE_BOOTSTRAP_KEY".into();
         assert!(configure_provider_credentials(&mut api, Some("connection"), resolver).is_err());
         assert!(api.chatgpt_credentials.is_none());
+    }
+
+    #[test]
+    fn user_api_bootstrap_requires_matching_binding_and_never_reads_static_key() {
+        use crate::provider::api_credentials::{
+            ApiCredentialBinding, ApiCredentialError, ApiCredentialResolver,
+        };
+        struct UnusedResolver;
+        #[async_trait::async_trait]
+        impl ApiCredentialResolver for UnusedResolver {
+            async fn resolve(
+                &self,
+                _: &ApiCredentialBinding,
+            ) -> std::result::Result<Zeroizing<String>, ApiCredentialError> {
+                panic!("bootstrap must not fetch a user API key");
+            }
+        }
+        #[async_trait::async_trait]
+        impl ChatGptCredentialResolver for UnusedResolver {
+            async fn resolve(
+                &self,
+                _: &str,
+                _: Option<&str>,
+            ) -> std::result::Result<
+                crate::provider::chatgpt::ChatGptAccess,
+                crate::provider::chatgpt::ChatGptAuthError,
+            > {
+                panic!("user API bootstrap must not use ChatGPT credentials");
+            }
+        }
+        let binding = ApiCredentialBinding {
+            connection_id: "connection".into(),
+            version: "version".into(),
+            human_id: "human".into(),
+        };
+        let resolver = Arc::new(UnusedResolver);
+        let mut spec = ModelSpec::preset("openai-chat").unwrap();
+        spec.public_endpoint = true;
+        spec.account_scope = binding.account_scope();
+        spec.api_key_env = "SUMI_TEST_ABSENT_BYOK_BOOTSTRAP_KEY".into();
+        assert!(configure_provider_credentials(&mut spec, None, resolver.clone()).is_err());
+        assert!(configure_api_credentials(&mut spec, None, resolver.clone()).is_err());
+        let mut foreign = binding.clone();
+        foreign.human_id = "different-human".into();
+        assert!(configure_api_credentials(&mut spec, Some(&foreign), resolver.clone()).is_err());
+        configure_api_credentials(&mut spec, Some(&binding), resolver.clone()).unwrap();
+        configure_provider_credentials(&mut spec, None, resolver).unwrap();
+        assert!(spec.api_credentials.is_some());
+        assert!(spec.chatgpt_credentials.is_none());
     }
 
     #[test]

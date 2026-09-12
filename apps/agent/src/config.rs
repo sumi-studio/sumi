@@ -55,6 +55,7 @@ pub struct ModelConfig {
     pub preset: Option<String>,
     pub id: Option<String>,
     pub base_url: Option<String>,
+    pub public_endpoint: Option<bool>,
     pub account_scope: Option<String>,
     pub api_key_env: Option<String>,
     pub context_window: Option<u64>,
@@ -104,6 +105,7 @@ struct EnvOverrides {
     model_preset: Option<String>,
     model_id: Option<String>,
     model_base_url: Option<String>,
+    model_public_endpoint: Option<bool>,
     model_api_key_env: Option<String>,
     model_account_scope: Option<String>,
     chatgpt_connection_id: Option<String>,
@@ -208,6 +210,10 @@ impl Config {
         let mut spec = match reviewer.preset.as_deref() {
             Some(preset) => ModelSpec::preset(preset)
                 .with_context(|| format!("unknown model preset {preset}"))?,
+            None if reviewer.api_key_env.is_some() && conversation.public_endpoint => {
+                ModelSpec::preset(self.model.preset.as_deref().unwrap_or(DEFAULT_MODEL_PRESET))
+                    .context("unknown conversation preset for independent reviewer")?
+            }
             None => conversation.clone(),
         };
         // A reviewer on the conversation's preset (omitted, or the same preset
@@ -234,10 +240,18 @@ impl Config {
             }
         };
         if same_preset {
-            if reviewer.id.is_none() {
+            let inherits_connection = reviewer.api_key_env.is_none() && reviewer.base_url.is_none();
+            if inherits_connection {
+                spec.public_endpoint = conversation.public_endpoint;
+                spec.base_url.clone_from(&conversation.base_url);
+            }
+            if reviewer.id.is_none() && (inherits_connection || !conversation.public_endpoint) {
                 spec.set_model_id(&conversation.id);
             }
-            if spec.backend == ProviderBackend::ChatGpt && reviewer.account_scope.is_none() {
+            if (spec.backend == ProviderBackend::ChatGpt
+                || (conversation.public_endpoint && inherits_connection))
+                && reviewer.account_scope.is_none()
+            {
                 spec.account_scope.clone_from(&conversation.account_scope);
             }
             if reviewer.api_key_env.is_none() {
@@ -281,6 +295,9 @@ impl Config {
         }
         if let Some(value) = overrides.model_base_url {
             file.model.base_url = Some(value);
+        }
+        if let Some(value) = overrides.model_public_endpoint {
+            file.model.public_endpoint = Some(value);
         }
         if let Some(value) = overrides.model_account_scope {
             file.model.account_scope = Some(value);
@@ -344,6 +361,9 @@ fn apply_model_config(spec: &mut ModelSpec, model: &ModelConfig) -> Result<()> {
     }
     if let Some(base_url) = &model.base_url {
         spec.base_url.clone_from(base_url);
+    }
+    if let Some(value) = model.public_endpoint {
+        spec.public_endpoint = value;
     }
     if let Some(account_scope) = &model.account_scope {
         spec.account_scope.clone_from(account_scope);
@@ -427,6 +447,9 @@ fn validate_resolved_model_spec(spec: ModelSpec, label: &str) -> Result<ModelSpe
         _ => anyhow::bail!("model protocol/compat variant mismatch"),
     }
     validate_model_base_url(&spec.base_url)?;
+    if spec.public_endpoint {
+        crate::provider::endpoint::validate_url(&spec.base_url).map_err(anyhow::Error::msg)?;
+    }
     if spec.context_window == 0 {
         anyhow::bail!("context_window must be greater than zero");
     }
@@ -664,6 +687,17 @@ impl EnvOverrides {
             model_preset: env::var("SUMI_MODEL_PRESET").ok(),
             model_id: env::var("SUMI_MODEL_ID").ok(),
             model_base_url: env::var("SUMI_MODEL_BASE_URL").ok(),
+            model_public_endpoint: match env::var("SUMI_MODEL_PUBLIC_ENDPOINT") {
+                Ok(value) => Some(
+                    value
+                        .parse::<bool>()
+                        .context("SUMI_MODEL_PUBLIC_ENDPOINT must be true or false")?,
+                ),
+                Err(env::VarError::NotPresent) => None,
+                Err(env::VarError::NotUnicode(_)) => {
+                    bail!("SUMI_MODEL_PUBLIC_ENDPOINT must be valid UTF-8")
+                }
+            },
             model_api_key_env: env::var("SUMI_MODEL_API_KEY_ENV").ok(),
             model_account_scope: env::var("SUMI_MODEL_ACCOUNT_SCOPE").ok(),
             chatgpt_connection_id: env::var("SUMI_CHATGPT_CONNECTION_ID").ok(),
@@ -1402,6 +1436,73 @@ default_output_tokens = 16000
         assert_eq!(partial_execution.provider, conversation.provider);
         assert_eq!(partial_execution.base_url, conversation.base_url);
         assert_eq!(partial_execution.api_key_env, conversation.api_key_env);
+    }
+
+    #[test]
+    fn public_endpoint_policy_and_custom_origin_follow_inherited_reviewers() {
+        for preset in ["openai-chat", "openai-responses", "anthropic"] {
+            let config = Config::resolve(
+                FileConfig {
+                    model: ModelConfig {
+                        preset: Some(preset.into()),
+                        base_url: Some("https://provider.example/custom/v1".into()),
+                        account_scope: Some("user-connection".into()),
+                        ..ModelConfig::default()
+                    },
+                    reviewers: ReviewerModelsConfig {
+                        execution: Some(ModelConfig {
+                            preset: Some(preset.into()),
+                            ..ModelConfig::default()
+                        }),
+                        escalation: None,
+                    },
+                    ..FileConfig::default()
+                },
+                EnvOverrides {
+                    model_public_endpoint: Some(true),
+                    ..identity_overrides()
+                },
+            )
+            .unwrap();
+            let conversation = config.model_spec().unwrap();
+            let reviewer = config.execution_reviewer_model_spec().unwrap();
+            assert!(conversation.public_endpoint && reviewer.public_endpoint);
+            assert_eq!(reviewer.base_url, conversation.base_url);
+            assert_eq!(reviewer.account_scope, conversation.account_scope);
+            assert_eq!(reviewer.api_key_env, conversation.api_key_env);
+        }
+    }
+
+    #[test]
+    fn operator_reviewer_key_never_inherits_user_endpoint() {
+        for reviewer_preset in [None, Some("openai-chat".into())] {
+            let config = Config::resolve(
+                FileConfig {
+                    model: ModelConfig {
+                        preset: Some("openai-chat".into()),
+                        base_url: Some("https://user-controlled.example/v1".into()),
+                        api_key_env: Some("USER_KEY".into()),
+                        public_endpoint: Some(true),
+                        ..ModelConfig::default()
+                    },
+                    reviewers: ReviewerModelsConfig {
+                        execution: Some(ModelConfig {
+                            preset: reviewer_preset,
+                            api_key_env: Some("OPERATOR_KEY".into()),
+                            ..ModelConfig::default()
+                        }),
+                        escalation: None,
+                    },
+                    ..FileConfig::default()
+                },
+                identity_overrides(),
+            )
+            .unwrap();
+            let reviewer = config.execution_reviewer_model_spec().unwrap();
+            assert_eq!(reviewer.base_url, "https://api.openai.com/v1");
+            assert_eq!(reviewer.api_key_env, "OPERATOR_KEY");
+            assert!(!reviewer.public_endpoint);
+        }
     }
 
     #[test]

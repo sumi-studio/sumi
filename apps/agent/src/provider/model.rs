@@ -100,9 +100,12 @@ pub struct ModelSpec {
     pub backend: ProviderBackend,
     /// Runtime-only account-scoped resolver. Contains no provider credentials.
     pub chatgpt_credentials: Option<ChatGptCredentialSource>,
+    pub api_credentials: Option<super::api_credentials::ApiCredentialSource>,
     pub id: String,
     pub provider: String,
     pub base_url: String,
+    /// User-provided endpoints may connect only to public HTTPS destinations.
+    pub public_endpoint: bool,
     pub account_scope: String,
     pub api_key_env: String,
     pub context_window: u64,
@@ -135,6 +138,8 @@ impl ModelSpec {
             return Some(Self {
                 backend: ProviderBackend::ApiKey,
                 chatgpt_credentials: None,
+                api_credentials: None,
+                public_endpoint: false,
                 id: "claude-sonnet-4-6".to_owned(),
                 provider: "anthropic".to_owned(),
                 base_url: "https://api.anthropic.com/v1".to_owned(),
@@ -161,6 +166,8 @@ impl ModelSpec {
             return Some(Self {
                 backend: ProviderBackend::ApiKey,
                 chatgpt_credentials: None,
+                api_credentials: None,
+                public_endpoint: false,
                 id: "gpt-5.6".to_owned(),
                 provider: "openai".to_owned(),
                 base_url: "https://api.openai.com/v1".to_owned(),
@@ -191,6 +198,30 @@ impl ModelSpec {
             supports_images,
             compat,
         ) = match name {
+            "openai-chat" => (
+                "gpt-5.6",
+                "openai",
+                "https://api.openai.com/v1",
+                "OPENAI_API_KEY",
+                128_000,
+                16_384,
+                true,
+                ChatCompat {
+                    max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                    supports_usage_in_streaming: true,
+                    thinking_format: ThinkingFormat::ProviderDefault,
+                    requires_reasoning_content_on_assistant: false,
+                    requires_content_on_tool_only_assistant: false,
+                    zai_tool_stream: false,
+                    supports_strict_mode: false,
+                    supports_required_tool_choice: true,
+                    supports_store: false,
+                    supports_developer_role: false,
+                    allows_sampling_parameters: false,
+                    structured_output: ChatStructuredOutputMode::PromptSchema,
+                    infer_finish_reason_at_done: false,
+                },
+            ),
             "kimi-k3" => (
                 "kimi-k3",
                 "moonshot",
@@ -301,6 +332,8 @@ impl ModelSpec {
         Some(Self {
             backend: ProviderBackend::ApiKey,
             chatgpt_credentials: None,
+            api_credentials: None,
+            public_endpoint: false,
             id: id.to_owned(),
             provider: provider.to_owned(),
             base_url: base_url.to_owned(),

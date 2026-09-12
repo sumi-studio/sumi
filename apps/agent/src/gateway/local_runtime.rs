@@ -9180,3 +9180,25 @@ impl crate::provider::chatgpt::ChatGptCredentialResolver for LocalControlHttpCli
         })
     }
 }
+
+#[async_trait]
+impl crate::provider::api_credentials::ApiCredentialResolver for LocalControlHttpClient {
+    async fn resolve(
+        &self,
+        binding: &crate::provider::api_credentials::ApiCredentialBinding,
+    ) -> Result<zeroize::Zeroizing<String>, crate::provider::api_credentials::ApiCredentialError>
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AccessResponse {
+            api_key: String,
+        }
+        // Runtime authentication fixes the PA and generation; API checks the
+        // current employer plus the expected selection/version for every call.
+        let response: AccessResponse = self
+            .post_json_bounded("/internal/providers/api/access", binding, 80 * 1024)
+            .await
+            .map_err(|_| crate::provider::api_credentials::ApiCredentialError)?;
+        Ok(zeroize::Zeroizing::new(response.api_key))
+    }
+}

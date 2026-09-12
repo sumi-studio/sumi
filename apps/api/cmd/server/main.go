@@ -32,6 +32,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
@@ -380,6 +381,29 @@ func newApplicationFromEnv() (*application, error) {
 		chatGPTLogin = chatgpt.NewLoginService(chatGPTConnections, oauth, chatGPTBrowserIdentity(sv, browserOrigins), chatGPTActivation.enqueue)
 	}
 
+	modelConnections, err := modelConnectionStoreFromEnv(databasePool)
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
+	if modelConnections != nil {
+		if chatGPTRuntimeAccess != nil {
+			chatGPTRuntimeAccess.selection = modelConnections
+		}
+		if chatGPTActivation == nil {
+			chatGPTActivation = newChatGPTActivationWorker(koseki.New(databasePool, directChatLifecycle))
+		}
+		chatGPTActivation.shouldStart = func(ctx context.Context, human string) (bool, error) {
+			selected, exists, err := modelConnections.Selected(ctx, human)
+			return !exists || selected.Kind != "none", err
+		}
+		resolveModelActivation = userModelActivation(modelConnections, koseki.New(databasePool, directChatLifecycle), chatGPTRuntimeAccess, resolveModelActivation)
+	}
+	modelConnectionService := &modelconnections.Service{Store: modelConnections, Authenticate: chatGPTBrowserIdentity(sv, browserOrigins)}
+	if chatGPTActivation != nil {
+		modelConnectionService.Changed = chatGPTActivation.enqueue
+	}
+
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
 	if database != nil {
 		directChatAuthorizer = newDirectChatAuthorizer(
@@ -528,6 +552,12 @@ func newApplicationFromEnv() (*application, error) {
 		closeOnError()
 		return nil, fmt.Errorf("local control fixture: %w", err)
 	}
+	if localControl != nil && modelConnections != nil {
+		if err := localControl.RegisterAuthorizedRoute("POST "+userAPIAccessPath, userAPIAccess(modelConnections, koseki.New(databasePool, directChatLifecycle))); err != nil {
+			closeOnError()
+			return nil, err
+		}
+	}
 	if localControl != nil && chatGPTRuntimeAccess != nil {
 		if err := chatGPTRuntimeAccess.register(localControl); err != nil {
 			closeOnError()
@@ -608,6 +638,7 @@ func newApplicationFromEnv() (*application, error) {
 	if chatGPTLogin != nil {
 		chatGPTLogin.RegisterRoutes(mux)
 	}
+	modelConnectionService.RegisterRoutes(mux)
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {

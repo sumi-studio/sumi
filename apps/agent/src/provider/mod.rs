@@ -1,10 +1,13 @@
 //! Provider transport, protocol adapters, and normalized event assembly.
 
 pub mod adapters;
+pub mod api_credentials;
 pub mod assembler;
 pub(crate) mod canonical_request;
 pub mod chatgpt;
 pub(crate) mod context_fingerprint;
+pub(crate) mod endpoint;
+mod error_redaction;
 pub mod model;
 pub mod overflow;
 pub mod partial_json;
@@ -240,7 +243,11 @@ pub fn stream(
     options: RequestOptions,
     cancel: CancellationToken,
 ) -> ProviderEventStream {
-    let api_key = env::var(&spec.api_key_env).ok();
+    let api_key = if spec.public_endpoint || spec.api_credentials.is_some() {
+        None
+    } else {
+        env::var(&spec.api_key_env).ok()
+    };
     stream_with_api_key(spec, context, options, cancel, api_key)
 }
 
@@ -253,7 +260,11 @@ pub(crate) fn stream_observed(
     cancel: CancellationToken,
     observer: ProviderTimingObserver,
 ) -> ProviderEventStream {
-    let api_key = env::var(&spec.api_key_env).ok();
+    let api_key = if spec.public_endpoint || spec.api_credentials.is_some() {
+        None
+    } else {
+        env::var(&spec.api_key_env).ok()
+    };
     stream_with_api_key_observed(spec, context, options, cancel, api_key, Some(observer))
 }
 
@@ -264,7 +275,10 @@ pub async fn compact_native(
 ) -> Result<NativeCompactionResult, NativeCompactionError> {
     responses_compaction_coverage(&spec, &context)
         .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
-    let api_key = if spec.backend == ProviderBackend::ChatGpt {
+    let api_key = if spec.backend == ProviderBackend::ChatGpt
+        || spec.public_endpoint
+        || spec.api_credentials.is_some()
+    {
         String::new()
     } else {
         env::var(&spec.api_key_env).unwrap_or_default()
@@ -278,13 +292,35 @@ async fn compact_native_with_api_key(
     cancel: CancellationToken,
     api_key: String,
 ) -> Result<NativeCompactionResult, NativeCompactionError> {
-    let coverage = responses_compaction_coverage(&spec, &context)
-        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
-    let body = build_compact_request(&spec, &context)
-        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
-    let client = http_client().map_err(NativeCompactionError::Transport)?;
-    let body = CanonicalRequestBody::serialize(&body)
-        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
+    let api_key = api_credentials::resolve(&spec, Some(api_key), &cancel)
+        .await
+        .map_err(|error| {
+            if cancel.is_cancelled() {
+                NativeCompactionError::Cancelled
+            } else {
+                NativeCompactionError::Transport(error.to_string())
+            }
+        })?
+        .unwrap_or_default();
+    let coverage = responses_compaction_coverage(&spec, &context).map_err(|error| {
+        NativeCompactionError::InvalidRequest(error_redaction::redact_known(
+            &error.to_string(),
+            &api_key,
+        ))
+    })?;
+    let body = build_compact_request(&spec, &context).map_err(|error| {
+        NativeCompactionError::InvalidRequest(error_redaction::redact_known(
+            &error.to_string(),
+            &api_key,
+        ))
+    })?;
+    let client = endpoint::client(&spec).map_err(NativeCompactionError::Transport)?;
+    let body = CanonicalRequestBody::serialize(&body).map_err(|error| {
+        NativeCompactionError::InvalidRequest(error_redaction::redact_known(
+            &error.to_string(),
+            &api_key,
+        ))
+    })?;
     let response = match chatgpt::send(
         client,
         &spec,
@@ -303,7 +339,9 @@ async fn compact_native_with_api_key(
             response: Err(error),
             ..
         } => {
-            return Err(NativeCompactionError::Transport(error.to_string()));
+            return Err(NativeCompactionError::Transport(
+                error_redaction::redact_known(&error.to_string(), &api_key),
+            ));
         }
         RequestWait::Response {
             response: Ok(response),
@@ -329,7 +367,7 @@ async fn compact_native_with_api_key(
         collect_bounded_body(response, body_limit, !success, &cancel).await,
     )?;
     if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes)
+        let body = error_redaction::redact_known(&String::from_utf8_lossy(&bytes), &api_key)
             .chars()
             .take(4_000)
             .collect();
@@ -338,10 +376,18 @@ async fn compact_native_with_api_key(
             body,
         });
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))?;
-    parse_compact_response(value, coverage)
-        .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        NativeCompactionError::InvalidResponse(error_redaction::redact_known(
+            &error.to_string(),
+            &api_key,
+        ))
+    })?;
+    parse_compact_response(value, coverage).map_err(|error| {
+        NativeCompactionError::InvalidResponse(error_redaction::redact_known(
+            &error.to_string(),
+            &api_key,
+        ))
+    })
 }
 
 fn retain_compact_http_status(
@@ -453,7 +499,7 @@ fn stream_chat_with_api_key(
     let retry_after = Arc::new(OnceLock::new());
     let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
-        async move {
+        error_redaction::scope(async move {
             run_chat_stream(
                 spec,
                 context,
@@ -470,7 +516,7 @@ fn stream_chat_with_api_key(
                 },
             )
             .await;
-        }
+        })
         .instrument(span),
     );
     ProviderEventStream::with_priority_terminal(
@@ -515,7 +561,7 @@ fn stream_responses_with_api_key(
     let retry_after = Arc::new(OnceLock::new());
     let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
-        async move {
+        error_redaction::scope(async move {
             run_responses_stream(
                 spec,
                 context,
@@ -532,7 +578,7 @@ fn stream_responses_with_api_key(
                 },
             )
             .await;
-        }
+        })
         .instrument(span),
     );
     ProviderEventStream::with_priority_terminal(
@@ -577,7 +623,7 @@ fn stream_anthropic_with_api_key(
     let retry_after = Arc::new(OnceLock::new());
     let producer_retry_after = retry_after.clone();
     let producer_task = tokio::spawn(
-        async move {
+        error_redaction::scope(async move {
             run_anthropic_stream(
                 spec,
                 context,
@@ -594,7 +640,7 @@ fn stream_anthropic_with_api_key(
                 },
             )
             .await;
-        }
+        })
         .instrument(span),
     );
     ProviderEventStream::with_priority_terminal(
@@ -628,6 +674,23 @@ async fn run_anthropic_stream(
     } = channels;
     let mut assembler = MessageAssembler::new();
     let _ = assembler.apply(&ProviderEvent::Start);
+    let api_key = match api_credentials::resolve(&spec, api_key, &cancel).await {
+        Ok(key) => key,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error.to_string(),
+                "provider_authentication_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+
     let output_tokens = match anthropic_requested_output_tokens(&spec, &options) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -722,7 +785,7 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    let client = match http_client() {
+    let client = match endpoint::client(&spec) {
         Ok(client) => client,
         Err(error) => {
             finish_failure(
@@ -1031,6 +1094,23 @@ async fn run_responses_stream(
     } = channels;
     let mut assembler = MessageAssembler::new();
     let _ = assembler.apply(&ProviderEvent::Start);
+    let api_key = match api_credentials::resolve(&spec, api_key, &cancel).await {
+        Ok(key) => key,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error.to_string(),
+                "provider_authentication_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+
     let output_tokens = match responses_requested_output_tokens(&spec, &options) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -1095,7 +1175,7 @@ async fn run_responses_stream(
             return;
         }
     };
-    let client = match http_client() {
+    let client = match endpoint::client(&spec) {
         Ok(client) => client,
         Err(error) => {
             finish_failure(
@@ -1429,6 +1509,22 @@ async fn run_chat_stream(
         }
     };
     let mut receive = ChatReceiveState::with_budget(schemas, budget);
+    let api_key = match api_credentials::resolve(&spec, api_key, &cancel).await {
+        Ok(key) => key,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error.to_string(),
+                "provider_authentication_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
 
     let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
         finish_failure(
@@ -1443,7 +1539,7 @@ async fn run_chat_stream(
         .await;
         return;
     };
-    let client = match http_client() {
+    let client = match endpoint::client(&spec) {
         Ok(client) => client,
         Err(error) => {
             finish_failure(
@@ -2392,8 +2488,8 @@ async fn finish_failure_with_context(
         origin: spec.origin(),
         usage: usage.clone(),
         stop_reason: requested_reason,
-        error_message: Some(error_message),
-        provider_code: Some(provider_code.to_owned()),
+        error_message: Some(error_redaction::redact(&error_message)),
+        provider_code: Some(error_redaction::redact(provider_code)),
         interrupted: cancelled,
         timestamp: Utc::now(),
     };
