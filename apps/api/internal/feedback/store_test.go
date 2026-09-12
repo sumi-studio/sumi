@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
@@ -45,11 +45,6 @@ func fixture(t *testing.T) world {
 		t.Fatal(err)
 	}
 	w.pa = participant.PersonalityAgent(paid)
-	for _, p := range []participant.Ref{w.human, w.dev, w.stranger, w.pa} {
-		if _, err := apps.New(pool, nil).InstallAtOperation(ctx, apps.ParticipantOwner(p), p, AppID, uuid.NewString()); err != nil {
-			t.Fatal(err)
-		}
-	}
 	w.s = New(pool, []participant.Ref{w.dev})
 	return w
 }
@@ -57,7 +52,7 @@ func TestFeedbackSharedConversationAndUnread(t *testing.T) {
 	w := fixture(t)
 	ctx := context.Background()
 	b, err := w.s.Bootstrap(ctx, w.pa)
-	if err != nil || !b.Available || !b.Enabled {
+	if err != nil || !b.Available || b.Scope != "builtin" {
 		t.Fatalf("bootstrap: %+v %v", b, err)
 	}
 	thread, err := w.s.Create(ctx, w.pa, "Notification mismatch", "The channel says all, but only mentions arrive.", uuid.NewString(), nil)
@@ -166,21 +161,6 @@ func TestFeedbackRetryAndLifecycle(t *testing.T) {
 	if _, err = w.s.Reply(ctx, w.human, id, "Changed detail", rn); !errors.Is(err, ErrRequest) {
 		t.Fatal(err)
 	}
-	if _, err = w.pool.Exec(ctx, `UPDATE app_installations SET enabled=false WHERE owner_kind='human' AND owner_id=$1 AND app_id='feedback'`, w.human.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = w.s.Open(ctx, w.human, id, ""); !errors.Is(err, ErrDisabled) {
-		t.Fatalf("disabled read %v", err)
-	}
-	if _, err = w.pool.Exec(ctx, `DELETE FROM app_installations WHERE owner_kind='human' AND owner_id=$1 AND app_id='feedback'`, w.human.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = w.s.List(ctx, w.human, "all", ""); !errors.Is(err, ErrInstallation) {
-		t.Fatal(err)
-	}
-	if _, err = apps.New(w.pool, nil).InstallAtOperation(ctx, apps.ParticipantOwner(w.human), w.human, AppID, uuid.NewString()); err != nil {
-		t.Fatal(err)
-	}
 	detail, err := w.s.Open(ctx, w.human, id, "")
 	if err != nil || len(detail.Messages) != 1 {
 		t.Fatalf("uninstall lost conversation: %+v %v", detail, err)
@@ -253,5 +233,52 @@ func TestFeedbackDiagnosticSnapshotPersistsAndRetryCannotReplaceIt(t *testing.T)
 	}
 	if _, err = w.s.Open(ctx, w.stranger, created.ID, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("diagnostics leaked: %v", err)
+	}
+}
+
+func TestFeedbackBuiltinRejectsUnknownIdentity(t *testing.T) {
+	w := fixture(t)
+	unknown := participant.Human("01a051f1-1cd2-7ea1-a674-5ab4cede03bd")
+	if _, err := w.s.Bootstrap(context.Background(), unknown); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown bootstrap: %v", err)
+	}
+	if _, err := w.s.List(context.Background(), unknown, "all", ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown list: %v", err)
+	}
+}
+
+// A valid participant can encounter a database lock timeout. That is a service
+// failure, not malformed user input; retain the original PostgreSQL cause.
+func TestFeedbackIdentityLockFailurePreservesInfrastructureError(t *testing.T) {
+	w := fixture(t)
+	ctx := context.Background()
+	config := w.pool.Config().Copy()
+	config.ConnConfig.RuntimeParams["lock_timeout"] = "50ms"
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := New(pool, w.s.recipients)
+	for _, actor := range []participant.Ref{w.human, w.pa} {
+		t.Run(string(actor.Kind), func(t *testing.T) {
+			tx, err := w.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err = participant.LockOwnIdentity(ctx, tx, actor); err != nil {
+				t.Fatal(err)
+			}
+			// The other connection cannot acquire this lock until this transaction ends.
+			_, err = store.List(ctx, actor, "all", "")
+			var databaseError *pgconn.PgError
+			if errors.Is(err, ErrInvalid) || !errors.As(err, &databaseError) || databaseError.Code != "55P03" {
+				t.Fatalf("lost identity lock failure: %v", err)
+			}
+			if status, code := errorCode(err); status != 500 || code != "internal_error" {
+				t.Fatalf("infrastructure failure classified %d/%s", status, code)
+			}
+		})
 	}
 }

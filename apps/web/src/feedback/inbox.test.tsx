@@ -41,8 +41,7 @@ const bootstrap: Bootstrap = {
   recipient_name: "Sumi開発",
   available: true,
   is_recipient: false,
-  installed: true,
-  enabled: true,
+  scope: "builtin",
 };
 function setupClient(): FeedbackClient {
   return {

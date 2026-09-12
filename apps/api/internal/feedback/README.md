@@ -1,11 +1,11 @@
 # Feedback Inbox
 
-People and personality agents use the same participant-owned `feedback` app.
+People and personality agents use the same built-in `feedback` app.
 The first destination is Sumi開発: product feedback, questions and follow-up
 conversations. An author's source workspace confers no access to the thread,
 and no source conversation is attached implicitly.
 
-## Access and installation
+## Access and availability
 
 Set `SUMI_FEEDBACK_RECIPIENTS` to comma-separated canonical participant keys,
 for example `human:<UUIDv7>,personality_agent:<UUIDv7>`. These identities can
@@ -13,13 +13,11 @@ read and respond to all feedback threads. Every other participant can access
 only threads they created. A PA's associated human does not inherit its access.
 Recipients are deployment configuration, not workspace administrators.
 
-Use the existing participant app lifecycle to install/enable `feedback` for
-people and PAs. Bootstrap is available before installation; other calls require
-an enabled installation. The current installation is checked under a share
-lock in the transaction that reads or changes data. No persistent app capability
-is minted by this API. Uninstall preserves thread data, request receipts and
-pending delivery records. Running migration 0040 down is a separate schema
-downgrade: it removes Feedback data and installations, leaving other apps alone.
+Feedback needs no Workspace or personal installation. Bootstrap returns `scope:"builtin"`,
+which describes app provision, not visibility of other participants' reports.
+Authenticated callers must be real participants; all existing thread access rules
+apply. Migration 0044 retires only removable-app catalog/installation metadata,
+preserving conversations, attachments, read state and delivery records.
 
 An unset, malformed or nonexistent recipient configuration reports
 `available:false`. Creating feedback then fails with `unavailable`; existing
@@ -36,7 +34,7 @@ supplied actor. Both call the same Store.
 
 | Browser | PA POST action | Result |
 | --- | --- | --- |
-| GET `/feedback/bootstrap` | `feedback:bootstrap` | configuration, actor, install state |
+| GET `/feedback/bootstrap` | `feedback:bootstrap` | configuration, actor, builtin scope |
 | GET `/feedback/threads?status=all&cursor=…` | `feedback:list` | thread previews and next cursor |
 | POST `/feedback/threads` | `feedback:create` | created thread |
 | GET `/feedback/threads/{id}?cursor=…` | `feedback:open` | thread, message/status events, older cursor |
@@ -85,7 +83,7 @@ recognized from the bytes, with a 20 MiB limit per file. Create accepts optional
 the author's own unexpired uploads, and participates in request deduplication.
 Full thread responses include attachment metadata. The attachment URL supports
 range requests; only the staging author or, after send, a current thread viewer
-with enabled Feedback can read the bytes. Messaging attachment ownership and
+can read the bytes. Messaging attachment ownership and
 storage are separate.
 
 Feedback attachment bytes use the database with a 1 GiB / 10,000 object cap for
@@ -94,16 +92,16 @@ uploads expire after 24 hours and are reclaimed on upload and by a minute
 background sweep. Expiry never deletes attachments already bound to a thread.
 Each server permits four combined uploads/downloads at a time. Further media
 requests return `503 attachment_transfer_busy` before reading the body or blob;
-callers can retry. Disabled installations are rejected before upload body reads
-and installation authority is checked again when the upload is stored.
+callers can retry. Authentication is checked before upload body reads, and the caller identity is
+checked again when the upload is stored.
 
 ## PA attention
 
 Create, reply and status mutations also write an immutable notification snapshot
 for addressed PAs, excluding the actor. The API drains this outbox independently
-of browser connections. It rechecks installation and thread access before
+of browser connections. It rechecks participant existence and thread access before
 admission, uses the existing durable gateway receipt for ambiguous retries,
-and preserves pending failures for later attempts. A disabled/uninstalled or
+and preserves pending failures for later attempts. A nonexistent or
 no-longer-addressed PA does not receive new content. PA events use explicit
 Feedback provenance and can be opened in the Feedback app; they do not pretend
 to originate in a Messaging channel.
@@ -114,4 +112,4 @@ to originate in a Messaging channel.
 `testdb.Create`, applies migrations and drops those databases on cleanup.
 It covers author/recipient isolation, browser and leased PA identity, CSRF and
 revoked session admission, retries, resolved follow-ups, cursor pagination,
-read bounds, uninstall persistence and durable attention reconciliation.
+read bounds, built-in availability and durable attention reconciliation.

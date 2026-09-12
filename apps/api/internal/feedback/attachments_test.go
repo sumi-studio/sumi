@@ -97,12 +97,10 @@ func TestAttachmentTransferLimitPrecedesBodyAndBlobReadsAndReleasesCapacity(t *t
 	if res := request("GET", nil); res.Code != 404 {
 		t.Fatal("completed transfers did not release capacity", res.Code)
 	}
-	if _, err = w.pool.Exec(context.Background(), `UPDATE app_installations SET enabled=false WHERE owner_kind='human' AND owner_id=$1 AND app_id='feedback'`, w.human.ID); err != nil {
-		t.Fatal(err)
-	}
+	s.Sessions = sessions{revoked: true}
 	extraBody = &observedAttachmentBody{}
-	if res := request("POST", extraBody); res.Code != 403 || extraBody.reads != 0 {
-		t.Fatal("disabled installation body read", res.Code, extraBody.reads)
+	if res := request("POST", extraBody); res.Code != 401 || extraBody.reads != 0 {
+		t.Fatal("revoked session body read", res.Code, extraBody.reads)
 	}
 }
 

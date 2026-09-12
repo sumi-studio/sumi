@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"time"
@@ -38,7 +39,7 @@ func (s *Store) available(ctx context.Context, q participant.QueryRower) (bool, 
 	return true, nil
 }
 func (s *Store) Bootstrap(ctx context.Context, actor participant.Ref) (Bootstrap, error) {
-	b := Bootstrap{RecipientName: "Sumi開発", Participant: wire(actor), IsRecipient: s.isRecipient(actor)}
+	b := Bootstrap{RecipientName: "Sumi開発", Scope: "builtin", Participant: wire(actor), IsRecipient: s.isRecipient(actor)}
 	if actor.Validate() != nil {
 		return b, ErrInvalid
 	}
@@ -47,12 +48,13 @@ func (s *Store) Bootstrap(ctx context.Context, actor participant.Ref) (Bootstrap
 	if err != nil {
 		return b, err
 	}
-	err = s.pool.QueryRow(ctx, `SELECT installation_id, enabled FROM app_installations WHERE owner_kind=$1 AND owner_id=$2 AND app_id='feedback'`, actor.Kind, actor.ID).Scan(&b.InstallationID, &b.Enabled)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return b, nil
+	if ok, err := participant.Exists(ctx, s.pool, actor); err != nil || !ok {
+		if err == nil {
+			err = ErrInvalid
+		}
+		return b, err
 	}
-	b.Installed = err == nil
-	return b, err
+	return b, nil
 }
 func (s *Store) begin(ctx context.Context, actor participant.Ref) (pgx.Tx, error) {
 	if actor.Validate() != nil {
@@ -62,20 +64,23 @@ func (s *Store) begin(ctx context.Context, actor participant.Ref) (pgx.Tx, error
 	if err != nil {
 		return nil, err
 	}
-	var enabled bool
-	err = tx.QueryRow(ctx, `SELECT enabled FROM app_installations WHERE owner_kind=$1 AND owner_id=$2 AND app_id='feedback' FOR SHARE`, actor.Kind, actor.ID).Scan(&enabled)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = ErrInstallation
+	// Feedback is built in. Pin the caller's own identity, never an employer's
+	// installation. Thread access is still checked separately by thread().
+	query := "SELECT human_id FROM humans WHERE human_id=$1 FOR UPDATE"
+	if actor.Kind == participant.KindPersonalityAgent {
+		query = "SELECT personality_agent_id FROM agents WHERE personality_agent_id=$1 FOR UPDATE"
 	}
-	if err == nil && !enabled {
-		err = ErrDisabled
-	}
-	if err != nil {
+	var id string
+	if err = tx.QueryRow(ctx, query, actor.ID).Scan(&id); err != nil {
 		_ = tx.Rollback(ctx)
-		return nil, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalid
+		}
+		return nil, fmt.Errorf("lock Feedback caller identity: %w", err)
 	}
 	return tx, nil
 }
+
 func author(ctx context.Context, q participant.QueryRower, actor participant.Ref) (Author, error) {
 	a := Author{Participant: wire(actor)}
 	query := `SELECT display_name FROM humans WHERE human_id=$1`
@@ -445,8 +450,6 @@ func errorCode(err error) (int, string) {
 		return 400, err.Error()
 	case errors.Is(err, ErrNotFound):
 		return 404, err.Error()
-	case errors.Is(err, ErrInstallation), errors.Is(err, ErrDisabled):
-		return 403, err.Error()
 	case errors.Is(err, ErrUnavailable):
 		return 503, err.Error()
 	case errors.Is(err, ErrRequest), errors.Is(err, ErrRevision):

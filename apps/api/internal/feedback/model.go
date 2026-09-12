@@ -17,8 +17,6 @@ const pageSize = 50
 var (
 	ErrInvalid      = errors.New("invalid_request")
 	ErrNotFound     = errors.New("not_found")
-	ErrInstallation = errors.New("installation_required")
-	ErrDisabled     = errors.New("app_disabled")
 	ErrUnavailable  = errors.New("unavailable")
 	ErrRevision     = errors.New("revision_conflict")
 	ErrRequest      = errors.New("request_conflict")
@@ -74,13 +72,12 @@ type Activity struct {
 	Revision  int64     `json:"revision"`
 }
 type Bootstrap struct {
-	RecipientName  string      `json:"recipient_name"`
-	Available      bool        `json:"available"`
-	Participant    Participant `json:"participant"`
-	IsRecipient    bool        `json:"is_recipient"`
-	Installed      bool        `json:"installed"`
-	Enabled        bool        `json:"enabled"`
-	InstallationID string      `json:"installation_id,omitempty"`
+	RecipientName string      `json:"recipient_name"`
+	Available     bool        `json:"available"`
+	Participant   Participant `json:"participant"`
+	IsRecipient   bool        `json:"is_recipient"`
+	// Scope describes app provision, not shared access to other participants' threads.
+	Scope string `json:"scope"`
 }
 type ThreadList struct {
 	Threads    []Thread `json:"threads"`

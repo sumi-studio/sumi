@@ -185,10 +185,8 @@ func (s *Store) attemptAttention(ctx context.Context, d AttentionDelivery, e Att
 	}
 	defer tx.Rollback(ctx)
 	actor := participant.PersonalityAgent(e.PersonalityAgentID)
-	var enabled bool
-	err = tx.QueryRow(ctx, `SELECT enabled FROM app_installations WHERE owner_kind='personality_agent' AND owner_id=$1 AND app_id='feedback' FOR SHARE`, actor.ID).Scan(&enabled)
-	eligible := err == nil && enabled
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	eligible, err := participant.Exists(ctx, tx, actor)
+	if err != nil {
 		return false, err
 	}
 	if eligible {

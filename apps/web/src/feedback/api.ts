@@ -51,9 +51,8 @@ export interface Bootstrap {
   available: boolean;
   participant: Participant;
   is_recipient: boolean;
-  installed: boolean;
-  enabled: boolean;
-  installation_id?: string;
+  /** App provision only; each thread retains its own access rules. */
+  scope: "builtin";
 }
 export interface ThreadPage {
   threads: Thread[];

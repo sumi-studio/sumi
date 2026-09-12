@@ -791,7 +791,6 @@ func TestCatalogProjectsOnlyAppOwnedWorkspaceRoleCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	foundMessaging := false
-	foundFeedback := false
 	for _, descriptor := range catalog {
 		switch descriptor.AppID {
 		case "messaging":
@@ -803,13 +802,9 @@ func TestCatalogProjectsOnlyAppOwnedWorkspaceRoleCapabilities(t *testing.T) {
 			if capability.Ref != "app.messaging.manage_channels" || capability.Label != "Manage channels" {
 				t.Fatalf("Messaging capability = %#v", capability)
 			}
-		case "alarm", "direct-chat", "life-log", "feedback":
-			if descriptor.AppID == "feedback" {
-				foundFeedback = true
-				if descriptor.WorkspaceOwnerAllowed || !descriptor.ParticipantOwnerAllowed {
-					t.Fatal("feedback must remain participant owned")
-				}
-			}
+		case "feedback":
+			t.Fatal("built-in Feedback must not advertise an installation")
+		case "alarm", "direct-chat", "life-log":
 			if descriptor.WorkspaceRoleCapabilities == nil || len(descriptor.WorkspaceRoleCapabilities) != 0 {
 				t.Fatalf("%s capabilities = %#v, want a non-nil empty catalog projection",
 					descriptor.AppID, descriptor.WorkspaceRoleCapabilities)
@@ -821,8 +816,8 @@ func TestCatalogProjectsOnlyAppOwnedWorkspaceRoleCapabilities(t *testing.T) {
 			}
 		}
 	}
-	if !foundMessaging || !foundFeedback {
-		t.Fatal("catalog omitted Messaging or Feedback")
+	if !foundMessaging {
+		t.Fatal("catalog omitted Messaging")
 	}
 	for _, invalid := range []struct {
 		id, appID, ref string

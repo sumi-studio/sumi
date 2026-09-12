@@ -87,14 +87,7 @@ export function AppRail({
       directInstallation !== "duplicate" &&
       directInstallation?.state === "enabled");
   const DirectIcon = DIRECT_CHAT_RENDERER.icon;
-  const feedbackInstallation = participantInstallation(
-    participantInstallations,
-    FEEDBACK_RENDERER.appId,
-  );
-  const feedbackEnabled =
-    exactHumanOwner &&
-    feedbackInstallation !== "duplicate" &&
-    feedbackInstallation?.state === "enabled";
+  const feedbackEnabled = Boolean(authenticated && user);
   const FeedbackIcon = FEEDBACK_RENDERER.icon;
 
   return (
