@@ -45,3 +45,18 @@ preset = "opencode-go"
 # id = "<dedicated-escalation-reviewer-model>"
 # preset = "<optional-structured-output-capable-preset>"
 # api_key_env = "<optional-reviewer-api-key-env>"
+
+# Notification reflex: opt-in selection on the SAME user connection as the parent.
+# No default lightweight model is purchased/chosen by Sumi. With neither field
+# set, the current parent model and effort are inherited. Environment overrides:
+# SUMI_REFLEX_MODEL_ID and SUMI_REFLEX_REASONING_EFFORT.
+# [reflex]
+# model_id = "<smaller-model-id-supported-by-this-connection>"
+# reasoning_effort = "low"
+# Only these two fields are supported; endpoint/account/credentials cannot change.
+# The selected model must accept the parent's complete context, images, protocol,
+# and request budget. Unsupported requests use the existing original-event soft
+# fallback, never a silent retry with the more expensive parent model. Native
+# opaque replay or model-bound thinking cannot be dropped to make a model switch
+# fit, so those snapshots also fall back softly. Effort-only changes keep the
+# parent model and exact replay. The parent prompt/options are never mutated.
