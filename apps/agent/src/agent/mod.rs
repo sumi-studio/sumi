@@ -667,6 +667,7 @@ pub(crate) struct AdmittedCommand {
     received_monotonic: Option<Instant>,
     incoming_timing: Option<crate::provider::types::IncomingEventTiming>,
     event_interpretation: Option<String>,
+    hard_steer_allowed: bool,
 }
 
 impl AdmittedCommand {
@@ -677,6 +678,7 @@ impl AdmittedCommand {
             received_monotonic: None,
             incoming_timing: None,
             event_interpretation: None,
+            hard_steer_allowed: true,
         }
     }
 
@@ -691,6 +693,7 @@ impl AdmittedCommand {
             received_monotonic: Some(received_monotonic),
             incoming_timing: None,
             event_interpretation: None,
+            hard_steer_allowed: true,
         }
     }
 
@@ -704,6 +707,11 @@ impl AdmittedCommand {
 
     fn with_event_interpretation(mut self, interpretation: Option<String>) -> Self {
         self.event_interpretation = interpretation;
+        self
+    }
+
+    fn without_hard_steer(mut self) -> Self {
+        self.hard_steer_allowed = false;
         self
     }
 
@@ -1780,6 +1788,11 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn route_hard_steer(&mut self, command: AdmittedCommand) -> Result<bool, SessionFailure> {
+        // Deferral changes when a notification can be delivered, not whether
+        // its already-assessed delivery may interrupt a provider generation.
+        if !command.hard_steer_allowed {
+            return Ok(false);
+        }
         let (mut phase_rx, accepted_rx) = {
             let Some(active) = self.active.as_mut() else {
                 return Ok(false);

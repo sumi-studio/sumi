@@ -195,11 +195,15 @@ impl<G: Gateway + 'static> Session<G> {
             .as_ref()
             .is_some_and(|active| active.bridge.same_output_audience(&command))
         {
-            return self.defer_active_command(command);
+            return self.defer_active_command(command.without_hard_steer());
         }
         if hard && self.route_hard_steer(command.clone()).await? {
             return Ok(());
         }
+        // A fresh hard recommendation gets only the attempt above. Soft,
+        // stale, failed, or deferred assessments must remain non-interrupting
+        // when the ordinary queue is reclassified at a later lifecycle event.
+        let command = command.without_hard_steer();
         if self.route_retry_wait_command(&command).await?
             || self.route_soft_steer(command.clone()).await?
         {
