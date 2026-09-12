@@ -347,7 +347,6 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
-	var messagingPushCloser *messaging.Store
 	var workspaceServer *workspacecontrol.Server
 	var workspaceStore *workspacecontrol.Store
 	var appStore *applicationapps.Store
@@ -487,6 +486,9 @@ func newApplicationFromEnv() (*application, error) {
 		log.Print("workspace and app lifecycle routes ready")
 
 		messagingStore := messaging.New(database.Pool, workspaceStore, appStore)
+		if authEnabled {
+			authServer.PushDevices = messagingStore
+		}
 		if err := configureMessagingAttachmentsFromEnv(messagingStore); err != nil {
 			closeOnError()
 			return nil, fmt.Errorf("messaging attachments: %w", err)
@@ -502,7 +504,7 @@ func newApplicationFromEnv() (*application, error) {
 				return nil, errors.New("SUMI_MESSAGING_PUSH_SUBJECT requires browser session authorization")
 			}
 			pushDispatcher, pushErr := messaging.NewPushDispatcher(
-				context.Background(), messagingStore, sv, pushSubject,
+				context.Background(), messagingStore, pushSubject,
 			)
 			if pushErr != nil {
 				closeOnError()
@@ -510,7 +512,6 @@ func newApplicationFromEnv() (*application, error) {
 			}
 			messagingStore.UsePush(pushDispatcher)
 			messagingServer.Push = pushDispatcher
-			messagingPushCloser = messagingStore
 			log.Print("messaging Web Push ready (generic payload)")
 		} else {
 			log.Print("messaging Web Push disabled: SUMI_MESSAGING_PUSH_SUBJECT is unset")
@@ -541,9 +542,6 @@ func newApplicationFromEnv() (*application, error) {
 		closers := browserSessionConnectionClosers{browser}
 		if messagingWS != nil {
 			closers = append(closers, messagingWS)
-		}
-		if messagingPushCloser != nil {
-			closers = append(closers, messagingPushCloser)
 		}
 		authServer.Connections = closers
 	}

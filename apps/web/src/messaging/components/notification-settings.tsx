@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isImeComposing } from "../../lib/ime";
 import type { NotificationLevel } from "../model";
 import { type NotificationWriteResult, useMessaging } from "../store";
+import { DevicePushSettings } from "./device-push-settings";
 import { useOverlayPanel } from "./overlay";
 import { NOTIFICATION_LEVEL_LABEL } from "./place-context-menu";
 
@@ -243,6 +244,7 @@ export function NotificationSettingsMenu() {
             aria-label="通知キーワードを追加"
             className="w-full rounded-md border border-border bg-transparent px-2 py-1 text-[12.5px] outline-none focus:border-muted-foreground/60"
           />
+          <DevicePushSettings />
           <SoundToggle
             enabled={soundEnabled}
             onToggle={() => {

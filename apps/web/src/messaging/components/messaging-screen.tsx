@@ -121,11 +121,17 @@ function NotificationPermissionBanner() {
   const [permission, setPermission] = useState<NotificationPermissionState>(
     () => notificationPermission(),
   );
+  const [registrationFailed, setRegistrationFailed] = useState(false);
   const [dismissed, setDismissed] = useState(() =>
     isPermissionPromptDismissed(),
   );
 
-  if (!enabled || !isPushSupported() || dismissed || permission !== "default") {
+  if (
+    !enabled ||
+    !isPushSupported() ||
+    dismissed ||
+    (permission !== "default" && !registrationFailed)
+  ) {
     return null;
   }
 
@@ -133,19 +139,24 @@ function NotificationPermissionBanner() {
     <div className="flex shrink-0 items-center gap-2 border-border/70 border-b bg-accent/40 px-4 py-1.5 sm:px-5">
       <Bell className="size-3.5 shrink-0 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
-        呼ばれたときだけ通知します。ブラウザの通知を許可しますか？
+        {registrationFailed
+          ? "通知を登録できませんでした。再試行できます。"
+          : "ブラウザの通知を許可しますか？"}
       </span>
       <button
         type="button"
         onClick={() => {
           void requestNotificationPermission().then((next) => {
             setPermission(next);
-            if (next === "granted") void enablePushSubscription();
+            if (next === "granted")
+              void enablePushSubscription(true).then((saved) =>
+                setRegistrationFailed(!saved),
+              );
           });
         }}
         className="shrink-0 rounded-md bg-primary px-2 py-0.5 font-medium text-[12px] text-primary-foreground hover:opacity-90"
       >
-        許可する
+        {registrationFailed ? "再試行" : "許可する"}
       </button>
       <button
         type="button"

@@ -182,6 +182,7 @@ type BrowserAuthServer struct {
 	SecureCookies         bool
 	SessionTTL            time.Duration
 	Connections           BrowserSessionConnectionCloser
+	PushDevices           BrowserPushDevices
 	Flows                 BrowserAuthFlowController
 	Profiles              HumanProfileReader
 	random                io.Reader
@@ -309,6 +310,9 @@ func (s *BrowserAuthServer) serveSessionExchange(w http.ResponseWriter, r *http.
 }
 
 func (s *BrowserAuthServer) establishSession(w http.ResponseWriter, r *http.Request, claims UserSessionClaims) error {
+	if s.PushDevices != nil && len(r.CookiesNamed(BrowserPushDeviceCookie)) > 1 {
+		return errors.New("duplicate push device cookies")
+	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	ttl := s.SessionTTL
@@ -339,6 +343,9 @@ func (s *BrowserAuthServer) establishSession(w http.ResponseWriter, r *http.Requ
 		if err != nil {
 			return err
 		}
+	}
+	if err := s.refreshPushDevice(w, r, claims.UserID); err != nil {
+		return err
 	}
 	http.SetCookie(w, s.sessionCookie(session, int(ttl/time.Second)))
 	return nil
@@ -403,6 +410,14 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
+	// Retain HTTP authority if device revocation fails, so the user keeps the
+	// logout control and can retry. A removed device cannot be registered by an
+	// in-flight application request; only a later authenticated exchange can
+	// create a new device, and exchanges are serialized by sessionMu.
+	if err := s.revokePushDevice(r); err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "notification revocation unavailable")
+		return
+	}
 	for _, cookie := range r.CookiesNamed(BrowserSessionCookie) {
 		revoked, valid, revokeErr := s.Sessions.RevokeSessionForLogout(
 			r.Context(),
@@ -419,6 +434,9 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 				s.Connections.CloseBrowserSession(revoked.sessionID)
 			}
 		}
+	}
+	if s.PushDevices != nil || len(r.CookiesNamed(BrowserPushDeviceCookie)) > 0 {
+		http.SetCookie(w, s.pushDeviceCookie("", -1))
 	}
 	http.SetCookie(w, s.sessionCookie("", -1))
 	http.SetCookie(w, s.csrfCookie("", -1))

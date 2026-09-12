@@ -4,7 +4,7 @@ import { isMessagingPath, messagingPlacePath } from "./place-path.js";
 
 const GENERIC_TITLE = "Sumi";
 const GENERIC_BODY = "新しいメッセージがあります";
-const PLACE_KINDS = new Set(["channel", "dm", "group_dm"]);
+const PLACE_KINDS = new Set(["channel", "dm", "group_dm", "thread"]);
 
 self.addEventListener("install", () => {
   self.skipWaiting();

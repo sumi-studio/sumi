@@ -80,6 +80,15 @@ describe("generic push Service Worker", () => {
     openWindow.mockClear();
   });
 
+  it("shows thread notifications and opens their exact workspace thread", async () => {
+    await deliver({ ...POINTER, place_kind: "thread", place_id: "thread-1" });
+    expect(shown).toHaveLength(1);
+    await clickLast();
+    expect(openWindow).toHaveBeenCalledWith(
+      "/w/workspace-1/messaging/t/thread-1",
+    );
+  });
+
   it("ignores server-authored display content and uses fixed generic copy", async () => {
     await deliver({
       ...POINTER,
