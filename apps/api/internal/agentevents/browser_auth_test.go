@@ -126,14 +126,14 @@ func obtainCSRF(t *testing.T, server *BrowserAuthServer) (string, *http.Cookie) 
 		t.Fatal(err)
 	}
 	cookies := recorder.Result().Cookies()
-	if len(cookies) != 1 {
-		t.Fatalf("expected one CSRF cookie, got %d", len(cookies))
+	if len(cookies) != 2 {
+		t.Fatalf("expected CSRF cookie and legacy deletion, got %d", len(cookies))
 	}
 	if cookies[0].Name != BrowserCSRFCookie ||
 		cookies[0].HttpOnly ||
 		!cookies[0].Secure ||
 		cookies[0].SameSite != http.SameSiteLaxMode ||
-		cookies[0].Path != "/auth" ||
+		cookies[0].Path != "/" ||
 		cookies[0].Domain != "" {
 		t.Fatalf("unexpected CSRF cookie: %+v", cookies[0])
 	}
@@ -495,8 +495,8 @@ func TestBrowserAuthLogoutClearsSessionAndCSRF(t *testing.T) {
 		t.Fatalf("got %d, want 204", recorder.Code)
 	}
 	cookies := recorder.Result().Cookies()
-	if len(cookies) != 2 {
-		t.Fatalf("expected two clearing cookies, got %d", len(cookies))
+	if len(cookies) != 3 {
+		t.Fatalf("expected session and both CSRF paths cleared, got %d", len(cookies))
 	}
 	for _, cleared := range cookies {
 		if cleared.MaxAge >= 0 {
@@ -931,7 +931,7 @@ func TestBrowserAuthDuplicateCookieLogoutRevokesEveryVerifiableSession(t *testin
 		t.Fatalf("closed sessions = %v, want two", closer.sessionIDs)
 	}
 	cleared := recorder.Result().Cookies()
-	if len(cleared) != 2 || cleared[0].Name != BrowserSessionCookie || cleared[0].MaxAge >= 0 {
+	if len(cleared) != 3 || cleared[0].Name != BrowserSessionCookie || cleared[0].MaxAge >= 0 {
 		t.Fatalf("logout did not clear authoritative cookie: %+v", cleared)
 	}
 }

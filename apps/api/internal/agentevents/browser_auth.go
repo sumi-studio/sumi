@@ -251,6 +251,7 @@ func (s *BrowserAuthServer) serveCSRF(w http.ResponseWriter, r *http.Request) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	http.SetCookie(w, s.csrfCookie(token, 0))
+	s.expireLegacyCSRFCookie(w)
 	writeBrowserAuthJSON(w, http.StatusOK, map[string]string{"csrf_token": token})
 }
 
@@ -421,6 +422,7 @@ func (s *BrowserAuthServer) serveLogout(w http.ResponseWriter, r *http.Request) 
 	}
 	http.SetCookie(w, s.sessionCookie("", -1))
 	http.SetCookie(w, s.csrfCookie("", -1))
+	s.expireLegacyCSRFCookie(w)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -481,7 +483,7 @@ func (s *BrowserAuthServer) csrfCookie(value string, maxAge int) *http.Cookie {
 	cookie := &http.Cookie{
 		Name:     BrowserCSRFCookie,
 		Value:    value,
-		Path:     "/auth",
+		Path:     "/",
 		HttpOnly: false,
 		Secure:   s.SecureCookies,
 		SameSite: http.SameSiteLaxMode,
@@ -491,6 +493,14 @@ func (s *BrowserAuthServer) csrfCookie(value string, maxAge int) *http.Cookie {
 		cookie.Expires = time.Unix(1, 0)
 	}
 	return cookie
+}
+
+// Retire the former auth-only cookie so browsers do not send two cookies with
+// the same name to /auth after the application-wide cookie is issued.
+func (s *BrowserAuthServer) expireLegacyCSRFCookie(w http.ResponseWriter) {
+	cookie := s.csrfCookie("", -1)
+	cookie.Path = "/auth"
+	http.SetCookie(w, cookie)
 }
 
 func writeBrowserAuthError(w http.ResponseWriter, status int, message string) {
