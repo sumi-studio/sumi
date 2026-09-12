@@ -871,10 +871,19 @@ test("private origin binding preserves request and WebSocket in workerd", {
     const config = resolve(directory, "wrangler.jsonc");
     const originConfig = resolve(directory, "origin.jsonc");
     await writeFile(
+      resolve(directory, "entry.ts"),
+      `import worker from ${JSON.stringify(resolve(webDirectory, "cloudflare/worker.ts"))};
+export default {fetch(request, env) {
+  const url = new URL(request.url);
+  if (url.pathname === "/auth/secure") { url.protocol = "https:"; request = new Request(url, request); }
+  return worker.fetch(request, env);
+}};`,
+    );
+    await writeFile(
       config,
       JSON.stringify({
         name: "sumi-vpc-test",
-        main: resolve(webDirectory, "cloudflare/worker.ts"),
+        main: resolve(directory, "entry.ts"),
         compatibility_date: "2026-08-11",
         compatibility_flags: [
           "enable_request_signal",
@@ -900,6 +909,13 @@ test("private origin binding preserves request and WebSocket in workerd", {
         return new Response(null, {status:101, webSocket:pair[0]});
       }
       if (new URL(request.url).pathname === "/auth/redirect") return new Response(null, {status:302, headers:{Location:"https://login.example.org/"}});
+      if (new URL(request.url).pathname === "/auth/secure") {
+        const headers = new Headers({"Content-Type":"text/plain"});
+        headers.append("Set-Cookie", "session=opaque; HttpOnly; Path=/; SameSite=Lax");
+        headers.append("Set-Cookie", "csrf=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/");
+        headers.append("Set-Cookie", "secure=yes; Secure; HttpOnly");
+        return new Response("stream body", {headers});
+      }
       const data = {url:request.url, method:request.method, headers:Object.fromEntries(request.headers), body:await request.text()};
       return new Response(new ReadableStream({start(controller){ controller.enqueue(new TextEncoder().encode(JSON.stringify(data))); controller.close(); }}), {headers:{"Content-Type":"application/json", "Set-Cookie":"session=opaque; Secure; HttpOnly"}});
     }};`,
@@ -965,6 +981,13 @@ test("private origin binding preserves request and WebSocket in workerd", {
       (await fetch(`${origin}/auth/redirect`, { redirect: "manual" })).status,
       302,
     );
+    const secure = await fetch(`${origin}/auth/secure`);
+    assert.deepEqual(secure.headers.getSetCookie(), [
+      "session=opaque; HttpOnly; Path=/; SameSite=Lax; Secure",
+      "csrf=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; Path=/; Secure",
+      "secure=yes; Secure; HttpOnly",
+    ]);
+    assert.equal(await secure.text(), "stream body");
     await new Promise<void>((resolveSocket, rejectSocket) => {
       const socket = new WebSocket(`ws://127.0.0.1:${port}/messaging/ws`);
       const timeout = setTimeout(() => {

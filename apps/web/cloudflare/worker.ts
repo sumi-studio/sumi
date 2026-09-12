@@ -81,10 +81,39 @@ async function fetchPrivateService(
     publicUrl.port || (publicUrl.protocol === "https:" ? "443" : "80"),
   );
   // Return redirects to the browser, without replaying cookies/body to a new
-  // destination. Preserve response identity for streams and WebSocket 101.
-  return binding.fetch(forwarded, {
+  // destination. WebSocket upgrades retain their exact response identity.
+  const response = await binding.fetch(forwarded, {
     signal: request.signal,
     redirect: "manual",
+  });
+  return publicUrl.protocol === "https:"
+    ? secureOriginCookies(response)
+    : response;
+}
+
+function secureOriginCookies(response: Response): Response {
+  if (response.status === 101 || !response.headers.has("Set-Cookie"))
+    return response;
+  const cookies = response.headers.getSetCookie();
+  const secured = cookies.map((cookie) =>
+    cookie
+      .split(";")
+      .slice(1)
+      .some((attribute) => attribute.trim().toLowerCase() === "secure")
+      ? cookie
+      : `${cookie}; Secure`,
+  );
+  if (secured.every((cookie, index) => cookie === cookies[index]))
+    return response;
+  const headers = new Headers(response.headers);
+  headers.delete("Set-Cookie");
+  for (const cookie of secured) headers.append("Set-Cookie", cookie);
+  // HTTPS termination is here; the same API still serves local HTTP clients.
+  // Reuse the untouched stream, without cloning, reading, or buffering it.
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 

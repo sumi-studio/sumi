@@ -894,3 +894,56 @@ test("failed VPC origin does not retry through public fetch or assets", async ()
   assert.equal(response.headers.get("Cache-Control"), "no-store");
   assert.deepEqual(await response.json(), { error: "origin_unavailable" });
 });
+
+test("HTTPS VPC termination secures each cookie without folding attributes or buffering", async () => {
+  const cookies = [
+    "session=opaque; Path=/; HttpOnly; SameSite=Lax",
+    "csrf=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; SameSite=Strict",
+    "already=yes; sEcUrE; HttpOnly",
+    "secure=value; Path=/secure; HttpOnly",
+  ];
+  const headers = new Headers({
+    Location: "/direct",
+    "Cache-Control": "no-store",
+  });
+  for (const cookie of cookies) headers.append("Set-Cookie", cookie);
+  const body = new ReadableStream();
+  const upstream = new Response(body, { status: 302, headers });
+  const result = await handleRequest(
+    new Request("https://sumi-alpha.example.workers.dev/auth/session"),
+    {
+      ASSETS: { fetch: () => assert.fail() },
+      SUMI_ORIGIN: { fetch: async () => upstream },
+    },
+  );
+  assert.equal(result.body, body);
+  assert.equal(result.bodyUsed, false);
+  assert.equal(result.status, 302);
+  assert.equal(result.headers.get("Location"), "/direct");
+  assert.equal(result.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(
+    result.headers.getSetCookie(),
+    cookies.map((cookie, index) =>
+      index === 2 ? cookie : `${cookie}; Secure`,
+    ),
+  );
+  assert.deepEqual(upstream.headers.getSetCookie(), cookies);
+  await result.body?.cancel();
+});
+
+test("HTTP VPC and direct origin routing leave local development cookies unchanged", async () => {
+  for (const vpc of [true, false]) {
+    const upstream = new Response(null, {
+      headers: { "Set-Cookie": "session=local; HttpOnly" },
+    });
+    const result = await handleRequest(
+      new Request(`${vpc ? "http" : "https"}://localhost/auth/session`),
+      {
+        ASSETS: { fetch: () => assert.fail() },
+        ...(vpc ? { SUMI_ORIGIN: { fetch: async () => upstream } } : {}),
+      },
+      async () => upstream,
+    );
+    assert.equal(result, upstream);
+  }
+});
