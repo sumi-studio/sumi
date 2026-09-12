@@ -3,10 +3,6 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAuth } from "../auth/auth-context";
 import { isImeComposing } from "../lib/ime";
-import {
-  participantInstallation,
-  useParticipantApps,
-} from "../participant/app-store";
 import { type Bootstrap, feedbackClient, type Thread } from "./api";
 import {
   captureFeedbackDiagnostics,
@@ -34,17 +30,7 @@ export function FeedbackMode({
   workspaceId?: string;
 }) {
   const { authenticated, user } = useAuth();
-  const apps = useParticipantApps();
-  const installed = participantInstallation(apps.installations, "feedback");
-  const allowed = Boolean(
-    authenticated &&
-      user &&
-      apps.owner?.kind === "participant" &&
-      apps.owner.participant.kind === "human" &&
-      apps.owner.participant.humanId === user.id &&
-      installed !== "duplicate" &&
-      installed?.state === "enabled",
-  );
+  const allowed = Boolean(authenticated && user);
   const [snapshot, setSnapshot] = useState<FeedbackDiagnostics>();
   const [open, setOpen] = useState(false);
   const [minimized, setMinimized] = useState(false);
@@ -91,7 +77,7 @@ export function FeedbackMode({
       visual.removeEventListener("scroll", update);
     };
   }, []);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: A changed identity or installation must discard the previous user's open panel.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A changed identity must discard the previous user's open panel.
   useEffect(() => {
     setOpen(false);
     setSnapshot(undefined);
@@ -550,7 +536,7 @@ export function FeedbackMode({
             }
             client={feedbackClient}
             recipient={bootstrap.recipient_name}
-            enabled={bootstrap.enabled && bootstrap.available}
+            enabled={bootstrap.available}
             onBack={close}
             onCreated={setCreated}
             onCaptureChange={setCapture}

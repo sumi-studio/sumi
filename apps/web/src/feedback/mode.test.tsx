@@ -14,20 +14,14 @@ import { feedbackClient } from "./api";
 import { resetFeedbackOrigin } from "./diagnostics";
 import { FeedbackMode, openFeedbackMode } from "./mode";
 
-const identity = vi.hoisted(() => ({ userId: "mode-human", enabled: true }));
-vi.mock("../auth/auth-context", () => ({
-  useAuth: () => ({ authenticated: true, user: { id: identity.userId } }),
+const identity = vi.hoisted(() => ({
+  userId: "mode-human",
+  authenticated: true,
 }));
-vi.mock("../participant/app-store", () => ({
-  useParticipantApps: () => ({
-    owner: {
-      kind: "participant",
-      participant: { kind: "human", humanId: identity.userId },
-    },
-    installations: [],
-  }),
-  participantInstallation: () => ({
-    state: identity.enabled ? "enabled" : "disabled",
+vi.mock("../auth/auth-context", () => ({
+  useAuth: () => ({
+    authenticated: identity.authenticated,
+    user: { id: identity.userId },
   }),
 }));
 
@@ -35,7 +29,7 @@ beforeEach(() => {
   localStorage.clear();
   resetFeedbackOrigin();
   identity.userId = "mode-human";
-  identity.enabled = true;
+  identity.authenticated = true;
   vi.spyOn(globalThis, "fetch").mockImplementation(
     async () => new Response("{}", { status: 200 }),
   );
@@ -44,8 +38,7 @@ beforeEach(() => {
     recipient_name: "Sumi開発",
     available: true,
     is_recipient: false,
-    installed: true,
-    enabled: true,
+    scope: "builtin",
   });
 });
 afterEach(() => {
@@ -103,7 +96,7 @@ it("releases target interception when Feedback access disappears", async () => {
   const view = render(content());
   await open();
   fireEvent.click(screen.getByRole("button", { name: "画面の場所を指定" }));
-  identity.enabled = false;
+  identity.authenticated = false;
   view.rerender(content());
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "元の操作" }));

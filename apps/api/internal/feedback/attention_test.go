@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"testing"
 	"time"
@@ -79,10 +78,7 @@ func TestFeedbackAttentionReconcilesLostAckWithOriginalSender(t *testing.T) {
 	if command["content"] != reply.Body {
 		t.Fatal("body changed")
 	}
-	// Recovery acknowledges the prior admission even after eligibility is lost.
-	if _, err = w.pool.Exec(ctx, `UPDATE app_installations SET enabled=false WHERE owner_id=$1 AND app_id='feedback'`, w.pa.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Recovery acknowledges the prior admission without a second delivery.
 	if _, err = w.pool.Exec(ctx, `UPDATE feedback_attention_outbox SET next_attempt_at=now()`); err != nil {
 		t.Fatal(err)
 	}
@@ -90,14 +86,14 @@ func TestFeedbackAttentionReconcilesLostAckWithOriginalSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(d.events) != 1 || d.prepared != 1 {
-		t.Fatal("recovery duplicated delivery or restarted disabled agent")
+		t.Fatal("recovery duplicated delivery or restarted agent")
 	}
 	var outcome string
 	if err = w.pool.QueryRow(ctx, `SELECT outcome FROM feedback_attention_outbox WHERE event_id=$1 AND recipient_paid=$2`, reply.ID, w.pa.ID).Scan(&outcome); err != nil || outcome != "admitted" {
 		t.Fatalf("receipt: %s %v", outcome, err)
 	}
 }
-func TestFeedbackAttentionSuppressesUnavailableRecipientAndSelfEcho(t *testing.T) {
+func TestFeedbackAttentionBuiltinRecipientAndSelfEcho(t *testing.T) {
 	w := fixture(t)
 	ctx := context.Background()
 	w.s.recipients = append(w.s.recipients, w.pa)
@@ -112,18 +108,15 @@ func TestFeedbackAttentionSuppressesUnavailableRecipientAndSelfEcho(t *testing.T
 	if _, err = w.s.Reply(ctx, w.dev, thread.ID, "Reply", uuid.NewString()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = w.pool.Exec(ctx, `UPDATE app_installations SET enabled=false WHERE owner_kind=$1 AND owner_id=$2 AND app_id='feedback'`, participant.KindPersonalityAgent, w.pa.ID); err != nil {
-		t.Fatal(err)
-	}
 	d := &fakeAttention{}
 	if err = w.s.DeliverAttention(ctx, d, 10); err != nil {
 		t.Fatal(err)
 	}
-	if len(d.events) != 0 || d.prepared != 0 {
-		t.Fatal("disabled recipient was started or notified")
+	if len(d.events) != 1 || d.prepared != 1 {
+		t.Fatal("built-in recipient was not notified")
 	}
 	var outcome string
-	if err = w.pool.QueryRow(ctx, `SELECT outcome FROM feedback_attention_outbox`).Scan(&outcome); err != nil || outcome != "suppressed" {
+	if err = w.pool.QueryRow(ctx, `SELECT outcome FROM feedback_attention_outbox`).Scan(&outcome); err != nil || outcome != "admitted" {
 		t.Fatalf("suppression: %s %v", outcome, err)
 	}
 }
@@ -150,9 +143,6 @@ func TestFeedbackAttentionTimedOutRecipientDoesNotStarveAnother(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := participant.PersonalityAgent(paid)
-	if _, err = apps.New(w.pool, nil).InstallAtOperation(ctx, apps.ParticipantOwner(other), other, AppID, uuid.NewString()); err != nil {
-		t.Fatal(err)
-	}
 	w.s.recipients = []participant.Ref{w.pa, other}
 	if _, err = w.s.Create(ctx, w.human, "相談", "内容", uuid.NewString(), nil); err != nil {
 		t.Fatal(err)

@@ -96,11 +96,8 @@ func TestDiagnosticCaptureUsesSessionPAAndSurvivesUnavailableRuntime(t *testing.
 		t.Fatal("revoked diagnostic capture", res.Code)
 	}
 	s.Sessions = diagnosticSessions{paid: w.pa.ID}
-	if _, err = w.pool.Exec(context.Background(), `UPDATE app_installations SET enabled=false WHERE owner_kind='human' AND owner_id=$1 AND app_id='feedback'`, w.human.ID); err != nil {
-		t.Fatal(err)
-	}
-	if res = request(`{}`); res.Code != 403 {
-		t.Fatal("disabled Feedback captured diagnostics", res.Code)
+	if res = request(`{}`); res.Code != 200 {
+		t.Fatal("built-in Feedback unavailable", res.Code)
 	}
 }
 

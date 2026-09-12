@@ -109,7 +109,7 @@ export function FeedbackInbox({
         const boot = await client.bootstrap();
         if (version !== generation.current) return;
         setBootstrap(boot);
-        if (!boot.enabled || !boot.available) {
+        if (!boot.available) {
           setLoading(false);
           return;
         }
@@ -204,7 +204,7 @@ export function FeedbackInbox({
       .includes(search.toLocaleLowerCase()),
   );
   const detailVisible = Boolean(location.thread || location.compose);
-  const unavailable = bootstrap && (!bootstrap.available || !bootstrap.enabled);
+  const unavailable = bootstrap && !bootstrap.available;
   return (
     <div
       ref={container}
@@ -226,7 +226,7 @@ export function FeedbackInbox({
             className="feedback-icon-button"
             title="新しいフィードバック"
             aria-label="新しいフィードバック"
-            disabled={!bootstrap?.available || !bootstrap?.enabled}
+            disabled={!bootstrap?.available}
             onClick={() => navigate({ compose: true })}
           >
             <MessageSquarePlus size={20} />
@@ -269,9 +269,7 @@ export function FeedbackInbox({
           )}
           {unavailable && (
             <p className="feedback-list-note" role="status">
-              {!bootstrap.enabled
-                ? "Feedbackを有効にしてください。"
-                : "送信先の準備中です。まだ送信できません。"}
+              {"送信先の準備中です。まだ送信できません。"}
             </p>
           )}
           {!loading && !error && !unavailable && visible.length === 0 && (
@@ -357,7 +355,7 @@ export function FeedbackInbox({
             key={`${actor}:new`}
             actor={actor}
             recipient={bootstrap?.recipient_name ?? "Sumi開発"}
-            enabled={Boolean(bootstrap?.enabled && bootstrap.available)}
+            enabled={Boolean(bootstrap?.available)}
             client={client}
             onBack={() => navigate({})}
             onCreated={(thread) => {
@@ -389,7 +387,7 @@ export function FeedbackInbox({
             <button
               type="button"
               className="feedback-primary"
-              disabled={!bootstrap?.available || !bootstrap?.enabled}
+              disabled={!bootstrap?.available}
               onClick={() => navigate({ compose: true })}
             >
               フィードバックを書く

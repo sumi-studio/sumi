@@ -105,6 +105,11 @@ func TestFeedbackBrowserAndPABoundaries(t *testing.T) {
 	if r := local("open", bearer, `{"thread_id":"`+humanThread.ID+`"}`); r.Code != 404 {
 		t.Fatal("PA inherited employer access", r.Code, r.Body.String())
 	}
+	res = local("bootstrap", bearer, `{}`)
+	var bootstrap Bootstrap
+	if err := json.Unmarshal(res.Body.Bytes(), &bootstrap); res.Code != 200 || err != nil || !bootstrap.Available || bootstrap.Scope != "builtin" {
+		t.Fatalf("PA cannot discover built-in Feedback: %d %+v %v", res.Code, bootstrap, err)
+	}
 	res = local("create", bearer, create)
 	if res.Code != 200 {
 		t.Fatal(res.Code, res.Body.String())
