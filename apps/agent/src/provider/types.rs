@@ -360,13 +360,16 @@ impl UserMessage {
         let source_text = source.map(|source| {
             // JSON keeps names and other source-authored labels quoted. This is
             // metadata in the user-message block, never a system instruction.
-            format!(
-                "[Source {}]",
-                serde_json::json!({
-                    "actor": source.actor(),
-                    "source": source.source(),
-                })
-            )
+            let metadata = match source.source() {
+                crate::runtime::contracts::IncomingSource::ApprovalOperation(operation) => serde_json::json!({
+                    "surface": "approval_operation", "operation_id": operation.operation_id,
+                    "tool_call_id": operation.tool_call_id, "status": operation.status, "executed": operation.executed,
+                }),
+                other => serde_json::to_value(other).expect("typed incoming source serializes"),
+            };
+            let projection =
+                serde_json::json!({ "actor": source.actor(), "source": metadata });
+            format!("[Source {projection}]")
         });
         let receipt = self.receipt_timing_text(source.is_some());
         match (source_text, receipt) {

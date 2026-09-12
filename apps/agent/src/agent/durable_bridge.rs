@@ -436,6 +436,10 @@ pub(super) struct DurableBridge {
     pending_start: Option<(String, PublicMessage)>,
     pending_tool_end: HashMap<String, (Value, bool)>,
     pending_tool_calls: HashSet<String>,
+    pending_operation_turns: HashMap<String, String>,
+    pending_operation_commands: HashMap<String, String>,
+    pending_operation_resolutions: HashMap<String, (EventWrite, AgentEvent, Option<String>)>,
+    pending_operation_provenance: HashMap<String, crate::runtime::contracts::IncomingProvenance>,
     length_not_started: HashSet<String>,
     pending_rejected_end: Option<(String, PublicMessage, HashSet<String>, MessageCommitBarrier)>,
     pending_rejected_results: Vec<(String, PublicMessage, MessageCommitBarrier)>,
@@ -544,6 +548,81 @@ impl DurableBridge {
         bridge
     }
 
+    fn buffer_operation_resolution(
+        &mut self,
+        request_id: &str,
+        write: EventWrite,
+        event: AgentEvent,
+        command_id: Option<String>,
+    ) -> Result<CommittedRunOutput> {
+        let call = self
+            .approval_request_tools
+            .get(request_id)
+            .ok_or_else(|| anyhow!("operation resolution has no original tool"))?
+            .clone();
+        if self
+            .pending_operation_resolutions
+            .insert(call, (write, event, command_id))
+            .is_some()
+        {
+            bail!("operation has duplicate pending resolution");
+        }
+        Ok(CommittedRunOutput {
+            outputs: Vec::new(),
+            tool_start_barrier: None,
+            message_receipts: Vec::new(),
+            retry_wait_commit_barrier: None,
+            terminal_command_ids: std::mem::take(&mut self.committed_terminal_command_ids),
+        })
+    }
+
+    pub(super) fn has_pending_receipt(&self, request_id: &str) -> bool {
+        self.approval_request_tools
+            .get(request_id)
+            .is_some_and(|call| self.pending_operation_provenance.contains_key(call))
+    }
+
+    pub(super) fn pending_receipt_scope_matches(
+        &self,
+        request_id: &str,
+        provenance: &crate::runtime::contracts::IncomingProvenance,
+    ) -> bool {
+        let Some(original) = self
+            .approval_request_tools
+            .get(request_id)
+            .and_then(|call| self.pending_operation_provenance.get(call))
+        else {
+            return false;
+        };
+        provenance.tenant_id() == original.tenant_id()
+            && provenance.personality_agent_id() == original.personality_agent_id()
+            && provenance.authenticated_direct_chat_human().is_some()
+            && provenance.authenticated_direct_chat_human()
+                == original.authenticated_direct_chat_human()
+    }
+
+    pub(super) fn restore_pending_operations(
+        &mut self,
+        operations: &[crate::store::RecoveredPendingOperation],
+    ) {
+        for operation in operations {
+            self.pending_operation_provenance
+                .insert(operation.tool_call_id.clone(), operation.provenance.clone());
+            self.pending_operation_turns.insert(
+                operation.tool_call_id.clone(),
+                operation.original_turn_id.clone(),
+            );
+            self.pending_operation_commands.insert(
+                operation.tool_call_id.clone(),
+                operation.original_command_id.clone(),
+            );
+            self.approval_request_tools
+                .insert(operation.request_id.clone(), operation.tool_call_id.clone());
+            self.approval_prepared_tools
+                .insert(operation.tool_call_id.clone());
+        }
+    }
+
     pub(super) fn new(binding: DurableRunBinding) -> Self {
         let worker_command_id = binding.command_id.clone();
         let worker_command_seq = binding.command_seq;
@@ -557,6 +636,10 @@ impl DurableBridge {
             pending_start: None,
             pending_tool_end: HashMap::new(),
             pending_tool_calls: HashSet::new(),
+            pending_operation_turns: HashMap::new(),
+            pending_operation_commands: HashMap::new(),
+            pending_operation_resolutions: HashMap::new(),
+            pending_operation_provenance: HashMap::new(),
             length_not_started: HashSet::new(),
             pending_rejected_end: None,
             pending_rejected_results: Vec::new(),
@@ -1129,6 +1212,9 @@ impl DurableBridge {
                 }
                 Ok((vec![CommittedOutput { event, seq: None }], Vec::new()))
             }
+            AgentEvent::ApprovalOperationOutcome { .. } => {
+                bail!("operation outcomes must be committed with their canonical external message")
+            }
             AgentEvent::Error { .. } => {
                 Ok((vec![CommittedOutput { event, seq: None }], Vec::new()))
             }
@@ -1145,7 +1231,12 @@ impl DurableBridge {
                         }
                         self.pending_steer_open_start = Some((message_id, *message));
                         Ok((Vec::new(), Vec::new()))
-                    } else if matches!(message.as_ref(), PublicMessage::User(_)) {
+                    } else if matches!(message.as_ref(), PublicMessage::User(_))
+                        && crate::runtime::contracts::ApprovalOperationSource::from_message(
+                            &message,
+                        )
+                        .is_none()
+                    {
                         // The first user MessageStart of a soft/retry group begins collection.
                         self.pending_steer_collecting = true;
                         self.pending_steer_open_start = Some((message_id, *message));
@@ -1346,7 +1437,10 @@ impl DurableBridge {
                     let superseded = self.pending_approval_resolved.iter().any(|(req, _, _)| {
                         self.approval_request_tools.get(req) == Some(&tool_call_id)
                     }) || self.pending_tool_calls.contains(&tool_call_id);
-                    if superseded {
+                    if superseded
+                        && (self.phase == RunPhase::CancelRequested
+                            || !self.pending_operation_turns.contains_key(&tool_call_id))
+                    {
                         output
                             .commit_barrier
                             .take()
@@ -1372,7 +1466,10 @@ impl DurableBridge {
                         &tool_name,
                         &args,
                         &self.binding.run_id,
-                        &self.binding.turn_id,
+                        self.pending_operation_turns
+                            .get(&tool_call_id)
+                            .map(String::as_str)
+                            .unwrap_or(&self.binding.turn_id),
                     )
                     .await?;
                 let must_reauthorize = match &grant_revalidation {
@@ -1508,7 +1605,10 @@ impl DurableBridge {
                                 tool_call_id.clone(),
                                 tool_name.clone(),
                                 args.clone(),
-                                self.binding.command_id.clone(),
+                                self.pending_operation_commands
+                                    .get(&tool_call_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.binding.command_id.clone()),
                                 run_id.clone(),
                                 self.binding.executor_generation,
                             )?),
@@ -1879,6 +1979,28 @@ impl DurableBridge {
                     self.approval_cancelled.insert(tool_call_id.clone());
                     self.approval_prepared_tools.remove(tool_call_id);
                 }
+                if self.has_pending_receipt(&request_id) {
+                    return self.buffer_operation_resolution(
+                        &request_id,
+                        EventWrite {
+                            event: Some(DurableEvent::approval_resolved(
+                                request_id.clone(),
+                                ApprovalResolution::Cancelled,
+                                "runtime".to_owned(),
+                            )?),
+                            projections: vec![Projection::Approval(ApprovalMutation::Resolve {
+                                request_id: request_id.clone(),
+                                state: "cancelled",
+                                actor: "runtime".to_owned(),
+                            })],
+                        },
+                        AgentEvent::ApprovalResolved {
+                            request_id: request_id.clone(),
+                            resolution: ApprovalResolution::Cancelled,
+                        },
+                        None,
+                    );
+                }
                 self.commit_single(
                     writer,
                     DurableEvent::approval_resolved(
@@ -1904,12 +2026,16 @@ impl DurableBridge {
                     resolution
                     @ (ApprovalResolution::Decision(..) | ApprovalResolution::Rejected { .. }),
             } => {
-                if self.phase != RunPhase::AssistantStarted
+                let receipted = self
+                    .approval_request_tools
+                    .get(&request_id)
+                    .is_some_and(|call| self.pending_operation_turns.contains_key(call));
+                if (self.phase != RunPhase::AssistantStarted && !receipted)
                     || !self.turn_open
                     || self.assistant_open.is_some()
                 {
                     bail!(
-                        "ApprovalResolved Decision requires a durable assistant tool call in the active turn"
+                        "ApprovalResolved Decision requires a durable pending operation in an open turn"
                     );
                 }
                 let state = approval_state(&resolution);
@@ -1996,6 +2122,24 @@ impl DurableBridge {
                             run_id: Some(run_id),
                         },
                     ];
+                    if receipted {
+                        return self.buffer_operation_resolution(
+                            &request_id,
+                            EventWrite {
+                                event: Some(DurableEvent::approval_resolved(
+                                    request_id.clone(),
+                                    resolution.clone(),
+                                    actor,
+                                )?),
+                                projections,
+                            },
+                            AgentEvent::ApprovalResolved {
+                                request_id: request_id.clone(),
+                                resolution,
+                            },
+                            Some(command_id),
+                        );
+                    }
                     self.committed_terminal_command_ids.push(command_id);
                     self.commit_single(
                         writer,
@@ -2162,10 +2306,40 @@ impl DurableBridge {
             provider_context: Vec::new(),
             eviction_footprint_tokens: 0,
         }];
+        let operation_outcome =
+            crate::runtime::contracts::ApprovalOperationSource::from_message(&message).cloned();
+        let operation_result = operation_outcome
+            .as_ref()
+            .map(|outcome| -> Result<ToolResultMessage> {
+                outcome.validate().map_err(anyhow::Error::msg)?;
+                if self.approval_request_tools.get(&outcome.operation_id)
+                    != Some(&outcome.tool_call_id)
+                    || !self
+                        .pending_operation_turns
+                        .contains_key(&outcome.tool_call_id)
+                {
+                    bail!("operation outcome has no exact pending receipt");
+                }
+                Ok(serde_json::from_value(outcome.result.clone())?)
+            })
+            .transpose()?;
         let mut writes = Vec::new();
         let mut public_prefix = Vec::new();
         let mut injected_commands = Vec::new();
-        if matches!(message, PublicMessage::User(_)) {
+        if let Some(outcome) = &operation_outcome {
+            if let Some((write, event, command)) = self
+                .pending_operation_resolutions
+                .remove(&outcome.tool_call_id)
+            {
+                writes.push(write);
+                public_prefix.push(event);
+                if let Some(command) = command {
+                    self.committed_terminal_command_ids.push(command);
+                }
+            }
+        }
+
+        if matches!(message, PublicMessage::User(_)) && operation_outcome.is_none() {
             if self.startup_agent_pending || self.startup_turn_pending {
                 if !(self.startup_agent_pending && self.startup_turn_pending) {
                     bail!("idle startup lifecycle is only partially buffered");
@@ -2203,7 +2377,10 @@ impl DurableBridge {
                     .map_err(anyhow::Error::msg)?,
                 self.binding.provenance.clone(),
             ));
-        } else if let PublicMessage::ToolResult(result) = &message {
+        } else if let Some(result) = match &message {
+            PublicMessage::ToolResult(result) => Some(result),
+            _ => operation_result.as_ref(),
+        } {
             let tool_call_id = result.tool_call_id.clone();
             if let Some((result_value, is_error)) = self.pending_tool_end.remove(&tool_call_id) {
                 if result_value.is_null() {
@@ -2233,6 +2410,25 @@ impl DurableBridge {
                     tool_call_id: result.tool_call_id.clone(),
                     result: serde_json::to_value(result)?,
                     is_error,
+                });
+            } else if let Some(receipt) =
+                crate::approval::operation::PendingOperationReceipt::from_result(result)
+            {
+                if self.approval_request_tools.get(&receipt.operation_id) != Some(&tool_call_id)
+                    || !self.approval_prepared_tools.contains(&tool_call_id)
+                {
+                    bail!("pending receipt has no exact durably prepared approval operation");
+                }
+                self.pending_operation_turns
+                    .insert(tool_call_id.clone(), self.binding.turn_id.clone());
+                self.pending_operation_provenance
+                    .insert(tool_call_id.clone(), self.binding.provenance.clone());
+                self.pending_operation_commands
+                    .insert(tool_call_id.clone(), self.binding.command_id.clone());
+                projections.push(Projection::ApprovalReceipt {
+                    request_id: receipt.operation_id,
+                    tool_call_id: tool_call_id.clone(),
+                    message_id: message_id.clone(),
                 });
             } else if self.approval_not_started.contains_key(&tool_call_id)
                 && self.pending_tool_calls.contains(&tool_call_id)
@@ -2428,6 +2624,19 @@ impl DurableBridge {
                     "tool result has neither execution lifecycle nor known not-started disposition"
                 );
             }
+        }
+        if let Some(outcome) = operation_outcome {
+            writes.push(EventWrite {
+                event: Some(DurableEvent::approval_operation_outcome(outcome.clone())?),
+                projections: Vec::new(),
+            });
+            self.pending_operation_turns.remove(&outcome.tool_call_id);
+            self.pending_operation_commands
+                .remove(&outcome.tool_call_id);
+            self.pending_operation_provenance
+                .remove(&outcome.tool_call_id);
+            self.approval_request_tools.remove(&outcome.operation_id);
+            public_prefix.push(AgentEvent::ApprovalOperationOutcome { outcome });
         }
         writes.push(EventWrite {
             event: Some(DurableEvent::message(
@@ -3030,15 +3239,20 @@ impl DurableBridge {
         }
     }
 
-    async fn commit_batch(
-        &mut self,
-        writer: &EventWriter,
+    fn commit_batch<'a>(
+        &'a mut self,
+        writer: &'a EventWriter,
         batch: EventBatch,
         public: Vec<AgentEvent>,
-    ) -> Result<Vec<CommittedOutput>> {
-        self.collect_terminal_command_ids(&batch);
-        let events = writer.apply_with_events(batch).await?;
-        reconcile_committed_events(events, public)
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<CommittedOutput>>> {
+        // Control acceptance can persist an event while deferred-input routing
+        // is still on the stack. Keep the evidence-heavy writer future out of
+        // every commit dispatch branch, including construction temporaries.
+        Box::pin(async move {
+            self.collect_terminal_command_ids(&batch);
+            let events = writer.apply_with_events(batch).await?;
+            reconcile_committed_events(events, public)
+        })
     }
 }
 

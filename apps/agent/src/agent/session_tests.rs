@@ -13816,3 +13816,9 @@ mod interrupted_inference_continuity {
         }
     }
 }
+
+#[path = "approval_receipt_tests.rs"]
+mod approval_receipt_continuity;
+
+#[path = "reflex_session_tests.rs"]
+mod reflex_session_tests;

@@ -195,6 +195,8 @@ mod durable_bridge;
 pub(crate) mod events;
 mod provider_projection;
 mod queue;
+pub(crate) mod reflex;
+mod reflex_gate;
 mod run;
 #[cfg(test)]
 mod start_authority_tests;
@@ -363,7 +365,7 @@ async fn own_gateway_writer<W: GatewayWriter>(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct HydratedSessionBinding {
     binding_id: Uuid,
     runtime: RuntimeEpochAuthority,
@@ -371,6 +373,7 @@ struct HydratedSessionBinding {
     core_ownership_id: Uuid,
     core_mutation_epoch: u64,
     received_user_commands: Vec<ReceivedUserCommand>,
+    received_approval_commands: Vec<CommandEnvelope>,
 }
 
 impl HydratedSessionBinding {
@@ -413,6 +416,8 @@ pub(crate) struct RunCore {
     provider_context: Vec<ProviderContextItemWithFootprint>,
     durable_binding: Option<DurableRunBinding>,
     recovered_inference_continuation: Option<Box<crate::store::RecoveredInferenceContinuation>>,
+    recovered_pending_operations: Vec<crate::store::RecoveredPendingOperation>,
+    has_unobserved_operation_outcome: bool,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
     /// Session reserves the token around `bind_hard_steer` so the provider is
@@ -439,6 +444,8 @@ impl RunCore {
             provider_context: Vec::new(),
             durable_binding: None,
             recovered_inference_continuation: None,
+            recovered_pending_operations: Vec::new(),
+            has_unobserved_operation_outcome: false,
             worker_phase: None,
             attempt_cancellation: None,
             runtime_shutdown: CancellationToken::new(),
@@ -585,6 +592,8 @@ impl SessionStartAuthority {
         core.runtime_context = hydrated.messages.clone();
         core.provider_context = hydrated.provider_context.clone();
         core.recovered_inference_continuation = hydrated.continuation.clone();
+        core.recovered_pending_operations = hydrated.pending_operations.clone();
+        core.has_unobserved_operation_outcome = hydrated.has_unobserved_operation_outcome;
         // Approval is a security-sensitive dependency of this exact RunCore.
         // Compose it before minting the binding; every later replacement goes
         // through `set_approval` and invalidates the binding.
@@ -596,6 +605,7 @@ impl SessionStartAuthority {
             core_ownership_id: core.ownership_id,
             core_mutation_epoch: core.mutation_epoch,
             received_user_commands: hydrated.received_user_commands.clone(),
+            received_approval_commands: hydrated.received_approval_commands.clone(),
         };
         binding.validate_receipt()?;
         core.hydrated_session_binding_id = Some(binding.binding_id);
@@ -656,6 +666,7 @@ pub(crate) struct AdmittedCommand {
     received_at: DateTime<Utc>,
     received_monotonic: Option<Instant>,
     incoming_timing: Option<crate::provider::types::IncomingEventTiming>,
+    event_interpretation: Option<String>,
 }
 
 impl AdmittedCommand {
@@ -665,6 +676,7 @@ impl AdmittedCommand {
             received_at,
             received_monotonic: None,
             incoming_timing: None,
+            event_interpretation: None,
         }
     }
 
@@ -678,6 +690,7 @@ impl AdmittedCommand {
             received_at,
             received_monotonic: Some(received_monotonic),
             incoming_timing: None,
+            event_interpretation: None,
         }
     }
 
@@ -686,6 +699,11 @@ impl AdmittedCommand {
         timing: Option<crate::provider::types::IncomingEventTiming>,
     ) -> Self {
         self.incoming_timing = timing;
+        self
+    }
+
+    fn with_event_interpretation(mut self, interpretation: Option<String>) -> Self {
+        self.event_interpretation = interpretation;
         self
     }
 
@@ -764,6 +782,35 @@ pub(crate) enum WorkerFailure {
 }
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
+    fn latest_reflex_snapshot(&self) -> Option<crate::provider::types::ParentContextSnapshot> {
+        None
+    }
+
+    fn idle_reflex_snapshot<'a>(
+        &'a self,
+        _core: &'a RunCore,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<crate::provider::types::ParentContextSnapshot>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn evaluate_reflex<'a>(
+        &'a self,
+        parent: &'a crate::provider::types::ParentContextSnapshot,
+        event: &'a crate::provider::types::UserMessage,
+        limits: reflex::ReflexLimits,
+        cancel: CancellationToken,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<reflex::ReflexDecision, reflex::ReflexError>> + Send + 'a>,
+    > {
+        Box::pin(reflex::evaluate(parent, event, limits, cancel))
+    }
+
     /// Hydrated production starts must preserve the complete executor RPC
     /// identity through the worker/driver boundary.
     fn validate_runtime_identity(&self, _identity: &RpcIdentity) -> Result<()> {
@@ -1014,6 +1061,7 @@ pub(crate) struct Session<G: Gateway> {
     /// One admission per authenticated input recovered at Session startup.
     /// This survives gateway reconnects; ordinary replays stay deduplicated.
     received_user_replays: HashSet<ReceivedUserCommand>,
+    received_approval_commands: Vec<CommandEnvelope>,
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
@@ -1032,6 +1080,9 @@ pub(crate) struct Session<G: Gateway> {
     /// worker exclusively owns `RunCore`. Retain it until the next idle
     /// boundary; it is independent of a run-local overflow marker.
     maintenance_ready_pending: bool,
+    reflex_epoch: u64,
+    reflex_jobs: tokio::task::JoinSet<reflex_gate::ReflexCompletion>,
+    reflex_pending: std::collections::HashMap<String, AdmittedCommand>,
     /// A bridge/Store refusal can leave a returned core ahead of durability;
     /// a post-receipt worker failure can leave it behind. Neither state is a
     /// recoverable life-log snapshot.
@@ -1143,13 +1194,26 @@ impl<G: Gateway + 'static> Session<G> {
             "completed hydration must not produce a second recovery plan"
         );
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
-        let received_user_replays = match &start_authority.kind {
+        let received_approval_commands = match &start_authority.kind {
+            SessionStartAuthorityKind::Hydrated(binding) => {
+                binding.received_approval_commands.clone()
+            }
+            #[cfg(test)]
+            SessionStartAuthorityKind::UnhydratedFixture(_) => Vec::new(),
+        };
+        let mut received_user_replays: HashSet<ReceivedUserCommand> = match &start_authority.kind {
             SessionStartAuthorityKind::Hydrated(binding) => {
                 binding.received_user_commands.iter().cloned().collect()
             }
             #[cfg(test)]
             SessionStartAuthorityKind::UnhydratedFixture(_) => HashSet::new(),
         };
+        received_user_replays.extend(received_approval_commands.iter().map(|command| {
+            ReceivedUserCommand {
+                command_id: command.command_id.as_str().to_owned(),
+                seq: command.seq,
+            }
+        }));
         let (gateway_reader, gateway_writer) = gateway.split();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let volatile_in_flight = Arc::new(AtomicUsize::new(0));
@@ -1182,6 +1246,7 @@ impl<G: Gateway + 'static> Session<G> {
             admission,
             recovery_steps,
             received_user_replays,
+            received_approval_commands,
             core: Some(core),
             active: None,
             worker,
@@ -1189,6 +1254,9 @@ impl<G: Gateway + 'static> Session<G> {
             executor_generation,
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             maintenance_ready_pending: false,
+            reflex_epoch: 0,
+            reflex_jobs: tokio::task::JoinSet::new(),
+            reflex_pending: std::collections::HashMap::new(),
             durable_core_invalidated: false,
             suspended_inference: false,
             runtime_shutdown: CancellationToken::new(),
@@ -1321,6 +1389,10 @@ impl<G: Gateway + 'static> Session<G> {
             ))
             .await?;
         }
+        self.restore_reflex_notifications().await?;
+        for command in std::mem::take(&mut self.received_approval_commands) {
+            self.admit_and_route(InboundCommand::Valid(command)).await?;
+        }
         loop {
             if self.active.is_none() {
                 self.apply_idle_memory_maintenance().await?;
@@ -1331,6 +1403,7 @@ impl<G: Gateway + 'static> Session<G> {
                 enum IdleSelected {
                     Shutdown,
                     MemoryReady,
+                    Reflex(Option<Result<reflex_gate::ReflexCompletion, tokio::task::JoinError>>),
                     Command(Result<InboundCommand>),
                     Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
                 }
@@ -1339,12 +1412,17 @@ impl<G: Gateway + 'static> Session<G> {
                     _ = shutdown.cancelled() => IdleSelected::Shutdown,
                     command = self.gateway_reader.next_command() => IdleSelected::Command(command),
                     _ = self.worker.memory_maintenance_ready() => IdleSelected::MemoryReady,
+                    result = self.reflex_jobs.join_next(), if !self.reflex_jobs.is_empty() => IdleSelected::Reflex(result),
                     writer = &mut self.writer_done => IdleSelected::Writer(writer),
                 };
                 let inbound = match selected {
                     IdleSelected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                     IdleSelected::MemoryReady => {
                         self.maintenance_ready().await?;
+                        continue;
+                    }
+                    IdleSelected::Reflex(result) => {
+                        self.finish_reflex(result).await?;
                         continue;
                     }
                     IdleSelected::Command(Ok(inbound)) => inbound,
@@ -1369,6 +1447,7 @@ impl<G: Gateway + 'static> Session<G> {
             enum Selected {
                 Shutdown,
                 MemoryReady,
+                Reflex(Option<Result<reflex_gate::ReflexCompletion, tokio::task::JoinError>>),
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
                 Event(Option<RunOutput>),
@@ -1383,6 +1462,7 @@ impl<G: Gateway + 'static> Session<G> {
                     _ = shutdown.cancelled() => Selected::Shutdown,
                     command = self.gateway_reader.next_command() => Selected::Command(command),
                     _ = self.worker.memory_maintenance_ready() => Selected::MemoryReady,
+                    result = self.reflex_jobs.join_next(), if !self.reflex_jobs.is_empty() => Selected::Reflex(result),
                     event = active.events_rx.recv() => Selected::Event(event),
                     writer = &mut self.writer_done => Selected::Writer(writer),
                 }
@@ -1391,6 +1471,7 @@ impl<G: Gateway + 'static> Session<G> {
             match selected {
                 Selected::Shutdown => return Ok(SessionLoopExit::ShutdownRequested),
                 Selected::MemoryReady => self.maintenance_ready().await?,
+                Selected::Reflex(result) => self.finish_reflex(result).await?,
                 Selected::Completion(completion) => self.finish_run(completion).await?,
                 Selected::Command(Ok(inbound)) => self.admit_and_route(inbound).await?,
                 Selected::Command(Err(error))
@@ -1444,7 +1525,19 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
+    // Admission is also reached by startup replay. Keep its durable-write and
+    // reflex state machines out of each Session select/recovery future frame.
+    fn admit_and_route<'a>(
+        &'a mut self,
+        inbound: InboundCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SessionFailure>> + Send + 'a>> {
+        Box::pin(self.admit_and_route_inner(inbound))
+    }
+
+    async fn admit_and_route_inner(
+        &mut self,
+        inbound: InboundCommand,
+    ) -> Result<(), SessionFailure> {
         if inbound.personality_agent_id() != &self.personality_agent_id
             || inbound.provenance().personality_agent_id() != &self.personality_agent_id
         {
@@ -1506,6 +1599,17 @@ impl<G: Gateway + 'static> Session<G> {
             AdmittedCommand::live(command, received_at, received_monotonic)
                 .with_incoming_timing(incoming_timing)
         };
+        self.reflex_epoch = self.reflex_epoch.wrapping_add(1);
+        if self.begin_reflex(command.clone()).await? {
+            return Ok(());
+        }
+        self.route_admitted_command(command).await
+    }
+
+    async fn route_admitted_command(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<(), SessionFailure> {
         if self.active.is_some() {
             if self.route_retry_wait_command(&command).await? {
                 return Ok(());
@@ -1860,7 +1964,8 @@ impl<G: Gateway + 'static> Session<G> {
         let is_pending = active
             .approval
             .as_ref()
-            .is_some_and(|broker| broker.has_pending(request_id));
+            .is_some_and(|broker| broker.has_pending(request_id))
+            || active.bridge.has_pending_receipt(request_id);
         if !is_pending {
             self.apply_idle_approval_decision(command).await?;
             return Ok(true);
@@ -1878,6 +1983,9 @@ impl<G: Gateway + 'static> Session<G> {
                     )
                 })
             })
+            && !active
+                .bridge
+                .pending_receipt_scope_matches(request_id, provenance)
         {
             // The command remains durably received, but it does not become the
             // in-flight resolver for a pending approval owned by another
@@ -2199,6 +2307,7 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
+        let initial = self.enrich_reflex(initial).await?;
         let continuation = self
             .core
             .as_ref()
@@ -2238,6 +2347,7 @@ impl<G: Gateway + 'static> Session<G> {
             .take()
             .ok_or(SessionFailure::CompletionChannelClosed)?;
         core.durable_binding = Some(binding.clone());
+        let recovered_operations = core.recovered_pending_operations.clone();
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (phase_tx, phase_rx) = watch::channel(WorkerPhase::Active);
@@ -2263,9 +2373,13 @@ impl<G: Gateway + 'static> Session<G> {
             events_rx,
             completion_rx,
             join,
-            bridge: match resumed_turn_open {
-                Some((open, phase)) => DurableBridge::resume_inference(binding, open, phase),
-                None => DurableBridge::new(binding),
+            bridge: {
+                let mut bridge = match resumed_turn_open {
+                    Some((open, phase)) => DurableBridge::resume_inference(binding, open, phase),
+                    None => DurableBridge::new(binding),
+                };
+                bridge.restore_pending_operations(&recovered_operations);
+                bridge
             },
             attempt_cancellation,
             approval,

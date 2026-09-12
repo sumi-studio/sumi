@@ -438,3 +438,22 @@ fn feedback_source_preserves_sender_body_and_receipt_for_every_provider() {
         assert_eq!(blocks[1]["text"], "修正しました。");
     }
 }
+
+#[test]
+fn approval_receipt_does_not_claim_messaging_delivery_or_repeat_operation_result() {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../../contracts/agent-events-fixtures.json"
+    ))
+    .unwrap();
+    let user: UserMessage =
+        serde_json::from_value(fixtures["approval_operation_recorded_history"]["wire"].clone())
+            .unwrap();
+    for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+        let blocks = payload_blocks(preset, user.clone());
+        let prefix = blocks[0]["text"].as_str().unwrap();
+        assert!(prefix.contains("\"surface\":\"approval_operation\""));
+        assert!(!prefix.contains("\"delivery\""));
+        assert!(!prefix.contains("Original operation result"));
+        assert_eq!(blocks[1]["text"], "Operation completed");
+    }
+}

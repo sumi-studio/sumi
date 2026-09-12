@@ -789,7 +789,12 @@ pub(crate) fn build_user_message(command: &AdmittedCommand) -> Result<PublicMess
     Ok(PublicMessage::User(crate::provider::types::UserMessage {
         incoming_source,
         incoming_timing: command.incoming_timing(),
-        content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
+        content: vec![crate::provider::types::UserContent::Text {
+            text: super::reflex::render_event_content(
+                text,
+                command.event_interpretation.as_deref(),
+            ),
+        }],
         timestamp: command.received_at(),
     }))
 }

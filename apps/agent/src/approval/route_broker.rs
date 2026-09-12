@@ -893,6 +893,84 @@ impl RouteApprovalBroker {
         })
     }
 
+    /// Restore a waiter, never an executable grant. The caller must bind the
+    /// original canonical call through the current registry/generation first.
+    /// `resolve` still checks current policy and authenticated Human scope.
+    pub(crate) fn restore_pending_operation(
+        &self,
+        operation: &crate::store::RecoveredPendingOperation,
+        sealed: SealedBoundToolInvocation,
+        scope: ApprovalPrincipalScope,
+    ) -> Result<PendingApproval> {
+        if scope.human_principal_id.is_none()
+            || scope.tenant_id != operation.provenance.tenant_id()
+            || scope.personality_agent_id != operation.provenance.personality_agent_id().as_str()
+            || scope.human_principal_id.as_deref()
+                != operation.provenance.authenticated_direct_chat_human()
+            || sealed.invocation().tool_call_id != operation.tool_call_id
+            || sealed.evidence_digest().to_hex()
+                != operation.evidence.bound.evidence_digest()?.to_hex()
+            || operation.call.route != ToolInvocationRoute::Elevated
+        {
+            anyhow::bail!("recovered approval does not match fresh bound operation");
+        }
+        let evidence = operation.evidence.clone();
+        evidence.policy.validate()?;
+        if evidence.escalation_review.decision.outcome != EscalationReviewOutcome::AskHuman {
+            anyhow::bail!("recovered approval has no pending Human review");
+        }
+        let review = &evidence.escalation_review;
+        let technical_failure = (!review.budget.terminal.is_judged())
+            .then(|| self.redactor.redact_text(&review.decision.rationale));
+        let pa_reason = review
+            .pa_objection_response
+            .as_ref()
+            .and_then(|response| response.answer.as_ref())
+            .and_then(|answer| answer.reason.as_deref())
+            .map(|reason| self.redactor.redact_text(reason));
+        let pa_failure = review
+            .pa_objection_failure
+            .as_deref()
+            .map(|reason| self.redactor.redact_text(reason));
+        let request = PendingApprovalRequest::from_bound(
+            operation.request_id.clone(),
+            ToolInvocationRoute::Elevated,
+            sealed.invocation(),
+            self.redactor.as_ref(),
+            None,
+            technical_failure,
+            pa_reason,
+            pa_failure,
+        )?;
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.contains_key(&operation.request_id) {
+            anyhow::bail!("recovered approval waiter already exists");
+        }
+        pending.insert(
+            operation.request_id.clone(),
+            PendingEntry {
+                provider_call_id: operation.call.provider_call_id.clone(),
+                sealed,
+                scope,
+                run_id: operation.run_id.clone(),
+                turn_id: operation.original_turn_id.clone(),
+                policy: evidence.policy.clone(),
+                escalation_review: evidence.escalation_review.clone(),
+                sender,
+            },
+        );
+        Ok(PendingApproval {
+            request: Box::new(request),
+            durable_evidence: evidence,
+            receiver,
+            pending: self.pending.clone(),
+        })
+    }
+
     pub(crate) async fn resolve(
         &self,
         request_id: &str,
@@ -2584,6 +2662,108 @@ mod tests {
             ExecutionAuthorityProvenance::AgentOwn
         );
         assert_eq!(sealed.invocation().tool_call_id, "tool-call-1");
+    }
+
+    #[tokio::test]
+    async fn restored_receipt_waiter_keeps_request_identity_and_requires_fresh_exact_binding() {
+        let (broker, _, _) = broker(
+            json!({"outcome":"block","risk":"high","rationale":"unused"}),
+            json!({"outcome":"ask_human","risk":"medium","misunderstanding":null,"rationale":"exact target"}),
+        );
+        let mut original_scope = scope();
+        original_scope.personality_agent_id =
+            crate::gateway::test_personality_agent_id().to_string();
+        let RouteApprovalOutcome::Pending { pending } = broker
+            .start_request(
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                ToolInvocationRoute::Elevated,
+                &[],
+                original_scope.clone(),
+                "original-run",
+                "original-turn",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("pending expected");
+        };
+        let operation = crate::store::RecoveredPendingOperation {
+            original_command_id: "original-command".into(),
+            provenance: crate::runtime::contracts::IncomingProvenance::new(
+                "tenant-1",
+                crate::gateway::test_personality_agent_id(),
+                "human-1",
+            )
+            .unwrap(),
+            request_id: pending.request().id.clone(),
+            tool_call_id: "tool-call-1".into(),
+            run_id: "original-run".into(),
+            original_turn_id: "original-turn".into(),
+            assistant_message_id: "assistant-1".into(),
+            call: ToolCall {
+                provider_call_id: None,
+                id: "tool-call-1".into(),
+                name: "app_action".into(),
+                route: ToolInvocationRoute::Elevated,
+                arguments: serde_json::from_value(json!({"title":"new title"})).unwrap(),
+            },
+            evidence: pending.durable_evidence().clone(),
+        };
+        drop(pending);
+        assert!(
+            broker
+                .restore_pending_operation(
+                    &operation,
+                    sealed_with_title(
+                        CapabilityClass::Mutate,
+                        ToolInvocationRoute::Elevated,
+                        "different target"
+                    )
+                    .await,
+                    original_scope.clone()
+                )
+                .is_err()
+        );
+        assert!(
+            broker
+                .restore_pending_operation(
+                    &operation,
+                    sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                    scope()
+                )
+                .is_err(),
+            "a later unrelated input owner cannot take over the original request"
+        );
+        let restored = broker
+            .restore_pending_operation(
+                &operation,
+                sealed(CapabilityClass::Mutate, ToolInvocationRoute::Elevated).await,
+                original_scope.clone(),
+            )
+            .unwrap();
+        assert_eq!(restored.request().id, operation.request_id);
+        let mut approval = command(CurrentCallDecision::ApproveOnce);
+        approval.personality_agent_id = original_scope.personality_agent_id.clone();
+        let CurrentCallResolution::Approved { grant, .. } = broker
+            .resolve(&operation.request_id, approval)
+            .await
+            .unwrap()
+        else {
+            panic!("approval expected");
+        };
+        let (status, lease, _, _) = grant
+            .authorize(
+                "tool-call-1",
+                "app_action",
+                ToolInvocationRoute::Elevated,
+                "original-run",
+                "original-turn",
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, GrantRevalidation::Valid);
+        drop(lease);
     }
 
     #[tokio::test]

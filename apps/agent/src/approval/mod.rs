@@ -5,6 +5,7 @@ pub mod action;
 pub mod authority;
 #[cfg(test)]
 pub mod broker;
+pub(crate) mod operation;
 #[cfg(test)]
 pub mod policy;
 #[cfg(test)]

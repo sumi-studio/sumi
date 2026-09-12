@@ -151,6 +151,24 @@ impl IncomingProvenance {
         value.validate(&value.personality_agent_id)?;
         Ok(value)
     }
+    pub(crate) fn approval_operation(
+        &self,
+        source: ApprovalOperationSource,
+    ) -> Result<Self, RuntimeContractError> {
+        let value = Self {
+            version: 2,
+            tenant_id: self.tenant_id.clone(),
+            personality_agent_id: self.personality_agent_id.clone(),
+            actor: IncomingActor {
+                kind: ActorKind::PersonalityAgent,
+                principal_id: self.personality_agent_id.to_string(),
+                display_name: None,
+            },
+            source: IncomingSource::ApprovalOperation(Box::new(source)),
+        };
+        value.validate(&value.personality_agent_id)?;
+        Ok(value)
+    }
     pub const fn version(&self) -> u8 {
         self.version
     }
@@ -321,6 +339,13 @@ pub enum ApprovalOperationStatus {
     Indeterminate,
 }
 impl ApprovalOperationSource {
+    pub(crate) fn message_id(&self) -> String {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("sumi/approval-operation/{}/outcome", self.operation_id).as_bytes(),
+        )
+        .to_string()
+    }
     pub(crate) fn validate(&self) -> Result<(), RuntimeContractError> {
         let result: crate::provider::types::ToolResultMessage =
             serde_json::from_value(self.result.clone())
@@ -341,6 +366,15 @@ impl ApprovalOperationSource {
             return Err(RuntimeContractError::InvalidIncomingProvenance);
         }
         Ok(())
+    }
+    pub(crate) fn from_message(message: &crate::provider::types::PublicMessage) -> Option<&Self> {
+        let crate::provider::types::PublicMessage::User(user) = message else {
+            return None;
+        };
+        match user.incoming_source.as_ref()?.source() {
+            IncomingSource::ApprovalOperation(source) => Some(source),
+            _ => None,
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

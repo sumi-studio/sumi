@@ -1176,6 +1176,9 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
                 result,
                 is_error,
             },
+            AgentEvent::ApprovalOperationOutcome { outcome } => {
+                Self::ApprovalOperationOutcome { outcome }
+            }
             AgentEvent::ApprovalRequested { request } => Self::ApprovalRequested {
                 request: request.try_into()?,
             },

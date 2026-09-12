@@ -986,15 +986,21 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                     let message = envelope
                         .get("message")
                         .ok_or_else(|| anyhow::anyhow!("recovery message event has no message"))?;
-                    if message.get("role").and_then(|value| value.as_str()) != Some("tool_result") {
-                        bail!("recovery suffix contains a non-tool message event");
-                    }
-                    let tool = message
-                        .get("tool_call_id")
-                        .and_then(|value| value.as_str())
+                    let decoded: crate::provider::types::PublicMessage =
+                        serde_json::from_value(message.clone())?;
+                    let tool = match &decoded {
+                        crate::provider::types::PublicMessage::ToolResult(result) => {
+                            result.tool_call_id.as_str()
+                        }
+                        _ => crate::runtime::contracts::ApprovalOperationSource::from_message(
+                            &decoded,
+                        )
                         .ok_or_else(|| {
-                            anyhow::anyhow!("recovery tool result has no tool_call_id")
-                        })?;
+                            anyhow::anyhow!("recovery suffix contains unrelated non-tool message")
+                        })?
+                        .tool_call_id
+                        .as_str(),
+                    };
                     if !expected_tools.contains(tool)
                         && !self
                             .co_recovered_suffix_tool(transaction, &owners, tool)
@@ -1009,6 +1015,24 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                     };
                     if map.insert(tool.to_owned(), seq).is_some() {
                         bail!("recovery suffix contains duplicate {event_type} for tool {tool}");
+                    }
+                }
+                "approval_operation_outcome" => {
+                    let mut payload = envelope;
+                    payload
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("operation outcome must be an object"))?
+                        .remove("type");
+                    let outcome: crate::runtime::contracts::ApprovalOperationSource =
+                        serde_json::from_value(payload)?;
+                    outcome.validate()?;
+                    if !expected_tools.contains(outcome.tool_call_id.as_str()) {
+                        bail!("physical recovery operation outcome is outside its exact intents");
+                    }
+                    let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM approval_log WHERE id=? AND tool_call_id=? AND receipt_message_id IS NOT NULL)")
+                        .bind(&outcome.operation_id).bind(&outcome.tool_call_id).fetch_one(&mut **transaction).await?;
+                    if !matches {
+                        bail!("physical recovery outcome lacks original operation receipt");
                     }
                 }
                 "approval_resolved" => {
@@ -1183,12 +1207,12 @@ mod tests {
             (
                 first_seq,
                 "message_start",
-                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
             (
                 11,
                 "message_end",
-                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
         ] {
             sqlx::query(
@@ -1488,17 +1512,17 @@ mod tests {
             (
                 first_seq,
                 "message_start",
-                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
             (
                 11u64,
                 "message_start",
-                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
             (
                 12u64,
                 "message_end",
-                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
         ] {
             sqlx::query(
@@ -1581,12 +1605,12 @@ mod tests {
             (
                 first_seq,
                 "message_end",
-                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
             (
                 11u64,
                 "message_start",
-                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1","tool_name":"test_tool","content":[],"details":{"error":"indeterminate"},"is_error":true,"timestamp":"2026-09-12T00:00:00Z"}}"#,
             ),
         ] {
             sqlx::query(
