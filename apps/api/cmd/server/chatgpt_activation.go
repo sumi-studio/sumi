@@ -23,12 +23,13 @@ type chatGPTActivationEmployer interface {
 // The connection store is the durable latest selection; this queue only nudges
 // already-running processes to pick it up once their current work is finished.
 type chatGPTActivationWorker struct {
-	mu        sync.Mutex
-	pending   map[string]uint64
-	revision  uint64
-	wake      chan struct{}
-	employers chatGPTActivationEmployer
-	manager   chatGPTActivationManager
+	mu          sync.Mutex
+	pending     map[string]uint64
+	revision    uint64
+	wake        chan struct{}
+	employers   chatGPTActivationEmployer
+	manager     chatGPTActivationManager
+	shouldStart func(context.Context, string) (bool, error)
 }
 
 func newChatGPTActivationWorker(employers chatGPTActivationEmployer) *chatGPTActivationWorker {
@@ -65,6 +66,15 @@ func (w *chatGPTActivationWorker) apply(ctx context.Context, human string) (bool
 	ready, err := w.manager.StopIfIdle(pa)
 	if err != nil || !ready {
 		return false, err
+	}
+	if w.shouldStart != nil {
+		start, err := w.shouldStart(ctx, human)
+		if err != nil {
+			return false, err
+		}
+		if !start {
+			return true, nil
+		}
 	}
 	// Activation itself derives and rechecks the current employer again.
 	return true, w.manager.EnsureRunning(ctx, pa)

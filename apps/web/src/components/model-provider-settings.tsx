@@ -14,6 +14,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import type { APIConnectionsClient } from "../lib/api-connections";
 import {
   CHATGPT_EFFORTS,
   CHATGPT_MODEL,
@@ -23,6 +24,7 @@ import {
   createModelConnectionsAPI,
   type ModelConnectionsAPI,
 } from "../lib/model-connections";
+import { APIConnectionSettings } from "./api-connection-settings";
 
 const defaultAPI = createModelConnectionsAPI();
 const EFFORT_LABELS: Record<ChatGPTEffort, string> = {
@@ -37,10 +39,12 @@ export function ModelProviderSettings({
   open,
   onOpenChange,
   api = defaultAPI,
+  connectionsAPI,
 }: {
   open: boolean;
   onOpenChange(open: boolean): void;
   api?: ModelConnectionsAPI;
+  connectionsAPI?: APIConnectionsClient;
 }) {
   const [connection, setConnection] = useState<ChatGPTConnection | null>(null);
   const [login, setLogin] = useState<ChatGPTLogin | null>(null);
@@ -125,7 +129,7 @@ export function ModelProviderSettings({
               : next.connection?.connectionId &&
                   next.connection.connectionId !== connected.connectionId
                 ? "最新の接続状態を表示しています。"
-                : "ChatGPTに接続しました。作業中の場合は、一区切りついてからAstraに切り替わります。",
+                : "ChatGPTに接続しました。下の「使う接続」でChatGPTを選べます。",
           );
           return;
         }
@@ -201,7 +205,7 @@ export function ModelProviderSettings({
         <SheetHeader className="border-border border-b px-6 py-5 pr-12">
           <SheetTitle>AIの接続</SheetTitle>
           <SheetDescription>
-            あなたのChatGPTアカウントをSumiで使います。
+            あなたのアカウントやAPIをSumiに接続します。
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
@@ -246,7 +250,7 @@ export function ModelProviderSettings({
                 </div>
               ) : (
                 <p className="mt-5 text-muted-foreground text-sm leading-relaxed">
-                  ChatGPTでログインすると、Astra（Medium）を使えます。作業中の場合は、一区切りついてから切り替わります。
+                  ChatGPTでログインすると、Astra（Medium）の接続を追加できます。使う接続は下で選べます。
                 </p>
               )}
               {!pending ? (
@@ -390,7 +394,7 @@ export function ModelProviderSettings({
                     setConnection(next);
                     setEffort(next.effort || "medium");
                     setNotice(
-                      "保存しました。作業中の場合は、一区切りついてから切り替わります。",
+                      "ChatGPTの設定を保存しました。ChatGPTを使用中なら、作業が一区切りついてから反映されます。",
                     );
                   })
                 }
@@ -401,7 +405,7 @@ export function ModelProviderSettings({
                 {confirmDisconnect ? (
                   <div className="space-y-3">
                     <p className="text-sm">
-                      接続を解除すると、標準のモデル設定に戻ります。作業中なら完了を待って切り替えます。
+                      ChatGPTの接続を解除します。ChatGPTを選択中の場合は、別の接続を選んでください。作業中なら一区切りついてから反映されます。
                     </p>
                     <div className="flex gap-2">
                       <Button
@@ -421,7 +425,7 @@ export function ModelProviderSettings({
                             setLogin(null);
                             setConfirmDisconnect(false);
                             setNotice(
-                              "接続を解除しました。作業中の場合は、一区切りついてから標準のモデル設定に戻ります。",
+                              "ChatGPTの接続を解除しました。使う接続は下で選べます。",
                             );
                           })
                         }
@@ -472,6 +476,12 @@ export function ModelProviderSettings({
               </Button>
             </div>
           ) : null}
+          {open && (
+            <APIConnectionSettings
+              chatgptConnected={connected}
+              client={connectionsAPI}
+            />
+          )}
         </div>
       </SheetContent>
     </Sheet>

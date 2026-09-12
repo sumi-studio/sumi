@@ -232,7 +232,7 @@ case "${role}" in
     load_runtime_secret SUMI_LOCAL_CONTROL_BEARER "${LOCAL_CONTROL_BEARER_FILE}"
     load_runtime_secret SUMI_AGENT_WRAPPING_KEY "${AGENT_WRAPPING_KEY_FILE}"
     load_runtime_secret SUMI_APPROVAL_SECRET_DIGEST_KEY "${APPROVAL_SECRET_DIGEST_KEY_FILE}"
-    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" ]]; then
+    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" && -z "${SUMI_API_CONNECTION_ID:-}" ]]; then
       load_runtime_secret SUMI_PROVIDER_API_KEY "${PROVIDER_API_KEY_FILE}"
     fi
     load_runtime_secret SUMI_EXECUTION_REVIEWER_API_KEY "${EXECUTION_REVIEWER_API_KEY_FILE}"
@@ -256,6 +256,9 @@ case "${role}" in
     done
     if [[ "${SUMI_MODEL_PRESET:-}" == "chatgpt-responses" ]]; then
       for name in SUMI_CHATGPT_CONNECTION_ID SUMI_MODEL_ACCOUNT_SCOPE SUMI_MODEL_ID SUMI_MODEL_REASONING_EFFORT; do require_env "${name}"; done
+    elif [[ -n "${SUMI_API_CONNECTION_ID:-}" ]]; then
+      for name in SUMI_API_CONNECTION_VERSION SUMI_API_CONNECTION_HUMAN_ID SUMI_MODEL_PUBLIC_ENDPOINT; do require_env "${name}"; done
+      [[ "${SUMI_MODEL_PUBLIC_ENDPOINT}" == true ]] || fail "API connection requires public endpoint policy"
     else
       require_env SUMI_PROVIDER_API_KEY
     fi
@@ -297,7 +300,7 @@ case "${role}" in
       "SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY=${SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY:-}"
       "SUMI_LOG=${SUMI_LOG:-sumi_agent=info}"
     )
-    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" ]]; then
+    if [[ "${SUMI_MODEL_PRESET:-}" != "chatgpt-responses" && -z "${SUMI_API_CONNECTION_ID:-}" ]]; then
       runtime_environment+=("SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}")
     fi
     for name in \
@@ -314,8 +317,13 @@ case "${role}" in
       runtime_environment+=("SUMI_MODEL_ID=${SUMI_MODEL_ID}")
     fi
     for name in \
+      SUMI_API_CONNECTION_ID \
+      SUMI_API_CONNECTION_VERSION \
+      SUMI_API_CONNECTION_HUMAN_ID \
       SUMI_CHATGPT_CONNECTION_ID \
       SUMI_MODEL_ACCOUNT_SCOPE \
+      SUMI_MODEL_BASE_URL \
+      SUMI_MODEL_PUBLIC_ENDPOINT \
       SUMI_MODEL_REASONING_EFFORT \
       SUMI_EXECUTION_REVIEWER_MODEL_ID \
       SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL \

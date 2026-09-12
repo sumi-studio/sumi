@@ -14,6 +14,7 @@ export interface RouteDecision {
 export const originRoutes = Object.freeze({
   exact: Object.freeze([
     "/health",
+    "/api/model-connections",
     "/workspaces",
     "/app-installations",
     "/feedback/bootstrap",

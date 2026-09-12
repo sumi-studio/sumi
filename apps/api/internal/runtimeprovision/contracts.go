@@ -8,6 +8,7 @@ package runtimeprovision
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -71,6 +72,11 @@ type ActivationConfig struct {
 	AgentWrappingKeyID             string           `json:"agent_wrapping_key_id"`
 	ApprovalSecretDigestKey        string           `json:"approval_secret_digest_key"`
 	ProviderAPIKey                 string           `json:"provider_api_key"`
+	APIConnectionID                string           `json:"api_connection_id,omitempty"`
+	APIConnectionVersion           string           `json:"api_connection_version,omitempty"`
+	APIConnectionHumanID           string           `json:"api_connection_human_id,omitempty"`
+	ModelBaseURL                   string           `json:"model_base_url,omitempty"`
+	ModelPublicEndpoint            bool             `json:"model_public_endpoint,omitempty"`
 	ModelPreset                    string           `json:"model_preset,omitempty"`
 	ModelID                        string           `json:"model_id,omitempty"`
 	ModelReasoningEffort           string           `json:"model_reasoning_effort,omitempty"`
@@ -260,6 +266,23 @@ func (request ActivateRequest) Validate() error {
 }
 
 func (config ActivationConfig) Validate() error {
+	if len(config.ModelBaseURL) > 2048 || strings.ContainsAny(config.ModelBaseURL, "\x00\r\n") {
+		return errors.New("invalid model base URL")
+	}
+	if config.ModelPublicEndpoint {
+		u, err := url.Parse(config.ModelBaseURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || config.ModelPreset == "chatgpt-responses" {
+			return errors.New("user API endpoint requires HTTPS and an API-key model")
+		}
+	}
+
+	if config.APIConnectionID != "" {
+		if !config.ModelPublicEndpoint || config.APIConnectionVersion == "" || config.APIConnectionHumanID == "" || config.ProviderAPIKey != "" || config.ChatGPTConnectionID != "" {
+			return errors.New("user API connection requires identity and no static key")
+		}
+	} else if config.APIConnectionVersion != "" || config.APIConnectionHumanID != "" {
+		return errors.New("incomplete API connection identity")
+	}
 	if config.ModelPreset == "chatgpt-responses" {
 		if config.ProviderAPIKey != "" || config.ChatGPTConnectionID == "" || config.ModelAccountScope == "" || config.ModelID == "" {
 			return errors.New("ChatGPT activation requires account/connection/model and no provider API key")
@@ -273,7 +296,13 @@ func (config ActivationConfig) Validate() error {
 		if config.ChatGPTConnectionID != "" {
 			return errors.New("ChatGPT connection requires native ChatGPT preset")
 		}
-		if err := validateOpaque("provider_api_key", config.ProviderAPIKey); err != nil {
+		if config.APIConnectionID != "" {
+			// Credential is resolved per provider request.
+		} else if config.ModelPublicEndpoint {
+			if config.ProviderAPIKey == "" || len(config.ProviderAPIKey) > 65536 {
+				return errors.New("invalid provider API key")
+			}
+		} else if err := validateOpaque("provider_api_key", config.ProviderAPIKey); err != nil {
 			return err
 		}
 		if strings.ContainsAny(config.ProviderAPIKey, "\x00\r\n") {
@@ -315,7 +344,11 @@ func (config ActivationConfig) Validate() error {
 		return errors.New("local_control_socket_gid must be nonzero")
 	}
 	for name, value := range map[string]string{
-		"model_preset":                       config.ModelPreset,
+		"model_preset":            config.ModelPreset,
+		"api_connection_id":       config.APIConnectionID,
+		"api_connection_version":  config.APIConnectionVersion,
+		"api_connection_human_id": config.APIConnectionHumanID,
+
 		"model_id":                           config.ModelID,
 		"model_reasoning_effort":             config.ModelReasoningEffort,
 		"model_account_scope":                config.ModelAccountScope,

@@ -79,15 +79,24 @@ const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
 const approvalHistory = fixtures.approval_operation_recorded_history.wire;
 for (const command of [
   { type: "external_event", content: "done" },
-  { type: "approval_decision", request_id: "request", decision: { type: "approve_once" } },
+  {
+    type: "approval_decision",
+    request_id: "request",
+    decision: { type: "approve_once" },
+  },
 ]) {
-  assert.equal(getValidator("CommandEnvelope")({
-    seq: 1,
-    command_id: "01992000-0000-7000-8000-000000000009",
-    personality_agent_id: approvalHistory.incoming_source.personality_agent_id,
-    provenance: approvalHistory.incoming_source,
-    command,
-  }), false, "runtime approval evidence admitted as command");
+  assert.equal(
+    getValidator("CommandEnvelope")({
+      seq: 1,
+      command_id: "01992000-0000-7000-8000-000000000009",
+      personality_agent_id:
+        approvalHistory.incoming_source.personality_agent_id,
+      provenance: approvalHistory.incoming_source,
+      command,
+    }),
+    false,
+    "runtime approval evidence admitted as command",
+  );
 }
 
 let failed = false;
@@ -248,6 +257,58 @@ function getOpenApiSchemaValidator(definition) {
     components: openApi.components,
   });
 }
+
+// BYOK metadata is intentionally distinct from write-only credential input.
+const apiMetadata = {
+  id: "00000000-0000-4000-8000-000000000001",
+  name: "Personal",
+  preset: "openai-chat",
+  baseUrl: "https://provider.example/v1",
+  model: "custom-model",
+};
+const validateConnections = getOpenApiSchemaValidator("ModelConnectionsState");
+assert.equal(
+  validateConnections({
+    available: true,
+    connections: [apiMetadata],
+    selection: { kind: "api", connectionId: apiMetadata.id },
+    activation: "next_start",
+  }),
+  true,
+);
+assert.equal(
+  validateConnections({
+    available: false,
+    unavailableReason: "Storage unavailable",
+    connections: [],
+    selection: null,
+    activation: "next_start",
+  }),
+  true,
+);
+assert.equal(
+  validateConnections({
+    available: true,
+    connections: [{ ...apiMetadata, apiKey: "must-not-be-returned" }],
+    selection: { kind: "none" },
+    activation: "next_start",
+  }),
+  false,
+);
+const validateSelection = getOpenApiSchemaValidator("ModelConnectionSelection");
+assert.equal(validateSelection({ kind: "none" }), true);
+assert.equal(validateSelection({ kind: "api" }), false);
+assert.equal(
+  validateSelection({ kind: "none", connectionId: apiMetadata.id }),
+  false,
+);
+const validateUpdate = getOpenApiSchemaValidator("ModelAPIConnectionUpdate");
+const { id: _apiId, ...apiUpdate } = apiMetadata;
+assert.equal(validateUpdate(apiUpdate), true);
+assert.equal(
+  getOpenApiSchemaValidator("ModelAPIConnectionCreate")(apiUpdate),
+  false,
+);
 
 const workspaceId = "018f1e72-6e9a-7c20-8e90-123456789abc";
 const humanId = "018f1e72-6e9a-7c20-8e90-123456789abd";

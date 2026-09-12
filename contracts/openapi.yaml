@@ -3,6 +3,165 @@ info:
   title: Sumi API
   version: 0.1.0
 paths:
+  /api/model-connections:
+    get:
+      operationId: listModelConnections
+      summary: List the authenticated Human’s connection metadata and selection
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing
+            mutation CSRF proof.
+        '503':
+          description: Credential storage unavailable or operation could not complete.
+        '200':
+          description: Human-owned metadata only. No secret values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelConnectionsState'
+  /api/model-connections/api:
+    post:
+      operationId: createModelAPIConnection
+      summary: Save a Human-owned API connection without contacting the provider
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing
+            mutation CSRF proof.
+        '503':
+          description: Credential storage unavailable or operation could not complete.
+        '400':
+          description: Strict JSON or connection validation failed.
+        '404':
+          description: Connection does not exist for the authenticated Human or selected
+            connection is unavailable.
+        '200':
+          description: Saved metadata only; does not verify provider authentication,
+            model availability or an inference request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelAPIConnection'
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelAPIConnectionCreate'
+  /api/model-connections/api/{id}:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    put:
+      operationId: updateModelAPIConnection
+      summary: Update this Human’s connection; changing endpoint requires a new key
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing
+            mutation CSRF proof.
+        '503':
+          description: Credential storage unavailable or operation could not complete.
+        '400':
+          description: Strict JSON or connection validation failed.
+        '404':
+          description: Connection does not exist for the authenticated Human or selected
+            connection is unavailable.
+        '200':
+          description: Saved metadata only; does not verify provider authentication,
+            model availability or an inference request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelAPIConnection'
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelAPIConnectionUpdate'
+    delete:
+      operationId: deleteModelAPIConnection
+      summary: Delete this Human’s connection; selected deletion becomes explicit none
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing
+            mutation CSRF proof.
+        '503':
+          description: Credential storage unavailable or operation could not complete.
+        '204':
+          description: Deleted. If selected, old access is denied at the next request
+            and no other credentials are substituted.
+        '404':
+          description: Connection not found for this Human.
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
+  /api/model-connections/selection:
+    put:
+      operationId: selectModelConnection
+      summary: Select this Human’s API, ChatGPT or explicit none; none never falls back
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing
+            mutation CSRF proof.
+        '503':
+          description: Credential storage unavailable or operation could not complete.
+        '400':
+          description: Strict JSON or connection validation failed.
+        '404':
+          description: Connection does not exist for the authenticated Human or selected
+            connection is unavailable.
+        '200':
+          description: Saved metadata only; does not verify provider authentication,
+            model availability or an inference request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelConnectionSelection'
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelConnectionSelection'
   /health:
     get:
       operationId: getHealth
@@ -975,6 +1134,183 @@ components:
           schema:
             $ref: "#/components/schemas/AppLifecycleUnavailableError"
   schemas:
+    ModelAPIConnection:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - preset
+      - baseUrl
+      - model
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        preset:
+          type: string
+          enum:
+          - openai-chat
+          - openai-responses
+          - anthropic
+          - kimi-k3
+          - glm-5.2
+          - umans
+          - umans-kimi-k2.7
+          - opencode-go
+          - opencode-zen-go
+        baseUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Public HTTPS API base URL without user info, query or fragment.
+            Runtime transport checks every DNS destination and disallows redirects.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+    ModelAPIConnectionCreate:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - preset
+      - baseUrl
+      - model
+      - apiKey
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        preset:
+          type: string
+          enum:
+          - openai-chat
+          - openai-responses
+          - anthropic
+          - kimi-k3
+          - glm-5.2
+          - umans
+          - umans-kimi-k2.7
+          - opencode-go
+          - opencode-zen-go
+        baseUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Public HTTPS API base URL without user info, query or fragment.
+            Runtime transport checks every DNS destination and disallows redirects.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+        apiKey:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          writeOnly: true
+          description: Stored encrypted on this Sumi server. Never returned. Required
+            for creation and when changing baseUrl; omitted during edits to retain the
+            existing key.
+    ModelAPIConnectionUpdate:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - preset
+      - baseUrl
+      - model
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        preset:
+          type: string
+          enum:
+          - openai-chat
+          - openai-responses
+          - anthropic
+          - kimi-k3
+          - glm-5.2
+          - umans
+          - umans-kimi-k2.7
+          - opencode-go
+          - opencode-zen-go
+        baseUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Public HTTPS API base URL without user info, query or fragment.
+            Runtime transport checks every DNS destination and disallows redirects.
+        model:
+          type: string
+          minLength: 1
+          maxLength: 128
+        apiKey:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          writeOnly: true
+          description: Stored encrypted on this Sumi server. Never returned. Required
+            for creation and when changing baseUrl; omitted during edits to retain the
+            existing key.
+    ModelConnectionSelection:
+      oneOf:
+      - type: object
+        additionalProperties: false
+        required:
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - none
+            - chatgpt
+      - type: object
+        additionalProperties: false
+        required:
+        - kind
+        - connectionId
+        properties:
+          kind:
+            const: api
+            type: string
+          connectionId:
+            type: string
+            format: uuid
+    ModelConnectionsState:
+      type: object
+      additionalProperties: false
+      required:
+      - available
+      - connections
+      - selection
+      - activation
+      properties:
+        available:
+          type: boolean
+        unavailableReason:
+          type: string
+        connections:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelAPIConnection'
+        selection:
+          oneOf:
+          - $ref: '#/components/schemas/ModelConnectionSelection'
+          - type: 'null'
+        activation:
+          type: string
+          const: next_start
+          description: New configuration is activated once the agent is idle. Credential/endpoint/preset
+            replacement, selection change and deletion revoke old access at its next credential
+            request. Model-only changes retain current-run credentials.
     UUIDv7:
       type: string
       format: uuid

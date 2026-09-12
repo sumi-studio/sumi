@@ -766,7 +766,10 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 		"SUMI_ESCALATION_REVIEWER_MODEL_PRESET":      config.EscalationReviewerModelPreset,
 		"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV": "SUMI_ESCALATION_REVIEWER_API_KEY",
 	}
-	if config.ModelPreset == "chatgpt-responses" {
+	if config.ModelPublicEndpoint {
+		values["SUMI_MODEL_PUBLIC_ENDPOINT"] = "true"
+	}
+	if config.ModelPreset == "chatgpt-responses" || config.APIConnectionID != "" {
 		delete(values, "SUMI_PROVIDER_API_KEY")
 	}
 	if config.ModelPreset != "" {
@@ -776,6 +779,10 @@ func activationEnvironment(config ActivationConfig) map[string]string {
 		values["SUMI_MODEL_ID"] = config.ModelID
 	}
 	for name, value := range map[string]string{
+		"SUMI_API_CONNECTION_ID":                       config.APIConnectionID,
+		"SUMI_API_CONNECTION_VERSION":                  config.APIConnectionVersion,
+		"SUMI_API_CONNECTION_HUMAN_ID":                 config.APIConnectionHumanID,
+		"SUMI_MODEL_BASE_URL":                          config.ModelBaseURL,
 		"SUMI_MODEL_REASONING_EFFORT":                  config.ModelReasoningEffort,
 		"SUMI_MODEL_ACCOUNT_SCOPE":                     config.ModelAccountScope,
 		"SUMI_CHATGPT_CONNECTION_ID":                   config.ChatGPTConnectionID,
@@ -922,6 +929,11 @@ var allowedActivationEnvironment = map[string]bool{
 	"SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE": true,
 	"SUMI_ESCALATION_REVIEWER_MODEL_API_KEY_ENV":   true,
 	"SUMI_MODEL_PRESET":                            true,
+	"SUMI_MODEL_BASE_URL":                          true,
+	"SUMI_API_CONNECTION_ID":                       true,
+	"SUMI_API_CONNECTION_VERSION":                  true,
+	"SUMI_API_CONNECTION_HUMAN_ID":                 true,
+	"SUMI_MODEL_PUBLIC_ENDPOINT":                   true,
 	"SUMI_MODEL_ID":                                true,
 	"SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY":         true,
 	"SUMI_LOG":                                     true,

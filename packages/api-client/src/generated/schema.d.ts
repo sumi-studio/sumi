@@ -4,6 +4,77 @@
  */
 
 export interface paths {
+    "/api/model-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the authenticated Human’s connection metadata and selection */
+        get: operations["listModelConnections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/model-connections/api": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Save a Human-owned API connection without contacting the provider */
+        post: operations["createModelAPIConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/model-connections/api/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Update this Human’s connection; changing endpoint requires a new key */
+        put: operations["updateModelAPIConnection"];
+        post?: never;
+        /** Delete this Human’s connection; selected deletion becomes explicit none */
+        delete: operations["deleteModelAPIConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/model-connections/selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Select this Human’s API, ChatGPT or explicit none; none never falls back */
+        put: operations["selectModelConnection"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -470,6 +541,65 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ModelAPIConnection: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @enum {string} */
+            preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
+            /**
+             * Format: uri
+             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             */
+            baseUrl: string;
+            model: string;
+        };
+        ModelAPIConnectionCreate: {
+            name: string;
+            /** @enum {string} */
+            preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
+            /**
+             * Format: uri
+             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             */
+            baseUrl: string;
+            model: string;
+            /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
+            apiKey: string;
+        };
+        ModelAPIConnectionUpdate: {
+            name: string;
+            /** @enum {string} */
+            preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
+            /**
+             * Format: uri
+             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             */
+            baseUrl: string;
+            model: string;
+            /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
+            apiKey?: string;
+        };
+        ModelConnectionSelection: {
+            /** @enum {string} */
+            kind: "none" | "chatgpt";
+        } | {
+            /** @constant */
+            kind: "api";
+            /** Format: uuid */
+            connectionId: string;
+        };
+        ModelConnectionsState: {
+            available: boolean;
+            unavailableReason?: string;
+            connections: components["schemas"]["ModelAPIConnection"][];
+            selection: components["schemas"]["ModelConnectionSelection"] | null;
+            /**
+             * @description New configuration is activated once the agent is idle. Credential/endpoint/preset replacement, selection change and deletion revoke old access at its next credential request. Model-only changes retain current-run credentials.
+             * @constant
+             */
+            activation: "next_start";
+        };
         /** Format: uuid */
         UUIDv7: string;
         /**
@@ -1530,6 +1660,251 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listModelConnections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Human-owned metadata only. No secret values. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionsState"];
+                };
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Credential storage unavailable or operation could not complete. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createModelAPIConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelAPIConnectionCreate"];
+            };
+        };
+        responses: {
+            /** @description Saved metadata only; does not verify provider authentication, model availability or an inference request. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelAPIConnection"];
+                };
+            };
+            /** @description Strict JSON or connection validation failed. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection does not exist for the authenticated Human or selected connection is unavailable. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Credential storage unavailable or operation could not complete. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    updateModelAPIConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelAPIConnectionUpdate"];
+            };
+        };
+        responses: {
+            /** @description Saved metadata only; does not verify provider authentication, model availability or an inference request. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelAPIConnection"];
+                };
+            };
+            /** @description Strict JSON or connection validation failed. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection does not exist for the authenticated Human or selected connection is unavailable. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Credential storage unavailable or operation could not complete. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteModelAPIConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. If selected, old access is denied at the next request and no other credentials are substituted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection not found for this Human. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Credential storage unavailable or operation could not complete. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    selectModelConnection: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelConnectionSelection"];
+            };
+        };
+        responses: {
+            /** @description Saved metadata only; does not verify provider authentication, model availability or an inference request. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelConnectionSelection"];
+                };
+            };
+            /** @description Strict JSON or connection validation failed. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection does not exist for the authenticated Human or selected connection is unavailable. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Credential storage unavailable or operation could not complete. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getHealth: {
         parameters: {
             query?: never;

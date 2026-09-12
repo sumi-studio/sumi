@@ -750,6 +750,38 @@ function assertWorkspaceIntegrationContract(discovery: RouteDiscovery): void {
   }
 }
 
+test("BYOK list reaches the bound API origin without a static fallback", async () => {
+  const response = Response.json({ available: true, connections: [] });
+  let forwarded: Request | undefined;
+  const actual = await handleRequest(
+    new Request("https://sumi.example/api/model-connections", {
+      headers: { Cookie: "session=fixture", Accept: "application/json" },
+    }),
+    {
+      ASSETS: { fetch: () => assert.fail("BYOK list reached static assets") },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          forwarded = request;
+          return response;
+        },
+      },
+    },
+    async () => assert.fail("BYOK list bypassed the bound API origin"),
+  );
+  assert.equal(forwarded?.url, "http://sumi.example/api/model-connections");
+  assert.equal(forwarded?.method, "GET");
+  assert.equal(forwarded?.headers.get("Cookie"), "session=fixture");
+  assert.equal(actual, response);
+  for (const path of [
+    "/api/model-connections",
+    "/api/model-connections/api",
+    "/api/model-connections/selection",
+  ]) {
+    assert.equal(classifyPath(path), "origin", path);
+  }
+  assert.notEqual(classifyPath("/api/model-connections-unrelated"), "origin");
+});
+
 test("model connection status and login route to the authenticated API", () => {
   for (const path of [
     "/api/model-connections/chatgpt",

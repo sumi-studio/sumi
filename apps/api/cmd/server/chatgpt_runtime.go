@@ -28,6 +28,7 @@ type chatGPTEmployerAuthority interface {
 	AuthorizeCurrentHumanEmployer(context.Context, string, string, func() error) error
 }
 type chatGPTRuntime struct {
+	selection   userModelStore
 	connections chatGPTConnectionStore
 	employers   chatGPTEmployerAuthority
 	refresh     chatgpt.RefreshFunc
@@ -50,6 +51,20 @@ func chatGPTStoreFromEnv(pool *pgxpool.Pool) (*chatgpt.Store, error) {
 	return chatgpt.New(pool, key)
 }
 
+func (c *chatGPTRuntime) authorizeSelection(ctx context.Context, human string) error {
+	if c.selection == nil {
+		return nil
+	}
+	selected, exists, err := c.selection.Selected(ctx, human)
+	if err != nil {
+		return err
+	}
+	if exists && selected.Kind != "chatgpt" {
+		return errors.New("ChatGPT is no longer the selected connection")
+	}
+	return nil
+}
+
 func (c *chatGPTRuntime) withHuman(ctx context.Context, pa string, operation func(string) error) error {
 	kind, human, err := c.employers.CurrentEmployer(ctx, pa)
 	if err != nil {
@@ -58,7 +73,12 @@ func (c *chatGPTRuntime) withHuman(ctx context.Context, pa string, operation fun
 	if kind != "human" {
 		return errors.New("ChatGPT connection requires a current Human employer")
 	}
-	return c.employers.AuthorizeCurrentHumanEmployer(ctx, human, pa, func() error { return operation(human) })
+	return c.employers.AuthorizeCurrentHumanEmployer(ctx, human, pa, func() error {
+		if err := c.authorizeSelection(ctx, human); err != nil {
+			return err
+		}
+		return operation(human)
+	})
 }
 
 func (c *chatGPTRuntime) activation(ctx context.Context, pa string, base runtimeprovision.ActivationConfig) (runtimeprovision.ActivationConfig, error) {
@@ -70,6 +90,9 @@ func (c *chatGPTRuntime) activation(ctx context.Context, pa string, base runtime
 		return base, nil
 	}
 	err = c.employers.AuthorizeCurrentHumanEmployer(ctx, human, pa, func() error {
+		if err := c.authorizeSelection(ctx, human); err != nil {
+			return err
+		}
 		status, err := c.connections.Status(ctx, human)
 		if err != nil {
 			return err
