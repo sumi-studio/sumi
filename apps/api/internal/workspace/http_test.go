@@ -935,16 +935,12 @@ func TestAppCatalogWireCarriesCapabilityVocabularyWithoutMentionAll(t *testing.T
 	}
 	decodeRecorder(t, response, &body)
 	foundMessaging := false
-	foundFeedback := false
 	for _, descriptor := range body.Apps {
 		if descriptor.WorkspaceRoleCapabilities == nil {
 			t.Fatalf("%s emitted null workspace_role_capabilities", descriptor.AppID)
 		}
 		if descriptor.AppID == "feedback" {
-			foundFeedback = true
-			if descriptor.WorkspaceOwnerAllowed || !descriptor.ParticipantOwnerAllowed {
-				t.Fatal("Feedback wire must describe participant ownership")
-			}
+			t.Fatal("built-in Feedback must not appear in the installable app catalog")
 		}
 		if descriptor.AppID == "messaging" {
 			foundMessaging = true
@@ -962,8 +958,8 @@ func TestAppCatalogWireCarriesCapabilityVocabularyWithoutMentionAll(t *testing.T
 			}
 		}
 	}
-	if !foundMessaging || !foundFeedback {
-		t.Fatal("catalog omitted Messaging or Feedback")
+	if !foundMessaging {
+		t.Fatal("catalog omitted Messaging")
 	}
 }
 
