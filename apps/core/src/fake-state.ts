@@ -4,6 +4,8 @@ import type {
   CommitRequest,
   Event,
   Input,
+  Job,
+  JobTerminalReport,
   LoadResult,
   Operation,
   OutboxEntry,
@@ -22,6 +24,46 @@ const MISS_POLICIES = new Set([
   "expire",
   "report_missed",
 ]);
+
+const JOB_TERMINAL = new Set(["done", "failed", "cancelled", "lost"]);
+
+/** Mirrors Go validateJobRequest for kind 'subprocess'. */
+function validateSubprocessRequest(request: Record<string, unknown>) {
+  const cmd = request.command;
+  if (
+    !Array.isArray(cmd) ||
+    cmd.length === 0 ||
+    cmd.some((a) => typeof a !== "string" || a === "")
+  ) {
+    throw new StateError(
+      400,
+      "subprocess job requires a non-empty command array of strings",
+    );
+  }
+  if (request.cwd !== undefined && typeof request.cwd !== "string") {
+    throw new StateError(400, "subprocess cwd must be a string");
+  }
+  const t = request.timeout_ms;
+  if (
+    t !== undefined &&
+    (typeof t !== "number" || !Number.isInteger(t) || t <= 0 || t > 3_600_000)
+  ) {
+    throw new StateError(
+      400,
+      "subprocess timeout_ms must be an integer in (0, 3600000]",
+    );
+  }
+  if (request.env !== undefined) {
+    if (typeof request.env !== "object" || request.env === null) {
+      throw new StateError(400, "subprocess env must be an object of strings");
+    }
+    for (const [k, v] of Object.entries(request.env)) {
+      if (typeof v !== "string") {
+        throw new StateError(400, `subprocess env[${k}] must be a string`);
+      }
+    }
+  }
+}
 
 /** True when any string in a JSON-shaped value contains NUL. */
 function hasNul(v: unknown): boolean {
@@ -61,6 +103,8 @@ export class FakeState implements StateClient {
   /** One durable plan per input — key: persona|input_id. Immutable. */
   plans = new Map<string, TurnPlan>();
   schedules = new Map<string, Schedule>();
+  /** Persona-scoped execution records — key: persona|job_id. */
+  jobs = new Map<string, Job>();
   outboxEntries: OutboxEntry[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
@@ -295,12 +339,11 @@ export class FakeState implements StateClient {
     }
     // Go rejects a decision containing NUL at SavePlan — jsonb cannot
     // store it, and retrying can never succeed.
-    if (
-      hasNul(req.text) ||
-      hasNul(req.calls) ||
-      hasNul(req.usage ?? {})
-    ) {
-      throw new StateError(400, "decision contains a NUL byte jsonb cannot store");
+    if (hasNul(req.text) || hasNul(req.calls) || hasNul(req.usage ?? {})) {
+      throw new StateError(
+        400,
+        "decision contains a NUL byte jsonb cannot store",
+      );
     }
     const key = `${persona}|${turn.input_id}`;
     const stored = this.plans.get(key);
@@ -433,7 +476,13 @@ export class FakeState implements StateClient {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish.
-    if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
+    if (
+      op.tool !== "schedule.set" &&
+      op.tool !== "journal.note" &&
+      op.tool !== "job.start" &&
+      op.tool !== "job.status" &&
+      op.tool !== "job.cancel"
+    ) {
       throw new StateError(400, `unknown tool: ${op.tool}`);
     }
     // A NUL in the request is a deterministic data error (jsonb cannot
@@ -484,7 +533,10 @@ export class FakeState implements StateClient {
       }
       // A running op claimed by a fenced generation is reclaimed for
       // re-execution (external tools; internal tools can't stay running).
-      if (existing.status === "running" && existing.claimed_generation !== generation) {
+      if (
+        existing.status === "running" &&
+        existing.claimed_generation !== generation
+      ) {
         existing.claimed_generation = generation;
         existing.turn_id = op.turnId;
         return { operation: existing, fresh: true };
@@ -558,6 +610,32 @@ export class FakeState implements StateClient {
         this.schedules.set(`${persona}|${sid}`, sch);
         operation.response = { schedule: sch };
       }
+    } else if (op.tool === "job.start") {
+      // The job row is minted inside this claim transaction with a
+      // server-derived id (plan position), so a replayed claim can never
+      // mint a second job and the model never chooses an id.
+      validateSubprocessRequest(op.request);
+      const jobId = `op:${turn.input_id}:${op.callIndex}`;
+      const job = this.insertJob(
+        persona,
+        jobId,
+        "subprocess",
+        op.request,
+        `tool:${op.turnId}:${op.callIndex}`,
+      );
+      operation.response = { job };
+    } else if (op.tool === "job.status") {
+      const jobId = op.request.job_id;
+      if (typeof jobId !== "string" || jobId === "") {
+        throw new StateError(400, "job.status requires job_id");
+      }
+      operation.response = { job: this.mustJob(persona, jobId) };
+    } else if (op.tool === "job.cancel") {
+      const jobId = op.request.job_id;
+      if (typeof jobId !== "string" || jobId === "") {
+        throw new StateError(400, "job.cancel requires job_id");
+      }
+      operation.response = { job: this.cancelJobRow(persona, jobId) };
     } else {
       const ev: Event = {
         persona_id: persona,
@@ -675,5 +753,247 @@ export class FakeState implements StateClient {
           .map((e) => e.seq),
       ),
     };
+  }
+
+  // --- jobs (M09) ---------------------------------------------------------
+  // Same contract as the Go store: runner-claim ownership (not the writer
+  // generation), atomic terminal+notification, identical-replay semantics.
+
+  private mustJob(persona: string, jobId: string): Job {
+    const j = this.jobs.get(`${persona}|${jobId}`);
+    if (!j) throw new StateError(404, "job not found");
+    return j;
+  }
+
+  private insertJob(
+    persona: string,
+    jobId: string,
+    kind: string,
+    request: Record<string, unknown>,
+    createdBy: string,
+  ): Job {
+    const existing = this.jobs.get(`${persona}|${jobId}`);
+    if (existing) {
+      if (existing.kind !== kind || !jsonEqual(existing.request, request)) {
+        throw new StateError(409, "job_id replay carries a different request");
+      }
+      return existing;
+    }
+    const job: Job = {
+      persona_id: persona,
+      job_id: jobId,
+      kind,
+      request,
+      status: "queued",
+      claimed_by: null,
+      claim_expires_at: null,
+      created_by: createdBy,
+      created_at: new Date().toISOString(),
+      started_at: null,
+      finished_at: null,
+      cancel_requested_at: null,
+      result: null,
+      error: null,
+      notified_at: null,
+    };
+    this.jobs.set(`${persona}|${jobId}`, job);
+    return job;
+  }
+
+  /** Queue the 'job:<id>' terminal notification input exactly once. */
+  private notifyJobTerminal(job: Job) {
+    const inputId = `job:${job.job_id}`;
+    if (
+      !this.inputs.some(
+        (i) => i.persona_id === job.persona_id && i.input_id === inputId,
+      )
+    ) {
+      const payload: Record<string, unknown> = {
+        job_id: job.job_id,
+        kind: job.kind,
+        status: job.status,
+        text:
+          `job ${job.job_id} (${job.kind}) ${job.status}` +
+          (job.error ? `: ${job.error}` : ""),
+      };
+      if (job.error) payload.error = job.error;
+      const code = job.result?.exit_code;
+      if (code !== undefined) payload.exit_code = code;
+      this.inputs.push({
+        persona_id: job.persona_id,
+        input_id: inputId,
+        kind: "job_completed",
+        payload,
+        actor_kind: "job",
+        actor_id: job.job_id,
+        source_surface: "core_jobs",
+        thread_id: "",
+        occurred_at: null,
+        attention: "reply",
+        status: "queued",
+        claimed_generation: null,
+        turn_id: null,
+        created_at: new Date().toISOString(),
+        done_at: null,
+        not_before: null,
+      });
+    }
+    job.notified_at = new Date().toISOString();
+  }
+
+  private cancelJobRow(persona: string, jobId: string): Job {
+    const job = this.mustJob(persona, jobId);
+    if (job.status === "queued") {
+      job.status = "cancelled";
+      job.cancel_requested_at = new Date().toISOString();
+      job.finished_at = job.cancel_requested_at;
+      this.notifyJobTerminal(job);
+    } else if (job.status === "running") {
+      job.status = "cancel_requested";
+      job.cancel_requested_at = new Date().toISOString();
+    }
+    return job;
+  }
+
+  async submitJob(
+    persona: string,
+    job: { jobId: string; kind: string; request: Record<string, unknown> },
+  ): Promise<{ job: Job; created: boolean }> {
+    if (!job.jobId || job.jobId.length > 256) {
+      throw new StateError(400, "job_id must be 1-256 characters");
+    }
+    if (job.jobId.startsWith("op:") || job.jobId === "claim") {
+      throw new StateError(400, `job_id ${job.jobId} is reserved`);
+    }
+    if (job.kind !== "subprocess") {
+      throw new StateError(400, `unknown job kind ${job.kind}`);
+    }
+    validateSubprocessRequest(job.request);
+    const key = `${persona}|${job.jobId}`;
+    const existed = this.jobs.has(key);
+    const stored = this.insertJob(
+      persona,
+      job.jobId,
+      job.kind,
+      job.request,
+      "api",
+    );
+    return { job: stored, created: !existed };
+  }
+
+  async getJob(persona: string, jobId: string): Promise<Job> {
+    return this.mustJob(persona, jobId);
+  }
+
+  async listJobs(
+    persona: string,
+    opts?: { status?: Job["status"][]; limit?: number },
+  ): Promise<Job[]> {
+    return [...this.jobs.values()]
+      .filter(
+        (j) =>
+          j.persona_id === persona &&
+          (!opts?.status?.length || opts.status.includes(j.status)),
+      )
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, opts?.limit ?? 50);
+  }
+
+  async cancelJob(persona: string, jobId: string): Promise<Job> {
+    return this.cancelJobRow(persona, jobId);
+  }
+
+  async claimJobs(
+    persona: string,
+    req: { runnerId: string; kinds: string[]; leaseMs: number; limit?: number },
+  ): Promise<{ claimed: Job[]; swept: Job[] }> {
+    const now = Date.now();
+    const swept: Job[] = [];
+    for (const j of this.jobs.values()) {
+      if (
+        j.persona_id === persona &&
+        (j.status === "running" || j.status === "cancel_requested") &&
+        j.claim_expires_at !== null &&
+        Date.parse(j.claim_expires_at) < now
+      ) {
+        j.status = "lost";
+        j.finished_at = new Date().toISOString();
+        j.error = "runner claim expired; outcome is indeterminate";
+        j.result = { ...(j.result ?? {}), reason: "claim_expired" };
+        this.notifyJobTerminal(j);
+        swept.push(j);
+      }
+    }
+    const claimed: Job[] = [];
+    const limit = req.limit ?? 1;
+    for (const j of [...this.jobs.values()].sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    )) {
+      if (claimed.length >= limit) break;
+      if (
+        j.persona_id !== persona ||
+        j.status !== "queued" ||
+        !req.kinds.includes(j.kind)
+      ) {
+        continue;
+      }
+      j.status = "running";
+      j.claimed_by = req.runnerId;
+      j.claim_expires_at = new Date(now + req.leaseMs).toISOString();
+      j.started_at ??= new Date().toISOString();
+      claimed.push(j);
+    }
+    return { claimed, swept };
+  }
+
+  async heartbeatJob(
+    persona: string,
+    jobId: string,
+    req: { runnerId: string; leaseMs: number },
+  ): Promise<Job> {
+    const job = this.mustJob(persona, jobId);
+    if (job.claimed_by !== req.runnerId || JOB_TERMINAL.has(job.status)) {
+      throw new StateError(409, "job is not claimed by this runner", job);
+    }
+    job.claim_expires_at = new Date(Date.now() + req.leaseMs).toISOString();
+    return job;
+  }
+
+  async completeJob(
+    persona: string,
+    jobId: string,
+    req: {
+      runnerId: string;
+      status: JobTerminalReport;
+      result: Record<string, unknown>;
+      error?: string;
+    },
+  ): Promise<Job> {
+    if (!["done", "failed", "cancelled"].includes(req.status)) {
+      throw new StateError(
+        400,
+        "complete status must be done, failed, or cancelled",
+      );
+    }
+    const job = this.mustJob(persona, jobId);
+    if (JOB_TERMINAL.has(job.status)) {
+      const same =
+        job.status === req.status &&
+        jsonEqual(job.result ?? {}, req.result) &&
+        (job.error ?? "") === (req.error ?? "");
+      if (!same) {
+        throw new StateError(409, `job already finished as ${job.status}`, job);
+      }
+      return job;
+    }
+    if (job.claimed_by !== req.runnerId) {
+      throw new StateError(409, "job is not claimed by this runner", job);
+    }
+    job.status = req.status;
+    job.result = req.result;
+    job.error = req.error || null;
+    job.finished_at = new Date().toISOString();
+    this.notifyJobTerminal(job);
+    return job;
   }
 }

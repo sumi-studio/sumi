@@ -117,7 +117,7 @@ type Input struct {
 	// NotBefore delays a retryable-failed input's next claim — the
 	// durable bound that keeps one failing input from hot-looping and
 	// starving every later queued input.
-	NotBefore         *time.Time     `json:"not_before"`
+	NotBefore *time.Time `json:"not_before"`
 }
 
 type Turn struct {
@@ -460,8 +460,8 @@ const schedInputPrefix = "sched:"
 // violation, not idempotency: it is rejected rather than answered with a
 // receipt for a different request.
 func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error) {
-	if strings.HasPrefix(in.InputID, schedInputPrefix) {
-		return Input{}, false, fmt.Errorf("%w: input_id prefix %q is reserved", ErrBadRequest, schedInputPrefix)
+	if strings.HasPrefix(in.InputID, schedInputPrefix) || strings.HasPrefix(in.InputID, jobInputPrefix) {
+		return Input{}, false, fmt.Errorf("%w: input_id prefix %q is reserved", ErrBadRequest, strings.SplitN(in.InputID, ":", 2)[0]+":")
 	}
 	if in.Attention == "" {
 		in.Attention = "reply"
@@ -1152,13 +1152,23 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 // atomically inside the claim transaction. Anything else has no execution
 // path yet and must not be claimable.
 func isInternalTool(tool string) bool {
-	return tool == "schedule.set" || tool == "journal.note"
+	switch tool {
+	case "schedule.set", "journal.note", "job.start", "job.status", "job.cancel":
+		return true
+	}
+	return false
 }
 
 // internalToolResponse applies a state-internal tool's effect inside the
 // claim transaction: the operation record and its effect are atomic, so a
-// crash cannot leave an unrecorded effect or a dangling record.
-func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, tool string, request map[string]any) (map[string]any, bool, error) {
+// crash cannot leave an unrecorded effect or a dangling record. inputID and
+// callIndex are the claim's plan position — job.start derives its job_id
+// from them so a replayed claim can never mint a second job.
+func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, request map[string]any) (map[string]any, bool, error) {
+	if strings.HasPrefix(tool, "job.") {
+		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
+		return resp, resp != nil, err
+	}
 	switch tool {
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
@@ -1370,7 +1380,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
-	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
+	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
 	if err != nil {
 		return Operation{}, false, err
 	}
