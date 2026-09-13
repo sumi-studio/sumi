@@ -16,6 +16,23 @@ import type {
   WriterLease,
 } from "./types.ts";
 
+const MISS_POLICIES = new Set([
+  "fire_late",
+  "coalesce",
+  "expire",
+  "report_missed",
+]);
+
+/** True when any string in a JSON-shaped value contains NUL. */
+function hasNul(v: unknown): boolean {
+  if (typeof v === "string") return v.includes("\u0000");
+  if (Array.isArray(v)) return v.some(hasNul);
+  if (v !== null && typeof v === "object") {
+    return Object.values(v).some(hasNul);
+  }
+  return false;
+}
+
 /**
  * In-memory StateClient implementing the same contract semantics as the Go
  * service — fencing, idempotent claims, atomic internal effects, recovery —
@@ -263,6 +280,15 @@ export class FakeState implements StateClient {
     if (turn.generation !== generation || turn.status !== "running") {
       throw new StateError(409, "conflicting turn state");
     }
+    // Go rejects a decision containing NUL at SavePlan — jsonb cannot
+    // store it, and retrying can never succeed.
+    if (
+      hasNul(req.text) ||
+      hasNul(req.calls) ||
+      hasNul(req.usage ?? {})
+    ) {
+      throw new StateError(400, "decision contains a NUL byte jsonb cannot store");
+    }
     const key = `${persona}|${turn.input_id}`;
     const stored = this.plans.get(key);
     if (stored) {
@@ -377,6 +403,14 @@ export class FakeState implements StateClient {
     if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
       throw new StateError(400, `unknown tool: ${op.tool}`);
     }
+    // A NUL in the request is a deterministic data error (jsonb cannot
+    // store it) — checked before the fence/plan checks like Go.
+    if (hasNul(op.request)) {
+      throw new StateError(
+        400,
+        `${op.tool} request contains a NUL byte jsonb cannot store`,
+      );
+    }
     this.mustHold(persona, generation);
     // Operations are attributed to the live turn: it must exist and be
     // running under this generation (Go claim enforces the same).
@@ -438,20 +472,59 @@ export class FakeState implements StateClient {
       completed_at: new Date().toISOString(),
     };
     if (op.tool === "schedule.set") {
+      const missPolicy = (op.request.miss_policy as string) ?? "fire_late";
+      if (!MISS_POLICIES.has(missPolicy)) {
+        throw new StateError(
+          400,
+          "schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed",
+        );
+      }
+      const wakeAt = new Date(String(op.request.wake_at));
+      if (Number.isNaN(wakeAt.getTime())) {
+        throw new StateError(400, "schedule.set requires RFC3339 wake_at");
+      }
       const sid = (op.request.schedule_id as string) ?? `sch-${Date.now()}`;
-      const sch: Schedule = this.schedules.get(`${persona}|${sid}`) ?? {
-        persona_id: persona,
-        schedule_id: sid,
-        wake_at: String(op.request.wake_at),
-        payload: (op.request.payload as Record<string, unknown>) ?? {},
-        miss_policy: "fire_late",
-        status: "pending",
-        claimed_generation: null,
-        created_at: new Date().toISOString(),
-        fired_at: null,
-      };
-      this.schedules.set(`${persona}|${sid}`, sch);
-      operation.response = { schedule: sch };
+      const existing = this.schedules.get(`${persona}|${sid}`);
+      if (existing) {
+        // Crash replay never reaches here — receipts are keyed by plan
+        // position. An identical request over a pending row is a true
+        // idempotent set; anything else must not report a wake that was
+        // not created.
+        const identical =
+          new Date(existing.wake_at).getTime() === wakeAt.getTime() &&
+          existing.miss_policy === missPolicy &&
+          jsonEqual(
+            existing.payload,
+            (op.request.payload as Record<string, unknown>) ?? {},
+          );
+        if (!identical) {
+          throw new StateError(
+            400,
+            `schedule.set schedule_id ${sid} already exists with different contents`,
+          );
+        }
+        if (existing.status !== "pending") {
+          throw new StateError(
+            400,
+            `schedule.set schedule_id ${sid} is already ${existing.status}`,
+          );
+        }
+        operation.response = { schedule: existing };
+      } else {
+        const sch: Schedule = {
+          persona_id: persona,
+          schedule_id: sid,
+          wake_at: wakeAt.toISOString(),
+          payload: (op.request.payload as Record<string, unknown>) ?? {},
+          miss_policy: missPolicy as Schedule["miss_policy"],
+          status: "pending",
+          claimed_generation: null,
+          created_at: new Date().toISOString(),
+          fired_at: null,
+        };
+        this.schedules.set(`${persona}|${sid}`, sch);
+        operation.response = { schedule: sch };
+      }
     } else {
       const ev: Event = {
         persona_id: persona,

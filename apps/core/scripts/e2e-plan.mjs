@@ -429,6 +429,147 @@ async function main() {
   );
   log("  zero-call decision replayed verbatim");
 
+  // --- scenario 4: deterministic bad tool data resolves honestly ----------
+  // CR3-B1: a decision that can never persist must fail the input
+  // non-retryable — recorded, observable, and never blocking later inputs.
+  log("scenario 4: deterministic bad tool data resolves; queue unblocked");
+  const in4 = (await submit("input-four")).json.input.input_id;
+  const out5 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply",
+      calls: [{ tool: "journal.note", request: { text: "a\u0000b" } }],
+    }),
+  });
+  assert(
+    out5.includes("turn failed on plan divergence"),
+    "NUL decision was not recorded as a non-retryable failure",
+    out5,
+  );
+  const in4State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in4}`,
+    ptoken,
+  );
+  assert(
+    in4State.json?.input?.status === "done",
+    `poisoned input must resolve (done), got ${in4State.text}`,
+  );
+  // The queue is unblocked: a later normal input completes on the same
+  // persona with no residue from the failed decision.
+  const in5 = (await submit("input-five")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply-F",
+      calls: [{ tool: "journal.note", request: { text: "note-F" } }],
+    }),
+  });
+  const replies5 = await outboxFor(in5);
+  assert(
+    replies5.length === 1 &&
+      replies5[0].payload.output.text === "reply-F" &&
+      (await noteTexts()).includes("note-F"),
+    "the input after a poisoned decision must complete normally",
+  );
+  log("  NUL decision failed non-retryable; next input completed");
+
+  // CR3-B1 (claim side): a plan-valid but semantically invalid argument is
+  // a recorded tool error, and the turn commits — not a retried 500.
+  const in6 = (await submit("input-six")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "scheduling",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            wake_at: "2030-01-01T00:00:00Z",
+            miss_policy: "bogus",
+          },
+        },
+      ],
+    }),
+  });
+  const evs6 = await events();
+  const toolErr = evs6.find(
+    (e) => e.kind === "tool_result" && /miss_policy/.test(e.payload.error ?? ""),
+  );
+  assert(toolErr, "invalid miss_policy must surface as a tool_result error");
+  const in6State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in6}`,
+    ptoken,
+  );
+  assert(
+    in6State.json?.input?.status === "done",
+    `bad-policy input must resolve (done), got ${in6State.text}`,
+  );
+  log("  invalid miss_policy recorded as a tool error; input resolved");
+
+  // CR3-B2: a second schedule.set reusing an id must not report a stale
+  // success — different contents are an explicit tool error.
+  const in7 = (await submit("input-seven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reminder set",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            schedule_id: "rem-e2e",
+            wake_at: "2030-01-01T00:00:00Z",
+            payload: { text: "first" },
+            miss_policy: "coalesce",
+          },
+        },
+      ],
+    }),
+  });
+  const evs7 = await events();
+  assert(
+    evs7.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        e.payload.response?.schedule?.schedule_id === "rem-e2e",
+    ),
+    "initial schedule.set did not commit",
+  );
+  const in8 = (await submit("input-eight")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reminder again",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            schedule_id: "rem-e2e",
+            wake_at: "2031-06-01T00:00:00Z",
+            payload: { text: "different" },
+            miss_policy: "coalesce",
+          },
+        },
+      ],
+    }),
+  });
+  const evs8 = await events();
+  assert(
+    evs8.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        /already exists with different contents/.test(e.payload.error ?? ""),
+    ),
+    "conflicting schedule_id reuse must be an explicit tool error",
+  );
+  const in8State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in8}`,
+    ptoken,
+  );
+  assert(
+    in8State.json?.input?.status === "done",
+    `conflicting-reuse input must resolve (done), got ${in8State.text}`,
+  );
+  log("  schedule_id reuse with different contents is an honest error");
+
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");
 }

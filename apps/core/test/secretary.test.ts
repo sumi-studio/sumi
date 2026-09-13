@@ -9,6 +9,7 @@ import type {
 import { MockProvider } from "../src/providers/mock.ts";
 import { assemble, Secretary, type SecretaryConfig } from "../src/secretary.ts";
 import { type StateClient, StateError } from "../src/state-client.ts";
+import { toolSpecs } from "../src/tools.ts";
 import type { Event } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000001";
@@ -628,4 +629,170 @@ test("same-holder acquire bumps generation; release keeps monotonic fencing", as
   await state.releaseWriter(PERSONA, "h", l2.generation);
   const l3 = await state.acquireWriter(PERSONA, "h", 30_000);
   assert.equal(l3.generation, l2.generation + 1);
+});
+
+test("a decision containing NUL data fails the input non-retryable; the next input completes (CR3-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-20", "hi");
+  // First consultation decides a call whose request can never persist
+  // (jsonb cannot hold NUL); the second consultation is a clean reply.
+  let consultations = 0;
+  const seq: ModelProvider = {
+    name: "seq",
+    async *stream(_req: ModelRequest) {
+      consultations++;
+      yield { type: "text", delta: "r" };
+      if (consultations === 1) {
+        yield {
+          type: "tool_call",
+          call: {
+            id: "c0",
+            name: "journal.note",
+            arguments: { text: "a\u0000b" },
+          },
+        };
+      }
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: seq }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  // The impossible decision is not retried: the turn is failed and the
+  // input resolves instead of blocking every later input.
+  assert.equal(consultations, 1, "savePlan 400 is not retried");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-20" && t.status === "failed",
+  );
+  assert.ok(failed, "turn must record the non-retryable failure");
+  assert.match(
+    failed!.error ?? "",
+    /decision could not be recorded|diverged retry/,
+  );
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-20")!.status,
+    "done",
+  );
+  // The queue is unblocked: a subsequent normal input completes.
+  state.addInput(PERSONA, "in-21", "hello");
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-21")!.status,
+    "done",
+  );
+});
+
+test("schedule.set with an invalid miss_policy is a recorded tool error, not a retried failure (CR3-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-22", "remind me");
+  const bad = new ScriptedProvider({
+    text: "scheduling",
+    calls: [
+      {
+        tool: "schedule.set",
+        request: { wake_at: "2030-01-01T00:00:00Z", miss_policy: "bogus" },
+      },
+    ],
+  });
+  const s = new Secretary(cfg(state, "h", { provider: bad }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const evs = await state.events(PERSONA, 0);
+  const tr = evs.find(
+    (e) => e.kind === "tool_result" && e.payload.error,
+  );
+  assert.ok(tr, "the tool error must be observable in the journal");
+  assert.match(String(tr!.payload.error), /miss_policy/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-22")!.status,
+    "done",
+    "the input resolves — no poison retry loop",
+  );
+  assert.equal(state.schedules.size, 0, "no schedule was created");
+});
+
+test("schedule.set schedule_id reuse: identical pending replays; different contents or a fired row is a tool error (CR3-B2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const s = new Secretary(cfg(state));
+  await s.start();
+  const gen = s.generation!;
+  const req1 = {
+    schedule_id: "rem",
+    wake_at: "2000-01-01T00:00:00Z",
+    payload: { text: "hi" },
+    miss_policy: "coalesce",
+  };
+  const setSchedule = async (inputId: string, turnId: string, request: Record<string, unknown>) => {
+    state.addInput(PERSONA, inputId, "x");
+    await state.loadTurn(PERSONA, gen, turnId, 10);
+    await state.savePlan(PERSONA, gen, {
+      turnId,
+      text: "r",
+      calls: [{ tool: "schedule.set", request }],
+      usage: {},
+    });
+    try {
+      return await state.claimOperation(PERSONA, gen, {
+        operationId: `${turnId}:op:0`,
+        turnId,
+        tool: "schedule.set",
+        callIndex: 0,
+        request,
+      });
+    } finally {
+      // The secretary always resolves the turn after a claim — a 400 is
+      // recorded as a tool_result error and the turn commits complete.
+      await state.commitTurn(PERSONA, turnId, gen, {
+        outcome: "complete",
+        events: [],
+      });
+    }
+  };
+
+  // in-30 creates the schedule.
+  const c1 = await setSchedule("in-30", "t-1", req1);
+  assert.equal(c1.fresh, true);
+
+  // in-31 reuses the id with different contents → explicit 400; the
+  // existing row is untouched.
+  await assert.rejects(
+    setSchedule("in-31", "t-2", {
+      ...req1,
+      wake_at: "2030-01-01T00:00:00Z",
+    }),
+    (e: unknown) => e instanceof StateError && e.status === 400,
+  );
+  const kept = state.schedules.get(`${PERSONA}|rem`)!;
+  assert.equal(kept.wake_at, new Date("2000-01-01T00:00:00Z").toISOString());
+  assert.equal(kept.status, "pending");
+
+  // in-32 reuses the id with identical contents while pending → the
+  // existing row is returned; no duplicate, no false "newly decided".
+  const c3 = await setSchedule("in-32", "t-3", req1);
+  assert.equal(c3.fresh, true);
+  assert.equal(
+    [...state.schedules.values()].filter((x) => x.schedule_id === "rem")
+      .length,
+    1,
+  );
+
+  // Fire it: an identical reuse now names a dead row → honest error.
+  const fired = await state.dispatchSchedules(PERSONA, gen);
+  assert.equal(fired.length, 1);
+  await assert.rejects(
+    setSchedule("in-33", "t-4", req1),
+    (e: unknown) => e instanceof StateError && e.status === 400,
+  );
+});
+
+test("the model-visible schedule.set spec does not expose schedule_id", async () => {
+  const spec = toolSpecs().find((t) => t.name === "schedule.set")!;
+  const props = Object.keys(
+    (spec.parameters as { properties: Record<string, unknown> }).properties,
+  );
+  assert.deepEqual(props.sort(), ["payload", "wake_at"]);
 });

@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,6 +40,45 @@ var (
 	ErrUnknownTool     = errors.New("unknown tool")
 	ErrBadRequest      = errors.New("bad request")
 )
+
+// dataErr maps deterministic PostgreSQL data errors — class 22 data
+// exceptions (e.g. 22P05 unsupported Unicode escape) and 23514 check
+// violations — to ErrBadRequest. They are caused by the submitted
+// content, are never transient, and must surface as 400 so the caller
+// records a tool/decision error instead of retrying the same write
+// forever.
+func dataErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) &&
+		(strings.HasPrefix(pgErr.Code, "22") || pgErr.Code == "23514") {
+		return fmt.Errorf("%w: %s", ErrBadRequest, pgErr.Message)
+	}
+	return err
+}
+
+// hasNUL reports whether any string in v (after JSON normalization)
+// contains NUL — PostgreSQL jsonb cannot store it (22P05). Checked
+// explicitly so the failure is a clean 400 at the first persistence
+// boundary rather than a wrapped driver error at a later one.
+func hasNUL(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case map[string]any:
+		for _, e := range t {
+			if hasNUL(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range t {
+			if hasNUL(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 type Persona struct {
 	PersonaID   string    `json:"persona_id"`
@@ -483,7 +523,7 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		return stored, false, nil
 	}
 	if err != nil {
-		return Input{}, false, fmt.Errorf("submit input: %w", err)
+		return Input{}, false, fmt.Errorf("submit input: %w", dataErr(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Input{}, false, err
@@ -552,6 +592,17 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	if err != nil {
 		return TurnPlan{}, false, err
 	}
+	// The plan is the first persistence boundary for model output: a NUL
+	// anywhere in it cannot be stored as jsonb, and retrying the save can
+	// never succeed. Reject it as a deterministic decision error here —
+	// before any effect boundary is reached.
+	var genericPlan any
+	if err := json.Unmarshal(planJSON, &genericPlan); err != nil {
+		return TurnPlan{}, false, err
+	}
+	if hasNUL(genericPlan) {
+		return TurnPlan{}, false, fmt.Errorf("%w: decision contains a NUL byte jsonb cannot store", ErrBadRequest)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return TurnPlan{}, false, err
@@ -613,7 +664,7 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 		return p, false, nil
 	}
 	if err != nil {
-		return TurnPlan{}, false, fmt.Errorf("save plan: %w", err)
+		return TurnPlan{}, false, fmt.Errorf("save plan: %w", dataErr(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TurnPlan{}, false, err
@@ -1094,6 +1145,11 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		if missPolicy == "" {
 			missPolicy = "fire_late"
 		}
+		switch missPolicy {
+		case "fire_late", "coalesce", "expire", "report_missed":
+		default:
+			return nil, false, fmt.Errorf("%w: schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed", ErrBadRequest)
+		}
 		var sch Schedule
 		err = tx.QueryRow(ctx, `
 			INSERT INTO core_schedules (persona_id, schedule_id, wake_at, payload, miss_policy, status)
@@ -1103,15 +1159,33 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			personaID, scheduleID, wakeAt, payload, missPolicy).
 			Scan(&sch.PersonaID, &sch.ScheduleID, &sch.WakeAt, &sch.Payload, &sch.MissPolicy, &sch.Status, &sch.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Schedule already exists under this id — replay it.
+			// The id is taken. Crash replay never reaches here — the
+			// operation receipt is keyed by plan position — so a conflict
+			// is a fresh claim reusing the id. An identical request over a
+			// still-pending row is a true idempotent set; anything else
+			// (different contents, or a fired/cancelled/expired row) must
+			// not report a wake that was not created.
 			err = tx.QueryRow(ctx, `
 				SELECT persona_id, schedule_id, wake_at, payload, miss_policy, status, created_at
 				FROM core_schedules WHERE persona_id = $1 AND schedule_id = $2`,
 				personaID, scheduleID).
 				Scan(&sch.PersonaID, &sch.ScheduleID, &sch.WakeAt, &sch.Payload, &sch.MissPolicy, &sch.Status, &sch.CreatedAt)
+			if err != nil {
+				return nil, false, fmt.Errorf("schedule.set: %w", dataErr(err))
+			}
+			identical := sch.WakeAt.Equal(wakeAt) &&
+				sch.MissPolicy == missPolicy &&
+				jsonbEqual(sch.Payload, payload)
+			if !identical {
+				return nil, false, fmt.Errorf("%w: schedule.set schedule_id %q already exists with different contents", ErrBadRequest, scheduleID)
+			}
+			if sch.Status != "pending" {
+				return nil, false, fmt.Errorf("%w: schedule.set schedule_id %q is already %s", ErrBadRequest, scheduleID, sch.Status)
+			}
+			return map[string]any{"schedule": sch}, true, nil
 		}
 		if err != nil {
-			return nil, false, fmt.Errorf("schedule.set: %w", err)
+			return nil, false, fmt.Errorf("schedule.set: %w", dataErr(err))
 		}
 		return map[string]any{"schedule": sch}, true, nil
 	case "journal.note":
@@ -1127,7 +1201,7 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			RETURNING seq`,
 			personaID, turnID, map[string]any{"text": text}).Scan(&seq)
 		if err != nil {
-			return nil, false, fmt.Errorf("journal.note: %w", err)
+			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
 	default:
@@ -1155,6 +1229,11 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	if request == nil {
 		request = map[string]any{}
+	}
+	// The request is about to be bound against the recorded plan as jsonb:
+	// a NUL in it is a deterministic data error, never a transient one.
+	if hasNUL(request) {
+		return Operation{}, false, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1200,7 +1279,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	if errors.Is(err, pgx.ErrNoRows) {
 		planned = false
 	} else if err != nil {
-		return Operation{}, false, err
+		return Operation{}, false, dataErr(err)
 	}
 	if !planned {
 		return Operation{}, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
@@ -1254,7 +1333,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		return op, false, nil
 	}
 	if err != nil {
-		return Operation{}, false, fmt.Errorf("claim operation: %w", err)
+		return Operation{}, false, fmt.Errorf("claim operation: %w", dataErr(err))
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.

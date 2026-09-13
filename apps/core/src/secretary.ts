@@ -392,6 +392,19 @@ export class Secretary {
         await this.failDivergent(turn, events, `conflicting plan: ${msg}`);
         return null;
       }
+      if (e instanceof StateError && e.status === 400) {
+        // The decision itself cannot be recorded (deterministic rejection —
+        // e.g. a NUL jsonb cannot hold). Retrying savePlan or re-planning
+        // can never succeed, so commit a recorded non-retryable failure
+        // rather than leaving the input to poison the queue.
+        const msg = e instanceof Error ? e.message : String(e);
+        await this.failDivergent(
+          turn,
+          events,
+          `decision could not be recorded: ${msg}`,
+        );
+        return null;
+      }
       // Transient: no effect committed yet — leave the turn running for
       // recovery to retry the save (idempotent on identical body).
       throw e;

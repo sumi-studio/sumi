@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -156,9 +157,19 @@ func storeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case isDataError(err):
+		// Deterministic data errors (class 22, 23514) can never succeed on
+		// retry; report them as 400, not a transient-looking 500.
+		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func isDataError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		(strings.HasPrefix(pgErr.Code, "22") || pgErr.Code == "23514")
 }
 
 func (s *Server) createPersona(w http.ResponseWriter, r *http.Request) {
