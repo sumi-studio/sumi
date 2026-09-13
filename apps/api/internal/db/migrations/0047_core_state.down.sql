@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS core_turn_plans;
 DROP TABLE IF EXISTS core_outbox;
 DROP TABLE IF EXISTS core_schedules;
 DROP TABLE IF EXISTS core_operations;

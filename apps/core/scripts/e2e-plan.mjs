@@ -14,8 +14,8 @@
  *   4. Server-derived effect identity: a spoofed legacy idempotency_key and
  *      a fresh operation_id cannot mint a second effect.
  *
- * Requires SUMI_TEST_DB_URL pointing at a database migrated to 0048+
- * (core_turn_plans). Example:
+ * Requires SUMI_TEST_DB_URL pointing at a database migrated to 0047+
+ * (core_turn_plans lives in 0047_core_state). Example:
  *   SUMI_TEST_DB_URL=postgres://sumi:sumi-dev@127.0.0.1:55432/sumi_core_f1?sslmode=disable \
  *     node scripts/e2e-plan.mjs
  *
