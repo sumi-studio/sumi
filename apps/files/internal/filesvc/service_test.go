@@ -2,6 +2,7 @@ package filesvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -457,5 +458,55 @@ func TestRemoveEscapingSymlink(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatal("remove followed the symlink and deleted the target")
+	}
+}
+
+// Cache-policy gate: a FUSE mount must prove zero metadata caching via the
+// JuiceFS /.config control file; anything else mounted is refused.
+func TestMountPolicyConfigCheck(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, ".config")
+	good := `{"AttrTimeout":0,"EntryTimeout":0,"DirEntryTimeout":0,"NegEntryTimeout":0}`
+	if err := checkZeroMetadataCache(cfg); !errors.Is(err, ErrMountPolicy) {
+		t.Fatalf("missing config must fail closed, got %v", err)
+	}
+	os.WriteFile(cfg, []byte("not json"), 0o644)
+	if err := checkZeroMetadataCache(cfg); !errors.Is(err, ErrMountPolicy) {
+		t.Fatalf("unparseable config must fail, got %v", err)
+	}
+	os.WriteFile(cfg, []byte(good), 0o644)
+	if err := checkZeroMetadataCache(cfg); err != nil {
+		t.Fatalf("zero-cache config must pass, got %v", err)
+	}
+	os.WriteFile(cfg, []byte(`{"AttrTimeout":1e9,"EntryTimeout":0,"DirEntryTimeout":0,"NegEntryTimeout":0}`), 0o644)
+	if err := checkZeroMetadataCache(cfg); !errors.Is(err, ErrMountPolicy) {
+		t.Fatalf("1s attr cache must fail, got %v", err)
+	}
+	os.WriteFile(cfg, []byte(`{"AttrTimeout":0,"EntryTimeout":0}`), 0o644)
+	if err := checkZeroMetadataCache(cfg); !errors.Is(err, ErrMountPolicy) {
+		t.Fatalf("missing fields must fail, got %v", err)
+	}
+}
+
+// Non-FUSE filesystem (a plain test dir) is kernel-coherent: freshness
+// holds with no client config. The mount gate still requires it to be a
+// mountpoint when RequireMount is set.
+func TestNonFuseFreshnessOK(t *testing.T) {
+	r, err := newRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.verifyFreshness("ext4"); err != nil {
+		t.Fatalf("non-fuse must pass freshness, got %v", err)
+	}
+	if err := r.verifyFreshness("fuse.somefs"); !errors.Is(err, ErrMountPolicy) {
+		t.Fatalf("unverifiable fuse must fail closed, got %v", err)
+	}
+	// but it is not a mountpoint, so RequireMount must still refuse ops
+	svc, _ := NewAt(r.root, newFakeStore(), map[string]map[string]bool{"t": {"*": true}})
+	svc.RequireMount()
+	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=x", "t", "x", map[string]string{"If-Version": "any"})
+	if w.Code != 503 {
+		t.Fatalf("unmounted root must 503, got %d", w.Code)
 	}
 }

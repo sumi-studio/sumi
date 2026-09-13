@@ -112,10 +112,17 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "forbidden", "token does not grant this scope")
 		return
 	}
-	if s.root.requireMount && op != "changes" && !s.root.mounted() {
-		writeErr(w, 503, "mount_unavailable",
-			"canonical namespace root is not mounted")
-		return
+	if s.root.requireMount && op != "changes" {
+		if err := s.root.checkMount(); err != nil {
+			if errors.Is(err, ErrMountPolicy) {
+				writeErr(w, 503, "mount_policy",
+					"canonical mount does not satisfy the freshness policy")
+			} else {
+				writeErr(w, 503, "mount_unavailable",
+					"canonical namespace root is not mounted")
+			}
+			return
+		}
 	}
 	q := r.URL.Query()
 	path := q.Get("path")

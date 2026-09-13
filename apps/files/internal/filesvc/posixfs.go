@@ -3,6 +3,7 @@ package filesvc
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,30 +25,137 @@ import (
 // All access is contained beneath root; symlinks that would escape are denied.
 type posixRoot struct {
 	root         string
-	requireMount bool // refuse mutations when root is not a live mountpoint
+	requireMount bool // refuse file ops when root is not a verified mount
+
+	mu        sync.Mutex
+	lastMntID uint64 // kernel mount ID of the last verified mount instance
+	mntOK     bool   // last freshness verdict for lastMntID
 }
 
-// mounted reports whether root is a distinct filesystem from its parent —
-// the cheap POSIX mountpoint test. Used to prevent the service writing into
-// the bare mountpoint directory while the real mount is down, which would
-// silently strand files beneath the next mount.
-func (p *posixRoot) mounted() bool {
-	var st, pst syscall.Stat_t
-	if err := syscall.Stat(p.root, &st); err != nil {
-		return false
+// mountID returns the kernel mount ID and fstype of the mountpoint exactly
+// at p.root, per /proc/self/mountinfo — which lists mountpoints only, so a
+// bare directory simply has no entry. The mount ID identifies a specific
+// mount instance: remounting over the same path allocates a new ID, making
+// it a reliable generation key (unlike st_dev, which the kernel may reuse).
+func (p *posixRoot) mountID() (id uint64, fstype string, ok bool) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return 0, "", false
 	}
-	if err := syscall.Stat(filepath.Dir(p.root), &pst); err != nil {
-		return false
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 10 {
+			continue
+		}
+		// fields: id parent dev root mountpoint opts ... "-" fstype ...
+		mp := strings.ReplaceAll(f[4], "\\040", " ")
+		if mp != p.root {
+			continue
+		}
+		n, err := strconv.ParseUint(f[0], 10, 64)
+		if err != nil {
+			return 0, "", false
+		}
+		sep := -1
+		for i := 5; i < len(f); i++ {
+			if f[i] == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 || sep+1 >= len(f) {
+			return 0, "", false
+		}
+		return n, f[sep+1], true
 	}
-	return st.Dev != pst.Dev
+	return 0, "", false
+}
+
+// checkMount enforces the mount requirements for canonical-namespace mode
+// (requireMount): the root must itself be a live mountpoint AND its
+// filesystem must not serve stale metadata. A fuse.juicefs mount must
+// prove zero metadata caching through the /.config control file
+// (synthesized by the JuiceFS daemon — not a regular file in the
+// namespace); any other FUSE type is refused as unverifiable; non-FUSE
+// mounts are kernel-coherent and pass. Fail closed: an unverifiable FUSE
+// mount is refused rather than trusted, because the CAS fingerprint gate
+// reads through this mount and a nonzero attr cache silently re-opens the
+// B1 clobber window.
+//
+// The verdict is cached per mount instance (kernel mount ID): remounting
+// with different flags allocates a new ID and is re-checked once, so the
+// steady state is one mountinfo read per request.
+func (p *posixRoot) checkMount() error {
+	id, fstype, ok := p.mountID()
+	if !ok {
+		return ErrMountUnavailable
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id == p.lastMntID {
+		if p.mntOK {
+			return nil
+		}
+		return ErrMountPolicy
+	}
+	err := p.verifyFreshness(fstype)
+	if err == nil {
+		p.lastMntID, p.mntOK = id, true
+		return nil
+	}
+	p.lastMntID, p.mntOK = id, false
+	return err
+}
+
+// verifyFreshness confirms the mounted filesystem cannot return stale
+// metadata to this client. fstype comes from mountinfo.
+func (p *posixRoot) verifyFreshness(fstype string) error {
+	if fstype == "fuse.juicefs" {
+		return checkZeroMetadataCache(filepath.Join(p.root, ".config"))
+	}
+	if strings.HasPrefix(fstype, "fuse.") || fstype == "fuse" || fstype == "fuseblk" {
+		return fmt.Errorf("%w: FUSE filesystem %q cannot prove metadata freshness",
+			ErrMountPolicy, fstype)
+	}
+	return nil // kernel-coherent filesystem; no client cache to distrust
+}
+
+// checkZeroMetadataCache reads a JuiceFS /.config control file and requires
+// every metadata cache timeout to be zero. The file is synthesized by the
+// JuiceFS client at the mount root — it is not namespace user data.
+func checkZeroMetadataCache(cfgPath string) error {
+	cfg, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
+	}
+	var c map[string]any
+	if err := json.Unmarshal(cfg, &c); err != nil {
+		return fmt.Errorf("%w: mount config unparseable", ErrMountPolicy)
+	}
+	for _, k := range []string{
+		"AttrTimeout", "EntryTimeout", "DirEntryTimeout", "NegEntryTimeout",
+	} {
+		v, ok := c[k].(float64)
+		if !ok {
+			return fmt.Errorf("%w: mount config lacks %s", ErrMountPolicy, k)
+		}
+		if v != 0 {
+			return fmt.Errorf("%w: %s=%v must be 0 (mount with "+
+				"--attr-cache=0 --entry-cache=0 --dir-entry-cache=0)",
+				ErrMountPolicy, k, v)
+		}
+	}
+	return nil
 }
 
 var (
-	ErrEscape   = errors.New("path escapes scope root")
-	ErrNotFound = errors.New("not found")
-	ErrIsDir    = errors.New("is a directory")
-	ErrNotDir   = errors.New("not a directory")
-	ErrReserved = errors.New("path uses the service staging prefix")
+	ErrEscape           = errors.New("path escapes scope root")
+	ErrNotFound         = errors.New("not found")
+	ErrIsDir            = errors.New("is a directory")
+	ErrNotDir           = errors.New("not a directory")
+	ErrReserved         = errors.New("path uses the service staging prefix")
+	ErrMountUnavailable = errors.New("canonical namespace root is not mounted")
+	ErrMountPolicy      = errors.New("canonical mount violates freshness policy")
 )
 
 // stagingPrefix marks service-internal temp siblings. User-facing ops reject

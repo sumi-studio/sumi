@@ -15,6 +15,14 @@ info:
     --attr-cache=0 --entry-cache=0 --dir-entry-cache=0). A nonzero attr
     cache lets a conditional write stat a stale fingerprint and silently
     overwrite a direct writer's edit made inside the cache window.
+    FILESV_REQUIRE_MOUNT=1 enforces this at runtime: every file op is
+    refused with 503 mount_unavailable while the root is not a mountpoint,
+    and 503 mount_policy when the mount cannot prove zero metadata
+    caching (JuiceFS /.config timeouts nonzero or unverifiable FUSE fs).
+    The verdict is re-checked per kernel mount ID, so a remount with
+    different flags is caught. Plain non-FUSE filesystems (kernel-coherent,
+    e.g. a local dir in dev) pass; REQUIRE_MOUNT=0 disables the gate for
+    simple local operation.
 paths:
   /v1/files/{scope}/stat:
     get:
