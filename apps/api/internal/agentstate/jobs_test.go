@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -472,6 +473,172 @@ func TestJobNotificationEntersInputStream(t *testing.T) {
 	}
 	if load2.Input != nil && load2.Input.InputID == "job:j-1" {
 		t.Fatalf("notification delivered twice: %+v", load2.Input)
+	}
+}
+
+// M1: a job started by one round can finish while a later round of the same
+// request is still backing off. Its notification names the command and the
+// unfinished request it was started for, and a resumed turn's replayed
+// receipt carries the job's current state next to the unchanged original.
+func TestJobCompletionBeforeOriginTurn(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "run the tests in the background"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	req := map[string]any{"command": []any{"echo", "hi"}}
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.start", Request: req})
+	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.start", 0, req)
+	if err != nil || !fresh {
+		t.Fatalf("claim: %+v fresh=%v err=%v", op, fresh, err)
+	}
+	if _, ok := op.Response["current_job"]; ok {
+		t.Fatalf("fresh receipt must not carry current_job: %+v", op.Response)
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+	// The job ends while in-1 is still unfinished.
+	if _, err := s.CompleteJob(ctx, pa, "op:in-1:0", "runner-1", "done",
+		map[string]any{"exit_code": 0.0}, ""); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// Resumed turn: the replay returns the original receipt plus now.
+	op, fresh, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-2", "job.start", 0, req)
+	if err != nil || fresh {
+		t.Fatalf("replay: %+v fresh=%v err=%v", op, fresh, err)
+	}
+	jm, _ := op.Response["job"].(map[string]any)
+	cur, _ := op.Response["current_job"].(map[string]any)
+	if jm["status"] != "queued" || cur["status"] != "done" || cur["exit_code"] != 0.0 ||
+		cur["finished_at"] == nil || op.Response["receipt_note"] == nil {
+		t.Fatalf("replayed receipt: %+v", op.Response)
+	}
+	// The stored receipt is history and stays as recorded.
+	var stored map[string]any
+	if err := pool.QueryRow(ctx,
+		`SELECT response FROM core_operations WHERE persona_id = $1 AND idempotency_key = 'in-1:tool:0'`,
+		pa).Scan(&stored); err != nil {
+		t.Fatalf("stored receipt: %v", err)
+	}
+	if _, ok := stored["current_job"]; ok || stored["job"].(map[string]any)["status"] != "queued" {
+		t.Fatalf("stored receipt rewritten: %+v", stored)
+	}
+
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{Outcome: "complete"}); err != nil {
+		t.Fatalf("commit t-1: %v", err)
+	}
+	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-9", 10)
+	if err != nil || load.Input == nil || load.Input.InputID != "job:op:in-1:0" {
+		t.Fatalf("notification load: %+v err=%v", load, err)
+	}
+	p := load.Input.Payload
+	if p["origin_input_id"] != "in-1" || p["command"] != "echo hi" ||
+		p["origin_request"] != "run the tests in the background" || p["origin_in_progress"] != true {
+		t.Fatalf("notification provenance: %+v", p)
+	}
+	want := `job op:in-1:0 (subprocess) done, exit 0 — command: echo hi — started by you for request in-1: "run the tests in the background" (that request was not finished yet when this job ended)`
+	if p["text"] != want {
+		t.Fatalf("notification text:\n got %q\nwant %q", p["text"], want)
+	}
+}
+
+// API-submitted jobs have no origin request; their notification stays plain.
+func TestJobNotificationWithoutOrigin(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("true"), "api"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.CancelJob(ctx, pa, "j-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	in, _, err := s.GetInput(ctx, pa, "job:j-1")
+	if err != nil {
+		t.Fatalf("notification: %v", err)
+	}
+	if _, ok := in.Payload["origin_input_id"]; ok || in.Payload["text"] != "job j-1 (subprocess) cancelled — command: true" {
+		t.Fatalf("api job notification: %+v", in.Payload)
+	}
+}
+
+func TestBoundRunes(t *testing.T) {
+	long := strings.Repeat("あ", 150)
+	out := boundRunes(long, 120)
+	if strings.ToValidUTF8(out, "?") != out || len([]rune(out)) != 121 || !strings.HasSuffix(out, "…") {
+		t.Fatalf("bounded multibyte: %q", out)
+	}
+	if boundRunes("short", 120) != "short" {
+		t.Fatal("short strings are unchanged")
+	}
+}
+
+// L1: a store failure while a job.status/job.cancel claim runs is not a
+// verdict on the request. It propagates (5xx → the secretary retries the
+// turn) and records nothing; only an unknown job is a recorded 400.
+func TestJobToolTransientStoreFailure(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("sleep", "9"), "api"); err != nil {
+		t.Fatalf("submit job: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "stop it"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	req := map[string]any{"job_id": "j-1"}
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.cancel", Request: req})
+
+	// Hold the job row so the claim's FOR UPDATE waits past its deadline —
+	// a real store failure inside the claim transaction.
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("blocker: %v", err)
+	}
+	if _, err := blocker.Exec(ctx,
+		`SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = 'j-1' FOR UPDATE`, pa); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	short, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, _, err = s.ClaimOperation(short, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
+	cancel()
+	if err == nil || errors.Is(err, ErrBadRequest) {
+		t.Fatalf("transient claim failure must not be a bad request: %v", err)
+	}
+	_ = blocker.Rollback(ctx)
+	var ops int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM core_operations WHERE persona_id = $1`, pa).Scan(&ops); err != nil || ops != 0 {
+		t.Fatalf("failed claim recorded an operation: n=%d err=%v", ops, err)
+	}
+	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
+	if err != nil || !fresh || op.Response["job"].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("retried claim: %+v fresh=%v err=%v", op, fresh, err)
+	}
+
+	if err := jobToolErr(fmt.Errorf("%w", ErrJobNotFound)); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("not-found should map to ErrBadRequest: %v", err)
 	}
 }
 

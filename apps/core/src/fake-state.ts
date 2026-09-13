@@ -408,7 +408,10 @@ export class FakeState implements StateClient {
     // boundary (Go dataErr), not a retryable 500. The stored error is
     // diagnostic: Go strips NUL from it, so do the same.
     if (hasNul(req.events) || hasNul(req.output) || hasNul(req.usage)) {
-      throw new StateError(400, "commit contains a NUL byte jsonb cannot store");
+      throw new StateError(
+        400,
+        "commit contains a NUL byte jsonb cannot store",
+      );
     }
     // The Go server rejects bodies over maxBody (1 MiB, "read body")
     // before decode — mirror that boundary so oversized-commit fallback
@@ -416,7 +419,11 @@ export class FakeState implements StateClient {
     if (new TextEncoder().encode(JSON.stringify(req)).length > 1 << 20) {
       throw new StateError(400, "read body");
     }
-    req = { ...req, error: req.error === undefined ? req.error : req.error.replace(/\u0000/g, "") };
+    req = {
+      ...req,
+      error:
+        req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
+    };
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -574,6 +581,17 @@ export class FakeState implements StateClient {
         existing.turn_id = op.turnId;
         return { operation: existing, fresh: true };
       }
+      // A replayed job.* receipt carries the job's state now next to the
+      // original result (Go withCurrentJobTx); the stored receipt stays.
+      if (op.tool.startsWith("job.") && existing.status === "done") {
+        return {
+          operation: {
+            ...existing,
+            response: this.withCurrentJob(persona, existing.response),
+          },
+          fresh: false,
+        };
+      }
       return { operation: existing, fresh: false };
     }
     const operation: Operation = {
@@ -656,19 +674,26 @@ export class FakeState implements StateClient {
         op.request,
         `tool:${op.turnId}:${op.callIndex}`,
       );
-      operation.response = { job };
+      // Receipts are snapshots (Go stores jsonb), never the live job row.
+      operation.response = { job: structuredClone(job) };
     } else if (op.tool === "job.status") {
       const jobId = op.request.job_id;
       if (typeof jobId !== "string" || jobId === "") {
         throw new StateError(400, "job.status requires job_id");
       }
-      operation.response = { job: this.mustJob(persona, jobId) };
+      // Internal-tool boundary: Go maps ErrJobNotFound to 400 here so a
+      // missing job is a recorded tool error, not a transient retry.
+      operation.response = {
+        job: structuredClone(this.mustJob400(persona, jobId)),
+      };
     } else if (op.tool === "job.cancel") {
       const jobId = op.request.job_id;
       if (typeof jobId !== "string" || jobId === "") {
         throw new StateError(400, "job.cancel requires job_id");
       }
-      operation.response = { job: this.cancelJobRow(persona, jobId) };
+      operation.response = {
+        job: structuredClone(this.cancelJobRow(persona, jobId, true)),
+      };
     } else {
       const ev: Event = {
         persona_id: persona,
@@ -798,6 +823,15 @@ export class FakeState implements StateClient {
     return j;
   }
 
+  // Internal-tool boundary: inside a claim the Go store maps "job not
+  // found" to 400 so a missing job_id is recorded as a tool error rather
+  // than retried as transient. The public routes keep 404.
+  private mustJob400(persona: string, jobId: string): Job {
+    const j = this.jobs.get(`${persona}|${jobId}`);
+    if (!j) throw new StateError(400, "job not found");
+    return j;
+  }
+
   private insertJob(
     persona: string,
     jobId: string,
@@ -841,14 +875,30 @@ export class FakeState implements StateClient {
         (i) => i.persona_id === job.persona_id && i.input_id === inputId,
       )
     ) {
+      const command = this.jobCommandSummary(job);
+      const origin = this.jobOrigin(job);
       const payload: Record<string, unknown> = {
         job_id: job.job_id,
         kind: job.kind,
         status: job.status,
         text:
           `job ${job.job_id} (${job.kind}) ${job.status}` +
-          (job.error ? `: ${job.error}` : ""),
+          (job.error ? `: ${job.error}` : "") +
+          (command ? ` — command: ${command}` : "") +
+          (origin
+            ? ` — started by you for request ${origin.inputId}` +
+              (origin.request ? `: ${JSON.stringify(origin.request)}` : "") +
+              (origin.inProgress
+                ? " (that request was not finished yet when this job ended)"
+                : "")
+            : ""),
       };
+      if (command) payload.command = command;
+      if (origin) {
+        payload.origin_input_id = origin.inputId;
+        payload.origin_request = origin.request;
+        payload.origin_in_progress = origin.inProgress;
+      }
       if (job.error) payload.error = job.error;
       const code = job.result?.exit_code;
       if (code !== undefined) payload.exit_code = code;
@@ -874,8 +924,61 @@ export class FakeState implements StateClient {
     job.notified_at = new Date().toISOString();
   }
 
-  private cancelJobRow(persona: string, jobId: string): Job {
-    const job = this.mustJob(persona, jobId);
+  private jobCommandSummary(job: Job): string {
+    const cmd = job.request.command;
+    if (!Array.isArray(cmd) || cmd.length === 0) return "";
+    return boundCodePoints(cmd.map((c) => String(c)).join(" "), 120);
+  }
+
+  // A tool-minted job (op:<input_id>:<call_index>) resolves to the request
+  // it was started for, as Go jobOriginTx does.
+  private jobOrigin(
+    job: Job,
+  ): { inputId: string; request: string; inProgress: boolean } | null {
+    if (!job.created_by.startsWith("tool:") || !job.job_id.startsWith("op:")) {
+      return null;
+    }
+    const rest = job.job_id.slice(3);
+    const i = rest.lastIndexOf(":");
+    if (i <= 0) return null;
+    const input = this.inputs.find(
+      (x) => x.persona_id === job.persona_id && x.input_id === rest.slice(0, i),
+    );
+    if (!input) return null;
+    const text =
+      typeof input.payload.text === "string" ? input.payload.text : "";
+    return {
+      inputId: input.input_id,
+      request: boundCodePoints(text, 200),
+      inProgress: input.status !== "done",
+    };
+  }
+
+  private withCurrentJob(
+    persona: string,
+    receipt: Operation["response"],
+  ): Operation["response"] {
+    const r = receipt as Record<string, unknown> | null;
+    const jobId = (r?.job as Job | undefined)?.job_id;
+    const j = jobId ? this.jobs.get(`${persona}|${jobId}`) : undefined;
+    if (!r || !j) return receipt;
+    const current: Record<string, unknown> = { status: j.status };
+    if (j.result?.exit_code !== undefined)
+      current.exit_code = j.result.exit_code;
+    if (j.error) current.error = j.error;
+    if (j.finished_at) current.finished_at = j.finished_at;
+    return {
+      ...r,
+      current_job: current,
+      receipt_note:
+        "job is this call's original result; current_job is the job's state when this turn resumed",
+    } as Operation["response"];
+  }
+
+  private cancelJobRow(persona: string, jobId: string, internal = false): Job {
+    const job = internal
+      ? this.mustJob400(persona, jobId)
+      : this.mustJob(persona, jobId);
     if (job.status === "queued") {
       job.status = "cancelled";
       job.cancel_requested_at = new Date().toISOString();
@@ -1050,4 +1153,10 @@ export class FakeState implements StateClient {
     this.notifyJobTerminal(job);
     return job;
   }
+}
+
+/** Cut to at most n code points, marking the cut (Go boundRunes). */
+function boundCodePoints(s: string, n: number): string {
+  const cps = [...s];
+  return cps.length > n ? `${cps.slice(0, n).join("")}…` : s;
 }

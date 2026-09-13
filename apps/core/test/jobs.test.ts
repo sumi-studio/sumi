@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
 import { JobRunner } from "../src/jobs/runner.ts";
-import type {
-  ModelEvent,
-  ModelProvider,
-  ModelRequest,
+import {
+  ModelError,
+  type ModelEvent,
+  type ModelProvider,
+  type ModelRequest,
 } from "../src/provider.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
 import { type StateClient, StateError } from "../src/state-client.ts";
@@ -520,6 +521,117 @@ test("a 400-rejected completion degrades to a minimal honest record", async () =
   assert.ok(job.error?.includes("rejected deterministically"));
   assert.ok(s.inputs.some((i) => i.input_id === "job:j-1"));
   await r.stop();
+});
+
+// --- Notification context (M1) -------------------------------------------
+
+// M1: round 0 starts a job, round 1 is rate-limited, and the job finishes
+// during the backoff. The notification turn runs before the request's
+// journal exists, so it must name the command and the unfinished request;
+// the resumed request then sees its job.start receipt next to the job's
+// current state instead of a bare 'queued'.
+test("a job ending while its request backs off is explained and resumed with its current state", async () => {
+  const s = newState();
+  const consults: { round: number; messages: ModelRequest["messages"] }[] = [];
+  let rateLimited = false;
+  const provider: ModelProvider = {
+    name: "scripted",
+    async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      const round = req.round ?? 0;
+      consults.push({ round, messages: structuredClone(req.messages) });
+      const last = String(req.messages.at(-1)?.content ?? "");
+      if (last.startsWith("[job]")) {
+        yield { type: "text", delta: "noted" };
+      } else if (round === 0) {
+        yield { type: "text", delta: "starting" };
+        yield {
+          type: "tool_call",
+          call: {
+            id: "call-0-0",
+            name: "job.start",
+            arguments: { command: ["echo", "hi"] },
+          },
+        };
+      } else if (!rateLimited) {
+        rateLimited = true;
+        throw new ModelError("429", { retryable: true, retryAfterMs: 300 });
+      } else {
+        yield { type: "text", delta: "it finished" };
+      }
+      yield { type: "done", usage: {} };
+    },
+  };
+  const sec = new Secretary(secretaryCfg(s, provider));
+  s.addInput(PERSONA, "in-1", "run echo in the background");
+  await sec.start();
+  await sec.step(); // round 0 starts the job; round 1 is rate-limited
+
+  const jobId = "op:in-1:0";
+  await s.claimJobs(PERSONA, {
+    runnerId: "r-1",
+    kinds: ["subprocess"],
+    leaseMs: 30_000,
+  });
+  await s.completeJob(PERSONA, jobId, {
+    runnerId: "r-1",
+    status: "done",
+    result: { exit_code: 0 },
+  });
+  const origin = () => s.inputs.find((i) => i.input_id === "in-1");
+  assert.equal(origin()?.status, "queued");
+
+  await sec.step(); // the notification is handled first
+  const noteConsult = consults.at(-1);
+  assert.equal(
+    noteConsult?.messages.at(-1)?.content,
+    '[job] job op:in-1:0 (subprocess) done — command: echo hi — started by you for request in-1: "run echo in the background" (that request was not finished yet when this job ended)',
+  );
+  assert.equal(origin()?.status, "queued");
+
+  for (let i = 0; i < 100 && origin()?.status !== "done"; i++) {
+    await sec.step();
+    await sleep(20);
+  }
+  assert.equal(origin()?.status, "done");
+  const resumed = consults.at(-1);
+  assert.equal(resumed?.round, 1);
+  const receipt = JSON.parse(
+    String(resumed?.messages.find((m) => m.role === "tool")?.content),
+  );
+  assert.equal(receipt.job.status, "queued");
+  assert.equal(receipt.current_job.status, "done");
+  assert.equal(receipt.current_job.exit_code, 0);
+  // The stored receipt is unchanged history.
+  const stored = [...s.ops.values()].find((o) => o.tool === "job.start")
+    ?.response as Record<string, { status: string }>;
+  assert.equal(stored.job?.status, "queued");
+  assert.equal(stored.current_job, undefined);
+  await sec.stop();
+});
+
+// L1: job.status/cancel on a job that does not exist is a definite
+// rejection — recorded as the tool result (400), not retried forever.
+test("job.status on a missing job is a recorded 400, not a transient retry", async () => {
+  const s = newState();
+  const provider = new ScriptedProvider({
+    text: "checked",
+    calls: [{ tool: "job.status", request: { job_id: "op:nope:0" } }],
+  });
+  const sec = new Secretary(secretaryCfg(s, provider));
+  s.addInput(PERSONA, "in-1", "check that job");
+  await sec.start();
+  await sec.step();
+  const op = [...s.ops.values()].find(
+    (o) => o.persona_id === PERSONA && o.tool === "job.status",
+  );
+  // A 400 claim records no operation row; the rejection is the tool_result.
+  assert.equal(op, undefined);
+  const err = s.eventLog.find(
+    (e) => e.kind === "tool_result" && e.payload.tool === "job.status",
+  );
+  assert.match(String(err?.payload.error), /job not found/);
+  assert.equal(s.inputs.find((i) => i.input_id === "in-1")?.status, "done");
+  await sec.stop();
 });
 
 // D2: an external signal with no cancel request is a failure, not a

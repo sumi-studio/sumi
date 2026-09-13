@@ -261,9 +261,82 @@ func (s *Store) ListJobs(ctx context.Context, personaID string, statuses []strin
 	return out, rows.Err()
 }
 
+// Notification context bounds, in code points: enough to recognise the job
+// and its request, never the full request (job.status has the command).
+const (
+	jobNoteCommandRunes = 120
+	jobNoteRequestRunes = 200
+)
+
+// boundRunes cuts s to at most n code points — never inside a UTF-8
+// sequence — and marks the cut.
+func boundRunes(s string, n int) string {
+	i := 0
+	for pos := range s {
+		if i == n {
+			return s[:pos] + "…"
+		}
+		i++
+	}
+	return s
+}
+
+// jobCommandSummary renders the job's command as one bounded line.
+func jobCommandSummary(j *Job) string {
+	cmd, _ := j.Request["command"].([]any)
+	if len(cmd) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cmd))
+	for _, c := range cmd {
+		parts = append(parts, fmt.Sprint(c))
+	}
+	return boundRunes(strings.Join(parts, " "), jobNoteCommandRunes)
+}
+
+// jobOrigin is the request a tool-minted job was started for.
+type jobOrigin struct {
+	InputID string
+	Request string
+	// InProgress: the origin request had not finished when the job ended.
+	InProgress bool
+}
+
+// jobOriginTx resolves a tool-minted job (job_id op:<input_id>:<call_index>)
+// to its origin request. The notification can be handled before that
+// request's journal exists — a later model round of the same turn may still
+// be backing off — so it must explain itself. API-submitted jobs have no
+// origin input and return a zero value.
+func jobOriginTx(ctx context.Context, tx pgx.Tx, j *Job) (jobOrigin, error) {
+	if !strings.HasPrefix(j.CreatedBy, "tool:") {
+		return jobOrigin{}, nil
+	}
+	rest, _ := strings.CutPrefix(j.JobID, jobToolPrefix)
+	i := strings.LastIndex(rest, ":")
+	if i <= 0 {
+		return jobOrigin{}, nil
+	}
+	o := jobOrigin{InputID: rest[:i]}
+	var text, status string
+	err := tx.QueryRow(ctx,
+		`SELECT coalesce(payload->>'text', ''), status FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
+		j.PersonaID, o.InputID).Scan(&text, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return jobOrigin{}, nil
+	}
+	if err != nil {
+		return jobOrigin{}, err
+	}
+	o.Request = boundRunes(text, jobNoteRequestRunes)
+	o.InProgress = status != "done"
+	return o, nil
+}
+
 // jobNotificationText is the one-line, model-readable summary carried in the
 // notification input's payload.text (the journal/context assembly reads it).
-func jobNotificationText(j *Job) string {
+// It names the command and the request the job was started for, so the turn
+// is self-explanatory even when processed before that request's journal.
+func jobNotificationText(j *Job, origin jobOrigin) string {
 	var b strings.Builder
 	b.WriteString("job " + j.JobID + " (" + j.Kind + ") " + j.Status)
 	if j.Result != nil {
@@ -274,6 +347,18 @@ func jobNotificationText(j *Job) string {
 	if j.Error != nil && *j.Error != "" {
 		b.WriteString(": " + *j.Error)
 	}
+	if cmd := jobCommandSummary(j); cmd != "" {
+		b.WriteString(" — command: " + cmd)
+	}
+	if origin.InputID != "" {
+		b.WriteString(" — started by you for request " + origin.InputID)
+		if origin.Request != "" {
+			b.WriteString(": " + strconv.Quote(origin.Request))
+		}
+		if origin.InProgress {
+			b.WriteString(" (that request was not finished yet when this job ended)")
+		}
+	}
 	return b.String()
 }
 
@@ -281,11 +366,23 @@ func jobNotificationText(j *Job) string {
 // once (id 'job:<job_id>', ON CONFLICT DO NOTHING) and stamps notified_at.
 // Callers hold the job's row lock inside the terminal transition's tx.
 func (s *Store) notifyJobTerminalTx(ctx context.Context, tx pgx.Tx, j *Job) error {
+	origin, err := jobOriginTx(ctx, tx, j)
+	if err != nil {
+		return err
+	}
 	payload := map[string]any{
 		"job_id": j.JobID,
 		"kind":   j.Kind,
 		"status": j.Status,
-		"text":   jobNotificationText(j),
+		"text":   jobNotificationText(j, origin),
+	}
+	if cmd := jobCommandSummary(j); cmd != "" {
+		payload["command"] = cmd
+	}
+	if origin.InputID != "" {
+		payload["origin_input_id"] = origin.InputID
+		payload["origin_request"] = origin.Request
+		payload["origin_in_progress"] = origin.InProgress
 	}
 	if j.Error != nil && *j.Error != "" {
 		payload["error"] = *j.Error
@@ -601,11 +698,14 @@ func (s *Store) internalJobTool(ctx context.Context, tx pgx.Tx, personaID, turnI
 		if jobID == "" {
 			return nil, fmt.Errorf("%w: job.status requires job_id", ErrBadRequest)
 		}
+		if hasNUL(jobID) {
+			return nil, fmt.Errorf("%w: job_id contains a NUL byte", ErrBadRequest)
+		}
 		j, err := scanJob(tx.QueryRow(ctx,
 			`SELECT `+jobCols+` FROM core_jobs WHERE persona_id = $1 AND job_id = $2`,
 			personaID, jobID))
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
+			return nil, jobToolErr(err)
 		}
 		return map[string]any{"job": j}, nil
 	case "job.cancel":
@@ -613,11 +713,65 @@ func (s *Store) internalJobTool(ctx context.Context, tx pgx.Tx, personaID, turnI
 		if jobID == "" {
 			return nil, fmt.Errorf("%w: job.cancel requires job_id", ErrBadRequest)
 		}
+		if hasNUL(jobID) {
+			return nil, fmt.Errorf("%w: job_id contains a NUL byte", ErrBadRequest)
+		}
 		j, err := s.cancelJobTx(ctx, tx, personaID, jobID)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
+			return nil, jobToolErr(err)
 		}
 		return map[string]any{"job": j}, nil
 	}
 	return nil, nil
+}
+
+// jobToolErr keeps definite rejections (unknown job, deterministic data
+// errors) as recorded 400 tool results but lets transient store failures
+// propagate, so the claim — and thus the call — is retried rather than
+// committed as a bad request.
+func jobToolErr(err error) error {
+	if errors.Is(err, ErrJobNotFound) {
+		return fmt.Errorf("%w: %v", ErrBadRequest, err)
+	}
+	return dataErr(err)
+}
+
+// withCurrentJobTx returns a replayed job.* receipt with the job's state now
+// alongside it. The receipt is the call's original result — job.start's
+// always says 'queued' — while a resumed turn is typically reasoning after
+// the job moved on (a later round backed off, the job finished, and its
+// notification may already have been handled). The stored receipt is never
+// rewritten; current_job exists only in this replay's response.
+func withCurrentJobTx(ctx context.Context, tx pgx.Tx, personaID string, receipt map[string]any) (map[string]any, error) {
+	jm, _ := receipt["job"].(map[string]any)
+	jobID, _ := jm["job_id"].(string)
+	if jobID == "" {
+		return receipt, nil
+	}
+	j, err := scanJob(tx.QueryRow(ctx,
+		`SELECT `+jobCols+` FROM core_jobs WHERE persona_id = $1 AND job_id = $2`,
+		personaID, jobID))
+	if errors.Is(err, ErrJobNotFound) {
+		return receipt, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	current := map[string]any{"status": j.Status}
+	if code, ok := j.Result["exit_code"]; ok {
+		current["exit_code"] = code
+	}
+	if j.Error != nil && *j.Error != "" {
+		current["error"] = *j.Error
+	}
+	if j.FinishedAt != nil {
+		current["finished_at"] = j.FinishedAt
+	}
+	out := make(map[string]any, len(receipt)+2)
+	for k, v := range receipt {
+		out[k] = v
+	}
+	out["current_job"] = current
+	out["receipt_note"] = "job is this call's original result; current_job is the job's state when this turn resumed"
+	return out, nil
 }

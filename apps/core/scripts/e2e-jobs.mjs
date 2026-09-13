@@ -23,6 +23,12 @@
  *      sweeps the job to 'lost' + notification; it is never re-executed.
  *   6. Completed effects are never re-run: marker files written by the
  *      subprocess prove one execution each.
+ *   7. A job ends while its request is backing off: rounds 0-1 start two
+ *      jobs, the process dies consulting round 2, the recovery's round 2 is
+ *      rate-limited, and both jobs finish during the backoff. The job
+ *      notifications are handled first and name the command and the
+ *      unfinished request; the resumed request replays its receipts with
+ *      each job's current state and executes nothing twice.
  *
  * Requires SUMI_TEST_DB_URL pointing at a database migrated to 0048.
  *   SUMI_TEST_DB_URL=postgres://sumi:sumi-dev@127.0.0.1:55432/sumi_core_jobs?sslmode=disable \
@@ -49,6 +55,7 @@ if (CHILD) {
 async function childMain() {
   const { Secretary } = await import("../src/secretary.ts");
   const { HttpStateClient } = await import("../src/state-client.ts");
+  const { ModelError } = await import("../src/provider.ts");
 
   const env = (n) => {
     const v = process.env[n];
@@ -71,6 +78,27 @@ async function childMain() {
         : round === 0
           ? script
           : { text: "", calls: [] };
+      if (decision.crash) {
+        console.log("[child] CRASH");
+        process.exit(137);
+      }
+      if (decision.transient) {
+        console.log("[child] TRANSIENT");
+        throw new ModelError("scripted 429", {
+          retryable: true,
+          retryAfterMs: decision.retryAfterMs,
+        });
+      }
+      if (script.logMessages) {
+        // What this round was fed, for context assertions in the parent.
+        for (const m of req.messages) {
+          if (m.role === "user" || m.role === "tool") {
+            console.log(
+              `[child] FED round=${round} ${m.role} ${JSON.stringify(m.content)}`,
+            );
+          }
+        }
+      }
       yield { type: "text", delta: decision.text ?? "" };
       for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
@@ -748,6 +776,195 @@ async function main() {
       "runner-s6 exit",
     );
     log("  NUL output → done + sanitized flag; SIGSEGV → failed + signal");
+  }
+
+  // --- scenario 7: a job ends while its request is backing off -------------
+  // Own persona: earlier scenarios leave queued notifications behind.
+  log(
+    "scenario 7: crash + rate-limited round; notification explains itself; resume sees current job state",
+  );
+  {
+    const p7 = uuidv7();
+    const made = await req("POST", "/internal/core/personas", ADMIN, {
+      persona_id: p7,
+      display_name: "e2e jobs secretary (backoff)",
+    });
+    assert(made.status === 201, `createPersona s7 ${made.status}`);
+    const t7 = made.json.persona_token;
+    const who = { SUMI_PERSONA_ID: p7, SUMI_PERSONA_TOKEN: t7 };
+    const get7 = async (path) =>
+      (await req("GET", `/internal/core/personas/${p7}${path}`, t7)).json;
+    const job7 = async (id) =>
+      (await get7(`/jobs/${encodeURIComponent(id)}`))?.job;
+    const input7 = async (id) =>
+      (await get7(`/inputs/${encodeURIComponent(id)}`))?.input;
+    const consulted = (out) =>
+      [...out.matchAll(/MODEL CONSULTED round=(\d+)/g)].map((m) =>
+        Number(m[1]),
+      );
+    const fed = (out, round, role) =>
+      [...out.matchAll(new RegExp(`FED round=${round} ${role} (.*)`, "g"))].map(
+        (m) => JSON.parse(m[1]),
+      );
+    const script = (rounds) => ({
+      ...who,
+      SUMI_SCRIPT: JSON.stringify({ rounds, logMessages: true }),
+    });
+
+    const X = {
+      command: ["sh", "-c", "echo ran >> marker-s7.txt; echo job-out"],
+    };
+    const R0 = {
+      text: "starting",
+      calls: [
+        { tool: "journal.note", request: { text: "s7-note" } },
+        { tool: "job.start", request: X },
+      ],
+    };
+    const R1 = { text: "one more", calls: [{ tool: "job.start", request: X }] };
+    const R2 = {
+      text: "checking",
+      calls: [{ tool: "job.status", request: { job_id: "op:in-s7:1" } }],
+    };
+    const R3 = { text: "both jobs finished", calls: [] };
+
+    const sub = await req("POST", `/internal/core/personas/${p7}/inputs`, t7, {
+      input_id: "in-s7",
+      kind: "message",
+      payload: { text: "run X twice in the background" },
+      actor_kind: "human",
+      actor_id: "e2e",
+      source_surface: "e2e",
+    });
+    assert(sub.status === 201, `input submit: ${sub.text}`);
+
+    // A: rounds 0 and 1 commit their effects; the process dies at round 2.
+    const a = runSecretary(script([R0, R1, { crash: true }]), 137);
+    assert(
+      JSON.stringify(consulted(a)) === "[0,1,2]",
+      `A consulted ${consulted(a)}`,
+      a,
+    );
+    assert(
+      (await job7("op:in-s7:1"))?.status === "queued" &&
+        (await job7("op:in-s7:2"))?.status === "queued",
+      "rounds 0 and 1 each started a job before the crash",
+    );
+
+    // B: recovery replays rounds 0-1; round 2 is rate-limited.
+    const b = runSecretary(
+      script([R0, R1, { transient: true, retryAfterMs: 8_000 }]),
+    );
+    assert(
+      JSON.stringify(consulted(b)) === "[2]",
+      `B consulted ${consulted(b)}`,
+      b,
+    );
+    const deferred = await input7("in-s7");
+    assert(
+      deferred.status === "queued" &&
+        Date.parse(deferred.not_before) > Date.now(),
+      `in-s7 deferred: ${JSON.stringify(deferred)}`,
+    );
+
+    // Both jobs finish during the backoff.
+    const runner = spawnRunner({ ...who, SUMI_RUNNER_ID: "runner-s7" });
+    await until(
+      async () =>
+        (await job7("op:in-s7:1"))?.status === "done" &&
+        (await job7("op:in-s7:2"))?.status === "done",
+      20_000,
+      "s7 jobs done",
+    );
+    runner.kill("SIGTERM");
+    await until(
+      () => runner.exitCode !== null || runner.signalCode !== null,
+      10_000,
+      "runner-s7 exit",
+    );
+    assert(markerLines("marker-s7.txt").length === 2, "each job ran once");
+
+    // C: the notifications run before in-s7 and explain themselves.
+    assert(
+      Date.parse((await input7("in-s7")).not_before) > Date.now(),
+      "in-s7 still backing off before the notification turns",
+    );
+    const c = runSecretary(script([{ text: "noted the job", calls: [] }]));
+    const jobMsgs = fed(c, 0, "user").filter((m) => m.startsWith("[job]"));
+    log("  fed to the notification turn:", JSON.stringify(jobMsgs.at(-1)));
+    for (const id of ["op:in-s7:1", "op:in-s7:2"]) {
+      const want = `[job] job ${id} (subprocess) done, exit 0 — command: sh -c echo ran >> marker-s7.txt; echo job-out — started by you for request in-s7: "run X twice in the background" (that request was not finished yet when this job ended)`;
+      assert(jobMsgs.includes(want), `notification context for ${id}`, c);
+      assert(
+        (await input7(`job:${id}`))?.status === "done",
+        `${id} notification handled`,
+      );
+    }
+    assert(
+      (await input7("in-s7")).status === "queued",
+      "in-s7 still pending after the notifications",
+    );
+
+    // D: after the backoff the request resumes at round 2.
+    await until(
+      async () => {
+        const i = await input7("in-s7");
+        return !i.not_before || Date.parse(i.not_before) <= Date.now();
+      },
+      30_000,
+      "in-s7 backoff elapsed",
+    );
+    const d = runSecretary(script([R0, R1, R2, R3]));
+    assert(
+      JSON.stringify(consulted(d)) === "[2,3]",
+      `D consulted ${consulted(d)}`,
+      d,
+    );
+    const starts = fed(d, 2, "tool")
+      .map((t) => JSON.parse(t))
+      .filter((t) => t.job);
+    log(
+      "  replayed receipts fed to round 2:",
+      JSON.stringify(
+        starts.map((t) => ({
+          job_id: t.job.job_id,
+          receipt_status: t.job.status,
+          current_job: t.current_job,
+        })),
+      ),
+    );
+    assert(
+      starts.length === 2 &&
+        starts.every(
+          (t) =>
+            t.job.status === "queued" &&
+            t.current_job?.status === "done" &&
+            t.current_job?.exit_code === 0,
+        ),
+      `replayed job.start receipts carry current state: ${JSON.stringify(starts)}`,
+    );
+    const status = fed(d, 3, "tool")
+      .map((t) => JSON.parse(t))
+      .at(-1);
+    assert(
+      status?.job?.job_id === "op:in-s7:1" &&
+        status.job.status === "done" &&
+        status.current_job === undefined,
+      `fresh job.status: ${JSON.stringify(status)}`,
+    );
+    assert((await input7("in-s7")).status === "done", "in-s7 done");
+    assert(
+      (await job7("op:in-s7:3")) === undefined,
+      "job.status minted no job",
+    );
+    assert(markerLines("marker-s7.txt").length === 2, "no job re-ran");
+
+    // E: nothing left to deliver.
+    const e = runSecretary(script([{ text: "idle", calls: [] }]));
+    assert(!e.includes("MODEL CONSULTED"), "nothing re-delivered", e);
+    log(
+      "  crash + backoff: jobs once each; notifications self-explanatory; resume sees current state",
+    );
   }
 
   log("PASS");

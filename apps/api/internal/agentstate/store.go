@@ -1451,6 +1451,11 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			}
 			return op, true, nil
 		}
+		if strings.HasPrefix(tool, "job.") && op.Status == "done" {
+			if op.Response, err = withCurrentJobTx(ctx, tx, personaID, op.Response); err != nil {
+				return Operation{}, false, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, false, err
 		}
