@@ -43,7 +43,14 @@ func CreateWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
 	if _, err := rand.Read(suffix); err != nil {
 		t.Fatalf("generate db suffix: %v", err)
 	}
-	testDBName := "sumi_test_" + hex.EncodeToString(suffix)
+	// SUMI_TEST_DB_PREFIX lets a bound worktree claim its own database prefix
+	// (e.g. "sumi_memory_") so parallel feature branches never collide with
+	// another owner's databases on a shared local Postgres.
+	prefix := strings.TrimSpace(os.Getenv("SUMI_TEST_DB_PREFIX"))
+	if prefix == "" {
+		prefix = "sumi_test_"
+	}
+	testDBName := prefix + hex.EncodeToString(suffix)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

@@ -127,7 +127,8 @@ export class SecretaryObject {
       provider,
       leaseTtlMs: 30_000,
       renewEveryMs: 10_000,
-      contextLimit: 60,
+      // Row bound only; the state service bounds raw context by capacity.
+      contextLimit: 5_000,
       pollIntervalMs: 0,
       scheduleEveryMs: 1_000,
       idgen: () => crypto.randomUUID(),
@@ -260,7 +261,14 @@ export class SecretaryObject {
       const deadline = Date.now() + 25_000; // DO wall-clock budget
       while (Date.now() < deadline) {
         const r = await s.step();
-        if (r !== "turn") break;
+        if (r === "turn") continue;
+        // Idle, but a memory preparation branch is still in flight: keep
+        // serving inputs while it finishes rather than aborting it at stop.
+        if (r === "idle" && s.memoryBusy) {
+          await new Promise((res) => setTimeout(res, 200));
+          continue;
+        }
+        break;
       }
       await s.stop();
     } catch (e) {

@@ -1,11 +1,16 @@
 import { jsonEqual } from "./json.ts";
 import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import type {
+  ClaimedMemoryChunk,
   CommitRequest,
   Event,
   Input,
+  Json,
   LoadResult,
+  MemoryChunk,
+  MemoryStatus,
   Operation,
+  RenderedContext,
   OutboxEntry,
   PersonaState,
   PlanCall,
@@ -39,6 +44,22 @@ function retryBackoffMs(attempt: number): number {
   return Math.min(200 * 2 ** shift, 30_000);
 }
 
+// Memory thresholds mirrored from the Go store (agentstate/memory.go).
+const L0_CHUNK_MIN_TOKENS = 10_000;
+const L0_LIVE_LIMIT_TOKENS = 40_000;
+const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
+const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
+const L0_SEND_CAP_TOKENS = 60_000;
+const CONTEXT_MAX_EVENTS = 5_000;
+
+/** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
+function estEventTokens(kind: string, payload: Record<string, unknown>): number {
+  return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
+}
+function estTextTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
 /**
  * In-memory StateClient implementing the same contract semantics as the Go
  * service — fencing, idempotent claims, atomic internal effects, recovery —
@@ -62,10 +83,13 @@ export class FakeState implements StateClient {
   plans = new Map<string, TurnPlan>();
   schedules = new Map<string, Schedule>();
   outboxEntries: OutboxEntry[] = [];
+  /** Sealed journal ranges and their L1 replacement lifecycle. */
+  memoryChunks: MemoryChunk[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
   private seq = 0;
   private outboxSeq = 0;
+  private chunkSeq = 0;
 
   private key(persona: string, tool: string, idem: string) {
     return `${persona}|${tool}|${idem}`;
@@ -196,6 +220,17 @@ export class FakeState implements StateClient {
         s.claimed_generation = null;
       }
     }
+    // Memory chunks a fenced generation was preparing return to the shelf.
+    for (const c of this.memoryChunks) {
+      if (
+        c.persona_id === persona &&
+        c.status === "preparing" &&
+        c.claimed_generation !== generation
+      ) {
+        c.status = "sealed";
+        c.claimed_generation = null;
+      }
+    }
     return {
       interrupted_turns: interrupted,
       requeued_inputs: requeued,
@@ -221,12 +256,12 @@ export class FakeState implements StateClient {
       }
       const input = this.inputs.find((i) => i.input_id === running.input_id);
       if (!input) throw new Error("running turn input missing");
+      const rc = this.renderedContext(persona, contextLimit);
       return {
         turn: running,
         input,
-        context: this.eventLog
-          .filter((e) => e.persona_id === persona)
-          .slice(-contextLimit),
+        context: rc.events,
+        memory: rc.memory, omitted: rc.omitted,
         plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
       };
     }
@@ -238,7 +273,10 @@ export class FakeState implements StateClient {
         // its backoff expires, so it cannot hot-loop or starve others.
         (i.not_before === null || Date.parse(i.not_before) <= Date.now()),
     );
-    if (!input) return { turn: null, input: null, context: [], plan: null };
+    if (!input) {
+      const rc = this.renderedContext(persona, contextLimit);
+      return { turn: null, input: null, context: rc.events, memory: rc.memory, omitted: rc.omitted, plan: null };
+    }
     input.status = "claimed";
     input.claimed_generation = generation;
     input.turn_id = turnId;
@@ -259,14 +297,74 @@ export class FakeState implements StateClient {
       error: null,
     };
     this.turns.set(turnId, turn);
+    const rc = this.renderedContext(persona, contextLimit);
     return {
       turn,
       input,
-      context: this.eventLog
-        .filter((e) => e.persona_id === persona)
-        .slice(-contextLimit),
+      context: rc.events,
+      memory: rc.memory, omitted: rc.omitted,
       plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
     };
+  }
+
+  /**
+   * The journal as the model sees it: the newest events not covered by an
+   * applied chunk up to the send cap (newest always included), plus every
+   * applied block, plus the extent of older raw records left out — same
+   * contract as Go renderedContext.
+   */
+  private renderedContext(persona: string, limit: number): RenderedContext {
+    const applied = this.memoryChunks.filter(
+      (c) => c.persona_id === persona && c.status === "applied",
+    );
+    const uncovered = this.eventLog.filter(
+      (e) =>
+        e.persona_id === persona &&
+        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq),
+    );
+    const rowCap =
+      limit <= 0 ? CONTEXT_MAX_EVENTS : Math.min(limit, CONTEXT_MAX_EVENTS);
+    const picked: Event[] = [];
+    let budget = 0;
+    for (let i = uncovered.length - 1; i >= 0; i--) {
+      const e = uncovered[i];
+      if (!e) break;
+      const est = estEventTokens(e.kind, e.payload);
+      if (
+        picked.length >= rowCap ||
+        (picked.length > 0 && budget + est > L0_SEND_CAP_TOKENS)
+      ) {
+        break;
+      }
+      budget += est;
+      picked.push(e);
+    }
+    const events = picked.reverse();
+    const firstShown = events[0]?.seq ?? 0;
+    const older = uncovered.filter((e) => e.seq < firstShown);
+    const oldest = older[0];
+    const newestOmitted = older[older.length - 1];
+    const omitted =
+      oldest && newestOmitted
+        ? {
+            count: older.length,
+            first_seq: oldest.seq,
+            last_seq: newestOmitted.seq,
+            first_time: oldest.created_at,
+            last_time: newestOmitted.created_at,
+          }
+        : null;
+    const memory = applied
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .map((c) => ({
+        chunk_seq: c.chunk_seq,
+        layer: c.layer,
+        first_seq: c.first_seq,
+        last_seq: c.last_seq,
+        text: c.replacement ?? "",
+        est_tokens: c.replacement_est_tokens ?? 0,
+      }));
+    return { events, memory, omitted };
   }
 
   /**
@@ -465,7 +563,11 @@ export class FakeState implements StateClient {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish.
-    if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
+    if (
+      op.tool !== "schedule.set" &&
+      op.tool !== "journal.note" &&
+      op.tool !== "conversation_history"
+    ) {
       throw new StateError(400, `unknown tool: ${op.tool}`);
     }
     // A NUL in the request is a deterministic data error (jsonb cannot
@@ -590,7 +692,7 @@ export class FakeState implements StateClient {
         this.schedules.set(`${persona}|${sid}`, sch);
         operation.response = { schedule: sch };
       }
-    } else {
+    } else if (op.tool === "journal.note") {
       const ev: Event = {
         persona_id: persona,
         seq: ++this.seq,
@@ -601,9 +703,461 @@ export class FakeState implements StateClient {
       };
       this.eventLog.push(ev);
       operation.response = { seq: ev.seq, kind: "note" };
+    } else {
+      // conversation_history: read-only; runs inside the claim like Go so
+      // the receipt reflects the same committed view.
+      operation.response = this.historyTool(persona, op.request);
     }
     this.ops.set(k, operation);
     return { operation, fresh: true };
+  }
+
+  /**
+   * conversation_history: opens this persona's stored journal records —
+   * recorded history, not implicit recollection. Mirrors the Go backend:
+   * literal case-sensitive substring search over each record's stored text
+   * (or serialized payload); read pages by a 16,384-character budget over
+   * the stable journal_event_v1 serialization, with content_offset
+   * fragments for oversized records.
+   */
+  private historyTool(persona: string, request: Json): Json {
+    const num = (k: string): number | null => {
+      const v = request[k];
+      return v === undefined ? null : (v as number);
+    };
+    const operation = request.operation as string | undefined;
+    const query = request.query as string | undefined;
+    const seq = num("seq");
+    const chunkSeq = num("chunk_seq");
+    const fromSeq = num("from_seq");
+    const afterSeq = num("after_seq");
+    const contentOffset = num("content_offset");
+    const limit = (request.limit as number | undefined) ?? 5;
+    const bad = (m: string) => new StateError(400, `bad request: ${m}`);
+    if (operation !== "search" && operation !== "read") {
+      throw bad("operation must be search or read");
+    }
+    if (operation === "search" !== (query !== undefined)) {
+      throw bad("search requires query and read must not carry one");
+    }
+    if (limit < 1 || limit > 20 || !Number.isInteger(limit)) {
+      throw bad("limit must be an integer in [1, 20]");
+    }
+    if (contentOffset !== null && (operation !== "read" || seq === null)) {
+      throw bad("content_offset is only valid with read + seq");
+    }
+    const locators = [seq, chunkSeq, fromSeq].filter((v) => v !== null).length;
+    if (locators > 1) throw bad("seq, chunk_seq and from_seq are alternative locators");
+    // chunk_seq + after_seq continues a page within that chunk's range.
+    if (seq !== null && afterSeq !== null) {
+      throw bad("seq cannot combine with after_seq");
+    }
+    const all = this.eventLog.filter((e) => e.persona_id === persona);
+    const details = (messages: Json[], nextAfterSeq: number | null, nextRead: Json | null): Json => ({
+      operation,
+      scope: "your_conversation_history",
+      messages,
+      next_after_seq: nextAfterSeq,
+      next_read: nextRead,
+      has_more: nextAfterSeq !== null || nextRead !== null,
+      journal_event_format: "journal_event_v1",
+      content_complete_meaning:
+        "entire stored event representation returned in this call; does not imply provider vision support",
+      fragment_continuation:
+        "follow next_read to the end of this event before resuming the original query with after_seq=resume_after_seq; concatenated fragments form the journal_event_v1 JSON",
+      search_coverage:
+        "stored text fields and serialized tool records only; no match is not proof that a record is absent",
+    });
+    const projection = (e: Event): string =>
+      typeof e.payload.text === "string"
+        ? (e.payload.text as string)
+        : JSON.stringify(e.payload);
+    const source = (e: Event): Json => ({
+      seq: e.seq,
+      turn_id: e.turn_id,
+      kind: e.kind,
+    });
+    const journalJson = (e: Event): string =>
+      JSON.stringify({
+        seq: e.seq,
+        turn_id: e.turn_id,
+        kind: e.kind,
+        created_at: e.created_at,
+        payload: e.payload,
+      });
+    if (operation === "search") {
+      const after = afterSeq ?? 0;
+      const hits = all.filter(
+        (e) => e.seq > after && projection(e).includes(query as string),
+      );
+      const page = hits.slice(0, limit);
+      const last = page[page.length - 1];
+      const nextAfterSeq = hits.length > limit && last ? last.seq : null;
+      const messages = page.map((e) => {
+        const text = projection(e);
+        const matchStart = Math.max(0, text.indexOf(query as string));
+        const start = Math.max(0, matchStart - 80);
+        const snippet = [...text].slice(start, start + 500).join("");
+        return {
+          source: source(e),
+          timestamp: e.created_at,
+          snippet,
+          snippet_char_start: start,
+          snippet_truncated: start > 0 || start + 500 < [...text].length,
+        };
+      });
+      return details(messages, nextAfterSeq, null);
+    }
+    // read
+    let events: Event[];
+    let upper: number | null = null;
+    if (seq !== null) {
+      const e = all.find((ev) => ev.seq === seq);
+      if (!e) throw bad("journal event not found");
+      events = [e];
+    } else {
+      let from = 1;
+      if (chunkSeq !== null) {
+        const c = this.memoryChunks.find(
+          (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+        );
+        // A wrong locator is the model's bad request, recorded as the tool
+        // result — not a state outage (Go maps it to 400 too).
+        if (!c) throw bad(`memory chunk ${chunkSeq} not found`);
+        from = c.first_seq;
+        upper = c.last_seq;
+      }
+      if (fromSeq !== null) from = fromSeq;
+      if (afterSeq !== null && afterSeq + 1 > from) from = afterSeq + 1;
+      events = all
+        .filter((e) => e.seq >= from && (upper === null || e.seq <= upper))
+        .slice(0, limit + 1);
+    }
+    const messages: Json[] = [];
+    let nextAfterSeq: number | null = null;
+    let nextRead: Json | null = null;
+    let readChars = 0;
+    let lastCompleteSeq: number | null = null;
+    for (let i = 0; i < events.length; i++) {
+      const e = events[i];
+      if (!e) break;
+      const serialized = journalJson(e);
+      const runes = [...serialized];
+      const totalChars = runes.length;
+      const offset = contentOffset ?? 0;
+      if (offset > totalChars) {
+        throw bad(`content_offset ${offset} beyond record length ${totalChars}`);
+      }
+      if (
+        i >= limit ||
+        (offset === 0 &&
+          messages.length > 0 &&
+          readChars + totalChars > HISTORY_READ_CHAR_BUDGET)
+      ) {
+        if (lastCompleteSeq !== null) nextAfterSeq = lastCompleteSeq;
+        break;
+      }
+      if (offset === 0 && readChars + totalChars <= HISTORY_READ_CHAR_BUDGET) {
+        readChars += totalChars;
+        lastCompleteSeq = e.seq;
+        messages.push({
+          source: source(e),
+          event: JSON.parse(serialized),
+          content_complete: true,
+        });
+        continue;
+      }
+      const end = Math.min(offset + HISTORY_READ_CHAR_BUDGET, totalChars);
+      if (end < totalChars) {
+        nextRead = { operation: "read", seq: e.seq, content_offset: end };
+      }
+      let more = i + 1 < events.length;
+      if (!more && seq === null) {
+        more = all.some(
+          (ev) => ev.seq > e.seq && (upper === null || ev.seq <= upper),
+        );
+      }
+      if (more) nextAfterSeq = e.seq;
+      messages.push({
+        source: source(e),
+        timestamp: e.created_at,
+        event_json_fragment: runes.slice(offset, end).join(""),
+        event_json_range: {
+          start_char: offset,
+          end_char: end,
+          total_chars: totalChars,
+          ends_event: end === totalChars,
+        },
+        content_complete: false,
+        resume_after_seq: e.seq,
+      });
+      break;
+    }
+    return details(messages, nextAfterSeq, nextRead);
+  }
+
+  /**
+   * Memory housekeeping between turns: seal newly safe journal ranges, then
+   * apply shelved replacements while the live raw estimate exceeds the
+   * limit — same contract as Go MemoryMaintain.
+   */
+  async memoryMaintain(
+    persona: string,
+    generation: number,
+  ): Promise<MemoryStatus> {
+    this.mustHold(persona, generation);
+    for (const c of this.memoryChunks) {
+      if (
+        c.persona_id === persona &&
+        c.status === "preparing" &&
+        c.claimed_generation !== generation
+      ) {
+        c.status = "sealed";
+        c.claimed_generation = null;
+      }
+    }
+    const mine = () =>
+      this.memoryChunks.filter((c) => c.persona_id === persona);
+    let covered = Math.max(0, ...mine().map((c) => c.last_seq));
+    // Seal walk: accumulate the unsealed tail; cut a chunk just before each
+    // input_received once the window reaches the minimum and no tool call
+    // in it is still waiting for its result.
+    const tail = this.eventLog.filter(
+      (e) => e.persona_id === persona && e.seq > covered,
+    );
+    const pending = new Set<string>();
+    let windowEst = 0;
+    let windowStart = -1;
+    let window: Event[] = [];
+    for (const e of tail) {
+      if (
+        e.kind === "input_received" &&
+        windowStart >= 0 &&
+        pending.size === 0 &&
+        windowEst >= L0_CHUNK_MIN_TOKENS
+      ) {
+        this.memoryChunks.push({
+          persona_id: persona,
+          chunk_seq: ++this.chunkSeq,
+          layer: 1,
+          first_seq: windowStart,
+          last_seq: window[window.length - 1]?.seq ?? windowStart,
+          est_tokens: windowEst,
+          status: "sealed",
+          replacement: null,
+          replacement_est_tokens: null,
+          attempts: 0,
+          last_error: null,
+          claimed_generation: null,
+          not_before: null,
+          created_at: new Date().toISOString(),
+          prepared_at: null,
+          applied_at: null,
+        });
+        window = [];
+        windowEst = 0;
+        windowStart = -1;
+      }
+      if (windowStart < 0) windowStart = e.seq;
+      window.push(e);
+      windowEst += estEventTokens(e.kind, e.payload);
+      const callId = e.payload.call_id;
+      if (e.kind === "tool_call" && typeof callId === "string" && callId) {
+        pending.add(callId);
+      } else if (e.kind === "tool_result" && typeof callId === "string") {
+        pending.delete(callId);
+      }
+    }
+    // Live raw = every not-yet-applied chunk plus the unsealed tail.
+    let live =
+      windowEst +
+      mine()
+        .filter((c) => c.status !== "applied")
+        .reduce((s, c) => s + c.est_tokens, 0);
+    if (live > L0_LIVE_LIMIT_TOKENS) {
+      for (const c of mine()
+        .filter((c) => c.status === "prepared")
+        .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
+        if (live <= L0_LIVE_LIMIT_TOKENS) break;
+        c.status = "applied";
+        c.applied_at = new Date().toISOString();
+        live -= c.est_tokens;
+      }
+    }
+    return this.memoryStatus(persona);
+  }
+
+  async memoryStatus(persona: string): Promise<MemoryStatus> {
+    const mine = this.memoryChunks.filter((c) => c.persona_id === persona);
+    const covered = Math.max(0, ...mine.map((c) => c.last_seq));
+    const events = this.eventLog.filter((e) => e.persona_id === persona);
+    const tail = events
+      .filter((e) => e.seq > covered)
+      .reduce((s, e) => s + estEventTokens(e.kind, e.payload), 0);
+    const count = (s: MemoryChunk["status"]) =>
+      mine.filter((c) => c.status === s).length;
+    return {
+      live_raw_tokens:
+        mine
+          .filter((c) => c.status !== "applied")
+          .reduce((s, c) => s + c.est_tokens, 0) + tail,
+      applied_tokens: mine
+        .filter((c) => c.status === "applied")
+        .reduce((s, c) => s + (c.replacement_est_tokens ?? 0), 0),
+      sealed: count("sealed"),
+      preparing: count("preparing"),
+      prepared: count("prepared"),
+      applied: count("applied"),
+      kept: count("kept"),
+      failed: count("failed"),
+      covered_seq: covered,
+      latest_seq: Math.max(0, ...events.map((e) => e.seq)),
+      chunk_min_tokens: L0_CHUNK_MIN_TOKENS,
+      live_limit_tokens: L0_LIVE_LIMIT_TOKENS,
+    };
+  }
+
+  async claimMemoryChunk(
+    persona: string,
+    generation: number,
+    contextLimit: number,
+  ): Promise<ClaimedMemoryChunk> {
+    this.mustHold(persona, generation);
+    const mine = this.memoryChunks.filter((c) => c.persona_id === persona);
+    const empty = {
+      chunk: null,
+      target_events: [],
+      context: this.renderedContext(persona, contextLimit),
+    };
+    // An orphaned 'preparing' chunk (lost claim response, stopped branch) is
+    // re-claimed first; interrupted attempts spend the budget — same as Go.
+    let c: MemoryChunk | undefined;
+    for (;;) {
+      c =
+        mine.find((x) => x.status === "preparing") ??
+        mine
+          .filter(
+            (x) =>
+              x.status === "sealed" &&
+              (x.not_before === null || Date.parse(x.not_before) <= Date.now()),
+          )
+          .sort((a, b) => a.chunk_seq - b.chunk_seq)[0];
+      if (!c) return empty;
+      if (c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) break;
+      c.status = "failed";
+      c.claimed_generation = null;
+      c.not_before = null;
+      c.last_error = [
+        c.last_error,
+        `preparation did not finish within ${MEMORY_CHUNK_MAX_ATTEMPTS} attempts`,
+      ]
+        .filter(Boolean)
+        .join("; ");
+    }
+    c.status = "preparing";
+    c.claimed_generation = generation;
+    c.attempts += 1;
+    c.not_before = null;
+    return {
+      chunk: c,
+      target_events: this.eventLog.filter(
+        (e) =>
+          e.persona_id === persona &&
+          e.seq >= c.first_seq &&
+          e.seq <= c.last_seq,
+      ),
+      context: this.renderedContext(persona, contextLimit),
+    };
+  }
+
+  async completeMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    result: { replacement?: string; keepUnchanged?: boolean },
+  ): Promise<MemoryChunk> {
+    this.mustHold(persona, generation);
+    const replacement = result.replacement ?? "";
+    const keepUnchanged = result.keepUnchanged ?? false;
+    if (keepUnchanged === (replacement !== "")) {
+      throw new StateError(
+        400,
+        "bad request: exactly one of replacement text or keep_unchanged is required",
+      );
+    }
+    if (replacement.includes("\u0000")) {
+      throw new StateError(400, "bad request: replacement contains a NUL byte");
+    }
+    const c = this.memoryChunks.find(
+      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+    );
+    if (!c) throw new StateError(404, "memory chunk not found");
+    if (c.status === "preparing") {
+      if (c.claimed_generation !== generation) throw new FencedError();
+      if (keepUnchanged) {
+        c.status = "kept";
+      } else {
+        c.status = "prepared";
+        c.replacement = replacement;
+        c.replacement_est_tokens = estTextTokens(replacement);
+      }
+      c.claimed_generation = null;
+      c.prepared_at = new Date().toISOString();
+      return c;
+    }
+    if (
+      c.status === "prepared" ||
+      c.status === "kept" ||
+      c.status === "applied"
+    ) {
+      const same =
+        keepUnchanged === (c.status === "kept") &&
+        (c.replacement ?? "") === replacement;
+      if (!same) {
+        throw new StateError(
+          409,
+          `chunk ${chunkSeq} already completed with different content`,
+        );
+      }
+      return c;
+    }
+    throw new StateError(
+      409,
+      `chunk ${chunkSeq} is ${c.status}, not preparing`,
+    );
+  }
+
+  async failMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    failure: { error: string; retryable: boolean },
+  ): Promise<MemoryChunk> {
+    this.mustHold(persona, generation);
+    const c = this.memoryChunks.find(
+      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+    );
+    if (!c) throw new StateError(404, "memory chunk not found");
+    if (c.status !== "preparing" || c.claimed_generation !== generation) {
+      throw new StateError(
+        409,
+        `chunk ${chunkSeq} is not preparing under this generation`,
+      );
+    }
+    if (failure.retryable && c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) {
+      c.status = "sealed";
+      c.claimed_generation = null;
+      c.last_error = failure.error;
+      c.not_before = new Date(
+        Date.now() + retryBackoffMs(c.attempts),
+      ).toISOString();
+    } else {
+      c.status = "failed";
+      c.claimed_generation = null;
+      c.last_error = failure.error;
+      c.not_before = null;
+    }
+    return c;
   }
 
   async completeOperation(

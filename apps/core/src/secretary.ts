@@ -1,5 +1,9 @@
 import { jsonEqual } from "./json.ts";
 import {
+  renderJournalContext,
+  runMemoryPreparation,
+} from "./memory.ts";
+import {
   ModelError,
   type ChatMessage,
   type ModelProvider,
@@ -19,6 +23,8 @@ import type {
   EventInput,
   Input,
   Json,
+  MemoryBlock,
+  OmittedRange,
   Turn,
   TurnPlan,
   WriterLease,
@@ -102,6 +108,13 @@ export class Secretary {
   private inFlight: AbortController | null = null;
   private lastDispatch = 0;
   private poison: { turnId: string; count: number } | null = null;
+  /**
+   * The one in-flight memory preparation branch. Preparation is
+   * asynchronous: it runs alongside turns, never blocks them, and only one
+   * branch exists at a time (the state service also enforces this).
+   */
+  private memoryTask: Promise<void> | null = null;
+  private memoryAbort: AbortController | null = null;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -160,8 +173,28 @@ export class Secretary {
         const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
+      // Memory housekeeping between turns, while the conversation is idle
+      // enough for the sent context to change: seal newly safe journal
+      // ranges, then apply shelved L1 replacements while the live raw
+      // estimate exceeds the limit. Preparation itself is asynchronous —
+      // a claimed chunk's originals stay in the context while the branch
+      // runs, so corrections and new experiences during preparation are
+      // never overwritten.
+      // A 'preparing' chunk while this process runs no branch is orphaned
+      // (lost claim response, stopped branch); the claim re-claims it.
+      const mem = await state.memoryMaintain(personaId, gen);
+      if (!this.memoryTask && (mem.sealed > 0 || mem.preparing > 0)) {
+        this.memoryAbort = new AbortController();
+        this.memoryTask = this.prepareMemory(
+          gen,
+          this.memoryAbort.signal,
+        ).finally(() => {
+          this.memoryTask = null;
+          this.memoryAbort = null;
+        });
+      }
       const turnId = this.cfg.idgen();
-      const { turn, input, context, plan } = await state.loadTurn(
+      const { turn, input, context, memory, omitted, plan } = await state.loadTurn(
         personaId,
         gen,
         turnId,
@@ -196,7 +229,14 @@ export class Secretary {
         return "turn";
       }
       try {
-        await this.runTurn(turn, input, context, plan);
+        await this.runTurn(
+          turn,
+          input,
+          context,
+          memory ?? [],
+          omitted ?? null,
+          plan,
+        );
         this.poison = null;
       } catch (e) {
         if (
@@ -390,9 +430,18 @@ export class Secretary {
   }
 
   /** Drain in-flight work opportunity and release the lease. */
+  /** True while a memory preparation branch is in flight. */
+  get memoryBusy(): boolean {
+    return this.memoryTask !== null;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.inFlight?.abort();
+    this.memoryAbort?.abort();
+    // Let the aborted branch settle before the lease is released; it never
+    // rejects (prepareMemory records or logs every outcome).
+    await this.memoryTask;
     await this.shutdown();
   }
 
@@ -449,6 +498,44 @@ export class Secretary {
   }
 
   /**
+   * One asynchronous L1 preparation branch. The state service seals the
+   * chunk and hands back the parent's rendered context at claim time; the
+   * branch consults the same provider with no tools and records its verdict
+   * (prepared / kept / failed). The claim is generation-fenced: losing the
+   * writer fence mid-preparation stops the branch, and the next
+   * generation's recovery reseals the chunk.
+   */
+  private async prepareMemory(
+    gen: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const stopRenewal = this.renewDuringTurn(gen);
+    try {
+      await runMemoryPreparation({
+        personaId: this.cfg.personaId,
+        generation: gen,
+        state: this.cfg.state,
+        provider: this.cfg.provider,
+        contextLimit: this.cfg.contextLimit,
+        system: SYSTEM,
+        tools: toolSpecs(),
+        signal,
+        log: (msg, fields) => this.log(msg, fields),
+      });
+    } catch (e) {
+      // A fenced branch stops silently — the next generation's recovery
+      // reseals its chunk. Other errors inside preparation are already
+      // recorded on the chunk by runMemoryPreparation; anything that
+      // escaped that is a defect worth surfacing, not a loop-killer.
+      if (!(e instanceof FencedError)) {
+        this.log("memory preparation error", { error: String(e) });
+      }
+    } finally {
+      stopRenewal();
+    }
+  }
+
+  /**
    * Process one claimed turn. The durable plan is the authority: every
    * recorded round is replayed verbatim (claims return stored receipts);
    * the model is consulted only for the first round not yet recorded, and
@@ -461,6 +548,8 @@ export class Secretary {
     turn: Turn,
     input: Input,
     context: Event[],
+    memory: MemoryBlock[],
+    omitted: OmittedRange | null,
     plan: TurnPlan | null,
   ): Promise<void> {
     const gen = turn.generation;
@@ -469,7 +558,7 @@ export class Secretary {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       const events: EventInput[] = [inputReceivedEvent(input, turn)];
-      const messages = assemble(context, input);
+      const messages = assemble(context, input, memory, omitted);
       // The stored plan is the authority — re-sync on every savePlan so a
       // plan that grew further in a lost prior attempt is executed as
       // recorded, never as this attempt would have decided it.
@@ -944,6 +1033,7 @@ const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
+  "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
@@ -961,48 +1051,21 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
   };
 }
 
-/** Assemble model messages from the journal tail plus the current input. */
-export function assemble(context: Event[], input: Input): ChatMessage[] {
-  const messages: ChatMessage[] = [{ role: "system", content: SYSTEM }];
-  for (const ev of context) {
-    const p = ev.payload;
-    switch (ev.kind) {
-      case "input_received": {
-        const who =
-          p.actor_kind === "schedule"
-            ? "[scheduled wake]"
-            : `[${String(p.actor_kind)}]`;
-        messages.push({
-          role: "user",
-          content: `${who} ${String(p.text ?? "")}`,
-        });
-        break;
-      }
-      case "assistant_message":
-        messages.push({ role: "assistant", content: String(p.text ?? "") });
-        break;
-      case "note":
-        messages.push({
-          role: "assistant",
-          content: `[note] ${String(p.text ?? "")}`,
-        });
-        break;
-      case "tool_result":
-        // Flattened to assistant text: a bare role:"tool" message with no
-        // preceding assistant tool_calls is rejected by chat-completions
-        // providers. The journal keeps the structured record; the model gets
-        // the result inline.
-        messages.push({
-          role: "assistant",
-          content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
-            p.response ?? (p.error ? { error: p.error } : {}),
-          )}`,
-        });
-        break;
-      default:
-        break;
-    }
-  }
+/**
+ * Assemble model messages from the journal tail plus the current input.
+ * Applied L1 memory blocks interleave at the positions where their covered
+ * events were — a replacement never migrates to the top of the context.
+ */
+export function assemble(
+  context: Event[],
+  input: Input,
+  memory: MemoryBlock[] = [],
+  omitted: OmittedRange | null = null,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [
+    { role: "system", content: SYSTEM },
+    ...renderJournalContext(context, memory, omitted),
+  ];
   const text =
     typeof input.payload.text === "string"
       ? input.payload.text

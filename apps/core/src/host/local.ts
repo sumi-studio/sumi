@@ -40,7 +40,8 @@ async function main() {
     provider: providerFromEnv((n) => process.env[n]),
     leaseTtlMs: leaseTtl,
     renewEveryMs: Math.max(250, Math.floor(leaseTtl / 3)),
-    contextLimit: 60,
+    // Row bound only; the state service bounds raw context by capacity.
+    contextLimit: 5_000,
     pollIntervalMs: 500,
     scheduleEveryMs: 1_000,
     providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
@@ -61,7 +62,9 @@ async function main() {
     let lastWork = Date.now();
     while (Date.now() < deadline && Date.now() - lastWork < idleGraceMs) {
       const r = await secretary.step();
-      if (r === "turn") {
+      // A memory preparation branch in flight is work too: stopping would
+      // abort it and leave the chunk to be re-claimed on the next run.
+      if (r === "turn" || secretary.memoryBusy) {
         lastWork = Date.now();
       } else {
         await new Promise((res) => setTimeout(res, 100));

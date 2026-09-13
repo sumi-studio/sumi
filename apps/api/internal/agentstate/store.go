@@ -244,6 +244,13 @@ type LoadResult struct {
 	Turn    *Turn   `json:"turn"`
 	Input   *Input  `json:"input"`
 	Context []Event `json:"context"`
+	// Memory holds the applied L1 replacement blocks. Each renders at the
+	// journal position where its events were — the core interleaves them
+	// with the raw tail by sequence position.
+	Memory []MemoryBlock `json:"memory"`
+	// Omitted is the extent of older raw records outside the send cap —
+	// still stored and readable through conversation_history; nil if none.
+	Omitted *OmittedRange `json:"omitted"`
 	// Plan is the input's recorded decision, if one exists — returned on
 	// both the fresh-claim and running-turn replay paths so a retried
 	// attempt continues the recorded plan rather than re-planning.
@@ -759,29 +766,6 @@ func clampLimit(v, def, max int) int {
 	return v
 }
 
-func (s *Store) journalTail(ctx context.Context, db interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, personaID string, limit int) ([]Event, error) {
-	limit = clampLimit(limit, 50, 500)
-	rows, err := db.Query(ctx, `
-		SELECT persona_id, seq, turn_id, kind, payload, created_at
-		FROM (SELECT * FROM core_events WHERE persona_id = $1 ORDER BY seq DESC LIMIT $2) recent
-		ORDER BY seq`, personaID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 // LoadTurn is the coarse turn-start read under the writer's generation. If a
 // turn is already running under this generation (a lost load response), it is
 // replayed. Otherwise the oldest queued input is claimed and its turn begun
@@ -827,10 +811,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
 				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 		if errors.Is(err, pgx.ErrNoRows) {
-			res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit)
 			if err != nil {
 				return res, err
 			}
+			res.Context, res.Memory, res.Omitted = rc.Events, rc.Memory, rc.Omitted
 			if err := tx.Commit(ctx); err != nil {
 				return res, err
 			}
@@ -888,10 +873,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			return res, err
 		}
 	}
-	res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit)
 	if err != nil {
 		return res, err
 	}
+	res.Context, res.Memory, res.Omitted = rc.Events, rc.Memory, rc.Omitted
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -1202,6 +1188,15 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	if err := sRows.Err(); err != nil {
 		return res, err
 	}
+	// Return memory chunks a fenced generation was preparing to the shelf
+	// so the live generation can reprepare them — the originals never left
+	// the context while preparation ran.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_memory_chunks SET status = 'sealed', claimed_generation = NULL
+		WHERE persona_id = $1 AND status = 'preparing' AND claimed_generation <> $2`,
+		personaID, generation); err != nil {
+		return res, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -1233,7 +1228,7 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 // atomically inside the claim transaction. Anything else has no execution
 // path yet and must not be claimable.
 func isInternalTool(tool string) bool {
-	return tool == "schedule.set" || tool == "journal.note"
+	return tool == "schedule.set" || tool == "journal.note" || tool == "conversation_history"
 }
 
 // internalToolResponse applies a state-internal tool's effect inside the
@@ -1318,6 +1313,12 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
+	case "conversation_history":
+		resp, err := s.conversationHistory(ctx, tx, personaID, request)
+		if err != nil {
+			return nil, false, err
+		}
+		return resp, true, nil
 	default:
 		return nil, false, nil
 	}
