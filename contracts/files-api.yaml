@@ -10,6 +10,11 @@ info:
     a service version), or an integer (CAS against the last service-minted
     version). Service versions are cooperative among API writers; direct
     executor/POSIX writes bypass them and are reported via external_change.
+    Deployment requirement: the canonical mount the service roots on MUST
+    run with zero client-side metadata caching (JuiceFS:
+    --attr-cache=0 --entry-cache=0 --dir-entry-cache=0). A nonzero attr
+    cache lets a conditional write stat a stale fingerprint and silently
+    overwrite a direct writer's edit made inside the cache window.
 paths:
   /v1/files/{scope}/stat:
     get:
