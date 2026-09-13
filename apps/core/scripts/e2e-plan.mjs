@@ -1,0 +1,794 @@
+#!/usr/bin/env node
+/**
+ * E2E for the F1 durable-plan contract: REAL Go state service + REAL
+ * PostgreSQL + real Node core child processes.
+ *
+ * Covers:
+ *   1. Scripted decision A persisted → hard exit after an effect commits →
+ *      a replacement provider that would choose plan B is never consulted;
+ *      plan A continues with exactly one effect per position.
+ *   2. Lost savePlan/claim responses: identical resends replay the stored
+ *      decision and stored receipts — one effect, one commit.
+ *   3. Zero-call plan: crash before commitTurn → retry replays the recorded
+ *      text-only decision without consulting the model.
+ *   4. Server-derived effect identity: a spoofed legacy idempotency_key and
+ *      a fresh operation_id cannot mint a second effect.
+ *
+ * Requires SUMI_TEST_DB_URL pointing at a database migrated to 0047+
+ * (core_turn_plans lives in 0047_core_state). Example:
+ *   SUMI_TEST_DB_URL=postgres://sumi:sumi-dev@127.0.0.1:55432/sumi_core_f1?sslmode=disable \
+ *     node scripts/e2e-plan.mjs
+ *
+ * Child mode (--child) runs one secretary attempt with a scripted provider;
+ * the parent orchestrates crashes and assertions.
+ */
+import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const CHILD = process.argv.includes("--child");
+
+if (CHILD) {
+  await childMain();
+} else {
+  await main();
+}
+
+// ---------------------------------------------------------------- child ---
+// One attempt of a secretary with a deterministic scripted provider. The
+// plan it would emit comes from SUMI_SCRIPT; crash/replay knobs simulate
+// lost responses and a hard exit mid-turn.
+async function childMain() {
+  const { Secretary } = await import("../src/secretary.ts");
+  const { HttpStateClient } = await import("../src/state-client.ts");
+
+  const env = (n) => {
+    const v = process.env[n];
+    if (!v) throw new Error(`missing env ${n}`);
+    return v;
+  };
+  const script = JSON.parse(env("SUMI_SCRIPT")); // {text, calls:[{tool,request}]}
+  const dieAfterClaims = Number(process.env.SUMI_DIE_AFTER_CLAIMS ?? 0);
+  const dieBeforeCommit = process.env.SUMI_DIE_BEFORE_COMMIT === "1";
+  const resendPlan = process.env.SUMI_RESEND_PLAN === "1";
+  const resendClaim = process.env.SUMI_RESEND_CLAIM === "1";
+  const spoofClaim = process.env.SUMI_SPOOF_CLAIM === "1";
+
+  class ScriptedProvider {
+    name = "scripted";
+    async *stream() {
+      console.log("[child] MODEL CONSULTED");
+      // throwSize/textSize build oversized values in-process — a 1.5 MB
+      // env var would flirt with execve limits. The multibyte pattern
+      // makes sure truncation stays on code-point boundaries.
+      if (script.throwSize)
+        throw new Error(
+          "provider exploded " + "ø😀".repeat(script.throwSize),
+        );
+      if (script.throw) throw new Error(script.throw);
+      if (script.textSize)
+        yield { type: "text", delta: "ø😀".repeat(script.textSize) };
+      else yield { type: "text", delta: script.text };
+      for (const [i, c] of (script.calls ?? []).entries()) {
+        yield {
+          type: "tool_call",
+          call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+        };
+      }
+      yield { type: "done", usage: { scripted: true } };
+    }
+  }
+
+  const inner = new HttpStateClient(
+    env("SUMI_STATE_URL"),
+    env("SUMI_PERSONA_TOKEN"),
+  );
+  const baseUrl = env("SUMI_STATE_URL");
+  const token = env("SUMI_PERSONA_TOKEN");
+  let claims = 0;
+  // Wrap the state client to simulate transport-level realities the
+  // protocol must absorb — identical to a lost HTTP response.
+  const state = Object.create(inner, {
+    savePlan: {
+      value: async (p, g, req) => {
+        const r = await inner.savePlan(p, g, req);
+        if (resendPlan) {
+          const again = await inner.savePlan(p, g, req);
+          console.log(`[child] plan resend -> created=${again.created}`);
+          return again;
+        }
+        return r;
+      },
+    },
+    claimOperation: {
+      value: async (p, g, op) => {
+        const r = await inner.claimOperation(p, g, op);
+        claims++;
+        if (resendClaim) {
+          const again = await inner.claimOperation(p, g, op);
+          console.log(
+            `[child] claim resend -> fresh=${again.fresh} op=${again.operation.operation_id}`,
+          );
+        }
+        if (spoofClaim && claims === 1) {
+          // Legacy-protocol spoof mid-turn: a caller-supplied
+          // idempotency_key and a fresh operation_id on the same plan
+          // position. The agreed boundary rejects the old field outright
+          // (400, DisallowUnknownFields) — it can never mint a new effect.
+          const res = await fetch(
+            `${baseUrl}/internal/core/personas/${p}/operations/claim`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                generation: g,
+                operation_id: "spoof-attempt",
+                turn_id: op.turnId,
+                tool: op.tool,
+                call_index: op.callIndex,
+                request: op.request,
+                idempotency_key: "attacker-chosen-key",
+              }),
+            },
+          );
+          const body = await res.json().catch(() => ({}));
+          console.log(
+            `[child] spoofed claim -> status=${res.status} op=${body?.operation?.operation_id ?? "none"} fresh=${body?.fresh ?? "n/a"}`,
+          );
+        }
+        if (claims === dieAfterClaims) {
+          // Hard exit: the effect committed; the caller never came back.
+          console.log(`[child] dying after claim ${claims}`);
+          process.exit(9);
+        }
+        return r;
+      },
+    },
+    commitTurn: {
+      value: async (p, t, g, req) => {
+        if (dieBeforeCommit) {
+          console.log("[child] dying before commitTurn");
+          process.exit(9);
+        }
+        return inner.commitTurn(p, t, g, req);
+      },
+    },
+  });
+
+  const secretary = new Secretary({
+    personaId: env("SUMI_PERSONA_ID"),
+    holderId: process.env.SUMI_HOLDER_ID ?? `plan-e2e-${process.pid}`,
+    state,
+    provider: new ScriptedProvider(),
+    leaseTtlMs: 30_000,
+    renewEveryMs: 5_000,
+    contextLimit: 60,
+    pollIntervalMs: 100,
+    scheduleEveryMs: 0,
+    idgen: () => crypto.randomUUID(),
+    log: (msg, fields) =>
+      console.log(`[child] ${msg}`, fields ? JSON.stringify(fields) : ""),
+  });
+  await secretary.start();
+  const deadline = Date.now() + 30_000;
+  let lastWork = Date.now();
+  while (Date.now() < deadline && Date.now() - lastWork < 1_500) {
+    const r = await secretary.step();
+    if (r === "turn") lastWork = Date.now();
+    else await new Promise((res) => setTimeout(res, 100));
+  }
+
+  await secretary.stop();
+}
+
+// --------------------------------------------------------------- parent ---
+async function main() {
+  const DB_URL = process.env.SUMI_TEST_DB_URL ?? process.env.SUMI_DB_URL;
+  if (!DB_URL) {
+    console.error("e2e-plan: SUMI_TEST_DB_URL required — real PostgreSQL");
+    process.exit(2);
+  }
+  const API_DIR = resolve(import.meta.dirname, "../../api");
+  const SELF = resolve(import.meta.dirname, "e2e-plan.mjs");
+  const PORT = 9390 + (process.pid % 500);
+  const BASE = `http://127.0.0.1:${PORT}`;
+  const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
+
+  const log = (...a) => console.log("[e2e-plan]", ...a);
+  const fail = (msg) => {
+    console.error("[e2e-plan] FAIL:", msg);
+    process.exit(1);
+  };
+  const assert = (cond, msg, evidence) => {
+    if (cond) return;
+    if (evidence) console.error(evidence);
+    fail(msg);
+  };
+
+  function uuidv7() {
+    const now = Date.now().toString(16).padStart(12, "0");
+    const r = randomUUID().replaceAll("-", "");
+    return `${now.slice(0, 8)}-${now.slice(8, 12)}-7${r.slice(13, 16)}-${((parseInt(r.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, "0")}${r.slice(18, 20)}-${r.slice(20, 32)}`;
+  }
+  const personaId = uuidv7();
+
+  async function req(method, path, token, body) {
+    const res = await fetch(BASE + path, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      /* non-JSON */
+    }
+    return { status: res.status, json, text };
+  }
+
+  const binDir = mkdtempSync(join(tmpdir(), "sumi-e2e-plan-"));
+  const bin = join(binDir, "state-dev");
+  log("building state-dev…");
+  const build = spawnSync(
+    "go",
+    ["build", "-buildvcs=false", "-o", bin, "./cmd/state-dev"],
+    { cwd: API_DIR, stdio: "inherit" },
+  );
+  if (build.status !== 0) fail("go build failed");
+
+  log("starting state-dev on", BASE);
+  const svc = spawn(bin, [], {
+    env: {
+      ...process.env,
+      SUMI_DB_URL: DB_URL,
+      SUMI_CORE_STATE_TOKEN: ADMIN,
+      SUMI_STATE_LISTEN: `127.0.0.1:${PORT}`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  svc.stderr.on("data", (d) => process.stderr.write(`[state-dev] ${d}`));
+  process.on("exit", () => svc.kill("SIGKILL"));
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      const r = await fetch(`${BASE}/health`);
+      if (r.ok) break;
+    } catch {
+      /* not up */
+    }
+    if (Date.now() > deadline) fail("state-dev did not become healthy");
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  const created = await req("POST", "/internal/core/personas", ADMIN, {
+    persona_id: personaId,
+    display_name: "e2e plan secretary",
+  });
+  assert(created.status === 201, `createPersona ${created.status}`);
+  const ptoken = created.json.persona_token;
+
+  const childEnv = (extra) => ({
+    ...process.env,
+    SUMI_STATE_URL: BASE,
+    SUMI_PERSONA_ID: personaId,
+    SUMI_PERSONA_TOKEN: ptoken,
+    SUMI_HOLDER_ID: "e2e-plan-holder", // same holder: deterministic re-acquire
+    ...extra,
+  });
+  const runChild = (extra, expectExit = 0) => {
+    const r = spawnSync("node", [SELF, "--child"], {
+      env: childEnv(extra),
+      encoding: "utf8",
+      timeout: 90_000,
+      maxBuffer: 64 * 1024 * 1024, // oversized-error scenarios log big lines
+    });
+    if (r.status !== expectExit) {
+      console.error(r.stdout, r.stderr);
+      fail(`child exited ${r.status}, expected ${expectExit}`);
+    }
+    return r.stdout ?? "";
+  };
+  const submit = (text) =>
+    req("POST", `/internal/core/personas/${personaId}/inputs`, ptoken, {
+      input_id: `in-${randomUUID()}`,
+      kind: "message",
+      payload: { text },
+      actor_kind: "human",
+      actor_id: "e2e",
+      source_surface: "e2e",
+    });
+  const events = () =>
+    req(
+      "GET",
+      `/internal/core/personas/${personaId}/events?after_seq=0`,
+      ptoken,
+    ).then((r) => r.json.events);
+  const outboxFor = async (inputId) =>
+    (
+      await req(
+        "GET",
+        `/internal/core/personas/${personaId}/outbox?after_seq=0`,
+        ptoken,
+      )
+    ).json.outbox.filter((o) => o.payload.input_id === inputId);
+  const noteTexts = async () =>
+    (await events())
+      .filter((e) => e.kind === "note")
+      .map((e) => e.payload.text);
+
+  // --- scenario 1: decision A persisted → kill after effect → plan B provider
+  //     is never consulted; A continues exactly once -------------------------
+  log("scenario 1: kill after first effect; replacement provider must not run");
+  const in1 = (await submit("input-one")).json.input.input_id;
+  const scriptA = JSON.stringify({
+    text: "reply-A",
+    calls: [
+      { tool: "journal.note", request: { text: "note-A0" } },
+      { tool: "journal.note", request: { text: "note-A1" } },
+    ],
+  });
+  runChild({ SUMI_SCRIPT: scriptA, SUMI_DIE_AFTER_CLAIMS: "1" }, 9);
+  assert(
+    (await noteTexts()).filter((t) => t === "note-A0").length === 1,
+    "position-0 effect must have committed before the kill",
+  );
+
+  const out2 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply-B",
+      calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+    }),
+    SUMI_SPOOF_CLAIM: "1",
+  });
+  assert(
+    !out2.includes("MODEL CONSULTED"),
+    "retry consulted the model despite a recorded plan",
+    out2,
+  );
+  // The agreed boundary explicitly rejects a supplied legacy
+  // idempotency_key (400 via DisallowUnknownFields): one effect or nothing.
+  assert(
+    out2.includes("spoofed claim -> status=400"),
+    "legacy idempotency_key spoof was not explicitly rejected",
+    out2,
+  );
+  const notes1 = await noteTexts();
+  assert(
+    notes1.filter((t) => t === "note-A0").length === 1 &&
+      notes1.filter((t) => t === "note-A1").length === 1,
+    `plan A must continue exactly once; got notes ${JSON.stringify(notes1)}`,
+  );
+  assert(
+    !notes1.includes("note-B0"),
+    "plan B executed — the recorded plan was bypassed",
+  );
+  const replies1 = await outboxFor(in1);
+  assert(replies1.length === 1, `expected 1 reply, got ${replies1.length}`);
+  assert(
+    replies1[0].payload.output.text === "reply-A",
+    `committed ${replies1[0].payload.output.text}, expected reply-A`,
+  );
+  log("  plan A continued; B never consulted; effects exactly once");
+
+  // --- scenario 2: lost savePlan/claim responses resend identically ---------
+  log("scenario 2: lost plan-save and claim responses replay identically");
+  const in2 = (await submit("input-two")).json.input.input_id;
+  const out3 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply-C",
+      calls: [{ tool: "journal.note", request: { text: "note-C" } }],
+    }),
+    SUMI_RESEND_PLAN: "1",
+    SUMI_RESEND_CLAIM: "1",
+  });
+  assert(
+    out3.includes("plan resend -> created=false"),
+    "savePlan resend did not return the stored plan",
+  );
+  assert(
+    out3.includes("claim resend -> fresh=false"),
+    "claim resend did not replay the stored receipt",
+  );
+  assert(
+    (await noteTexts()).filter((t) => t === "note-C").length === 1,
+    "lost responses must not duplicate the effect",
+  );
+  assert(
+    (await outboxFor(in2)).length === 1,
+    "expected exactly one committed turn",
+  );
+  log("  plan-save + claim resends replayed; one effect, one commit");
+
+  // --- scenario 3: zero-call plan survives a crash before commit ------------
+  log("scenario 3: zero-call plan replayed without the model after kill");
+  const in3 = (await submit("input-three")).json.input.input_id;
+  runChild(
+    {
+      SUMI_SCRIPT: JSON.stringify({ text: "reply-D", calls: [] }),
+      SUMI_DIE_BEFORE_COMMIT: "1",
+    },
+    9,
+  );
+  const out4 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply-E",
+      calls: [{ tool: "journal.note", request: { text: "note-E" } }],
+    }),
+  });
+  assert(
+    !out4.includes("MODEL CONSULTED"),
+    "zero-call plan retry consulted the model",
+  );
+  const replies3 = await outboxFor(in3);
+  assert(
+    replies3.length === 1 && replies3[0].payload.output.text === "reply-D",
+    "recorded zero-call decision must commit its own text",
+  );
+  assert(
+    !(await noteTexts()).includes("note-E"),
+    "replacement plan must not execute",
+  );
+  log("  zero-call decision replayed verbatim");
+
+  // --- scenario 4: deterministic bad tool data resolves honestly ----------
+  // CR3-B1: a decision that can never persist must fail the input
+  // non-retryable — recorded, observable, and never blocking later inputs.
+  log("scenario 4: deterministic bad tool data resolves; queue unblocked");
+  const in4 = (await submit("input-four")).json.input.input_id;
+  const out5 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply",
+      calls: [{ tool: "journal.note", request: { text: "a\u0000b" } }],
+    }),
+  });
+  assert(
+    out5.includes("turn failed on plan divergence"),
+    "NUL decision was not recorded as a non-retryable failure",
+    out5,
+  );
+  const in4State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in4}`,
+    ptoken,
+  );
+  assert(
+    in4State.json?.input?.status === "done",
+    `poisoned input must resolve (done), got ${in4State.text}`,
+  );
+  // The queue is unblocked: a later normal input completes on the same
+  // persona with no residue from the failed decision.
+  const in5 = (await submit("input-five")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reply-F",
+      calls: [{ tool: "journal.note", request: { text: "note-F" } }],
+    }),
+  });
+  const replies5 = await outboxFor(in5);
+  assert(
+    replies5.length === 1 &&
+      replies5[0].payload.output.text === "reply-F" &&
+      (await noteTexts()).includes("note-F"),
+    "the input after a poisoned decision must complete normally",
+  );
+  log("  NUL decision failed non-retryable; next input completed");
+
+  // CR3-B1 (claim side): a plan-valid but semantically invalid argument is
+  // a recorded tool error, and the turn commits — not a retried 500.
+  const in6 = (await submit("input-six")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "scheduling",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            wake_at: "2030-01-01T00:00:00Z",
+            miss_policy: "bogus",
+          },
+        },
+      ],
+    }),
+  });
+  const evs6 = await events();
+  const toolErr = evs6.find(
+    (e) => e.kind === "tool_result" && /miss_policy/.test(e.payload.error ?? ""),
+  );
+  assert(toolErr, "invalid miss_policy must surface as a tool_result error");
+  const in6State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in6}`,
+    ptoken,
+  );
+  assert(
+    in6State.json?.input?.status === "done",
+    `bad-policy input must resolve (done), got ${in6State.text}`,
+  );
+  log("  invalid miss_policy recorded as a tool error; input resolved");
+
+  // CR3-B2: a second schedule.set reusing an id must not report a stale
+  // success — different contents are an explicit tool error.
+  const in7 = (await submit("input-seven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reminder set",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            schedule_id: "rem-e2e",
+            wake_at: "2030-01-01T00:00:00Z",
+            payload: { text: "first" },
+            miss_policy: "coalesce",
+          },
+        },
+      ],
+    }),
+  });
+  const evs7 = await events();
+  assert(
+    evs7.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        e.payload.response?.schedule?.schedule_id === "rem-e2e",
+    ),
+    "initial schedule.set did not commit",
+  );
+  const in8 = (await submit("input-eight")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      text: "reminder again",
+      calls: [
+        {
+          tool: "schedule.set",
+          request: {
+            schedule_id: "rem-e2e",
+            wake_at: "2031-06-01T00:00:00Z",
+            payload: { text: "different" },
+            miss_policy: "coalesce",
+          },
+        },
+      ],
+    }),
+  });
+  const evs8 = await events();
+  assert(
+    evs8.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        /already exists with different contents/.test(e.payload.error ?? ""),
+    ),
+    "conflicting schedule_id reuse must be an explicit tool error",
+  );
+  const in8State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in8}`,
+    ptoken,
+  );
+  assert(
+    in8State.json?.input?.status === "done",
+    `conflicting-reuse input must resolve (done), got ${in8State.text}`,
+  );
+  log("  schedule_id reuse with different contents is an honest error");
+
+  // --- scenario 5: failure disposition -------------------------------------
+  // Fresh-review F1: an un-storable commit payload (provider error text
+  // containing NUL — jsonb rejects it) is scrubbed and committed as an
+  // honest retryable failure, never a running-turn poison loop.
+  // Fresh-review F2: the retryable requeue carries per-attempt backoff —
+  // a permanently failing input cannot hot-loop or starve later queued
+  // inputs, and an ordinary transient failure still recovers.
+  log("scenario 5: un-storable commit resolves; retryable requeue is bounded and fair");
+  const in9 = (await submit("input-nine")).json.input.input_id;
+  const in10 = (await submit("input-ten")).json.input.input_id;
+  const attemptsOf = async (id) =>
+    (await events()).filter(
+      (e) => e.kind === "input_received" && e.payload.input_id === id,
+    ).length;
+  // A provider that always throws — with an un-storable NUL in the error
+  // text — stresses both blockers at once.
+  const storm = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throw: "provider exploded \u0000" }),
+  });
+  assert(
+    storm.includes("turn committed as scrubbed failure") ||
+      storm.includes("turn failed at model"),
+    "the un-storable commit did not resolve via the scrubbed path",
+    storm,
+  );
+  const [a9, a10] = [await attemptsOf(in9), await attemptsOf(in10)];
+  assert(
+    a9 >= 2 && a9 <= 15,
+    `failing input must retry but stay bounded by backoff, got ${a9} attempts (pre-fix: ~32/s)`,
+  );
+  assert(
+    a10 >= 1,
+    `later queued input starved behind the failing one: ${a10} attempts`,
+  );
+  // Both inputs remain honestly queued — retried, not fabricated or dropped.
+  for (const id of [in9, in10]) {
+    const st = await req(
+      "GET",
+      `/internal/core/personas/${personaId}/inputs/${id}`,
+      ptoken,
+    );
+    assert(
+      st.json?.input?.status === "queued",
+      `input ${id} must remain queued for retry, got ${st.text}`,
+    );
+  }
+  // The provider recovering unblocks both — ordinary transient failure
+  // still completes.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-G", calls: [] }),
+  });
+  for (const id of [in9, in10]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-G",
+      `input ${id} must complete after the provider recovers`,
+    );
+  }
+  log("  bounded retryable backoff; queue fair; transient failure recovered");
+
+  // --- scenario 6: >body-limit commit still finalizes (F-B1) ----------
+  // A commit payload over the server's 1 MiB body limit used to defeat
+  // every commitTurnFinal tier when `error` itself was huge: three 400s,
+  // child exit 1, input claimed forever, each recovery cycle re-claiming
+  // the same oldest input before any later queued work — head-of-line
+  // starvation at process cadence. The recorded failure must be bounded.
+  //
+  // 6a — oversized *complete* commit: a ~840 KB reply keeps savePlan
+  // under the 1 MiB limit, but the commit body (assistant_message event
+  // + output) doubles past it → 400 "read body" → the scrubbed tier
+  // lands with a bounded honest error. The turn is observably failed —
+  // not fabricated — and the input resolves.
+  log("scenario 6: >1MiB commit resolves bounded; queue proceeds");
+  const in11 = (await submit("input-eleven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ textSize: 140_000 }), // ~840 KB reply
+  });
+  const st11 = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in11}`,
+    ptoken,
+  );
+  assert(
+    st11.json?.input?.status === "done",
+    `oversized complete must resolve the input, got ${st11.text}`,
+  );
+  const recErr = st11.json?.turn?.error ?? "";
+  assert(
+    st11.json?.turn?.status === "failed" &&
+      recErr.includes("commit rejected deterministically") &&
+      recErr.includes("read body") &&
+      recErr.length < 20_000,
+    `recorded failure must be bounded and honest, got: ${recErr.slice(0, 200)}`,
+  );
+  assert(
+    (await outboxFor(in11)).length === 0,
+    "no fabricated reply for an un-storable completion",
+  );
+  log("  oversized complete resolved via minimal commit; honest bounded error");
+
+  // 6b — oversized provider *error* (retryable): the error is bounded at
+  // the source before the first upload, so the retryable failure commits
+  // on tier 1 — honest, backoff-bounded, and fair to later queued work.
+  const in12 = (await submit("input-twelve")).json.input.input_id;
+  const in13 = (await submit("input-thirteen")).json.input.input_id;
+  const giant = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
+  });
+  assert(
+    giant.includes("turn failed at model"),
+    "the bounded oversized error must commit as an honest retryable failure",
+    giant,
+  );
+  const [b12, b13] = [await attemptsOf(in12), await attemptsOf(in13)];
+  assert(
+    b12 >= 1 && b12 <= 15,
+    `oversized-error input must retry bounded by backoff, got ${b12}`,
+  );
+  assert(
+    b13 >= 1,
+    `later input starved behind the oversized-error input: ${b13} attempts`,
+  );
+  for (const id of [in12, in13]) {
+    const st = await req(
+      "GET",
+      `/internal/core/personas/${personaId}/inputs/${id}`,
+      ptoken,
+    );
+    assert(
+      st.json?.input?.status === "queued",
+      `input ${id} stays honestly queued for retry, got ${st.text}`,
+    );
+  }
+  // The provider healing completes both, exactly once — the recorded
+  // failure was honest retry, not fabrication or a strand.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-H", calls: [] }),
+  });
+  for (const id of [in12, in13]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-H",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  oversized error recorded bounded; later input progressed; both recovered");
+
+  // --- scenario 7: near-limit input + transient error keeps retryable --
+  // Opus F1/F2: when the input_received event alone (~1.04 MB) pushes
+  // every event-carrying commit tier over the body limit, only the
+  // minimal commit can land. That tier must still preserve a retryable
+  // disposition — a transient provider error on a near-limit message is
+  // not a terminal failure — and the record keeps both server rejection
+  // reasons ahead of the bounded detail.
+  log("scenario 7: near-limit input + transient error still retries");
+  const bigText = "x".repeat(1_042_000); // ~1.02 MiB — accepted at submit
+  const sub14 = await req(
+    "POST",
+    `/internal/core/personas/${personaId}/inputs`,
+    ptoken,
+    {
+      input_id: `in-${randomUUID()}`,
+      kind: "message",
+      payload: { text: bigText },
+      actor_kind: "human",
+      actor_id: "e2e",
+      source_surface: "e2e",
+    },
+  );
+  assert(sub14.status === 201, `near-limit submit ${sub14.status}`);
+  const in14 = sub14.json.input.input_id;
+  const in15 = (await submit("input-fifteen")).json.input.input_id;
+  const near = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 4_000 }), // ~24 KB error
+  });
+  assert(
+    near.includes("turn failed at model"),
+    "transient error should be recorded",
+    near,
+  );
+  // in14 is honestly queued for retry — the minimal tier kept retryable.
+  // If the disposition had been dropped it would read `done` + failed.
+  const st14 = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in14}`,
+    ptoken,
+  );
+  assert(
+    st14.json?.input?.status === "queued",
+    `near-limit input must stay queued for retry after minimal-tier commit, got ${st14.text}`,
+  );
+  assert(
+    (await attemptsOf(in15)) >= 1,
+    "later input must progress during the near-limit input's backoff",
+  );
+  // Provider heals: both complete, exactly once.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-I", calls: [] }),
+  });
+  for (const id of [in14, in15]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-I",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  minimal-tier commit kept retryable; near-limit input recovered");
+
+  svc.kill("SIGKILL");
+  log("PASS — durable-plan scenarios green on real PG + real Go + real Node");
+}

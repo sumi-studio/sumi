@@ -64,6 +64,11 @@ test("the browser API, private transports, service worker, and SPA have distinct
     "/agent/ws",
     "/agent/ws/",
     "/health/more",
+    "/internal",
+    "/internal/core/personas",
+    "/internal/core/personas/0198f3aa-1111-7222-8333-444455556666/state",
+    "/internal/providers/api/access",
+    "/internal%252Fcore%252Fpersonas",
     "/local-control/v1",
     "/local-control/v1/messaging:open",
     "/ready",
@@ -115,6 +120,8 @@ test("the browser API, private transports, service worker, and SPA have distinct
     "/c/0198f3aa-1111-7222-8333-444455556666",
     "/unknown-api",
     "/agent/future-browser-operation",
+    "/internal-core",
+    "/internalized",
   ]) {
     assert.equal(classifyPath(path), "navigation", path);
   }
@@ -257,6 +264,11 @@ test("private surfaces are explicit 404s and call neither origin nor assets", as
   for (const path of [
     "/agent/ws",
     "/agent/ws/child",
+    "/internal",
+    "/internal/core/personas",
+    "/internal/core/personas/0198f3aa-1111-7222-8333-444455556666/writer/acquire",
+    "/internal/providers/chatgpt/access",
+    "/internal%252Fcore%252Fpersonas",
     "/local-control/v1/runtime-state:publish",
     "/ready",
     "/ready/details",
@@ -508,9 +520,15 @@ test("every production API registration has an explicit edge disposition", async
   );
   for (const route of discovery.routes) {
     const path = route.pattern.slice(route.pattern.indexOf(" ") + 1);
+    // Server-only surfaces stay private at the front door: the
+    // local-control transport, the readiness probe, the agent WebSocket,
+    // and the /internal/* state/provider namespace the secretary core
+    // reaches through its own service URL rather than this edge.
     const expected =
       path === "/agent/ws" ||
       path === "/ready" ||
+      path === "/internal" ||
+      path.startsWith("/internal/") ||
       path.startsWith("/local-control/v1/")
         ? "deny"
         : "origin";
