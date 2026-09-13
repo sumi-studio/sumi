@@ -1,0 +1,109 @@
+openapi: 3.1.0
+info:
+  title: Sumi Files API (fabric-cloud prototype)
+  version: 0.1.0
+  description: >-
+    Scoped file API over one canonical POSIX namespace. Implemented by
+    apps/files (filesvc). Auth is bearer token -> scope grants; each scope is
+    an isolated subtree root/<scope>/. Mutations take an If-Version header:
+    "any" (unconditional), "none" (create-only; 409 if the path exists or has
+    a service version), or an integer (CAS against the last service-minted
+    version). Service versions are cooperative among API writers; direct
+    executor/POSIX writes bypass them and are reported via external_change.
+paths:
+  /v1/files/{scope}/stat:
+    get:
+      operationId: fileStat
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: kind, size, mtime_ns, version, fingerprint, external_change
+        '403': { description: No grant for scope, or path escapes scope }
+        '404': { description: Path not found }
+        '503': { description: Namespace root not mounted (mount_unavailable) }
+  /v1/files/{scope}/list:
+    get:
+      operationId: fileList
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: entries[] (name, kind, size, mtime_ns), next_cursor }
+        '400': { description: Path is not a directory }
+        '404': { description: Path not found }
+  /v1/files/{scope}/read:
+    get:
+      operationId: fileRead
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: offset, in: query, schema: { type: integer } }
+        - { name: len, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: >-
+            File bytes. X-File-Version carries the last service-minted
+            version; X-External-Change: true marks content changed outside
+            the API since that version.
+        '400': { description: Path is a directory }
+        '404': { description: Path not found }
+  /v1/files/{scope}/write:
+    put:
+      operationId: fileWrite
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ "version": n }' }
+        '409': { description: version_conflict }
+        '413': { description: Body exceeds the 256 MiB service ceiling }
+        '503': { description: mount_unavailable }
+  /v1/files/{scope}/rename:
+    post:
+      operationId: fileRename
+      description: >-
+        JSON body { "from": "...", "to": "...", "if_version": any|none|n }.
+        Atomic within the same scope.
+      responses:
+        '200': { description: '{ "version": n }' }
+        '404': { description: Source not found }
+        '409': { description: version_conflict }
+  /v1/files/{scope}/mkdir:
+    post:
+      operationId: fileMkdir
+      description: 'JSON body { "path": "..." }; creates parents.'
+      responses:
+        '200': { description: '{ "version": n }' }
+  /v1/files/{scope}/remove:
+    delete:
+      operationId: fileRemove
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ "removed": true }' }
+        '404': { description: Path not found }
+        '409': { description: version_conflict }
+  /v1/files/{scope}/changes:
+    get:
+      operationId: fileChanges
+      description: >-
+        Service-minted mutation journal (seq, op, path, version, at). Only
+        API-mediated mutations are journaled; direct executor writes are not.
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 5000 } }
+      responses:
+        '200': { description: events[] ordered by seq }
+components:
+  securitySchemes:
+    bearerScope:
+      type: http
+      scheme: bearer
+security:
+  - bearerScope: []
