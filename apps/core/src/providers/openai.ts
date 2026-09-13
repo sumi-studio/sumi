@@ -44,6 +44,7 @@ export class OpenAIProvider implements ModelProvider {
         body: JSON.stringify({
           model: this.cfg.model,
           stream: true,
+          stream_options: { include_usage: true },
           messages: request.messages.map((m) => ({
             role: m.role,
             content: m.content,

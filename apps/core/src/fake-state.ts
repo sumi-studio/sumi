@@ -1,4 +1,5 @@
-import type { StateClient } from "./state-client.ts";
+import { jsonEqual } from "./json.ts";
+import { FencedError, StateError, type StateClient } from "./state-client.ts";
 import type {
   CommitRequest,
   Event,
@@ -24,13 +25,18 @@ export class FakeState implements StateClient {
     string,
     { human_id: string | null; display_name: string; created_at: string }
   >();
-  lease: WriterLease | null = null;
+  /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
+  leases = new Map<string, WriterLease>();
+  /** Monotonic fencing generation per persona; never recycled. */
+  private generations = new Map<string, number>();
   inputs: Input[] = [];
   turns = new Map<string, Turn>();
   eventLog: Event[] = [];
   ops = new Map<string, Operation>(); // key: persona|tool|idem
   schedules = new Map<string, Schedule>();
   outboxEntries: OutboxEntry[] = [];
+  /** First commit request per turn — replay comparison (commit_request). */
+  private commits = new Map<string, CommitRequest>();
   private seq = 0;
   private outboxSeq = 0;
 
@@ -39,12 +45,9 @@ export class FakeState implements StateClient {
   }
 
   private mustHold(persona: string, generation: number) {
-    if (
-      !this.lease ||
-      this.lease.persona_id !== persona ||
-      this.lease.generation !== generation
-    ) {
-      throw new Error("writer generation fenced");
+    const lease = this.leases.get(persona);
+    if (!lease || lease.generation !== generation) {
+      throw new FencedError();
     }
   }
 
@@ -82,17 +85,26 @@ export class FakeState implements StateClient {
     ttlMs: number,
   ): Promise<WriterLease> {
     const now = Date.now();
-    if (this.lease && new Date(this.lease.expires_at).getTime() > now) {
-      throw new Error("writer lease already held");
+    const held = this.leases.get(persona);
+    // Same contract as the Go upsert: an unexpired lease blocks other
+    // holders, while the same holder re-acquires and bumps the generation.
+    if (
+      held &&
+      new Date(held.expires_at).getTime() > now &&
+      held.holder_id !== holder
+    ) {
+      throw new StateError(409, "writer lease held by another live holder");
     }
-    this.lease = {
+    const lease: WriterLease = {
       persona_id: persona,
-      generation: (this.lease?.generation ?? 0) + 1,
+      generation: (this.generations.get(persona) ?? 0) + 1,
       holder_id: holder,
       acquired_at: new Date(now).toISOString(),
       expires_at: new Date(now + ttlMs).toISOString(),
     };
-    return this.lease;
+    this.generations.set(persona, lease.generation);
+    this.leases.set(persona, lease);
+    return lease;
   }
 
   async renewWriter(
@@ -101,15 +113,16 @@ export class FakeState implements StateClient {
     generation: number,
     ttlMs: number,
   ): Promise<WriterLease> {
-    this.mustHold(persona, generation);
-    const held = this.lease;
-    if (!held || held.holder_id !== holder)
-      throw new Error("writer lease held by another holder");
-    this.lease = {
+    const held = this.leases.get(persona);
+    if (!held || held.generation !== generation || held.holder_id !== holder) {
+      throw new FencedError();
+    }
+    const lease = {
       ...held,
       expires_at: new Date(Date.now() + ttlMs).toISOString(),
     };
-    return this.lease;
+    this.leases.set(persona, lease);
+    return lease;
   }
 
   async releaseWriter(
@@ -117,13 +130,17 @@ export class FakeState implements StateClient {
     holder: string,
     generation: number,
   ): Promise<void> {
-    if (
-      this.lease?.persona_id === persona &&
-      this.lease.holder_id === holder &&
-      this.lease.generation === generation
-    ) {
-      this.lease = null;
+    // Never delete the row: generations are fencing tokens and must stay
+    // monotonic. Release = expire in place; the next acquire bumps the
+    // generation even for the same holder.
+    const held = this.leases.get(persona);
+    if (!held || held.holder_id !== holder || held.generation !== generation) {
+      throw new FencedError();
     }
+    this.leases.set(persona, {
+      ...held,
+      expires_at: new Date(Date.now() - 1).toISOString(),
+    });
   }
 
   async recover(persona: string, generation: number): Promise<RecoverResult> {
@@ -165,6 +182,25 @@ export class FakeState implements StateClient {
     contextLimit: number,
   ): Promise<LoadResult> {
     this.mustHold(persona, generation);
+    // A running turn under another generation must be recovered first; under
+    // ours it is a lost load response — return the same turn (Go LoadTurn).
+    const running = [...this.turns.values()].find(
+      (t) => t.persona_id === persona && t.status === "running",
+    );
+    if (running) {
+      if (running.generation !== generation) {
+        throw new StateError(409, "conflicting turn state");
+      }
+      const input = this.inputs.find((i) => i.input_id === running.input_id);
+      if (!input) throw new Error("running turn input missing");
+      return {
+        turn: running,
+        input,
+        context: this.eventLog
+          .filter((e) => e.persona_id === persona)
+          .slice(-contextLimit),
+      };
+    }
     const input = this.inputs.find(
       (i) => i.persona_id === persona && i.status === "queued",
     );
@@ -206,7 +242,15 @@ export class FakeState implements StateClient {
     this.mustHold(persona, generation);
     const turn = this.turns.get(turnId);
     if (!turn || turn.persona_id !== persona) throw new Error("unknown turn");
-    if (turn.status !== "running") return turn; // replay: durable result already stands
+    if (turn.status !== "running") {
+      // Replay: an identical commit returns the stored result; a divergent
+      // one conflicts (Go commit_request comparison, migration 47+).
+      const stored = this.commits.get(turnId);
+      if (stored && !jsonEqual(stored, req)) {
+        throw new StateError(409, "conflicting turn state");
+      }
+      return turn;
+    }
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -250,6 +294,7 @@ export class FakeState implements StateClient {
       }
     }
     turn.finished_at = new Date().toISOString();
+    this.commits.set(turnId, req);
     return turn;
   }
 
@@ -277,10 +322,23 @@ export class FakeState implements StateClient {
     this.mustHold(persona, generation);
     const k = this.key(persona, op.tool, op.idempotencyKey);
     const existing = this.ops.get(k);
-    if (existing) return { operation: existing, fresh: false };
-    if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
-      throw new Error(`unsupported tool: ${op.tool}`);
+    if (existing) {
+      // Same key, different request → conflict (Go B2 fix → ErrTurnConflict).
+      if (!jsonEqual(existing.request, op.request)) {
+        throw new StateError(409, "conflicting turn state");
+      }
+      // A running op claimed by a fenced generation is reclaimed for
+      // re-execution (external tools; internal tools can't stay running).
+      if (existing.status === "running" && existing.claimed_generation !== generation) {
+        existing.claimed_generation = generation;
+        existing.turn_id = op.turnId;
+        return { operation: existing, fresh: true };
+      }
+      return { operation: existing, fresh: false };
     }
+    // Unknown tools are claimable and left running, matching the Go store —
+    // the core's running-op branch records the failure.
+    const internal = op.tool === "schedule.set" || op.tool === "journal.note";
     const operation: Operation = {
       persona_id: persona,
       operation_id: op.operationId,
@@ -288,11 +346,11 @@ export class FakeState implements StateClient {
       tool: op.tool,
       idempotency_key: op.idempotencyKey,
       request: op.request,
-      status: "done",
+      status: internal ? "done" : "running",
       response: null,
       claimed_generation: generation,
       created_at: new Date().toISOString(),
-      completed_at: new Date().toISOString(),
+      completed_at: internal ? new Date().toISOString() : null,
     };
     if (op.tool === "schedule.set") {
       const sid = (op.request.schedule_id as string) ?? `sch-${Date.now()}`;
@@ -335,6 +393,10 @@ export class FakeState implements StateClient {
     this.mustHold(persona, generation);
     for (const op of this.ops.values()) {
       if (op.persona_id === persona && op.operation_id === operationId) {
+        // Go: only the claiming generation may finish a running op; an
+        // already-final op replays its stored record.
+        if (op.status !== "running") return op;
+        if (op.claimed_generation !== generation) throw new FencedError();
         op.status = failed ? "failed" : "done";
         op.response = response;
         op.completed_at = new Date().toISOString();
@@ -406,7 +468,7 @@ export class FakeState implements StateClient {
     );
     return {
       persona: { persona_id: persona, ...p },
-      lease: this.lease?.persona_id === persona ? this.lease : null,
+      lease: this.leases.get(persona) ?? null,
       queued_inputs: this.inputs.filter(
         (i) => i.persona_id === persona && i.status === "queued",
       ).length,

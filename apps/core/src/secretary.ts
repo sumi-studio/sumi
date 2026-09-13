@@ -1,5 +1,6 @@
+import { jsonEqual } from "./json.ts";
 import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
-import { FencedError, type StateClient } from "./state-client.ts";
+import { FencedError, StateError, type StateClient } from "./state-client.ts";
 import { toolSpecs } from "./tools.ts";
 import type { Event, Input, Turn, WriterLease } from "./types.ts";
 
@@ -34,11 +35,22 @@ export type StepResult = "turn" | "idle" | "stopped";
  * claims, atomic internal tool effects, durable results before success is
  * observable. This class holds no canonical state — killing it at any point
  * is safe; the next generation recovers.
+ *
+ * Crash-safety scope: a retried turn replays committed tool effects by
+ * (persona, tool, `input_id:tool:N`) idempotency key. That is exactly-once
+ * only while the retried model emits the same plan (true for the
+ * deterministic mock, NOT guaranteed for a real provider). A retried call
+ * whose request differs from the stored receipt is detected here and fails
+ * the turn loudly rather than double-executing or returning another call's
+ * result; durable plan recovery (replay the recorded plan instead of
+ * re-planning) is the pending contract extension — see the F1 proposal in
+ * the alpha kickoff artifacts.
  */
 export class Secretary {
   private lease: WriterLease | null = null;
   private running = false;
   private inFlight: AbortController | null = null;
+  private lastDispatch = 0;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -71,8 +83,12 @@ export class Secretary {
     const gen = this.lease.generation;
     const { state, personaId } = this.cfg;
     try {
-      const fired = await state.dispatchSchedules(personaId, gen, new Date());
-      if (fired.length) this.log("schedules fired", { count: fired.length });
+      const now = Date.now();
+      if (now - this.lastDispatch >= this.cfg.scheduleEveryMs) {
+        this.lastDispatch = now;
+        const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
+        if (fired.length) this.log("schedules fired", { count: fired.length });
+      }
       const turnId = this.cfg.idgen();
       const { turn, input, context } = await state.loadTurn(
         personaId,
@@ -227,22 +243,47 @@ export class Secretary {
         });
       } catch (e) {
         if (e instanceof FencedError) throw e;
-        // Unsupported/rejected tool: record the failure as the tool result
-        // rather than abandoning the whole turn.
         const msg = e instanceof Error ? e.message : String(e);
-        results.push({
-          tool: call.name,
-          call_id: call.id,
-          result: { error: msg },
-          replayed: false,
-        });
-        events.push({
-          kind: "tool_result",
-          payload: { tool: call.name, call_id: call.id, error: msg },
-        });
-        continue;
+        if (e instanceof StateError && (e.status === 400 || e.status === 422)) {
+          // Definite rejection (bad request / unsupported tool): record it as
+          // the tool result rather than abandoning the whole turn.
+          results.push({
+            tool: call.name,
+            call_id: call.id,
+            result: { error: msg },
+            replayed: false,
+          });
+          events.push({
+            kind: "tool_result",
+            payload: { tool: call.name, call_id: call.id, error: msg },
+          });
+          continue;
+        }
+        if (e instanceof StateError && e.status === 409) {
+          // The idempotency key is taken by a different request: a committed
+          // effect and this retry's plan diverge. Fail loudly — replaying the
+          // stored receipt or re-executing would both be wrong.
+          await this.failDivergent(turn, events, msg);
+          return;
+        }
+        // Anything else (5xx, network, auth outage) is transient: leave the
+        // turn running for a future generation to recover and retry.
+        throw e;
       }
       const { operation, fresh } = claim;
+      if (!fresh && !jsonEqual(operation.request, call.arguments)) {
+        // The stored receipt answers a different request than this retry
+        // emitted — the model changed its plan after an effect committed.
+        // Same loud-failure path as a 409 claim conflict. (The Go boundary is
+        // being changed to reject this at claim time; this client-side check
+        // keeps the guarantee on a store that still replays silently.)
+        await this.failDivergent(
+          turn,
+          events,
+          `${call.name} request differs from committed operation ${operation.operation_id}`,
+        );
+        return;
+      }
       if (operation.status === "running") {
         // A prior attempt crashed after claiming but before the receipt was
         // recorded. For internal tools this cannot happen (effect+receipt are
@@ -300,6 +341,35 @@ export class Secretary {
       tools: calls.length,
     });
   }
+
+  /**
+   * A retried turn emitted a plan that conflicts with an already-committed
+   * operation. Commit a non-retryable failure: the input is done, the journal
+   * keeps the events so far, and the turn row records why — no fabricated
+   * tool result, no poison requeue loop, no duplicate effect. The durable
+   * plan contract (F1 proposal) removes the divergence class entirely.
+   */
+  private async failDivergent(
+    turn: Turn,
+    events: { kind: string; payload: Record<string, unknown> }[],
+    msg: string,
+  ): Promise<void> {
+    await this.cfg.state.commitTurn(
+      this.cfg.personaId,
+      turn.turn_id,
+      turn.generation,
+      {
+        outcome: "fail",
+        retryable: false,
+        error: `diverged retry conflicts with committed operation: ${msg}`,
+        events,
+      },
+    );
+    this.log("turn failed on plan divergence", {
+      turn_id: turn.turn_id,
+      error: msg,
+    });
+  }
 }
 
 const SYSTEM =
@@ -334,11 +404,15 @@ export function assemble(context: Event[], input: Input): ChatMessage[] {
         });
         break;
       case "tool_result":
+        // Flattened to assistant text: a bare role:"tool" message with no
+        // preceding assistant tool_calls is rejected by chat-completions
+        // providers. The journal keeps the structured record; the model gets
+        // the result inline.
         messages.push({
-          role: "tool",
-          toolCallId: String(p.call_id ?? ""),
-          name: String(p.tool ?? ""),
-          content: JSON.stringify(p.response ?? {}),
+          role: "assistant",
+          content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
+            p.response ?? (p.error ? { error: p.error } : {}),
+          )}`,
         });
         break;
       default:

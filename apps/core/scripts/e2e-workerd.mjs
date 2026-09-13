@@ -8,6 +8,11 @@
  * outbox reply observed via the state API. Proves the workerd host adapter
  * runs the shared core end-to-end against canonical PG state.
  *
+ * Additional scenarios: (2) an ordinary duplicate wake during a turn is
+ * coalesced, not a second writer — the input completes exactly once with no
+ * third manual wake; (3) a schedule.set wake fires via the DO heartbeat
+ * alarm with NO further fetches — real local alarm evidence.
+ *
  * Requires SUMI_TEST_DB_URL. Offline: wrangler dev is local-only.
  *   node scripts/e2e-workerd.mjs
  */
@@ -138,6 +143,10 @@ worker = spawn(
     `SUMI_STATE_URL:${STATE}`,
     "--var",
     `SUMI_PERSONA_TOKEN_${personaId.replaceAll("-", "_")}:${ptoken}`,
+    "--var",
+    // Short heartbeat so the alarm-driven schedule scenario is exercised
+    // quickly; production default stays 30s.
+    "SUMI_HEARTBEAT_MS:1000",
     "--show-interactive-dev-session=false",
   ],
   {
@@ -208,6 +217,128 @@ assert(
 );
 log("reply:", reply.payload.output.text);
 log("journal note:", note.payload.text);
+
+// --- scenario 2: duplicate wake during a turn is coalesced ----------------
+// A second POST /wake while a turn is in flight must not spawn a parallel
+// drain that fences the first writer. The input completes exactly once with
+// no third manual wake.
+log("scenario 2: duplicate wake during a turn");
+const dup = await sreq(
+  "POST",
+  `/internal/core/personas/${personaId}/inputs`,
+  ptoken,
+  {
+    input_id: `in-${randomUUID()}`,
+    kind: "message",
+    payload: { text: "!slow 4000 slow reply" },
+    actor_kind: "human",
+    actor_id: "e2e-w",
+    source_surface: "workerd-e2e",
+  },
+);
+assert(dup.status === 201, `submitInput dup ${dup.status}`);
+const w1 = await fetch(`${WORKER}/personas/${personaId}/wake`, {
+  method: "POST",
+});
+assert(w1.ok, `wake1 ${w1.status}`);
+await new Promise((r) => setTimeout(r, 400)); // first drain is mid-turn
+const w2 = await fetch(`${WORKER}/personas/${personaId}/wake`, {
+  method: "POST",
+});
+assert(w2.ok, `wake2 ${w2.status}`);
+const w2body = await w2.json();
+assert(
+  w2body.coalesced === true,
+  `second wake should coalesce into the running drain: ${JSON.stringify(w2body)}`,
+);
+let dupReply = null;
+for (let i = 0; i < 60; i++) {
+  await new Promise((r) => setTimeout(r, 500));
+  const ob = await sreq(
+    "GET",
+    `/internal/core/personas/${personaId}/outbox?after_seq=0`,
+    ptoken,
+  );
+  const found = (ob.json?.outbox ?? []).find(
+    (o) => o.payload?.input_id === dup.json.input.input_id,
+  );
+  if (found) {
+    dupReply = found;
+    break;
+  }
+}
+assert(
+  dupReply,
+  "duplicated wake stranded the input — needed a third manual wake (F2)",
+);
+const dupReplies = (
+  await sreq(
+    "GET",
+    `/internal/core/personas/${personaId}/outbox?after_seq=0`,
+    ptoken,
+  )
+).json.outbox.filter((o) => o.payload?.input_id === dup.json.input.input_id);
+assert(
+  dupReplies.length === 1,
+  `expected exactly-once reply for duplicated wake, got ${dupReplies.length}`,
+);
+log("  duplicate wake coalesced; input completed exactly once");
+
+// --- scenario 3: schedule fires via the DO heartbeat alarm ----------------
+// schedule.set lands in PG; NO further fetches — the periodic DO alarm must
+// drain, dispatch the due schedule, and run the wake turn.
+log("scenario 3: alarm-driven schedule execution (no further wakes)");
+const sched = await sreq(
+  "POST",
+  `/internal/core/personas/${personaId}/inputs`,
+  ptoken,
+  {
+    input_id: `in-${randomUUID()}`,
+    kind: "message",
+    payload: {
+      text: `!schedule.set {"wake_at":"+200","payload":{"text":"woke by alarm"}}`,
+    },
+    actor_kind: "human",
+    actor_id: "e2e-w",
+    source_surface: "workerd-e2e",
+  },
+);
+assert(sched.status === 201, `submitInput sched ${sched.status}`);
+const w3 = await fetch(`${WORKER}/personas/${personaId}/wake`, {
+  method: "POST",
+});
+assert(w3.ok, `wake3 ${w3.status}`);
+
+let alarmReply = null;
+let wakeEvent = null;
+for (let i = 0; i < 60; i++) {
+  await new Promise((r) => setTimeout(r, 500));
+  const [ob, evs] = await Promise.all([
+    sreq(
+      "GET",
+      `/internal/core/personas/${personaId}/outbox?after_seq=0`,
+      ptoken,
+    ),
+    sreq(
+      "GET",
+      `/internal/core/personas/${personaId}/events?after_seq=0`,
+      ptoken,
+    ),
+  ]);
+  wakeEvent = (evs.json?.events ?? []).find(
+    (e) => e.kind === "input_received" && e.payload?.actor_kind === "schedule",
+  );
+  alarmReply = (ob.json?.outbox ?? []).find((o) =>
+    /woke by alarm/.test(JSON.stringify(o.payload ?? {})),
+  );
+  if (wakeEvent && alarmReply) break;
+}
+assert(
+  wakeEvent,
+  "no schedule-dispatched wake input — the DO alarm never fired (F3)",
+);
+assert(alarmReply, "scheduled wake input never produced an outbox reply");
+log("  heartbeat alarm drove the scheduled wake end-to-end");
 log("PASS — workerd DO ran the shared core against real Go+PG");
 cleanup();
 process.exit(0);

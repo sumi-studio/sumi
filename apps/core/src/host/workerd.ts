@@ -1,13 +1,26 @@
 /**
  * Cloud/workerd host: a Durable Object per persona that wakes the shared
- * core. Canonical state lives ONLY in PostgreSQL via the state service —
- * `ctx.storage` is deliberately unused (cache-only rule from progress.md).
- * Recovery after isolate loss = next alarm/fetch re-acquires the writer
- * lease and calls recover(); PG is the sole source of truth.
+ * core. Canonical state lives ONLY in PostgreSQL via the state service;
+ * `ctx.storage` holds routing/wakeup metadata only (the persona id and the
+ * DO's alarm) so an evicted instance can resume its own life — durable
+ * secretary state is never written here.
+ *
+ * Liveness: activating a persona arms a periodic heartbeat alarm
+ * (SUMI_HEARTBEAT_MS, default 30s). Each alarm drains pending work —
+ * including dispatching due schedules — and re-arms. A wake via fetch drains
+ * immediately and ensures the alarm exists. Honest scope: this is a fixed
+ * heartbeat per active persona, not next-due-wake scheduling; the state
+ * contract does not yet expose pending wake times.
+ *
+ * Concurrency: drains are serialized per DO instance. A wake arriving while
+ * a drain runs marks a re-drain instead of starting a parallel drain — two
+ * drains sharing one Secretary sabotaged each other (generation bump fenced
+ * the in-flight turn; the loser's stop() aborted the winner's stream).
  *
  * Env bindings (worker config):
  *   SUMI_STATE_URL    — base URL of the Go state service
  *   SUMI_MODEL_*      — provider config (same as local host)
+ *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
  *   SECRETARY         — Durable Object namespace binding
  * Persona capability tokens are provisioned per-persona via the admin
  * surface (POST /internal/core/personas) — the worker stores them in its
@@ -20,23 +33,32 @@ import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
 /** Minimal structural types — avoids a workers-types hard dependency. */
+interface DOStorage {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+  setAlarm(when: number): Promise<void>;
+  getAlarm(): Promise<number | null>;
+}
+
 interface AlarmState {
   waitUntil(promise: Promise<unknown>): void;
-  storage: {
-    setAlarm(when: number): Promise<void>;
-    getAlarm(): Promise<number | null>;
-  };
+  storage: DOStorage;
 }
 
 interface EnvLike {
   SUMI_STATE_URL: string;
   SUMI_MODEL_PROVIDER?: string;
+  SUMI_HEARTBEAT_MS?: string;
   SECRETARY: {
     idFromName(name: string): unknown;
     get(id: unknown): { fetch(req: Request): Promise<Response> };
   };
   [key: string]: unknown;
 }
+
+/** DO-storage key for the persona this object serves (routing metadata). */
+const PERSONA_KEY = "sumi/persona_id";
+const DEFAULT_HEARTBEAT_MS = 30_000;
 
 function envToken(env: EnvLike, persona: string): string {
   const v = env[`SUMI_PERSONA_TOKEN_${persona.replace(/-/g, "_")}`];
@@ -48,6 +70,8 @@ function envToken(env: EnvLike, persona: string): string {
 export class SecretaryObject {
   private secretary: Secretary | null = null;
   private personaId = "";
+  private drainPromise: Promise<void> | null = null;
+  private wakeAgain = false;
   private readonly ctx: AlarmState;
   private readonly env: EnvLike;
 
@@ -56,11 +80,15 @@ export class SecretaryObject {
     this.env = env;
   }
 
-  private build(personaId: string): Secretary {
-    if (this.secretary) return this.secretary;
-    this.personaId = personaId;
+  private heartbeatMs(): number {
+    const v = Number(this.env.SUMI_HEARTBEAT_MS);
+    return Number.isFinite(v) && v >= 250 ? v : DEFAULT_HEARTBEAT_MS;
+  }
+
+  /** Build the per-persona secretary; overridable for tests. */
+  protected newSecretary(personaId: string): Secretary {
     const provider: ModelProvider = new MockProvider(); // real provider wiring lands with secrets
-    this.secretary = new Secretary({
+    return new Secretary({
       personaId,
       holderId: `workerd-${personaId}`,
       state: new HttpStateClient(
@@ -75,6 +103,19 @@ export class SecretaryObject {
       scheduleEveryMs: 1_000,
       idgen: () => crypto.randomUUID(),
     });
+  }
+
+  private async build(personaId: string): Promise<Secretary> {
+    if (this.personaId && this.personaId !== personaId) {
+      throw new Error(
+        `persona mismatch: DO serves ${this.personaId}, got ${personaId}`,
+      );
+    }
+    if (!this.personaId) {
+      this.personaId = personaId;
+      await this.ctx.storage.put(PERSONA_KEY, personaId);
+    }
+    this.secretary ??= this.newSecretary(personaId);
     return this.secretary;
   }
 
@@ -83,16 +124,69 @@ export class SecretaryObject {
     const persona = new URL(req.url).pathname.split("/")[2];
     if (!persona)
       return Response.json({ error: "persona required" }, { status: 400 });
-    const s = this.build(persona);
-    this.ctx.waitUntil(this.drain(s));
-    return Response.json({ ok: true, persona });
+    let s: Secretary;
+    try {
+      s = await this.build(persona);
+    } catch (e) {
+      return Response.json(
+        { error: e instanceof Error ? e.message : String(e) },
+        { status: 500 },
+      );
+    }
+    const coalesced = this.drainPromise !== null;
+    this.ctx.waitUntil(this.requestDrain(s));
+    await this.ensureAlarm();
+    return Response.json({ ok: true, persona, coalesced });
   }
 
-  /** Alarm-driven wake for schedules and deferred work. */
+  /**
+   * Alarm-driven wake: drains pending work (due schedules become wake inputs)
+   * and re-arms the heartbeat. After an eviction the persona id is recovered
+   * from DO storage, so the heartbeat survives restarts.
+   */
   async alarm(): Promise<void> {
-    if (!this.personaId) return; // alarm before any fetch — nothing to do
-    await this.drain(this.build(this.personaId));
-    await this.ctx.storage.setAlarm(Date.now() + 30_000); // next heartbeat
+    const persona =
+      this.personaId ||
+      (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
+      "";
+    if (!persona) return; // never activated — nothing to re-arm either
+    try {
+      const s = await this.build(persona);
+      await this.requestDrain(s);
+    } finally {
+      // Re-arm even on drain failure: an error must not permanently disarm
+      // the persona's writer.
+      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
+    }
+  }
+
+  /**
+   * Serialize drains: one runs at a time; a trigger during a drain marks a
+   * re-drain so new work is still picked up without a parallel writer.
+   */
+  private requestDrain(s: Secretary): Promise<void> {
+    if (this.drainPromise) {
+      this.wakeAgain = true;
+      return this.drainPromise;
+    }
+    const p = this.drainLoop(s).finally(() => {
+      if (this.drainPromise === p) this.drainPromise = null;
+    });
+    this.drainPromise = p;
+    return p;
+  }
+
+  private async drainLoop(s: Secretary): Promise<void> {
+    do {
+      this.wakeAgain = false;
+      await this.drain(s);
+    } while (this.wakeAgain);
+  }
+
+  private async ensureAlarm(): Promise<void> {
+    if ((await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
+    }
   }
 
   private async drain(s: Secretary): Promise<void> {
