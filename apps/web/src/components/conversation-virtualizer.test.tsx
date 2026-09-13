@@ -442,6 +442,42 @@ describe("ConversationVirtualizer", () => {
       expect(handle.current?.isAtEnd()).toBe(false);
     });
   });
+
+  it("does not let a pending scroll-end notification outlive unmount", async () => {
+    // Regression: virtual-core's scroll-end fallback is a debounced timeout
+    // that its unsubscribe never cancels. A scroll within
+    // isScrollingResetDelay of unmount leaves a timer that notifies a dead
+    // virtualizer — a setState dispatch on an unmounted tree, and a hard
+    // ReferenceError once jsdom's window is gone (web-quality CI run
+    // 34784046080 failed this way after all tests passed).
+    render(
+      <ConversationVirtualizer
+        items={makeMessages(100)}
+        estimateSize={() => 64}
+        ariaLabel="Test conversation"
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="conversation-viewport"]',
+    );
+    expect(viewport).not.toBeNull();
+
+    // A real scroll arms the debounced fallback (150 ms).
+    act(() => {
+      viewport!.scrollTop = 120;
+      fireEvent.scroll(viewport!);
+    });
+    cleanup();
+    // Simulate the test environment tearing down before the timer fires.
+    const originalWindow = globalThis.window;
+    Reflect.deleteProperty(globalThis, "window");
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      globalThis.window = originalWindow;
+    }
+  });
 });
 
 function makeMessages(count: number): TestMessage[] {

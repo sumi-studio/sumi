@@ -1,4 +1,7 @@
-import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  observeElementOffset,
+  useVirtualizer,
+} from "@tanstack/react-virtual";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
@@ -84,6 +87,27 @@ const SCROLL_KEYS = new Set([
 const INTERACTIVE_SELECTOR =
   'button, a[href], input, textarea, select, summary, [contenteditable]:not([contenteditable="false"])';
 
+// virtual-core 3.17 arms its scroll-end fallback as a debounced timeout that
+// the returned unsubscribe never cancels: a scroll within
+// isScrollingResetDelay of unmount leaves a pending callback that notifies a
+// dead virtualizer — a setState dispatch on an unmounted tree in production,
+// and a hard ReferenceError once the test environment's window is gone.
+// Gate the callback on subscription liveness so the leaked timer becomes a
+// no-op after cleanup.
+const observeElementOffsetGuarded: typeof observeElementOffset = (
+  instance,
+  cb,
+) => {
+  let active = true;
+  const unsubscribe = observeElementOffset(instance, (offset, isScrolling) => {
+    if (active) cb(offset, isScrolling);
+  });
+  return () => {
+    active = false;
+    unsubscribe?.();
+  };
+};
+
 export function ConversationVirtualizer<
   TItem extends ConversationVirtualizerItem,
 >({
@@ -145,6 +169,7 @@ export function ConversationVirtualizer<
     paddingEnd,
     overscan,
     useFlushSync: false,
+    observeElementOffset: observeElementOffsetGuarded,
   });
 
   const scrollToEnd = useCallback(
