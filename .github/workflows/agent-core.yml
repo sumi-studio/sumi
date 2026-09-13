@@ -74,7 +74,18 @@ jobs:
       - name: Run workerd smoke (local wrangler dev + real state service)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
 
+      - name: Check local-host launcher syntax
+        run: |
+          bash -n deploy/local-host/sumi-local
+          bash -n deploy/local-host/self-test.sh
+
+      - name: Run local-host install/launcher self-test
+        run: bash deploy/local-host/self-test.sh
+
       # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
       # real model calls or secrets, no Cloudflare deployment, no remote
       # database. The workerd smoke exercises the Durable Object wake path via
       # local wrangler dev; deployed-worker alarm scheduling is not covered.
+      # The local-host self-test installs into disposable dirs against the
+      # ephemeral Postgres and additionally covers restart persistence and
+      # SIGKILL mid-turn recovery.

@@ -1,0 +1,31 @@
+# Managed PostgreSQL for `sumi-local` installs that do not supply their own
+# SUMI_DB_URL. Loopback-only; the named volume holds the secretary's entire
+# authored state and survives `sumi-local uninstall` (removed only by
+# `uninstall --purge`). The container itself is a disposable executable —
+# reinstalling recreates it against the same volume.
+#
+# Not a shared system service: `restart: "no"`, started and stopped by
+# `sumi-local start` / `stop`.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: ${SUMI_LOCAL_PG_CONTAINER:-sumi-local-pg}
+    environment:
+      POSTGRES_USER: sumi
+      POSTGRES_PASSWORD: ${SUMI_LOCAL_PG_PASSWORD:?set SUMI_LOCAL_PG_PASSWORD}
+      POSTGRES_DB: sumi
+    ports:
+      - "${SUMI_LOCAL_PG_LISTEN:-127.0.0.1:55439}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumi -d sumi"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    restart: "no"
+
+volumes:
+  pgdata:
+    name: ${SUMI_LOCAL_PG_VOLUME:-sumi-local-pgdata}
