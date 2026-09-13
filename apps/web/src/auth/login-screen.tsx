@@ -27,7 +27,9 @@ export function LoginScreen() {
     confirmIntentTransition,
     credentialRecoveryEmailSent,
     emailLinkCallbackPending,
+    dismissRedirectSignInError,
     logout,
+    redirectSignInError,
     rejectEmailLink,
     sendEmailLink,
     sessionState,
@@ -111,11 +113,13 @@ export function LoginScreen() {
     }
     setBusy(provider);
     setError(null);
+    dismissRedirectSignInError?.();
     try {
+      // This leaves the tab for the provider and normally never returns here.
+      // The spinner stays until the browser navigates away.
       await signIn(provider, intent);
     } catch (nextError) {
       setError(getAuthErrorMessage(nextError));
-    } finally {
       setBusy(null);
     }
   };
@@ -130,6 +134,7 @@ export function LoginScreen() {
       return;
     setBusy("email");
     setError(null);
+    dismissRedirectSignInError?.();
     setEmailSent(false);
     try {
       await sendEmailLink(email, intent);
@@ -161,6 +166,12 @@ export function LoginScreen() {
       setBusy(null);
     }
   };
+
+  // A redirect that came back without a session reports itself here: its
+  // failure happened during startup, outside any click handler.
+  const displayedError =
+    error ??
+    (redirectSignInError ? getAuthErrorMessage(redirectSignInError) : null);
 
   return (
     <main className="fixed inset-0 z-50 flex min-h-dvh flex-col overflow-y-auto bg-neutral-50 text-foreground dark:bg-background">
@@ -426,12 +437,12 @@ export function LoginScreen() {
                 Firebase Authentication が設定されていません。
               </p>
             )}
-            {error && (
+            {displayedError && (
               <p
                 role="alert"
                 className="mt-4 rounded-lg bg-red-50 px-3 py-2.5 text-red-700 text-sm dark:bg-red-950/30 dark:text-red-300"
               >
-                {error}
+                {displayedError}
               </p>
             )}
           </div>

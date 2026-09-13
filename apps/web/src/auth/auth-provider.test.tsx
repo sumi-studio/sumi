@@ -11,6 +11,7 @@ import {
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
+import type { PendingRedirectAuthFlow } from "./auth-flow-state";
 import {
   AuthAPIError,
   SumiProfileUpdateIndeterminateError,
@@ -54,8 +55,13 @@ const authMocks = vi.hoisted(() => ({
       vi.fn(),
   ),
   signOut: vi.fn(),
-  signInWithPopup: vi.fn(),
   getIdToken: vi.fn(),
+  beginRedirectSignIn: vi.fn(),
+  hasPendingRedirectSignIn: vi.fn(() => false),
+  takePendingRedirectSignIn: vi.fn<() => PendingRedirectAuthFlow | null>(
+    () => null,
+  ),
+  resolveRedirectSignInUser: vi.fn(),
   bindDirectChatAuthority: vi.fn(),
   clearDirectChatAuthority: vi.fn(() => true),
 }));
@@ -94,6 +100,14 @@ vi.mock("./firebase", () => ({
   getFirebaseAuth: authMocks.getFirebaseAuth,
 }));
 
+vi.mock("./redirect-sign-in", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./redirect-sign-in")>()),
+  beginRedirectSignIn: authMocks.beginRedirectSignIn,
+  hasPendingRedirectSignIn: authMocks.hasPendingRedirectSignIn,
+  takePendingRedirectSignIn: authMocks.takePendingRedirectSignIn,
+  resolveRedirectSignInUser: authMocks.resolveRedirectSignInUser,
+}));
+
 vi.mock("../agent/auth-authority", () => ({
   bindDirectChatAuthority: authMocks.bindDirectChatAuthority,
   clearDirectChatAuthority: authMocks.clearDirectChatAuthority,
@@ -106,7 +120,6 @@ vi.mock("firebase/auth", () => ({
   },
   getIdToken: authMocks.getIdToken,
   onAuthStateChanged: authMocks.onAuthStateChanged,
-  signInWithPopup: authMocks.signInWithPopup,
   signOut: authMocks.signOut,
 }));
 
@@ -156,6 +169,11 @@ beforeEach(() => {
   );
   authMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
   authMocks.hasEmailLinkCallback.mockReturnValue(false);
+  // The tab leaves for the provider: the promise that normally navigates away
+  // simply never settles in a test.
+  authMocks.beginRedirectSignIn.mockReturnValue(new Promise(() => {}));
+  authMocks.hasPendingRedirectSignIn.mockReturnValue(false);
+  authMocks.takePendingRedirectSignIn.mockReturnValue(null);
   authMocks.isSameEmailCredentialCollision.mockReturnValue(false);
   authMocks.clearDirectChatAuthority.mockReturnValue(true);
   authMocks.onAuthStateChanged.mockImplementation((_auth, _observer) =>
@@ -215,6 +233,12 @@ function AuthStateProbe() {
       </button>
       <button
         type="button"
+        onClick={() => void auth.refreshSession().catch(() => undefined)}
+      >
+        refresh session
+      </button>
+      <button
+        type="button"
         onClick={() => {
           setProfileUpdateResult("pending");
           void auth
@@ -246,6 +270,32 @@ function AuthStateProbe() {
       </button>
     </>
   );
+}
+
+/**
+ * The receipt the initiating tab persisted in sessionStorage before leaving
+ * for the provider. AuthContext only reads flowId, nonce, intent, provider
+ * and expiresAt from it; storage validation lives in auth-flow-state.
+ */
+function pendingRedirectReceipt() {
+  return {
+    flowId: "flow-id",
+    nonce: "n".repeat(43),
+    intent: "sign_in" as const,
+    provider: "google.com" as const,
+    expiresAt: "2099-08-01T01:00:00Z",
+    stage: "redirect_sent" as const,
+  };
+}
+
+/**
+ * Mount state after the browser returned from the provider into the same tab:
+ * the receipt is present and Firebase hands back this user on this startup.
+ */
+function simulateRedirectReturn(user: { uid: string }) {
+  authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+  authMocks.takePendingRedirectSignIn.mockReturnValue(pendingRedirectReceipt());
+  authMocks.resolveRedirectSignInUser.mockResolvedValue(user);
 }
 
 describe("canonical Human profile", () => {
@@ -885,16 +935,15 @@ describe("logout authority transition", () => {
   });
 
   it("binds the new identity before publishing a successful sign-in", async () => {
-    const firebaseAuth = {};
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
       authorityBindingId: authorityBindingA,
       user: { id: "user-a" },
     });
-    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
-    authMocks.signInWithPopup.mockResolvedValue({
-      user: { uid: "firebase-b" },
-    });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    // This mount is the browser returning from the provider: the startup
+    // session read is deferred while the receipt's flow is exchanged.
+    simulateRedirectReturn({ uid: "firebase-b" });
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.verifyCommittedSumiSession.mockResolvedValue({
       authenticated: true,
@@ -906,14 +955,6 @@ describe("logout authority transition", () => {
         <AuthStateProbe />
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "authenticated",
-      );
-    });
-    authMocks.bindDirectChatAuthority.mockClear();
-
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
 
     await waitFor(() => {
       expect(authMocks.bindDirectChatAuthority).toHaveBeenCalledWith(
@@ -933,37 +974,14 @@ describe("logout authority transition", () => {
       "signed_in:sign_in:none",
     );
     expect(sessionStorage.getItem("sumi.auth.outcome-notice.v1")).toBeNull();
+    // The deferred startup read never probed the old cookie: the exchanged
+    // proof alone published the session.
+    expect(authMocks.getSumiSession).not.toHaveBeenCalled();
   });
 
-  it("opens the Firebase popup synchronously before the flow start settles", async () => {
-    let resolveStart!: (value: {
-      flowId: string;
-      outcome: "proof_required";
-      expiresAt: string;
-    }) => void;
-    const start = new Promise<{
-      flowId: string;
-      outcome: "proof_required";
-      expiresAt: string;
-    }>((resolve) => {
-      resolveStart = resolve;
-    });
+  it("holds session reads while the provider redirect is leaving the tab", async () => {
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.startAuthFlow.mockReturnValue(start);
-    authMocks.signInWithPopup.mockResolvedValue({
-      user: {
-        uid: "firebase-b",
-        displayName: null,
-        email: "b@example.com",
-      },
-    });
-    authMocks.getIdToken.mockResolvedValue("id-token-b");
-    authMocks.verifyCommittedSumiSession.mockResolvedValue({
-      authenticated: true,
-      authorityBindingId: authorityBindingB,
-      user: { id: "user-b" },
-    });
     render(
       <AuthProvider>
         <AuthStateProbe />
@@ -977,23 +995,30 @@ describe("logout authority transition", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "sign in" }));
 
-    expect(authMocks.signInWithPopup).toHaveBeenCalledTimes(1);
-    expect(authMocks.startAuthFlow).toHaveBeenCalledTimes(1);
-    resolveStart({
-      flowId: "flow-id",
-      outcome: "proof_required",
-      expiresAt: "2026-08-01T01:00:00Z",
-    });
     await waitFor(() => {
-      expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalledWith({
+        provider: "google.com",
+        intent: "sign_in",
+      });
     });
+    // Navigation can lag the click. Until the tab actually leaves, a session
+    // re-read must not publish an unauthenticated flicker over the departure.
+    fireEvent.click(screen.getByRole("button", { name: "refresh session" }));
+    await Promise.resolve();
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(1);
   });
 
   it("starts bounded magic-link recovery for a same-email provider collision", async () => {
     const collision = new Error("credential collision");
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.signInWithPopup.mockRejectedValue(collision);
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    // getRedirectResult rejects with the collision before any credential is
+    // produced, so no Firebase sign-out is owed.
+    authMocks.resolveRedirectSignInUser.mockRejectedValue(collision);
     authMocks.isSameEmailCredentialCollision.mockImplementation(
       (error) => error === collision,
     );
@@ -1004,19 +1029,15 @@ describe("logout authority transition", () => {
         <AuthStateProbe />
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "unauthenticated",
-      );
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
 
     await waitFor(() => {
       expect(authMocks.beginSameEmailCredentialRecovery).toHaveBeenCalledWith(
         collision,
         "google.com",
         "sign_in",
+      );
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
       );
     });
     expect(authMocks.signOut).not.toHaveBeenCalled();
@@ -1106,9 +1127,7 @@ describe("logout authority transition", () => {
       authStateReady: vi.fn().mockResolvedValue(undefined),
     };
     authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
-    authMocks.signInWithPopup.mockResolvedValue({
-      user: firebaseUser,
-    });
+    simulateRedirectReturn(firebaseUser);
     authMocks.getIdToken
       .mockResolvedValueOnce("id-token-new")
       .mockResolvedValueOnce("id-token-fresh");
@@ -1136,13 +1155,6 @@ describe("logout authority transition", () => {
         <AuthStateProbe />
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "unauthenticated",
-      );
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
     await waitFor(() => {
       expect(screen.getByTestId("confirmation")).toHaveTextContent(
         "create_account",
@@ -1185,7 +1197,7 @@ describe("logout authority transition", () => {
     };
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue({ currentUser: firebaseUser });
-    authMocks.signInWithPopup.mockResolvedValue({ user: firebaseUser });
+    simulateRedirectReturn(firebaseUser);
     authMocks.getIdToken.mockResolvedValue("id-token-new");
     authMocks.resolveAuthFlow.mockResolvedValue({
       flowId: "flow-id",
@@ -1199,12 +1211,6 @@ describe("logout authority transition", () => {
         <AuthStateProbe />
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "unauthenticated",
-      );
-    });
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
     await waitFor(() => {
       expect(screen.getByTestId("confirmation")).toHaveTextContent(
         "create_account",
@@ -1231,7 +1237,7 @@ describe("logout authority transition", () => {
     };
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
-    authMocks.signInWithPopup.mockResolvedValue({ user: firebaseUser });
+    simulateRedirectReturn(firebaseUser);
     authMocks.getIdToken.mockResolvedValue("id-token-new");
     authMocks.resolveAuthFlow.mockResolvedValue({
       flowId: "flow-id",
@@ -1256,12 +1262,6 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "unauthenticated",
-      );
-    });
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
-    await waitFor(() => {
       expect(screen.getByTestId("confirmation")).toHaveTextContent(
         "create_account",
       );
@@ -1280,15 +1280,9 @@ describe("logout authority transition", () => {
   });
 
   it("clears old client authority after a committed exchange is compensated", async () => {
-    authMocks.getSumiSession.mockResolvedValue({
-      authenticated: true,
-      authorityBindingId: authorityBindingA,
-      user: { id: "user-a" },
-    });
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.signInWithPopup.mockResolvedValue({
-      user: { uid: "firebase-b" },
-    });
+    simulateRedirectReturn({ uid: "firebase-b" });
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.verifyCommittedSumiSession.mockRejectedValue(
       new SumiSessionCompensatedError(
@@ -1301,27 +1295,21 @@ describe("logout authority transition", () => {
         <AuthStateProbe />
       </AuthProvider>,
     );
-    await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "authenticated",
-      );
-    });
-    authMocks.clearDirectChatAuthority.mockClear();
-
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
 
     await waitFor(() => {
       expect(screen.getByTestId("session-state")).toHaveTextContent(
         "unauthenticated",
       );
     });
-    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+    // The compensation clears once; the deferred session read then confirms an
+    // unauthenticated server state and clears any residue again.
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalled();
   });
 
   it("does not establish a stale Firebase success after logout takes the generation", async () => {
-    let resolvePopup!: (value: { user: { uid: string } }) => void;
-    const popup = new Promise<{ user: { uid: string } }>((resolve) => {
-      resolvePopup = resolve;
+    let resolveReturn!: (value: { uid: string }) => void;
+    const returnRead = new Promise<{ uid: string }>((resolve) => {
+      resolveReturn = resolve;
     });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
@@ -1329,7 +1317,11 @@ describe("logout authority transition", () => {
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.signInWithPopup.mockReturnValue(popup);
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    authMocks.resolveRedirectSignInUser.mockReturnValue(returnRead);
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
     authMocks.signOut.mockResolvedValue(undefined);
     render(
@@ -1338,29 +1330,30 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "authenticated",
-      );
+      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalled();
     });
     authMocks.clearDirectChatAuthority.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
-    await waitFor(() => {
-      expect(authMocks.signInWithPopup).toHaveBeenCalled();
-    });
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
     await waitFor(() => {
       expect(screen.getByTestId("session-state")).toHaveTextContent(
         "unauthenticated",
       );
     });
-    resolvePopup({ user: { uid: "firebase-b" } });
+    // The committed logout cleared the cookie: the deferred session read must
+    // see the cleared state, not resurrect the signed-out account.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    resolveReturn({ uid: "firebase-b" });
+    // The abandoned Firebase credential is cleaned up: once by logout itself
+    // and once when the late redirect return notices the stale generation.
     await waitFor(() => {
-      expect(authMocks.signOut).toHaveBeenCalled();
+      expect(authMocks.signOut).toHaveBeenCalledTimes(2);
     });
 
     expect(authMocks.verifyCommittedSumiSession).not.toHaveBeenCalled();
-    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+    // Logout clears once; the deferred session read confirms the cleared
+    // cookie and clears any residue again.
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalled();
     expect(screen.getByTestId("session-state")).toHaveTextContent(
       "unauthenticated",
     );
@@ -1385,9 +1378,7 @@ describe("logout authority transition", () => {
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.signInWithPopup.mockResolvedValue({
-      user: { uid: "firebase-b" },
-    });
+    simulateRedirectReturn({ uid: "firebase-b" });
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.verifyCommittedSumiSession.mockReturnValue(establishment);
     authMocks.logoutSumiSession.mockRejectedValue(new Error("logout failed"));
@@ -1398,15 +1389,11 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(screen.getByTestId("user-id")).toHaveTextContent("user-a");
+      expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
     });
     authMocks.bindDirectChatAuthority.mockClear();
     authMocks.clearDirectChatAuthority.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
-    await waitFor(() => {
-      expect(authMocks.verifyCommittedSumiSession).toHaveBeenCalled();
-    });
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
     // The failed logout is ambiguous: the subsequent server read, not the
     // previously exchanged cached identity, must establish who remains signed in.
@@ -1433,10 +1420,10 @@ describe("logout authority transition", () => {
     expect(authMocks.clearDirectChatAuthority).not.toHaveBeenCalled();
   });
 
-  it("does not restore old authority when a stale Firebase popup fails after logout", async () => {
-    let rejectPopup!: (error: Error) => void;
-    const popup = new Promise<never>((_, reject) => {
-      rejectPopup = reject;
+  it("does not restore old authority when a stale redirect return fails after logout", async () => {
+    let rejectReturn!: (error: Error) => void;
+    const returnRead = new Promise<never>((_, reject) => {
+      rejectReturn = reject;
     });
     authMocks.getSumiSession.mockResolvedValue({
       authenticated: true,
@@ -1444,7 +1431,11 @@ describe("logout authority transition", () => {
       user: { id: "user-a" },
     });
     authMocks.getFirebaseAuth.mockReturnValue({});
-    authMocks.signInWithPopup.mockReturnValue(popup);
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    authMocks.resolveRedirectSignInUser.mockReturnValue(returnRead);
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
     render(
       <AuthProvider>
@@ -1452,27 +1443,27 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(screen.getByTestId("session-state")).toHaveTextContent(
-        "authenticated",
-      );
+      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalled();
     });
     authMocks.clearDirectChatAuthority.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
-    await waitFor(() => {
-      expect(authMocks.signInWithPopup).toHaveBeenCalled();
-    });
     fireEvent.click(screen.getByRole("button", { name: "logout" }));
     await waitFor(() => {
       expect(screen.getByTestId("session-state")).toHaveTextContent(
         "unauthenticated",
       );
     });
-    rejectPopup(new Error("popup failed"));
-    await Promise.resolve();
+    // The committed logout cleared the cookie before the return settled.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    rejectReturn(new Error("redirect return failed"));
+    // A macrotask flush lets the rejected return settle before asserting that
+    // nothing was exchanged and no stale authority was restored.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(authMocks.verifyCommittedSumiSession).not.toHaveBeenCalled();
-    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalledTimes(1);
+    // Logout clears once; the deferred session read confirms the cleared
+    // cookie and clears any residue again.
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalled();
     expect(screen.getByTestId("session-state")).toHaveTextContent(
       "unauthenticated",
     );

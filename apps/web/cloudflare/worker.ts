@@ -12,6 +12,8 @@ export interface CloudflareEnvironment {
   };
   /** Transport to the registered private service; public Origin stays intact. */
   SUMI_ORIGIN_PROTOCOL?: "http" | "https";
+  /** Firebase Hosting project that supplies the same-origin sign-in helpers. */
+  SUMI_FIREBASE_AUTH_DOMAIN?: string;
 }
 
 interface CloudflareRequestInit extends RequestInit {
@@ -136,6 +138,56 @@ function denied(): Response {
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+async function serveFirebaseAuth(
+  request: Request,
+  canonicalPath: string,
+  environment: CloudflareEnvironment,
+  authFetch: typeof fetch,
+): Promise<Response> {
+  const domain = environment.SUMI_FIREBASE_AUTH_DOMAIN;
+  if (
+    !domain ||
+    !/^[a-z0-9][a-z0-9-]*\.firebaseapp\.com$/.test(domain) ||
+    !["GET", "HEAD", "POST"].includes(request.method)
+  )
+    return denied();
+
+  // Firebase's redirect result must be read from our own origin: redirecting
+  // the browser to firebaseapp.com here would reintroduce storage partitioning.
+  const target = new URL(request.url);
+  target.protocol = "https:";
+  target.host = domain;
+  target.port = "";
+  target.pathname = canonicalPath;
+  const forwarded = new Request(target, request);
+  // Sumi credentials have no role at the fixed Firebase Hosting destination.
+  for (const name of [...forwarded.headers.keys()]) {
+    if (!/^(accept|accept-language|content-type|user-agent)$/i.test(name)) {
+      forwarded.headers.delete(name);
+    }
+  }
+  try {
+    const response = await authFetch(forwarded, {
+      redirect: "manual",
+      signal: request.signal,
+    });
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "no-store");
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.delete("Set-Cookie");
+    // This proxy serves Firebase's helper responses, with their own CSP and
+    // framing policy. The application's frame-ancestors 'none' would block the
+    // helper iframe needed to receive the redirect result.
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch {
+    return unavailable();
+  }
 }
 
 function isJavaScript(response: Response): boolean {
@@ -264,10 +316,19 @@ export async function handleRequest(
   request: Request,
   environment: CloudflareEnvironment,
   originFetch: OriginFetch = fetch,
+  authFetch: typeof fetch = fetch,
 ): Promise<Response> {
   const route = decidePath(new URL(request.url).pathname);
   if (route.disposition === "deny" || route.canonicalPath === null) {
     return denied();
+  }
+  if (route.disposition === "firebase-auth") {
+    return serveFirebaseAuth(
+      request,
+      route.canonicalPath,
+      environment,
+      authFetch,
+    );
   }
   if (route.disposition === "service-worker") {
     return serveServiceWorker(request, route.canonicalPath, environment);

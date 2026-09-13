@@ -1,5 +1,6 @@
 export type RouteDisposition =
   | "origin"
+  | "firebase-auth"
   | "deny"
   | "service-worker"
   | "release-manifest"
@@ -217,6 +218,9 @@ export function decidePath(pathname: string): RouteDecision {
   }
 
   const policyPath = canonicalPath.toLowerCase();
+  if (policyPath === "/__/auth" || policyPath.startsWith("/__/auth/")) {
+    return { canonicalPath, disposition: "firebase-auth" };
+  }
   if (policyPath === "/sw.js") {
     return { canonicalPath, disposition: "service-worker" };
   }

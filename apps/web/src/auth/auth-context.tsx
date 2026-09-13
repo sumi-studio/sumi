@@ -1,11 +1,8 @@
 import {
-  type AuthProvider as FirebaseAuthProvider,
-  GithubAuthProvider,
-  GoogleAuthProvider,
   getIdToken,
   onAuthStateChanged,
-  signInWithPopup,
   signOut,
+  type User,
 } from "firebase/auth";
 import {
   createContext,
@@ -32,10 +29,12 @@ import {
 import {
   type AuthIntent,
   confirmAuthFlow,
-  createAuthFlowNonce,
   resolveAuthFlow,
-  startAuthFlow,
 } from "./auth-flow-client";
+import type {
+  PendingRedirectAuthFlow,
+  RecoverableProvider,
+} from "./auth-flow-state";
 import {
   type AuthOutcomeNotice,
   clearAuthOutcomeNotice,
@@ -56,6 +55,12 @@ import {
 } from "./email-link-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import {
+  beginRedirectSignIn,
+  hasPendingRedirectSignIn,
+  resolveRedirectSignInUser,
+  takePendingRedirectSignIn,
+} from "./redirect-sign-in";
 import {
   AuthAPIError,
   type ConfirmedSumiProfile,
@@ -144,6 +149,9 @@ export interface AuthContextValue {
   outcomeNotice: AuthOutcomeNotice | null;
   emailLinkCallbackPending: boolean;
   credentialRecoveryEmailSent: boolean;
+  redirectSignInPending: boolean;
+  redirectSignInError: unknown;
+  dismissRedirectSignInError: () => void;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
   sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
   completeEmailLink: () => Promise<void>;
@@ -189,7 +197,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // reads must never re-authorize the chat after logout has started.
   const authGeneration = useRef(0);
   const sessionMutation = useRef<Promise<void>>(Promise.resolve());
-  const signInPending = useRef(false);
+  // Read during the first render, before any effect: a returning provider
+  // redirect must survive the initial session read and StrictMode's repeated
+  // effects without being claimed twice.
+  const [redirectSignInPending, setRedirectSignInPending] = useState(
+    () =>
+      !preissuedSessionMode && authOriginAllowed && hasPendingRedirectSignIn(),
+  );
+  const [redirectSignInError, setRedirectSignInError] = useState<unknown>(null);
+  const redirectReturnClaimed = useRef(false);
+  const signInPending = useRef(redirectSignInPending);
   const serverSession = useRef<SumiSessionStatus>(session);
 
   const claimSavedOutcomeNotice = useCallback(
@@ -280,8 +297,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSessionState("unavailable");
       return "unavailable";
     }
-    // Firebase popups can remain open while a component effect runs. A server
-    // read during that interval must not cancel the popup's eventual exchange.
+    // A provider redirect can still be in flight when a component effect runs:
+    // on this startup its return is being exchanged. A server read during that
+    // interval must not cancel it.
     if (signInPending.current || logoutPending.current) return "checking";
     const generation = nextGeneration();
     // A dropped socket does not end the authenticated session. Keep the
@@ -401,144 +419,202 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return unsubscribe;
   }, [claimSavedOutcomeNotice, confirmation, nextGeneration]);
 
-  const signIn = useCallback(
-    async (providerName: SignInProvider, intent: AuthIntent) => {
-      if (preissuedSessionMode || !authOriginAllowed) {
-        throw new AuthAPIError("Authentication is unavailable.", 0);
-      }
-      const generation = nextGeneration();
-      const auth = getFirebaseAuth();
-      const provider = createProvider(providerName);
-      const flowProvider = authFlowProvider(providerName);
-      const nonce = createAuthFlowNonce();
-      let firebaseSignInCompleted = false;
+  /**
+   * Turns a proven Firebase credential into the server-owned Sumi session.
+   * Shared by the redirect return and any later provider proof: a Firebase UID
+   * alone never authorizes a session.
+   */
+  const exchangeFirebaseProof = useCallback(
+    async ({
+      generation,
+      flow,
+      user,
+    }: {
+      generation: number;
+      flow: PendingRedirectAuthFlow;
+      user: User;
+    }): Promise<boolean> => {
       let confirmationRequired = false;
-      signInPending.current = true;
-      setCredentialRecoveryEmailSent(false);
-      let popup: ReturnType<typeof signInWithPopup> | null = null;
-      try {
-        // Firebase documents that popup auth may be blocked when invoked outside
-        // a click handler. Invoke it before the first await, while starting the
-        // persisted Sumi flow concurrently; proof resolution still waits for both.
-        popup = signInWithPopup(auth, provider);
-        const [started, result] = await Promise.all([
-          startAuthFlow({
-            intent,
-            provider: flowProvider,
-            continuation: "/",
-            nonce,
-          }),
-          popup,
-        ]);
-        firebaseSignInCompleted = true;
-        if (!isCurrentGeneration(generation)) {
-          await signOut(auth).catch(() => undefined);
+      await serializeSessionMutation(async () => {
+        if (!isCurrentGeneration(generation)) return;
+        const idToken = await getIdToken(user, true);
+        if (!isCurrentGeneration(generation)) return;
+        const resolved = await resolveAuthFlow({
+          flowId: flow.flowId,
+          nonce: flow.nonce,
+          idToken,
+        });
+        if (resolved.outcome === "confirmation_required") {
+          const pending: PendingAuthConfirmation = {
+            flowId: resolved.flowId,
+            nonce: flow.nonce,
+            intent: flow.intent,
+            provider: flow.provider,
+            expiresAt: resolved.expiresAt,
+            action: resolved.nextAction,
+            firebaseUID: user.uid,
+            account: firebaseAccount(user),
+          };
+          savePendingConfirmation(pending);
+          confirmationRequired = true;
+          if (isCurrentGeneration(generation)) setConfirmation(pending);
           return;
         }
-        await serializeSessionMutation(async () => {
-          if (!isCurrentGeneration(generation)) return;
-          const idToken = await getIdToken(result.user, true);
-          if (!isCurrentGeneration(generation)) return;
-          const resolved = await resolveAuthFlow({
-            flowId: started.flowId,
-            nonce,
-            idToken,
-          });
-          if (resolved.outcome === "confirmation_required") {
-            const pending: PendingAuthConfirmation = {
-              flowId: resolved.flowId,
-              nonce,
-              intent,
-              provider: flowProvider,
-              expiresAt: resolved.expiresAt,
-              action: resolved.nextAction,
-              firebaseUID: result.user.uid,
-              account: firebaseAccount(result.user),
-            };
-            savePendingConfirmation(pending);
-            confirmationRequired = true;
-            if (isCurrentGeneration(generation)) setConfirmation(pending);
-            return;
-          }
-          const nextSession = await verifyCommittedSumiSession();
-          if (
-            resolved.outcome !== "signed_in" &&
-            resolved.outcome !== "account_created"
-          ) {
-            throw new AuthAPIError("Invalid authentication flow response.", 0);
-          }
-          publishOutcomeNotice({
-            firebaseUID: result.user.uid,
-            humanId: nextSession.user.id,
-            outcome: resolved.outcome,
-            intent,
-            receiptId: resolved.flowId,
-          });
-          // The HttpOnly authority changed even if logout claimed the UI
-          // generation while this serialized exchange was in flight.
-          flushSync(() => {
-            bindDirectChatAuthority(nextSession.authorityBindingId);
-            serverSession.current = nextSession;
-            if (!isCurrentGeneration(generation)) return;
-            setSession(nextSession);
-            setSessionState("authenticated");
-          });
-        });
-        if (!isCurrentGeneration(generation) && !confirmationRequired) {
-          // A logout that began while the provider popup was open owns the
-          // terminal Firebase state as well as the server cookie.
-          await signOut(auth).catch(() => undefined);
-        }
-      } catch (error) {
-        if (!firebaseSignInCompleted && popup) {
-          const popupResult = await popup.catch(() => null);
-          firebaseSignInCompleted = popupResult !== null;
-        }
+        const nextSession = await verifyCommittedSumiSession();
         if (
-          !firebaseSignInCompleted &&
+          resolved.outcome !== "signed_in" &&
+          resolved.outcome !== "account_created"
+        ) {
+          throw new AuthAPIError("Invalid authentication flow response.", 0);
+        }
+        publishOutcomeNotice({
+          firebaseUID: user.uid,
+          humanId: nextSession.user.id,
+          outcome: resolved.outcome,
+          intent: flow.intent,
+          receiptId: resolved.flowId,
+        });
+        // The HttpOnly authority changed even if logout claimed the UI
+        // generation while this serialized exchange was in flight.
+        flushSync(() => {
+          bindDirectChatAuthority(nextSession.authorityBindingId);
+          serverSession.current = nextSession;
+          if (!isCurrentGeneration(generation)) return;
+          setSession(nextSession);
+          setSessionState("authenticated");
+        });
+      });
+      return confirmationRequired;
+    },
+    [isCurrentGeneration, publishOutcomeNotice, serializeSessionMutation],
+  );
+
+  /**
+   * Completes a provider redirect once, on startup. The persisted receipt —
+   * not the Firebase account — names the flow whose proof may be exchanged.
+   */
+  const completeRedirectSignIn = useCallback(async () => {
+    const generation = nextGeneration();
+    signInPending.current = true;
+    let firebaseSignInCompleted = false;
+    let confirmationRequired = false;
+    try {
+      const flow = takePendingRedirectSignIn();
+      if (!flow) return;
+      let user: User;
+      try {
+        user = await resolveRedirectSignInUser();
+      } catch (error) {
+        if (
           isSameEmailCredentialCollision(error) &&
           isCurrentGeneration(generation)
         ) {
-          await beginSameEmailCredentialRecovery(error, flowProvider, intent);
+          await beginSameEmailCredentialRecovery(
+            error,
+            flow.provider,
+            flow.intent,
+          );
           if (isCurrentGeneration(generation)) {
             setCredentialRecoveryEmailSent(true);
           }
           return;
         }
-        if (
-          (error instanceof SumiSessionCompensatedError ||
-            error instanceof SumiSessionCompensationFailedError) &&
-          isCurrentGeneration(generation)
-        ) {
-          let authorityCleared = true;
-          flushSync(() => {
-            authorityCleared = clearDirectChatAuthority();
-            serverSession.current = { authenticated: false };
-            setSession({ authenticated: false });
-            setSessionState(
-              authorityCleared && error instanceof SumiSessionCompensatedError
-                ? "unauthenticated"
-                : "unavailable",
-            );
-          });
-        }
-        // A Firebase account is display state, not Sumi authorization. Do not
-        // retain it when the server-owned identity binding/exchange failed.
-        if (firebaseSignInCompleted && !confirmationRequired) {
-          await signOut(auth).catch(() => undefined);
-        }
         throw error;
-      } finally {
+      }
+      firebaseSignInCompleted = true;
+      if (!isCurrentGeneration(generation)) {
+        // A logout claimed the generation while the return was being read. It
+        // owns the terminal Firebase state as well as the server cookie.
+        await signOutFirebaseBestEffort();
+        return;
+      }
+      confirmationRequired = await exchangeFirebaseProof({
+        generation,
+        flow,
+        user,
+      });
+      if (!isCurrentGeneration(generation) && !confirmationRequired) {
+        await signOutFirebaseBestEffort();
+      }
+    } catch (error) {
+      if (
+        (error instanceof SumiSessionCompensatedError ||
+          error instanceof SumiSessionCompensationFailedError) &&
+        isCurrentGeneration(generation)
+      ) {
+        let authorityCleared = true;
+        flushSync(() => {
+          authorityCleared = clearDirectChatAuthority();
+          serverSession.current = { authenticated: false };
+          setSession({ authenticated: false });
+          setSessionState(
+            authorityCleared && error instanceof SumiSessionCompensatedError
+              ? "unauthenticated"
+              : "unavailable",
+          );
+        });
+      }
+      // A Firebase account is display state, not Sumi authorization. Do not
+      // retain it when the server-owned identity binding/exchange failed.
+      if (firebaseSignInCompleted && !confirmationRequired) {
+        await signOutFirebaseBestEffort();
+      }
+      if (isCurrentGeneration(generation)) setRedirectSignInError(error);
+    } finally {
+      signInPending.current = false;
+      setRedirectSignInPending(false);
+      const publishedSession =
+        serverSession.current.authenticated && isCurrentGeneration(generation);
+      if (!publishedSession) {
+        // The startup read was deliberately deferred until the return settled.
+        // It must still run when the exchange committed under a generation it
+        // lost — the cookie may hold a session the UI never published, and a
+        // competing operation's own read may have run inside the deferred
+        // window and returned "checking" without reaching the server.
+        await refreshSession();
+      }
+    }
+  }, [
+    exchangeFirebaseProof,
+    isCurrentGeneration,
+    nextGeneration,
+    refreshSession,
+  ]);
+
+  useEffect(() => {
+    if (!redirectSignInPending || redirectReturnClaimed.current) return;
+    // Survives StrictMode's remount: the return is exchanged exactly once.
+    redirectReturnClaimed.current = true;
+    void completeRedirectSignIn();
+  }, [completeRedirectSignIn, redirectSignInPending]);
+
+  const signIn = useCallback(
+    async (providerName: SignInProvider, intent: AuthIntent) => {
+      if (preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError("Authentication is unavailable.", 0);
+      }
+      nextGeneration();
+      setCredentialRecoveryEmailSent(false);
+      setRedirectSignInError(null);
+      // The tab is about to leave for the provider. Hold the session read so a
+      // navigation that a browser delays cannot be mistaken for a logout.
+      signInPending.current = true;
+      try {
+        await beginRedirectSignIn({
+          provider: authFlowProvider(providerName),
+          intent,
+        });
+      } catch (error) {
         signInPending.current = false;
+        throw error;
       }
     },
-    [
-      isCurrentGeneration,
-      nextGeneration,
-      publishOutcomeNotice,
-      serializeSessionMutation,
-    ],
+    [nextGeneration],
   );
+
+  const dismissRedirectSignInError = useCallback(() => {
+    setRedirectSignInError(null);
+  }, []);
 
   const sendEmailLink = useCallback(
     async (email: string, intent: AuthIntent) => {
@@ -1019,6 +1095,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       outcomeNotice,
       emailLinkCallbackPending,
       credentialRecoveryEmailSent,
+      redirectSignInPending,
+      redirectSignInError,
+      dismissRedirectSignInError,
       signIn,
       sendEmailLink,
       completeEmailLink,
@@ -1041,6 +1120,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       emailLinkCallbackPending,
       credentialRecoveryEmailSent,
       dismissOutcomeNotice,
+      dismissRedirectSignInError,
+      redirectSignInError,
+      redirectSignInPending,
       rejectEmailLink,
       refreshSession,
       session.authenticated,
@@ -1085,18 +1167,7 @@ function isDefinitiveProfileUpdateRejection(error: unknown): boolean {
   );
 }
 
-function createProvider(providerName: SignInProvider): FirebaseAuthProvider {
-  if (providerName === "github") {
-    return new GithubAuthProvider();
-  }
-  const provider = new GoogleAuthProvider();
-  provider.setCustomParameters({ prompt: "select_account" });
-  return provider;
-}
-
-function authFlowProvider(
-  providerName: SignInProvider,
-): "google.com" | "github.com" {
+function authFlowProvider(providerName: SignInProvider): RecoverableProvider {
   return providerName === "github" ? "github.com" : "google.com";
 }
 
