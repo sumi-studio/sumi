@@ -643,6 +643,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       nextGeneration();
       setCredentialRecoveryEmailSent(false);
       setRedirectSignInError(null);
+      // Each attempt writes a fresh receipt, so each return — including a
+      // back/forward-cache restore of this same document — is a new return
+      // that must be allowed to complete once. Resetting here, before the
+      // tab can leave, cannot reopen the StrictMode replay window: the
+      // completion effect still needs a pending receipt to claim.
+      redirectReturnClaimed.current = false;
       // The tab is about to leave for the provider. Hold the session read so a
       // navigation that a browser delays cannot be mistaken for a logout.
       signInPending.current = true;

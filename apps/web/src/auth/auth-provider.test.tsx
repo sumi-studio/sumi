@@ -12,6 +12,7 @@ import {
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
+import { getAuthErrorMessage } from "./auth-errors";
 import type { PendingRedirectAuthFlow } from "./auth-flow-state";
 import { RedirectSignInAbandonedError } from "./redirect-sign-in";
 import {
@@ -203,6 +204,11 @@ function AuthStateProbe() {
       <div data-testid="redirect-error">
         {auth.redirectSignInError instanceof Error
           ? auth.redirectSignInError.name
+          : "none"}
+      </div>
+      <div data-testid="redirect-error-message">
+        {auth.redirectSignInError
+          ? getAuthErrorMessage(auth.redirectSignInError)
           : "none"}
       </div>
       <div data-testid="outcome">
@@ -1692,6 +1698,110 @@ describe("redirect return resilience", () => {
     // The hold survives: only a persisted restore means navigation ended.
     expect(authMocks.getSumiSession).toHaveBeenCalledTimes(1);
     expect(authMocks.takePendingRedirectSignIn).not.toHaveBeenCalled();
+  });
+
+  it("completes a second attempt's back/forward-cache return in the same document", async () => {
+    // First attempt: leave for the provider, restore via Back, land on the
+    // recoverable error. The claim ref belongs to that attempt's receipt —
+    // a new attempt writes a new receipt and resets it, so its own restore
+    // must complete too instead of staying silent.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalledTimes(1);
+    });
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+      new RedirectSignInAbandonedError(),
+    );
+    await act(async () => {
+      dispatchPersistedPageShow();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error")).toHaveTextContent(
+        "RedirectSignInAbandonedError",
+      );
+    });
+
+    // Second attempt in the same document: a fresh receipt, a fresh return.
+    authMocks.takePendingRedirectSignIn.mockReturnValue({
+      ...pendingRedirectReceipt(),
+      flowId: "flow-id-2",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalledTimes(2);
+    });
+    await act(async () => {
+      dispatchPersistedPageShow();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(authMocks.takePendingRedirectSignIn).toHaveBeenCalledTimes(2);
+      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId("redirect-error")).toHaveTextContent(
+        "RedirectSignInAbandonedError",
+      );
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+  });
+
+  it("names an expired flow when the server rejects a real credential", async () => {
+    // The person finished at the provider after the flow TTL: a credential
+    // returns, the exchange runs, and the server's 410 flow_expired must
+    // read as "expired — try again", not the generic session failure.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    authMocks.resolveRedirectSignInUser.mockResolvedValue({
+      uid: "firebase-b",
+    });
+    authMocks.getIdToken.mockResolvedValue("id-token-b");
+    authMocks.resolveAuthFlow.mockRejectedValue(
+      new AuthAPIError("Authentication flow expired.", 410),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error-message")).toHaveTextContent(
+        "ログインの有効期限が切れました",
+      );
+    });
+    expect(authMocks.resolveAuthFlow).toHaveBeenCalledWith({
+      flowId: "flow-id",
+      nonce: "n".repeat(43),
+      idToken: "id-token-b",
+    });
+    // The server rejected the exchange, so the orphaned Firebase identity is
+    // display state only and is signed out.
+    expect(authMocks.signOut).toHaveBeenCalled();
   });
 });
 

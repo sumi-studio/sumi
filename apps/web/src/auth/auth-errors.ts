@@ -41,6 +41,10 @@ export function getAuthErrorMessage(error: unknown): string {
     );
   }
   if (error instanceof AuthAPIError) {
+    if (error.status === 410) {
+      // flow_expired: the provider return outlived the server-side flow TTL.
+      return "ログインの有効期限が切れました。もう一度お試しください。";
+    }
     if (error.status === 403) {
       return "このアカウントは Sumi の利用対象に登録されていません。";
     }
