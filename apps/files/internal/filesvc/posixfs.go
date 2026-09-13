@@ -11,9 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,21 +25,18 @@ type posixRoot struct {
 	root         string
 	requireMount bool // refuse file ops when root is not a verified mount
 
-	mu        sync.Mutex
-	lastMntID uint64 // kernel mount ID of the last verified mount instance
-	mntOK     bool   // last freshness verdict for lastMntID
 }
 
-// mountID returns the kernel mount ID and fstype of the mountpoint exactly
-// at p.root, per /proc/self/mountinfo — which lists mountpoints only, so a
-// bare directory simply has no entry. The mount ID identifies a specific
-// mount instance: remounting over the same path allocates a new ID, making
-// it a reliable generation key (unlike st_dev, which the kernel may reuse).
-func (p *posixRoot) mountID() (id uint64, fstype string, ok bool) {
+// mountFSType returns the fstype of the mountpoint exactly at p.root, per
+// /proc/self/mountinfo — which lists mountpoints only, so a bare directory
+// simply has no entry. A path stacked under several mounts appears once per
+// mount, topmost last, so the last match wins.
+func (p *posixRoot) mountFSType() (fstype string, ok bool) {
 	data, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
-		return 0, "", false
+		return "", false
 	}
+	found := false
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 10 {
@@ -52,10 +47,6 @@ func (p *posixRoot) mountID() (id uint64, fstype string, ok bool) {
 		if mp != p.root {
 			continue
 		}
-		n, err := strconv.ParseUint(f[0], 10, 64)
-		if err != nil {
-			return 0, "", false
-		}
 		sep := -1
 		for i := 5; i < len(f); i++ {
 			if f[i] == "-" {
@@ -64,47 +55,50 @@ func (p *posixRoot) mountID() (id uint64, fstype string, ok bool) {
 			}
 		}
 		if sep < 0 || sep+1 >= len(f) {
-			return 0, "", false
+			continue
 		}
-		return n, f[sep+1], true
+		fstype, found = f[sep+1], true
 	}
-	return 0, "", false
+	return fstype, found
 }
 
 // checkMount enforces the mount requirements for canonical-namespace mode
 // (requireMount): the root must itself be a live mountpoint AND its
-// filesystem must not serve stale metadata. A fuse.juicefs mount must
-// prove zero metadata caching through the /.config control file
-// (synthesized by the JuiceFS daemon — not a regular file in the
-// namespace); any other FUSE type is refused as unverifiable; non-FUSE
-// mounts are kernel-coherent and pass. Fail closed: an unverifiable FUSE
-// mount is refused rather than trusted, because the CAS fingerprint gate
-// reads through this mount and a nonzero attr cache silently re-opens the
-// B1 clobber window.
+// filesystem must not serve stale metadata to this client. Freshness is
+// verified on every op — no verdict is cached across mount instances,
+// because neither st_dev nor the kernel mount ID is a safe generation key
+// (both are recycled; a recycled ID was observed resurrecting a stale
+// verdict and wedging a healthy remount into 503s).
 //
-// The verdict is cached per mount instance (kernel mount ID): remounting
-// with different flags allocates a new ID and is re-checked once, so the
-// steady state is one mountinfo read per request.
+// A fuse.juicefs mount must prove zero metadata caching through the
+// /.config control file (synthesized by the JuiceFS daemon — not a
+// regular file in the namespace). Other FUSE types are refused as
+// unverifiable, as are network filesystems (nfs/cifs/etc. have their own
+// client-side attribute caches we cannot inspect). Only known
+// kernel-coherent local filesystems pass. Fail closed by default, because
+// the CAS fingerprint gate reads through this mount and a nonzero attr
+// cache silently re-opens the B1 clobber window.
 func (p *posixRoot) checkMount() error {
-	id, fstype, ok := p.mountID()
+	fstype, ok := p.mountFSType()
 	if !ok {
 		return ErrMountUnavailable
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if id == p.lastMntID {
-		if p.mntOK {
-			return nil
-		}
-		return ErrMountPolicy
-	}
-	err := p.verifyFreshness(fstype)
-	if err == nil {
-		p.lastMntID, p.mntOK = id, true
-		return nil
-	}
-	p.lastMntID, p.mntOK = id, false
-	return err
+	return p.verifyFreshness(fstype)
+}
+
+// localCoherentFS are filesystems whose metadata is coherent across
+// processes on this kernel with no client-side cache layer — safe to
+// serve canonical-namespace ops on without further proof. Anything not
+// listed (including other FUSE types and network filesystems) is refused:
+// we cannot verify what we do not know.
+var localCoherentFS = map[string]bool{
+	"ext2": true, "ext3": true, "ext4": true,
+	"xfs": true, "btrfs": true, "f2fs": true,
+	"tmpfs": true, "ramfs": true, "overlay": true,
+	"zfs": true, "vfat": true, "exfat": true, "ntfs3": true,
+	"minix": true, "hfs": true, "hfsplus": true, "reiserfs": true,
+	"jfs": true, "nilfs2": true, "udf": true, "bcachefs": true,
+	"erofs": true, "squashfs": true, "msdos": true, "iso9660": true,
 }
 
 // verifyFreshness confirms the mounted filesystem cannot return stale
@@ -113,11 +107,11 @@ func (p *posixRoot) verifyFreshness(fstype string) error {
 	if fstype == "fuse.juicefs" {
 		return checkZeroMetadataCache(filepath.Join(p.root, ".config"))
 	}
-	if strings.HasPrefix(fstype, "fuse.") || fstype == "fuse" || fstype == "fuseblk" {
-		return fmt.Errorf("%w: FUSE filesystem %q cannot prove metadata freshness",
-			ErrMountPolicy, fstype)
+	if localCoherentFS[fstype] {
+		return nil
 	}
-	return nil // kernel-coherent filesystem; no client cache to distrust
+	return fmt.Errorf("%w: filesystem %q cannot prove metadata freshness",
+		ErrMountPolicy, fstype)
 }
 
 // checkZeroMetadataCache reads a JuiceFS /.config control file and requires
