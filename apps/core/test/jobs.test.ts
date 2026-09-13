@@ -455,3 +455,79 @@ test("graceful runner stop records the kill it performed", async () => {
   assert.equal(job.status, "failed");
   assert.ok(job.error?.includes("runner stopped"));
 });
+
+// --- Result accuracy (review D1/D2) ---------------------------------------
+
+// D1: output containing NUL cannot be stored in jsonb. The runner scrubs it
+// to U+FFFD and flags the rendering — the known exit-0 outcome is recorded
+// 'done', not stranded as 'lost'.
+test("runner scrubs NUL output and records the known outcome", async () => {
+  const s = newState();
+  await s.submitJob(PERSONA, {
+    jobId: "j-1",
+    kind: "subprocess",
+    request: { command: ["sh", "-c", "printf 'a\\0b\\n'"] },
+  });
+  const r = new JobRunner(runnerCfg(s));
+  await r.step();
+  await until(() => r.activeCount === 0);
+  const job = await s.getJob(PERSONA, "j-1");
+  assert.equal(job.status, "done");
+  assert.equal(job.result?.exit_code, 0);
+  assert.equal(job.result?.stdout, "a\uFFFDb\n");
+  assert.equal(job.result?.stdout_sanitized, true);
+  assert.ok(s.inputs.some((i) => i.input_id === "job:j-1"));
+  await r.stop();
+});
+
+// D1 fallback: a completion payload the service deterministically rejects
+// (400) is degraded once to a minimal honest record with the same observed
+// status — the job is not stranded as 'lost'.
+test("a 400-rejected completion degrades to a minimal honest record", async () => {
+  const s = newState();
+  await s.submitJob(PERSONA, {
+    jobId: "j-1",
+    kind: "subprocess",
+    request: { command: ["echo", "hi"] },
+  });
+  // The fake rejects the full result payload once (as the real service
+  // would for an un-storable field), then accepts the degraded record.
+  const wrapped: StateClient = Object.create(s);
+  const orig = s.completeJob.bind(s);
+  let rejected = false;
+  wrapped.completeJob = async (persona, jobId, req) => {
+    if (!rejected && Object.keys(req.result ?? {}).length > 0) {
+      rejected = true;
+      throw new StateError(400, "job result contains a NUL byte");
+    }
+    return orig(persona, jobId, req);
+  };
+  const r = new JobRunner(runnerCfg(wrapped));
+  await r.step();
+  await until(() => r.activeCount === 0);
+  const job = await s.getJob(PERSONA, "j-1");
+  assert.equal(job.status, "done"); // observed status preserved
+  assert.equal(job.result?.payload_rejected, true);
+  assert.ok(job.error?.includes("rejected deterministically"));
+  assert.ok(s.inputs.some((i) => i.input_id === "job:j-1"));
+  await r.stop();
+});
+
+// D2: an external signal with no cancel request is a failure, not a
+// cancellation — 'cancelled' is reserved for the observed cancel flow.
+test("an external signal without a cancel request records failed", async () => {
+  const s = newState();
+  await s.submitJob(PERSONA, {
+    jobId: "j-1",
+    kind: "subprocess",
+    request: { command: ["sh", "-c", "kill -SEGV $$"] },
+  });
+  const r = new JobRunner(runnerCfg(s));
+  await r.step();
+  await until(() => r.activeCount === 0);
+  const job = await s.getJob(PERSONA, "j-1");
+  assert.equal(job.status, "failed");
+  assert.equal(job.result?.signal, "SIGSEGV");
+  assert.ok(job.error?.includes("SIGSEGV"));
+  await r.stop();
+});

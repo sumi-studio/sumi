@@ -111,7 +111,7 @@ async function main() {
   const API_DIR = resolve(import.meta.dirname, "../../api");
   const SELF = resolve(import.meta.dirname, "e2e-jobs.mjs");
   const RUNNER_HOST = resolve(import.meta.dirname, "../src/host/job-runner.ts");
-  const PORT = 9890 + (process.pid % 500);
+  const PORT = 9450 + (process.pid % 10);
   const BASE = `http://127.0.0.1:${PORT}`;
   const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
   const WORKSPACE = mkdtempSync(join(tmpdir(), "sumi-jobs-ws-"));
@@ -660,6 +660,80 @@ async function main() {
       `lost notification consumed: ${consumed.status}`,
     );
     log("  claim expiry → lost + notify; no re-execution; dead runner refused");
+  }
+
+  // --- scenario 6: result accuracy -----------------------------------------
+  // NUL/binary output must not strand a known outcome as 'lost' (the runner
+  // scrubs un-storable bytes and flags the rendering), and an external
+  // signal with no cancel request is 'failed', not 'cancelled'.
+  log(
+    "scenario 6: NUL output records done+sanitized; external signal → failed",
+  );
+  {
+    // printf emits a literal NUL byte — valid UTF-8 output that jsonb
+    // cannot store. The runner must still durably record the exit-0 outcome.
+    const r = await submitJob("j-s6a", ["sh", "-c", "printf 'a\\0b\\n'"]);
+    assert(r.status === 201, `submit: ${r.text}`);
+    const runner = spawnRunner({ SUMI_RUNNER_ID: "runner-s6" });
+    await until(
+      async () => (await getJob("j-s6a")).json.job.status === "done",
+      20_000,
+      "j-s6a done",
+    );
+    const nulJob = (await getJob("j-s6a")).json.job;
+    assert(
+      nulJob.result.stdout === "a\uFFFDb\n",
+      `scrubbed stdout: ${JSON.stringify(nulJob.result.stdout)}`,
+    );
+    assert(
+      nulJob.result.stdout_sanitized === true,
+      `sanitized flag: ${JSON.stringify(nulJob.result)}`,
+    );
+    assert(
+      nulJob.result.exit_code === 0,
+      `exit_code: ${JSON.stringify(nulJob.result)}`,
+    );
+    const noteA = (await getInput("job:j-s6a")).json.input;
+    assert(
+      noteA && noteA.status === "queued" && noteA.kind === "job_completed",
+      `notification: ${JSON.stringify(noteA)}`,
+    );
+
+    // An external SIGSEGV — no cancel was ever requested — is a failure.
+    const r2 = await submitJob("j-s6b", ["sh", "-c", "kill -SEGV $$"]);
+    assert(r2.status === 201, `submit: ${r2.text}`);
+    await until(
+      async () =>
+        ["failed", "done", "cancelled"].includes(
+          (await getJob("j-s6b")).json.job.status,
+        ),
+      20_000,
+      "j-s6b terminal",
+    );
+    const segvJob = (await getJob("j-s6b")).json.job;
+    assert(
+      segvJob.status === "failed",
+      `expected failed, got ${segvJob.status}`,
+    );
+    assert(
+      segvJob.result.signal === "SIGSEGV",
+      `signal: ${JSON.stringify(segvJob.result)}`,
+    );
+    assert(/SIGSEGV/.test(segvJob.error ?? ""), `error: ${segvJob.error}`);
+    assert(
+      segvJob.cancel_requested_at === null,
+      "no cancel was requested — cancel_requested_at must stay null",
+    );
+    const noteB = (await getInput("job:j-s6b")).json.input;
+    assert(noteB && noteB.status === "queued", "one notification");
+
+    runner.kill("SIGTERM");
+    await until(
+      () => runner.exitCode !== null || runner.signalCode !== null,
+      10_000,
+      "runner-s6 exit",
+    );
+    log("  NUL output → done + sanitized flag; SIGSEGV → failed + signal");
   }
 
   log("PASS");

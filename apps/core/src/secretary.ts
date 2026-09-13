@@ -1,4 +1,4 @@
-import { jsonEqual } from "./json.ts";
+import { jsonEqual, scrubJson, truncateText } from "./json.ts";
 import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
 import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import { toolSpecs } from "./tools.ts";
@@ -92,7 +92,11 @@ export class Secretary {
       const now = Date.now();
       if (now - this.lastDispatch >= this.cfg.scheduleEveryMs) {
         this.lastDispatch = now;
-        const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
+        const fired = await state.dispatchSchedules(
+          personaId,
+          gen,
+          new Date(now),
+        );
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
       const turnId = this.cfg.idgen();
@@ -530,34 +534,6 @@ export class Secretary {
 // megabytes. Kept far below the state service's 1 MiB body limit so the
 // minimal fallback commit is always storable.
 const RECORDED_ERROR_BYTES = 8 * 1024;
-const TRUNC_MARK = "…[truncated]";
-
-/** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
-function scrubJson(v: unknown): unknown {
-  if (typeof v === "string") return v.replaceAll("\u0000", "\uFFFD");
-  if (Array.isArray(v)) return v.map(scrubJson);
-  if (v !== null && typeof v === "object") {
-    return Object.fromEntries(
-      Object.entries(v).map(([k, x]) => [k, scrubJson(x)]),
-    );
-  }
-  return v;
-}
-
-/**
- * Bound a string's UTF-8 encoding, cutting only at a code-point boundary
- * so multibyte and control characters can never push the result past
- * maxBytes. Truncation is explicit — the marker is part of the record.
- */
-function truncateText(s: string, maxBytes: number): string {
-  const enc = new TextEncoder().encode(s);
-  if (enc.length <= maxBytes) return s;
-  const markLen = new TextEncoder().encode(TRUNC_MARK).length;
-  let end = Math.max(0, maxBytes - markLen);
-  while (end > 0 && ((enc[end] ?? 0) & 0xc0) === 0x80) end--;
-  return new TextDecoder().decode(enc.subarray(0, end)) + TRUNC_MARK;
-}
-
 const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +

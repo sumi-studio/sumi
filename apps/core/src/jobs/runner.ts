@@ -16,6 +16,7 @@
 
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { scrubJson, truncateText } from "../json.ts";
 import type { StateClient } from "../state-client.ts";
 import { StateError } from "../state-client.ts";
 import type { Job, JobTerminalReport, SubprocessJobRequest } from "../types.ts";
@@ -80,6 +81,9 @@ interface Running {
   stderr: string;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  /** Stored text is not a byte-exact rendering of the raw stream. */
+  stdoutSanitized: boolean;
+  stderrSanitized: boolean;
   /** Set once completion has been durably recorded (or a conflict settled). */
   settled: boolean;
 }
@@ -237,8 +241,17 @@ export class JobRunner {
       if (stream === "stdout") r.stdoutTruncated = true;
       else r.stderrTruncated = true;
     }
-    if (stream === "stdout") r.stdout += take.toString("utf8");
-    else r.stderr += take.toString("utf8");
+    const text = take.toString("utf8");
+    // The stored value is a text rendering of the raw bytes, not the bytes
+    // themselves: invalid UTF-8 decodes to U+FFFD and NUL is scrubbed for
+    // jsonb at record time. Flag it so nobody reads the output as
+    // byte-perfect.
+    if (!Buffer.from(text, "utf8").equals(take) || text.includes("\u0000")) {
+      if (stream === "stdout") r.stdoutSanitized = true;
+      else r.stderrSanitized = true;
+    }
+    if (stream === "stdout") r.stdout += text;
+    else r.stderr += text;
   }
 
   /**
@@ -260,6 +273,8 @@ export class JobRunner {
       stderr: "",
       stdoutTruncated: false,
       stderrTruncated: false,
+      stdoutSanitized: false,
+      stderrSanitized: false,
       settled: false,
     };
     this.running.set(job.job_id, r);
@@ -344,6 +359,8 @@ export class JobRunner {
         stderr: r.stderr,
         stdout_truncated: r.stdoutTruncated,
         stderr_truncated: r.stderrTruncated,
+        stdout_sanitized: r.stdoutSanitized,
+        stderr_sanitized: r.stderrSanitized,
       };
       if (spawnError) {
         result.spawn_error = spawnError.message;
@@ -363,14 +380,16 @@ export class JobRunner {
       } else if (r.timedOut) {
         result.timed_out = true;
         await this.finish(r, "failed", result, `timeout after ${timeoutMs}ms`);
-      } else if (r.cancelObserved || signal) {
+      } else if (r.cancelObserved) {
+        // Only an observed cancel request makes this 'cancelled' —
+        // cancel_requested_at is already stored as evidence.
         if (signal) result.signal = signal;
-        await this.finish(
-          r,
-          "cancelled",
-          result,
-          r.cancelObserved ? "cancelled by request" : `killed by ${signal}`,
-        );
+        await this.finish(r, "cancelled", result, "cancelled by request");
+      } else if (signal) {
+        // An external signal with no cancel request is a failure, not a
+        // cancellation.
+        result.signal = signal;
+        await this.finish(r, "failed", result, `killed by ${signal}`);
       } else if (code === 0) {
         await this.finish(r, "done", result, "");
       } else {
@@ -428,9 +447,18 @@ export class JobRunner {
 
   /**
    * Record the terminal outcome. The response may be lost — retry the
-   * identical body; identical replays return the stored row. A 409 means a
-   * different verdict is already durable (e.g. the claim was swept to lost
-   * or cancelled differently): accept it, log, stop retrying.
+   * identical body; identical replays return the stored row. The response
+   * codes are distinct verdicts:
+   *   - 409: a different outcome is already durable (claim swept to lost,
+   *     a divergent report) — the stored record stands; stop retrying.
+   *   - 400: this payload was rejected and nothing was stored. Retrying it
+   *     identically can never succeed, so the report is degraded once to a
+   *     minimal honest record (same observed status, rejection noted) — a
+   *     known outcome is never stranded as 'lost' just because its payload
+   *     was un-storable. If even the minimal record is rejected, the claim
+   *     expires and the sweep reconciles to 'lost'.
+   * Everything sent is NUL-scrubbed first — jsonb and the text error column
+   * can never hold 0x00.
    */
   private async finish(
     r: Running,
@@ -438,20 +466,27 @@ export class JobRunner {
     result: Record<string, unknown>,
     error: string,
   ): Promise<void> {
+    const report = {
+      runnerId: this.cfg.runnerId,
+      status,
+      result: scrubJson(result) as Record<string, unknown>,
+      error: scrubJson(error) as string,
+    };
     const attempts = 5;
+    let degraded = false;
     for (let i = 0; i < attempts && !r.settled; i++) {
       try {
         await this.cfg.state.completeJob(this.cfg.personaId, r.job.job_id, {
-          runnerId: this.cfg.runnerId,
-          status,
-          result,
-          error,
+          runnerId: report.runnerId,
+          status: report.status,
+          result: report.result,
+          error: report.error,
         });
         r.settled = true;
         this.log("job completed", { job_id: r.job.job_id, status });
         return;
       } catch (e) {
-        if (e instanceof StateError && (e.status === 409 || e.status === 400)) {
+        if (e instanceof StateError && e.status === 409) {
           this.log("job completion settled by stored record", {
             job_id: r.job.job_id,
             stored: e.job?.status,
@@ -459,6 +494,31 @@ export class JobRunner {
           });
           r.settled = true;
           return;
+        }
+        if (e instanceof StateError && e.status === 400) {
+          if (degraded) {
+            this.log(
+              "job completion rejected deterministically (claim will expire → lost)",
+              {
+                job_id: r.job.job_id,
+                status,
+                error: e.message,
+              },
+            );
+            return;
+          }
+          degraded = true;
+          const why = truncateText(scrubJson(e.message) as string, 512);
+          report.result = {
+            payload_rejected: true,
+            rejection: why,
+            original_status: status,
+          };
+          report.error = truncateText(
+            `completion payload rejected deterministically (${why}); observed: ${status}${report.error ? ` — ${report.error}` : ""}`,
+            4 * 1024,
+          );
+          continue;
         }
         if (i + 1 < attempts) {
           await sleep(100 * 2 ** i);

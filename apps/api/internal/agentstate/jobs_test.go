@@ -76,6 +76,8 @@ func TestJobValidation(t *testing.T) {
 		{"op:in-1:0", "subprocess", subReq("echo")}, // reserved tool-derived prefix
 		{"claim", "subprocess", subReq("echo")},     // reserved route word
 		{strings.Repeat("x", 300), "subprocess", subReq("echo")},
+		{"j\x00x", "subprocess", subReq("echo")}, // NUL in a text column
+		{"j-x", "subprocess", map[string]any{"command": []any{"echo", "a\x00b"}}},
 	}
 	for i, b := range bad {
 		if _, _, err := s.SubmitJob(ctx, pa, b.jobID, b.kind, b.req, "api"); !errors.Is(err, ErrBadRequest) {
@@ -86,6 +88,41 @@ func TestJobValidation(t *testing.T) {
 	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "job:x",
 		Kind: "message", Payload: map[string]any{}}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("job: input err = %v, want ErrBadRequest", err)
+	}
+}
+
+// A NUL byte in the completion payload is a deterministic 400, not a
+// stranded job: jsonb cannot store one in result and text cannot in error.
+// The runner scrubs before sending, but the boundary holds regardless.
+func TestJobCompleteNULBoundaries(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("echo"), "api"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
+		map[string]any{"stdout": "a\x00b"}, ""); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL result err = %v, want ErrBadRequest", err)
+	}
+	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
+		map[string]any{}, "err\x00or"); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL error err = %v, want ErrBadRequest", err)
+	}
+	// A rejected payload stored nothing: the job is still running for the
+	// claiming runner and a clean completion succeeds.
+	done, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
+		map[string]any{"exit_code": 0.0}, "")
+	if err != nil || done.Status != "done" {
+		t.Fatalf("complete after rejection: %+v err=%v", done, err)
+	}
+	// NUL in a claim runner_id is rejected at the same boundary.
+	if _, _, err := s.ClaimJobs(ctx, pa, "r\x00", []string{"subprocess"}, time.Minute, 4); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL runner_id err = %v, want ErrBadRequest", err)
 	}
 }
 

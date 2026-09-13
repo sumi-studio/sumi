@@ -38,6 +38,9 @@ running/cancel_requested + expired claim ──sweep──> lost
   heartbeat, stops the process (SIGTERM → SIGKILL), and completes with the
   outcome it actually observed — `cancelled`, or the real exit result if
   the command had already finished (`cancel_requested_at` stays recorded).
+- `cancelled` means the cancel flow ran: an external signal (SIGSEGV,
+  OOM-kill) with no cancel request records `failed` with `result.signal`,
+  not `cancelled`.
 - `lost` is terminal and honest: the runner's claim expired without a
   completion, so the subprocess outcome is unknown. The job is never
   silently re-executed.
@@ -95,12 +98,19 @@ submit boundary.
 - Child env is minimal (`PATH`, `HOME`, `LANG`) + `request.env` + runner
   `baseEnv` — the child does not inherit service tokens from the runner.
 - stdout/stderr are bounded (`SUMI_JOB_MAX_OUTPUT_BYTES`, default 256 KiB,
-  truncation flagged).
+  truncation flagged). Stored output is a *text rendering* of the raw
+  bytes: invalid UTF-8 decodes to U+FFFD and NUL (un-storable in jsonb) is
+  scrubbed to U+FFFD — either sets `stdout_sanitized`/`stderr_sanitized`
+  on the result so nobody reads it as byte-exact.
 - Heartbeats at ~lease/3; on `cancel_requested` SIGTERMs then SIGKILLs; on a
   `409` (terminal/lost/claimed-away) kills the child and leaves the stored
   verdict.
 - Completion retries the identical body on transient failure; a `409` means
-  the record already settled — the runner accepts it.
+  the record already settled — the runner accepts it. A `400` means the
+  payload itself was rejected and nothing was stored: the runner degrades
+  once to a minimal record (`payload_rejected: true`, same observed status)
+  so a known outcome is never stranded as `lost`; if that is rejected too,
+  the claim expires and the sweep reconciles.
 - Graceful `stop()` records `failed: runner stopped` for jobs it killed —
   a determinate outcome it knows. A `kill -9` crash records nothing; the
   claim expires and the job is swept to `lost`.

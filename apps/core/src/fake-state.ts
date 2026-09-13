@@ -865,10 +865,19 @@ export class FakeState implements StateClient {
     if (job.jobId.startsWith("op:") || job.jobId === "claim") {
       throw new StateError(400, `job_id ${job.jobId} is reserved`);
     }
+    if (hasNul(job.jobId)) {
+      throw new StateError(400, "job_id contains a NUL byte text cannot store");
+    }
     if (job.kind !== "subprocess") {
       throw new StateError(400, `unknown job kind ${job.kind}`);
     }
     validateSubprocessRequest(job.request);
+    if (hasNul(job.request)) {
+      throw new StateError(
+        400,
+        "job request contains a NUL byte jsonb cannot store",
+      );
+    }
     const key = `${persona}|${job.jobId}`;
     const existed = this.jobs.has(key);
     const stored = this.insertJob(
@@ -973,6 +982,18 @@ export class FakeState implements StateClient {
       throw new StateError(
         400,
         "complete status must be done, failed, or cancelled",
+      );
+    }
+    if (hasNul(req.result)) {
+      throw new StateError(
+        400,
+        "job result contains a NUL byte jsonb cannot store",
+      );
+    }
+    if (hasNul(req.error ?? "")) {
+      throw new StateError(
+        400,
+        "job error contains a NUL byte text cannot store",
       );
     }
     const job = this.mustJob(persona, jobId);

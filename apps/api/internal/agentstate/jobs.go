@@ -132,6 +132,9 @@ func validJobID(jobID string) error {
 	if jobID == "" || len(jobID) > 256 {
 		return fmt.Errorf("%w: job_id must be 1-256 characters", ErrBadRequest)
 	}
+	if strings.ContainsRune(jobID, 0) {
+		return fmt.Errorf("%w: job_id contains a NUL byte text cannot store", ErrBadRequest)
+	}
 	if strings.HasPrefix(jobID, jobToolPrefix) {
 		return fmt.Errorf("%w: job_id prefix %q is reserved", ErrBadRequest, jobToolPrefix)
 	}
@@ -376,6 +379,9 @@ func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds
 	if runnerID == "" || len(runnerID) > 256 {
 		return nil, nil, fmt.Errorf("%w: runner_id must be 1-256 characters", ErrBadRequest)
 	}
+	if strings.ContainsRune(runnerID, 0) {
+		return nil, nil, fmt.Errorf("%w: runner_id contains a NUL byte text cannot store", ErrBadRequest)
+	}
 	if len(kinds) == 0 {
 		return nil, nil, fmt.Errorf("%w: kinds required", ErrBadRequest)
 	}
@@ -504,6 +510,9 @@ func (s *Store) CompleteJob(ctx context.Context, personaID, jobID, runnerID, sta
 	}
 	if hasNUL(result) {
 		return Job{}, fmt.Errorf("%w: job result contains a NUL byte jsonb cannot store", ErrBadRequest)
+	}
+	if strings.ContainsRune(jobError, 0) {
+		return Job{}, fmt.Errorf("%w: job error contains a NUL byte text cannot store", ErrBadRequest)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
