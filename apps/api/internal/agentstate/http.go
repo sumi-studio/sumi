@@ -153,7 +153,8 @@ func storeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict):
+	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
+		errors.Is(err, ErrPersonaInactive):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
 		writeError(w, http.StatusBadRequest, err.Error())
