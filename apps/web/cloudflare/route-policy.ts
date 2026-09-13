@@ -55,7 +55,11 @@ export const workspaceIntegrationContract = Object.freeze({
 // Bare dynamic namespaces are not application pages. Keeping them out of the
 // SPA fallback makes a missing API route fail visibly instead of rendering the
 // signed-in shell. The other entries are private transports or dormant
-// artifacts that must never reach the canonical browser origin.
+// artifacts that must never reach the canonical browser origin. `/internal/*`
+// is the server-only namespace: provider transports live on the private
+// local-control registry, and the persona state service is reached by the
+// secretary core through its own configured service URL — never through this
+// public front door.
 export const deniedRoutes = Object.freeze({
   exact: Object.freeze([
     "/.env",
@@ -89,6 +93,7 @@ export const deniedRoutes = Object.freeze({
     "/workspace-invites",
     "/apps",
     "/agent/ws",
+    "/internal",
     "/local-control/v1",
     "/ready",
     "/mcp-app-sandbox.html",
@@ -110,6 +115,7 @@ export const deniedRoutes = Object.freeze({
     "/favicon.svg/",
     "/health/",
     "/index.html/",
+    "/internal/",
     "/local-control/v1/",
     "/mcp-app-sandbox.html/",
     "/node_modules/",
