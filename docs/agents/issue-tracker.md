@@ -2,6 +2,11 @@
 
 Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
+Work states (`state:ready`, `state:in-progress`, …) and the concurrent
+claim protocol live in [workflow.md](workflow.md). Claim through
+`scripts/operations/task-ledger`; do not treat a GitHub label edit as an
+atomic claim.
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.

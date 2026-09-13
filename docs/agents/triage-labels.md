@@ -12,4 +12,6 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
+These are the *intake* axis. The *work-state* axis (`state:ready`, `state:in-progress`, `state:review`, `state:blocked`) is defined in [workflow.md](workflow.md); the two coexist on the same issue.
+
 Edit the right-hand column to match whatever vocabulary you actually use.
