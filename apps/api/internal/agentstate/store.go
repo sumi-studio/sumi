@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,12 +160,46 @@ type EventInput struct {
 	Payload map[string]any `json:"payload"`
 }
 
+// PlanCall is one decided tool call inside a durable plan. call_id is the
+// model's own identifier (kept verbatim for later provider tool_calls
+// reconstruction); the call's position in calls is the durable identity.
+type PlanCall struct {
+	CallID  string         `json:"call_id,omitempty"`
+	Tool    string         `json:"tool"`
+	Request map[string]any `json:"request"`
+}
+
+// Decision is what the model decided for an input: reply text, the ordered
+// tool calls to execute, and reported usage. It is persisted before any
+// effect runs; recovery continues it instead of re-planning.
+type Decision struct {
+	Text  string         `json:"text"`
+	Calls []PlanCall     `json:"calls"`
+	Usage map[string]any `json:"usage"`
+}
+
+// TurnPlan is the durable record of one input's decision. One row per input,
+// immutable once written: a replayed identical save returns the stored row,
+// a conflicting save is rejected.
+type TurnPlan struct {
+	PersonaID  string    `json:"persona_id"`
+	InputID    string    `json:"input_id"`
+	TurnID     string    `json:"turn_id"`
+	Generation int64     `json:"generation"`
+	Plan       Decision  `json:"plan"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // LoadResult is one coarse read: the running or freshly begun turn, its
 // claimed input, and the journal tail the core assembles context from.
 type LoadResult struct {
 	Turn    *Turn   `json:"turn"`
 	Input   *Input  `json:"input"`
 	Context []Event `json:"context"`
+	// Plan is the input's recorded decision, if one exists — returned on
+	// both the fresh-claim and running-turn replay paths so a retried
+	// attempt continues the recorded plan rather than re-planning.
+	Plan *TurnPlan `json:"plan"`
 }
 
 // CommitRequest is the single end-of-turn write: journal entries plus the
@@ -493,6 +528,116 @@ func (s *Store) GetInput(ctx context.Context, personaID, inputID string) (Input,
 	return in, turn, err
 }
 
+// SavePlan durably records the model's decision for the input a running
+// turn is resolving — the "decision before effects" boundary (F1). The
+// caller names the turn; the input is derived server-side from the turn row
+// so it cannot be mis-asserted. One plan per input, immutable: replaying an
+// identical save returns the stored row; a conflicting save conflicts.
+func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generation int64, decision Decision) (TurnPlan, bool, error) {
+	if decision.Calls == nil {
+		decision.Calls = []PlanCall{}
+	}
+	if decision.Usage == nil {
+		decision.Usage = map[string]any{}
+	}
+	for i := range decision.Calls {
+		if decision.Calls[i].Tool == "" {
+			return TurnPlan{}, false, fmt.Errorf("%w: plan call %d missing tool", ErrBadRequest, i)
+		}
+		if decision.Calls[i].Request == nil {
+			decision.Calls[i].Request = map[string]any{}
+		}
+	}
+	planJSON, err := json.Marshal(decision)
+	if err != nil {
+		return TurnPlan{}, false, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TurnPlan{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
+		return TurnPlan{}, false, err
+	}
+	// The plan may only be authored by the live attempt: the named turn must
+	// be running under this generation.
+	var inputID string
+	var turnGen int64
+	var turnStatus string
+	err = tx.QueryRow(ctx,
+		`SELECT input_id, generation, status FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&inputID, &turnGen, &turnStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TurnPlan{}, false, ErrTurnNotFound
+	}
+	if err != nil {
+		return TurnPlan{}, false, err
+	}
+	if turnGen != generation || turnStatus != "running" {
+		return TurnPlan{}, false, ErrTurnConflict
+	}
+	var p TurnPlan
+	err = tx.QueryRow(ctx, `
+		INSERT INTO core_turn_plans (persona_id, input_id, turn_id, generation, plan)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (persona_id, input_id) DO NOTHING
+		RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
+		personaID, inputID, turnID, generation, planJSON).
+		Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A plan already exists for this input. Idempotent only when the
+		// decision is identical — a different plan under the same input is
+		// a contract violation, never a supersession.
+		var same bool
+		if err := tx.QueryRow(ctx, `
+			SELECT plan = $3::jsonb FROM core_turn_plans
+			WHERE persona_id = $1 AND input_id = $2`,
+			personaID, inputID, planJSON).Scan(&same); err != nil {
+			return TurnPlan{}, false, err
+		}
+		if !same {
+			return TurnPlan{}, false, fmt.Errorf("%w: input already has a different recorded plan", ErrTurnConflict)
+		}
+		stored, err := s.planForInput(ctx, tx, personaID, inputID)
+		if err != nil {
+			return TurnPlan{}, false, err
+		}
+		if stored == nil {
+			return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
+		}
+		p = *stored
+		if err := tx.Commit(ctx); err != nil {
+			return TurnPlan{}, false, err
+		}
+		return p, false, nil
+	}
+	if err != nil {
+		return TurnPlan{}, false, fmt.Errorf("save plan: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TurnPlan{}, false, err
+	}
+	return p, true, nil
+}
+
+// planForInput returns the recorded decision for an input, or nil.
+func (s *Store) planForInput(ctx context.Context, db queryRower, personaID, inputID string) (*TurnPlan, error) {
+	var p TurnPlan
+	err := db.QueryRow(ctx, `
+		SELECT persona_id, input_id, turn_id, generation, plan, created_at
+		FROM core_turn_plans WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID).
+		Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 // clampLimit bounds caller-supplied list sizes: non-positive picks the
 // default, oversized values are capped server-side.
 func clampLimit(v, def, max int) int {
@@ -624,6 +769,15 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 		res.Input = &in
 	}
 	res.Turn = t
+	if res.Input != nil {
+		// A recorded plan belongs to the input's resolution lineage, so it
+		// surfaces on whichever attempt is running now — fresh claim or
+		// replayed running turn alike.
+		res.Plan, err = s.planForInput(ctx, tx, personaID, res.Input.InputID)
+		if err != nil {
+			return res, err
+		}
+	}
 	res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
 	if err != nil {
 		return res, err
@@ -991,13 +1145,16 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // external effect and its completion leaves a 'running' record that the next
 // generation reclaims — reconciliation by querying the external system is the
 // caller's duty, the ledger alone cannot prove an ambiguous external effect.
-func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool, idemKey string, request map[string]any) (Operation, bool, error) {
+func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, bool, error) {
 	if !isInternalTool(tool) {
 		// This slice has no external executor; claiming an unregistered tool
 		// would record a permanently dangling 'running' operation. Reject at
 		// the boundary — the authorized external-tool contract (M08) adds its
 		// own claim path.
 		return Operation{}, false, fmt.Errorf("%w: %s", ErrUnknownTool, tool)
+	}
+	if request == nil {
+		request = map[string]any{}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1010,11 +1167,12 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	// Operations are attributed to a turn; that turn must be the live one —
 	// running under this generation — so an effect cannot be recorded
 	// against a nonexistent or other-epoch turn.
+	var inputID string
 	var turnGen int64
 	var turnStatus string
 	err = tx.QueryRow(ctx,
-		`SELECT generation, status FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
-		personaID, turnID).Scan(&turnGen, &turnStatus)
+		`SELECT input_id, generation, status FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&inputID, &turnGen, &turnStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Operation{}, false, ErrTurnNotFound
 	}
@@ -1024,6 +1182,33 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	if turnGen != generation || turnStatus != "running" {
 		return Operation{}, false, ErrTurnConflict
 	}
+	// The claim must be an entry of the input's recorded plan: the decision
+	// is durable before effects, so an off-plan call — absent plan, index
+	// out of range, or a different tool/request at that position — is a
+	// contract violation, never a fresh effect.
+	if callIndex < 0 {
+		return Operation{}, false, fmt.Errorf("%w: call_index must be >= 0", ErrBadRequest)
+	}
+	var planned bool
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(
+			((plan->'calls'->($3::int))->>'tool') = $4
+			AND ((plan->'calls'->($3::int))->'request') = $5::jsonb,
+			false)
+		FROM core_turn_plans WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID, callIndex, tool, request).Scan(&planned)
+	if errors.Is(err, pgx.ErrNoRows) {
+		planned = false
+	} else if err != nil {
+		return Operation{}, false, err
+	}
+	if !planned {
+		return Operation{}, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
+	}
+	// Effect identity is server-owned: derived from the turn's input and the
+	// plan position. A caller-chosen key could otherwise mint a second
+	// effect for the same planned call.
+	idemKey := inputID + ":tool:" + strconv.Itoa(callIndex)
 	// Claim first: the idempotency insert decides whether this call owns the
 	// effect. The internal effect is applied only on a fresh claim, then the
 	// operation is finalized in the same transaction — record and effect are

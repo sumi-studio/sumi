@@ -86,6 +86,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/writer/release", s.releaseWriter)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/recover", s.recover)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/turns/load", s.loadTurn)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/turns/plan", s.savePlan)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/turns/{turn}/commit", s.commitTurn)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/events", s.events)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/operations/claim", s.claimOperation)
@@ -440,34 +441,71 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": evs})
 }
 
+// savePlan records the model's decision for the turn's input before any of
+// its effects execute — the durable F1 boundary. Identical resaves replay
+// the stored plan; a conflicting decision for the same input conflicts.
+func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Generation int64          `json:"generation"`
+		TurnID     string         `json:"turn_id"`
+		Text       string         `json:"text"`
+		Calls      *[]PlanCall    `json:"calls"`
+		Usage      map[string]any `json:"usage"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.TurnID == "" || req.Calls == nil {
+		writeError(w, http.StatusBadRequest, "turn_id and calls (array) required")
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	plan, created, err := s.store.SavePlan(r.Context(), personaID, req.TurnID, req.Generation, Decision{
+		Text:  req.Text,
+		Calls: *req.Calls,
+		Usage: req.Usage,
+	})
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"plan": plan, "created": created})
+}
+
 func (s *Server) claimOperation(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		Generation     int64          `json:"generation"`
-		OperationID    string         `json:"operation_id"`
-		TurnID         string         `json:"turn_id"`
-		Tool           string         `json:"tool"`
-		IdempotencyKey string         `json:"idempotency_key"`
-		Request        map[string]any `json:"request"`
+		Generation  int64          `json:"generation"`
+		OperationID string         `json:"operation_id"`
+		TurnID      string         `json:"turn_id"`
+		Tool        string         `json:"tool"`
+		CallIndex   *int           `json:"call_index"`
+		Request     map[string]any `json:"request"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
-	if req.OperationID == "" || req.TurnID == "" || req.Tool == "" || req.IdempotencyKey == "" {
-		writeError(w, http.StatusBadRequest, "operation_id, turn_id, tool, idempotency_key required")
+	// No caller idempotency_key: effect identity is derived server-side from
+	// the turn's input and call_index, so a supplied legacy key can never
+	// mint a second effect for the same planned call.
+	if req.OperationID == "" || req.TurnID == "" || req.Tool == "" || req.CallIndex == nil {
+		writeError(w, http.StatusBadRequest, "operation_id, turn_id, tool, call_index required")
 		return
 	}
 	if !requireGen(w, req.Generation) {
 		return
 	}
-	if req.Request == nil {
-		req.Request = map[string]any{}
-	}
 	op, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
-		req.OperationID, req.Tool, req.IdempotencyKey, req.Request)
+		req.OperationID, req.Tool, *req.CallIndex, req.Request)
 	if err != nil {
 		storeError(w, err)
 		return

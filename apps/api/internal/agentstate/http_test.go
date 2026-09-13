@@ -211,3 +211,108 @@ func TestHTTPBoundaryValidation(t *testing.T) {
 		t.Fatalf("claim missing fields: %d, want 400", rec.Code)
 	}
 }
+
+func TestHTTPPlanAndClaimBoundary(t *testing.T) {
+	_, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	tok := created.PersonaToken
+
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
+		`{"holder_id":"h1","ttl_ms":60000}`)
+	var lease WriterLease
+	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
+	gen := itoa(lease.Generation)
+	do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
+		`{"input_id":"i1","kind":"message","payload":{"text":"hi"}}`)
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok,
+		`{"generation":`+gen+`}`)
+	var load LoadResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &load)
+	if load.Plan != nil {
+		t.Fatalf("fresh input should have no plan: %+v", load.Plan)
+	}
+	turnID := load.Turn.TurnID
+
+	// Missing calls array → 400.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"hi"}`); rec.Code != 400 {
+		t.Fatalf("plan without calls: %d, want 400", rec.Code)
+	}
+	// Save the decision.
+	planBody := `{"generation":` + gen + `,"turn_id":"` + turnID + `","text":"noted",
+		"calls":[{"tool":"journal.note","request":{"text":"keep me"}}]}`
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok, planBody)
+	if rec.Code != 200 {
+		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
+	}
+	var saved struct {
+		Plan    TurnPlan `json:"plan"`
+		Created bool     `json:"created"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &saved)
+	if !saved.Created || saved.Plan.InputID != "i1" || saved.Plan.Plan.Text != "noted" {
+		t.Fatalf("saved plan: %+v", saved)
+	}
+	// Identical resave replays.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok, planBody)
+	var resaved struct {
+		Created bool `json:"created"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resaved)
+	if rec.Code != 200 || resaved.Created {
+		t.Fatalf("identical resave: %d created=%v", rec.Code, resaved.Created)
+	}
+	// Divergent resave conflicts.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"other","calls":[]}`); rec.Code != 409 {
+		t.Fatalf("divergent plan: %d, want 409", rec.Code)
+	}
+	// Load replay surfaces the plan.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok, `{"generation":`+gen+`}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &load)
+	if load.Plan == nil || len(load.Plan.Plan.Calls) != 1 {
+		t.Fatalf("load replay plan: %+v", load.Plan)
+	}
+
+	// Claim without call_index → 400; a spoofed legacy idempotency_key is
+	// an unknown field → 400, never an identity.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":`+gen+`,"operation_id":"o1","turn_id":"`+turnID+`","tool":"journal.note","request":{"text":"keep me"}}`); rec.Code != 400 {
+		t.Fatalf("claim without call_index: %d, want 400", rec.Code)
+	}
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":`+gen+`,"operation_id":"o1","turn_id":"`+turnID+`","tool":"journal.note","call_index":0,"idempotency_key":"spoofed","request":{"text":"keep me"}}`); rec.Code != 400 {
+		t.Fatalf("claim with legacy key: %d, want 400 (unknown field)", rec.Code)
+	}
+	// On-plan claim executes.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":`+gen+`,"operation_id":"o1","turn_id":"`+turnID+`","tool":"journal.note","call_index":0,"request":{"text":"keep me"}}`)
+	if rec.Code != 200 {
+		t.Fatalf("on-plan claim: %d %s", rec.Code, rec.Body)
+	}
+	var claimed struct {
+		Operation Operation `json:"operation"`
+		Fresh     bool      `json:"fresh"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &claimed)
+	if !claimed.Fresh || claimed.Operation.IdempotencyKey != "i1:tool:0" {
+		t.Fatalf("claim: %+v", claimed)
+	}
+	// Same position under a different operation_id replays the receipt.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":`+gen+`,"operation_id":"o2","turn_id":"`+turnID+`","tool":"journal.note","call_index":0,"request":{"text":"keep me"}}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &claimed)
+	if rec.Code != 200 || claimed.Fresh || claimed.Operation.OperationID != "o1" {
+		t.Fatalf("replay claim: %d %+v", rec.Code, claimed)
+	}
+	// Off-plan position → 409.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":`+gen+`,"operation_id":"o3","turn_id":"`+turnID+`","tool":"journal.note","call_index":1,"request":{"text":"x"}}`); rec.Code != 409 {
+		t.Fatalf("off-plan claim: %d, want 409", rec.Code)
+	}
+}
