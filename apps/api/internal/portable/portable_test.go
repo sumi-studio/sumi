@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -586,6 +587,26 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 	var mu sync.Mutex
 	accepted, refused := map[string]bool{}, map[string]bool{}
 	var wg sync.WaitGroup
+
+	// The seal is scheduled deliberately, not by a wall-clock guess: it
+	// begins once a counted slice of inputs has been accepted, while the
+	// rest of the stream is still racing it, and each worker's final
+	// submission is held until the seal returns. The cut is therefore
+	// guaranteed to straddle the stream — at least startSealAfter accepted,
+	// at least one refused per worker — with everything in between
+	// genuinely concurrent with the sealing transaction.
+	const startSealAfter = 30
+	var nAccepted atomic.Int64
+	sealAt := make(chan struct{})
+	sealed := make(chan struct{})
+	destination := newID(t)
+	var sealErr error
+	go func() {
+		<-sealAt
+		_, sealErr = local.svc.Seal(ctx, pid, "move-0007", destination)
+		close(sealed)
+	}()
+
 	start := make(chan struct{})
 	for w := 0; w < 6; w++ {
 		wg.Add(1)
@@ -593,12 +614,18 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for i := 0; i < 200; i++ {
+				if i == 199 {
+					<-sealed
+				}
 				id := fmt.Sprintf("race-%d-%03d", w, i)
 				_, created, err := local.state.SubmitInput(ctx, &agentstate.Input{PersonaID: pid, InputID: id, Kind: "message", Payload: map[string]any{"i": i}})
 				mu.Lock()
 				switch {
 				case err == nil && created:
 					accepted[id] = true
+					if nAccepted.Add(1) == startSealAfter {
+						close(sealAt)
+					}
 				case errors.Is(err, agentstate.ErrPersonaInactive):
 					refused[id] = true
 				default:
@@ -609,9 +636,10 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 		}(w)
 	}
 	close(start)
-	time.Sleep(20 * time.Millisecond)
-	must(local.svc.Seal(ctx, pid, "move-0007", newID(t)))
 	wg.Wait()
+	if sealErr != nil {
+		t.Fatalf("seal: %v", sealErr)
+	}
 	bundle, _ := exportBytes(t, local, pid, "move-0007")
 
 	exported := map[string]bool{}
