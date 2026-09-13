@@ -1012,6 +1012,7 @@ describe("logout authority transition", () => {
       expect(authMocks.beginRedirectSignIn).toHaveBeenCalledWith({
         provider: "google.com",
         intent: "sign_in",
+        isAborted: expect.any(Function),
       });
     });
     // Navigation can lag the click. Until the tab actually leaves, a session
@@ -1763,6 +1764,54 @@ describe("redirect return resilience", () => {
         "unauthenticated",
       );
     });
+  });
+
+  it("aborts an in-flight begin when the page is restored mid-registration", async () => {
+    // The restore path must mark the still-registering attempt obsolete so a
+    // late startAuthFlow resolution cannot drag the tab to the provider, and
+    // a later attempt must not inherit the cancellation.
+    let isAborted: (() => boolean) | undefined;
+    authMocks.beginRedirectSignIn.mockImplementation(
+      (options: { isAborted?: () => boolean }) => {
+        isAborted = options.isAborted;
+        return new Promise<void>(() => undefined);
+      },
+    );
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalledTimes(1);
+    });
+    const firstAttemptAborted = isAborted;
+    expect(firstAttemptAborted?.()).toBe(false);
+
+    await act(async () => {
+      dispatchPersistedPageShow();
+      await Promise.resolve();
+    });
+    expect(firstAttemptAborted?.()).toBe(true);
+    // The restore also released the navigation hold and read the session.
+    await waitFor(() => {
+      expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalledTimes(2);
+    });
+    expect(isAborted).not.toBe(firstAttemptAborted);
+    expect(isAborted?.()).toBe(false);
   });
 
   it("names an expired flow when the server rejects a real credential", async () => {

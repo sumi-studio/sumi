@@ -23,8 +23,9 @@ import { getFirebaseAuth } from "./firebase";
 import { AuthAPIError } from "./session-client";
 
 /**
- * The browser came back without a provider result: the person cancelled, used
- * the back button, or the browser discarded Firebase's pending redirect.
+ * The attempt ended without a provider result: the person cancelled, used the
+ * back button, came back before the tab could leave, or the browser discarded
+ * Firebase's pending redirect.
  */
 export class RedirectSignInAbandonedError extends Error {
   constructor() {
@@ -62,10 +63,17 @@ export function hasPendingRedirectSignIn(): boolean {
 export async function beginRedirectSignIn({
   provider,
   intent,
+  isAborted,
 }: {
   provider: RecoverableProvider;
   intent: AuthIntent;
-}): Promise<never> {
+  /**
+   * Checked once the server-side flow registration resolves. A page restored
+   * from the back/forward cache — or an attempt superseded by a newer one —
+   * means this attempt must not navigate the tab away again.
+   */
+  isAborted?: () => boolean;
+}): Promise<void> {
   clearPendingRedirectFlow();
   const auth = getFirebaseAuth();
   const nonce = createAuthFlowNonce();
@@ -75,6 +83,12 @@ export async function beginRedirectSignIn({
     continuation: "/",
     nonce,
   });
+  if (isAborted?.()) {
+    // The person already returned to this page while the flow was being
+    // registered. No receipt was written yet, so nothing needs cleanup:
+    // report the attempt as abandoned and stay on the login screen.
+    throw new RedirectSignInAbandonedError();
+  }
   const flow: PendingRedirectAuthFlow = {
     flowId: started.flowId,
     nonce,
@@ -90,7 +104,7 @@ export async function beginRedirectSignIn({
     );
   }
   try {
-    return await signInWithRedirect(auth, createRedirectProvider(provider));
+    await signInWithRedirect(auth, createRedirectProvider(provider));
   } catch (error) {
     clearPendingRedirectFlow();
     throw error;

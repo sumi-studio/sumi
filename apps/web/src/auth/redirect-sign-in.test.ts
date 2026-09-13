@@ -145,6 +145,21 @@ describe("beginRedirectSignIn", () => {
     expect(mocks.signInWithRedirect).not.toHaveBeenCalled();
   });
 
+  it("aborts without navigating when a restored page cancelled the attempt", async () => {
+    let aborted = false;
+    const begin = beginRedirectSignIn({
+      provider: "google.com",
+      intent: "sign_in",
+      isAborted: () => aborted,
+    });
+    // The back/forward-cache restore lands while startAuthFlow is in flight.
+    aborted = true;
+
+    await expect(begin).rejects.toBeInstanceOf(RedirectSignInAbandonedError);
+    expect(mocks.signInWithRedirect).not.toHaveBeenCalled();
+    expect(loadPendingRedirectFlow()).toBeNull();
+  });
+
   it("clears the receipt when leaving the tab fails", async () => {
     const failure = new Error("navigation failed");
     mocks.signInWithRedirect.mockRejectedValue(failure);

@@ -167,7 +167,9 @@ export interface AuthContextValue {
   ) => Promise<ConfirmedSumiProfile | null>;
   updateDisplayName: (displayName: string) => Promise<void>;
   logout: () => Promise<void>;
-  refreshSession: () => Promise<AuthSessionState>;
+  refreshSession: (options?: {
+    background?: boolean;
+  }) => Promise<AuthSessionState>;
 }
 
 export const AuthContext = createContext<AuthContextValue | null>(null);
@@ -209,6 +211,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
   const [redirectSignInError, setRedirectSignInError] = useState<unknown>(null);
   const redirectReturnClaimed = useRef(false);
+  // Each signIn gets an attempt id; a restored page or a newer attempt makes
+  // an in-flight begin obsolete, and it must not navigate the tab away.
+  const redirectBeginSeq = useRef(0);
+  const redirectBeginCancelled = useRef(0);
   const signInPending = useRef(redirectSignInPending);
   const serverSession = useRef<SumiSessionStatus>(session);
 
@@ -286,105 +292,116 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const refreshSession = useCallback(async (): Promise<AuthSessionState> => {
-    if (preissuedSessionMode) {
-      const generation = nextGeneration();
-      if (isCurrentGeneration(generation)) {
-        setSession({ authenticated: false });
-        setSessionState("preissued");
-      }
-      return "preissued";
-    }
-    if (!authOriginAllowed) {
-      setSession({ authenticated: false });
-      setSessionState("unavailable");
-      return "unavailable";
-    }
-    // A provider redirect can still be in flight when a component effect runs:
-    // on this startup its return is being exchanged. A server read during that
-    // interval must not cancel it.
-    if (signInPending.current || logoutPending.current) return "checking";
-    const generation = nextGeneration();
-    // A dropped socket does not end the authenticated session. Keep the
-    // workspace mounted while checking it so drafts and uploads survive a
-    // temporary network failure. Initial authentication still blocks the UI.
-    if (
-      !serverSession.current.authenticated ||
-      sessionRevalidationRequired.current
-    ) {
-      setSessionState("checking");
-    }
-    let nextSession: SumiSessionStatus;
-    try {
-      nextSession = await getSumiSession();
-    } catch (error) {
-      if (!isCurrentGeneration(generation)) return "checking";
-      let nextState = classifySessionFailure(error);
-      if (nextState === "unavailable" && serverSession.current.authenticated) {
-        // A failed logout may already have cleared the cookie. Keep the work
-        // paused until a fresh server read establishes who is authenticated.
-        if (sessionRevalidationRequired.current) {
-          setSessionState("unavailable");
-          return "unavailable";
+  const refreshSession = useCallback(
+    async (options?: { background?: boolean }): Promise<AuthSessionState> => {
+      if (preissuedSessionMode) {
+        const generation = nextGeneration();
+        if (isCurrentGeneration(generation)) {
+          setSession({ authenticated: false });
+          setSessionState("preissued");
         }
-        return "authenticated";
+        return "preissued";
       }
-      const sessionRejected = nextState === "unauthenticated";
-      flushSync(() => {
-        if (sessionRejected && !clearDirectChatAuthority()) {
-          nextState = "unavailable";
-        }
-        sessionRevalidationRequired.current = false;
-        setSessionSuspended(false);
-        serverSession.current = { authenticated: false };
-        setSession({ authenticated: false });
-        setSessionState(nextState);
-      });
-      if (sessionRejected) {
-        clearAuthOutcomeNotice();
-        setOutcomeNotice(null);
-      }
-      return nextState;
-    }
-    if (!isCurrentGeneration(generation)) return "checking";
-    try {
-      let nextState: AuthSessionState = nextSession.authenticated
-        ? "authenticated"
-        : "unauthenticated";
-      flushSync(() => {
-        if (nextSession.authenticated) {
-          clearPendingConfirmation();
-          setConfirmation(null);
-          bindDirectChatAuthority(nextSession.authorityBindingId);
-        } else if (!clearDirectChatAuthority()) {
-          nextState = "unavailable";
-        }
-        sessionRevalidationRequired.current = false;
-        setSessionSuspended(false);
-        serverSession.current = nextSession;
-        setSession(nextSession);
-        setSessionState(nextState);
-      });
-      if (nextSession.authenticated) claimSavedOutcomeNotice(nextSession);
-      else {
-        clearAuthOutcomeNotice();
-        setOutcomeNotice(null);
-      }
-      return nextState;
-    } catch {
-      // A failed private-state reset is an authority-transition failure,
-      // not a transient session read that can retain the previous workspace.
-      flushSync(() => {
-        clearDirectChatAuthority();
-        sessionRevalidationRequired.current = false;
-        setSessionSuspended(false);
-        serverSession.current = { authenticated: false };
+      if (!authOriginAllowed) {
         setSession({ authenticated: false });
         setSessionState("unavailable");
-      });
-      return "unavailable";
-    }
-  }, [claimSavedOutcomeNotice, isCurrentGeneration, nextGeneration]);
+        return "unavailable";
+      }
+      // A provider redirect can still be in flight when a component effect runs:
+      // on this startup its return is being exchanged. A server read during that
+      // interval must not cancel it.
+      if (signInPending.current || logoutPending.current) return "checking";
+      const generation = nextGeneration();
+      // A dropped socket does not end the authenticated session. Keep the
+      // workspace mounted while checking it so drafts and uploads survive a
+      // temporary network failure. Initial authentication still blocks the UI.
+      // A background read — reconciliation after a failed redirect return —
+      // must not bounce the unauthenticated login form through "checking"
+      // either: its local state (a typed address, a link-sent notice) survives
+      // unless the read produces a real transition.
+      if (
+        (!serverSession.current.authenticated &&
+          options?.background !== true) ||
+        sessionRevalidationRequired.current
+      ) {
+        setSessionState("checking");
+      }
+      let nextSession: SumiSessionStatus;
+      try {
+        nextSession = await getSumiSession();
+      } catch (error) {
+        if (!isCurrentGeneration(generation)) return "checking";
+        let nextState = classifySessionFailure(error);
+        if (
+          nextState === "unavailable" &&
+          serverSession.current.authenticated
+        ) {
+          // A failed logout may already have cleared the cookie. Keep the work
+          // paused until a fresh server read establishes who is authenticated.
+          if (sessionRevalidationRequired.current) {
+            setSessionState("unavailable");
+            return "unavailable";
+          }
+          return "authenticated";
+        }
+        const sessionRejected = nextState === "unauthenticated";
+        flushSync(() => {
+          if (sessionRejected && !clearDirectChatAuthority()) {
+            nextState = "unavailable";
+          }
+          sessionRevalidationRequired.current = false;
+          setSessionSuspended(false);
+          serverSession.current = { authenticated: false };
+          setSession({ authenticated: false });
+          setSessionState(nextState);
+        });
+        if (sessionRejected) {
+          clearAuthOutcomeNotice();
+          setOutcomeNotice(null);
+        }
+        return nextState;
+      }
+      if (!isCurrentGeneration(generation)) return "checking";
+      try {
+        let nextState: AuthSessionState = nextSession.authenticated
+          ? "authenticated"
+          : "unauthenticated";
+        flushSync(() => {
+          if (nextSession.authenticated) {
+            clearPendingConfirmation();
+            setConfirmation(null);
+            bindDirectChatAuthority(nextSession.authorityBindingId);
+          } else if (!clearDirectChatAuthority()) {
+            nextState = "unavailable";
+          }
+          sessionRevalidationRequired.current = false;
+          setSessionSuspended(false);
+          serverSession.current = nextSession;
+          setSession(nextSession);
+          setSessionState(nextState);
+        });
+        if (nextSession.authenticated) claimSavedOutcomeNotice(nextSession);
+        else {
+          clearAuthOutcomeNotice();
+          setOutcomeNotice(null);
+        }
+        return nextState;
+      } catch {
+        // A failed private-state reset is an authority-transition failure,
+        // not a transient session read that can retain the previous workspace.
+        flushSync(() => {
+          clearDirectChatAuthority();
+          sessionRevalidationRequired.current = false;
+          setSessionSuspended(false);
+          serverSession.current = { authenticated: false };
+          setSession({ authenticated: false });
+          setSessionState("unavailable");
+        });
+        return "unavailable";
+      }
+    },
+    [claimSavedOutcomeNotice, isCurrentGeneration, nextGeneration],
+  );
 
   useEffect(() => {
     void refreshSession();
@@ -589,8 +606,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // It must still run when the exchange committed under a generation it
         // lost — the cookie may hold a session the UI never published, and a
         // competing operation's own read may have run inside the deferred
-        // window and returned "checking" without reaching the server.
-        await refreshSession();
+        // window and returned "checking" without reaching the server. It runs
+        // in the background so a failed return keeps the login form mounted
+        // with its typed state instead of flashing a checking screen.
+        await refreshSession({ background: true });
       }
     }
   }, [
@@ -614,6 +633,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // left for a provider. The navigation promise that held signInPending
       // can never settle now, so the hold must be released here or every
       // login stays disabled and refreshSession keeps returning "checking".
+      // A begin still awaiting its flow registration belongs to a page the
+      // person already left and returned to: it must not navigate this tab
+      // away again once its server call resolves.
+      redirectBeginCancelled.current = redirectBeginSeq.current;
       if (redirectCompletionActive.current) {
         // An in-flight completion resumes with the restored page and its
         // finally still releases the hold and settles the session.
@@ -628,7 +651,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       if (signInPending.current) {
         signInPending.current = false;
-        void refreshSession();
+        void refreshSession({ background: true });
       }
     };
     window.addEventListener("pageshow", onPageShow);
@@ -652,13 +675,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // The tab is about to leave for the provider. Hold the session read so a
       // navigation that a browser delays cannot be mistaken for a logout.
       signInPending.current = true;
+      const attempt = ++redirectBeginSeq.current;
       try {
         await beginRedirectSignIn({
           provider: authFlowProvider(providerName),
           intent,
+          isAborted: () =>
+            attempt !== redirectBeginSeq.current ||
+            attempt <= redirectBeginCancelled.current,
         });
+        // A real provider navigation never lets this promise settle; reaching
+        // here means begin finished without leaving the tab. Release the
+        // hold unless a newer attempt now owns it.
+        if (attempt === redirectBeginSeq.current) signInPending.current = false;
       } catch (error) {
-        signInPending.current = false;
+        if (attempt === redirectBeginSeq.current) signInPending.current = false;
         throw error;
       }
     },
