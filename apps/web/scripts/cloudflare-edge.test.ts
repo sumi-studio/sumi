@@ -101,6 +101,28 @@ test("unconfigured auth proxy and unsupported requests do not fall through to th
   }
 });
 
+test("the Firebase helper namespace is exact lowercase and other /__/ paths are denied", async () => {
+  for (const path of [
+    "/__/AUTH/handler",
+    "/__/Auth/iframe",
+    "/__/aUth/handler",
+    "/__/firebase/init.json",
+    "/__/anything-else",
+    "/__",
+  ]) {
+    const response = await handleRequest(
+      new Request(`https://sumi.example${path}`),
+      {
+        ASSETS: { fetch: () => assert.fail("reserved path reached SPA") },
+        SUMI_FIREBASE_AUTH_DOMAIN: "sumi-studio.firebaseapp.com",
+      },
+      () => assert.fail("origin used"),
+      () => assert.fail("auth upstream used"),
+    );
+    assert.equal(response.status, 404);
+  }
+});
+
 interface DiscoveredRoute {
   file: string;
   line: number;

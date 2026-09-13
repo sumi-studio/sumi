@@ -494,12 +494,31 @@ export function savePendingRedirectFlow(
   }
 }
 
+/**
+ * Reports whether a redirect receipt record exists, without validating it.
+ * Startup must attempt completion even for a malformed receipt so the return
+ * reports a recoverable error instead of landing on a silent login screen.
+ */
+export function hasPendingRedirectFlowRecord(): boolean {
+  try {
+    return sessionStorage.getItem(redirectFlowKey) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Loads a structurally valid receipt. Expiry is deliberately not checked:
+ * the server owns flow expiry, so an expired-looking receipt is still
+ * exchanged — the clock may be fast, and the server's rejection carries a
+ * real answer. Malformed records are cleared and reported missing.
+ */
 export function loadPendingRedirectFlow(): PendingRedirectAuthFlow | null {
   try {
     const raw = sessionStorage.getItem(redirectFlowKey);
     if (raw === null) return null;
     const parsed: unknown = JSON.parse(raw);
-    if (!isPendingRedirectFlow(parsed) || isExpiredFlow(parsed)) {
+    if (!isPendingRedirectFlow(parsed)) {
       clearPendingRedirectFlow();
       return null;
     }
@@ -536,7 +555,7 @@ function isPendingRedirectFlow(
   );
 }
 
-function isExpiredFlow(flow: PendingAuthFlow): boolean {
+export function isExpiredFlow(flow: PendingAuthFlow): boolean {
   const expiry = Date.parse(flow.expiresAt);
   return !Number.isFinite(expiry) || expiry <= Date.now();
 }

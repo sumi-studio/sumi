@@ -31,9 +31,10 @@ import {
   confirmAuthFlow,
   resolveAuthFlow,
 } from "./auth-flow-client";
-import type {
-  PendingRedirectAuthFlow,
-  RecoverableProvider,
+import {
+  isExpiredFlow,
+  type PendingRedirectAuthFlow,
+  type RecoverableProvider,
 } from "./auth-flow-state";
 import {
   type AuthOutcomeNotice,
@@ -58,6 +59,8 @@ import { isFirebaseConfigured } from "./firebase-config";
 import {
   beginRedirectSignIn,
   hasPendingRedirectSignIn,
+  RedirectSignInAbandonedError,
+  RedirectSignInExpiredError,
   resolveRedirectSignInUser,
   takePendingRedirectSignIn,
 } from "./redirect-sign-in";
@@ -493,14 +496,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * Completes a provider redirect once, on startup. The persisted receipt —
    * not the Firebase account — names the flow whose proof may be exchanged.
    */
+  const redirectCompletionActive = useRef(false);
+
   const completeRedirectSignIn = useCallback(async () => {
     const generation = nextGeneration();
     signInPending.current = true;
+    redirectCompletionActive.current = true;
     let firebaseSignInCompleted = false;
     let confirmationRequired = false;
     try {
       const flow = takePendingRedirectSignIn();
-      if (!flow) return;
+      if (!flow) {
+        // A raw record existed but failed validation (or a reload claimed it
+        // first). The return must report an outcome, not land silently on
+        // the login screen.
+        throw new RedirectSignInAbandonedError();
+      }
       let user: User;
       try {
         user = await resolveRedirectSignInUser();
@@ -518,6 +529,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setCredentialRecoveryEmailSent(true);
           }
           return;
+        }
+        // No provider result arrived. When the receipt also outlived its
+        // expiry the person timed out at the provider rather than
+        // cancelling — say so specifically. A live credential would still
+        // have been exchanged: the server, not this clock, owns expiry.
+        if (error instanceof RedirectSignInAbandonedError) {
+          throw isExpiredFlow(flow) ? new RedirectSignInExpiredError() : error;
         }
         throw error;
       }
@@ -562,6 +580,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (isCurrentGeneration(generation)) setRedirectSignInError(error);
     } finally {
       signInPending.current = false;
+      redirectCompletionActive.current = false;
       setRedirectSignInPending(false);
       const publishedSession =
         serverSession.current.authenticated && isCurrentGeneration(generation);
@@ -587,6 +606,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     redirectReturnClaimed.current = true;
     void completeRedirectSignIn();
   }, [completeRedirectSignIn, redirectSignInPending]);
+
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      // The page was restored from the back/forward cache after this tab
+      // left for a provider. The navigation promise that held signInPending
+      // can never settle now, so the hold must be released here or every
+      // login stays disabled and refreshSession keeps returning "checking".
+      if (redirectCompletionActive.current) {
+        // An in-flight completion resumes with the restored page and its
+        // finally still releases the hold and settles the session.
+        return;
+      }
+      if (!redirectReturnClaimed.current && hasPendingRedirectSignIn()) {
+        // Back or a closed provider view returned before the result was
+        // read: run the normal completion. A missing credential reports
+        // the recoverable "not completed" error.
+        setRedirectSignInPending(true);
+        return;
+      }
+      if (signInPending.current) {
+        signInPending.current = false;
+        void refreshSession();
+      }
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, [refreshSession]);
 
   const signIn = useCallback(
     async (providerName: SignInProvider, intent: AuthIntent) => {

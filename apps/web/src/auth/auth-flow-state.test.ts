@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupPendingEmailFlowStorage,
   consumePendingCredentialRecovery,
+  hasPendingRedirectFlowRecord,
   loadPendingEmailFlow,
   loadPendingRedirectFlow,
   type PendingEmailAuthFlow,
@@ -152,15 +153,29 @@ describe("pending redirect flow", () => {
     expect(loadPendingRedirectFlow()).toBeNull();
   });
 
-  it("removes an expired receipt instead of resuming it", () => {
+  it("keeps an expired receipt so the exchange reaches a real outcome", () => {
+    // The server owns flow expiry: a fast clock must not silently strand a
+    // return that could still exchange, and a stale flow gets the server's
+    // answer rather than a quiet deletion.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-01T10:00:00Z"));
-    savePendingRedirectFlow(pendingRedirect());
+    const flow = pendingRedirect();
+    savePendingRedirectFlow(flow);
 
     vi.advanceTimersByTime(11 * 60_000);
 
+    expect(loadPendingRedirectFlow()).toEqual(flow);
+    expect(takePendingRedirectFlow()).toEqual(flow);
+    expect(takePendingRedirectFlow()).toBeNull();
+  });
+
+  it("reports a raw record as pending even when it fails validation", () => {
+    sessionStorage.setItem("sumi.auth.redirect-flow.v1", "{corrupt");
+
+    expect(hasPendingRedirectFlowRecord()).toBe(true);
     expect(loadPendingRedirectFlow()).toBeNull();
     expect(takePendingRedirectFlow()).toBeNull();
+    expect(hasPendingRedirectFlowRecord()).toBe(false);
   });
 
   it("rejects and clears a receipt that fails structural validation", () => {

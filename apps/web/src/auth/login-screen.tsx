@@ -103,6 +103,18 @@ export function LoginScreen() {
       .finally(() => setBusy(null));
   }, [completeEmailLink, configured, emailLinkCallbackPending, sessionState]);
 
+  // A back/forward-cache restore revives this component with the spinner that
+  // was showing when the tab left for the provider. The awaited navigation
+  // promise can never settle, so clear the busy state here; the auth context
+  // releases its own hold and reports the return's outcome separately.
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setBusy(null);
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
+
   const handleSignIn = async (provider: SignInProvider) => {
     if (
       busy ||

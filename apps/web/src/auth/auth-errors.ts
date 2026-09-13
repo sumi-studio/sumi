@@ -1,5 +1,8 @@
 import { FirebaseError } from "firebase/app";
-import { RedirectSignInAbandonedError } from "./redirect-sign-in";
+import {
+  RedirectSignInAbandonedError,
+  RedirectSignInExpiredError,
+} from "./redirect-sign-in";
 import { AuthAPIError } from "./session-client";
 
 const firebaseErrorMessages: Record<string, string> = {
@@ -25,6 +28,9 @@ const firebaseErrorMessages: Record<string, string> = {
 };
 
 export function getAuthErrorMessage(error: unknown): string {
+  if (error instanceof RedirectSignInExpiredError) {
+    return "ログインの有効期限が切れました。もう一度お試しください。";
+  }
   if (error instanceof RedirectSignInAbandonedError) {
     return "ログインは完了しませんでした。キャンセルされたか、ブラウザがログイン状態を保持できませんでした。もう一度お試しください。";
   }

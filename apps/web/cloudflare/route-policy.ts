@@ -217,10 +217,20 @@ export function decidePath(pathname: string): RouteDecision {
     return { canonicalPath: null, disposition: "deny" };
   }
 
-  const policyPath = canonicalPath.toLowerCase();
-  if (policyPath === "/__/auth" || policyPath.startsWith("/__/auth/")) {
+  // The Firebase helper namespace is exact lowercase: every proxied response
+  // is same-origin with the app and carries no app CSP, so case variants like
+  // /__/AUTH/handler (Firebase Hosting 404 HTML) are denied rather than
+  // forwarded.
+  if (canonicalPath === "/__/auth" || canonicalPath.startsWith("/__/auth/")) {
     return { canonicalPath, disposition: "firebase-auth" };
   }
+  // Everything else under Firebase's reserved /__/ namespace is not an app
+  // route: deny it rather than serving SPA fallback.
+  if (canonicalPath === "/__" || canonicalPath.startsWith("/__/")) {
+    return { canonicalPath, disposition: "deny" };
+  }
+
+  const policyPath = canonicalPath.toLowerCase();
   if (policyPath === "/sw.js") {
     return { canonicalPath, disposition: "service-worker" };
   }

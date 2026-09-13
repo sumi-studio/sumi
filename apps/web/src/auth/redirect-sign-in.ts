@@ -13,7 +13,7 @@ import {
 } from "./auth-flow-client";
 import {
   clearPendingRedirectFlow,
-  loadPendingRedirectFlow,
+  hasPendingRedirectFlowRecord,
   type PendingRedirectAuthFlow,
   type RecoverableProvider,
   savePendingRedirectFlow,
@@ -33,8 +33,25 @@ export class RedirectSignInAbandonedError extends Error {
   }
 }
 
+/**
+ * The return outlived the Sumi flow's server-side expiry and no provider
+ * result arrived to exchange. Reported distinctly from an abandonment so the
+ * person learns the attempt timed out rather than appearing cancelled.
+ */
+export class RedirectSignInExpiredError extends Error {
+  constructor() {
+    super("The provider redirect returned after the sign-in flow expired.");
+    this.name = "RedirectSignInExpiredError";
+  }
+}
+
+/**
+ * Whether startup must attempt a redirect completion. A raw record — even a
+ * malformed or expired one — still drives the completion path so the person
+ * sees a concrete outcome instead of a silent login screen.
+ */
 export function hasPendingRedirectSignIn(): boolean {
-  return loadPendingRedirectFlow() !== null;
+  return hasPendingRedirectFlowRecord();
 }
 
 /**

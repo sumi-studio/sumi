@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -12,6 +13,7 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
 import type { PendingRedirectAuthFlow } from "./auth-flow-state";
+import { RedirectSignInAbandonedError } from "./redirect-sign-in";
 import {
   AuthAPIError,
   SumiProfileUpdateIndeterminateError,
@@ -197,6 +199,11 @@ function AuthStateProbe() {
       <div data-testid="confirmed-tagline">{confirmedTagline}</div>
       <div data-testid="confirmation">
         {auth.confirmation?.action ?? "none"}
+      </div>
+      <div data-testid="redirect-error">
+        {auth.redirectSignInError instanceof Error
+          ? auth.redirectSignInError.name
+          : "none"}
       </div>
       <div data-testid="outcome">
         {auth.outcomeNotice
@@ -1469,3 +1476,227 @@ describe("logout authority transition", () => {
     );
   });
 });
+
+describe("redirect return resilience", () => {
+  it("reports an expired return instead of silently dropping the receipt", async () => {
+    // The person spent longer than the flow TTL at the provider. The receipt
+    // survives startup, no credential arrives, and the failure is named
+    // "expired" rather than absent.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue({
+      ...pendingRedirectReceipt(),
+      expiresAt: "2020-08-01T01:00:00Z",
+    });
+    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+      new RedirectSignInAbandonedError(),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error")).toHaveTextContent(
+        "RedirectSignInExpiredError",
+      );
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    expect(authMocks.resolveAuthFlow).not.toHaveBeenCalled();
+  });
+
+  it("still exchanges a live credential whose receipt only looks expired", async () => {
+    // A fast device clock makes the receipt look stale. The server owns flow
+    // expiry, so the credential is still offered for exchange.
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue({
+      ...pendingRedirectReceipt(),
+      expiresAt: "2020-08-01T01:00:00Z",
+    });
+    authMocks.resolveRedirectSignInUser.mockResolvedValue({
+      uid: "firebase-b",
+    });
+    authMocks.getIdToken.mockResolvedValue("id-token-b");
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b" },
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      );
+    });
+    expect(authMocks.resolveAuthFlow).toHaveBeenCalledWith({
+      flowId: "flow-id",
+      nonce: "n".repeat(43),
+      idToken: "id-token-b",
+    });
+  });
+
+  it("reports a return whose stored record failed validation", async () => {
+    // A raw sessionStorage record existed at startup but no valid receipt can
+    // be claimed from it. The completion still runs and reports the miss
+    // instead of landing on a silent login screen.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(null);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error")).toHaveTextContent(
+        "RedirectSignInAbandonedError",
+      );
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    expect(authMocks.resolveRedirectSignInUser).not.toHaveBeenCalled();
+  });
+
+  it("completes an unclaimed return after a back/forward-cache restore", async () => {
+    // The tab left for the provider, the page was cached, and Back restored
+    // it: the never-settled navigation promise can no longer release the
+    // sign-in hold. pageshow runs the normal completion once instead.
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalled();
+    });
+    // The hold is real: a session read stays deferred while navigation lags.
+    fireEvent.click(screen.getByRole("button", { name: "refresh session" }));
+    await Promise.resolve();
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(1);
+
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue(
+      pendingRedirectReceipt(),
+    );
+    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+      new RedirectSignInAbandonedError(),
+    );
+    await act(async () => {
+      dispatchPersistedPageShow();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error")).toHaveTextContent(
+        "RedirectSignInAbandonedError",
+      );
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases the navigation hold when a restored page has no return", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalled();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "refresh session" }));
+    await Promise.resolve();
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(1);
+
+    // Restored without a receipt: nothing to complete, but the hold must
+    // still be released so login and session reads work again.
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(false);
+    await act(async () => {
+      dispatchPersistedPageShow();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(authMocks.getSumiSession).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "unauthenticated",
+    );
+    expect(screen.getByTestId("redirect-error")).toHaveTextContent("none");
+  });
+
+  it("ignores an unpersisted pageshow so normal loads never release the hold", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "sign in" }));
+    await waitFor(() => {
+      expect(authMocks.beginRedirectSignIn).toHaveBeenCalled();
+    });
+
+    await act(async () => {
+      const event = new Event("pageshow");
+      Object.defineProperty(event, "persisted", { value: false });
+      window.dispatchEvent(event);
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "refresh session" }));
+    await Promise.resolve();
+    // The hold survives: only a persisted restore means navigation ended.
+    expect(authMocks.getSumiSession).toHaveBeenCalledTimes(1);
+    expect(authMocks.takePendingRedirectSignIn).not.toHaveBeenCalled();
+  });
+});
+
+function dispatchPersistedPageShow() {
+  const event = new Event("pageshow");
+  Object.defineProperty(event, "persisted", { value: true });
+  window.dispatchEvent(event);
+}
