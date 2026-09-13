@@ -15,8 +15,11 @@ package agentstate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -328,9 +331,15 @@ func (s *Store) RenewWriter(ctx context.Context, personaID, holderID string, gen
 	return lease, nil
 }
 
+// ReleaseWriter expires the lease row in place rather than deleting it:
+// the generation must be monotonic per persona, so the next acquire goes
+// through the ON CONFLICT path and returns generation+1. A deleted row
+// would restart generation at 1 and admit a stale holder's in-flight
+// mutation under the recycled fencing token.
 func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, generation int64) error {
 	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM core_writer_leases WHERE persona_id = $1 AND generation = $2 AND holder_id = $3`,
+		`UPDATE core_writer_leases SET expires_at = now()
+		 WHERE persona_id = $1 AND generation = $2 AND holder_id = $3`,
 		personaID, generation, holderID)
 	if err != nil {
 		return err
@@ -361,11 +370,25 @@ func scanInput(row inputScanner) (Input, error) {
 	return in, err
 }
 
+// schedInputPrefix is reserved for wake inputs enqueued by schedule
+// dispatch; a caller-supplied input_id in that namespace could otherwise
+// pre-occupy a schedule's wake slot and silently drop the wake.
+const schedInputPrefix = "sched:"
+
 // SubmitInput durably records an input. Re-submitting the same input_id
 // replays the stored row — this is the replay-after-lost-response path.
+// A replay whose fields differ from the stored request is a contract
+// violation, not idempotency: it is rejected rather than answered with a
+// receipt for a different request.
 func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error) {
+	if strings.HasPrefix(in.InputID, schedInputPrefix) {
+		return Input{}, false, fmt.Errorf("%w: input_id prefix %q is reserved", ErrBadRequest, schedInputPrefix)
+	}
 	if in.Attention == "" {
 		in.Attention = "reply"
+	}
+	if in.Payload == nil {
+		in.Payload = map[string]any{}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -395,6 +418,23 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		}
 		if !exists {
 			return Input{}, false, ErrPersonaNotFound
+		}
+		// Replay of an existing input_id is only valid when every caller-
+		// supplied field matches what was stored — an idempotent retry, not
+		// a different input claiming the same id.
+		var same bool
+		err = tx.QueryRow(ctx, `
+			SELECT kind = $3 AND payload = $4::jsonb AND actor_kind = $5
+				AND actor_id = $6 AND source_surface = $7 AND thread_id = $8
+				AND occurred_at IS NOT DISTINCT FROM $9 AND attention = $10
+			FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
+			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
+			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).Scan(&same)
+		if err != nil {
+			return Input{}, false, err
+		}
+		if !same {
+			return Input{}, false, fmt.Errorf("%w: input_id replay carries a different request", ErrTurnConflict)
 		}
 		stored, err = scanInput(tx.QueryRow(ctx,
 			`SELECT `+inputCols+` FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
@@ -453,12 +493,22 @@ func (s *Store) GetInput(ctx context.Context, personaID, inputID string) (Input,
 	return in, turn, err
 }
 
+// clampLimit bounds caller-supplied list sizes: non-positive picks the
+// default, oversized values are capped server-side.
+func clampLimit(v, def, max int) int {
+	if v <= 0 {
+		return def
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
 func (s *Store) journalTail(ctx context.Context, db interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }, personaID string, limit int) ([]Event, error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = clampLimit(limit, 50, 500)
 	rows, err := db.Query(ctx, `
 		SELECT persona_id, seq, turn_id, kind, payload, created_at
 		FROM (SELECT * FROM core_events WHERE persona_id = $1 ORDER BY seq DESC LIMIT $2) recent
@@ -609,6 +659,25 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			return nil, ErrTurnConflict
 		}
 		// Already finished by an earlier commit whose response was lost.
+		// Replaying is only valid when the request is byte-identical to
+		// what was committed — a different outcome, output, error, or event
+		// list under the same turn_id is a contract violation, not
+		// idempotency. commit_request was stored with the commit, so the
+		// comparison is exact rather than inferred from side effects.
+		reqJSON, err := json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
+		var same bool
+		if err := tx.QueryRow(ctx, `
+			SELECT commit_request IS NOT DISTINCT FROM $3::jsonb
+			FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+			personaID, turnID, reqJSON).Scan(&same); err != nil {
+			return nil, err
+		}
+		if !same {
+			return nil, fmt.Errorf("%w: turn replay carries a different commit", ErrTurnConflict)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -617,16 +686,23 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if t.Generation != generation {
 		return nil, ErrTurnConflict
 	}
+	if req.Outcome != "complete" && req.Outcome != "fail" {
+		return nil, fmt.Errorf("%w: outcome must be complete or fail", ErrBadRequest)
+	}
+	reqJSON, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.appendEventsTx(ctx, tx, personaID, turnID, req.Events); err != nil {
 		return nil, err
 	}
 	switch req.Outcome {
 	case "complete":
 		if err := tx.QueryRow(ctx, `
-			UPDATE core_turns SET status = 'done', finished_at = now(), output = $3, usage = $4
+			UPDATE core_turns SET status = 'done', finished_at = now(), output = $3, usage = $4, commit_request = $5
 			WHERE persona_id = $1 AND turn_id = $2
 			RETURNING status, finished_at, output, usage`,
-			personaID, turnID, req.Output, req.Usage).
+			personaID, turnID, req.Output, req.Usage, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Output, &t.Usage); err != nil {
 			return nil, fmt.Errorf("complete turn: %w", err)
 		}
@@ -648,9 +724,9 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		}
 	case "fail":
 		if err := tx.QueryRow(ctx, `
-			UPDATE core_turns SET status = 'failed', finished_at = now(), error = $3
+			UPDATE core_turns SET status = 'failed', finished_at = now(), error = $3, commit_request = $4
 			WHERE persona_id = $1 AND turn_id = $2 RETURNING status, finished_at, error`,
-			personaID, turnID, req.Error).
+			personaID, turnID, req.Error, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Error); err != nil {
 			return nil, err
 		}
@@ -674,6 +750,33 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	return t, nil
 }
 
+// jsonbEqual compares two JSON payloads semantically: both sides pass
+// through a canonical encode/decode so key order and numeric type
+// (Go int vs JSON float64) do not matter. nil and {} are intentionally
+// different — a caller that committed no output is not the same request
+// as one that committed {}.
+func jsonbEqual(a, b map[string]any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	an, bn := map[string]any{}, map[string]any{}
+	if err := roundTrip(a, &an); err != nil {
+		return false
+	}
+	if err := roundTrip(b, &bn); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(an, bn)
+}
+
+func roundTrip(v map[string]any, out *map[string]any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, out)
+}
+
 func (s *Store) appendEventsTx(ctx context.Context, tx pgx.Tx, personaID, turnID string, events []EventInput) error {
 	if len(events) == 0 {
 		return nil
@@ -687,13 +790,12 @@ func (s *Store) appendEventsTx(ctx context.Context, tx pgx.Tx, personaID, turnID
 		kinds[i] = e.Kind
 		payloads[i] = e.Payload
 	}
+	// WITH ORDINALITY makes the request's event order the journal order —
+	// unspecified input ordering would silently reorder the life log.
 	_, err := tx.Exec(ctx, `
 		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
-		SELECT $1, base.base + e.rn, $2, e.kind, e.payload
-		FROM (
-			SELECT u.kind, u.payload, ROW_NUMBER() OVER () AS rn
-			FROM unnest($3::text[], $4::jsonb[]) AS u(kind, payload)
-		) e
+		SELECT $1, base.base + e.ord, $2, e.kind, e.payload
+		FROM unnest($3::text[], $4::jsonb[]) WITH ORDINALITY AS e(kind, payload, ord)
 		CROSS JOIN (SELECT COALESCE(MAX(seq), 0) AS base FROM core_events WHERE persona_id = $1) base`,
 		personaID, turnID, kinds, payloads)
 	if err != nil {
@@ -788,9 +890,7 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 }
 
 func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, limit int) ([]Event, error) {
-	if limit <= 0 {
-		limit = 200
-	}
+	limit = clampLimit(limit, 200, 1000)
 	rows, err := s.pool.Query(ctx, `
 		SELECT persona_id, seq, turn_id, kind, payload, created_at
 		FROM core_events WHERE persona_id = $1 AND seq > $2
@@ -808,6 +908,13 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// isInternalTool lists the tools whose effects this slice can apply
+// atomically inside the claim transaction. Anything else has no execution
+// path yet and must not be claimable.
+func isInternalTool(tool string) bool {
+	return tool == "schedule.set" || tool == "journal.note"
 }
 
 // internalToolResponse applies a state-internal tool's effect inside the
@@ -885,6 +992,13 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // generation reclaims — reconciliation by querying the external system is the
 // caller's duty, the ledger alone cannot prove an ambiguous external effect.
 func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool, idemKey string, request map[string]any) (Operation, bool, error) {
+	if !isInternalTool(tool) {
+		// This slice has no external executor; claiming an unregistered tool
+		// would record a permanently dangling 'running' operation. Reject at
+		// the boundary — the authorized external-tool contract (M08) adds its
+		// own claim path.
+		return Operation{}, false, fmt.Errorf("%w: %s", ErrUnknownTool, tool)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Operation{}, false, err
@@ -892,6 +1006,23 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
 		return Operation{}, false, err
+	}
+	// Operations are attributed to a turn; that turn must be the live one —
+	// running under this generation — so an effect cannot be recorded
+	// against a nonexistent or other-epoch turn.
+	var turnGen int64
+	var turnStatus string
+	err = tx.QueryRow(ctx,
+		`SELECT generation, status FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&turnGen, &turnStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Operation{}, false, ErrTurnNotFound
+	}
+	if err != nil {
+		return Operation{}, false, err
+	}
+	if turnGen != generation || turnStatus != "running" {
+		return Operation{}, false, ErrTurnConflict
 	}
 	// Claim first: the idempotency insert decides whether this call owns the
 	// effect. The internal effect is applied only on a fresh claim, then the
@@ -910,6 +1041,12 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		op, err = s.operationByKey(ctx, tx, personaID, tool, idemKey)
 		if err != nil {
 			return Operation{}, false, err
+		}
+		// A replayed key is idempotent only for the identical request —
+		// returning the stored receipt for a different request would record
+		// an effect that never ran.
+		if !jsonbEqual(op.Request, request) {
+			return Operation{}, false, fmt.Errorf("%w: idempotency_key replay carries a different request", ErrTurnConflict)
 		}
 		if op.Status == "running" && op.ClaimedGeneration != generation {
 			// The claiming generation is fenced; reclaim for re-execution.
@@ -1028,9 +1165,7 @@ func (s *Store) CompleteOperation(ctx context.Context, personaID, operationID st
 // miss_policy is recorded contract for the scheduler milestones; the
 // product-visible policy for missed wakes is deliberately not decided here.
 func (s *Store) DispatchDueSchedules(ctx context.Context, personaID string, generation int64, now time.Time, limit int) ([]Schedule, error) {
-	if limit <= 0 {
-		limit = 16
-	}
+	limit = clampLimit(limit, 16, 256)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -1039,9 +1174,12 @@ func (s *Store) DispatchDueSchedules(ctx context.Context, personaID string, gene
 	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
 		return nil, err
 	}
+	// LEAST(now(), $2): the caller's clock is a scheduling hint only — a
+	// client-supplied future `now` must not pull future schedules into the
+	// present. A stale `now` merely under-fires; the next dispatch catches up.
 	rows, err := tx.Query(ctx, `
 		SELECT schedule_id FROM core_schedules
-		WHERE persona_id = $1 AND status = 'pending' AND wake_at <= $2
+		WHERE persona_id = $1 AND status = 'pending' AND wake_at <= LEAST(now(), $2)
 		ORDER BY wake_at, schedule_id LIMIT $3 FOR UPDATE SKIP LOCKED`,
 		personaID, now, limit)
 	if err != nil {
@@ -1062,17 +1200,34 @@ func (s *Store) DispatchDueSchedules(ctx context.Context, personaID string, gene
 	}
 	out := []Schedule{}
 	for _, id := range ids {
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status)
 			SELECT persona_id, 'sched:' || schedule_id, 'wake', payload, 'schedule', schedule_id, 'core_schedules', 'reply', 'queued'
 			FROM core_schedules
 			WHERE persona_id = $1 AND schedule_id = $2
 			ON CONFLICT (persona_id, input_id) DO NOTHING`,
-			personaID, id); err != nil {
+			personaID, id)
+		if err != nil {
 			return nil, err
 		}
+		if tag.RowsAffected() == 0 {
+			// Defense in depth: the sched: namespace is reserved at
+			// SubmitInput, so a conflicting row can only be this schedule's
+			// own wake input. Anything else means the wake would be dropped
+			// while the schedule reports fired — fail loudly instead.
+			var kind, actorID string
+			if err := tx.QueryRow(ctx, `
+				SELECT kind, actor_id FROM core_inputs
+				WHERE persona_id = $1 AND input_id = $2`,
+				personaID, schedInputPrefix+id).Scan(&kind, &actorID); err != nil {
+				return nil, err
+			}
+			if kind != "wake" || actorID != id {
+				return nil, fmt.Errorf("%w: wake input %s%s occupied by a foreign row", ErrTurnConflict, schedInputPrefix, id)
+			}
+		}
 		var sch Schedule
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE core_schedules SET status = 'fired', fired_at = now(), claimed_generation = $3
 			WHERE persona_id = $1 AND schedule_id = $2
 			RETURNING persona_id, schedule_id, wake_at, payload, miss_policy, status, claimed_generation, created_at, fired_at`,
@@ -1090,9 +1245,7 @@ func (s *Store) DispatchDueSchedules(ctx context.Context, personaID string, gene
 }
 
 func (s *Store) Outbox(ctx context.Context, personaID string, afterSeq int64, limit int) ([]OutboxEntry, error) {
-	if limit <= 0 {
-		limit = 200
-	}
+	limit = clampLimit(limit, 200, 1000)
 	rows, err := s.pool.Query(ctx, `
 		SELECT persona_id, seq, kind, payload, created_at, delivered_at
 		FROM core_outbox WHERE persona_id = $1 AND seq > $2

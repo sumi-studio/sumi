@@ -9,12 +9,17 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// uuidv7Re matches the uuidv7 domain: malformed persona ids in the path are
+// a client error (400), not a database domain violation (500).
+var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // Server exposes the persona-scoped state contract over HTTP.
 //
@@ -91,8 +96,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
 	personaID := r.PathValue("persona")
-	if personaID == "" {
-		writeError(w, http.StatusBadRequest, "persona scope required")
+	if !uuidv7Re.MatchString(personaID) {
+		writeError(w, http.StatusBadRequest, "persona must be a uuidv7")
 		return "", false
 	}
 	if !s.authorized(r, personaID) {
@@ -100,6 +105,16 @@ func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
 		return "", false
 	}
 	return personaID, true
+}
+
+// requireGen enforces that mutation bodies carry a positive writer
+// generation; a missing one is a client error, not a fencing failure.
+func requireGen(w http.ResponseWriter, generation int64) bool {
+	if generation <= 0 {
+		writeError(w, http.StatusBadRequest, "generation required")
+		return false
+	}
+	return true
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any, maxBody int64) bool {
@@ -158,8 +173,12 @@ func (s *Server) createPersona(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
-	if req.PersonaID == "" {
-		writeError(w, http.StatusBadRequest, "persona_id required")
+	if !uuidv7Re.MatchString(req.PersonaID) {
+		writeError(w, http.StatusBadRequest, "persona_id must be a uuidv7")
+		return
+	}
+	if req.HumanID != nil && !uuidv7Re.MatchString(*req.HumanID) {
+		writeError(w, http.StatusBadRequest, "human_id must be a uuidv7")
 		return
 	}
 	p, created, err := s.store.EnsurePersona(r.Context(), req.PersonaID, req.HumanID, req.DisplayName)
@@ -290,6 +309,13 @@ func (s *Server) renewWriter(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
+	if req.HolderID == "" || req.TTLms <= 0 {
+		writeError(w, http.StatusBadRequest, "holder_id and positive ttl_ms required")
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
 	lease, err := s.store.RenewWriter(r.Context(), personaID, req.HolderID, req.Generation, time.Duration(req.TTLms)*time.Millisecond)
 	if err != nil {
 		storeError(w, err)
@@ -310,6 +336,13 @@ func (s *Server) releaseWriter(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
+	if req.HolderID == "" {
+		writeError(w, http.StatusBadRequest, "holder_id required")
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
 	if err := s.store.ReleaseWriter(r.Context(), personaID, req.HolderID, req.Generation); err != nil {
 		storeError(w, err)
 		return
@@ -326,6 +359,9 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 		Generation int64 `json:"generation"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
 		return
 	}
 	res, err := s.store.Recover(r.Context(), personaID, req.Generation)
@@ -349,6 +385,9 @@ func (s *Server) loadTurn(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
 	res, err := s.store.LoadTurn(r.Context(), personaID, req.Generation, req.TurnID, req.ContextLimit)
 	if err != nil {
 		storeError(w, err)
@@ -367,6 +406,9 @@ func (s *Server) commitTurn(w http.ResponseWriter, r *http.Request) {
 		CommitRequest
 	}
 	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
 		return
 	}
 	t, err := s.store.CommitTurn(r.Context(), personaID, r.PathValue("turn"), req.Generation, req.CommitRequest)
@@ -418,6 +460,12 @@ func (s *Server) claimOperation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "operation_id, turn_id, tool, idempotency_key required")
 		return
 	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	if req.Request == nil {
+		req.Request = map[string]any{}
+	}
 	op, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
 		req.OperationID, req.Tool, req.IdempotencyKey, req.Request)
 	if err != nil {
@@ -438,6 +486,9 @@ func (s *Server) completeOperation(w http.ResponseWriter, r *http.Request) {
 		Failed     bool           `json:"failed"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
 		return
 	}
 	op, err := s.store.CompleteOperation(r.Context(), personaID, r.PathValue("operation"), req.Generation, req.Response, req.Failed)
@@ -464,6 +515,9 @@ func (s *Server) dispatchSchedules(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	if req.Now != nil {
 		now = *req.Now
+	}
+	if !requireGen(w, req.Generation) {
+		return
 	}
 	fired, err := s.store.DispatchDueSchedules(r.Context(), personaID, req.Generation, now, req.Limit)
 	if err != nil {

@@ -129,10 +129,21 @@ func TestHTTPInputToCommitFlow(t *testing.T) {
 	if rec.Code != 201 {
 		t.Fatalf("submit: %d %s", rec.Code, rec.Body)
 	}
-	// Resubmit replays.
+	// Identical resubmit replays the stored row.
 	if rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
-		`{"input_id":"i1","kind":"message","payload":{"text":"hi"}}`); rec.Code != 200 {
-		t.Fatalf("resubmit: %d", rec.Code)
+		`{"input_id":"i1","kind":"message","payload":{"text":"hi"},"actor_kind":"human","actor_id":"h-1","attention":"reply"}`); rec.Code != 200 {
+		t.Fatalf("identical resubmit: %d %s", rec.Code, rec.Body)
+	}
+	// A different request under the same input_id conflicts — it must not
+	// be answered with the first request's receipt.
+	if rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
+		`{"input_id":"i1","kind":"message","payload":{"text":"different"},"actor_kind":"human","actor_id":"h-1","attention":"reply"}`); rec.Code != 409 {
+		t.Fatalf("divergent resubmit: %d, want 409", rec.Code)
+	}
+	// The sched: prefix is reserved for dispatch-generated wake inputs.
+	if rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
+		`{"input_id":"sched:x","kind":"message","payload":{}}`); rec.Code != 400 {
+		t.Fatalf("sched: input: %d, want 400", rec.Code)
 	}
 
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok,
@@ -170,3 +181,33 @@ func TestHTTPInputToCommitFlow(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestHTTPBoundaryValidation(t *testing.T) {
+	_, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	tok := created.PersonaToken
+
+	// Malformed persona id in path is a client error, not a DB 500.
+	if rec := do(t, mux, "GET", "/internal/core/personas/not-a-uuid/state", testAdminSecret, ""); rec.Code != 400 {
+		t.Fatalf("bad persona path: %d, want 400", rec.Code)
+	}
+	// Missing generation on mutation routes is 400, not a fencing 409.
+	for _, path := range []string{"/turns/load", "/writer/renew", "/writer/release", "/recover"} {
+		if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+path, tok, `{}`); rec.Code != 400 {
+			t.Fatalf("%s without generation: %d, want 400", path, rec.Code)
+		}
+	}
+	// Missing required fields on input/operation submit.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok, `{"kind":"message"}`); rec.Code != 400 {
+		t.Fatalf("input missing fields: %d, want 400", rec.Code)
+	}
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
+		`{"generation":1,"tool":"journal.note"}`); rec.Code != 400 {
+		t.Fatalf("claim missing fields: %d, want 400", rec.Code)
+	}
+}

@@ -2,6 +2,7 @@ package agentstate
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -251,12 +252,22 @@ func TestOperationIdempotency(t *testing.T) {
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
-	// Replay after lost response: same idempotency key returns stored op.
+	// Replay after lost response: same idempotency key AND the identical
+	// request returns the stored op.
+	req := map[string]any{"schedule_id": "s-1", "wake_at": wake.Format(time.RFC3339Nano),
+		"payload": map[string]any{"note": "ping"}}
 	op2, fresh2, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
-		"op-2", "schedule.set", "t-1:schedule.set:0",
-		map[string]any{"schedule_id": "s-1", "wake_at": wake.Format(time.RFC3339Nano)})
+		"op-2", "schedule.set", "t-1:schedule.set:0", req)
 	if err != nil || fresh2 || op2.OperationID != "op-1" || op2.Status != "done" {
 		t.Fatalf("replay claim: %+v fresh=%v err=%v", op2, fresh2, err)
+	}
+	// A replayed key carrying a different request is a contract violation —
+	// the stored receipt must not be returned for an effect that never ran.
+	_, _, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-3", "schedule.set", "t-1:schedule.set:0",
+		map[string]any{"schedule_id": "s-1", "wake_at": wake.Format(time.RFC3339Nano)})
+	if !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent replay err = %v, want ErrTurnConflict", err)
 	}
 
 	// The internal effect was atomic with the claim: the schedule exists and
@@ -331,5 +342,303 @@ func TestFailTurnRequeues(t *testing.T) {
 	load2, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
 	if err != nil || load2.Turn == nil || load2.Turn.Attempt != 2 {
 		t.Fatalf("retry load: %+v err=%v", load2, err)
+	}
+}
+
+// B1 regression: a released lease must keep its generation reserved. The
+// next acquire continues the monotonic sequence, so a mutation in flight
+// under the released generation can never be admitted under the new epoch.
+func TestGenerationMonotonicAcrossRelease(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+
+	l1, err := s.AcquireWriter(ctx, pa, "holder-a", time.Minute)
+	if err != nil || l1.Generation != 1 {
+		t.Fatalf("acquire: %+v err=%v", l1, err)
+	}
+	if err := s.ReleaseWriter(ctx, pa, "holder-a", l1.Generation); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	l2, err := s.AcquireWriter(ctx, pa, "holder-b", time.Minute)
+	if err != nil {
+		t.Fatalf("reacquire: %v", err)
+	}
+	if l2.Generation != 2 {
+		t.Fatalf("generation recycled: got %d, want 2", l2.Generation)
+	}
+
+	// Reproduce the exact reported sequence: B owns a running turn; stale
+	// A commits under the recycled generation value.
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	load, err := s.LoadTurn(ctx, pa, l2.Generation, "tB", 10)
+	if err != nil || load.Turn == nil {
+		t.Fatalf("load: %+v err=%v", load, err)
+	}
+	_, err = s.CommitTurn(ctx, pa, "tB", l1.Generation, CommitRequest{Outcome: "fail", Error: "stale"})
+	if !errors.Is(err, ErrGenerationFence) {
+		t.Fatalf("stale-generation commit err = %v, want ErrGenerationFence", err)
+	}
+	// The live turn is untouched.
+	if _, err := s.CommitTurn(ctx, pa, "tB", l2.Generation, CommitRequest{
+		Outcome: "complete", Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("live commit: %v", err)
+	}
+	in, turn, err := s.GetInput(ctx, pa, "in-1")
+	if err != nil || in.Status != "done" || turn.Status != "done" {
+		t.Fatalf("final state: %+v / %+v err=%v", in, turn, err)
+	}
+}
+
+// B2 regression: replays return stored results only for identical requests.
+func TestConflictingReplaysRejected(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	in := &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "hello"}, ActorKind: "human", ActorID: "h-1",
+		SourceSurface: "dev", Attention: "reply"}
+	if _, _, err := s.SubmitInput(ctx, in); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	// Identical resubmit still replays.
+	if _, created, err := s.SubmitInput(ctx, in); err != nil || created {
+		t.Fatalf("identical resubmit: created=%v err=%v", created, err)
+	}
+	// Divergent resubmit is rejected, not absorbed.
+	diverged := *in
+	diverged.Payload = map[string]any{"text": "different"}
+	if _, _, err := s.SubmitInput(ctx, &diverged); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent input replay err = %v, want ErrTurnConflict", err)
+	}
+	diverged2 := *in
+	diverged2.ActorID = "other"
+	if _, _, err := s.SubmitInput(ctx, &diverged2); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent actor replay err = %v, want ErrTurnConflict", err)
+	}
+
+	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10)
+	if err != nil || load.Turn == nil {
+		t.Fatalf("load: %v", err)
+	}
+	commit := CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, commit); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Identical re-commit replays the stored turn.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, commit); err != nil {
+		t.Fatalf("identical commit replay: %v", err)
+	}
+	// Divergent re-commit (different output, different events) is rejected.
+	divergedCommit := commit
+	divergedCommit.Output = map[string]any{"text": "changed"}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, divergedCommit); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent commit output err = %v, want ErrTurnConflict", err)
+	}
+	divergedCommit2 := commit
+	divergedCommit2.Events = append(append([]EventInput{}, commit.Events...),
+		EventInput{Kind: "extra", Payload: map[string]any{}})
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, divergedCommit2); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent commit events err = %v, want ErrTurnConflict", err)
+	}
+	divergedCommit3 := commit
+	divergedCommit3.Outcome = "fail"
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, divergedCommit3); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("divergent commit outcome err = %v, want ErrTurnConflict", err)
+	}
+	// Dropping the event list entirely is also divergence — the committed
+	// request is compared exactly, not inferred from the journaled tail.
+	divergedCommit4 := commit
+	divergedCommit4.Events = nil
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, divergedCommit4); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("empty-events commit replay err = %v, want ErrTurnConflict", err)
+	}
+}
+
+// B3 regression: the sched: input namespace is reserved, and dispatch never
+// marks a schedule fired when its wake slot is occupied by a foreign row.
+func TestSchedNamespaceReserved(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// Callers cannot occupy the reserved namespace.
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "sched:col", Kind: "message",
+		Payload: map[string]any{"text": "squat"}}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("sched: submit err = %v, want ErrBadRequest", err)
+	}
+
+	// Defense in depth: a foreign row (e.g. written before the reservation
+	// or by a buggy path) must abort dispatch, not drop the wake silently.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status)
+		VALUES ($1, 'sched:col', 'message', '{}'::jsonb, 'human', 'x', 'dev', 'reply', 'queued')`, pa); err != nil {
+		t.Fatalf("seed foreign input: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO core_schedules (persona_id, schedule_id, wake_at, payload, status)
+		VALUES ($1, 'col', now() - interval '1 second', '{"text":"wake"}'::jsonb, 'pending')`, pa); err != nil {
+		t.Fatalf("seed schedule: %v", err)
+	}
+	if _, err := s.DispatchDueSchedules(ctx, pa, lease.Generation, time.Now(), 10); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("dispatch over foreign row err = %v, want ErrTurnConflict", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM core_schedules WHERE persona_id = $1 AND schedule_id = 'col'`, pa).Scan(&status); err != nil {
+		t.Fatalf("schedule status: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("schedule marked %q despite dropped wake", status)
+	}
+	// Clean the foreign row → the same schedule fires normally.
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM core_inputs WHERE persona_id = $1 AND input_id = 'sched:col'`, pa); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	fired, err := s.DispatchDueSchedules(ctx, pa, lease.Generation, time.Now(), 10)
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("dispatch after cleanup: %+v err=%v", fired, err)
+	}
+	in, _, err := s.GetInput(ctx, pa, "sched:col")
+	if err != nil || in.Kind != "wake" || in.ActorID != "col" {
+		t.Fatalf("wake input: %+v err=%v", in, err)
+	}
+}
+
+// Operations must be recorded against the live running turn, not a
+// nonexistent or finished one.
+func TestClaimOperationTurnBinding(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	// No turn at all.
+	if _, _, err := s.ClaimOperation(ctx, pa, "ghost", lease.Generation,
+		"op-1", "journal.note", "k1", map[string]any{"text": "x"}); !errors.Is(err, ErrTurnNotFound) {
+		t.Fatalf("claim on missing turn err = %v, want ErrTurnNotFound", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{Outcome: "complete"}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Finished turn.
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-2", "journal.note", "k2", map[string]any{"text": "x"}); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("claim on finished turn err = %v, want ErrTurnConflict", err)
+	}
+}
+
+// Only the two state-internal tools are claimable in this slice.
+func TestUnknownToolRejected(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-1", "http.post", "k1", map[string]any{"url": "https://x"}); !errors.Is(err, ErrUnknownTool) {
+		t.Fatalf("unknown tool err = %v, want ErrUnknownTool", err)
+	}
+}
+
+// A caller-supplied future `now` is a hint, not an override: schedules are
+// due only against the service clock.
+func TestDispatchClampsCallerNow(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	future := time.Now().Add(365 * 24 * time.Hour)
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "schedule.set", "k1",
+		map[string]any{"schedule_id": "far", "wake_at": future.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatalf("schedule.set: %v", err)
+	}
+	// now=+10y must not fire the 1-year-out schedule.
+	fired, err := s.DispatchDueSchedules(ctx, pa, lease.Generation, time.Now().Add(10*365*24*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if len(fired) != 0 {
+		t.Fatalf("caller-supplied future now fired %+v", fired)
+	}
+}
+
+func TestListLimitsClamped(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	// Oversized context_limit must not error or scan unboundedly.
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 1<<30); err != nil {
+		t.Fatalf("load with huge context limit: %v", err)
+	}
+	if _, err := s.Events(ctx, pa, 0, 1<<30); err != nil {
+		t.Fatalf("events with huge limit: %v", err)
+	}
+	if _, err := s.Outbox(ctx, pa, 0, 1<<30); err != nil {
+		t.Fatalf("outbox with huge limit: %v", err)
 	}
 }

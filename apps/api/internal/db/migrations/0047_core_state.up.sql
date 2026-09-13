@@ -60,6 +60,10 @@ CREATE TABLE core_turns (
     output      jsonb,
     usage       jsonb,
     error       text,
+    -- commit_request is the exact accepted CommitRequest for this turn, so a
+    -- replayed commit can be verified as byte-identical rather than inferred
+    -- from journaled side effects.
+    commit_request jsonb,
     PRIMARY KEY (persona_id, turn_id),
     FOREIGN KEY (persona_id, input_id) REFERENCES core_inputs(persona_id, input_id)
 );
