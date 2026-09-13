@@ -114,6 +114,10 @@ type Input struct {
 	TurnID            *string        `json:"turn_id"`
 	CreatedAt         time.Time      `json:"created_at"`
 	DoneAt            *time.Time     `json:"done_at"`
+	// NotBefore delays a retryable-failed input's next claim — the
+	// durable bound that keeps one failing input from hot-looping and
+	// starving every later queued input.
+	NotBefore         *time.Time     `json:"not_before"`
 }
 
 type Turn struct {
@@ -427,7 +431,7 @@ func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, g
 
 const inputCols = `persona_id, input_id, kind, payload, actor_kind, actor_id,
 	source_surface, thread_id, occurred_at, attention, status,
-	claimed_generation, turn_id, created_at, done_at`
+	claimed_generation, turn_id, created_at, done_at, not_before`
 
 type inputScanner interface {
 	Scan(dest ...any) error
@@ -438,7 +442,7 @@ func scanInput(row inputScanner) (Input, error) {
 	err := row.Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 		&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 		&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-		&in.TurnID, &in.CreatedAt, &in.DoneAt)
+		&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return in, ErrInputNotFound
 	}
@@ -483,7 +487,7 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
 			&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
 			&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
-			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt)
+			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
 		err = tx.QueryRow(ctx,
@@ -755,10 +759,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 	case errors.Is(err, pgx.ErrNoRows):
 		var in Input
 		err = tx.QueryRow(ctx, `
-			UPDATE core_inputs SET status = 'claimed', claimed_generation = $2
+			UPDATE core_inputs SET status = 'claimed', claimed_generation = $2, not_before = NULL
 			WHERE (persona_id, input_id) = (
 				SELECT persona_id, input_id FROM core_inputs
 				WHERE persona_id = $1 AND status = 'queued'
+					AND (not_before IS NULL OR not_before <= now())
 				ORDER BY created_at, input_id LIMIT 1 FOR UPDATE SKIP LOCKED
 			)
 			RETURNING `+inputCols,
@@ -766,7 +771,7 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 				&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-				&in.TurnID, &in.CreatedAt, &in.DoneAt)
+				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 		if errors.Is(err, pgx.ErrNoRows) {
 			res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
 			if err != nil {
@@ -899,7 +904,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		return nil, err
 	}
 	if err := s.appendEventsTx(ctx, tx, personaID, turnID, req.Events); err != nil {
-		return nil, err
+		return nil, dataErr(err)
 	}
 	switch req.Outcome {
 	case "complete":
@@ -909,12 +914,12 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			RETURNING status, finished_at, output, usage`,
 			personaID, turnID, req.Output, req.Usage, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Output, &t.Usage); err != nil {
-			return nil, fmt.Errorf("complete turn: %w", err)
+			return nil, fmt.Errorf("complete turn: %w", dataErr(err))
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE core_inputs SET status = 'done', done_at = now() WHERE persona_id = $1 AND input_id = $2`,
 			personaID, t.InputID); err != nil {
-			return nil, err
+			return nil, dataErr(err)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO core_outbox (persona_id, seq, kind, payload)
@@ -925,7 +930,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				"input_id": t.InputID,
 				"output":   req.Output,
 			}); err != nil {
-			return nil, fmt.Errorf("append outbox: %w", err)
+			return nil, fmt.Errorf("append outbox: %w", dataErr(err))
 		}
 	case "fail":
 		if err := tx.QueryRow(ctx, `
@@ -933,12 +938,20 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			WHERE persona_id = $1 AND turn_id = $2 RETURNING status, finished_at, error`,
 			personaID, turnID, req.Error, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Error); err != nil {
-			return nil, err
+			return nil, dataErr(err)
 		}
 		if req.Retryable {
+			// The requeue carries a per-attempt backoff: without it a
+			// deterministically failing input reclaims instantly every
+			// pass (its original created_at wins the ordering), grows
+			// the journal and turns table without bound, and starves
+			// every later queued input. not_before keeps the retry
+			// honest and lets other work proceed.
 			if _, err := tx.Exec(ctx, `
-				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL, turn_id = NULL
-				WHERE persona_id = $1 AND input_id = $2`, personaID, t.InputID); err != nil {
+				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
+					turn_id = NULL, not_before = now() + $3 * interval '1 millisecond'
+				WHERE persona_id = $1 AND input_id = $2`,
+				personaID, t.InputID, retryBackoff(t.Attempt).Milliseconds()); err != nil {
 				return nil, err
 			}
 		} else {
@@ -953,6 +966,26 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		return nil, err
 	}
 	return t, nil
+}
+
+// retryBackoff bounds how soon a retryable-failed input may be claimed
+// again: 200ms doubling per attempt, capped at 30s. The attempt number
+// of the turn that just failed drives it, so a permanently failing
+// input decays to a slow poll instead of a hot loop — while later queued
+// inputs remain claimable during the delay.
+func retryBackoff(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 8 {
+		shift = 8
+	}
+	d := 200 * time.Millisecond << shift
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }
 
 // jsonbEqual compares two JSON payloads semantically: both sides pass

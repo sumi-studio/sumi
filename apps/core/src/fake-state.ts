@@ -33,6 +33,12 @@ function hasNul(v: unknown): boolean {
   return false;
 }
 
+/** Matches Go retryBackoff: 200ms doubling per attempt, capped at 30s. */
+function retryBackoffMs(attempt: number): number {
+  const shift = Math.min(Math.max(attempt - 1, 0), 8);
+  return Math.min(200 * 2 ** shift, 30_000);
+}
+
 /**
  * In-memory StateClient implementing the same contract semantics as the Go
  * service — fencing, idempotent claims, atomic internal effects, recovery —
@@ -97,6 +103,7 @@ export class FakeState implements StateClient {
       turn_id: null,
       created_at: new Date().toISOString(),
       done_at: null,
+      not_before: null,
     });
   }
 
@@ -224,12 +231,18 @@ export class FakeState implements StateClient {
       };
     }
     const input = this.inputs.find(
-      (i) => i.persona_id === persona && i.status === "queued",
+      (i) =>
+        i.persona_id === persona &&
+        i.status === "queued" &&
+        // Go claim filter: a retryable-failed input stays parked until
+        // its backoff expires, so it cannot hot-loop or starve others.
+        (i.not_before === null || Date.parse(i.not_before) <= Date.now()),
     );
     if (!input) return { turn: null, input: null, context: [], plan: null };
     input.status = "claimed";
     input.claimed_generation = generation;
     input.turn_id = turnId;
+    input.not_before = null;
     const turn: Turn = {
       persona_id: persona,
       turn_id: turnId,
@@ -329,6 +342,15 @@ export class FakeState implements StateClient {
       }
       return turn;
     }
+    // Go stores the commit as jsonb: a payload containing NUL can never
+    // persist — deterministic 400, so the caller records a failure rather
+    // than retrying an impossible write.
+    if (hasNul(req)) {
+      throw new StateError(
+        400,
+        "commit contains a NUL byte jsonb cannot store",
+      );
+    }
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -366,6 +388,11 @@ export class FakeState implements StateClient {
         input.status = "queued";
         input.claimed_generation = null;
         input.turn_id = null;
+        // Go: not_before = now() + retryBackoff(attempt) — a bounded,
+        // per-attempt growing delay before the next claim.
+        input.not_before = new Date(
+          Date.now() + retryBackoffMs(turn.attempt),
+        ).toISOString();
       } else {
         input.status = "done";
         input.done_at = new Date().toISOString();
@@ -598,6 +625,7 @@ export class FakeState implements StateClient {
           turn_id: null,
           created_at: new Date().toISOString(),
           done_at: null,
+          not_before: null,
         });
       }
       s.status = "fired";

@@ -31,6 +31,8 @@ export interface Input {
   turn_id: string | null;
   created_at: string;
   done_at: string | null;
+  /** Retryable-failed inputs requeue with a future claim time (backoff). */
+  not_before: string | null;
 }
 
 export interface Turn {

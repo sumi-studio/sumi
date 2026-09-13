@@ -328,7 +328,7 @@ func TestJournalNoteTool(t *testing.T) {
 }
 
 func TestFailTurnRequeues(t *testing.T) {
-	s, _ := newStore(t)
+	s, pool := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
@@ -352,6 +352,12 @@ func TestFailTurnRequeues(t *testing.T) {
 	in, _, err := s.GetInput(ctx, pa, "in-1")
 	if err != nil || in.Status != "queued" {
 		t.Fatalf("requeued input: %+v err=%v", in, err)
+	}
+	// The retryable requeue parks the input behind its backoff; expire it
+	// to reach the retry immediately.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("expire backoff: %v", err)
 	}
 	load2, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
 	if err != nil || load2.Turn == nil || load2.Turn.Attempt != 2 {
@@ -896,7 +902,7 @@ func TestServerDerivedClaimIdentity(t *testing.T) {
 // A retryable-failed turn does not discard the recorded plan: the requeued
 // input's next attempt continues the same decision.
 func TestPlanSurvivesRetryableFail(t *testing.T) {
-	s, _ := newStore(t)
+	s, pool := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
@@ -920,6 +926,11 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
 		Outcome: "fail", Error: "transient", Retryable: true}); err != nil {
 		t.Fatalf("fail commit: %v", err)
+	}
+	// Expire the retry backoff so the next attempt can claim immediately.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("expire backoff: %v", err)
 	}
 	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
 	if err != nil || load.Turn == nil || load.Turn.Attempt != 2 {
@@ -1107,5 +1118,134 @@ func TestScheduleSetIDReuse(t *testing.T) {
 	if _, _, err := s.ClaimOperation(ctx, pa, "t-4", lease.Generation,
 		"op-4", "schedule.set", 0, req1); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("fired schedule reuse err = %v, want ErrBadRequest", err)
+	}
+}
+
+// Fresh-review F1: a commit whose payload PostgreSQL can never store is
+// a deterministic 400 at the store boundary — so the core records an
+// honest failure instead of leaving the input claimed forever.
+func TestCommitUnstorablePayloadRejected(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// NUL anywhere in the committed record — output, an event payload, or
+	// the error text — cannot persist; every variant is a 400.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "complete", Events: []EventInput{
+			{Kind: "assistant_message", Payload: map[string]any{"text": "a\u0000b"}},
+		}, Output: map[string]any{"text": "a\u0000b"},
+	}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL output commit err = %v, want ErrBadRequest", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "model: \u0000",
+	}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL error commit err = %v, want ErrBadRequest", err)
+	}
+	// Nothing committed: the turn is still running for a corrected commit.
+	tr, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: false, Error: "recorded failure",
+	})
+	if err != nil || tr.Status != "failed" {
+		t.Fatalf("clean commit after rejections: %+v err=%v", tr, err)
+	}
+}
+
+// Fresh-review F2: a retryable failure requeues with backoff (not_before)
+// instead of instantly reclaiming — the queue stays fair and the retry
+// rate is bounded.
+func TestRetryableFailureRequeuesWithBackoff(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	submit := func(id string) {
+		t.Helper()
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": "x"}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	submit("in-bad")
+	submit("in-good")
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "provider down",
+	}); err != nil {
+		t.Fatalf("retryable commit: %v", err)
+	}
+	// The failed input is queued but parked behind its backoff — and a
+	// later queued input claims first instead of starving behind it.
+	var nb time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-bad'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if !nb.After(time.Now()) {
+		t.Fatalf("not_before = %v, want a future backoff", nb)
+	}
+	res, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
+	if err != nil {
+		t.Fatalf("load t-2: %v", err)
+	}
+	if res.Input == nil || res.Input.InputID != "in-good" {
+		t.Fatalf("claim during backoff took %+v, want in-good", res.Input)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", lease.Generation, CommitRequest{
+		Outcome: "complete",
+	}); err != nil {
+		t.Fatalf("complete in-good: %v", err)
+	}
+	// Backoff grows with the input's attempt count: failing in-bad a
+	// second time parks it for longer than the first.
+	expire := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`UPDATE core_inputs SET not_before = now() - interval '1 second'
+			 WHERE persona_id = $1 AND status = 'queued'`, pa); err != nil {
+			t.Fatalf("expire not_before: %v", err)
+		}
+	}
+	expire()
+	res, err = s.LoadTurn(ctx, pa, lease.Generation, "t-3", 10)
+	if err != nil {
+		t.Fatalf("load t-3: %v", err)
+	}
+	if res.Input == nil || res.Input.InputID != "in-bad" || res.Turn.Attempt != 2 {
+		t.Fatalf("post-backoff claim took %+v, want in-bad attempt 2", res.Input)
+	}
+	before := time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-3", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "provider down",
+	}); err != nil {
+		t.Fatalf("second retryable commit: %v", err)
+	}
+	var nb2 time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-bad'`,
+		pa).Scan(&nb2); err != nil {
+		t.Fatalf("read not_before 2: %v", err)
+	}
+	if nb2.Sub(before) <= nb.Sub(before) {
+		t.Fatalf("backoff did not grow: attempt1=%v attempt2=%v", nb, nb2)
 	}
 }

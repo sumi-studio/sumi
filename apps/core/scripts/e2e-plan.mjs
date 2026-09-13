@@ -60,6 +60,7 @@ async function childMain() {
     name = "scripted";
     async *stream() {
       console.log("[child] MODEL CONSULTED");
+      if (script.throw) throw new Error(script.throw);
       yield { type: "text", delta: script.text };
       for (const [i, c] of (script.calls ?? []).entries()) {
         yield {
@@ -569,6 +570,66 @@ async function main() {
     `conflicting-reuse input must resolve (done), got ${in8State.text}`,
   );
   log("  schedule_id reuse with different contents is an honest error");
+
+  // --- scenario 5: failure disposition -------------------------------------
+  // Fresh-review F1: an un-storable commit payload (provider error text
+  // containing NUL — jsonb rejects it) is scrubbed and committed as an
+  // honest retryable failure, never a running-turn poison loop.
+  // Fresh-review F2: the retryable requeue carries per-attempt backoff —
+  // a permanently failing input cannot hot-loop or starve later queued
+  // inputs, and an ordinary transient failure still recovers.
+  log("scenario 5: un-storable commit resolves; retryable requeue is bounded and fair");
+  const in9 = (await submit("input-nine")).json.input.input_id;
+  const in10 = (await submit("input-ten")).json.input.input_id;
+  const attemptsOf = async (id) =>
+    (await events()).filter(
+      (e) => e.kind === "input_received" && e.payload.input_id === id,
+    ).length;
+  // A provider that always throws — with an un-storable NUL in the error
+  // text — stresses both blockers at once.
+  const storm = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throw: "provider exploded \u0000" }),
+  });
+  assert(
+    storm.includes("turn committed as scrubbed failure") ||
+      storm.includes("turn failed at model"),
+    "the un-storable commit did not resolve via the scrubbed path",
+    storm,
+  );
+  const [a9, a10] = [await attemptsOf(in9), await attemptsOf(in10)];
+  assert(
+    a9 >= 2 && a9 <= 15,
+    `failing input must retry but stay bounded by backoff, got ${a9} attempts (pre-fix: ~32/s)`,
+  );
+  assert(
+    a10 >= 1,
+    `later queued input starved behind the failing one: ${a10} attempts`,
+  );
+  // Both inputs remain honestly queued — retried, not fabricated or dropped.
+  for (const id of [in9, in10]) {
+    const st = await req(
+      "GET",
+      `/internal/core/personas/${personaId}/inputs/${id}`,
+      ptoken,
+    );
+    assert(
+      st.json?.input?.status === "queued",
+      `input ${id} must remain queued for retry, got ${st.text}`,
+    );
+  }
+  // The provider recovering unblocks both — ordinary transient failure
+  // still completes.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-G", calls: [] }),
+  });
+  for (const id of [in9, in10]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-G",
+      `input ${id} must complete after the provider recovers`,
+    );
+  }
+  log("  bounded retryable backoff; queue fair; transient failure recovered");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

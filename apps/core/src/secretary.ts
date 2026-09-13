@@ -3,6 +3,7 @@ import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
 import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import { toolSpecs } from "./tools.ts";
 import type {
+  CommitRequest,
   Decision,
   Event,
   Input,
@@ -313,7 +314,7 @@ export class Secretary {
       kind: "assistant_message",
       payload: { text: decision.text },
     });
-    await state.commitTurn(personaId, turn.turn_id, gen, {
+    await this.commitTurnFinal(turn, {
       outcome: "complete",
       events,
       output: { text: decision.text, tool_results: results },
@@ -360,7 +361,7 @@ export class Secretary {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      await state.commitTurn(personaId, turn.turn_id, gen, {
+      await this.commitTurnFinal(turn, {
         outcome: "fail",
         retryable: true,
         error: `model: ${msg}`,
@@ -424,22 +425,94 @@ export class Secretary {
     events: { kind: string; payload: Record<string, unknown> }[],
     msg: string,
   ): Promise<void> {
-    await this.cfg.state.commitTurn(
-      this.cfg.personaId,
-      turn.turn_id,
-      turn.generation,
-      {
-        outcome: "fail",
-        retryable: false,
-        error: `diverged retry conflicts with committed operation: ${msg}`,
-        events,
-      },
-    );
+    await this.commitTurnFinal(turn, {
+      outcome: "fail",
+      retryable: false,
+      error: `diverged retry conflicts with committed operation: ${msg}`,
+      events,
+    });
     this.log("turn failed on plan divergence", {
       turn_id: turn.turn_id,
       error: msg,
     });
   }
+
+  /**
+   * Commit a turn so a deterministic rejection cannot strand the input.
+   *
+   * A commit payload can itself be un-storable: model output or error
+   * text containing NUL (jsonb rejects it) or a body over the request
+   * limit both surface as a deterministic 400. Retrying the identical
+   * commit can never succeed, and abandoning the turn leaves the input
+   * claimed by a running turn that every recovery cycle fails to
+   * finalize — a permanent poison loop.
+   *
+   * On 400 the commit is retried once with un-storable bytes scrubbed
+   * and — for a complete outcome — downgraded to a recorded
+   * non-retryable failure rather than a fabricated success (effects
+   * already applied stay recorded; they are never un-committed). If the
+   * scrubbed payload is still rejected, a minimal failure commit
+   * finalizes the turn and honestly notes that the events could not be
+   * stored. Anything else (5xx, network) is transient and propagates —
+   * the running turn is recovered and retried; storage unavailability
+   * must never become a fabricated record.
+   */
+  private async commitTurnFinal(turn: Turn, req: CommitRequest): Promise<void> {
+    const { state, personaId } = this.cfg;
+    const commit = (r: CommitRequest) =>
+      state.commitTurn(personaId, turn.turn_id, turn.generation, r);
+    try {
+      await commit(req);
+      return;
+    } catch (e) {
+      if (!(e instanceof StateError && e.status === 400)) throw e;
+    }
+    // The explanation itself goes through the same scrub — the original
+    // error text may be exactly what made the payload un-storable.
+    const msg = scrubJson(
+      `commit rejected deterministically: ${req.error ?? req.outcome}`,
+    ) as string;
+    const scrubbed: CommitRequest = {
+      outcome: "fail",
+      // A fail+retryable commit (e.g. a provider error whose message was
+      // un-storable) keeps its retryable disposition — the input still
+      // deserves the retry. Only an un-storable *complete* downgrade is
+      // terminal, since its output cannot be honestly recorded.
+      retryable: req.outcome === "fail" && req.retryable === true,
+      events: (req.events ?? []).map((e) => ({
+        kind: e.kind,
+        payload: scrubJson(e.payload) as Record<string, unknown>,
+      })),
+      error: msg,
+    };
+    try {
+      await commit(scrubbed);
+      this.log("turn committed as scrubbed failure", {
+        turn_id: turn.turn_id,
+      });
+      return;
+    } catch (e) {
+      if (!(e instanceof StateError && e.status === 400)) throw e;
+    }
+    await commit({
+      outcome: "fail",
+      retryable: false,
+      events: [],
+      error: `${msg}; original commit events could not be stored`,
+    });
+  }
+}
+
+/** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
+function scrubJson(v: unknown): unknown {
+  if (typeof v === "string") return v.replaceAll("\u0000", "\uFFFD");
+  if (Array.isArray(v)) return v.map(scrubJson);
+  if (v !== null && typeof v === "object") {
+    return Object.fromEntries(
+      Object.entries(v).map(([k, x]) => [k, scrubJson(x)]),
+    );
+  }
+  return v;
 }
 
 const SYSTEM =
