@@ -21,3 +21,31 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   }
   return false;
 }
+
+/** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
+export function scrubJson(v: unknown): unknown {
+  if (typeof v === "string") return v.replaceAll("\u0000", "\uFFFD");
+  if (Array.isArray(v)) return v.map(scrubJson);
+  if (v !== null && typeof v === "object") {
+    return Object.fromEntries(
+      Object.entries(v).map(([k, x]) => [k, scrubJson(x)]),
+    );
+  }
+  return v;
+}
+
+const TRUNC_MARK = "…[truncated]";
+
+/**
+ * Bound a string's UTF-8 encoding, cutting only at a code-point boundary
+ * so multibyte and control characters can never push the result past
+ * maxBytes. Truncation is explicit — the marker is part of the record.
+ */
+export function truncateText(s: string, maxBytes: number): string {
+  const enc = new TextEncoder().encode(s);
+  if (enc.length <= maxBytes) return s;
+  const markLen = new TextEncoder().encode(TRUNC_MARK).length;
+  let end = Math.max(0, maxBytes - markLen);
+  while (end > 0 && ((enc[end] ?? 0) & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(enc.subarray(0, end)) + TRUNC_MARK;
+}

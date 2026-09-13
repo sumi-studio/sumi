@@ -1,3 +1,8 @@
+export {
+  JobRunner,
+  type JobRunnerConfig,
+  type SpawnFn,
+} from "./jobs/runner.ts";
 export type {
   ChatMessage,
   ModelEvent,

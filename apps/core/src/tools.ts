@@ -49,6 +49,58 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       required: ["text"],
     },
   },
+  {
+    internal: true,
+    name: "job.start",
+    description:
+      "Start a background job that keeps running even if you stop. Returns a job record with a job_id; the result arrives later as a 'job_completed' input — do not wait for it in this turn. Use for commands or tasks that may outlive this turn.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            'executable and arguments, e.g. ["bash","-lc","make test"] — never a shell string',
+        },
+        cwd: {
+          type: "string",
+          description: "working directory, relative to the workspace root",
+        },
+        timeout_ms: {
+          type: "integer",
+          description: "max run time in milliseconds (<= 3600000)",
+        },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    internal: true,
+    name: "job.status",
+    description:
+      "Read a job's current status and, once finished, its recorded result. Reading a result never re-runs the job.",
+    parameters: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "id from job.start" },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    internal: true,
+    name: "job.cancel",
+    description:
+      "Ask to cancel a job. A queued job is cancelled immediately; a running job is asked to stop and its runner reports the real outcome (the command may already have finished).",
+    parameters: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "id from job.start" },
+      },
+      required: ["job_id"],
+    },
+  },
 ];
 
 /** Model-visible specs for the registered internal tools. */
