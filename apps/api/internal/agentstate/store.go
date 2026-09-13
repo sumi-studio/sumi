@@ -439,10 +439,12 @@ func (s *Store) RenewWriter(ctx context.Context, personaID, holderID string, gen
 // the generation must be monotonic per persona, so the next acquire goes
 // through the ON CONFLICT path and returns generation+1. A deleted row
 // would restart generation at 1 and admit a stale holder's in-flight
-// mutation under the recycled fencing token.
+// mutation under the recycled fencing token. The expiry is a fixed past
+// instant, not now(): a now()-written "dead" marker can look live to a
+// later transaction after the host clock steps backward.
 func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, generation int64) error {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE core_writer_leases SET expires_at = now()
+		`UPDATE core_writer_leases SET expires_at = 'epoch'::timestamptz
 		 WHERE persona_id = $1 AND generation = $2 AND holder_id = $3`,
 		personaID, generation, holderID)
 	if err != nil {

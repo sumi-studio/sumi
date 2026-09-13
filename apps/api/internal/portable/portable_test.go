@@ -811,6 +811,42 @@ func TestLostActivateResponseKeepsOneWriter(t *testing.T) {
 	}
 }
 
+// The import's lease epoch floor must be dead on arrival under any clock:
+// the generation travels so the first destination writer acquires
+// floor+1, but the expiry itself is a fixed past instant — a now()
+// expiry can look live to a later transaction after the host clock steps
+// backward (observed on WSL2: journald "Time jumped backwards"), which
+// once surfaced here as ErrWriterHeld on the first destination acquire.
+func TestImportLeaseFloorIsDeadOnArrival(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	must(local.svc.Seal(ctx, pid, "move-0010b", must(cloud.svc.PlacementID(ctx))))
+	bundle, _ := exportBytes(t, local, pid, "move-0010b")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+
+	var floorGen int64
+	var holder string
+	var expires time.Time
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT generation, holder_id, expires_at FROM core_writer_leases WHERE persona_id = $1`,
+		pid).Scan(&floorGen, &holder, &expires); err != nil {
+		t.Fatalf("read floor lease: %v", err)
+	}
+	if holder != "transfer:move-0010b" {
+		t.Fatalf("floor lease holder %q", holder)
+	}
+	if expires.After(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("floor lease expiry is not a fixed past instant: %s", expires)
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-0010b"))
+	lease := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute))
+	if lease.Generation != floorGen+1 {
+		t.Fatalf("first destination writer generation %d, want floor %d + 1", lease.Generation, floorGen)
+	}
+}
+
 // F3: a bundle is addressed to one placement. Staging it anywhere else is
 // refused, so a routine "import to A timed out, try B" retry can never leave
 // two activatable copies.

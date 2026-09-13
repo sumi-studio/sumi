@@ -430,10 +430,13 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 	// Epoch floor: the destination's lease starts at the source's sealed
 	// generation, already expired. The first writer here acquires the next
 	// generation, so every carried turn, claim and operation belongs to an
-	// older writer and is recovered rather than resumed as its own.
+	// older writer and is recovered rather than resumed as its own. The
+	// expiry is a fixed past instant rather than now(): a now()-written
+	// "dead" marker can look live to a later transaction after the host
+	// clock steps backward, which has been observed on WSL2 hosts.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO core_writer_leases (persona_id, generation, holder_id, acquired_at, expires_at)
-		VALUES ($1, $2, $3, now(), now())`,
+		VALUES ($1, $2, $3, now(), 'epoch'::timestamptz)`,
 		hdr.PersonaID, hdr.Cut.GenerationHighWater, sealHolder(hdr.TransferID)); err != nil {
 		return Receipt{}, false, fmt.Errorf("write lease epoch floor: %w", err)
 	}

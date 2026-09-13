@@ -465,8 +465,11 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof 
 		return Receipt{}, err
 	}
 	// Expire the parked lease so the next writer acquires generation+1.
+	// A fixed past instant stays dead under any clock — a now()-written
+	// expiry can look live to a later transaction after a backward
+	// host-clock step.
 	if _, err := tx.Exec(ctx,
-		`UPDATE core_writer_leases SET expires_at = now() WHERE persona_id = $1`, personaID); err != nil {
+		`UPDATE core_writer_leases SET expires_at = 'epoch'::timestamptz WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
 	rec.RetireProof = retireProof
