@@ -5,15 +5,13 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-var sha256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // Server exposes transfer steps under /internal/core. Every route requires
 // the admin/service secret: a persona capability token must never be able to
@@ -32,12 +30,13 @@ func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	const p = "/internal/core/personas/{persona}/transfers/{transfer}"
-	mux.HandleFunc("POST "+p+"/seal", s.step((*Service).Seal))
+	mux.HandleFunc("GET /internal/core/placement", s.placement)
+	mux.HandleFunc("POST "+p+"/seal", s.seal)
 	mux.HandleFunc("GET "+p+"/bundle", s.bundle)
 	mux.HandleFunc("POST "+p+"/complete", s.complete)
-	mux.HandleFunc("POST "+p+"/abort", s.step((*Service).Abort))
+	mux.HandleFunc("POST "+p+"/abort", s.abort)
 	mux.HandleFunc("POST "+p+"/activate", s.step((*Service).Activate))
-	mux.HandleFunc("POST "+p+"/discard", s.step((*Service).Discard))
+	mux.HandleFunc("POST "+p+"/retire", s.retire)
 	mux.HandleFunc("POST /internal/core/transfers/import", s.importBundle)
 	mux.HandleFunc("GET /internal/core/transfers/{direction}/{transfer}", s.status)
 }
@@ -53,6 +52,18 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// body decodes an optional JSON object. An empty body decodes as the zero
+// value so a bare POST stays meaningful where a step takes no parameters.
+func body[T any](w http.ResponseWriter, r *http.Request, v *T) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "request body must be a JSON object")
+		return false
+	}
+	return true
+}
+
 func (s *Server) step(fn func(*Service, context.Context, string, string) (Receipt, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.admin(w, r) {
@@ -65,6 +76,36 @@ func (s *Server) step(fn func(*Service, context.Context, string, string) (Receip
 		}
 		writeJSON(w, http.StatusOK, rec)
 	}
+}
+
+func (s *Server) placement(w http.ResponseWriter, r *http.Request) {
+	if !s.admin(w, r) {
+		return
+	}
+	id, err := s.svc.PlacementID(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"placement_id": id})
+}
+
+func (s *Server) seal(w http.ResponseWriter, r *http.Request) {
+	if !s.admin(w, r) {
+		return
+	}
+	var b struct {
+		DestinationID string `json:"destination_id"`
+	}
+	if !body(w, r, &b) {
+		return
+	}
+	rec, err := s.svc.Seal(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.DestinationID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }
 
 type startedWriter struct {
@@ -98,16 +139,50 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	if !s.admin(w, r) {
 		return
 	}
-	var body struct {
-		ContentSHA256 string `json:"content_sha256"`
+	var b struct {
+		ActivateProof string `json:"activate_proof"`
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil || !sha256Re.MatchString(body.ContentSHA256) {
-		writeError(w, http.StatusBadRequest, "body must be {\"content_sha256\": <destination receipt digest>}")
+	if !body(w, r, &b) {
 		return
 	}
-	rec, err := s.svc.Complete(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), body.ContentSHA256)
+	rec, err := s.svc.Complete(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.ActivateProof)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
+	if !s.admin(w, r) {
+		return
+	}
+	var b struct {
+		RetireProof string `json:"retire_proof"`
+		Force       bool   `json:"force"`
+	}
+	if !body(w, r, &b) {
+		return
+	}
+	rec, err := s.svc.Abort(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.RetireProof, b.Force)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
+	if !s.admin(w, r) {
+		return
+	}
+	var b struct {
+		TransferKey string `json:"transfer_key"`
+	}
+	if !body(w, r, &b) {
+		return
+	}
+	rec, err := s.svc.Retire(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.TransferKey)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -166,6 +241,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusRequestEntityTooLarge, "bundle exceeds the accepted size")
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrTransferNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrMissingProof):
+		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrTransferConflict), errors.Is(err, ErrPersonaExists), errors.Is(err, ErrUnresolvedOperations):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadBundle), errors.Is(err, ErrIntegrity), errors.Is(err, ErrNotPortable):

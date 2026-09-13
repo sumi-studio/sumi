@@ -11,10 +11,14 @@
  *   2. Local: while a slow turn is in flight the transfer seals the cut. The
  *      running core is fenced at its next state call and stops; new inputs
  *      and new writers are refused.
- *   3. The bundle streams Local → Cloud. Truncated and altered copies are
- *      refused and leave nothing behind; the real one stages. Staging runs
- *      nothing. Importing the same bundle again replays the receipt.
- *   4. Cloud activates; Local completes with Cloud's digest.
+ *   3. The bundle streams Local → Cloud. It is addressed to Cloud's
+ *      placement id, so importing it back into Local is refused. Truncated
+ *      and altered copies are refused and leave nothing behind; the real
+ *      one stages. Staging runs nothing. Importing the same bundle again
+ *      replays the receipt.
+ *   4. Cloud activates and produces an activate_proof. Local cannot
+ *      complete without it — the proof is read back from Cloud's transfer
+ *      status (the lost-response path), then Local completes.
  *   5. Cloud: the core continues the same life — the carried journal and
  *      outbox are identical, the interrupted input runs again as attempt 2,
  *      the queued input is answered, the carried reminder fires, and new work
@@ -41,12 +45,12 @@ const EVIDENCE = process.env.SUMI_PORTABLE_EVIDENCE_DIR;
 const API_DIR = resolve(import.meta.dirname, "../../api");
 const CORE_DIR = resolve(import.meta.dirname, "..");
 const run = randomUUID().replaceAll("-", "").slice(0, 10);
-const LOCAL_DB = withDatabase(DB_URL, `sumi_portable_local_${run}`);
-const CLOUD_DB = withDatabase(DB_URL, `sumi_portable_cloud_${run}`);
+const LOCAL_DB = withDatabase(DB_URL, `sumi_portable_repair_local_${run}`);
+const CLOUD_DB = withDatabase(DB_URL, `sumi_portable_repair_cloud_${run}`);
 const LOCAL_ADMIN = `local-admin-${randomUUID()}`;
 const CLOUD_ADMIN = `cloud-admin-${randomUUID()}`;
-const LOCAL_PORT = 8400 + (process.pid % 500);
-const CLOUD_PORT = LOCAL_PORT + 500;
+const LOCAL_PORT = Number(process.env.SUMI_PORTABLE_LOCAL_PORT ?? 9430);
+const CLOUD_PORT = Number(process.env.SUMI_PORTABLE_CLOUD_PORT ?? 9431);
 const LOCAL = `http://127.0.0.1:${LOCAL_PORT}`;
 const CLOUD = `http://127.0.0.1:${CLOUD_PORT}`;
 const TRANSFER = `e2e-move-${run}`;
@@ -252,16 +256,40 @@ await waitFor("local slow turn running", async () => {
 }, 20_000);
 check((await submit(LOCAL, pid, localToken, "in-queued", "please check my calendar after the move")).status === 201, "queued input accepted before the seal");
 
-const seal = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN);
-check(seal.status === 200 && seal.json.status === "sealed", "local seal", seal.text);
+const cloudPlacement = await req(CLOUD, "GET", "/internal/core/placement", CLOUD_ADMIN);
+check(cloudPlacement.status === 200 && typeof cloudPlacement.json.placement_id === "string", "cloud exposes its placement id", cloudPlacement.text);
+const localPlacement = await req(LOCAL, "GET", "/internal/core/placement", LOCAL_ADMIN);
+check(
+  localPlacement.status === 200 && localPlacement.json.placement_id !== cloudPlacement.json.placement_id,
+  "the two placements have distinct durable ids",
+  { local: localPlacement.json, cloud: cloudPlacement.json },
+);
+
+const noDest = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN);
+check(noDest.status === 400, "seal without a destination is refused", noDest.text);
+const seal = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN, {
+  destination_id: cloudPlacement.json.placement_id,
+});
+check(seal.status === 200 && seal.json.status === "sealed", "local seal bound to cloud", seal.text);
+check(seal.json.destination_id === cloudPlacement.json.placement_id, "seal receipt names the destination", seal.json);
 const cont = seal.json.continuity;
 check(
   cont.running_turns === 1 && cont.claimed_inputs === 1 && cont.queued_inputs === 1 && cont.notes === 1 && cont.pending_schedules === 1,
   "seal receipt lists the in-flight turn, queued input, note and reminder",
   cont,
 );
-const sealReplay = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN);
+const sealReplay = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN, {
+  destination_id: cloudPlacement.json.placement_id,
+});
 check(sealReplay.status === 200 && sealReplay.json.sealed_at === seal.json.sealed_at, "seal replay returns the same cut");
+const sealSelf = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN, {
+  destination_id: localPlacement.json.placement_id,
+});
+check(sealSelf.status === 400, "a seal cannot address the source placement itself", sealSelf.text);
+const sealOther = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN, {
+  destination_id: uuidv7(),
+});
+check(sealOther.status === 409, "seal replayed with a different destination is a conflict", sealOther.text);
 const personaTokenSeal = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/other-transfer/seal`, localToken);
 check(personaTokenSeal.status === 401, "a persona token cannot drive a transfer");
 
@@ -290,12 +318,23 @@ const lines = bundle.trimEnd().split("\n");
 const header = JSON.parse(lines[0]);
 const trailer = JSON.parse(lines[lines.length - 1]);
 check(header.format === "sumi.portable-secretary" && header.format_version === 1 && header.secrets === "none", "bundle header declares format v1 and no secrets", header);
+check(
+  header.destination_id === cloudPlacement.json.placement_id && /^[0-9a-f]{64}$/.test(header.transfer_key ?? ""),
+  "bundle is addressed to cloud's placement and carries a transfer key",
+  { destination_id: header.destination_id },
+);
 check(!bundle.includes(LOCAL_ADMIN) && !bundle.includes(localToken) && !bundle.includes("local-core"), "bundle carries no service secret, persona token or lease holder");
 const exportStatus = await req(LOCAL, "GET", `/internal/core/transfers/export/${TRANSFER}`, LOCAL_ADMIN);
 check(exportStatus.json.content_sha256 === trailer.content_sha256, "local ledger recorded the exported digest");
 
+// The bundle is addressed to Cloud; Local must refuse to stage it, so an
+// ordinary "the response was lost, try the other service" retry can never
+// leave a second staged copy.
+let r = await req(LOCAL, "POST", "/internal/core/transfers/import", LOCAL_ADMIN, bundle, true);
+check(r.status === 422 && r.json.error.includes("addressed to placement"), "local refuses a bundle addressed to cloud", r.text);
+
 const truncated = lines.slice(0, -1).join("\n") + "\n";
-let r = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, truncated, true);
+r = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, truncated, true);
 check(r.status === 422 && r.json.error.includes("truncated"), "cloud refuses a bundle cut before its trailer", r.text);
 r = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, bundle.replace("tea at 15:00", "tea at 16:00"), true);
 check(r.status === 422 && r.json.error.includes("digest"), "cloud refuses an altered bundle", r.text);
@@ -317,10 +356,46 @@ r = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, bun
 check(r.status === 200 && r.json.content_sha256 === trailer.content_sha256, "re-importing the same bundle replays the receipt", r.text);
 
 // --- 4. activate cloud, complete local --------------------------------------
-r = await req(CLOUD, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/activate`, CLOUD_ADMIN);
-check(r.status === 200 && r.json.status === "activated", "cloud activated", r.text);
-r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/complete`, LOCAL_ADMIN, { content_sha256: imported.json.content_sha256 });
-check(r.status === 200 && r.json.status === "completed", "local completed with cloud's digest", r.text);
+// Without destination evidence the source must not end its authority: a
+// complete carrying no proof, a wrong proof, or the source's own digest is
+// refused and the secretary stays sealed rather than stranded.
+r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/complete`, LOCAL_ADMIN, {});
+check(r.status === 400, "complete without an activate_proof is refused", r.text);
+r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/complete`, LOCAL_ADMIN, {
+  activate_proof: imported.json.content_sha256,
+});
+check(r.status === 409, "complete with a fabricated proof is refused", r.text);
+r = await req(LOCAL, "GET", `/internal/core/personas/${pid}/state`, localToken);
+check(r.json.persona.authority === "sealed", "local stayed sealed through the refused completes", r.json);
+
+const activated = await req(CLOUD, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/activate`, CLOUD_ADMIN);
+check(activated.status === 200 && activated.json.status === "activated", "cloud activated", activated.text);
+check(/^[0-9a-f]{64}$/.test(activated.json.activate_proof ?? ""), "cloud produced an activate_proof", activated.json);
+const activatedReplay = await req(CLOUD, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/activate`, CLOUD_ADMIN);
+check(
+  activatedReplay.status === 200 && activatedReplay.json.activate_proof === activated.json.activate_proof,
+  "activate replay returns the same proof",
+  activatedReplay.text,
+);
+
+// The lost-response path: pretend the activate answer never arrived. The
+// proof is discoverable from the destination's transfer status, and only
+// then can the source complete.
+const importStatus = await req(CLOUD, "GET", `/internal/core/transfers/import/${TRANSFER}`, CLOUD_ADMIN);
+check(
+  importStatus.status === 200 && importStatus.json.status === "activated" &&
+    importStatus.json.activate_proof === activated.json.activate_proof,
+  "the activate proof is readable from cloud's transfer status",
+  importStatus.text,
+);
+r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/complete`, LOCAL_ADMIN, {
+  activate_proof: importStatus.json.activate_proof,
+});
+check(r.status === 200 && r.json.status === "completed", "local completed with cloud's activate_proof", r.text);
+const completeReplay = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/complete`, LOCAL_ADMIN, {
+  activate_proof: importStatus.json.activate_proof,
+});
+check(completeReplay.status === 200 && completeReplay.json.status === "completed", "complete replay returns the same receipt", completeReplay.text);
 st = await req(LOCAL, "GET", `/internal/core/personas/${pid}/state`, localToken);
 check(st.json.persona.authority === "transferred", "local persona is marked transferred");
 const localEvents = await allPages(LOCAL, `/internal/core/personas/${pid}/events`, localToken);
@@ -396,5 +471,5 @@ if (EVIDENCE) {
   );
   log("evidence written to", EVIDENCE);
 }
-log(`PASS: ${passed} checks. databases left for inspection: sumi_portable_local_${run}, sumi_portable_cloud_${run}`);
+log(`PASS: ${passed} checks. databases left for inspection: sumi_portable_repair_local_${run}, sumi_portable_repair_cloud_${run}`);
 process.exit(0);

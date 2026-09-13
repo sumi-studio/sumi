@@ -20,14 +20,15 @@ admin/service secret. A persona token cannot seal, export, import or activate.
 
 | Step | Where | Route | Result |
 |---|---|---|---|
-| Seal | source | `POST /personas/{p}/transfers/{t}/seal` | `active → sealed`. The writer generation is bumped past every holder and the lease is parked, so the running core is fenced at its next state call. New inputs get `409`; replays of accepted inputs still answer. The receipt lists the cut and what continues. |
-| Export | source | `GET /personas/{p}/transfers/{t}/bundle` | NDJSON stream of the cut. Byte-identical on repeat. |
-| Import | destination | `POST /transfers/import?human_id=` | `staged`. One transaction: rows, trailer digest and counts, cut positions, reference checks, lease epoch floor, ledger. Any failure leaves nothing. Same transfer and content again → `200` with the recorded receipt. |
-| Activate | destination | `POST /personas/{p}/transfers/{t}/activate` | `staged → active`. |
-| Complete | source | `POST /personas/{p}/transfers/{t}/complete` `{content_sha256}` | `sealed → transferred`, only if the digest equals what the source exported. Source rows stay as history. |
-| Abort | source | `POST /personas/{p}/transfers/{t}/abort` | `sealed → active`; the next writer gets a newer generation. |
-| Discard | destination | `POST /personas/{p}/transfers/{t}/discard` | Removes a staged, never-activated import. |
-| Status | either | `GET /transfers/{export\|import}/{t}` | The ledger answer after a lost response. |
+| Placement | either | `GET /placement` | This placement's durable id. A seal addresses its bundle to exactly one. |
+| Seal | source | `POST /personas/{p}/transfers/{t}/seal` `{destination_id}` | `active → sealed`. The writer generation is bumped past every holder and the lease is parked, so the running core is fenced at its next state call. New inputs get `409`; replays of accepted inputs still answer. The receipt lists the cut, the destination and what continues. Replaying with a different `destination_id` is a `409`; retargeting means a new transfer id. |
+| Export | source | `GET /personas/{p}/transfers/{t}/bundle` | NDJSON stream of the cut. Byte-identical on repeat. The header names the destination and carries the transfer key. |
+| Import | destination | `POST /transfers/import?human_id=` | `staged`. One transaction: rows, trailer digest and counts, cut positions, reference checks, lease epoch floor, ledger. Any failure leaves nothing. A bundle addressed to another placement is refused (`422`), so an ordinary retry can never stage two copies. A retired transfer is refused forever. Same transfer, content and `human_id` again → `200` with the recorded receipt; a different `human_id` is a `409`. |
+| Activate | destination | `POST /personas/{p}/transfers/{t}/activate` | `staged → active`, and mints the `activate_proof`. Replay returns the same proof. After a retire, `409`. |
+| Complete | source | `POST /personas/{p}/transfers/{t}/complete` `{activate_proof}` | `sealed → transferred`, only with the destination's `activate_proof`. A missing proof is `400`; a value the destination never produced is `409`, and the source stays sealed. Source rows stay as history. |
+| Retire | destination | `POST /personas/{p}/transfers/{t}/retire` `{transfer_key?}` | Commits "this transfer never runs here": deletes a staged copy, or writes a tombstone when the bundle never arrived (the `transfer_key` from the bundle header is required then). Mints the `retire_proof`. Replay returns the same proof. An activated transfer cannot retire (`409`). Retire on the transfer's own source is refused. |
+| Abort | source | `POST /personas/{p}/transfers/{t}/abort` `{retire_proof}` or `{force:true}` | `sealed → active` with the destination's `retire_proof`; the next writer gets a newer generation. Without proof the source stays sealed. `force:true` is the recorded break-glass for a destination gone for good. |
+| Status | either | `GET /transfers/{export\|import}/{t}` | The ledger answer after a lost response, including whichever proof the destination committed (`activate_proof` or `retire_proof`). |
 
 `authority` is checked inside the same transactions as the writer generation
 (`requireGeneration`, `AcquireWriter`, `SubmitInput`), so it is a database fence,
@@ -39,15 +40,31 @@ ordinary recovery: carried running turns are interrupted, their inputs are
 requeued, and the recorded plan continues. Operations already done before the
 move are answered from the ledger instead of running again.
 
-**Ordering rule for the coordinator:** only abort the source after confirming
-the destination has not activated this transfer (Status, then Discard). The
-source cannot know on its own; aborting after activation would leave two
-placements able to run the secretary.
+**One continuing secretary.** Source authority can only end on destination
+evidence, so no lost response, retry or partition creates two writers:
+
+- Activation and retirement serialize on the destination's transfer ledger
+  row: exactly one commits; the loser gets `409` and can read the winner from
+  Status.
+- `Complete` requires the `activate_proof` the destination minted when it
+  activated. `Abort` requires the `retire_proof` it minted when it retired.
+  Both are HMAC-SHA256 of `action:transfer_id:persona_id` under the transfer
+  key that travels in the bundle header — a value the destination only
+  publishes after it commits, so it works as commit evidence. It is not an
+  identity proof: anyone holding the bundle already holds the whole life and
+  could mint any proof. Deliberate forgery is out of scope; the gates exist
+  so honest calls cannot end authority by accident.
+- While the destination is unreachable the source stays `sealed`: parked,
+  visible, singular. When it answers again, Status returns whichever proof
+  committed — `activate_proof` → `complete`, `retire_proof` → `abort`.
+- `force:true` on abort is the only exit without destination contact. It is
+  recorded on the receipt, and it can produce two writers if the destination
+  copy still exists — it is the deliberate break-glass, not a normal step.
 
 ## Bundle format v1
 
 ```
-{"record":"header","format":"sumi.portable-secretary","format_version":1,"transfer_id":…,"persona_id":…,"sealed_at":…,"sections":[{"name":"core","contract":"core.v1"}],"cut":{"generation_high_water":…,"latest_event_seq":…,"latest_outbox_seq":…},"secrets":"none","not_included":[…]}
+{"record":"header","format":"sumi.portable-secretary","format_version":1,"transfer_id":…,"persona_id":…,"destination_id":…,"transfer_key":…,"sealed_at":…,"sections":[{"name":"core","contract":"core.v1"}],"cut":{"generation_high_water":…,"latest_event_seq":…,"latest_outbox_seq":…},"secrets":"none","not_included":[…]}
 {"record":"row","section":"core","table":"core_personas","data":{…}}
 {"record":"row","section":"core","table":"core_inputs","data":{…}}
 …
@@ -58,6 +75,10 @@ placements able to run the secretary.
   `core_turns` (including `commit_request`), `core_turn_plans`, `core_events`,
   `core_operations`, `core_schedules`, `core_outbox`, with exactly the columns in
   `contract.go`. Unknown or missing columns are refused on both sides.
+- `destination_id` is the destination's placement id (`GET /placement`); an
+  import anywhere else is refused. `transfer_key` is a per-transfer random key
+  the source mints at the seal; the destination stores it at import and uses it
+  to mint the proofs. It authorizes evidence for this one transfer only.
 - Not carried: the writer lease (only its generation, as the epoch floor),
   placement authority, and the human binding — the destination binds the
   persona to its own authenticated human.

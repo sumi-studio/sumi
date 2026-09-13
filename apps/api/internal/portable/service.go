@@ -2,6 +2,11 @@ package portable
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -23,11 +29,13 @@ var (
 	ErrBadBundle            = errors.New("bundle rejected")
 	ErrIntegrity            = errors.New("reference integrity check failed")
 	ErrBadRequest           = errors.New("bad request")
+	ErrMissingProof         = errors.New("destination proof required")
 )
 
 var (
 	transferIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{8,128}$`)
 	uuidv7Re     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	proofRe      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // sealHolder is the lease holder recorded while a transfer holds the cut.
@@ -58,6 +66,61 @@ func validateIDs(personaID, transferID string) error {
 	return nil
 }
 
+// PlacementID returns this placement's stable identity, minting it on first
+// use. A seal addresses its bundle to exactly one placement id.
+func (s *Service) PlacementID(ctx context.Context) (string, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO core_placement (placement_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+		id.String()); err != nil {
+		return "", err
+	}
+	var got string
+	err = s.pool.QueryRow(ctx, `SELECT placement_id FROM core_placement`).Scan(&got)
+	return got, err
+}
+
+// newTransferKey mints the per-transfer key that travels inside the bundle.
+func newTransferKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// transferProof is the evidence a destination produces when it commits a
+// transition: HMAC-SHA256 of "action:transfer_id:persona_id" under the
+// transfer's key. The source verifies it before ending its own authority, so
+// completing or aborting requires a value the destination only publishes when
+// that step actually committed — readable again from its transfer Status after
+// a lost response. A party holding the bundle can mint any proof; it already
+// holds the whole life, and deliberate forgery is out of scope. The gates
+// exist so that an honest caller cannot end authority by accident.
+func transferProof(key, action, transferID, personaID string) string {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(action + ":" + transferID + ":" + personaID))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func proofMatches(key, action, transferID, personaID, presented string) bool {
+	return subtle.ConstantTimeCompare(
+		[]byte(transferProof(key, action, transferID, personaID)), []byte(presented)) == 1
+}
+
+// transferLock serializes an import with a retire of the same transfer on
+// this placement: without it a retire's tombstone and a slow import could
+// commit in either order and leave a staged copy after cancellation.
+func transferLock(ctx context.Context, tx pgx.Tx, transferID string) error {
+	_, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		"portable.transfer:"+transferID)
+	return err
+}
+
 // lockPersona takes FOR NO KEY UPDATE on the persona row. It conflicts with
 // SubmitInput's share lock, so inputs serialize with authority changes, but
 // not with the key-share locks that foreign-key checks take while a writer
@@ -78,20 +141,23 @@ func heldBy(transferID *string, id string) bool {
 	return transferID != nil && *transferID == id
 }
 
-// ledger reads one side of a transfer. Status, digest and update time come
-// from the ledger columns; the rest is the receipt recorded when the step
-// that created the row verified it.
+// ledger reads one side of a transfer. Status, digest, destination and update
+// time come from the ledger columns; the rest is the receipt recorded when
+// the step that created the row verified it. The proof key is loaded into the
+// receipt's unexported key field for verification; it is never serialized.
 func ledger(ctx context.Context, q querier, direction, transferID string, lock bool) (Receipt, error) {
-	sql := `SELECT persona_id::text, status, COALESCE(content_sha256, ''), receipt, updated_at
+	sql := `SELECT persona_id::text, status, COALESCE(content_sha256, ''),
+			COALESCE(proof_key, ''), COALESCE(destination_id::text, ''), receipt, updated_at
 		FROM core_transfers WHERE direction = $1 AND transfer_id = $2`
 	if lock {
 		sql += ` FOR UPDATE`
 	}
 	var rec Receipt
-	var personaID, status, digest string
+	var personaID, status, digest, key, destination string
 	var raw []byte
 	var updated time.Time
-	err := q.QueryRow(ctx, sql, direction, transferID).Scan(&personaID, &status, &digest, &raw, &updated)
+	err := q.QueryRow(ctx, sql, direction, transferID).
+		Scan(&personaID, &status, &digest, &key, &destination, &raw, &updated)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rec, ErrTransferNotFound
 	}
@@ -106,21 +172,33 @@ func ledger(ctx context.Context, q querier, direction, transferID string, lock b
 	rec.PersonaID = personaID
 	rec.Status = status
 	rec.ContentSHA256 = digest
+	rec.DestinationID = destination
+	rec.key = key
 	rec.UpdatedAt = updated.UTC()
 	return rec, nil
 }
 
-func setStatus(ctx context.Context, tx pgx.Tx, direction, transferID, status string) (time.Time, error) {
+// commit records a transition: the new status plus the receipt as augmented
+// by that step (proofs, forced flag), so Status returns them after a lost
+// response.
+func commit(ctx context.Context, tx pgx.Tx, direction, transferID, status string, rec *Receipt) error {
+	rec.Status = status
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
 	var updated time.Time
-	err := tx.QueryRow(ctx,
-		`UPDATE core_transfers SET status = $3, updated_at = now()
+	err = tx.QueryRow(ctx,
+		`UPDATE core_transfers SET status = $3, receipt = $4, updated_at = now()
 		 WHERE direction = $1 AND transfer_id = $2 RETURNING updated_at`,
-		direction, transferID, status).Scan(&updated)
-	return updated.UTC(), err
+		direction, transferID, status, raw).Scan(&updated)
+	rec.UpdatedAt = updated.UTC()
+	return err
 }
 
 // Status returns the recorded state of one side of a transfer — the answer
-// to a step whose response was lost.
+// to a step whose response was lost, including the proofs the destination
+// produced.
 func (s *Service) Status(ctx context.Context, direction, transferID string) (Receipt, error) {
 	if direction != "export" && direction != "import" {
 		return Receipt{}, fmt.Errorf("%w: direction must be export or import", ErrBadRequest)
@@ -128,19 +206,32 @@ func (s *Service) Status(ctx context.Context, direction, transferID string) (Rec
 	return ledger(ctx, s.pool, direction, transferID, false)
 }
 
-// Seal fixes the export cut on the source. In one transaction it bumps the
-// writer generation past every holder and parks the lease, marks the persona
-// sealed, verifies the state, and records the cut. From commit on, the
-// running secretary is fenced at its next state call, no new writer can be
-// acquired, and new inputs are refused, so nothing the export reads can
-// change. Work in flight is not lost: an uncommitted turn stays running and
-// is recovered by whichever placement runs the secretary next.
+// Seal fixes the export cut on the source and addresses it to one
+// destination. In one transaction it bumps the writer generation past every
+// holder and parks the lease, marks the persona sealed, verifies the state,
+// and records the cut, the destination and a fresh transfer key. From commit
+// on, the running secretary is fenced at its next state call, no new writer
+// can be acquired, and new inputs are refused, so nothing the export reads
+// can change. Work in flight is not lost: an uncommitted turn stays running
+// and is recovered by whichever placement runs the secretary next.
 //
 // Sealing refuses state that could duplicate or lose an effect: an operation
 // still running has an unknown external result and must be resolved first.
-func (s *Service) Seal(ctx context.Context, personaID, transferID string) (Receipt, error) {
+// destinationID must name another placement (read it from the destination's
+// /internal/core/placement); retargeting means sealing a new transfer.
+func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID string) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
+	}
+	if !uuidv7Re.MatchString(destinationID) {
+		return Receipt{}, fmt.Errorf("%w: destination_id must be the destination's placement uuidv7", ErrBadRequest)
+	}
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if destinationID == own {
+		return Receipt{}, fmt.Errorf("%w: destination_id %s is this placement", ErrBadRequest, destinationID)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -155,6 +246,10 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID string) (Recei
 		rec, err := ledger(ctx, tx, "export", transferID, false)
 		if err != nil {
 			return Receipt{}, err
+		}
+		if rec.DestinationID != destinationID {
+			return Receipt{}, fmt.Errorf("%w: transfer %s was sealed for destination %s",
+				ErrTransferConflict, transferID, rec.DestinationID)
 		}
 		return rec, tx.Commit(ctx)
 	}
@@ -225,6 +320,10 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID string) (Recei
 		return Receipt{}, err
 	}
 	cut.GenerationHighWater = epoch
+	key, err := newTransferKey()
+	if err != nil {
+		return Receipt{}, err
+	}
 	var sealedAt time.Time
 	if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&sealedAt); err != nil {
 		return Receipt{}, err
@@ -235,6 +334,7 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID string) (Recei
 		PersonaID:     personaID,
 		Status:        "sealed",
 		FormatVersion: FormatVersion,
+		DestinationID: destinationID,
 		SealedAt:      sealedAt.UTC(),
 		Cut:           cut,
 		Rows:          rows,
@@ -247,20 +347,22 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID string) (Recei
 		return Receipt{}, err
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO core_transfers (direction, transfer_id, persona_id, status, format_version, receipt, created_at, updated_at)
-		VALUES ('export', $1, $2, 'sealed', $3, $4, $5, $5)`,
-		transferID, personaID, FormatVersion, raw, sealedAt); err != nil {
+		INSERT INTO core_transfers (direction, transfer_id, persona_id, status, format_version, destination_id, proof_key, receipt, created_at, updated_at)
+		VALUES ('export', $1, $2, 'sealed', $3, $4, $5, $6, $7, $7)`,
+		transferID, personaID, FormatVersion, destinationID, key, raw, sealedAt); err != nil {
 		return Receipt{}, fmt.Errorf("record transfer: %w", err)
 	}
 	return rec, tx.Commit(ctx)
 }
 
-// Complete marks the source transferred once the destination has verified
-// the same bundle. destinationSHA256 is the content digest from the
-// destination's import receipt; it must equal the digest this source
-// exported, so the source only records a hand-off of exactly what it sent.
-// The source rows stay as history; deleting them is a separate decision.
-func (s *Service) Complete(ctx context.Context, personaID, transferID, destinationSHA256 string) (Receipt, error) {
+// Complete marks the source transferred once the destination committed
+// activation. activateProof is the activate_proof from the destination's
+// activate response or its import Status — a value that only exists because
+// the destination committed. Without it the source stays sealed: a complete
+// issued against a transfer the destination never ran can no longer strand
+// the secretary on no placement. The source rows stay as history; deleting
+// them is a separate decision.
+func (s *Service) Complete(ctx context.Context, personaID, transferID, activateProof string) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
@@ -280,37 +382,46 @@ func (s *Service) Complete(ctx context.Context, personaID, transferID, destinati
 	if rec.PersonaID != personaID || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona is not held by transfer %s", ErrTransferConflict, transferID)
 	}
-	if rec.ContentSHA256 == "" {
-		return Receipt{}, fmt.Errorf("%w: transfer %s has not been exported", ErrTransferConflict, transferID)
-	}
-	if rec.ContentSHA256 != destinationSHA256 {
-		return Receipt{}, fmt.Errorf("%w: destination digest %s does not match exported digest %s",
-			ErrTransferConflict, destinationSHA256, rec.ContentSHA256)
-	}
-	switch authority {
-	case "transferred":
+	if rec.Status == "completed" {
 		return rec, tx.Commit(ctx)
-	case "sealed":
-	default:
+	}
+	if authority != "sealed" {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
+	}
+	if !proofRe.MatchString(activateProof) {
+		return Receipt{}, fmt.Errorf("%w: pass the destination's activate_proof "+
+			"(POST activate on the destination, or GET /transfers/import/%s there)", ErrMissingProof, transferID)
+	}
+	if !proofMatches(rec.key, "activate", transferID, personaID, activateProof) {
+		return Receipt{}, fmt.Errorf("%w: %s is not the activation proof for transfer %s; "+
+			"the destination has not activated it (check its import status)",
+			ErrTransferConflict, activateProof, transferID)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
-	if rec.UpdatedAt, err = setStatus(ctx, tx, "export", transferID, "completed"); err != nil {
+	rec.ActivateProof = activateProof
+	if err := commit(ctx, tx, "export", transferID, "completed", &rec); err != nil {
 		return Receipt{}, err
 	}
-	rec.Status = "completed"
 	return rec, tx.Commit(ctx)
 }
 
 // Abort returns a sealed source to active so the same secretary continues
-// where it was. The caller must first establish that the destination did not
-// activate this transfer (Status on the destination, then Discard there);
-// the source alone cannot know, and aborting after activation would leave
-// two placements able to run the same secretary.
-func (s *Service) Abort(ctx context.Context, personaID, transferID string) (Receipt, error) {
+// where it was. It requires the destination's retire_proof: evidence that the
+// destination committed "this transfer will never run here" — the staged copy
+// deleted or a tombstone recorded before the bundle ever arrived. A
+// destination that activated can never produce one, and a destination that
+// has not retired cannot either, so no lost response or mistaken retry can
+// leave two placements able to run the secretary.
+//
+// If the destination cannot be asked at all (unreachable, retired service),
+// the source stays sealed: paused and visible, but singular. force=true is
+// the break-glass for a destination that is gone for good; it is recorded on
+// the receipt and can produce two writers if the destination copy still
+// exists.
+func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof string, force bool) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
@@ -336,6 +447,18 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID string) (Rece
 	if authority != "sealed" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
 	}
+	switch {
+	case force:
+		rec.Forced = true
+	case !proofRe.MatchString(retireProof):
+		return Receipt{}, fmt.Errorf("%w: pass the destination's retire_proof "+
+			"(POST retire on the destination, or GET /transfers/import/%s there), "+
+			"or force=true for a destination that is gone for good", ErrMissingProof, transferID)
+	case !proofMatches(rec.key, "retire", transferID, personaID, retireProof):
+		return Receipt{}, fmt.Errorf("%w: %s is not the retire proof for transfer %s; "+
+			"the destination has not retired it (check its import status)",
+			ErrTransferConflict, retireProof, transferID)
+	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'active', transfer_id = NULL WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
@@ -345,17 +468,18 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID string) (Rece
 		`UPDATE core_writer_leases SET expires_at = now() WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
-	if rec.UpdatedAt, err = setStatus(ctx, tx, "export", transferID, "aborted"); err != nil {
+	rec.RetireProof = retireProof
+	if err := commit(ctx, tx, "export", transferID, "aborted", &rec); err != nil {
 		return Receipt{}, err
 	}
-	rec.Status = "aborted"
 	return rec, tx.Commit(ctx)
 }
 
-// Activate makes a staged import the authoritative placement. From commit
-// on, a writer can be acquired and inputs accepted here. The first writer
-// acquires a generation above the source's epoch and runs ordinary recovery,
-// which interrupts carried running turns and requeues their inputs.
+// Activate makes a staged import the authoritative placement and produces the
+// activation proof the source's Complete requires. From commit on, a writer
+// can be acquired and inputs accepted here. The first writer acquires a
+// generation above the source's epoch and runs ordinary recovery, which
+// interrupts carried running turns and requeues their inputs.
 func (s *Service) Activate(ctx context.Context, personaID, transferID string) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
@@ -365,10 +489,12 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 		return Receipt{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	authority, held, err := lockPersona(ctx, tx, personaID)
-	if err != nil {
+	if err := transferLock(ctx, tx, transferID); err != nil {
 		return Receipt{}, err
 	}
+	// The ledger decides before the persona row does: after a retire the
+	// persona is gone, and the tombstone — not a 404 — must answer a late
+	// activate so the source can tell "retired" from "never arrived".
 	rec, err := ledger(ctx, tx, "import", transferID, true)
 	if err != nil {
 		return Receipt{}, err
@@ -379,43 +505,8 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	if rec.Status == "activated" {
 		return rec, tx.Commit(ctx)
 	}
-	if rec.Status != "staged" || authority != "staged" || !heldBy(held, transferID) {
-		return Receipt{}, fmt.Errorf("%w: transfer is %s and persona authority is %s", ErrTransferConflict, rec.Status, authority)
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, personaID); err != nil {
-		return Receipt{}, err
-	}
-	if rec.UpdatedAt, err = setStatus(ctx, tx, "import", transferID, "activated"); err != nil {
-		return Receipt{}, err
-	}
-	rec.Status = "activated"
-	return rec, tx.Commit(ctx)
-}
-
-// Discard removes a staged, never-activated import so the transfer can be
-// retried or abandoned. The ledger row remains as a record.
-func (s *Service) Discard(ctx context.Context, personaID, transferID string) (Receipt, error) {
-	if err := validateIDs(personaID, transferID); err != nil {
-		return Receipt{}, err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return Receipt{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	rec, err := ledger(ctx, tx, "import", transferID, true)
-	if err != nil {
-		return Receipt{}, err
-	}
-	if rec.PersonaID != personaID {
-		return Receipt{}, fmt.Errorf("%w: transfer %s belongs to another persona", ErrTransferConflict, transferID)
-	}
-	if rec.Status == "discarded" {
-		return rec, tx.Commit(ctx)
-	}
 	if rec.Status != "staged" {
-		return Receipt{}, fmt.Errorf("%w: an %s transfer cannot be discarded", ErrTransferConflict, rec.Status)
+		return Receipt{}, fmt.Errorf("%w: transfer %s is %s; it cannot be activated", ErrTransferConflict, transferID, rec.Status)
 	}
 	authority, held, err := lockPersona(ctx, tx, personaID)
 	if err != nil {
@@ -424,13 +515,127 @@ func (s *Service) Discard(ctx context.Context, personaID, transferID string) (Re
 	if authority != "staged" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM core_personas WHERE persona_id = $1`, personaID); err != nil {
-		return Receipt{}, fmt.Errorf("discard staged persona: %w", err)
-	}
-	if rec.UpdatedAt, err = setStatus(ctx, tx, "import", transferID, "discarded"); err != nil {
+	if _, err := tx.Exec(ctx,
+		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
-	rec.Status = "discarded"
+	rec.ActivateProof = transferProof(rec.key, "activate", transferID, personaID)
+	if err := commit(ctx, tx, "import", transferID, "activated", &rec); err != nil {
+		return Receipt{}, err
+	}
+	return rec, tx.Commit(ctx)
+}
+
+// Retire records on the destination that this transfer will never run here:
+// a staged import's persona is deleted, or — when the bundle never arrived —
+// a tombstone is written so a late import is refused. Either way it produces
+// the retire_proof the source's Abort requires. Retire is refused once the
+// transfer has activated; the ledger row lock makes retire and activate
+// commit in some order, never both.
+//
+// transferKey is required only for the tombstone case: a placement that never
+// imported the bundle has not seen the key, so the caller passes it from the
+// bundle header. A mismatch means the proof will not satisfy the source's
+// Abort — read the key from the bundle, not from memory.
+func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey string) (Receipt, error) {
+	if err := validateIDs(personaID, transferID); err != nil {
+		return Receipt{}, err
+	}
+	if transferKey != "" && !proofRe.MatchString(transferKey) {
+		return Receipt{}, fmt.Errorf("%w: transfer_key must be the 64-hex key from the bundle header", ErrBadRequest)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := transferLock(ctx, tx, transferID); err != nil {
+		return Receipt{}, err
+	}
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
+	rec, err := ledger(ctx, tx, "import", transferID, true)
+	switch {
+	case err == nil:
+		// A known transfer: persona must match, and only a staged copy can
+		// retire. Replay a previous retire; refuse an activated one.
+		if rec.PersonaID != personaID {
+			return Receipt{}, fmt.Errorf("%w: transfer %s belongs to another persona", ErrTransferConflict, transferID)
+		}
+		if rec.Status == "retired" {
+			return rec, tx.Commit(ctx)
+		}
+		if rec.Status != "staged" {
+			return Receipt{}, fmt.Errorf("%w: an %s transfer cannot be retired", ErrTransferConflict, rec.Status)
+		}
+		authority, held, lerr := lockPersona(ctx, tx, personaID)
+		if lerr != nil {
+			return Receipt{}, lerr
+		}
+		if authority != "staged" || !heldBy(held, transferID) {
+			return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM core_personas WHERE persona_id = $1`, personaID); err != nil {
+			return Receipt{}, fmt.Errorf("retire staged persona: %w", err)
+		}
+		rec.RetireProof = transferProof(rec.key, "retire", transferID, personaID)
+		if err := commit(ctx, tx, "import", transferID, "retired", &rec); err != nil {
+			return Receipt{}, err
+		}
+		return rec, tx.Commit(ctx)
+	case !errors.Is(err, ErrTransferNotFound):
+		return Receipt{}, err
+	}
+
+	// Tombstone: the bundle never arrived here. Refuse to retire the
+	// transfer's own source — that would let a mistaken call to this
+	// service produce a proof the source itself accepts while a copy
+	// elsewhere stays activatable.
+	var authority string
+	var held *string
+	err = tx.QueryRow(ctx,
+		`SELECT authority, transfer_id FROM core_personas WHERE persona_id = $1 FOR NO KEY UPDATE`,
+		personaID).Scan(&authority, &held)
+	switch {
+	case err == nil:
+		if heldBy(held, transferID) && (authority == "sealed" || authority == "transferred") {
+			return Receipt{}, fmt.Errorf("%w: persona %s is this placement's own %s transfer %s",
+				ErrTransferConflict, personaID, authority, transferID)
+		}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return Receipt{}, err
+	}
+	if transferKey == "" {
+		return Receipt{}, fmt.Errorf("%w: transfer %s was never imported here; "+
+			"pass transfer_key from the bundle header", ErrMissingProof, transferID)
+	}
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
+		return Receipt{}, err
+	}
+	rec = Receipt{
+		Direction:     "import",
+		TransferID:    transferID,
+		PersonaID:     personaID,
+		Status:        "retired",
+		FormatVersion: FormatVersion,
+		DestinationID: own,
+		RetireProof:   transferProof(transferKey, "retire", transferID, personaID),
+		NotIncluded:   NotIncluded,
+		UpdatedAt:     now.UTC(),
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO core_transfers (direction, transfer_id, persona_id, status, format_version, destination_id, proof_key, receipt, created_at, updated_at)
+		VALUES ('import', $1, $2, 'retired', $3, $4, $5, $6, $7, $7)`,
+		transferID, personaID, FormatVersion, own, transferKey, raw, now); err != nil {
+		return Receipt{}, fmt.Errorf("record transfer tombstone: %w", err)
+	}
 	return rec, tx.Commit(ctx)
 }
 

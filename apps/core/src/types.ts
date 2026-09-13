@@ -104,6 +104,10 @@ export interface PersonaState {
     human_id: string | null;
     display_name: string;
     created_at: string;
+    /** Placement authority: active | sealed | staged | transferred. */
+    authority: string;
+    /** The transfer that last changed authority, when one is in flight. */
+    transfer_id: string | null;
   };
   lease: WriterLease | null;
   queued_inputs: number;

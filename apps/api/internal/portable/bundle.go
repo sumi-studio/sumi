@@ -60,12 +60,17 @@ func (s *Service) Export(ctx context.Context, personaID, transferID string, w io
 	if err != nil {
 		return Receipt{}, err
 	}
+	if rec.key == "" {
+		return Receipt{}, fmt.Errorf("transfer %s was sealed without a proof key", transferID)
+	}
 	hdr := Header{
 		Record:        "header",
 		Format:        FormatName,
 		FormatVersion: rec.FormatVersion,
 		TransferID:    transferID,
 		PersonaID:     personaID,
+		DestinationID: rec.DestinationID,
+		TransferKey:   rec.key,
 		SealedAt:      rec.SealedAt,
 		Sections:      []SectionRef{{Name: CoreSection, Contract: CoreContract}},
 		Cut:           rec.Cut,
@@ -243,16 +248,20 @@ const personaInsertSQL = `
 	SELECT (d->>'persona_id')::uuidv7, $2, d->>'display_name', (d->>'created_at')::timestamptz, 'staged', $3
 	FROM (SELECT $1::jsonb AS d) r`
 
-// Import stages a bundle. Everything happens in one transaction: rows are
-// inserted as they stream, then the trailer's counts and digest, the cut
-// positions and reference integrity are verified, the lease epoch floor is
-// written, and the ledger records the staged receipt. Any failure — a cut
-// connection, a changed byte, an unknown section or column, a dangling
-// reference — rolls back to nothing.
+// Import stages a bundle addressed to this placement. Everything happens in
+// one transaction: rows are inserted as they stream, then the trailer's
+// counts and digest, the cut positions and reference integrity are verified,
+// the lease epoch floor is written, and the ledger records the staged
+// receipt. Any failure — a cut connection, a changed byte, an unknown section
+// or column, a dangling reference — rolls back to nothing.
 //
-// A persona already present here is never overwritten or duplicated. The
-// same transfer imported again with identical content is answered with the
-// recorded receipt (created=false).
+// A bundle addressed to another placement is refused outright, so an ordinary
+// "import timed out, try another service" retry can never leave two staged
+// copies. A retired transfer is refused forever: cancellation is durable
+// against a late or replayed import. A persona already present here is never
+// overwritten or duplicated. The same transfer imported again with identical
+// content and the same human_id is answered with the recorded receipt
+// (created=false); a different human_id is a conflict, not a silent rebind.
 func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Receipt, bool, error) {
 	if humanID != nil && !uuidv7Re.MatchString(*humanID) {
 		return Receipt{}, false, fmt.Errorf("%w: human_id must be a uuidv7", ErrBadRequest)
@@ -273,6 +282,14 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 	if err := checkHeader(hdr); err != nil {
 		return Receipt{}, false, err
 	}
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, false, err
+	}
+	if hdr.DestinationID != own {
+		return Receipt{}, false, fmt.Errorf("%w: this bundle is addressed to placement %s; this is %s",
+			ErrBadBundle, hdr.DestinationID, own)
+	}
 	h.Write(line)
 
 	tx, err := s.pool.Begin(ctx)
@@ -280,6 +297,9 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		return Receipt{}, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := transferLock(ctx, tx, hdr.TransferID); err != nil {
+		return Receipt{}, false, err
+	}
 	prior, err := ledger(ctx, tx, "import", hdr.TransferID, true)
 	replay := false
 	switch {
@@ -288,13 +308,16 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		return Receipt{}, false, err
 	case prior.PersonaID != hdr.PersonaID:
 		return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported for another persona", ErrTransferConflict, hdr.TransferID)
-	case prior.Status == "discarded":
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM core_transfers WHERE direction = 'import' AND transfer_id = $1`, hdr.TransferID); err != nil {
-			return Receipt{}, false, err
-		}
+	case prior.Status == "retired":
+		return Receipt{}, false, fmt.Errorf("%w: transfer %s was retired here; it can never be staged on this placement",
+			ErrTransferConflict, hdr.TransferID)
 	default:
 		replay = true
+		if (prior.HumanID == nil) != (humanID == nil) ||
+			(prior.HumanID != nil && *prior.HumanID != *humanID) {
+			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with a different human_id",
+				ErrTransferConflict, hdr.TransferID)
+		}
 	}
 	if !replay {
 		var authority string
@@ -368,11 +391,13 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		if !replay {
 			if idx == 0 {
 				_, err = tx.Exec(ctx, personaInsertSQL, json.RawMessage(row.Data), humanID, hdr.TransferID)
+				err = personaInsertErr(err)
 			} else {
 				_, err = tx.Exec(ctx, t.insertSQL(), json.RawMessage(row.Data))
+				err = insertErr(t.name, err)
 			}
 			if err != nil {
-				return Receipt{}, false, insertErr(t.name, err)
+				return Receipt{}, false, err
 			}
 		}
 		counts[t.name]++
@@ -437,6 +462,8 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		PersonaID:     hdr.PersonaID,
 		Status:        "staged",
 		FormatVersion: hdr.FormatVersion,
+		DestinationID: hdr.DestinationID,
+		HumanID:       humanID,
 		ContentSHA256: digest,
 		SealedAt:      hdr.SealedAt.UTC(),
 		Cut:           hdr.Cut,
@@ -452,9 +479,9 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		return Receipt{}, false, err
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO core_transfers (direction, transfer_id, persona_id, status, format_version, content_sha256, receipt, created_at, updated_at)
-		VALUES ('import', $1, $2, 'staged', $3, $4, $5, $6, $6)`,
-		hdr.TransferID, hdr.PersonaID, hdr.FormatVersion, digest, raw, now); err != nil {
+		INSERT INTO core_transfers (direction, transfer_id, persona_id, status, format_version, destination_id, content_sha256, proof_key, receipt, created_at, updated_at)
+		VALUES ('import', $1, $2, 'staged', $3, $4, $5, $6, $7, $8, $8)`,
+		hdr.TransferID, hdr.PersonaID, hdr.FormatVersion, hdr.DestinationID, digest, hdr.TransferKey, raw, now); err != nil {
 		return Receipt{}, false, fmt.Errorf("record transfer: %w", err)
 	}
 	return rec, true, tx.Commit(ctx)
@@ -473,6 +500,10 @@ func checkHeader(h Header) error {
 		return fmt.Errorf("%w: invalid transfer_id", ErrBadBundle)
 	case !uuidv7Re.MatchString(h.PersonaID):
 		return fmt.Errorf("%w: persona_id must be a uuidv7", ErrBadBundle)
+	case !uuidv7Re.MatchString(h.DestinationID):
+		return fmt.Errorf("%w: destination_id must be a placement uuidv7", ErrBadBundle)
+	case !proofRe.MatchString(h.TransferKey):
+		return fmt.Errorf("%w: header lacks a valid transfer_key", ErrBadBundle)
 	case h.Secrets != SecretsNone:
 		return fmt.Errorf("%w: secrets mode %q is not supported", ErrBadBundle, h.Secrets)
 	case h.Cut.GenerationHighWater < 1:
@@ -513,13 +544,46 @@ func checkDestinationSchema(ctx context.Context, q querier) error {
 	return nil
 }
 
+// insertErr maps insert failures of carried rows. A duplicate key inside a
+// bundle is a deterministic bundle defect (422), not a concurrency signal:
+// the staged persona's keyspace is fresh, so 23505 here means the bundle
+// itself carries the same key twice.
 func insertErr(table string, err error) error {
+	if err == nil {
+		return nil
+	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code != "23505" &&
-		(strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23")) {
+	if errors.As(err, &pgErr) && (strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23")) {
+		if pgErr.Code == "23505" {
+			return fmt.Errorf("%w: %s row duplicates a key already in this bundle", ErrBadBundle, table)
+		}
 		return fmt.Errorf("%w: %s row: %v", ErrBadBundle, table, err)
 	}
 	return fmt.Errorf("insert %s row: %w", table, err)
+}
+
+// personaInsertErr maps failures of the persona insert itself. A duplicate
+// persona means a concurrent different transfer staged it first — a 409, not
+// a bundle defect. A missing human is a caller-parameter error naming
+// human_id, not a bundle error.
+func personaInsertErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			return fmt.Errorf("%w (staged by a concurrent transfer); a transfer never overwrites or duplicates a secretary",
+				ErrPersonaExists)
+		case "23503":
+			return fmt.Errorf("%w: human_id does not reference an existing human", ErrBadRequest)
+		}
+		if strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23") {
+			return fmt.Errorf("%w: %s row: %v", ErrBadBundle, personaTable.name, err)
+		}
+	}
+	return fmt.Errorf("insert %s row: %w", personaTable.name, err)
 }
 
 func readLine(br *bufio.Reader) ([]byte, error) {

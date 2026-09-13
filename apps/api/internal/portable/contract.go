@@ -13,16 +13,36 @@
 // Lifecycle and the authority each step leaves behind:
 //
 //	source Seal      active → sealed       writer generation bumped past every
-//	                                       holder; new inputs refused
-//	source Export    (read-only)           deterministic stream of the cut
+//	                                       holder; new inputs refused. Names
+//	                                       the intended destination and mints
+//	                                       the transfer's proof key
+//	source Export    (read-only)           deterministic stream of the cut;
+//	                                       the header is addressed to the one
+//	                                       destination and carries the key
 //	dest   Import    (none) → staged       rows and epoch floor, verified; no
-//	                                       writer, no inputs, no effects
-//	dest   Activate  staged → active       the destination may run the secretary
-//	source Complete  sealed → transferred  records the destination's digest
+//	                                       writer, no inputs, no effects.
+//	                                       Refused on any other placement
+//	dest   Activate  staged → active       the destination may run the
+//	                                       secretary; produces activate_proof
+//	dest   Retire    staged → retired      this placement will never run this
+//	             or  (none) → retired      transfer: the staged copy is deleted
+//	                                       or a tombstone is recorded for a
+//	                                       bundle that never arrived;
+//	                                       produces retire_proof
+//	source Complete  sealed → transferred  requires the destination's
+//	                                       activate_proof
+//	source Abort     sealed → active       requires the destination's
+//	                                       retire_proof (or force)
 //
-// Abort (source, sealed → active) and Discard (destination, staged → removed)
-// undo an unfinished transfer. Every step is idempotent by transfer id: after
-// a lost response, repeat the call or read the transfer ledger.
+// Every step is idempotent by transfer id: after a lost response, repeat the
+// call or read the transfer ledger, which returns the recorded proofs.
+//
+// The proofs are evidence, not authentication: only a party holding the
+// bundle can mint them, and the destination produces each honestly only when
+// it commits that transition. The coordinator already holds the bundle — and
+// with it the whole life — so the gates make the correct order the only easy
+// one: no ordinary lost response, retry or partition can leave two placements
+// able to run the secretary, or none.
 //
 // What is deliberately not carried is part of the contract: the writer lease
 // itself (only its generation as an epoch floor), placement authority, the
@@ -45,13 +65,19 @@ const (
 	SecretsNone = "none"
 )
 
-// Header is the first line of a bundle.
+// Header is the first line of a bundle. DestinationID addresses the bundle
+// to one placement — an import anywhere else is refused — and TransferKey is
+// the per-transfer HMAC key the destination uses to prove it committed a
+// transition (activate or retire). The key is private life content like the
+// rest of the bundle; it never appears in a receipt.
 type Header struct {
 	Record        string       `json:"record"` // "header"
 	Format        string       `json:"format"`
 	FormatVersion int          `json:"format_version"`
 	TransferID    string       `json:"transfer_id"`
 	PersonaID     string       `json:"persona_id"`
+	DestinationID string       `json:"destination_id"`
+	TransferKey   string       `json:"transfer_key"`
 	SealedAt      time.Time    `json:"sealed_at"`
 	Sections      []SectionRef `json:"sections"`
 	Cut           Cut          `json:"cut"`
@@ -118,20 +144,34 @@ type Continuity struct {
 }
 
 // Receipt is the verified result of a transfer step, stored in the ledger
-// and returned again on replay.
+// and returned again on replay. ActivateProof and RetireProof are set only
+// when the destination committed that transition; they are what the source's
+// Complete and Abort require. Forced marks an abort the operator allowed
+// without a retire proof — the only path that can leave two placements able
+// to run the secretary, taken deliberately against a lost destination.
 type Receipt struct {
 	Direction     string           `json:"direction"`
 	TransferID    string           `json:"transfer_id"`
 	PersonaID     string           `json:"persona_id"`
 	Status        string           `json:"status"`
 	FormatVersion int              `json:"format_version"`
+	DestinationID string           `json:"destination_id,omitempty"`
+	HumanID       *string          `json:"human_id,omitempty"`
 	ContentSHA256 string           `json:"content_sha256,omitempty"`
+	ActivateProof string           `json:"activate_proof,omitempty"`
+	RetireProof   string           `json:"retire_proof,omitempty"`
+	Forced        bool             `json:"forced,omitempty"`
 	SealedAt      time.Time        `json:"sealed_at"`
 	Cut           Cut              `json:"cut"`
 	Rows          map[string]int64 `json:"rows"`
 	Continuity    Continuity       `json:"continuity"`
 	NotIncluded   []Exclusion      `json:"not_included"`
 	UpdatedAt     time.Time        `json:"updated_at"`
+
+	// key is the transfer's HMAC key, loaded from the ledger column for
+	// proof verification. It is never serialized into a receipt or stored
+	// inside the receipt JSON.
+	key string
 }
 
 // NotIncluded is what version 1 does not carry. Each entry needs its own
