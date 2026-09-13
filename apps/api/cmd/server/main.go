@@ -650,12 +650,14 @@ func newApplicationFromEnv() (*application, error) {
 	// core. Opt-in: mounted only when a service token is configured and the
 	// control-plane database exists. Developer/operator credential scope; see
 	// internal/agentstate for the authorization model.
+	var coreServer *agentstate.Server
 	if coreToken := strings.TrimSpace(os.Getenv("SUMI_CORE_STATE_TOKEN")); coreToken != "" && database != nil {
 		if len(coreToken) < 16 {
 			closeOnError()
 			return nil, errors.New("SUMI_CORE_STATE_TOKEN must be at least 16 characters")
 		}
-		agentstate.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
+		coreServer = agentstate.NewServer(database.Pool, coreToken)
+		coreServer.RegisterRoutes(mux)
 		log.Print("core state routes ready (/internal/core, scoped tokens)")
 	}
 	mux.HandleFunc("GET /health", handler.Health)
@@ -664,7 +666,27 @@ func newApplicationFromEnv() (*application, error) {
 		go messagingServer.Store.RunAttachmentReconciler(backgroundCtx, messaging.AttachmentReconcileInterval)
 	}
 	var deliverAttention func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
-	if messagingServer != nil && spawnManager != nil {
+	switch {
+	case messagingServer != nil && coreServer != nil:
+		// Shared-conversation intake into the accepted core: attention events
+		// become durable per-persona inputs, and the secretary's replies post
+		// back into real Messaging places through the messaging.send effect —
+		// atomic with the operation record that authorized it.
+		delivery := &messaging.CoreAttentionDelivery{
+			Core:      coreServer.Store(),
+			Messaging: messagingServer.Store,
+			Hub:       messagingServer.Hub,
+		}
+		if err := coreServer.RegisterToolEffect(messaging.MessagingCoreTool, delivery.SendEffect()); err != nil {
+			stopBackground()
+			closeOnError()
+			return nil, fmt.Errorf("register core messaging effect: %w", err)
+		}
+		deliverAttention = func(ctx context.Context) (messaging.AgentAttentionDeliveryStats, error) {
+			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
+		}
+		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
+	case messagingServer != nil && spawnManager != nil:
 		delivery := &messaging.AgentAttentionGateway{
 			Gateway: runtime, Spawner: spawnManager,
 			TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID")),

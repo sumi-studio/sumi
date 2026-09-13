@@ -270,11 +270,52 @@ type CommitRequest struct {
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
 // service generates one per attempt internally when needed.
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	effects map[string]ToolEffect
+}
+
+// ToolEffect delegates one tool's atomic, state-internal effect to a
+// registered applier — the seam that lets an in-process domain (Messaging)
+// give the secretary a real action without the state service knowing the
+// domain. Apply runs inside the operation-claim transaction: the operation
+// record and its effect commit or roll back together, exactly like the
+// built-in internal tools. AfterCommit runs after that transaction commits,
+// best-effort (e.g. live fanout); it cannot decide or undo the committed
+// record and its failure is invisible to the caller by design.
+type ToolEffect struct {
+	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
+	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
 }
 
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// RegisterEffect makes tool claimable with its effect applied by effect.
+// Register at construction, before serving — the map is not synchronized for
+// concurrent registration. Built-in internal tools cannot be re-registered.
+func (s *Store) RegisterEffect(tool string, effect ToolEffect) error {
+	if tool == "" || effect.Apply == nil {
+		return fmt.Errorf("%w: tool effect requires a name and Apply", ErrBadRequest)
+	}
+	if isInternalTool(tool) {
+		return fmt.Errorf("%w: %s is a built-in internal tool", ErrBadRequest, tool)
+	}
+	if s.effects == nil {
+		s.effects = map[string]ToolEffect{}
+	}
+	s.effects[tool] = effect
+	return nil
+}
+
+// claimableTool reports whether a tool has an execution path this store can
+// run: the built-in state-internal tools, or a delegated registered effect.
+func (s *Store) claimableTool(tool string) bool {
+	if isInternalTool(tool) {
+		return true
+	}
+	_, ok := s.effects[tool]
+	return ok
 }
 
 // requireGeneration locks the writer lease row and verifies the presented
@@ -818,7 +859,7 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				SELECT persona_id, input_id FROM core_inputs
 				WHERE persona_id = $1 AND status = 'queued'
 					AND (not_before IS NULL OR not_before <= now())
-				ORDER BY created_at, input_id LIMIT 1 FOR UPDATE SKIP LOCKED
+				ORDER BY admission_seq LIMIT 1 FOR UPDATE SKIP LOCKED
 			)
 			RETURNING `+inputCols,
 			personaID, generation).
@@ -1239,7 +1280,7 @@ func isInternalTool(tool string) bool {
 // internalToolResponse applies a state-internal tool's effect inside the
 // claim transaction: the operation record and its effect are atomic, so a
 // crash cannot leave an unrecorded effect or a dangling record.
-func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, tool string, request map[string]any) (map[string]any, bool, error) {
+func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, tool, idemKey string, request map[string]any) (map[string]any, bool, error) {
 	switch tool {
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
@@ -1319,6 +1360,13 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
 	default:
+		if effect, ok := s.effects[tool]; ok {
+			response, err := effect.Apply(ctx, tx, personaID, idemKey, request)
+			if err != nil {
+				return nil, false, err
+			}
+			return response, true, nil
+		}
 		return nil, false, nil
 	}
 }
@@ -1334,7 +1382,7 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // generation reclaims — reconciliation by querying the external system is the
 // caller's duty, the ledger alone cannot prove an ambiguous external effect.
 func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, bool, error) {
-	if !isInternalTool(tool) {
+	if !s.claimableTool(tool) {
 		// This slice has no external executor; claiming an unregistered tool
 		// would record a permanently dangling 'running' operation. Reject at
 		// the boundary — the authorized external-tool contract (M08) adds its
@@ -1451,7 +1499,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
-	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
+	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, idemKey, request)
 	if err != nil {
 		return Operation{}, false, err
 	}
@@ -1467,6 +1515,14 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Operation{}, false, err
+	}
+	if internal {
+		// Post-commit hook for delegated effects (e.g. live fanout for a
+		// committed message). Best-effort: the record is already durable, a
+		// fanout failure must not fail the committed claim.
+		if effect, ok := s.effects[tool]; ok && effect.AfterCommit != nil {
+			effect.AfterCommit(ctx, personaID, request, op.Response)
+		}
 	}
 	return op, true, nil
 }

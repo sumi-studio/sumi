@@ -944,21 +944,81 @@ const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
+  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
 function inputReceivedEvent(input: Input, turn: Turn): EventInput {
+  const p = input.payload as Record<string, unknown>;
+  const actor = (p.actor ?? {}) as Record<string, unknown>;
+  const place = (p.place ?? {}) as Record<string, unknown>;
   return {
     kind: "input_received",
     payload: {
       input_id: input.input_id,
       kind: input.kind,
-      text: typeof input.payload.text === "string" ? input.payload.text : null,
+      text: typeof p.text === "string" ? p.text : null,
       actor_kind: input.actor_kind,
+      actor_id: input.actor_id || null,
+      actor_display:
+        typeof actor.display_name === "string" ? actor.display_name : null,
       source_surface: input.source_surface,
+      thread_id: input.thread_id || null,
+      place_name: typeof place.name === "string" ? place.name : null,
+      place_kind: typeof place.kind === "string" ? place.kind : null,
+      attention: input.attention,
+      occurred_at: input.occurred_at,
+      event_id: typeof p.event_id === "string" ? p.event_id : null,
+      message_id: typeof p.message_id === "string" ? p.message_id : null,
+      message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
+      reason: typeof p.reason === "string" ? p.reason : null,
       attempt: turn.attempt,
     },
   };
+}
+
+type InputProvenance = {
+  actorKind: string;
+  actorName: unknown;
+  surface: string;
+  placeId: unknown;
+  placeName: unknown;
+  placeKind: unknown;
+  messageId: unknown;
+  attention: string;
+};
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * Render the "[who in where]" marker prefixing an input's text in model
+ * context and in the current input. Provenance stays inside one bracket pair
+ * (names are stripped of brackets) so directive-style content still parses
+ * first. A Messaging input names the place_id and message_id the secretary
+ * needs to answer there through messaging.send — without them a real model
+ * could see who spoke but not address a reply. The attention hint is part of
+ * the marker — it informs, never mandates.
+ */
+function inputMarker(p: InputProvenance): string {
+  const clean = (s: string) => s.replace(/[[\]]/g, "");
+  const name = clean(str(p.actorName));
+  const who = name ? `${name} (${p.actorKind})` : p.actorKind;
+  const placeLabel = clean(str(p.placeName)) || str(p.placeKind);
+  const where = placeLabel ? ` in ${placeLabel}` : "";
+  const refs =
+    p.surface === "messaging"
+      ? [
+          str(p.placeId) && ` place_id=${str(p.placeId)}`,
+          str(p.messageId) && ` message_id=${str(p.messageId)}`,
+        ].join("")
+      : "";
+  const hint =
+    p.attention === "observe"
+      ? " — fyi, no reply needed"
+      : p.attention === "defer"
+        ? " — deferred"
+        : "";
+  return `[${who}${where}${refs}${hint}]`;
 }
 
 /** Assemble model messages from the journal tail plus the current input. */
@@ -971,7 +1031,16 @@ export function assemble(context: Event[], input: Input): ChatMessage[] {
         const who =
           p.actor_kind === "schedule"
             ? "[scheduled wake]"
-            : `[${String(p.actor_kind)}]`;
+            : inputMarker({
+                actorKind: String(p.actor_kind),
+                actorName: p.actor_display,
+                surface: str(p.source_surface),
+                placeId: p.thread_id,
+                placeName: p.place_name,
+                placeKind: p.place_kind,
+                messageId: p.message_id,
+                attention: str(p.attention),
+              });
         messages.push({
           role: "user",
           content: `${who} ${String(p.text ?? "")}`,
@@ -1003,14 +1072,25 @@ export function assemble(context: Event[], input: Input): ChatMessage[] {
         break;
     }
   }
+  const p = input.payload as Record<string, unknown>;
   const text =
-    typeof input.payload.text === "string"
-      ? input.payload.text
+    typeof p.text === "string" && p.text !== ""
+      ? p.text
       : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"
-      : `[${input.actor_kind}]`;
+      : inputMarker({
+          actorKind: input.actor_kind,
+          actorName: (p.actor as Record<string, unknown> | undefined)
+            ?.display_name,
+          surface: input.source_surface,
+          placeId: input.thread_id,
+          placeName: (p.place as Record<string, unknown> | undefined)?.name,
+          placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
+          messageId: p.message_id,
+          attention: input.attention,
+        });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
 }
