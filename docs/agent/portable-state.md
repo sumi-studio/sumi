@@ -26,8 +26,8 @@ admin/service secret. A persona token cannot seal, export, import or activate.
 | Import | destination | `POST /transfers/import?human_id=` | `staged`. One transaction: rows, trailer digest and counts, cut positions, reference checks, lease epoch floor, ledger. Any failure leaves nothing. A bundle addressed to another placement is refused (`422`), so an ordinary retry can never stage two copies. A retired transfer is refused forever. Same transfer, content and `human_id` again → `200` with the recorded receipt; a different `human_id` is a `409`. |
 | Activate | destination | `POST /personas/{p}/transfers/{t}/activate` | `staged → active`, and mints the `activate_proof`. Replay returns the same proof. After a retire, `409`. |
 | Complete | source | `POST /personas/{p}/transfers/{t}/complete` `{activate_proof}` | `sealed → transferred`, only with the destination's `activate_proof`. A missing proof is `400`; a value the destination never produced is `409`, and the source stays sealed. Source rows stay as history. |
-| Retire | destination | `POST /personas/{p}/transfers/{t}/retire` `{transfer_key?}` | Commits "this transfer never runs here": deletes a staged copy, or writes a tombstone when the bundle never arrived (the `transfer_key` from the bundle header is required then). Mints the `retire_proof`. Replay returns the same proof. An activated transfer cannot retire (`409`). Retire on the transfer's own source is refused. |
-| Abort | source | `POST /personas/{p}/transfers/{t}/abort` `{retire_proof}` or `{force:true}` | `sealed → active` with the destination's `retire_proof`; the next writer gets a newer generation. Without proof the source stays sealed. `force:true` is the recorded break-glass for a destination gone for good. |
+| Retire | destination | `POST /personas/{p}/transfers/{t}/retire` `{destination_id, transfer_key?}` | Commits "this transfer never runs here": deletes a staged copy, or writes a tombstone when the bundle never arrived (the `transfer_key` from the bundle header is required then). `destination_id` must name this placement — a retire dispatched to the wrong service is refused. Mints the `retire_proof`. Replay returns the same proof; a bare tombstone (nothing ever imported) may be *corrected* by a re-retire naming the real `persona_id`/`transfer_key`, which re-mints the proof but never lifts the foreclosure. An activated transfer cannot retire (`409`). Retire on the transfer's own source is refused. |
+| Abort | source | `POST /personas/{p}/transfers/{t}/abort` `{retire_proof}` | `sealed → active` with the destination's `retire_proof`; the next writer gets a newer generation. Without proof the source stays sealed. There is no force path — `{force:true}` is rejected `400`. |
 | Status | either | `GET /transfers/{export\|import}/{t}` | The ledger answer after a lost response, including whichever proof the destination committed (`activate_proof` or `retire_proof`). |
 
 `authority` is checked inside the same transactions as the writer generation
@@ -48,18 +48,23 @@ evidence, so no lost response, retry or partition creates two writers:
   Status.
 - `Complete` requires the `activate_proof` the destination minted when it
   activated. `Abort` requires the `retire_proof` it minted when it retired.
-  Both are HMAC-SHA256 of `action:transfer_id:persona_id` under the transfer
-  key that travels in the bundle header — a value the destination only
-  publishes after it commits, so it works as commit evidence. It is not an
-  identity proof: anyone holding the bundle already holds the whole life and
-  could mint any proof. Deliberate forgery is out of scope; the gates exist
-  so honest calls cannot end authority by accident.
+  Both are HMAC-SHA256 of `action:transfer_id:persona_id:destination_id`
+  under the transfer key that travels in the bundle header, computed over the
+  producing service's own placement id — a value the destination only
+  publishes after it commits, so it works as commit evidence. A proof minted
+  by the wrong placement names that placement and fails the source's check
+  against the recorded destination. It is not an identity proof: anyone
+  holding the bundle already holds the whole life and could mint any proof.
+  Deliberate forgery is out of scope; the gates exist so honest calls cannot
+  end authority by accident.
 - While the destination is unreachable the source stays `sealed`: parked,
   visible, singular. When it answers again, Status returns whichever proof
   committed — `activate_proof` → `complete`, `retire_proof` → `abort`.
-- `force:true` on abort is the only exit without destination contact. It is
-  recorded on the receipt, and it can produce two writers if the destination
-  copy still exists — it is the deliberate break-glass, not a normal step.
+- A destination that is gone *permanently* cannot produce a retire proof, so
+  the source stays sealed indefinitely. That is the honest availability
+  tradeoff this contract takes today: recovering from a truly lost placement
+  means deciding who may declare it dead, which has identity consequences —
+  it is a separate product decision, not a request flag on `abort`.
 
 ## Bundle format v1
 

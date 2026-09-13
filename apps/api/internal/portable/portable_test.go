@@ -181,11 +181,17 @@ func bundleHeader(t *testing.T, bundle []byte) Header {
 	return hdr
 }
 
+// placementID is the durable identity a seal addresses a bundle to.
+func placementID(t *testing.T, p placement) string {
+	t.Helper()
+	return must(p.svc.PlacementID(context.Background()))
+}
+
 // retireDest retires the transfer on the destination and returns the proof
 // the source's abort requires.
 func retireDest(t *testing.T, dest placement, personaID, transferID, key string) Receipt {
 	t.Helper()
-	return must(dest.svc.Retire(context.Background(), personaID, transferID, key))
+	return must(dest.svc.Retire(context.Background(), personaID, transferID, placementID(t, dest), key))
 }
 
 // The same secretary moves from one database to another and continues: its
@@ -501,10 +507,10 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 
 	// Abort without evidence stays sealed; the staged copy alone is enough
 	// to make an unproven abort unsafe.
-	if _, err := local.svc.Abort(ctx, pid, "move-0005", "", false); !errors.Is(err, ErrMissingProof) {
+	if _, err := local.svc.Abort(ctx, pid, "move-0005", ""); !errors.Is(err, ErrMissingProof) {
 		t.Fatalf("abort without a retire proof: %v", err)
 	}
-	if _, err := local.svc.Abort(ctx, pid, "move-0005", strings.Repeat("b", 64), false); !errors.Is(err, ErrTransferConflict) {
+	if _, err := local.svc.Abort(ctx, pid, "move-0005", strings.Repeat("b", 64)); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("abort with a foreign proof: %v", err)
 	}
 	if a := authority(t, local, pid); a != "sealed" {
@@ -533,8 +539,8 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 		t.Fatalf("activate after retire: %v", err)
 	}
 
-	must(local.svc.Abort(ctx, pid, "move-0005", retired.RetireProof, false))
-	must(local.svc.Abort(ctx, pid, "move-0005", retired.RetireProof, false))
+	must(local.svc.Abort(ctx, pid, "move-0005", retired.RetireProof))
+	must(local.svc.Abort(ctx, pid, "move-0005", retired.RetireProof))
 	if _, err := local.svc.Complete(ctx, pid, "move-0005", retired.RetireProof); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("complete after abort: %v", err)
 	}
@@ -747,17 +753,17 @@ func TestLostActivateResponseKeepsOneWriter(t *testing.T) {
 
 	// The mistaken coordinator retries by aborting the source. No proof
 	// exists: abort is refused and the source stays sealed, not dual.
-	if _, err := local.svc.Abort(ctx, pid, "move-0010", "", false); !errors.Is(err, ErrMissingProof) {
+	if _, err := local.svc.Abort(ctx, pid, "move-0010", ""); !errors.Is(err, ErrMissingProof) {
 		t.Fatalf("abort after lost activate: %v, want ErrMissingProof", err)
 	}
-	if _, err := local.svc.Abort(ctx, pid, "move-0010", strings.Repeat("c", 64), false); !errors.Is(err, ErrTransferConflict) {
+	if _, err := local.svc.Abort(ctx, pid, "move-0010", strings.Repeat("c", 64)); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("abort with a fabricated proof: %v", err)
 	}
 	if a := authority(t, local, pid); a != "sealed" {
 		t.Fatalf("refused abort changed authority to %s", a)
 	}
 	// The destination cannot be talked out of it either.
-	if _, err := cloud.svc.Retire(ctx, pid, "move-0010", ""); !errors.Is(err, ErrTransferConflict) {
+	if _, err := cloud.svc.Retire(ctx, pid, "move-0010", placementID(t, cloud), ""); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("retire after activate: %v", err)
 	}
 
@@ -839,7 +845,7 @@ func TestCompleteRequiresDestinationActivation(t *testing.T) {
 	// The bundle never arrived at the destination either. Retire records a
 	// tombstone keyed by the header's transfer key, and abort unseals.
 	key := bundleHeader(t, bundle).TransferKey
-	if _, err := cloud.svc.Retire(ctx, pid, "move-0012", ""); !errors.Is(err, ErrMissingProof) {
+	if _, err := cloud.svc.Retire(ctx, pid, "move-0012", placementID(t, cloud), ""); !errors.Is(err, ErrMissingProof) {
 		t.Fatalf("tombstone retire without the key: %v", err)
 	}
 	tomb := retireDest(t, cloud, pid, "move-0012", key)
@@ -849,7 +855,7 @@ func TestCompleteRequiresDestinationActivation(t *testing.T) {
 	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("a late import beats the tombstone: %v", err)
 	}
-	must(local.svc.Abort(ctx, pid, "move-0012", tomb.RetireProof, false))
+	must(local.svc.Abort(ctx, pid, "move-0012", tomb.RetireProof))
 	lease := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute))
 	if lease.Generation <= localGen {
 		t.Fatalf("source resumed at generation %d", lease.Generation)
@@ -867,7 +873,7 @@ func TestRetireRefusesTheSourcePlacement(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-0013", newID(t)))
 	bundle, _ := exportBytes(t, local, pid, "move-0013")
 	key := bundleHeader(t, bundle).TransferKey
-	if _, err := local.svc.Retire(ctx, pid, "move-0013", key); !errors.Is(err, ErrTransferConflict) {
+	if _, err := local.svc.Retire(ctx, pid, "move-0013", placementID(t, local), key); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("retire on the source: %v", err)
 	}
 	if _, err := local.svc.Status(ctx, "import", "move-0013"); !errors.Is(err, ErrTransferNotFound) {
@@ -888,7 +894,7 @@ func TestRetireAndActivateCommitExactlyOnce(t *testing.T) {
 
 	results := make(chan error, 2)
 	go func() { _, err := cloud.svc.Activate(ctx, pid, "move-0014"); results <- err }()
-	go func() { _, err := cloud.svc.Retire(ctx, pid, "move-0014", ""); results <- err }()
+	go func() { _, err := cloud.svc.Retire(ctx, pid, "move-0014", placementID(t, cloud), ""); results <- err }()
 	err1, err2 := <-results, <-results
 	if (err1 == nil) == (err2 == nil) {
 		t.Fatalf("retire and activate both committed or both failed: %v / %v", err1, err2)
@@ -898,13 +904,13 @@ func TestRetireAndActivateCommitExactlyOnce(t *testing.T) {
 	st := must(cloud.svc.Status(ctx, "import", "move-0014"))
 	switch st.Status {
 	case "retired":
-		must(local.svc.Abort(ctx, pid, "move-0014", st.RetireProof, false))
+		must(local.svc.Abort(ctx, pid, "move-0014", st.RetireProof))
 		if _, err := cloud.svc.Activate(ctx, pid, "move-0014"); !errors.Is(err, ErrTransferConflict) {
 			t.Fatalf("activated after retire: %v", err)
 		}
 	case "activated":
 		must(local.svc.Complete(ctx, pid, "move-0014", st.ActivateProof))
-		if _, err := local.svc.Abort(ctx, pid, "move-0014", "", false); !errors.Is(err, ErrTransferConflict) {
+		if _, err := local.svc.Abort(ctx, pid, "move-0014", ""); !errors.Is(err, ErrTransferConflict) {
 			t.Fatalf("aborted after completion: %v", err)
 		}
 	default:
@@ -936,7 +942,7 @@ func TestImportAndRetireRaceToOneOutcome(t *testing.T) {
 		results <- outcome{imported: created, err: err}
 	}()
 	go func() {
-		_, err := cloud.svc.Retire(ctx, pid, "move-0015", key)
+		_, err := cloud.svc.Retire(ctx, pid, "move-0015", placementID(t, cloud), key)
 		results <- outcome{retired: err == nil, err: err}
 	}()
 	a, b := <-results, <-results
@@ -954,25 +960,42 @@ func TestImportAndRetireRaceToOneOutcome(t *testing.T) {
 	}
 }
 
-// A destination gone for good can never produce a retire proof. force=true
-// is the explicit, recorded escape: the source unseals and the receipt shows
-// the abort was forced.
-func TestForceAbortIsRecorded(t *testing.T) {
+// There is no force path on abort: a destination that cannot answer leaves
+// the source sealed. The HTTP route rejects {force:true} explicitly so the
+// flag can never silently release authority.
+func TestAbortHasNoForcePath(t *testing.T) {
 	ctx := context.Background()
 	local := newPlacement(t)
 	pid := newID(t)
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0016", newID(t)))
-	rec := must(local.svc.Abort(ctx, pid, "move-0016", "", true))
-	if rec.Status != "aborted" || !rec.Forced {
-		t.Fatalf("forced abort receipt %+v", rec)
+
+	const secret = "portable-test-admin-secret"
+	mux := http.NewServeMux()
+	NewServer(local.pool, secret).RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	req := func(body string) int {
+		r, _ := http.NewRequestWithContext(ctx, "POST",
+			srv.URL+"/internal/core/personas/"+pid+"/transfers/move-0016/abort",
+			strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+secret)
+		res, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		return res.StatusCode
 	}
-	st := must(local.svc.Status(ctx, "export", "move-0016"))
-	if !st.Forced {
-		t.Fatal("status does not show the abort was forced")
+	if code := req(`{"force":true}`); code != http.StatusBadRequest {
+		t.Fatalf("force abort: %d, want 400", code)
 	}
-	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); err != nil {
-		t.Fatalf("source did not resume after a forced abort: %v", err)
+	if code := req(`{}`); code != http.StatusBadRequest {
+		t.Fatalf("proofless abort: %d, want 400", code)
+	}
+	if a := authority(t, local, pid); a != "sealed" {
+		t.Fatalf("refused aborts changed authority to %s", a)
 	}
 }
 
@@ -1021,6 +1044,158 @@ func TestImportErrorContract(t *testing.T) {
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || created {
 		t.Fatalf("faithful replay: created=%v err=%v", created, err)
 	}
+}
+
+// R7: a retire dispatched to a service that never saw the bundle cannot end
+// the source's authority. The request itself must name this placement, and
+// the proof any placement mints names its own id — the source verifies it
+// against the destination it sealed to.
+func TestRetireProofBindsTheDestination(t *testing.T) {
+	ctx := context.Background()
+	local, cloud, third := newPlacement(t), newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	cloudID := placementID(t, cloud)
+	thirdID := placementID(t, third)
+	must(local.svc.Seal(ctx, pid, "move-0020", cloudID))
+	bundle, _ := exportBytes(t, local, pid, "move-0020")
+	key := bundleHeader(t, bundle).TransferKey
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+
+	// The request itself must name this placement: a retire addressed to
+	// cloud is refused by third before anything is recorded.
+	if _, err := third.svc.Retire(ctx, pid, "move-0020", cloudID, key); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("retire addressed elsewhere: %v", err)
+	}
+	if _, err := third.svc.Status(ctx, "import", "move-0020"); !errors.Is(err, ErrTransferNotFound) {
+		t.Fatalf("the refused retire still wrote a tombstone: %v", err)
+	}
+
+	// Even when the mistaken call names the wrong service's own id, the
+	// proof minted there names that placement — the source rejects it, and
+	// the staged copy on the real destination is not freed to activate beside
+	// a resumed source.
+	bogus := must(third.svc.Retire(ctx, pid, "move-0020", thirdID, key))
+	if bogus.Status != "retired" || bogus.RetireProof == "" {
+		t.Fatalf("third's tombstone: %+v", bogus)
+	}
+	if _, err := local.svc.Abort(ctx, pid, "move-0020", bogus.RetireProof); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("abort on a proof minted by the wrong placement: %v", err)
+	}
+	if a := authority(t, local, pid); a != "sealed" {
+		t.Fatalf("a foreign retire proof changed authority to %s", a)
+	}
+
+	// The honest resolution: retire on the addressed destination deletes the
+	// staged copy, and its proof — naming cloud — unseals the source.
+	retired := retireDest(t, cloud, pid, "move-0020", "")
+	must(local.svc.Abort(ctx, pid, "move-0020", retired.RetireProof))
+	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); err != nil {
+		t.Fatalf("source did not resume: %v", err)
+	}
+	if _, err := cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute); err == nil {
+		t.Fatal("the retired destination acquired a writer — two writers")
+	}
+}
+
+// R8: a tombstone written from mistaken parameters — a wrong transfer_key —
+// stays correctable while nothing was imported. Correction rewrites the
+// record and re-mints the proof; it never lifts the foreclosure.
+func TestTombstoneCorrectionRecoversAWrongKey(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-0021", cloudID))
+	bundle, _ := exportBytes(t, local, pid, "move-0021")
+	key := bundleHeader(t, bundle).TransferKey
+
+	// The retire reached the right service but carried the wrong key: its
+	// proof can never satisfy the source, and replaying the same wrong call
+	// keeps returning it.
+	wrong := must(cloud.svc.Retire(ctx, pid, "move-0021", cloudID, strings.Repeat("d", 64)))
+	if _, err := local.svc.Abort(ctx, pid, "move-0021", wrong.RetireProof); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("abort on a proof minted under the wrong key: %v", err)
+	}
+	if again := must(cloud.svc.Retire(ctx, pid, "move-0021", cloudID, strings.Repeat("d", 64))); again.RetireProof != wrong.RetireProof {
+		t.Fatal("repeating the bad key minted a different proof")
+	}
+	// Correcting without the key is refused; with the real key the tombstone
+	// is rewritten in place and its proof re-minted.
+	if _, err := cloud.svc.Retire(ctx, pid, "move-0021", cloudID, ""); !errors.Is(err, ErrMissingProof) {
+		t.Fatalf("correction without the key: %v", err)
+	}
+	fixed := must(cloud.svc.Retire(ctx, pid, "move-0021", cloudID, key))
+	if fixed.RetireProof == wrong.RetireProof {
+		t.Fatal("correcting the key did not re-mint the proof")
+	}
+	must(local.svc.Abort(ctx, pid, "move-0021", fixed.RetireProof))
+	// Foreclosure is durable through correction.
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("import after tombstone correction: %v", err)
+	}
+	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); err != nil {
+		t.Fatalf("source did not resume: %v", err)
+	}
+}
+
+// The other half of R8: a tombstone naming the wrong persona is corrected the
+// same way — and while it stands, the real bundle is refused on the
+// persona mismatch rather than staged beside it.
+func TestTombstoneCorrectionRecoversAWrongPersona(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-0022", cloudID))
+	bundle, _ := exportBytes(t, local, pid, "move-0022")
+	key := bundleHeader(t, bundle).TransferKey
+
+	mistaken := must(cloud.svc.Retire(ctx, newID(t), "move-0022", cloudID, key))
+	if mistaken.PersonaID == pid {
+		t.Fatal("the tombstone recorded the requested persona")
+	}
+	if _, err := local.svc.Abort(ctx, pid, "move-0022", mistaken.RetireProof); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("abort on a proof naming another persona: %v", err)
+	}
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("the real bundle staged beside a wrong-persona tombstone: %v", err)
+	}
+	fixed := must(cloud.svc.Retire(ctx, pid, "move-0022", cloudID, key))
+	if fixed.PersonaID != pid {
+		t.Fatalf("correction kept persona %s", fixed.PersonaID)
+	}
+	must(local.svc.Abort(ctx, pid, "move-0022", fixed.RetireProof))
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("import after persona correction: %v", err)
+	}
+}
+
+// An imported-then-retired transfer is never rewritten: its parameters were
+// verified against the bundle at import, so a replay with a different key is
+// a conflict, not a correction.
+func TestImportedRetireIsNotCorrectable(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-0023", cloudID))
+	bundle, _ := exportBytes(t, local, pid, "move-0023")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	retired := retireDest(t, cloud, pid, "move-0023", "")
+	if _, err := cloud.svc.Retire(ctx, pid, "move-0023", cloudID, strings.Repeat("e", 64)); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("re-retire of an imported transfer with a different key: %v", err)
+	}
+	if _, err := cloud.svc.Retire(ctx, newID(t), "move-0023", cloudID, ""); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("re-retire of an imported transfer with a different persona: %v", err)
+	}
+	if again := retireDest(t, cloud, pid, "move-0023", ""); again.RetireProof != retired.RetireProof {
+		t.Fatal("imported retire replay changed the proof")
+	}
+	must(local.svc.Abort(ctx, pid, "move-0023", retired.RetireProof))
 }
 
 func ptr[T any](v T) *T { return &v }

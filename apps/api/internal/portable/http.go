@@ -164,7 +164,15 @@ func (s *Server) abort(w http.ResponseWriter, r *http.Request) {
 	if !body(w, r, &b) {
 		return
 	}
-	rec, err := s.svc.Abort(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.RetireProof, b.Force)
+	// There is no force path: a destination that cannot answer leaves the
+	// source sealed. Recovery for a permanently lost placement is a product
+	// decision with identity consequences, not a request flag.
+	if b.Force {
+		writeError(w, http.StatusBadRequest,
+			"abort has no force path: retire the transfer on the destination, or the source stays sealed")
+		return
+	}
+	rec, err := s.svc.Abort(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.RetireProof)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -177,12 +185,13 @@ func (s *Server) retire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		TransferKey string `json:"transfer_key"`
+		DestinationID string `json:"destination_id"`
+		TransferKey   string `json:"transfer_key"`
 	}
 	if !body(w, r, &b) {
 		return
 	}
-	rec, err := s.svc.Retire(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.TransferKey)
+	rec, err := s.svc.Retire(r.Context(), r.PathValue("persona"), r.PathValue("transfer"), b.DestinationID, b.TransferKey)
 	if err != nil {
 		writeErr(w, err)
 		return

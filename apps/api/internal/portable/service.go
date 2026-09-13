@@ -93,22 +93,26 @@ func newTransferKey() (string, error) {
 }
 
 // transferProof is the evidence a destination produces when it commits a
-// transition: HMAC-SHA256 of "action:transfer_id:persona_id" under the
-// transfer's key. The source verifies it before ending its own authority, so
-// completing or aborting requires a value the destination only publishes when
-// that step actually committed — readable again from its transfer Status after
-// a lost response. A party holding the bundle can mint any proof; it already
-// holds the whole life, and deliberate forgery is out of scope. The gates
-// exist so that an honest caller cannot end authority by accident.
-func transferProof(key, action, transferID, personaID string) string {
+// transition: HMAC-SHA256 of "action:transfer_id:persona_id:destination_id"
+// under the transfer's key. The destination computes it over its own
+// placement id; the source verifies it against the destination it recorded
+// at seal, so a proof minted by any other placement — for example a retire
+// dispatched to the wrong service — can never satisfy the source. The source
+// verifies it before ending its own authority, so completing or aborting
+// requires a value the destination only publishes when that step actually
+// committed — readable again from its transfer Status after a lost response.
+// A party holding the bundle can mint any proof; it already holds the whole
+// life, and deliberate forgery is out of scope. The gates exist so that an
+// honest caller cannot end authority by accident.
+func transferProof(key, action, transferID, personaID, destinationID string) string {
 	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write([]byte(action + ":" + transferID + ":" + personaID))
+	mac.Write([]byte(action + ":" + transferID + ":" + personaID + ":" + destinationID))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func proofMatches(key, action, transferID, personaID, presented string) bool {
+func proofMatches(key, action, transferID, personaID, destinationID, presented string) bool {
 	return subtle.ConstantTimeCompare(
-		[]byte(transferProof(key, action, transferID, personaID)), []byte(presented)) == 1
+		[]byte(transferProof(key, action, transferID, personaID, destinationID)), []byte(presented)) == 1
 }
 
 // transferLock serializes an import with a retire of the same transfer on
@@ -179,7 +183,7 @@ func ledger(ctx context.Context, q querier, direction, transferID string, lock b
 }
 
 // commit records a transition: the new status plus the receipt as augmented
-// by that step (proofs, forced flag), so Status returns them after a lost
+// by that step (the proofs it produced), so Status returns them after a lost
 // response.
 func commit(ctx context.Context, tx pgx.Tx, direction, transferID, status string, rec *Receipt) error {
 	rec.Status = status
@@ -392,10 +396,10 @@ func (s *Service) Complete(ctx context.Context, personaID, transferID, activateP
 		return Receipt{}, fmt.Errorf("%w: pass the destination's activate_proof "+
 			"(POST activate on the destination, or GET /transfers/import/%s there)", ErrMissingProof, transferID)
 	}
-	if !proofMatches(rec.key, "activate", transferID, personaID, activateProof) {
-		return Receipt{}, fmt.Errorf("%w: %s is not the activation proof for transfer %s; "+
-			"the destination has not activated it (check its import status)",
-			ErrTransferConflict, activateProof, transferID)
+	if !proofMatches(rec.key, "activate", transferID, personaID, rec.DestinationID, activateProof) {
+		return Receipt{}, fmt.Errorf("%w: %s is not the activation proof for transfer %s on destination %s; "+
+			"the addressed placement has not activated it (check its import status)",
+			ErrTransferConflict, activateProof, transferID, rec.DestinationID)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, personaID); err != nil {
@@ -410,18 +414,18 @@ func (s *Service) Complete(ctx context.Context, personaID, transferID, activateP
 
 // Abort returns a sealed source to active so the same secretary continues
 // where it was. It requires the destination's retire_proof: evidence that the
-// destination committed "this transfer will never run here" — the staged copy
-// deleted or a tombstone recorded before the bundle ever arrived. A
-// destination that activated can never produce one, and a destination that
-// has not retired cannot either, so no lost response or mistaken retry can
-// leave two placements able to run the secretary.
+// recorded destination committed "this transfer will never run here" — the
+// staged copy deleted or a tombstone recorded before the bundle ever
+// arrived. A destination that activated can never produce one, and a proof
+// minted by any other placement names the wrong destination, so no lost
+// response or mistaken retry can leave two placements able to run the
+// secretary.
 //
 // If the destination cannot be asked at all (unreachable, retired service),
-// the source stays sealed: paused and visible, but singular. force=true is
-// the break-glass for a destination that is gone for good; it is recorded on
-// the receipt and can produce two writers if the destination copy still
-// exists.
-func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof string, force bool) (Receipt, error) {
+// the source stays sealed: paused and visible, but singular. There is no
+// force path — a placement that is gone for good is a deliberate product
+// decision with explicit identity consequences, to be designed separately.
+func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof string) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
@@ -447,17 +451,14 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof 
 	if authority != "sealed" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
 	}
-	switch {
-	case force:
-		rec.Forced = true
-	case !proofRe.MatchString(retireProof):
+	if !proofRe.MatchString(retireProof) {
 		return Receipt{}, fmt.Errorf("%w: pass the destination's retire_proof "+
-			"(POST retire on the destination, or GET /transfers/import/%s there), "+
-			"or force=true for a destination that is gone for good", ErrMissingProof, transferID)
-	case !proofMatches(rec.key, "retire", transferID, personaID, retireProof):
-		return Receipt{}, fmt.Errorf("%w: %s is not the retire proof for transfer %s; "+
-			"the destination has not retired it (check its import status)",
-			ErrTransferConflict, retireProof, transferID)
+			"(POST retire on the destination, or GET /transfers/import/%s there)", ErrMissingProof, transferID)
+	}
+	if !proofMatches(rec.key, "retire", transferID, personaID, rec.DestinationID, retireProof) {
+		return Receipt{}, fmt.Errorf("%w: %s is not the retire proof for transfer %s on destination %s; "+
+			"the addressed placement has not retired it (check its import status)",
+			ErrTransferConflict, retireProof, transferID, rec.DestinationID)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'active', transfer_id = NULL WHERE persona_id = $1`, personaID); err != nil {
@@ -515,11 +516,18 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	if authority != "staged" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
 	}
+	// The proof names this placement's own id — which is the ledger's
+	// destination_id for every import — so it can only ever verify as the
+	// addressed destination's evidence.
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
-	rec.ActivateProof = transferProof(rec.key, "activate", transferID, personaID)
+	rec.ActivateProof = transferProof(rec.key, "activate", transferID, personaID, own)
 	if err := commit(ctx, tx, "import", transferID, "activated", &rec); err != nil {
 		return Receipt{}, err
 	}
@@ -529,20 +537,43 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 // Retire records on the destination that this transfer will never run here:
 // a staged import's persona is deleted, or — when the bundle never arrived —
 // a tombstone is written so a late import is refused. Either way it produces
-// the retire_proof the source's Abort requires. Retire is refused once the
-// transfer has activated; the ledger row lock makes retire and activate
-// commit in some order, never both.
+// the retire_proof the source's Abort requires, computed over this
+// placement's own id — so a retire dispatched to the wrong service is both
+// refused here (destination_id must be this placement) and useless there
+// (its proof names the wrong placement). Retire is refused once the transfer
+// has activated; the ledger row lock makes retire and activate commit in
+// some order, never both.
 //
-// transferKey is required only for the tombstone case: a placement that never
-// imported the bundle has not seen the key, so the caller passes it from the
-// bundle header. A mismatch means the proof will not satisfy the source's
-// Abort — read the key from the bundle, not from memory.
-func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey string) (Receipt, error) {
+// destinationID is always required — the caller knows it from the bundle
+// header — and must equal this placement's id. transferKey is required only
+// for the tombstone case: a placement that never imported the bundle has not
+// seen the key, so the caller passes it from the bundle header.
+//
+// A tombstone is the one ledger record a caller writes from unverifiable
+// parameters, so it stays correctable: while no bundle was imported
+// (content_sha256 is empty), a re-retire with a different persona_id or
+// transfer_key rewrites the record and re-mints the proof. Correction can
+// never lift the foreclosure — status stays retired, so no late import or
+// activate can ever proceed — and only a record naming the real key, persona
+// and destination produces a proof the source accepts. An imported-then-
+// retired row is never rewritten: its parameters were verified at import.
+func (s *Service) Retire(ctx context.Context, personaID, transferID, destinationID, transferKey string) (Receipt, error) {
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
+	if !uuidv7Re.MatchString(destinationID) {
+		return Receipt{}, fmt.Errorf("%w: destination_id must be this placement's uuidv7", ErrBadRequest)
+	}
 	if transferKey != "" && !proofRe.MatchString(transferKey) {
 		return Receipt{}, fmt.Errorf("%w: transfer_key must be the 64-hex key from the bundle header", ErrBadRequest)
+	}
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if destinationID != own {
+		return Receipt{}, fmt.Errorf("%w: retire was addressed to placement %s; this placement is %s",
+			ErrBadRequest, destinationID, own)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -552,19 +583,51 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey
 	if err := transferLock(ctx, tx, transferID); err != nil {
 		return Receipt{}, err
 	}
-	own, err := s.PlacementID(ctx)
-	if err != nil {
-		return Receipt{}, err
-	}
 	rec, err := ledger(ctx, tx, "import", transferID, true)
 	switch {
+	case err == nil && rec.Status == "retired" && rec.ContentSHA256 == "":
+		// A bare tombstone: nothing was ever imported, so its persona_id and
+		// key are caller-supplied and may be wrong. Every touch must present
+		// the key; replay on identical parameters, rewrite — never
+		// un-retire — on different ones.
+		if transferKey == "" {
+			return Receipt{}, fmt.Errorf("%w: the tombstone for transfer %s was recorded under a "+
+				"transfer_key; pass transfer_key from the bundle header", ErrMissingProof, transferID)
+		}
+		if rec.PersonaID == personaID && transferKey == rec.key {
+			return rec, tx.Commit(ctx)
+		}
+		if err := s.refuseOwnSource(ctx, tx, personaID, transferID); err != nil {
+			return Receipt{}, err
+		}
+		rec.PersonaID = personaID
+		rec.key = transferKey
+		rec.RetireProof = transferProof(transferKey, "retire", transferID, personaID, own)
+		raw, merr := json.Marshal(rec)
+		if merr != nil {
+			return Receipt{}, merr
+		}
+		var updated time.Time
+		if err := tx.QueryRow(ctx, `
+			UPDATE core_transfers SET persona_id = $2, proof_key = $3, receipt = $4, updated_at = now()
+			WHERE direction = 'import' AND transfer_id = $1 AND status = 'retired' AND content_sha256 IS NULL
+			RETURNING updated_at`, transferID, personaID, transferKey, raw).
+			Scan(&updated); err != nil {
+			return Receipt{}, fmt.Errorf("correct transfer tombstone: %w", err)
+		}
+		rec.UpdatedAt = updated.UTC()
+		return rec, tx.Commit(ctx)
 	case err == nil:
-		// A known transfer: persona must match, and only a staged copy can
-		// retire. Replay a previous retire; refuse an activated one.
 		if rec.PersonaID != personaID {
 			return Receipt{}, fmt.Errorf("%w: transfer %s belongs to another persona", ErrTransferConflict, transferID)
 		}
 		if rec.Status == "retired" {
+			// Imported-then-retired: its parameters were verified at import.
+			// Replay on them; a different key is a mismatch, not a rewrite.
+			if transferKey != "" && transferKey != rec.key {
+				return Receipt{}, fmt.Errorf("%w: transfer %s was retired under a different transfer_key",
+					ErrTransferConflict, transferID)
+			}
 			return rec, tx.Commit(ctx)
 		}
 		if rec.Status != "staged" {
@@ -580,7 +643,7 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey
 		if _, err := tx.Exec(ctx, `DELETE FROM core_personas WHERE persona_id = $1`, personaID); err != nil {
 			return Receipt{}, fmt.Errorf("retire staged persona: %w", err)
 		}
-		rec.RetireProof = transferProof(rec.key, "retire", transferID, personaID)
+		rec.RetireProof = transferProof(rec.key, "retire", transferID, personaID, own)
 		if err := commit(ctx, tx, "import", transferID, "retired", &rec); err != nil {
 			return Receipt{}, err
 		}
@@ -593,18 +656,7 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey
 	// transfer's own source — that would let a mistaken call to this
 	// service produce a proof the source itself accepts while a copy
 	// elsewhere stays activatable.
-	var authority string
-	var held *string
-	err = tx.QueryRow(ctx,
-		`SELECT authority, transfer_id FROM core_personas WHERE persona_id = $1 FOR NO KEY UPDATE`,
-		personaID).Scan(&authority, &held)
-	switch {
-	case err == nil:
-		if heldBy(held, transferID) && (authority == "sealed" || authority == "transferred") {
-			return Receipt{}, fmt.Errorf("%w: persona %s is this placement's own %s transfer %s",
-				ErrTransferConflict, personaID, authority, transferID)
-		}
-	case !errors.Is(err, pgx.ErrNoRows):
+	if err := s.refuseOwnSource(ctx, tx, personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
 	if transferKey == "" {
@@ -622,7 +674,7 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey
 		Status:        "retired",
 		FormatVersion: FormatVersion,
 		DestinationID: own,
-		RetireProof:   transferProof(transferKey, "retire", transferID, personaID),
+		RetireProof:   transferProof(transferKey, "retire", transferID, personaID, own),
 		NotIncluded:   NotIncluded,
 		UpdatedAt:     now.UTC(),
 	}
@@ -637,6 +689,30 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, transferKey
 		return Receipt{}, fmt.Errorf("record transfer tombstone: %w", err)
 	}
 	return rec, tx.Commit(ctx)
+}
+
+// refuseOwnSource refuses to tombstone a transfer whose source is this
+// placement: the persona here holds the transfer in sealed or transferred
+// authority, and a local tombstone could mint a proof the source accepts
+// while a copy elsewhere stays activatable.
+func (s *Service) refuseOwnSource(ctx context.Context, tx pgx.Tx, personaID, transferID string) error {
+	var authority string
+	var held *string
+	err := tx.QueryRow(ctx,
+		`SELECT authority, transfer_id FROM core_personas WHERE persona_id = $1 FOR NO KEY UPDATE`,
+		personaID).Scan(&authority, &held)
+	switch {
+	case err == nil:
+		if heldBy(held, transferID) && (authority == "sealed" || authority == "transferred") {
+			return fmt.Errorf("%w: persona %s is this placement's own %s transfer %s",
+				ErrTransferConflict, personaID, authority, transferID)
+		}
+		return nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil
+	default:
+		return err
+	}
 }
 
 // summarize counts carried rows and what continues at the cut.

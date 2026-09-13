@@ -28,21 +28,24 @@
 //	             or  (none) → retired      transfer: the staged copy is deleted
 //	                                       or a tombstone is recorded for a
 //	                                       bundle that never arrived;
-//	                                       produces retire_proof
+//	                                       produces retire_proof; a bare
+//	                                       tombstone stays correctable
 //	source Complete  sealed → transferred  requires the destination's
 //	                                       activate_proof
 //	source Abort     sealed → active       requires the destination's
-//	                                       retire_proof (or force)
+//	                                       retire_proof
 //
 // Every step is idempotent by transfer id: after a lost response, repeat the
 // call or read the transfer ledger, which returns the recorded proofs.
 //
 // The proofs are evidence, not authentication: only a party holding the
 // bundle can mint them, and the destination produces each honestly only when
-// it commits that transition. The coordinator already holds the bundle — and
-// with it the whole life — so the gates make the correct order the only easy
-// one: no ordinary lost response, retry or partition can leave two placements
-// able to run the secretary, or none.
+// it commits that transition. Each proof names the placement that produced
+// it, so evidence minted by the wrong service cannot satisfy the source. The
+// coordinator already holds the bundle — and with it the whole life — so the
+// gates make the correct order the only easy one: no ordinary lost response,
+// retry, wrong-service dispatch or partition can leave two placements able
+// to run the secretary, or none.
 //
 // What is deliberately not carried is part of the contract: the writer lease
 // itself (only its generation as an epoch floor), placement authority, the
@@ -146,9 +149,8 @@ type Continuity struct {
 // Receipt is the verified result of a transfer step, stored in the ledger
 // and returned again on replay. ActivateProof and RetireProof are set only
 // when the destination committed that transition; they are what the source's
-// Complete and Abort require. Forced marks an abort the operator allowed
-// without a retire proof — the only path that can leave two placements able
-// to run the secretary, taken deliberately against a lost destination.
+// Complete and Abort require, and each names the destination placement in
+// its HMAC input.
 type Receipt struct {
 	Direction     string           `json:"direction"`
 	TransferID    string           `json:"transfer_id"`
@@ -160,7 +162,6 @@ type Receipt struct {
 	ContentSHA256 string           `json:"content_sha256,omitempty"`
 	ActivateProof string           `json:"activate_proof,omitempty"`
 	RetireProof   string           `json:"retire_proof,omitempty"`
-	Forced        bool             `json:"forced,omitempty"`
 	SealedAt      time.Time        `json:"sealed_at"`
 	Cut           Cut              `json:"cut"`
 	Rows          map[string]int64 `json:"rows"`
