@@ -367,3 +367,48 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 		t.Fatalf("NUL claim: %d, want 400", rec.Code)
 	}
 }
+
+// TestHTTPCommitOverBodyLimit pins the boundary the commit fallback
+// relies on: a commit body over maxBody is rejected 400 ("read body"),
+// deterministically — a giant error text can never be persisted
+// verbatim and must be bounded client-side.
+func TestHTTPCommitOverBodyLimit(t *testing.T) {
+	_, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	tok := created.PersonaToken
+
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
+		`{"holder_id":"h1","ttl_ms":60000}`)
+	var lease WriterLease
+	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
+	gen := itoa(lease.Generation)
+	do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
+		`{"input_id":"i1","kind":"message","payload":{"text":"hi"}}`)
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok,
+		`{"generation":`+gen+`}`)
+	var load LoadResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &load)
+
+	// ~1.2 MB of error text — over the 1 MiB body limit.
+	huge := strings.Repeat("x", 1_200_000)
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/"+load.Turn.TurnID+"/commit", tok,
+		`{"generation":`+gen+`,"outcome":"fail","retryable":true,"error":"`+huge+`"}`)
+	if rec.Code != 400 {
+		t.Fatalf("oversized commit: %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "read body") {
+		t.Fatalf("oversized commit body: %s", rec.Body)
+	}
+	// The turn is untouched — the rejection leaves it running so a
+	// bounded retry can still finalize it.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/"+load.Turn.TurnID+"/commit", tok,
+		`{"generation":`+gen+`,"outcome":"fail","retryable":false,"error":"bounded: too large to store"}`)
+	if rec.Code != 200 {
+		t.Fatalf("bounded commit after rejection: %d %s", rec.Code, rec.Body)
+	}
+}

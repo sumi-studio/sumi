@@ -63,13 +63,20 @@ async function childMain() {
       // replays recorded rounds must never re-consult them.
       const round = req.round ?? 0;
       console.log(`[child] MODEL CONSULTED round=${round}`);
+      // throwSize/textSize build oversized values in-process — a 1.5 MB
+      // env var would flirt with execve limits. The multibyte pattern
+      // makes sure truncation stays on code-point boundaries.
+      if (script.throwSize)
+        throw new Error("provider exploded " + "ø😀".repeat(script.throwSize));
       if (script.throw) throw new Error(script.throw);
       const decision = script.rounds?.[round] ?? { text: "", calls: [] };
-      // pad_kb inflates the reply in-process — a 700KiB script cannot
-      // travel through an env var (MAX_ARG_STRLEN).
-      const text = decision.pad_kb
-        ? decision.text + "x".repeat(decision.pad_kb * 1024)
-        : decision.text;
+      // pad_kb/textSize inflate the reply in-process — a 700KiB script
+      // cannot travel through an env var (MAX_ARG_STRLEN).
+      const text = script.textSize
+        ? "ø😀".repeat(script.textSize)
+        : decision.pad_kb
+          ? decision.text + "x".repeat(decision.pad_kb * 1024)
+          : decision.text;
       yield { type: "text", delta: text };
       for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
@@ -167,6 +174,7 @@ async function childMain() {
     provider: new ScriptedProvider(),
     leaseTtlMs: 30_000,
     renewEveryMs: 5_000,
+    maxAttempts: Number(process.env.SUMI_MAX_ATTEMPTS ?? 5),
     contextLimit: 60,
     pollIntervalMs: 100,
     scheduleEveryMs: 0,
@@ -290,6 +298,7 @@ async function main() {
       env: childEnv(extra),
       encoding: "utf8",
       timeout: 90_000,
+      maxBuffer: 64 * 1024 * 1024, // oversized-error scenarios log big lines
     });
     if (r.status !== expectExit) {
       console.error(r.stdout, r.stderr);
@@ -722,37 +731,80 @@ async function main() {
   );
   log("  queue healthy after the failure storm");
 
-  // Review-B F1 repro: a reply that fits savePlan but whose commit body
-  // (events + output + stored commit_request) exceeds maxBody used to
-  // crash-loop the writer until the attempt cap masked the cause. Now the
-  // deterministic 400 is scrubbed and the turn ends as a recorded failure.
+  // --- scenario 6: >body-limit commit still finalizes (F-B1) ----------
+  // A commit payload over the server's 1 MiB body limit used to defeat
+  // every commitTurnFinal tier when `error` itself was huge: three 400s,
+  // child exit 1, input claimed forever, each recovery cycle re-claiming
+  // the same oldest input before any later queued work — head-of-line
+  // starvation at process cadence. The recorded failure must be bounded.
+  //
+  // 6a — oversized *complete* commit: a ~840 KB multibyte reply keeps
+  // savePlan under the 1 MiB limit, but the commit body
+  // (assistant_message event + output) doubles past it → 400 "read body"
+  // → tiers land with a bounded honest error. The turn is observably
+  // failed — not fabricated — and the input resolves.
+  log("scenario 6: >1MiB commit resolves bounded; queue proceeds");
   const in12 = (await submit("input-twelve")).json.input.input_id;
   const big = runChild({
-    SUMI_SCRIPT: JSON.stringify({
-      rounds: [{ text: "big:", pad_kb: 700, calls: [] }],
-    }),
+    SUMI_SCRIPT: JSON.stringify({ textSize: 140_000 }), // ~840 KB reply
   });
   assert(
-    !big.includes("fatal") || big.includes("committed as scrubbed"),
-    `oversize commit must not kill the process\n${big}`,
+    !big.includes("fatal"),
+    `oversize commit must not kill the process\n${big.slice(0, 400)}`,
   );
-  const in12State = await req(
-    "GET",
-    `/internal/core/personas/${personaId}/inputs/${in12}`,
-    ptoken,
-  );
+  const in12State = await getInput(in12);
   assert(
-    in12State.json?.input?.status === "done",
-    `oversize-commit input must resolve, got ${in12State.text}`,
+    in12State?.status === "done",
+    `oversized complete must resolve the input, got ${JSON.stringify(in12State)}`,
   );
   const fails12 = await outboxFor(in12);
+  const recErr = fails12[0]?.payload?.error ?? "";
   assert(
     fails12.length === 1 &&
       fails12[0].kind === "turn_failed" &&
-      /commit rejected deterministically/.test(fails12[0].payload.error ?? ""),
-    `oversize commit must record an honest failure, got ${JSON.stringify(fails12).slice(0, 400)}`,
+      recErr.includes("commit rejected deterministically") &&
+      recErr.includes("read body") &&
+      new TextEncoder().encode(recErr).length < 20_000,
+    `recorded failure must be bounded and honest, got: ${recErr.slice(0, 200)}`,
   );
-  log("  un-storable commit resolves as recorded failure — no crash loop");
+  log("  oversized complete resolved via fallback; honest bounded error");
+
+  // 6b — oversized provider *error* (retryable): bounded recorded
+  // failure, backoff-bounded retries, and a later queued input still
+  // progresses. SUMI_MAX_ATTEMPTS keeps both honestly queued through the
+  // storm; not_before set on each proves the later input was claimed,
+  // failed, and reparked — not starved behind the first.
+  const in13 = (await submit("input-thirteen")).json.input.input_id;
+  const in14 = (await submit("input-fourteen")).json.input.input_id;
+  const giant = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
+    SUMI_MAX_ATTEMPTS: "50",
+  });
+  assert(
+    giant.includes("turn committed as scrubbed failure"),
+    "the oversized-error commit must land via the bounded scrubbed tier",
+    giant.slice(0, 400),
+  );
+  for (const id of [in13, in14]) {
+    const st = await getInput(id);
+    assert(
+      st?.status === "queued" && st?.not_before !== null,
+      `input ${id} stays honestly queued for retry (claimed + reparked), got ${JSON.stringify(st)}`,
+    );
+  }
+  // The provider healing completes both, exactly once — the recorded
+  // failure was honest retry, not fabrication or a strand.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ rounds: [{ text: "reply-H", calls: [] }] }),
+  });
+  for (const id of [in13, in14]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-H",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  oversized error recorded bounded; later input progressed; both recovered");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");
