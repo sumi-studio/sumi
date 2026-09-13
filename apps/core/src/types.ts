@@ -171,4 +171,10 @@ export interface CommitRequest {
   usage?: Json;
   error?: string;
   retryable?: boolean;
+  /**
+   * Provider-supplied retry pacing (Retry-After) for a retryable
+   * failure: the requeue's not_before is at least now+retry_after_ms
+   * (server clamps). Absent/0 = the default per-attempt backoff.
+   */
+  retry_after_ms?: number;
 }

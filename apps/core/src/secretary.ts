@@ -1,5 +1,10 @@
 import { jsonEqual } from "./json.ts";
-import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
+import {
+  ModelError,
+  type ChatMessage,
+  type ModelProvider,
+  type ToolCall,
+} from "./provider.ts";
 import {
   FencedError,
   type StateClient,
@@ -37,11 +42,24 @@ export interface SecretaryConfig {
   scheduleEveryMs: number;
   /**
    * Max turns (attempts) one input may consume before it is marked
-   * done-failed — a provider that keeps failing, or a plan that keeps
-   * hitting transient errors, cannot burn attempts forever or starve the
-   * inputs queued behind it. Default 5.
+   * done-failed — a plan that keeps hitting transient errors cannot burn
+   * attempts forever or starve the inputs queued behind it. The cap only
+   * fires once the provider-retry budget has also elapsed; within the
+   * budget, attempts continue so a short provider outage is survived.
+   * Default 5.
    */
   maxAttempts?: number;
+  /**
+   * Wall-clock budget for retrying transient provider failures, measured
+   * from the input's submission (`created_at`) so it survives restarts
+   * and is identical across hosts. Provider rate limits and short
+   * incidents resolve in seconds to tens of minutes; the default 30 min
+   * rides out ordinary outages without discarding the request, and still
+   * bounds a provider that never recovers. Provider-supplied
+   * Retry-After pacing is honored per attempt on top of the durable
+   * backoff. Default 30 minutes.
+   */
+  providerRetryBudgetMs?: number;
   /**
    * Max model consultations (rounds) per turn. A round that ends with tool
    * calls feeds its committed results back into the next consultation; a
@@ -55,6 +73,9 @@ export interface SecretaryConfig {
 }
 
 export type StepResult = "turn" | "idle" | "stopped";
+
+/** Default wall-clock budget for transient provider retries (F1). */
+const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
 
 /**
  * One continuing secretary life. Boot = acquire writer lease + recover
@@ -80,6 +101,7 @@ export class Secretary {
   private running = false;
   private inFlight: AbortController | null = null;
   private lastDispatch = 0;
+  private poison: { turnId: string; count: number } | null = null;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -95,6 +117,26 @@ export class Secretary {
   /** Acquire the writer lease and recover whatever the last holder left. */
   async start(): Promise<void> {
     const { state, personaId, holderId, leaseTtlMs } = this.cfg;
+    if (this.running && this.lease) {
+      // Already running (e.g. a workerd drain resumed after a mid-turn
+      // error): continue the same generation — re-acquiring would bump
+      // it, interrupt the in-flight turn, and spend an attempt on a
+      // bookkeeping error. The alarm cadence can exceed the TTL, so the
+      // held lease must be renewed, not just reused.
+      try {
+        this.lease = await state.renewWriter(
+          personaId,
+          holderId,
+          this.lease.generation,
+          leaseTtlMs,
+        );
+        return;
+      } catch (e) {
+        if (!(e instanceof FencedError)) throw e;
+        this.running = false;
+        this.lease = null;
+      }
+    }
     this.lease = await state.acquireWriter(personaId, holderId, leaseTtlMs);
     const gen = this.lease.generation;
     const rec = await state.recover(personaId, gen);
@@ -127,12 +169,19 @@ export class Secretary {
       );
       if (!turn || !input) return "idle";
       const maxAttempts = this.cfg.maxAttempts ?? 5;
-      if (turn.attempt > maxAttempts) {
+      const budgetMs =
+        this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS;
+      const withinBudget =
+        Date.now() - Date.parse(input.created_at) < budgetMs;
+      if (turn.attempt > maxAttempts && !withinBudget) {
         // Attempt cap (CR3-N1): an input that has already consumed its
         // allowance — model failures, transient claim errors, a poison
         // plan — is done-failed here, before any further model consult or
         // effect claim, so it cannot consume indefinitely or starve the
-        // inputs queued behind it.
+        // inputs queued behind it. The cap only fires after the provider
+        // retry budget has elapsed: within it, a transient provider
+        // outage keeps retrying rather than discarding the request
+        // (fresh-review F1).
         await this.commitTurnFinal(turn, {
           outcome: "fail",
           retryable: false,
@@ -146,7 +195,40 @@ export class Secretary {
         });
         return "turn";
       }
-      await this.runTurn(turn, input, context, plan);
+      try {
+        await this.runTurn(turn, input, context, plan);
+        this.poison = null;
+      } catch (e) {
+        if (
+          e instanceof FencedError ||
+          e instanceof StateError ||
+          isTransportError(e)
+        ) {
+          throw e; // genuine outage — run() backs off and retries
+        }
+        // An unknown failure while a turn is in flight — an invariant
+        // violation or a corrupt response — would otherwise retry
+        // forever at backoff pace without consuming attempts
+        // (fresh-review F6). A few consecutive strikes on the same turn
+        // resolve to an honest recorded failure instead of a silent loop.
+        const msg = stripNul(e instanceof Error ? e.message : String(e));
+        this.poison =
+          this.poison?.turnId === turn.turn_id
+            ? { turnId: turn.turn_id, count: this.poison.count + 1 }
+            : { turnId: turn.turn_id, count: 1 };
+        if (this.poison.count < 3) throw e;
+        this.poison = null;
+        await this.commitTurnFinal(turn, {
+          outcome: "fail",
+          retryable: false,
+          error: `recurring internal error: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
+          events: [inputReceivedEvent(input, turn)],
+        });
+        this.log("turn failed after recurring internal error", {
+          turn_id: turn.turn_id,
+          error: truncateText(msg, 4 * 1024),
+        });
+      }
       return "turn";
     } catch (e) {
       if (e instanceof FencedError) {
@@ -171,7 +253,10 @@ export class Secretary {
       return false;
     }
     if (e instanceof StateError) return e.status >= 500 || e.status === 429;
-    return true; // fetch TypeError, AbortError, DNS — no status at all
+    // Anything without an HTTP status must still be a transport failure
+    // (fetch TypeError, AbortError, DNS) — an unknown defect is not
+    // transient and must not be retried forever in silence (F6).
+    return isTransportError(e);
   }
 
   private transientBackoff(failures: number): number {
@@ -189,12 +274,52 @@ export class Secretary {
     const backoff = () =>
       sleep(this.transientBackoff(failures), signal);
     if (!this.running) {
+      let heldDeadline = 0;
       for (;;) {
         try {
           await this.start();
           break;
         } catch (e) {
-          if (signal?.aborted || !this.isTransient(e)) throw e;
+          if (signal?.aborted) throw e;
+          if (e instanceof StateError && e.status === 409) {
+            // The lease is held by another holder. On an ordinary
+            // restart (default holder is local-<pid>) that holder is our
+            // own dead predecessor: wait out its TTL and acquire rather
+            // than dying instantly — that was the whole point of riding
+            // transient failures in-process (fresh-review F3). A live
+            // holder keeps renewing past the deadline; then yield
+            // honestly instead of stealing the life.
+            if (!heldDeadline) {
+              // Up to two TTLs: one full expiry window plus grace for
+              // clock skew. A live holder renews inside one TTL, so a
+              // lease still held past this window is genuinely owned.
+              heldDeadline =
+                Date.now() +
+                this.cfg.leaseTtlMs +
+                Math.min(10_000, this.cfg.leaseTtlMs);
+            }
+            if (Date.now() < heldDeadline) {
+              failures++;
+              this.log("writer lease held; waiting for expiry", {
+                attempt: failures,
+                error: String(e),
+              });
+              await sleep(
+                Math.min(
+                  this.transientBackoff(failures),
+                  heldDeadline - Date.now(),
+                ),
+                signal,
+              );
+              continue;
+            }
+            // Deadline passed: one final acquire — a merely-expired
+            // predecessor is gone by now, so this either succeeds or
+            // confirms a live holder outlasted the window.
+            await this.start();
+            break;
+          }
+          if (!this.isTransient(e)) throw e;
           failures++;
           this.log("state service unavailable; retrying writer acquire", {
             attempt: failures,
@@ -341,7 +466,7 @@ export class Secretary {
       for (let r = 0; ; r++) {
         let decision = rounds[r];
         if (!decision) {
-          const outcome = await this.decide(turn, events, messages, r);
+          const outcome = await this.decide(turn, input, events, messages, r);
           // Failure committed inside decide(); a retryable one is paced
           // durably by the requeue's not_before backoff, so the loop is
           // free to serve other inputs immediately.
@@ -460,7 +585,13 @@ export class Secretary {
       const msg = stripNul(e instanceof Error ? e.message : String(e));
       if (e instanceof StateError && (e.status === 400 || e.status === 422)) {
         // Definite rejection (bad request / unsupported tool): record it as
-        // the tool result rather than abandoning the whole turn.
+        // the tool result rather than abandoning the whole turn. The
+        // tool_call event still journals first — the journal shows the
+        // decided call and its rejection symmetrically.
+        events.push({
+          kind: "tool_call",
+          payload: { tool: call.tool, call_id: callId, request: call.request },
+        });
         events.push({
           kind: "tool_result",
           payload: { tool: call.tool, call_id: callId, error: msg },
@@ -536,6 +667,7 @@ export class Secretary {
    */
   private async decide(
     turn: Turn,
+    input: Input,
     events: EventInput[],
     messages: ChatMessage[],
     round: number,
@@ -559,17 +691,33 @@ export class Secretary {
         else usage = ev.usage;
       }
     } catch (e) {
+      if (!this.running) throw e; // fence lost mid-stream — leave the turn
       // Provider error text is untrusted bytes: a poisoned message (e.g.
       // one containing NUL) must not make the failure itself unpersistable.
       const msg = stripNul(e instanceof Error ? e.message : String(e));
-      // Last allowed attempt: fail the input outright rather than requeue
-      // it into the attempt-cap check. A retryable failure leaves no
-      // partial journal — the next attempt re-emits its full event set.
-      const retryable = turn.attempt < (this.cfg.maxAttempts ?? 5);
+      const mErr = e instanceof ModelError ? e : null;
+      // Deterministic provider rejections cannot be fixed by retrying —
+      // they fail the input outright. Transient failures (5xx/429,
+      // network, timeout, an incomplete stream) stay retryable for a
+      // wall-clock budget measured from the input's submission — a
+      // seconds-long provider outage must not lose a request (F1). The
+      // attempt cap still bounds inputs that die before recording a
+      // failure; committed-transient retries are bounded by time, and a
+      // retryable failure leaves no partial journal — the next attempt
+      // re-emits its full event set.
+      const withinBudget =
+        Date.now() - Date.parse(input.created_at) <
+        (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
+      const retryable =
+        mErr !== null && !mErr.retryable ? false : withinBudget;
       await this.commitTurnFinal(turn, {
         outcome: "fail",
         retryable,
-        error: `model: ${msg}`,
+        // Bound at the source too: a provider error can be megabytes, and
+        // the first commit upload should never carry that onto a
+        // memory-limited host. The truncation marker stays in the record.
+        error: `model: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
+        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
         events: retryable ? [] : events,
       });
       // Bound the log line too — a provider error can be megabytes.
@@ -578,6 +726,7 @@ export class Secretary {
         round,
         attempt: turn.attempt,
         retryable,
+        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
         error: truncateText(msg, 4 * 1024),
       });
       return { failed: true, retryable };
@@ -727,15 +876,16 @@ export class Secretary {
       if (!(e instanceof StateError && e.status === 400)) throw e;
       rejected = e;
     }
+    // Last resort: both rejection reasons sit ahead of the bounded detail
+    // so neither is truncated away, and a retryable disposition survives —
+    // a transient failure whose record could not fit still deserves the
+    // retry. Only an un-storable *complete* downgrade is terminal.
+    const why2 = truncateText(scrubJson(rejected.message) as string, 512);
     await commit({
       outcome: "fail",
-      retryable: false,
+      retryable: req.outcome === "fail" && req.retryable === true,
       events: [],
-      error:
-        truncateText(
-          `${msg} (second rejection: ${scrubJson(rejected.message) as string})`,
-          RECORDED_ERROR_BYTES,
-        ) + "; original commit events could not be stored",
+      error: `commit rejected deterministically (${why}; then ${why2}): ${detail}; original commit events could not be stored`,
     });
   }
 }
@@ -866,12 +1016,36 @@ function stripNulDeep(v: unknown): unknown {
   return v;
 }
 
+/**
+ * True for transport-level failures — fetch/DNS/socket errors and aborts
+ * carry no HTTP status but are transient by nature. Distinguished from
+ * other unknown exceptions so a deterministic defect on a live turn can
+ * be bounded instead of retried forever.
+ */
+function isTransportError(e: unknown): boolean {
+  if (!(e instanceof Error)) return true; // non-Error throw: cannot classify — treat as transient
+  if (e.name === "AbortError") return true;
+  return (
+    e instanceof TypeError &&
+    /fetch|network|terminated|socket|connect|ECONN|ENOTFOUND|EAI_AGAIN/i.test(
+      e.message,
+    )
+  );
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const onAbort = () => {
       clearTimeout(t);
       resolve();
-    });
+    };
+    const t = setTimeout(() => {
+      // The abort listener must not outlive the timer — a long-running
+      // loop would otherwise accumulate one closure per sleep on the
+      // signal (fresh-review F4).
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

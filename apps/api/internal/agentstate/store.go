@@ -260,6 +260,11 @@ type CommitRequest struct {
 	Usage     map[string]any `json:"usage"`
 	Error     string         `json:"error"`
 	Retryable bool           `json:"retryable"`
+	// RetryAfterMs is provider-supplied pacing (HTTP Retry-After) for a
+	// retryable failure: the requeue's not_before is at least
+	// now()+RetryAfterMs on top of the per-attempt backoff. Clamped to
+	// [0, 2min] — a hint can slow the next retry, never silence it.
+	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
 }
 
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
@@ -1001,12 +1006,21 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			// pass (its original created_at wins the ordering), grows
 			// the journal and turns table without bound, and starves
 			// every later queued input. not_before keeps the retry
-			// honest and lets other work proceed.
+			// honest and lets other work proceed. Provider-supplied
+			// pacing (Retry-After) is honored on top, clamped to 2min —
+			// a hint can slow a retry, never silence it.
+			delay := retryBackoff(t.Attempt)
+			if after := time.Duration(req.RetryAfterMs) * time.Millisecond; after > delay {
+				if after > 2*time.Minute {
+					after = 2 * time.Minute
+				}
+				delay = after
+			}
 			if _, err := tx.Exec(ctx, `
 				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
 					turn_id = NULL, not_before = now() + $3 * interval '1 millisecond'
 				WHERE persona_id = $1 AND input_id = $2`,
-				personaID, t.InputID, retryBackoff(t.Attempt).Milliseconds()); err != nil {
+				personaID, t.InputID, delay.Milliseconds()); err != nil {
 				return nil, err
 			}
 		} else {

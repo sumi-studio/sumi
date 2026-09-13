@@ -410,10 +410,12 @@ export class FakeState implements StateClient {
         input.status = "queued";
         input.claimed_generation = null;
         input.turn_id = null;
-        // Go: not_before = now() + retryBackoff(attempt) — a bounded,
-        // per-attempt growing delay before the next claim.
+        // Go: not_before = now() + max(retryBackoff(attempt),
+        // clamped retry_after_ms) — a bounded, per-attempt growing delay
+        // that also honors provider-supplied pacing.
+        const after = Math.min(Math.max(req.retry_after_ms ?? 0, 0), 120_000);
         input.not_before = new Date(
-          Date.now() + retryBackoffMs(turn.attempt),
+          Date.now() + Math.max(retryBackoffMs(turn.attempt), after),
         ).toISOString();
       } else {
         input.status = "done";

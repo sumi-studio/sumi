@@ -1,8 +1,9 @@
-import type {
-  ModelEvent,
-  ModelProvider,
-  ModelRequest,
-  ToolCall,
+import {
+  ModelError,
+  type ModelEvent,
+  type ModelProvider,
+  type ModelRequest,
+  type ToolCall,
 } from "../provider.ts";
 
 interface OpenAIConfig {
@@ -61,9 +62,12 @@ export class OpenAIProvider implements ModelProvider {
       timeoutMs,
     );
     (timer as { unref?: () => void }).unref?.();
+    let readerRef: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
-      const res = await this.fetchImpl(
-        `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`,
+      let res: Response;
+      try {
+        res = await this.fetchImpl(
+          `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`,
         {
           method: "POST",
           headers: {
@@ -109,18 +113,34 @@ export class OpenAIProvider implements ModelProvider {
             ...this.cfg.extra,
           }),
         },
-      );
+        );
+      } catch (e) {
+        // Caller cancellation propagates untouched; our wall timeout and
+        // network failures are transient provider errors worth retrying.
+        if (request.signal?.aborted) throw e;
+        const reason = e instanceof Error ? e.message : String(e);
+        throw new ModelError(`model request failed: ${reason}`, {
+          retryable: true,
+        });
+      }
       if (!res.ok || !res.body) {
         // Untrusted bytes bounded: a multi-MB or NUL-laden error body is
         // diagnostic text, and it flows into a commit's error field.
         const body = (await res.text()).slice(0, 4096);
-        throw new Error(`model request failed: ${res.status} ${body}`);
+        throw new ModelError(`model request failed: ${res.status} ${body}`, {
+          retryable:
+            res.status === 408 || res.status === 429 || res.status >= 500,
+          retryAfterMs: parseRetryAfter(res.headers.get("retry-after")),
+        });
       }
 
       const calls = new Map<number, { id: string; name: string; args: string }>();
       let usage: Record<string, unknown> = {};
+      let sawDone = false;
+      let finishReason: string | null = null;
       const decoder = new TextDecoder();
       const reader = res.body.getReader();
+      readerRef = reader;
       let buf = "";
 
       for (;;) {
@@ -140,8 +160,11 @@ export class OpenAIProvider implements ModelProvider {
           buf = buf.slice(nl + 1);
           if (!line.startsWith("data:")) continue;
           const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          const json = JSON.parse(data) as {
+          if (data === "[DONE]") {
+            sawDone = true;
+            continue;
+          }
+          let json: {
             choices?: {
               delta?: {
                 content?: string | null;
@@ -154,9 +177,49 @@ export class OpenAIProvider implements ModelProvider {
               finish_reason?: string | null;
             }[];
             usage?: Record<string, unknown>;
+            error?:
+              | { message?: string; code?: unknown; type?: unknown }
+              | string;
           };
+          try {
+            json = JSON.parse(data);
+          } catch {
+            // A router/proxy mid-stream failure can emit non-JSON lines —
+            // an unterminated response is a transient failure, not a reply.
+            throw new ModelError("malformed SSE data from provider", {
+              retryable: true,
+            });
+          }
+          // Some OpenAI-compatible routers signal failure as an in-band
+          // error chunk on a 200 stream — it is a failed call, not text.
+          if (json.error !== undefined) {
+            const err = json.error;
+            const em =
+              typeof err === "string"
+                ? err
+                : (err.message ?? JSON.stringify(err));
+            // Routers embed a status/code/type: a permanent-looking
+            // rejection (auth, invalid request) must not retry forever.
+            const code =
+              typeof err === "object" && err !== null
+                ? Number(err.code ?? 0)
+                : 0;
+            const etype =
+              typeof err === "object" && err !== null
+                ? String(err.type ?? "")
+                : "";
+            const permanent =
+              (code >= 400 && code < 500 && code !== 408 && code !== 429) ||
+              /authentication|invalid|permission|not_found/i.test(etype);
+            throw new ModelError(
+              `provider stream error: ${em.slice(0, 1024)}`,
+              { retryable: !permanent },
+            );
+          }
           if (json.usage) usage = json.usage;
-          const delta = json.choices?.[0]?.delta;
+          const choice = json.choices?.[0];
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          const delta = choice?.delta;
           if (!delta) continue;
           // reasoning_content deltas are deliberately not surfaced — the
           // provider port carries text + tool calls only.
@@ -173,14 +236,27 @@ export class OpenAIProvider implements ModelProvider {
         if (done) break;
       }
 
+      // A stream that closes without [DONE] or any finish_reason was cut
+      // off mid-response — the partial text is not a reply (F2). Record
+      // the finish reason (e.g. "length") so a truncated-by-limit answer
+      // is distinguishable in the stored usage rather than invisible.
+      if (!sawDone && finishReason === null) {
+        throw new ModelError(
+          "provider stream ended before [DONE]/finish_reason — incomplete response",
+          { retryable: true },
+        );
+      }
+      if (finishReason !== null) usage = { ...usage, finish_reason: finishReason };
+
       const sorted = [...calls.entries()].sort(([a], [b]) => a - b);
       for (const [, c] of sorted) {
         let args: Record<string, unknown> = {};
         try {
           args = JSON.parse(c.args || "{}") as Record<string, unknown>;
         } catch {
-          throw new Error(
+          throw new ModelError(
             `model emitted unparseable tool arguments for ${c.name}: ${c.args.slice(0, 1024)}`,
+            { retryable: true },
           );
         }
         const call: ToolCall = {
@@ -196,6 +272,7 @@ export class OpenAIProvider implements ModelProvider {
     } finally {
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", onAbort);
+      await readerRef?.cancel().catch(() => {});
     }
   }
 }
@@ -217,12 +294,22 @@ function toolNameMaps(tools: { name: string }[]): {
     if (!/^[a-zA-Z]/.test(wire)) wire = `t_${wire}`;
     const taken = fromWire.get(wire);
     if (taken !== undefined && taken !== t.name) {
-      throw new Error(
+      throw new ModelError(
         `tool names collide on the wire: ${taken} and ${t.name} → ${wire}`,
+        { retryable: false },
       );
     }
     toWire.set(t.name, wire);
     fromWire.set(wire, t.name);
   }
   return { toWire, fromWire };
+}
+
+/** Parse a Retry-After header (delay-seconds or HTTP-date) into ms. */
+function parseRetryAfter(v: string | null): number | undefined {
+  if (!v) return undefined;
+  const secs = Number(v);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }

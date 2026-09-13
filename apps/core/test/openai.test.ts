@@ -1,0 +1,264 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { test } from "node:test";
+import { ModelError, type ModelEvent } from "../src/provider.ts";
+import { OpenAIProvider } from "../src/providers/openai.ts";
+
+/**
+ * The real OpenAIProvider against a scripted OpenAI-compatible SSE
+ * endpoint — no mocks inside the adapter. Each case arms the handler
+ * with a status/headers/body script; `withServer` wires a throwaway
+ * loopback server per test.
+ */
+
+type Script = (req: http.IncomingMessage, res: http.ServerResponse) => void;
+
+async function withServer(
+  script: Script,
+  fn: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const srv = http.createServer(script);
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as { port: number }).port;
+  try {
+    await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+}
+
+function provider(baseUrl: string, timeoutMs = 5_000): OpenAIProvider {
+  return new OpenAIProvider({
+    baseUrl,
+    apiKey: "test-key",
+    model: "test-model",
+    timeoutMs,
+  });
+}
+
+const REQ = {
+  personaId: "p",
+  turnId: "t",
+  round: 0,
+  messages: [{ role: "user" as const, content: "hi" }],
+  tools: [],
+};
+
+async function collect(p: OpenAIProvider): Promise<ModelEvent[]> {
+  const out: ModelEvent[] = [];
+  for await (const ev of p.stream(REQ)) out.push(ev);
+  return out;
+}
+
+const sse = (lines: string[]) =>
+  (res: http.ServerResponse) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(lines.map((l) => `data: ${l}\n\n`).join(""));
+  };
+
+const chunk = (obj: unknown) => JSON.stringify(obj);
+const text = (s: string) =>
+  chunk({ choices: [{ delta: { content: s } }] });
+const fin = (reason: string) =>
+  chunk({ choices: [{ delta: {}, finish_reason: reason }] });
+
+test("clean stream: text, finish_reason in usage, done", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([text("hello"), fin("stop"), "[DONE]"])(res),
+    async (base) => {
+      const evs = await collect(provider(base));
+      assert.equal(
+        evs.filter((e) => e.type === "text").map((e) => e.delta).join(""),
+        "hello",
+      );
+      const done = evs.find((e) => e.type === "done")!;
+      assert.equal(done.usage.finish_reason, "stop");
+    },
+  );
+});
+
+test("in-band SSE error chunk is a failure, never a reply (F2)", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([
+        text("partial"),
+        chunk({ error: { message: "upstream exploded", code: 503 } }),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.match(e.message, /upstream exploded/);
+        return true;
+      });
+    },
+  );
+});
+
+test("in-band permanent error chunk is non-retryable (F2)", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([
+        chunk({
+          error: { message: "invalid model", code: 400, type: "invalid_request_error" },
+        }),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        return true;
+      });
+    },
+  );
+});
+
+test("EOF without [DONE] or finish_reason is an incomplete-stream failure (F2)", async () => {
+  await withServer(
+    (_req, res) => sse([text("half a reply") ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.match(e.message, /incomplete/);
+        return true;
+      });
+    },
+  );
+});
+
+test("malformed SSE data is a transient failure, not a reply (F2)", async () => {
+  await withServer(
+    (_req, res) => sse(["{not json", "[DONE]"])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError && e.retryable);
+        assert.match(e.message, /malformed SSE/);
+        return true;
+      });
+    },
+  );
+});
+
+test("finish_reason without [DONE] still completes (routers omit DONE)", async () => {
+  await withServer(
+    (_req, res) => sse([text("ok"), fin("length")])(res),
+    async (base) => {
+      const evs = await collect(provider(base));
+      const done = evs.find((e) => e.type === "done")!;
+      assert.equal(done.usage.finish_reason, "length");
+    },
+  );
+});
+
+test("429 honors Retry-After and is retryable; 401 is permanent", async () => {
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429, { "retry-after": "7" });
+      res.end("rate limited");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.ok(
+          e.retryAfterMs !== undefined &&
+            e.retryAfterMs > 5_000 &&
+            e.retryAfterMs <= 7_500,
+          `retryAfterMs ≈ 7s, got ${e.retryAfterMs}`,
+        );
+        return true;
+      });
+    },
+  );
+  await withServer(
+    (_req, res) => {
+      res.writeHead(401);
+      res.end("bad key");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError && !e.retryable);
+        assert.match(e.message, /401/);
+        return true;
+      });
+    },
+  );
+});
+
+test("5xx is retryable; a giant error body is bounded", async () => {
+  await withServer(
+    (_req, res) => {
+      res.writeHead(500);
+      res.end("x".repeat(100_000));
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError && e.retryable);
+        assert.ok(e.message.length < 5_000, "error body bounded");
+        return true;
+      });
+    },
+  );
+});
+
+test("connection refused is a retryable transport error", async () => {
+  // Nothing listens on this port — an ordinary provider outage.
+  const p = provider("http://127.0.0.1:1");
+  await assert.rejects(collect(p), (e: unknown) => {
+    assert.ok(e instanceof ModelError && e.retryable);
+    assert.match(e.message, /model request failed/);
+    return true;
+  });
+});
+
+test("request timeout is a retryable error and cleans up", async () => {
+  await withServer(
+    (_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // Never writes, never ends — the wall timeout must fire.
+      setTimeout(() => res.end(), 60_000).unref();
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base, 300)), (e: unknown) => {
+        assert.ok(e instanceof ModelError && e.retryable);
+        return true;
+      });
+    },
+  );
+});
+
+test("unparseable tool arguments are a retryable failure, not a call", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([
+        chunk({
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "c1",
+                    function: { name: "journal_note", arguments: "{bad" },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        fin("tool_calls"),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError && e.retryable);
+        assert.match(e.message, /unparseable tool arguments/);
+        return true;
+      });
+    },
+  );
+});

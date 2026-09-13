@@ -24,6 +24,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -49,7 +50,9 @@ async function childMain() {
     if (!v) throw new Error(`missing env ${n}`);
     return v;
   };
-  const script = JSON.parse(env("SUMI_SCRIPT")); // {rounds:[{text,calls:[{tool,request}]}]}
+  // SUMI_SCRIPT drives the in-process provider; the real OpenAI adapter
+  // (SUMI_PROVIDER=openai) needs no script at all.
+  const script = JSON.parse(process.env.SUMI_SCRIPT ?? "{}");
   const dieAfterClaims = Number(process.env.SUMI_DIE_AFTER_CLAIMS ?? 0);
   const dieBeforeCommit = process.env.SUMI_DIE_BEFORE_COMMIT === "1";
   const resendPlan = process.env.SUMI_RESEND_PLAN === "1";
@@ -58,16 +61,22 @@ async function childMain() {
 
   class ScriptedProvider {
     name = "scripted";
+    consults = 0;
     async *stream(req) {
       // The round being consulted is explicit in the request — a retry that
       // replays recorded rounds must never re-consult them.
       const round = req.round ?? 0;
+      this.consults++;
       console.log(`[child] MODEL CONSULTED round=${round}`);
       // throwSize/textSize build oversized values in-process — a 1.5 MB
       // env var would flirt with execve limits. The multibyte pattern
       // makes sure truncation stays on code-point boundaries.
       if (script.throwSize)
         throw new Error("provider exploded " + "ø😀".repeat(script.throwSize));
+      // throwCount fails only the first N consults — a scripted provider
+      // outage that heals mid-run.
+      if (script.throwCount && this.consults <= script.throwCount)
+        throw new Error(script.throw ?? "provider exploded");
       if (script.throw) throw new Error(script.throw);
       const decision = script.rounds?.[round] ?? { text: "", calls: [] };
       // pad_kb/textSize inflate the reply in-process — a 700KiB script
@@ -167,14 +176,30 @@ async function childMain() {
     },
   });
 
+  // The default provider is deterministic and in-process; SUMI_PROVIDER=
+  // openai swaps in the real OpenAI adapter against whatever SSE endpoint
+  // SUMI_MODEL_BASE_URL points at — same secretary, same state service.
+  const provider =
+    process.env.SUMI_PROVIDER === "openai"
+      ? new (await import("../src/providers/openai.ts")).OpenAIProvider({
+          baseUrl: env("SUMI_MODEL_BASE_URL"),
+          apiKey: process.env.SUMI_MODEL_API_KEY ?? "e2e",
+          model: process.env.SUMI_MODEL ?? "e2e-model",
+          timeoutMs: Number(process.env.SUMI_MODEL_TIMEOUT_MS ?? 15_000),
+        })
+      : new ScriptedProvider();
+
   const secretary = new Secretary({
     personaId: env("SUMI_PERSONA_ID"),
     holderId: process.env.SUMI_HOLDER_ID ?? `plan-e2e-${process.pid}`,
     state,
-    provider: new ScriptedProvider(),
+    provider,
     leaseTtlMs: 30_000,
     renewEveryMs: 5_000,
     maxAttempts: Number(process.env.SUMI_MAX_ATTEMPTS ?? 5),
+    providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
+      ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
+      : undefined,
     contextLimit: 60,
     pollIntervalMs: 100,
     scheduleEveryMs: 0,
@@ -184,8 +209,11 @@ async function childMain() {
   });
   await secretary.start();
   const deadline = Date.now() + 30_000;
+  // Idle grace before exit; a short value makes each boot one consult —
+  // a parked not_before outlives the grace and the run exits.
+  const idleGrace = Number(process.env.SUMI_ONCE_IDLE_MS ?? 1_500);
   let lastWork = Date.now();
-  while (Date.now() < deadline && Date.now() - lastWork < 1_500) {
+  while (Date.now() < deadline && Date.now() - lastWork < idleGrace) {
     const r = await secretary.step();
     if (r === "turn") lastWork = Date.now();
     else await new Promise((res) => setTimeout(res, 100));
@@ -305,6 +333,21 @@ async function main() {
       fail(`child exited ${r.status}, expected ${expectExit}`);
     }
     return r.stdout ?? "";
+  };
+  // Async variant: lets the parent observe queue state while the child
+  // drains (e.g. an input parked behind not_before mid-boot).
+  const runChildAsync = (extra) => {
+    const proc = spawn("node", [SELF, "--child"], { env: childEnv(extra) });
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d));
+    proc.stderr.on("data", (d) => (out += d));
+    const done = new Promise((res, rej) => {
+      proc.on("exit", (code) =>
+        code === 0 ? res(out) : rej(new Error(`child exited ${code}\n${out}`)),
+      );
+      proc.on("error", rej);
+    });
+    return { proc, done, out: () => out };
   };
   const submit = (text) =>
     req("POST", `/internal/core/personas/${personaId}/inputs`, ptoken, {
@@ -660,9 +703,12 @@ async function main() {
   // Review-B F1 / fresh reviews: a provider that always throws (with a NUL
   // in its message — un-storable bytes in diagnostic text) must fail each
   // attempt retryably, paced by the durable not_before backoff — not hot-
-  // loop or crash the process — and each input resolves honestly at the
-  // attempt cap with a turn_failed record. A later queued input is served
-  // during the backoff, not starved behind the failing one.
+  // loop or crash the process — and each input resolves honestly once the
+  // retry budget elapses, with a turn_failed record. A later queued input
+  // is served during the backoff, not starved behind the failing one.
+  // The children carry a short retry budget (2.5s of input age) so the
+  // terminal boundary is observable inside the scenario — the default
+  // 30-minute budget is exercised separately in scenario 7.
   log("scenario 5: failing provider resolves honestly under bounded backoff");
   const in9 = (await submit("input-nine")).json.input.input_id;
   const in10 = (await submit("input-ten")).json.input.input_id;
@@ -679,24 +725,37 @@ async function main() {
   const stormStart = Date.now();
   // Each child drains for its idle grace and exits; a parked input simply
   // survives to the next run — the durable backoff carries across boots.
-  for (let boot = 0; boot < 4; boot++) {
-    const out = runChild({
+  for (let boot = 0; boot < 6; boot++) {
+    // The child runs while the parent polls — a parked not_before is
+    // observable mid-boot, between the child's own retries.
+    const child = runChildAsync({
       SUMI_SCRIPT: JSON.stringify({ throw: "provider exploded \u0000" }),
+      SUMI_PROVIDER_RETRY_BUDGET_MS: "2500",
     });
-    consults += (out.match(/MODEL CONSULTED/g) ?? []).length;
+    let exited = false;
+    child.done.then(() => (exited = true), () => (exited = true));
+    while (!exited) {
+      const i9 = await getInput(in9);
+      const i10 = await getInput(in10);
+      if (i9?.not_before && i9?.status === "queued") parkedSeen = true;
+      if (i10?.not_before && i10?.status === "queued") parkedSeen = true;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    await child.done; // propagate a non-zero child exit
+    consults += (child.out().match(/MODEL CONSULTED/g) ?? []).length;
     const i9 = await getInput(in9);
     const i10 = await getInput(in10);
-    if (i9?.not_before && i9?.status === "queued") parkedSeen = true;
-    if (i10?.not_before && i10?.status === "queued") parkedSeen = true;
     if (i9?.status === "done" && i10?.status === "done") break;
+    // Give the durable backoff room before the next boot.
+    await new Promise((r) => setTimeout(r, 700));
   }
   const stormMs = Date.now() - stormStart;
   assert(
-    consults >= 4 && consults <= 12,
-    `failing provider must be bounded by not_before + attempt cap, got ${consults} consults`,
+    consults >= 4 && consults <= 20,
+    `failing provider must be bounded by not_before + retry budget, got ${consults} consults`,
   );
   assert(
-    stormMs >= 2000,
+    stormMs >= 1500,
     `retries must be paced by durable backoff, storm took only ${stormMs}ms`,
   );
   assert(
@@ -780,9 +839,12 @@ async function main() {
     SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
     SUMI_MAX_ATTEMPTS: "50",
   });
+  // The error is bounded at the source (8 KiB), so the first commit
+  // already fits — no scrubbed/minimal tier is needed for it to land.
   assert(
-    giant.includes("turn committed as scrubbed failure"),
-    "the oversized-error commit must land via the bounded scrubbed tier",
+    giant.includes('"retryable":true') &&
+      giant.includes("turn failed at model"),
+    "the oversized provider error must commit as a bounded retryable failure",
     giant.slice(0, 400),
   );
   for (const id of [in13, in14]) {
@@ -805,6 +867,152 @@ async function main() {
     );
   }
   log("  oversized error recorded bounded; later input progressed; both recovered");
+
+  // --- scenario 7: real OpenAIProvider failure modes on the real stack ---
+  // The actual OpenAI adapter (not ScriptedProvider) against a scripted
+  // OpenAI-compatible SSE endpoint, real Go + PG + Node, default retry
+  // budget (no override). Every ordinary provider failure mode must leave
+  // the input honestly queued — a short outage, a 429 honoring
+  // Retry-After, an in-band stream error, and a truncated stream — and a
+  // healed provider completes the SAME input exactly once.
+  log("scenario 7: real OpenAIProvider survives ordinary provider failures");
+  let sseReqs = 0;
+  const sseServer = createServer((sreq, res) => {
+    sseReqs++;
+    const n = sseReqs;
+    if (n === 1) {
+      sreq.socket.destroy(); // hard network outage mid-request
+      return;
+    }
+    if (n === 2) {
+      res.writeHead(429, { "retry-after": "8" });
+      res.end("rate limited");
+      return;
+    }
+    if (n === 3) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(
+        `data: {"choices":[{"delta":{"content":"partial "}}]}\n\n` +
+          `data: {"error":{"message":"router blew up","code":502}}\n\n`,
+      );
+      return;
+    }
+    if (n === 4) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(`data: {"choices":[{"delta":{"content":"partial "}}]}\n\n`); // EOF, no DONE
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(
+      `data: {"choices":[{"delta":{"content":"real adapter recovered"}}]}\n\n` +
+        `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n` +
+        `data: [DONE]\n\n`,
+    );
+  });
+  await new Promise((r) => sseServer.listen(0, "127.0.0.1", r));
+  const sseBase = `http://127.0.0.1:${sseServer.address().port}`;
+  const openaiEnv = {
+    SUMI_PROVIDER: "openai",
+    SUMI_MODEL_BASE_URL: sseBase,
+    // One consult per boot: any retryable park (>=200ms) outlives the
+    // 60ms idle grace, so each scripted failure mode maps to one boot.
+    SUMI_ONCE_IDLE_MS: "60",
+  };
+  const in15 = (await submit("input-fifteen")).json.input.input_id;
+  const waitClaimable = async (id) => {
+    const t0 = Date.now();
+    for (;;) {
+      const st = await getInput(id);
+      const nb = st?.not_before ? Date.parse(st.not_before) : 0;
+      if (st?.status === "queued" && nb <= Date.now()) return st;
+      assert(
+        Date.now() - t0 < 30_000,
+        `input ${id} never became claimable: ${JSON.stringify(st)}`,
+      );
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
+
+  // The scripted SSE endpoint lives in this parent process, so the
+  // openai children MUST be spawned asynchronously — a spawnSync child
+  // would block the event loop and the server could never answer.
+  const runOpenAI = () => runChildAsync(openaiEnv).done;
+
+  // Phase 1 — network outage: retryable failure, input parked not lost.
+  await runOpenAI();
+  let st15 = await getInput(in15);
+  assert(
+    st15?.status === "queued" && st15?.not_before !== null,
+    `network outage must leave the input queued for retry, got ${JSON.stringify(st15)}`,
+  );
+  assert(
+    (await outboxFor(in15)).length === 0,
+    "a transient outage must not resolve the request",
+  );
+
+  // Phase 2 — 429 with Retry-After:8s: the durable requeue honors provider
+  // pacing — the parked delay far exceeds the attempt backoff (~400ms).
+  await waitClaimable(in15);
+  await runOpenAI();
+  st15 = await getInput(in15);
+  const raDelay = Date.parse(st15?.not_before ?? 0) - Date.now();
+  assert(
+    st15?.status === "queued" && raDelay > 3_000 && raDelay < 60_000,
+    `Retry-After must pace the requeue (~8s), got not_before=${st15?.not_before} (${raDelay}ms)`,
+  );
+
+  // Phase 3 — in-band SSE error chunk on a 200 stream: a failure, never a reply.
+  await waitClaimable(in15);
+  await runOpenAI();
+  st15 = await getInput(in15);
+  assert(
+    st15?.status === "queued",
+    `in-band stream error must stay retryable, got ${JSON.stringify(st15)}`,
+  );
+
+  // Phase 4 — truncated stream (EOF, no [DONE]/finish_reason): not a reply.
+  await waitClaimable(in15);
+  await runOpenAI();
+  st15 = await getInput(in15);
+  assert(
+    st15?.status === "queued",
+    `incomplete stream must stay retryable, got ${JSON.stringify(st15)}`,
+  );
+  const failedTurns15 = (
+    await req(
+      "GET",
+      `/internal/core/personas/${personaId}/events?after_seq=0`,
+      ptoken,
+    )
+  ).json.events.filter(
+    (e) => e.kind === "assistant_message" && /partial/.test(e.payload.text ?? ""),
+  );
+  assert(
+    failedTurns15.length === 0,
+    "partial stream text must never be journaled as a reply",
+  );
+
+  // Phase 5 — provider heals: the SAME input completes exactly once.
+  await waitClaimable(in15);
+  await runOpenAI();
+  st15 = await getInput(in15);
+  assert(
+    st15?.status === "done",
+    `input must complete after the provider heals, got ${JSON.stringify(st15)}`,
+  );
+  const replies15 = await outboxFor(in15);
+  assert(
+    replies15.length === 1 &&
+      replies15[0].kind === "turn_completed" &&
+      replies15[0].payload.output.text === "real adapter recovered",
+    `exactly one real reply expected, got ${JSON.stringify(replies15)}`,
+  );
+  assert(
+    sseReqs >= 5,
+    `each failure mode must reach the real adapter, saw ${sseReqs} requests`,
+  );
+  sseServer.close();
+  log("  outage, Retry-After, in-band error, truncated stream all survived; heal completed once");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

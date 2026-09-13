@@ -1343,3 +1343,64 @@ func TestRetryableFailureRequeuesWithBackoff(t *testing.T) {
 		t.Fatalf("backoff did not grow: attempt1=%v attempt2=%v", nb, nb2)
 	}
 }
+
+// Fresh-review F1: provider-supplied pacing (Retry-After) flows through
+// CommitRequest.retry_after_ms into the requeue's not_before — honored on
+// top of the per-attempt backoff, and clamped so a hint can never silence
+// a request.
+func TestRetryAfterMsPacesRequeue(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-ra", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-ra", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	before := time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-ra", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "rate limited", RetryAfterMs: 5_000,
+	}); err != nil {
+		t.Fatalf("retryable commit: %v", err)
+	}
+	var nb time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-ra'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if d := nb.Sub(before); d < 4*time.Second || d > 6*time.Second {
+		t.Fatalf("retry_after_ms must dominate the backoff (~5s), got %v", d)
+	}
+	// An absurd hint is clamped — it can slow a retry, never silence it.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = now() - interval '1 second'
+		 WHERE persona_id = $1 AND input_id = 'in-ra'`, pa); err != nil {
+		t.Fatalf("expire not_before: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-ra2", 10); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	before = time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-ra2", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "rate limited",
+		RetryAfterMs: 3_600_000, // provider asks for an hour
+	}); err != nil {
+		t.Fatalf("second retryable commit: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-ra'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if d := nb.Sub(before); d > 3*time.Minute {
+		t.Fatalf("an absurd Retry-After must be clamped to 2min, got %v", d)
+	}
+}

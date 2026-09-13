@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
-import type {
-  ModelEvent,
-  ModelProvider,
-  ModelRequest,
+import {
+  ModelError,
+  type ModelEvent,
+  type ModelProvider,
+  type ModelRequest,
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { assemble, Secretary, type SecretaryConfig } from "../src/secretary.ts";
@@ -752,7 +754,7 @@ test("plan rounds are append-only across attempts (lost save before round 1)", a
   assert.equal(claim.fresh, true);
 });
 
-test("attempt cap: a failing provider cannot consume an input forever", async () => {
+test("attempt cap + budget: transient provider retries within the budget, then resolves", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   state.addInput(PERSONA, "in-17", "hi");
@@ -767,22 +769,107 @@ test("attempt cap: a failing provider cannot consume an input forever", async ()
   const s = new Secretary(
     cfg(state, "h", {
       provider: down,
-      maxAttempts: 2,
+      maxAttempts: 1,
     }),
   );
+  const input = () => state.inputs.find((i) => i.input_id === "in-17")!;
   await s.start();
-  assert.equal(await s.step(), "turn"); // attempt 1: fails, requeued with not_before
-  // Expire the durable retry backoff to reach the next attempt now.
-  state.inputs.find((i) => i.input_id === "in-17")!.not_before = null;
-  assert.equal(await s.step(), "turn"); // attempt 2: last allowed — terminal
-  assert.equal(await s.step(), "idle");
+  assert.equal(await s.step(), "turn"); // attempt 1: fails, retryable within budget
+  assert.equal(input().status, "queued");
+  input().not_before = null;
+  // Attempt 2 is already past maxAttempts — but the provider-retry budget
+  // is still open, so a transient outage keeps retrying instead of
+  // discarding the request (F1).
+  assert.equal(await s.step(), "turn");
   assert.equal(consultations, 2);
-  const input = state.inputs.find((i) => i.input_id === "in-17")!;
-  assert.equal(input.status, "done", "input ends, not requeued forever");
+  assert.equal(input().status, "queued");
+  // Budget elapsed: the attempt cap resolves the input honestly.
+  input().not_before = null;
+  input().created_at = new Date(Date.now() - 31 * 60_000).toISOString();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+  assert.equal(consultations, 2, "no consult past the expired budget");
+  assert.equal(input().status, "done", "input ends once the budget closes");
   const failed = [...state.turns.values()].find(
-    (t) => t.input_id === "in-17" && t.status === "failed",
+    (t) => t.input_id === "in-17" && t.status === "failed" &&
+      /attempt cap/.test(t.error ?? ""),
   )!;
-  assert.match(failed.error ?? "", /provider down/);
+  assert.match(failed.error ?? "", /attempt cap 1 exceeded/);
+});
+
+test("short provider outage: retryable failures recover and complete within the budget (F1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-17b", "hi");
+  let consultations = 0;
+  const flaky: ModelProvider = {
+    name: "flaky",
+    async *stream() {
+      consultations++;
+      if (consultations <= 2) {
+        throw new ModelError("provider overloaded", {
+          retryable: true,
+          retryAfterMs: 42_000,
+        });
+      }
+      yield { type: "text", delta: "recovered answer" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  // Default maxAttempts 5, default budget — no test overrides on policy.
+  const s = new Secretary(cfg(state, "h", { provider: flaky }));
+  await s.start();
+  const input = () => state.inputs.find((i) => i.input_id === "in-17b")!;
+  assert.equal(await s.step(), "turn"); // attempt 1: retryable
+  assert.equal(input().status, "queued");
+  // The provider's Retry-After hint paces the durable requeue.
+  const nb = Date.parse(input().not_before!);
+  assert.ok(
+    nb >= Date.now() + 40_000 && nb <= Date.now() + 120_000,
+    `not_before honors retry_after_ms, got ${input().not_before}`,
+  );
+  input().not_before = null;
+  assert.equal(await s.step(), "turn"); // attempt 2: still retryable
+  assert.equal(input().status, "queued");
+  input().not_before = null;
+  assert.equal(await s.step(), "turn"); // provider healed — completes
+  assert.equal(input().status, "done");
+  const out = await state.outbox(PERSONA, 0);
+  const reply = out.find((o) => o.payload.input_id === "in-17b");
+  assert.equal(reply!.kind, "turn_completed");
+});
+
+test("a deterministic provider rejection terminates immediately, not after the cap (F1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-17c", "hi");
+  let consultations = 0;
+  const bad: ModelProvider = {
+    name: "bad",
+    stream() {
+      consultations++;
+      throw new ModelError("model request failed: 401 invalid api key", {
+        retryable: false,
+      });
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: bad }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+  assert.equal(consultations, 1, "no retries for a permanent rejection");
+  const input = state.inputs.find((i) => i.input_id === "in-17c")!;
+  assert.equal(input.status, "done");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-17c" && t.status === "failed",
+  )!;
+  assert.match(failed.error ?? "", /401 invalid api key/);
+  const out = await state.outbox(PERSONA, 0);
+  assert.ok(
+    out.some(
+      (o) => o.kind === "turn_failed" && o.payload.input_id === "in-17c",
+    ),
+  );
 });
 
 test("lease renews while a model call is in flight", async () => {
@@ -1020,7 +1107,11 @@ test("a provider error containing NUL still persists as a recorded terminal fail
     },
   };
   const s = new Secretary(
-    cfg(state, "h", { provider: poisoned, maxAttempts: 1 }),
+    cfg(state, "h", {
+      provider: poisoned,
+      maxAttempts: 1,
+      providerRetryBudgetMs: 0, // budget closed → failure is terminal
+    }),
   );
   await s.start();
   assert.equal(await s.step(), "turn");
@@ -1233,7 +1324,8 @@ test("a >body-limit provider error still records a bounded honest failure (F-B1)
     new TextEncoder().encode(recorded).length < 10_000,
     `recorded error must be bounded, got ${recorded.length} chars`,
   );
-  assert.match(recorded, /read body/, "keeps the server's rejection reason");
+  // The error is bounded at the source, so the FIRST commit already fits —
+  // no server rejection is involved.
   assert.match(recorded, /truncated/, "marks truncation explicitly");
   assert.match(recorded, /provider exploded/, "keeps the useful reason");
   const in50 = state.inputs.find((i) => i.input_id === "in-50")!;
@@ -1246,6 +1338,14 @@ test("a >body-limit provider error still records a bounded honest failure (F-B1)
     state.inputs.find((i) => i.input_id === "in-51")!.status,
     "done",
   );
+  // Provider healed: the retryable input completes on its next attempt.
+  in50.not_before = null;
+  assert.equal(await s.step(), "turn");
+  assert.equal(in50.status, "done");
+  const ob50 = (await state.outbox(PERSONA, 0)).find(
+    (o) => o.payload.input_id === "in-50",
+  );
+  assert.equal(ob50!.kind, "turn_completed");
 });
 
 test("an oversized complete commit downgrades through the minimal tier (F-B1)", async () => {
@@ -1277,4 +1377,179 @@ test("an oversized complete commit downgrades through the minimal tier (F-B1)", 
   );
   assert.equal(ob52.length, 1);
   assert.equal(ob52[0]!.kind, "turn_failed");
+});
+
+// --- Fresh-review F3/F4/F6 repair coverage ---------------------------------
+
+test("restart with a dead predecessor's lease waits out the TTL instead of dying (F3)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-60", "hi");
+  // A prior process died without releasing: its lease still reads live.
+  await state.acquireWriter(PERSONA, "local-dead-pid", 300);
+  const logs: string[] = [];
+  const s = new Secretary(
+    cfg(state, "local-new-pid", {
+      leaseTtlMs: 300,
+      pollIntervalMs: 5,
+      log: (m) => logs.push(m),
+    }),
+  );
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const input = state.inputs.find((i) => i.input_id === "in-60")!;
+    if (input.status === "done") break;
+    assert.ok(Date.now() < deadline, "dead predecessor's lease never expired");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  ac.abort();
+  await done;
+  assert.ok(
+    logs.some((m) => m.includes("waiting for expiry")),
+    "the held lease was waited out, not fatal",
+  );
+  const out = await state.outbox(PERSONA, 0);
+  assert.equal(out[0]!.kind, "turn_completed");
+});
+
+test("a live holder's lease is never stolen — run() yields honestly (F3)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-61", "hi");
+  // A genuinely live holder keeps renewing; its lease outlives the
+  // newcomer's wait window.
+  const holder = new Secretary(cfg(state, "local-live", { leaseTtlMs: 2_000 }));
+  await holder.start();
+  const newcomer = new Secretary(
+    cfg(state, "local-new", { leaseTtlMs: 200, pollIntervalMs: 5 }),
+  );
+  const ac = new AbortController();
+  await assert.rejects(
+    newcomer.run(ac.signal),
+    (e: unknown) =>
+      e instanceof StateError && e.status === 409,
+    "a live holder is not displaced — the newcomer yields",
+  );
+  // The live holder's work is untouched.
+  assert.equal(await holder.step(), "turn");
+  assert.equal(state.inputs.find((i) => i.input_id === "in-61")!.status, "done");
+  await holder.stop();
+});
+
+test("retry sleeps do not accumulate abort listeners on the run signal (F4)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  let calls = 0;
+  const outage: StateClient = Object.create(state, {
+    loadTurn: {
+      value: async (
+        ...args: Parameters<StateClient["loadTurn"]>
+      ): ReturnType<StateClient["loadTurn"]> => {
+        calls++;
+        if (calls <= 3) throw new TypeError("fetch failed"); // transport outage
+        return state.loadTurn(...args);
+      },
+    },
+  });
+  const s = new Secretary(
+    cfg(outage, "h", { pollIntervalMs: 5, provider: new MockProvider() }),
+  );
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  let maxListeners = 0;
+  const deadline = Date.now() + 10_000;
+  while (calls <= 3) {
+    maxListeners = Math.max(
+      maxListeners,
+      getEventListeners(ac.signal, "abort").length,
+    );
+    assert.ok(Date.now() < deadline, "transient outage never recovered");
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  // Let one more step land, then stop.
+  await new Promise((r) => setTimeout(r, 100));
+  maxListeners = Math.max(
+    maxListeners,
+    getEventListeners(ac.signal, "abort").length,
+  );
+  ac.abort();
+  await done;
+  assert.ok(
+    maxListeners <= 1,
+    `abort listeners accumulated across retries: ${maxListeners}`,
+  );
+});
+
+test("an unknown recurring in-turn error resolves as an honest failure after 3 strikes (F6)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-62", "hi");
+  // claimOperation throws a defect-class error (not StateError, not transport):
+  // without a bound, the same running turn would retry forever in silence.
+  const buggy: StateClient = Object.create(state, {
+    claimOperation: {
+      value: async (): Promise<never> => {
+        throw new RangeError("corrupt operation record");
+      },
+    },
+  });
+  const s = new Secretary(
+    cfg(buggy, "h", {
+      provider: new ScriptedProvider({
+        text: "",
+        calls: [{ tool: "journal.note", request: { text: "x" } }],
+      }),
+    }),
+  );
+  await s.start();
+  await assert.rejects(s.step(), /corrupt operation record/); // strike 1
+  await assert.rejects(s.step(), /corrupt operation record/); // strike 2
+  assert.equal(await s.step(), "turn"); // strike 3 → recorded failure
+  const input = state.inputs.find((i) => i.input_id === "in-62")!;
+  assert.equal(input.status, "done", "defect resolves, not an infinite loop");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-62" && t.status === "failed",
+  )!;
+  assert.match(failed.error ?? "", /recurring internal error: corrupt/);
+  const out = await state.outbox(PERSONA, 0);
+  assert.ok(
+    out.some(
+      (o) => o.kind === "turn_failed" && o.payload.input_id === "in-62",
+    ),
+  );
+});
+
+test("a rejected claim still journals its tool_call before the tool_result (F6)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-63", "hi");
+  const s = new Secretary(
+    cfg(state, "h", {
+      provider: new ScriptedProvider({
+        rounds: [
+          {
+            text: "",
+            calls: [{ tool: "no.such.tool", request: { x: 1 } }],
+          },
+          { text: "could not do it", calls: [] },
+        ],
+      }),
+    }),
+  );
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const evs = await state.events(PERSONA, 0);
+  const callIdx = evs.findIndex(
+    (e) => e.kind === "tool_call" && e.payload.tool === "no.such.tool",
+  );
+  const resIdx = evs.findIndex(
+    (e) => e.kind === "tool_result" && e.payload.tool === "no.such.tool",
+  );
+  assert.ok(callIdx >= 0, "rejected call is still journaled as a decision");
+  assert.ok(
+    resIdx > callIdx,
+    "the rejection result follows its call symmetrically",
+  );
 });

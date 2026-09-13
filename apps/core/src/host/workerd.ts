@@ -21,6 +21,8 @@
  *   SUMI_STATE_URL    — base URL of the Go state service
  *   SUMI_MODEL_*      — provider config (same as local host)
  *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
+ *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
+ *                       binding is missing (default 30min)
  *   SECRETARY         — Durable Object namespace binding
  * Persona capability tokens are provisioned per-persona via the admin
  * surface (POST /internal/core/personas) — the worker stores them in its
@@ -58,11 +60,18 @@ interface EnvLike {
 /** DO-storage key for the persona this object serves (routing metadata). */
 const PERSONA_KEY = "sumi/persona_id";
 const DEFAULT_HEARTBEAT_MS = 30_000;
+// While a persona's token binding is missing, a heartbeat-paced retry
+// only loops the same error — but a permanently disarmed DO never
+// recovers once the binding lands (fresh-review F5). The dormant cadence
+// is long: provisioning is a rare operator action, and a fetch wake or a
+// new activation still drains immediately.
+const DEFAULT_DORMANT_REARM_MS = 30 * 60_000;
 
 /**
  * Thrown when no SUMI_PERSONA_TOKEN_* binding exists for a persona — a
- * provisioning gap no amount of retrying fixes. alarm() treats it as
- * terminal-for-this-activation instead of a per-heartbeat error loop.
+ * provisioning gap no amount of retrying fixes. alarm() logs it once and
+ * re-arms on the long dormant cadence instead of a per-heartbeat error
+ * loop or a permanent disarm.
  */
 export class MissingPersonaTokenError extends Error {
   constructor(persona: string) {
@@ -94,6 +103,11 @@ export class SecretaryObject {
   private heartbeatMs(): number {
     const v = Number(this.env.SUMI_HEARTBEAT_MS);
     return Number.isFinite(v) && v >= 250 ? v : DEFAULT_HEARTBEAT_MS;
+  }
+
+  private dormantRearmMs(): number {
+    const v = Number(this.env.SUMI_DORMANT_REARM_MS);
+    return Number.isFinite(v) && v >= 1_000 ? v : DEFAULT_DORMANT_REARM_MS;
   }
 
   /** Build the per-persona secretary; overridable for tests. */
@@ -171,20 +185,24 @@ export class SecretaryObject {
       (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
       "";
     if (!persona) return; // never activated — nothing to re-arm either
-    let unprovisioned = false;
+    let rearmIn = this.heartbeatMs();
     try {
       const s = await this.build(persona);
+      this.missingTokenLogged = false;
       await this.requestDrain(s);
     } catch (e) {
       if (e instanceof MissingPersonaTokenError) {
-        // The binding is absent until provisioned — re-arming only loops
-        // the same uncaught error every heartbeat. Log once and disarm; a
-        // fresh wake (fetch) after provisioning re-arms the heartbeat.
-        unprovisioned = true;
+        // The binding is absent until provisioned — re-arming at
+        // heartbeat pace only loops the same uncaught error, but
+        // disarming entirely leaves an activated persona asleep forever
+        // (fresh-review F5). Log once and re-arm on the long dormant
+        // cadence: no model/state calls while the token is absent, yet
+        // the persona recovers on its own once the binding exists.
+        rearmIn = this.dormantRearmMs();
         if (!this.missingTokenLogged) {
           this.missingTokenLogged = true;
           console.log(
-            `[core] no persona token binding for ${persona}; heartbeat disarmed until next wake`,
+            `[core] no persona token binding for ${persona}; dormant re-arm in ${rearmIn}ms`,
           );
         }
       } else {
@@ -193,11 +211,9 @@ export class SecretaryObject {
         );
       }
     } finally {
-      // Re-arm on every failure except an activation that can never
-      // succeed — anything else must not permanently disarm the writer.
-      if (!unprovisioned) {
-        await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
-      }
+      // Re-arm on every outcome — nothing must permanently disarm an
+      // activated writer.
+      await this.ctx.storage.setAlarm(Date.now() + rearmIn);
     }
   }
 
@@ -248,6 +264,12 @@ export class SecretaryObject {
       }
       await s.stop();
     } catch (e) {
+      // A mid-drain error (state outage, transient step failure) leaves
+      // the Secretary running and the lease held — deliberately: the next
+      // alarm's start() renews the same generation and continues the
+      // in-flight turn instead of fencing it into a new attempt
+      // (fresh-review F6). A real fence loss still surfaces via
+      // FencedError on the next step.
       console.log(
         `[core] drain error: ${e instanceof Error ? (e.stack ?? e.message) : e}`,
       );

@@ -8,6 +8,9 @@
  *   SUMI_MODEL_BASE_URL / _API_KEY / _MODEL  (openai only)
  *   SUMI_MODEL_HEADERS_JSON / _EXTRA_JSON / _TIMEOUT_MS  (openai only;
  *                                          see host/provider-env.ts)
+ *   SUMI_PROVIDER_RETRY_BUDGET_MS  wall-clock budget for transient provider
+ *                                  retries, measured from input submission
+ *                                  (default 30 min)
  *   --once  drain pending work then exit (used by e2e + dev scripts)
  *
  * Kill -9 safe at any point: nothing canonical lives in this process.
@@ -40,6 +43,9 @@ async function main() {
     contextLimit: 60,
     pollIntervalMs: 500,
     scheduleEveryMs: 1_000,
+    providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
+      ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
+      : undefined,
     idgen: () => crypto.randomUUID(),
     log: (msg, fields) =>
       console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),

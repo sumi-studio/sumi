@@ -54,3 +54,24 @@ export interface ModelProvider {
   /** Streaming contract: text deltas, tool calls, then exactly one done. */
   stream(request: ModelRequest): AsyncIterable<ModelEvent>;
 }
+
+/**
+ * A provider failure carrying its own retry disposition. `retryable`
+ * distinguishes transient conditions (5xx/429, network, timeout, an
+ * incomplete stream) from rejections no retry can fix (auth, bad
+ * request). `retryAfterMs` carries provider-supplied pacing (Retry-After)
+ * so the durable retry honors it instead of guessing.
+ */
+export class ModelError extends Error {
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  constructor(
+    message: string,
+    opts: { retryable: boolean; retryAfterMs?: number },
+  ) {
+    super(message);
+    this.name = "ModelError";
+    this.retryable = opts.retryable;
+    this.retryAfterMs = opts.retryAfterMs;
+  }
+}
