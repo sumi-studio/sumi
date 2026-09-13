@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export LC_ALL=C
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Durable per-issue claim ledger for concurrent workers on one host.
+# See docs/agents/workflow.md. Every invocation is serialized through
+# flock(1) on ${LEDGER_DIR}/.lock so concurrent claims cannot interleave.
+# The lock is held for the whole command; record writes are additionally
+# atomic (tmp file + rename) so a crashed writer cannot leave torn JSON.
+
+LEDGER_DIR="${SUMI_TASK_LEDGER_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/sumi/task-ledger}"
+
+while [[ "${1:-}" == --ledger-dir || "${1:-}" == --ledger-dir=* ]]; do
+  case "$1" in
+    --ledger-dir)
+      [[ $# -ge 2 ]] || { echo "task-ledger: --ledger-dir requires a path" >&2; exit 1; }
+      LEDGER_DIR="$2"
+      shift 2
+      ;;
+    --ledger-dir=*)
+      LEDGER_DIR="${1#--ledger-dir=}"
+      shift
+      ;;
+  esac
+done
+
+mkdir -p "$LEDGER_DIR"
+readonly LOCK_FILE="${LEDGER_DIR}/.lock"
+
+# Record the caller's PID, not this transient invocation's: the ledger's
+# liveness evidence is only meaningful if it names the worker's own
+# process (shell/session), which outlives a one-shot claim command.
+SUMI_TASK_LEDGER_CALLER_PID="${SUMI_TASK_LEDGER_CALLER_PID:-${PPID}}" \
+  exec flock -w 30 "$LOCK_FILE" \
+  node "${SCRIPT_DIR}/task-ledger.mjs" --ledger-dir "$LEDGER_DIR" "$@"
