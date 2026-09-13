@@ -36,7 +36,7 @@ describe("ChatItemView", () => {
           id: "user-1",
           text: "こんにちは",
           attachments: [],
-          timestamp: "2026-08-01T09:00:00+09:00",
+          timestamp: new Date(2026, 7, 1, 9, 0).toISOString(),
           delivery: "durable",
         }}
       />,

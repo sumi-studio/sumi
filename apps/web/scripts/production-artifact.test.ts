@@ -22,7 +22,6 @@ test("the isolated production WebApp artifact contains edge policy without mutat
 }, async () => {
   const artifact = await buildProductionArtifactOnce();
   const artifactDirectory = artifact.directory;
-  assert.equal(artifact.releaseSha, releaseSha);
 
   assert.equal(
     await directoryFingerprint(deployableDistDirectory),

@@ -311,7 +311,10 @@ describe("Feedback conversations", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "送信する" }));
     await waitFor(() => expect(client.create).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(client.create).mock.calls[1]).toEqual(first);
+    // Drafts survive a JSON round trip; UTC's -0 offset is transmitted as 0.
+    expect(
+      JSON.parse(JSON.stringify(vi.mocked(client.create).mock.calls[1])),
+    ).toEqual(JSON.parse(JSON.stringify(first)));
   });
   it("does not let an old successful request erase a newer draft after returning to the conversation", async () => {
     const client = setupClient();
