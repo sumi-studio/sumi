@@ -47,6 +47,7 @@ async function fixture(issues = []) {
     ...process.env,
     PATH: `${binDir}:${process.env.PATH}`,
     SUMI_TASK_LEDGER_DIR: ledgerDir,
+    SUMI_TASK_LEDGER_REPO: "test-org/test-repo",
     GH_STUB_ISSUES: issuesFile,
     GH_LOG: ghLog,
   };
@@ -55,9 +56,12 @@ async function fixture(issues = []) {
   return { dir, ledgerDir, env, ghCalls };
 }
 
-async function run(env, args) {
+async function run(env, args, cwd) {
   try {
-    const { stdout, stderr } = await execFileAsync(ledgerBin, args, { env });
+    const { stdout, stderr } = await execFileAsync(ledgerBin, args, {
+      env,
+      ...(cwd ? { cwd } : {}),
+    });
     return { code: 0, stdout, stderr };
   } catch (error) {
     return {
@@ -316,7 +320,7 @@ test("gh-sync claim removes every other state label, then adds in-progress", asy
   assert.deepEqual(await ghCalls(), [
     "issue edit 51 --remove-label state:ready " +
       "--remove-label state:review --remove-label state:blocked " +
-      "--add-label state:in-progress",
+      "--add-label state:in-progress -R test-org/test-repo",
   ]);
 });
 
@@ -337,7 +341,7 @@ test("gh-sync release done strips all state labels but never closes", async () =
   assert.deepEqual(calls, [
     "issue edit 53 --remove-label state:ready " +
       "--remove-label state:in-progress --remove-label state:review " +
-      "--remove-label state:blocked",
+      "--remove-label state:blocked -R test-org/test-repo",
   ]);
   assert.match(result.stderr, /acceptor closes the issue/);
   assert.match(result.stderr, /gh issue close 53/);
@@ -359,7 +363,7 @@ test("gh-sync release abandoned returns the issue to state:ready", async () => {
   assert.deepEqual(await ghCalls(), [
     "issue edit 57 --remove-label state:in-progress " +
       "--remove-label state:review --remove-label state:blocked " +
-      "--add-label state:ready",
+      "--add-label state:ready -R test-org/test-repo",
   ]);
 });
 
@@ -399,4 +403,85 @@ test("next warns on stderr when ready issues are held by expired claims", async 
   assert.doesNotMatch(result.stdout, /#61/);
   assert.match(result.stdout, /#63\tfree/);
   assert.match(result.stderr, /1 ready issue\(s\) held by expired claims/);
+});
+
+test("ledger binds to the first resolving repo and refuses conflicts", async () => {
+  const { env, dir, ghCalls } = await fixture([
+    { number: 71, title: "x", updatedAt: "2026-09-13T00:00:00Z" },
+  ]);
+  const unbound = { ...env };
+  delete unbound.SUMI_TASK_LEDGER_REPO;
+
+  // A foreign checkout (e.g. the ChatGPT-Coding worktrees) supplies the
+  // repo only when the ledger has no binding yet — first resolution wins.
+  const foreign = join(dir, "foreign-checkout");
+  await execFileAsync("git", ["init", foreign]);
+  await execFileAsync("git", [
+    "-C",
+    foreign,
+    "remote",
+    "add",
+    "origin",
+    "git@github.com:other-org/other-repo.git",
+  ]);
+  const claim = await run(
+    unbound,
+    ["claim", "71", "--owner", "a", "--gh-sync"],
+    foreign,
+  );
+  assert.equal(claim.code, 0, claim.stderr);
+  assert.match((await ghCalls()).join("\n"), /-R other-org\/other-repo/);
+  const stored = await readFile(join(env.SUMI_TASK_LEDGER_DIR, "repo"), "utf8");
+  assert.equal(stored.trim(), "other-org/other-repo");
+
+  // A later explicit setting (flag or env) conflicting with the stored
+  // binding is refused instead of silently retargeting the namespace.
+  const conflict = await run(
+    env,
+    ["claim", "72", "--owner", "b", "--repo", "test-org/test-repo"],
+    foreign,
+  );
+  assert.equal(conflict.code, 2);
+  assert.match(conflict.stderr, /bound to other-org\/other-repo/);
+
+  // An inherited GH_REPO pointing elsewhere cannot divert gh: the bound
+  // -R flag wins over gh's GH_REPO/cwd resolution.
+  const diverted = { ...unbound, GH_REPO: "evil-org/evil-repo" };
+  const next = await run(diverted, ["next"], foreign);
+  assert.equal(next.code, 0, next.stderr);
+  const calls = await ghCalls();
+  assert.match(calls.at(-1), /issue list .*-R other-org\/other-repo/);
+});
+
+test("next refuses to guess a repo when none is resolvable", async () => {
+  const { env, dir } = await fixture();
+  const unbound = { ...env };
+  delete unbound.SUMI_TASK_LEDGER_REPO;
+  const bare = join(dir, "plain-dir");
+  await execFileAsync("mkdir", ["-p", bare]);
+  const result = await run(unbound, ["next"], bare);
+  assert.equal(result.code, 4);
+  assert.match(result.stderr, /cannot determine the repository/);
+});
+
+test("unbound claim works offline; unbound --gh-sync refuses to write", async () => {
+  const { env, dir, ghCalls } = await fixture();
+  const unbound = { ...env };
+  delete unbound.SUMI_TASK_LEDGER_REPO;
+  const bare = join(dir, "nowhere");
+  await execFileAsync("mkdir", ["-p", bare]);
+
+  const claim = await run(unbound, ["claim", "73", "--owner", "a"], bare);
+  assert.equal(claim.code, 0, claim.stderr);
+  assert.match(claim.stderr, /repository unresolved/);
+  assert.doesNotMatch(claim.stderr, /gh issue edit 73 [^\n]*-R /);
+
+  const release = await run(
+    unbound,
+    ["release", "73", "--owner", "a", "--reason", "ready", "--gh-sync"],
+    bare,
+  );
+  assert.equal(release.code, 0, release.stderr);
+  assert.match(release.stderr, /needs a repository binding/);
+  assert.equal((await ghCalls()).length, 0);
 });

@@ -84,6 +84,20 @@ Semantics:
   tracker mutation — the local transition still commits.
 - The ledger is advisory about tracker existence: `claim` does not
   verify the issue exists or is open — it records worker intent.
+- **One ledger directory binds to one repository namespace.** The first
+  tracker-facing command resolves the repo from `--repo`,
+  `SUMI_TASK_LEDGER_REPO`, or `git remote get-url origin` in the
+  caller's cwd, then persists it to `$LEDGER_DIR/repo`. From then on the
+  binding wins over the caller's checkout — an invocation from a
+  different worktree (e.g. ChatGPT-Coding) still addresses the bound
+  repo, and every `gh` call/suggestion carries `-R OWNER/NAME`, which
+  overrides `GH_REPO` and cwd resolution. An explicit `--repo` that
+  conflicts with the stored binding is refused. For the shared Sumi
+  ledger, launch workers with `SUMI_TASK_LEDGER_REPO=sumi-studio/sumi`;
+  a second repository gets its own `SUMI_TASK_LEDGER_DIR`. Purely local
+  commands (`show`, `list`, `renew`) never resolve or write a binding,
+  and offline claims work with no repo resolvable — `--gh-sync` and
+  `next` are the only commands that require one.
 - The ledger is per-host (the shared WSL). It is not a distributed
   system; if workers ever run on separate hosts, promote the ledger to a
   shared location or a compare-and-swap primitive first.

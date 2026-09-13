@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -34,6 +34,11 @@ function usage() {
   show     <issue> [--json]
   list     [--all] [--json]
   next     [--label NAME] [--limit N] [--json]
+
+Common options: --repo OWNER/NAME pins the tracker repository;
+SUMI_TASK_LEDGER_REPO does the same. A ledger directory binds to one
+repository namespace — the first resolved repo is persisted to
+$LEDGER_DIR/repo and wins over the caller's checkout from then on.
 
 --owner identifies the worker, e.g. swe-2/devin-cli/<session> or
 opus5/<session>. Claims carry a lease; an expired lease is NOT
@@ -125,26 +130,24 @@ function pidAlive(pid) {
   }
 }
 
-function findOpenPrs(issue) {
+function findOpenPrs(issue, repo) {
   try {
-    const out = execFileSync(
-      "gh",
-      [
-        "pr",
-        "list",
-        "--state",
-        "open",
-        "--limit",
-        "100",
-        "--json",
-        "number,title,headRefName,body",
-      ],
-      {
-        timeout: 15_000,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      },
-    );
+    const argv = [
+      "pr",
+      "list",
+      "--state",
+      "open",
+      "--limit",
+      "100",
+      "--json",
+      "number,title,headRefName,body",
+    ];
+    if (repo) argv.push("-R", repo);
+    const out = execFileSync("gh", argv, {
+      timeout: 15_000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
     const needle = new RegExp(`#${issue}\\b`);
     return JSON.parse(out)
       .filter((pr) => needle.test(pr.title) || needle.test(pr.body ?? ""))
@@ -207,7 +210,7 @@ const TARGET_LABEL = {
   done: null,
 };
 
-function ghCommands(issue, transition) {
+function ghCommands(issue, transition, repo) {
   if (!(transition in TARGET_LABEL)) return [];
   const add = TARGET_LABEL[transition];
   const argv = ["issue", "edit", String(issue)];
@@ -215,11 +218,12 @@ function ghCommands(issue, transition) {
     if (label !== add) argv.push("--remove-label", label);
   }
   if (add) argv.push("--add-label", add);
+  if (repo) argv.push("-R", repo);
   return [argv];
 }
 
-function ghSync(issue, transition) {
-  for (const argv of ghCommands(issue, transition)) {
+function ghSync(issue, transition, repo) {
+  for (const argv of ghCommands(issue, transition, repo)) {
     try {
       execFileSync("gh", argv, {
         timeout: 15_000,
@@ -238,8 +242,14 @@ function ghSync(issue, transition) {
   }
 }
 
-function printGhPlan(issue, transition) {
-  for (const argv of ghCommands(issue, transition)) {
+function printGhPlan(issue, transition, repo) {
+  if (!repo) {
+    console.error(
+      "task-ledger: repository unresolved; add `-R OWNER/REPO` to the " +
+        "commands below or set --repo/SUMI_TASK_LEDGER_REPO",
+    );
+  }
+  for (const argv of ghCommands(issue, transition, repo)) {
     console.error(
       `task-ledger: tracker not synced; equivalent: gh ${argv.join(" ")}`,
     );
@@ -251,9 +261,60 @@ function printGhPlan(issue, transition) {
   }
 }
 
-function syncOrPrint(args, issue, transition) {
-  if (args["gh-sync"]) ghSync(issue, transition);
-  else printGhPlan(issue, transition);
+function syncOrPrint(args, issue, transition, repo) {
+  if (args["gh-sync"] && !repo) {
+    console.error(
+      "task-ledger: --gh-sync needs a repository binding; " +
+        "set --repo or SUMI_TASK_LEDGER_REPO — not syncing",
+    );
+    printGhPlan(issue, transition, repo);
+    return;
+  }
+  if (args["gh-sync"]) ghSync(issue, transition, repo);
+  else printGhPlan(issue, transition, repo);
+}
+
+// One ledger directory = one repository namespace. Resolution order:
+// --repo flag > SUMI_TASK_LEDGER_REPO > the binding persisted at
+// $LEDGER_DIR/repo > `git remote get-url origin` in the caller's cwd.
+// The first successful resolution is persisted, so a later invocation
+// from a different checkout (e.g. the ChatGPT-Coding worktrees) still
+// addresses the bound repo instead of its same-numbered issues.
+function repoFromGitRemote() {
+  try {
+    const url = execFileSync("git", ["remote", "get-url", "origin"], {
+      timeout: 5_000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const match = url.match(/github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveRepo(args, dir) {
+  // biome-ignore lint/suspicious/noUndeclaredEnvVars: caller-set binding, not a cached Turbo task
+  const explicit = args.repo ?? process.env.SUMI_TASK_LEDGER_REPO ?? null;
+  let stored = null;
+  try {
+    stored = readFileSync(join(dir, "repo"), "utf8").trim() || null;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (stored) {
+    if (explicit && explicit !== stored) {
+      throw new Error(
+        `ledger ${dir} is bound to ${stored}; --repo ${explicit} ` +
+          `conflicts — use a different SUMI_TASK_LEDGER_DIR or remove ${dir}/repo`,
+      );
+    }
+    return stored;
+  }
+  const resolved = explicit ?? repoFromGitRemote();
+  if (resolved) writeFileSync(join(dir, "repo"), `${resolved}\n`);
+  return resolved;
 }
 
 function describeHolder(record, at) {
@@ -261,7 +322,7 @@ function describeHolder(record, at) {
   return `issue #${record.issue} is claimed by ${record.owner} (lease ${lease} until ${record.leaseExpiresAt}, worktree ${record.worktree ?? "?"})`;
 }
 
-async function cmdClaim(args, dir) {
+async function cmdClaim(args, dir, repo) {
   const issue = parseIssue(args._[1]);
   if (!args.owner) usage();
   const at = now();
@@ -279,13 +340,13 @@ async function cmdClaim(args, dir) {
   if (record) claim.history = record.history ?? [];
   history(claim, "claim", args.owner, args.note);
   await writeRecord(dir, issue, claim);
-  syncOrPrint(args, issue, "claim");
+  syncOrPrint(args, issue, "claim", repo);
   console.log(
     `claimed #${issue} owner=${claim.owner} lease-until=${claim.leaseExpiresAt}`,
   );
 }
 
-async function cmdReclaim(args, dir) {
+async function cmdReclaim(args, dir, repo) {
   const issue = parseIssue(args._[1]);
   if (!args.owner || !args.evidence) usage();
   const at = now();
@@ -304,7 +365,7 @@ async function cmdReclaim(args, dir) {
         ? "present"
         : "missing"
       : "unknown";
-    const prs = findOpenPrs(issue);
+    const prs = findOpenPrs(issue, repo);
     console.error(
       `task-ledger: evidence — prior owner=${record.owner} ` +
         `pid=${record.pid}(${pid}) worktree=${record.worktree}(${worktree})`,
@@ -325,7 +386,7 @@ async function cmdReclaim(args, dir) {
     `evidence: ${args.evidence}${args.note ? ` — ${args.note}` : ""}`,
   );
   await writeRecord(dir, issue, claim);
-  syncOrPrint(args, issue, "claim");
+  syncOrPrint(args, issue, "claim", repo);
   console.log(
     `reclaimed #${issue} owner=${claim.owner} lease-until=${claim.leaseExpiresAt}`,
   );
@@ -349,7 +410,7 @@ async function cmdRenew(args, dir) {
   console.log(`renewed #${issue} lease-until=${record.leaseExpiresAt}`);
 }
 
-async function cmdRelease(args, dir) {
+async function cmdRelease(args, dir, repo) {
   const issue = parseIssue(args._[1]);
   if (!args.owner || !RELEASE_REASONS.has(args.reason)) usage();
   const record = await readRecord(dir, issue);
@@ -369,7 +430,7 @@ async function cmdRelease(args, dir) {
   record.releasedAt = iso(now());
   history(record, `release:${args.reason}`, args.owner, args.note);
   await writeRecord(dir, issue, record);
-  syncOrPrint(args, issue, args.reason);
+  syncOrPrint(args, issue, args.reason, repo);
   console.log(`released #${issue} reason=${args.reason}`);
 }
 
@@ -424,7 +485,14 @@ async function cmdList(args, dir) {
   }
 }
 
-async function cmdNext(args, dir) {
+async function cmdNext(args, dir, repo) {
+  if (!repo) {
+    console.error(
+      "task-ledger: cannot determine the repository for `next` — " +
+        "set --repo or SUMI_TASK_LEDGER_REPO, or run inside the checkout",
+    );
+    process.exit(4);
+  }
   const label = args.label ?? "state:ready";
   const limit = args.limit ?? "100";
   let issues;
@@ -442,6 +510,8 @@ async function cmdNext(args, dir) {
         limit,
         "--json",
         "number,title,updatedAt",
+        "-R",
+        repo,
       ],
       { timeout: 20_000, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -503,7 +573,12 @@ async function main() {
   };
   const handler = commands[command];
   if (!handler) usage();
-  await handler(args, dir);
+  // Only tracker-facing commands resolve (and on first use, persist) the
+  // repository binding; local bookkeeping stays free of cwd side effects.
+  const repo = ["claim", "reclaim", "release", "next"].includes(command)
+    ? resolveRepo(args, dir)
+    : null;
+  await handler(args, dir, repo);
 }
 
 main().catch((error) => {
