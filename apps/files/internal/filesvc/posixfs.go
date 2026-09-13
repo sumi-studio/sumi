@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,24 +28,20 @@ type posixRoot struct {
 
 }
 
-// mountFSType returns the fstype of the mountpoint exactly at p.root, per
-// /proc/self/mountinfo — which lists mountpoints only, so a bare directory
-// simply has no entry. A path stacked under several mounts appears once per
-// mount, topmost last, so the last match wins.
-func (p *posixRoot) mountFSType() (fstype string, ok bool) {
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return "", false
-	}
-	found := false
+// mountInfoEntry is one parsed /proc/self/mountinfo line.
+type mountInfoEntry struct {
+	id         uint64 // field 0: kernel mount ID
+	root       string // field 3: root of the mount within its filesystem
+	mountpoint string // field 4
+	fstype     string // first field after the "-" separator
+}
+
+// parseMountInfo parses the kernel mount table; malformed lines are skipped.
+func parseMountInfo(data []byte) []mountInfoEntry {
+	var out []mountInfoEntry
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 10 {
-			continue
-		}
-		// fields: id parent dev root mountpoint opts ... "-" fstype ...
-		mp := strings.ReplaceAll(f[4], "\\040", " ")
-		if mp != p.root {
 			continue
 		}
 		sep := -1
@@ -57,9 +54,75 @@ func (p *posixRoot) mountFSType() (fstype string, ok bool) {
 		if sep < 0 || sep+1 >= len(f) {
 			continue
 		}
-		fstype, found = f[sep+1], true
+		id, err := strconv.ParseUint(f[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, mountInfoEntry{
+			id:         id,
+			root:       unescapeMountInfo(f[3]),
+			mountpoint: unescapeMountInfo(f[4]),
+			fstype:     f[sep+1],
+		})
 	}
-	return fstype, found
+	return out
+}
+
+// findMount returns the mountinfo entry for the given kernel mount ID.
+func findMount(entries []mountInfoEntry, id uint64) (mountInfoEntry, bool) {
+	for _, e := range entries {
+		if e.id == id {
+			return e, true
+		}
+	}
+	return mountInfoEntry{}, false
+}
+
+// unescapeMountInfo decodes the \ooo octal escapes the kernel applies to
+// mountinfo fields containing space, tab, newline, or backslash.
+func unescapeMountInfo(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// mountVerdict decides whether the mount the kernel resolves root to may
+// serve canonical file operations. visible is the mountinfo entry for the
+// mount statx(STATX_MNT_ID) reports at the path — the mount a subsequent
+// open would actually use, including mounts stacked or placed beneath
+// others. The visible mount's mountpoint must be the service root itself:
+// if an ancestor is overmounted the path resolves on a different mount and
+// writes would land on the wrong filesystem. Returns nil for a JuiceFS
+// mount root, whose cache policy the caller must still verify.
+func mountVerdict(visible mountInfoEntry, root string) error {
+	if visible.mountpoint != root {
+		return fmt.Errorf("%w: %s resolves on mount at %q, not a mountpoint",
+			ErrMountUnavailable, root, visible.mountpoint)
+	}
+	if visible.fstype == "fuse.juicefs" {
+		if visible.root != "/" {
+			return fmt.Errorf("%w: JuiceFS root is a %q subdirectory bind; the service root must be the mount root",
+				ErrMountPolicy, visible.root)
+		}
+		return nil
+	}
+	if localCoherentFS[visible.fstype] {
+		return nil
+	}
+	return fmt.Errorf("%w: filesystem %q cannot prove metadata freshness",
+		ErrMountPolicy, visible.fstype)
 }
 
 // checkMount enforces the mount requirements for canonical-namespace mode
@@ -70,20 +133,43 @@ func (p *posixRoot) mountFSType() (fstype string, ok bool) {
 // (both are recycled; a recycled ID was observed resurrecting a stale
 // verdict and wedging a healthy remount into 503s).
 //
-// A fuse.juicefs mount must prove zero metadata caching through the
-// /.config control file (synthesized by the JuiceFS daemon — not a
-// regular file in the namespace). Other FUSE types are refused as
-// unverifiable, as are network filesystems (nfs/cifs/etc. have their own
-// client-side attribute caches we cannot inspect). Only known
-// kernel-coherent local filesystems pass. Fail closed by default, because
-// the CAS fingerprint gate reads through this mount and a nonzero attr
-// cache silently re-opens the B1 clobber window.
+// The mount serving p.root is identified with statx(STATX_MNT_ID): mountinfo
+// order does not always reflect which mount a path lookup reaches (a mount
+// placed beneath the top is listed last but hidden), so the ID is matched
+// rather than the last mountpoint entry.
+//
+// A fuse.juicefs mount must be mounted at its root (not a subdirectory
+// bind, where a forged regular .config could stand in for daemon metadata)
+// and must prove zero metadata caching through the /.config control file
+// (synthesized by the JuiceFS daemon — not a regular file in the
+// namespace). Other FUSE types are refused as unverifiable, as are network
+// filesystems (nfs/cifs/etc. have their own client-side attribute caches
+// we cannot inspect). Only known kernel-coherent local filesystems pass.
+// Fail closed by default, because the CAS fingerprint gate reads through
+// this mount and a nonzero attr cache silently re-opens the B1 clobber
+// window.
 func (p *posixRoot) checkMount() error {
-	fstype, ok := p.mountFSType()
+	var stx unix.Statx_t
+	err := unix.Statx(unix.AT_FDCWD, p.root,
+		unix.AT_STATX_DONT_SYNC, unix.STATX_MNT_ID, &stx)
+	if err != nil || stx.Mask&unix.STATX_MNT_ID == 0 {
+		return ErrMountUnavailable
+	}
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ErrMountUnavailable
+	}
+	visible, ok := findMount(parseMountInfo(data), stx.Mnt_id)
 	if !ok {
 		return ErrMountUnavailable
 	}
-	return p.verifyFreshness(fstype)
+	if err := mountVerdict(visible, p.root); err != nil {
+		return err
+	}
+	if visible.fstype == "fuse.juicefs" {
+		return checkZeroMetadataCache(filepath.Join(p.root, ".config"))
+	}
+	return nil
 }
 
 // localCoherentFS are filesystems whose metadata is coherent across
@@ -99,19 +185,6 @@ var localCoherentFS = map[string]bool{
 	"minix": true, "hfs": true, "hfsplus": true, "reiserfs": true,
 	"jfs": true, "nilfs2": true, "udf": true, "bcachefs": true,
 	"erofs": true, "squashfs": true, "msdos": true, "iso9660": true,
-}
-
-// verifyFreshness confirms the mounted filesystem cannot return stale
-// metadata to this client. fstype comes from mountinfo.
-func (p *posixRoot) verifyFreshness(fstype string) error {
-	if fstype == "fuse.juicefs" {
-		return checkZeroMetadataCache(filepath.Join(p.root, ".config"))
-	}
-	if localCoherentFS[fstype] {
-		return nil
-	}
-	return fmt.Errorf("%w: filesystem %q cannot prove metadata freshness",
-		ErrMountPolicy, fstype)
 }
 
 // checkZeroMetadataCache reads a JuiceFS /.config control file and requires

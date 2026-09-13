@@ -19,10 +19,14 @@ info:
     refused with 503 mount_unavailable while the root is not a mountpoint,
     and 503 mount_policy when the mount cannot prove zero metadata
     caching (JuiceFS /.config timeouts nonzero or unverifiable FUSE fs).
-    The verdict is re-checked per kernel mount ID, so a remount with
-    different flags is caught. Plain non-FUSE filesystems (kernel-coherent,
-    e.g. a local dir in dev) pass; REQUIRE_MOUNT=0 disables the gate for
-    simple local operation.
+    The check runs on every request: statx(STATX_MNT_ID) identifies the
+    mount the path actually resolves to (correct under mount stacking and
+    MOVE_MOUNT_BENEATH), the mount must be mounted at that path and at the
+    JuiceFS root "/" — subdirectory binds are refused because their .config
+    is a regular file, not daemon metadata. A known allowlist of
+    kernel-coherent local filesystems (ext4, xfs, tmpfs, ...) passes;
+    other FUSE and network filesystems are refused. REQUIRE_MOUNT=0
+    disables the gate for simple local operation.
 paths:
   /v1/files/{scope}/stat:
     get:

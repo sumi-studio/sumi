@@ -488,25 +488,110 @@ func TestMountPolicyConfigCheck(t *testing.T) {
 	}
 }
 
-// Non-FUSE filesystem (a plain test dir) is kernel-coherent: freshness
-// holds with no client config. The mount gate still requires it to be a
-// mountpoint when RequireMount is set.
-func TestNonFuseFreshnessOK(t *testing.T) {
+// A plain (unmounted) service root must be refused under RequireMount:
+// statx resolves it on the parent mount whose mountpoint is not the root.
+func TestRequireMountPlainDirRefused(t *testing.T) {
 	r, err := newRoot(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.verifyFreshness("ext4"); err != nil {
-		t.Fatalf("non-fuse must pass freshness, got %v", err)
-	}
-	if err := r.verifyFreshness("fuse.somefs"); !errors.Is(err, ErrMountPolicy) {
-		t.Fatalf("unverifiable fuse must fail closed, got %v", err)
-	}
-	// but it is not a mountpoint, so RequireMount must still refuse ops
 	svc, _ := NewAt(r.root, newFakeStore(), map[string]map[string]bool{"t": {"*": true}})
 	svc.RequireMount()
 	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=x", "t", "x", map[string]string{"If-Version": "any"})
 	if w.Code != 503 {
 		t.Fatalf("unmounted root must 503, got %d", w.Code)
+	}
+}
+
+// mountVerdict boundary cases — the mount the kernel resolves the service
+// root to (identified by statx MNT_ID) must itself be a mountpoint at the
+// root, and its filesystem must be provably fresh.
+func TestMountVerdict(t *testing.T) {
+	const root = "/data"
+
+	t.Run("juicefs mount root passes to config check", func(t *testing.T) {
+		e := mountInfoEntry{id: 10, root: "/", mountpoint: root, fstype: "fuse.juicefs"}
+		if err := mountVerdict(e, root); err != nil {
+			t.Fatalf("mount-root juicefs must pass verdict, got %v", err)
+		}
+	})
+
+	// Opus F2: a JuiceFS subdirectory bind exposes a regular, user-writable
+	// .config — forged zeros would pass the freshness check. Refuse it.
+	t.Run("juicefs subdirectory bind refused", func(t *testing.T) {
+		e := mountInfoEntry{id: 11, root: "/nsroot-a", mountpoint: root, fstype: "fuse.juicefs"}
+		if err := mountVerdict(e, root); !errors.Is(err, ErrMountPolicy) {
+			t.Fatalf("subdir bind must fail with mount_policy, got %v", err)
+		}
+	})
+
+	// Opus F1 ancestor case: the visible mount covers an ancestor, so the
+	// service root is not itself a mountpoint — writes would land on the
+	// wrong filesystem. Unavailable, not policy: nothing was proved mounted.
+	t.Run("ancestor overmount is unavailable", func(t *testing.T) {
+		e := mountInfoEntry{id: 12, root: "/", mountpoint: "/data-parent", fstype: "tmpfs"}
+		if err := mountVerdict(e, root); !errors.Is(err, ErrMountUnavailable) {
+			t.Fatalf("ancestor mount must fail with mount_unavailable, got %v", err)
+		}
+	})
+
+	t.Run("local coherent fs allowed", func(t *testing.T) {
+		e := mountInfoEntry{id: 13, root: "/", mountpoint: root, fstype: "ext4"}
+		if err := mountVerdict(e, root); err != nil {
+			t.Fatalf("ext4 mount root must pass, got %v", err)
+		}
+	})
+
+	t.Run("unknown and network fs refused", func(t *testing.T) {
+		for _, fs := range []string{"nfs", "cifs", "9p", "fuse.somefs", "devpts"} {
+			e := mountInfoEntry{id: 14, root: "/", mountpoint: root, fstype: fs}
+			if err := mountVerdict(e, root); !errors.Is(err, ErrMountPolicy) {
+				t.Fatalf("%s must fail with mount_policy, got %v", fs, err)
+			}
+		}
+	})
+}
+
+// findMount selects by kernel mount ID, not by mountinfo order — Opus F1:
+// a mount moved beneath the top (MOVE_MOUNT_BENEATH) is listed last, so
+// last-match picks the hidden tmpfs and skips the visible JuiceFS check.
+func TestFindMountSelectsVisibleByID(t *testing.T) {
+	mi := `909 1 0:90 / /data rw - tmpfs tmpfs rw
+910 1 0:91 / /data rw - fuse.juicefs jfs rw
+943 1 0:92 / /data rw - tmpfs tmpfs rw`
+	entries := parseMountInfo([]byte(mi))
+	if len(entries) != 3 {
+		t.Fatalf("want 3 entries, got %d", len(entries))
+	}
+	// statx at /data reports 910 (the visible top); the last-listed 943 is
+	// the tmpfs hidden beneath. The verdict must see the JuiceFS entry.
+	vis, ok := findMount(entries, 910)
+	if !ok || vis.fstype != "fuse.juicefs" {
+		t.Fatalf("visible mount must be juicefs entry 910, got %+v", vis)
+	}
+	if err := mountVerdict(vis, "/data"); err != nil {
+		t.Fatalf("visible juicefs mount root must reach config check, got %v", err)
+	}
+}
+
+// mountinfo escaping: space, tab, newline, and backslash appear as \040
+// \011 \012 \134; all must decode for the mountpoint comparison (F3).
+func TestMountInfoEscapes(t *testing.T) {
+	mi := `800 1 0:80 / /data/with\040space rw - tmpfs tmpfs rw
+801 1 0:81 / /data/with\011tab rw - tmpfs tmpfs rw
+802 1 0:82 / /data/with\012nl rw - tmpfs tmpfs rw
+803 1 0:83 / /data/with\134backslash rw - tmpfs tmpfs rw`
+	entries := parseMountInfo([]byte(mi))
+	want := map[uint64]string{
+		800: "/data/with space",
+		801: "/data/with\ttab",
+		802: "/data/with\nnl",
+		803: "/data/with\\backslash",
+	}
+	for id, mp := range want {
+		e, ok := findMount(entries, id)
+		if !ok || e.mountpoint != mp {
+			t.Fatalf("id %d: want mountpoint %q, got %+v", id, mp, e)
+		}
 	}
 }
