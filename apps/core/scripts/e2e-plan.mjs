@@ -681,16 +681,17 @@ async function main() {
   );
   log("  oversized complete resolved via minimal commit; honest bounded error");
 
-  // 6b — oversized provider *error* (retryable): bounded recorded failure,
-  // backoff-bounded retries, and a later queued input still progresses.
+  // 6b — oversized provider *error* (retryable): the error is bounded at
+  // the source before the first upload, so the retryable failure commits
+  // on tier 1 — honest, backoff-bounded, and fair to later queued work.
   const in12 = (await submit("input-twelve")).json.input.input_id;
   const in13 = (await submit("input-thirteen")).json.input.input_id;
   const giant = runChild({
     SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
   });
   assert(
-    giant.includes("turn committed as scrubbed failure"),
-    "the oversized-error commit must land via the bounded scrubbed tier",
+    giant.includes("turn failed at model"),
+    "the bounded oversized error must commit as an honest retryable failure",
     giant,
   );
   const [b12, b13] = [await attemptsOf(in12), await attemptsOf(in13)];
@@ -726,6 +727,67 @@ async function main() {
     );
   }
   log("  oversized error recorded bounded; later input progressed; both recovered");
+
+  // --- scenario 7: near-limit input + transient error keeps retryable --
+  // Opus F1/F2: when the input_received event alone (~1.04 MB) pushes
+  // every event-carrying commit tier over the body limit, only the
+  // minimal commit can land. That tier must still preserve a retryable
+  // disposition — a transient provider error on a near-limit message is
+  // not a terminal failure — and the record keeps both server rejection
+  // reasons ahead of the bounded detail.
+  log("scenario 7: near-limit input + transient error still retries");
+  const bigText = "x".repeat(1_042_000); // ~1.02 MiB — accepted at submit
+  const sub14 = await req(
+    "POST",
+    `/internal/core/personas/${personaId}/inputs`,
+    ptoken,
+    {
+      input_id: `in-${randomUUID()}`,
+      kind: "message",
+      payload: { text: bigText },
+      actor_kind: "human",
+      actor_id: "e2e",
+      source_surface: "e2e",
+    },
+  );
+  assert(sub14.status === 201, `near-limit submit ${sub14.status}`);
+  const in14 = sub14.json.input.input_id;
+  const in15 = (await submit("input-fifteen")).json.input.input_id;
+  const near = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 4_000 }), // ~24 KB error
+  });
+  assert(
+    near.includes("turn failed at model"),
+    "transient error should be recorded",
+    near,
+  );
+  // in14 is honestly queued for retry — the minimal tier kept retryable.
+  // If the disposition had been dropped it would read `done` + failed.
+  const st14 = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in14}`,
+    ptoken,
+  );
+  assert(
+    st14.json?.input?.status === "queued",
+    `near-limit input must stay queued for retry after minimal-tier commit, got ${st14.text}`,
+  );
+  assert(
+    (await attemptsOf(in15)) >= 1,
+    "later input must progress during the near-limit input's backoff",
+  );
+  // Provider heals: both complete, exactly once.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-I", calls: [] }),
+  });
+  for (const id of [in14, in15]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-I",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  minimal-tier commit kept retryable; near-limit input recovered");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

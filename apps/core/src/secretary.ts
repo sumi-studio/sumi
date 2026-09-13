@@ -364,7 +364,10 @@ export class Secretary {
       await this.commitTurnFinal(turn, {
         outcome: "fail",
         retryable: true,
-        error: `model: ${msg}`,
+        // Bound at the source too: a provider error can be megabytes, and
+        // the first commit upload should never carry that onto a
+        // memory-limited host. The truncation marker stays in the record.
+        error: `model: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
         events,
       });
       // Bound the log line too — a provider error can be megabytes.
@@ -509,15 +512,16 @@ export class Secretary {
       if (!(e instanceof StateError && e.status === 400)) throw e;
       rejected = e;
     }
+    // Last resort: both rejection reasons sit ahead of the bounded detail
+    // so neither is truncated away, and a retryable disposition survives —
+    // a transient failure whose record could not fit still deserves the
+    // retry. Only an un-storable *complete* downgrade is terminal.
+    const why2 = truncateText(scrubJson(rejected.message) as string, 512);
     await commit({
       outcome: "fail",
-      retryable: false,
+      retryable: req.outcome === "fail" && req.retryable === true,
       events: [],
-      error:
-        truncateText(
-          `${msg} (second rejection: ${scrubJson(rejected.message) as string})`,
-          RECORDED_ERROR_BYTES,
-        ) + "; original commit events could not be stored",
+      error: `commit rejected deterministically (${why}; then ${why2}): ${detail}; original commit events could not be stored`,
     });
   }
 }

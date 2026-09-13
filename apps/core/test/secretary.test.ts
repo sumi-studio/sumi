@@ -891,12 +891,13 @@ test("an un-storable provider error commits scrubbed and retryable — with back
   );
 });
 
-test("a >body-limit provider error still records a bounded honest failure (F-B1)", async () => {
+test("a >body-limit provider error is bounded at the source and recorded honestly (F-B1/F3)", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   state.addInput(PERSONA, "in-50", "hi");
-  // Multibyte + control characters, ~1.5 MB total — over the server
-  // body limit FakeState now enforces.
+  // Multibyte + control characters, ~1.5 MB total — bounded before the
+  // first commit upload, so the recorded failure lands on tier 1 with an
+  // explicit truncation marker.
   const huge = "ø😀".repeat(200_000);
   let calls = 0;
   const giant: ModelProvider = {
@@ -920,7 +921,6 @@ test("a >body-limit provider error still records a bounded honest failure (F-B1)
     new TextEncoder().encode(recorded).length < 10_000,
     `recorded error must be bounded, got ${recorded.length} chars`,
   );
-  assert.match(recorded, /read body/, "keeps the server's rejection reason");
   assert.match(recorded, /truncated/, "marks truncation explicitly");
   assert.match(recorded, /provider exploded/, "keeps the useful reason");
   const in50 = state.inputs.find((i) => i.input_id === "in-50")!;
@@ -963,5 +963,61 @@ test("an oversized complete commit downgrades through the minimal tier (F-B1)", 
       (o) => o.payload.input_id === "in-52",
     ).length,
     0,
+  );
+});
+
+test("a retryable failure reaching the minimal tier keeps its disposition and both reasons (opus F1+F2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  // Near-limit input: the input_received commit event alone (~1.04 MB)
+  // keeps every tier carrying events over the body limit, so only the
+  // minimal commit can land. A transient provider error must still
+  // requeue — not silently finalize.
+  state.addInput(PERSONA, "in-53", "x".repeat(1_042_000));
+  state.addInput(PERSONA, "in-54", "later");
+  let calls = 0;
+  const flaky: ModelProvider = {
+    name: "flaky",
+    async *stream() {
+      calls++;
+      if (calls === 1) throw new Error(`provider 503 ${"y".repeat(50_000)}`);
+      yield { type: "text", delta: "recovered" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: flaky }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const in53 = state.inputs.find((i) => i.input_id === "in-53")!;
+  assert.equal(
+    in53.status,
+    "queued",
+    "minimal tier must preserve the retryable disposition",
+  );
+  assert.ok(in53.not_before !== null, "requeue carries backoff");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-53" && t.status === "failed",
+  );
+  const recorded = failed!.error ?? "";
+  assert.ok(recorded.length < 10_000, "recorded error bounded");
+  // Both server rejection reasons survive ahead of the bounded detail.
+  assert.match(recorded, /read body; then read body/);
+  assert.match(recorded, /could not be stored/);
+  // The later input is not starved while in-53 backs off.
+  assert.equal(await s.step(), "turn");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-54")!.status,
+    "done",
+  );
+  // Backoff expired → in-53 retries and completes once.
+  in53.not_before = new Date(Date.now() - 1).toISOString();
+  assert.equal(await s.step(), "turn");
+  assert.equal(in53.status, "done", "transient failure recovers");
+  const out = (await state.outbox(PERSONA, 0)).find(
+    (o) => o.payload.input_id === "in-53",
+  );
+  assert.equal(
+    (out!.payload as { output: { text: string } }).output.text,
+    "recovered",
   );
 });
