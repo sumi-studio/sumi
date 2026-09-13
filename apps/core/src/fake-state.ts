@@ -319,11 +319,28 @@ export class FakeState implements StateClient {
       request: Record<string, unknown>;
     },
   ): Promise<{ operation: Operation; fresh: boolean }> {
+    // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
+    // 400), before the fence check — a dangling 'running' op is never
+    // recorded for a tool no executor can finish.
+    if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
+      throw new StateError(400, `unknown tool: ${op.tool}`);
+    }
     this.mustHold(persona, generation);
+    // Operations are attributed to the live turn: it must exist and be
+    // running under this generation (Go claim enforces the same).
+    const turn = this.turns.get(op.turnId);
+    if (!turn || turn.persona_id !== persona) {
+      throw new StateError(404, "turn not found");
+    }
+    if (turn.generation !== generation || turn.status !== "running") {
+      throw new StateError(409, "conflicting turn state");
+    }
     const k = this.key(persona, op.tool, op.idempotencyKey);
     const existing = this.ops.get(k);
     if (existing) {
-      // Same key, different request → conflict (Go B2 fix → ErrTurnConflict).
+      // A replayed key is idempotent only for the identical request —
+      // returning the stored receipt for a different request would record
+      // an effect that never ran (Go ErrTurnConflict).
       if (!jsonEqual(existing.request, op.request)) {
         throw new StateError(409, "conflicting turn state");
       }
@@ -336,9 +353,6 @@ export class FakeState implements StateClient {
       }
       return { operation: existing, fresh: false };
     }
-    // Unknown tools are claimable and left running, matching the Go store —
-    // the core's running-op branch records the failure.
-    const internal = op.tool === "schedule.set" || op.tool === "journal.note";
     const operation: Operation = {
       persona_id: persona,
       operation_id: op.operationId,
@@ -346,11 +360,11 @@ export class FakeState implements StateClient {
       tool: op.tool,
       idempotency_key: op.idempotencyKey,
       request: op.request,
-      status: internal ? "done" : "running",
+      status: "done",
       response: null,
       claimed_generation: generation,
       created_at: new Date().toISOString(),
-      completed_at: internal ? new Date().toISOString() : null,
+      completed_at: new Date().toISOString(),
     };
     if (op.tool === "schedule.set") {
       const sid = (op.request.schedule_id as string) ?? `sch-${Date.now()}`;

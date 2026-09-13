@@ -203,9 +203,9 @@ test("claim conflict: retried plan diverging from a committed effect fails loudl
   const s = new Secretary(cfg(state));
   await s.start();
   const gen = s.generation!;
-  // Simulate a prior attempt that committed this effect then crashed:
-  // position 0 of in-7 already owns the idempotency key with a DIFFERENT
-  // request.
+  // Attempt 1 under a real running turn: claim the input, commit the
+  // effect, then crash before commitTurn (what recover() cleans up).
+  await state.loadTurn(PERSONA, gen, "t-old", 10);
   const { operation } = await state.claimOperation(PERSONA, gen, {
     operationId: "t-old:op:0",
     turnId: "t-old",
@@ -214,9 +214,12 @@ test("claim conflict: retried plan diverging from a committed effect fails loudl
     request: { text: "committed version" },
   });
   assert.equal(operation.status, "done");
+  await state.recover(PERSONA, gen); // interrupt t-old, requeue in-7
 
   assert.equal(await s.step(), "turn"); // fails loudly, does not throw
-  const turn = [...state.turns.values()].find((t) => t.input_id === "in-7")!;
+  const turn = [...state.turns.values()].find(
+    (t) => t.input_id === "in-7" && t.turn_id !== "t-old",
+  )!;
   assert.equal(turn.status, "failed");
   assert.match(turn.error ?? "", /diverged retry/);
   const input = state.inputs.find((i) => i.input_id === "in-7")!;
@@ -255,6 +258,9 @@ test("silent replay with a different request is caught client-side (pre-B2 store
   const s = new Secretary(cfg(lenient));
   await s.start();
   const gen = s.generation!;
+  // Same crash shape as the strict-store test: a real running turn commits
+  // the effect, then dies; the retried attempt's position-0 call differs.
+  await inner.loadTurn(PERSONA, gen, "t-old", 10);
   await inner.claimOperation(PERSONA, gen, {
     operationId: "t-old:op:0",
     turnId: "t-old",
@@ -262,8 +268,11 @@ test("silent replay with a different request is caught client-side (pre-B2 store
     idempotencyKey: "in-8:tool:0",
     request: { text: "A" },
   });
+  await inner.recover(PERSONA, gen);
   assert.equal(await s.step(), "turn");
-  const turn = [...inner.turns.values()].find((t) => t.input_id === "in-8")!;
+  const turn = [...inner.turns.values()].find(
+    (t) => t.input_id === "in-8" && t.turn_id !== "t-old",
+  )!;
   assert.equal(turn.status, "failed");
   assert.match(turn.error ?? "", /diverged retry/);
 });
