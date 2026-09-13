@@ -235,11 +235,19 @@ function ghSync(issue, transition, repo) {
       );
     }
   }
-  if (transition === "done") {
-    console.error(
-      `task-ledger: released as done; the acceptor closes the issue once verified: gh issue close ${issue}`,
-    );
-  }
+  if (transition === "done") printDoneNote(issue, repo);
+}
+
+// Done = closed, and closing belongs to the acceptor. The suggestion is
+// only executable when the repo is bound — never print an unscoped
+// `gh issue close` that cwd/GH_REPO could retarget.
+function printDoneNote(issue, repo) {
+  const close = repo
+    ? `gh issue close ${issue} -R ${repo}`
+    : "gh issue close <N> -R OWNER/REPO (repository unresolved)";
+  console.error(
+    `task-ledger: released as done; the acceptor closes the issue once verified: ${close}`,
+  );
 }
 
 function printGhPlan(issue, transition, repo) {
@@ -254,11 +262,7 @@ function printGhPlan(issue, transition, repo) {
       `task-ledger: tracker not synced; equivalent: gh ${argv.join(" ")}`,
     );
   }
-  if (transition === "done") {
-    console.error(
-      `task-ledger: released as done; the acceptor closes the issue once verified: gh issue close ${issue}`,
-    );
-  }
+  if (transition === "done") printDoneNote(issue, repo);
 }
 
 function syncOrPrint(args, issue, transition, repo) {
@@ -365,12 +369,18 @@ async function cmdReclaim(args, dir, repo) {
         ? "present"
         : "missing"
       : "unknown";
-    const prs = findOpenPrs(issue, repo);
+    // No binding: never let the lookup fall back to the caller's cwd
+    // repo — an unrelated repository's PRs are not evidence here.
+    const prs = repo ? findOpenPrs(issue, repo) : "skipped";
     console.error(
       `task-ledger: evidence — prior owner=${record.owner} ` +
         `pid=${record.pid}(${pid}) worktree=${record.worktree}(${worktree})`,
     );
-    if (prs === null)
+    if (prs === "skipped")
+      console.error(
+        "task-ledger: evidence — open-PR lookup skipped (no repo binding)",
+      );
+    else if (prs === null)
       console.error("task-ledger: evidence — open-PR lookup failed (gh)");
     else if (prs.length)
       console.error(`task-ledger: evidence — open PRs: ${prs.join("; ")}`);

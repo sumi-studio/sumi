@@ -344,7 +344,7 @@ test("gh-sync release done strips all state labels but never closes", async () =
       "--remove-label state:blocked -R test-org/test-repo",
   ]);
   assert.match(result.stderr, /acceptor closes the issue/);
-  assert.match(result.stderr, /gh issue close 53/);
+  assert.match(result.stderr, /gh issue close 53 -R test-org\/test-repo/);
 });
 
 test("gh-sync release abandoned returns the issue to state:ready", async () => {
@@ -387,7 +387,7 @@ test("without --gh-sync no tracker call is made; equivalent commands print", asy
   assert.equal((await ghCalls()).length, 0);
   assert.match(released.stderr, /equivalent: gh issue edit 59 /);
   assert.doesNotMatch(released.stderr, /--add-label/);
-  assert.match(released.stderr, /gh issue close 59/);
+  assert.match(released.stderr, /gh issue close 59 -R test-org\/test-repo/);
 });
 
 test("next warns on stderr when ready issues are held by expired claims", async () => {
@@ -483,5 +483,46 @@ test("unbound claim works offline; unbound --gh-sync refuses to write", async ()
   );
   assert.equal(release.code, 0, release.stderr);
   assert.match(release.stderr, /needs a repository binding/);
+  assert.equal((await ghCalls()).length, 0);
+});
+
+test("unbound done suggestion is not an executable unscoped command", async () => {
+  const { env, dir } = await fixture();
+  const unbound = { ...env };
+  delete unbound.SUMI_TASK_LEDGER_REPO;
+  const bare = join(dir, "plain2");
+  await execFileAsync("mkdir", ["-p", bare]);
+  await run(unbound, ["claim", "75", "--owner", "a"], bare);
+  const released = await run(
+    unbound,
+    ["release", "75", "--owner", "a", "--reason", "done"],
+    bare,
+  );
+  assert.equal(released.code, 0, released.stderr);
+  assert.match(released.stderr, /repository unresolved/);
+  // No bare `gh issue close 75` that cwd/GH_REPO could retarget.
+  assert.doesNotMatch(released.stderr, /gh issue close 75\b/);
+});
+
+test("reclaim skips the PR evidence lookup when no repo is bound", async () => {
+  const { env, dir, ghCalls } = await fixture();
+  const unbound = { ...env };
+  delete unbound.SUMI_TASK_LEDGER_REPO;
+  const bare = join(dir, "plain3");
+  await execFileAsync("mkdir", ["-p", bare]);
+  await run(
+    unbound,
+    ["claim", "77", "--owner", "gone", "--lease-minutes", "0.02"],
+    bare,
+  );
+  await new Promise((r) => setTimeout(r, 1500));
+  const reclaim = await run(
+    unbound,
+    ["reclaim", "77", "--owner", "b", "--evidence", "holder gone"],
+    bare,
+  );
+  assert.equal(reclaim.code, 0, reclaim.stderr);
+  assert.match(reclaim.stderr, /open-PR lookup skipped/);
+  // gh was never invoked: no unscoped `pr list` against the caller's cwd.
   assert.equal((await ghCalls()).length, 0);
 });
