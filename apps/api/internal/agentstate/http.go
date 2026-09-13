@@ -452,9 +452,11 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": evs})
 }
 
-// savePlan records the model's decision for the turn's input before any of
-// its effects execute — the durable F1 boundary. Identical resaves replay
-// the stored plan; a conflicting decision for the same input conflicts.
+// savePlan records one round of the model's decisions for the turn's input
+// before any of that round's effects execute — the durable F1 boundary.
+// The plan is an append-only list of rounds: identical resaves of a
+// recorded round replay the stored plan; a conflicting decision at a
+// recorded position or a skipped round conflicts.
 func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
@@ -463,6 +465,7 @@ func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Generation int64          `json:"generation"`
 		TurnID     string         `json:"turn_id"`
+		Round      *int64         `json:"round"`
 		Text       string         `json:"text"`
 		Calls      *[]PlanCall    `json:"calls"`
 		Usage      map[string]any `json:"usage"`
@@ -470,14 +473,14 @@ func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req, s.maxBody) {
 		return
 	}
-	if req.TurnID == "" || req.Calls == nil {
-		writeError(w, http.StatusBadRequest, "turn_id and calls (array) required")
+	if req.TurnID == "" || req.Calls == nil || req.Round == nil || *req.Round < 0 {
+		writeError(w, http.StatusBadRequest, "turn_id, round (>= 0), and calls (array) required")
 		return
 	}
 	if !requireGen(w, req.Generation) {
 		return
 	}
-	plan, created, err := s.store.SavePlan(r.Context(), personaID, req.TurnID, req.Generation, Decision{
+	plan, created, err := s.store.SavePlan(r.Context(), personaID, req.TurnID, req.Generation, *req.Round, Decision{
 		Text:  req.Text,
 		Calls: *req.Calls,
 		Usage: req.Usage,

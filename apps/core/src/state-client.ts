@@ -68,15 +68,18 @@ export interface StateClient {
     contextLimit: number,
   ): Promise<LoadResult>;
   /**
-   * Persist the model's decision for the claimed input before any of its
-   * effects run. Idempotent: an identical resend returns the stored plan
-   * with `created: false`; a conflicting plan is rejected 409.
+   * Persist one round of the model's decisions for the claimed input before
+   * any of that round's effects run. The plan is an append-only list of
+   * rounds: an identical resend of a recorded round returns the stored plan
+   * with `created: false`; a different decision at a recorded position or a
+   * skipped round is rejected 409.
    */
   savePlan(
     persona: string,
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -92,8 +95,8 @@ export interface StateClient {
   /**
    * Claim one position of the recorded plan. The service derives the durable
    * effect identity server-side (input_id + call_index) and verifies the
-   * claimed (tool, request) equals plan.calls[call_index] — a caller never
-   * supplies an idempotency key.
+   * claimed (tool, request) equals the recorded call at that flat position
+   * across all plan rounds — a caller never supplies an idempotency key.
    */
   claimOperation(
     persona: string,
@@ -174,7 +177,21 @@ export class HttpStateClient implements StateClient {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      try {
+        return (await res.json()) as T;
+      } catch (e) {
+        // A 200 with an unreadable body is an infrastructure blip — a
+        // truncated proxy/middlebox response or a service bug — not a
+        // code defect. Surface it as a transient 5xx so callers back
+        // off instead of exiting (final-review NF2). The real status
+        // stays in the message.
+        throw new StateError(
+          503,
+          `state service returned an unreadable ${res.status} body: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
     let message = `state service ${res.status}`;
     try {
       const parsed = (await res.json()) as { error?: string };
@@ -254,6 +271,7 @@ export class HttpStateClient implements StateClient {
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -265,6 +283,7 @@ export class HttpStateClient implements StateClient {
       {
         generation,
         turn_id: req.turnId,
+        round: req.round,
         text: req.text,
         calls: req.calls,
         usage: req.usage,

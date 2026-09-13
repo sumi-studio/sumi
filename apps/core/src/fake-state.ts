@@ -270,16 +270,18 @@ export class FakeState implements StateClient {
   }
 
   /**
-   * Persist one input's decision before its effects run (F1). The input is
-   * derived from the running turn — the caller can never mis-assert it.
-   * One plan per input: identical resend returns the stored row, a
-   * conflicting decision is rejected 409 (semantic JSON compare).
+   * Persist one round of an input's decisions before that round's effects
+   * run (F1). The input is derived from the running turn — the caller can
+   * never mis-assert it. One plan per input, append-only rounds: resaving
+   * a recorded round is idempotent only when identical, a different
+   * decision at a recorded position or a skipped round is rejected 409.
    */
   async savePlan(
     persona: string,
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -295,29 +297,44 @@ export class FakeState implements StateClient {
     }
     // Go rejects a decision containing NUL at SavePlan — jsonb cannot
     // store it, and retrying can never succeed.
-    if (
-      hasNul(req.text) ||
-      hasNul(req.calls) ||
-      hasNul(req.usage ?? {})
-    ) {
-      throw new StateError(400, "decision contains a NUL byte jsonb cannot store");
+    if (hasNul(req.text) || hasNul(req.calls) || hasNul(req.usage ?? {})) {
+      throw new StateError(
+        400,
+        "decision contains a NUL byte jsonb cannot store",
+      );
     }
+    const decision = {
+      text: req.text,
+      calls: req.calls,
+      usage: req.usage ?? {},
+    };
     const key = `${persona}|${turn.input_id}`;
     const stored = this.plans.get(key);
     if (stored) {
-      const same =
-        stored.plan.text === req.text &&
-        jsonEqual(stored.plan.calls, req.calls) &&
-        jsonEqual(stored.plan.usage, req.usage ?? {});
-      if (!same) throw new StateError(409, "conflicting stored plan");
-      return { plan: stored, created: false };
+      const existing = stored.plan[req.round];
+      if (existing) {
+        const same =
+          existing.text === decision.text &&
+          jsonEqual(existing.calls, decision.calls) &&
+          jsonEqual(existing.usage, decision.usage);
+        if (!same) throw new StateError(409, "conflicting stored plan round");
+        return { plan: stored, created: false };
+      }
+      if (req.round !== stored.plan.length) {
+        throw new StateError(409, "plan round skips recorded rounds");
+      }
+      stored.plan.push(decision);
+      return { plan: stored, created: true };
+    }
+    if (req.round !== 0) {
+      throw new StateError(409, "first plan round must be round 0");
     }
     const plan: TurnPlan = {
       persona_id: persona,
       input_id: turn.input_id,
       turn_id: req.turnId,
       generation,
-      plan: { text: req.text, calls: req.calls, usage: req.usage ?? {} },
+      plan: [decision],
       created_at: new Date().toISOString(),
     };
     this.plans.set(key, plan);
@@ -342,14 +359,12 @@ export class FakeState implements StateClient {
       }
       return turn;
     }
-    // Go stores the commit as jsonb: a payload containing NUL can never
-    // persist — deterministic 400, so the caller records a failure rather
-    // than retrying an impossible write.
-    if (hasNul(req)) {
-      throw new StateError(
-        400,
-        "commit contains a NUL byte jsonb cannot store",
-      );
+    // Parity with Go: committed payloads land in jsonb/text — a NUL in
+    // events, output, or usage is a deterministic 400 at the commit
+    // boundary (Go dataErr), not a retryable 500. The stored error is
+    // diagnostic: Go strips NUL from it, so do the same.
+    if (hasNul(req.events) || hasNul(req.output) || hasNul(req.usage)) {
+      throw new StateError(400, "commit contains a NUL byte jsonb cannot store");
     }
     // The Go server rejects bodies over maxBody (1 MiB, "read body")
     // before decode — mirror that boundary so oversized-commit fallback
@@ -357,6 +372,7 @@ export class FakeState implements StateClient {
     if (new TextEncoder().encode(JSON.stringify(req)).length > 1 << 20) {
       throw new StateError(400, "read body");
     }
+    req = { ...req, error: req.error === undefined ? req.error : req.error.replace(/\u0000/g, "") };
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -394,14 +410,30 @@ export class FakeState implements StateClient {
         input.status = "queued";
         input.claimed_generation = null;
         input.turn_id = null;
-        // Go: not_before = now() + retryBackoff(attempt) — a bounded,
-        // per-attempt growing delay before the next claim.
+        // Go: not_before = now() + max(retryBackoff(attempt),
+        // clamped retry_after_ms) — a bounded, per-attempt growing delay
+        // that also honors provider-supplied pacing.
+        const after = Math.min(Math.max(req.retry_after_ms ?? 0, 0), 120_000);
         input.not_before = new Date(
-          Date.now() + retryBackoffMs(turn.attempt),
+          Date.now() + Math.max(retryBackoffMs(turn.attempt), after),
         ).toISOString();
       } else {
         input.status = "done";
         input.done_at = new Date().toISOString();
+        // Parity with Go: a terminal failure must be visible to the
+        // requester — the failure itself is the reply.
+        this.outboxEntries.push({
+          persona_id: persona,
+          seq: ++this.outboxSeq,
+          kind: "turn_failed",
+          payload: {
+            turn_id: turnId,
+            input_id: input.input_id,
+            error: turn.error,
+          },
+          created_at: new Date().toISOString(),
+          delivered_at: null,
+        });
       }
     }
     turn.finished_at = new Date().toISOString();
@@ -455,13 +487,13 @@ export class FakeState implements StateClient {
       throw new StateError(409, "conflicting turn state");
     }
     // Plan binding (F1): no plan → no claims. The claim must equal the
-    // recorded plan.calls[call_index] — an off-plan position, request, or
-    // tool can never start a fresh effect, whatever the caller sent.
+    // recorded call at the flat position across all rounds — an off-plan
+    // position, request, or tool can never start a fresh effect.
     const plan = this.plans.get(`${persona}|${turn.input_id}`);
     if (!plan) {
       throw new StateError(409, "no plan recorded for this input");
     }
-    const planned = plan.plan.calls[op.callIndex];
+    const planned = plan.plan.flatMap((r) => r.calls)[op.callIndex];
     if (
       !planned ||
       planned.tool !== op.tool ||

@@ -6,14 +6,17 @@
  *   SUMI_HOLDER_ID                        (default: local-<pid>)
  *   SUMI_MODEL_PROVIDER=mock|openai       (default: mock)
  *   SUMI_MODEL_BASE_URL / _API_KEY / _MODEL  (openai only)
+ *   SUMI_MODEL_HEADERS_JSON / _EXTRA_JSON / _TIMEOUT_MS  (openai only;
+ *                                          see host/provider-env.ts)
+ *   SUMI_PROVIDER_RETRY_BUDGET_MS  wall-clock budget for transient provider
+ *                                  retries, measured from input submission
+ *                                  (default 30 min)
  *   --once  drain pending work then exit (used by e2e + dev scripts)
  *
  * Kill -9 safe at any point: nothing canonical lives in this process.
  */
 
-import type { ModelProvider } from "../provider.ts";
-import { MockProvider } from "../providers/mock.ts";
-import { OpenAIProvider } from "../providers/openai.ts";
+import { providerFromEnv } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -21,19 +24,6 @@ function env(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`missing env ${name}`);
   return v;
-}
-
-function provider(): ModelProvider {
-  const kind = process.env.SUMI_MODEL_PROVIDER ?? "mock";
-  if (kind === "openai") {
-    return new OpenAIProvider({
-      baseUrl: env("SUMI_MODEL_BASE_URL"),
-      apiKey: env("SUMI_MODEL_API_KEY"),
-      model: env("SUMI_MODEL_MODEL"),
-    });
-  }
-  if (kind !== "mock") throw new Error(`unknown SUMI_MODEL_PROVIDER ${kind}`);
-  return new MockProvider();
 }
 
 async function main() {
@@ -47,12 +37,15 @@ async function main() {
     personaId: env("SUMI_PERSONA_ID"),
     holderId: process.env.SUMI_HOLDER_ID ?? `local-${process.pid}`,
     state,
-    provider: provider(),
+    provider: providerFromEnv((n) => process.env[n]),
     leaseTtlMs: leaseTtl,
     renewEveryMs: Math.max(250, Math.floor(leaseTtl / 3)),
     contextLimit: 60,
     pollIntervalMs: 500,
     scheduleEveryMs: 1_000,
+    providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
+      ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
+      : undefined,
     idgen: () => crypto.randomUUID(),
     log: (msg, fields) =>
       console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),
