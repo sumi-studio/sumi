@@ -13,9 +13,11 @@ const ledgerBin = join(sourceRoot, "scripts/operations/task-ledger");
 
 // A stub `gh` keeps the suite hermetic: no tracker reads or writes.
 // $GH_STUB_ISSUES controls `issue list` output; `pr list` returns [].
+// Every invocation's argv is appended to $GH_LOG for sync assertions.
 // $GH_STUB_FAIL=1 makes every call fail (for exit-4 coverage).
 const GH_STUB = `#!/usr/bin/env bash
 set -Eeuo pipefail
+echo "$*" >> "$GH_LOG"
 if [[ "\${GH_STUB_FAIL:-0}" == 1 ]]; then
   echo "stub gh failure" >&2
   exit 1
@@ -24,10 +26,11 @@ if [[ "\${1:-}" == "issue" && "\${2:-}" == "list" ]]; then
   cat "\${GH_STUB_ISSUES}"
 elif [[ "\${1:-}" == "pr" && "\${2:-}" == "list" ]]; then
   echo "[]"
-else
-  echo "stub gh: unexpected args: $*" >&2
+elif [[ "\${1:-}" == "issue" && "\${2:-}" == "edit" && $# -le 3 ]]; then
+  echo "gh: a flag is required to edit" >&2
   exit 1
 fi
+exit 0
 `;
 
 async function fixture(issues = []) {
@@ -35,16 +38,21 @@ async function fixture(issues = []) {
   const binDir = join(dir, "bin");
   const ledgerDir = join(dir, "ledger");
   const issuesFile = join(dir, "issues.json");
+  const ghLog = join(dir, "gh.log");
   await execFileAsync("mkdir", ["-p", binDir]);
   await writeFile(join(binDir, "gh"), GH_STUB, { mode: 0o755 });
   await writeFile(issuesFile, JSON.stringify(issues));
+  await writeFile(ghLog, "");
   const env = {
     ...process.env,
     PATH: `${binDir}:${process.env.PATH}`,
     SUMI_TASK_LEDGER_DIR: ledgerDir,
     GH_STUB_ISSUES: issuesFile,
+    GH_LOG: ghLog,
   };
-  return { dir, ledgerDir, env };
+  const ghCalls = async () =>
+    (await readFile(ghLog, "utf8")).trim().split("\n").filter(Boolean);
+  return { dir, ledgerDir, env, ghCalls };
 }
 
 async function run(env, args) {
@@ -299,4 +307,96 @@ test("a torn record fails closed instead of looking unclaimed", async () => {
   await writeFile(join(ledgerDir, "issue-43.json"), "{torn");
   const result = await run(env, ["claim", "43", "--owner", "a"]);
   assert.equal(result.code, 2);
+});
+
+test("gh-sync claim removes every other state label, then adds in-progress", async () => {
+  const { env, ghCalls } = await fixture();
+  const result = await run(env, ["claim", "51", "--owner", "a", "--gh-sync"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(await ghCalls(), [
+    "issue edit 51 --remove-label state:ready " +
+      "--remove-label state:review --remove-label state:blocked " +
+      "--add-label state:in-progress",
+  ]);
+});
+
+test("gh-sync release done strips all state labels but never closes", async () => {
+  const { env, ghCalls } = await fixture();
+  await run(env, ["claim", "53", "--owner", "a"]);
+  const result = await run(env, [
+    "release",
+    "53",
+    "--owner",
+    "a",
+    "--reason",
+    "done",
+    "--gh-sync",
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  const calls = await ghCalls();
+  assert.deepEqual(calls, [
+    "issue edit 53 --remove-label state:ready " +
+      "--remove-label state:in-progress --remove-label state:review " +
+      "--remove-label state:blocked",
+  ]);
+  assert.match(result.stderr, /acceptor closes the issue/);
+  assert.match(result.stderr, /gh issue close 53/);
+});
+
+test("gh-sync release abandoned returns the issue to state:ready", async () => {
+  const { env, ghCalls } = await fixture();
+  await run(env, ["claim", "57", "--owner", "a"]);
+  const result = await run(env, [
+    "release",
+    "57",
+    "--owner",
+    "a",
+    "--reason",
+    "abandoned",
+    "--gh-sync",
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(await ghCalls(), [
+    "issue edit 57 --remove-label state:in-progress " +
+      "--remove-label state:review --remove-label state:blocked " +
+      "--add-label state:ready",
+  ]);
+});
+
+test("without --gh-sync no tracker call is made; equivalent commands print", async () => {
+  const { env, ghCalls } = await fixture();
+  const claim = await run(env, ["claim", "59", "--owner", "a"]);
+  assert.equal(claim.code, 0, claim.stderr);
+  assert.equal((await ghCalls()).length, 0);
+  assert.match(claim.stderr, /equivalent: gh issue edit 59 /);
+  assert.match(claim.stderr, /--add-label state:in-progress/);
+
+  const released = await run(env, [
+    "release",
+    "59",
+    "--owner",
+    "a",
+    "--reason",
+    "done",
+  ]);
+  assert.equal(released.code, 0, released.stderr);
+  assert.equal((await ghCalls()).length, 0);
+  assert.match(released.stderr, /equivalent: gh issue edit 59 /);
+  assert.doesNotMatch(released.stderr, /--add-label/);
+  assert.match(released.stderr, /gh issue close 59/);
+});
+
+test("next warns on stderr when ready issues are held by expired claims", async () => {
+  const issues = [
+    { number: 61, title: "held", updatedAt: "2026-09-13T00:00:00Z" },
+    { number: 63, title: "free", updatedAt: "2026-09-13T00:00:00Z" },
+  ];
+  const { env } = await fixture(issues);
+  await run(env, ["claim", "61", "--owner", "gone", "--lease-minutes", "0.02"]);
+  await new Promise((r) => setTimeout(r, 1500));
+  const result = await run(env, ["next"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /#61/);
+  assert.match(result.stdout, /#63\tfree/);
+  assert.match(result.stderr, /1 ready issue\(s\) held by expired claims/);
 });

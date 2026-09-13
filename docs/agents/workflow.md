@@ -68,13 +68,22 @@ Semantics:
   live lease, requires `--evidence` describing what you checked, and the
   tool itself reports the recorded PID's liveness, whether the recorded
   worktree still exists, and any open PRs referencing the issue.
-- `release --reason` maps to the state transitions above
-  (`ready`/`review`/`done`/`blocked`/`abandoned`) and keeps the history,
-  so a released issue can be claimed again — the ledger-level form of
-  reopening.
+- `release --reason` maps to the state transitions above and keeps the
+  history, so a released issue can be claimed again — the ledger-level
+  form of reopening. Tracker label mapping: `ready` → `state:ready`,
+  `review` → `state:review`, `blocked` → `state:blocked`,
+  `abandoned` → `state:ready` (dropped work returns to the pool), and
+  `done` → all `state:*` labels removed. Done means closed, and closing
+  is the acceptor's call — the ledger never closes the issue itself; it
+  prints the `gh issue close` suggestion for whoever verifies the work.
+  Every sync removes the *other* `state:*` labels too, so an issue
+  never carries two contradictory states.
 - With `--gh-sync`, claim/release also swap the `state:*` labels via
   `gh` for callers with tracker write access. Without it, the tool
-  prints the equivalent `gh` commands for whoever owns tracker mutation.
+  prints the equivalent `gh` commands to stderr for whoever owns
+  tracker mutation — the local transition still commits.
+- The ledger is advisory about tracker existence: `claim` does not
+  verify the issue exists or is open — it records worker intent.
 - The ledger is per-host (the shared WSL). It is not a distributed
   system; if workers ever run on separate hosts, promote the ledger to a
   shared location or a compare-and-swap primitive first.

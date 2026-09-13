@@ -183,38 +183,77 @@ function newClaim(args, issue, at) {
   };
 }
 
-function ghSync(issue, transition) {
-  const add = {
-    claim: "state:in-progress",
-    ready: "state:ready",
-    review: "state:review",
-    blocked: "state:blocked",
-  }[transition];
-  const remove = {
-    claim: "state:ready",
-    ready: "state:in-progress",
-    review: "state:in-progress",
-    blocked: "state:in-progress",
-  }[transition];
-  if (!add && transition !== "done") return;
+// Tracker label semantics (see docs/agents/workflow.md):
+//   claim/reclaim        -> state:in-progress (any other state:* removed)
+//   release ready        -> state:ready
+//   release review       -> state:review
+//   release blocked      -> state:blocked
+//   release abandoned    -> state:ready (the work returns to the pool)
+//   release done         -> all state:* removed; Done means closed, and
+//                           closing is the acceptor's action, so the
+//                           ledger never closes the issue itself.
+const STATE_LABELS = [
+  "state:ready",
+  "state:in-progress",
+  "state:review",
+  "state:blocked",
+];
+const TARGET_LABEL = {
+  claim: "state:in-progress",
+  ready: "state:ready",
+  review: "state:review",
+  blocked: "state:blocked",
+  abandoned: "state:ready",
+  done: null,
+};
+
+function ghCommands(issue, transition) {
+  if (!(transition in TARGET_LABEL)) return [];
+  const add = TARGET_LABEL[transition];
   const argv = ["issue", "edit", String(issue)];
+  for (const label of STATE_LABELS) {
+    if (label !== add) argv.push("--remove-label", label);
+  }
   if (add) argv.push("--add-label", add);
-  if (remove) argv.push("--remove-label", remove);
-  try {
-    execFileSync("gh", argv, {
-      timeout: 15_000,
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-  } catch {
+  return [argv];
+}
+
+function ghSync(issue, transition) {
+  for (const argv of ghCommands(issue, transition)) {
+    try {
+      execFileSync("gh", argv, {
+        timeout: 15_000,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    } catch {
+      console.error(
+        `task-ledger: warning: gh label sync failed; run manually: gh ${argv.join(" ")}`,
+      );
+    }
+  }
+  if (transition === "done") {
     console.error(
-      `task-ledger: warning: gh label sync failed; run manually: gh ${argv.join(" ")}`,
+      `task-ledger: released as done; the acceptor closes the issue once verified: gh issue close ${issue}`,
+    );
+  }
+}
+
+function printGhPlan(issue, transition) {
+  for (const argv of ghCommands(issue, transition)) {
+    console.error(
+      `task-ledger: tracker not synced; equivalent: gh ${argv.join(" ")}`,
     );
   }
   if (transition === "done") {
     console.error(
-      `task-ledger: released as done; close the issue when verified: gh issue close ${issue}`,
+      `task-ledger: released as done; the acceptor closes the issue once verified: gh issue close ${issue}`,
     );
   }
+}
+
+function syncOrPrint(args, issue, transition) {
+  if (args["gh-sync"]) ghSync(issue, transition);
+  else printGhPlan(issue, transition);
 }
 
 function describeHolder(record, at) {
@@ -240,7 +279,7 @@ async function cmdClaim(args, dir) {
   if (record) claim.history = record.history ?? [];
   history(claim, "claim", args.owner, args.note);
   await writeRecord(dir, issue, claim);
-  if (args["gh-sync"]) ghSync(issue, "claim");
+  syncOrPrint(args, issue, "claim");
   console.log(
     `claimed #${issue} owner=${claim.owner} lease-until=${claim.leaseExpiresAt}`,
   );
@@ -286,7 +325,7 @@ async function cmdReclaim(args, dir) {
     `evidence: ${args.evidence}${args.note ? ` — ${args.note}` : ""}`,
   );
   await writeRecord(dir, issue, claim);
-  if (args["gh-sync"]) ghSync(issue, "claim");
+  syncOrPrint(args, issue, "claim");
   console.log(
     `reclaimed #${issue} owner=${claim.owner} lease-until=${claim.leaseExpiresAt}`,
   );
@@ -330,7 +369,7 @@ async function cmdRelease(args, dir) {
   record.releasedAt = iso(now());
   history(record, `release:${args.reason}`, args.owner, args.note);
   await writeRecord(dir, issue, record);
-  if (args["gh-sync"]) ghSync(issue, args.reason);
+  syncOrPrint(args, issue, args.reason);
   console.log(`released #${issue} reason=${args.reason}`);
 }
 
@@ -413,13 +452,27 @@ async function cmdNext(args, dir) {
     );
     process.exit(4);
   }
-  const claimed = new Set();
+  const claimed = new Map();
   for (const file of await readdir(dir)) {
     if (!/^issue-\d+\.json$/.test(file)) continue;
     const record = JSON.parse(await readFile(join(dir, file), "utf8"));
-    if (record.state === "claimed") claimed.add(record.issue);
+    if (record.state === "claimed") {
+      claimed.set(record.issue, expired(record, now()));
+    }
   }
-  const available = issues.filter((issue) => !claimed.has(issue.number));
+  let expiredHeld = 0;
+  const available = issues.filter((issue) => {
+    const isClaimed = claimed.get(issue.number);
+    if (isClaimed === undefined) return true;
+    if (isClaimed) expiredHeld += 1;
+    return false;
+  });
+  if (expiredHeld > 0) {
+    console.error(
+      `task-ledger: ${expiredHeld} ready issue(s) held by expired claims — ` +
+        "inspect with `list`/`show`, then `reclaim --evidence …` if the holder is gone",
+    );
+  }
   if (args.json) {
     console.log(JSON.stringify(available, null, 2));
     return;
