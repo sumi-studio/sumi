@@ -890,3 +890,78 @@ test("an un-storable provider error commits scrubbed and retryable — with back
     "recovered",
   );
 });
+
+test("a >body-limit provider error still records a bounded honest failure (F-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-50", "hi");
+  // Multibyte + control characters, ~1.5 MB total — over the server
+  // body limit FakeState now enforces.
+  const huge = "ø😀".repeat(200_000);
+  let calls = 0;
+  const giant: ModelProvider = {
+    name: "giant",
+    async *stream() {
+      calls++;
+      if (calls === 1) throw new Error(`provider exploded ${huge}`);
+      yield { type: "text", delta: "fine" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: giant }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-50" && t.status === "failed",
+  );
+  assert.ok(failed, "the oversized error must resolve to a recorded failure");
+  const recorded = failed!.error ?? "";
+  assert.ok(
+    new TextEncoder().encode(recorded).length < 10_000,
+    `recorded error must be bounded, got ${recorded.length} chars`,
+  );
+  assert.match(recorded, /read body/, "keeps the server's rejection reason");
+  assert.match(recorded, /truncated/, "marks truncation explicitly");
+  assert.match(recorded, /provider exploded/, "keeps the useful reason");
+  const in50 = state.inputs.find((i) => i.input_id === "in-50")!;
+  assert.equal(in50.status, "queued", "retryable disposition survives");
+  assert.ok(in50.not_before !== null, "requeue carries backoff");
+  // A later queued input is not starved by the failing one.
+  state.addInput(PERSONA, "in-51", "later");
+  assert.equal(await s.step(), "turn");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-51")!.status,
+    "done",
+  );
+});
+
+test("an oversized complete commit downgrades through the minimal tier (F-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-52", "hi");
+  // A ~1.5 MB reply makes both the original commit AND the scrubbed
+  // commit (events still carry the giant assistant_message) un-storable;
+  // only the minimal failure commit can land.
+  const s = new Secretary(cfg(state, "h", {
+    provider: new ScriptedProvider({ text: "x".repeat(1_500_000) }),
+  }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-52" && t.status === "failed",
+  );
+  assert.ok(failed, "oversized complete resolves as a recorded failure");
+  const recorded = failed!.error ?? "";
+  assert.ok(recorded.length < 10_000, "recorded error bounded");
+  assert.match(recorded, /read body/);
+  assert.match(recorded, /could not be stored/);
+  const in52 = state.inputs.find((i) => i.input_id === "in-52")!;
+  assert.equal(in52.status, "done", "input finalizes — no poison loop");
+  // No fabricated success: no outbox reply was written for it.
+  assert.equal(
+    (await state.outbox(PERSONA, 0)).filter(
+      (o) => o.payload.input_id === "in-52",
+    ).length,
+    0,
+  );
+});

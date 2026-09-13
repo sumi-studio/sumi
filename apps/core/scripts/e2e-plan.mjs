@@ -60,8 +60,17 @@ async function childMain() {
     name = "scripted";
     async *stream() {
       console.log("[child] MODEL CONSULTED");
+      // throwSize/textSize build oversized values in-process — a 1.5 MB
+      // env var would flirt with execve limits. The multibyte pattern
+      // makes sure truncation stays on code-point boundaries.
+      if (script.throwSize)
+        throw new Error(
+          "provider exploded " + "ø😀".repeat(script.throwSize),
+        );
       if (script.throw) throw new Error(script.throw);
-      yield { type: "text", delta: script.text };
+      if (script.textSize)
+        yield { type: "text", delta: "ø😀".repeat(script.textSize) };
+      else yield { type: "text", delta: script.text };
       for (const [i, c] of (script.calls ?? []).entries()) {
         yield {
           type: "tool_call",
@@ -281,6 +290,7 @@ async function main() {
       env: childEnv(extra),
       encoding: "utf8",
       timeout: 90_000,
+      maxBuffer: 64 * 1024 * 1024, // oversized-error scenarios log big lines
     });
     if (r.status !== expectExit) {
       console.error(r.stdout, r.stderr);
@@ -630,6 +640,92 @@ async function main() {
     );
   }
   log("  bounded retryable backoff; queue fair; transient failure recovered");
+
+  // --- scenario 6: >body-limit commit still finalizes (F-B1) ----------
+  // A commit payload over the server's 1 MiB body limit used to defeat
+  // every commitTurnFinal tier when `error` itself was huge: three 400s,
+  // child exit 1, input claimed forever, each recovery cycle re-claiming
+  // the same oldest input before any later queued work — head-of-line
+  // starvation at process cadence. The recorded failure must be bounded.
+  //
+  // 6a — oversized *complete* commit: a ~840 KB reply keeps savePlan
+  // under the 1 MiB limit, but the commit body (assistant_message event
+  // + output) doubles past it → 400 "read body" → the scrubbed tier
+  // lands with a bounded honest error. The turn is observably failed —
+  // not fabricated — and the input resolves.
+  log("scenario 6: >1MiB commit resolves bounded; queue proceeds");
+  const in11 = (await submit("input-eleven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ textSize: 140_000 }), // ~840 KB reply
+  });
+  const st11 = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in11}`,
+    ptoken,
+  );
+  assert(
+    st11.json?.input?.status === "done",
+    `oversized complete must resolve the input, got ${st11.text}`,
+  );
+  const recErr = st11.json?.turn?.error ?? "";
+  assert(
+    st11.json?.turn?.status === "failed" &&
+      recErr.includes("commit rejected deterministically") &&
+      recErr.includes("read body") &&
+      recErr.length < 20_000,
+    `recorded failure must be bounded and honest, got: ${recErr.slice(0, 200)}`,
+  );
+  assert(
+    (await outboxFor(in11)).length === 0,
+    "no fabricated reply for an un-storable completion",
+  );
+  log("  oversized complete resolved via minimal commit; honest bounded error");
+
+  // 6b — oversized provider *error* (retryable): bounded recorded failure,
+  // backoff-bounded retries, and a later queued input still progresses.
+  const in12 = (await submit("input-twelve")).json.input.input_id;
+  const in13 = (await submit("input-thirteen")).json.input.input_id;
+  const giant = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
+  });
+  assert(
+    giant.includes("turn committed as scrubbed failure"),
+    "the oversized-error commit must land via the bounded scrubbed tier",
+    giant,
+  );
+  const [b12, b13] = [await attemptsOf(in12), await attemptsOf(in13)];
+  assert(
+    b12 >= 1 && b12 <= 15,
+    `oversized-error input must retry bounded by backoff, got ${b12}`,
+  );
+  assert(
+    b13 >= 1,
+    `later input starved behind the oversized-error input: ${b13} attempts`,
+  );
+  for (const id of [in12, in13]) {
+    const st = await req(
+      "GET",
+      `/internal/core/personas/${personaId}/inputs/${id}`,
+      ptoken,
+    );
+    assert(
+      st.json?.input?.status === "queued",
+      `input ${id} stays honestly queued for retry, got ${st.text}`,
+    );
+  }
+  // The provider healing completes both, exactly once — the recorded
+  // failure was honest retry, not fabrication or a strand.
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ text: "reply-H", calls: [] }),
+  });
+  for (const id of [in12, in13]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-H",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  oversized error recorded bounded; later input progressed; both recovered");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

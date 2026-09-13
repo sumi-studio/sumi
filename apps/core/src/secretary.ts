@@ -367,7 +367,11 @@ export class Secretary {
         error: `model: ${msg}`,
         events,
       });
-      this.log("turn failed at model", { turn_id: turn.turn_id, error: msg });
+      // Bound the log line too — a provider error can be megabytes.
+      this.log("turn failed at model", {
+        turn_id: turn.turn_id,
+        error: truncateText(msg, 4 * 1024),
+      });
       return null;
     }
     try {
@@ -461,17 +465,27 @@ export class Secretary {
     const { state, personaId } = this.cfg;
     const commit = (r: CommitRequest) =>
       state.commitTurn(personaId, turn.turn_id, turn.generation, r);
+    let rejected: StateError | null = null;
     try {
       await commit(req);
       return;
     } catch (e) {
       if (!(e instanceof StateError && e.status === 400)) throw e;
+      rejected = e;
     }
-    // The explanation itself goes through the same scrub — the original
-    // error text may be exactly what made the payload un-storable.
-    const msg = scrubJson(
-      `commit rejected deterministically: ${req.error ?? req.outcome}`,
-    ) as string;
+    // error is the only field surviving every tier, so it must be bounded
+    // or a >body-limit provider/tool error re-creates the strand the
+    // fallback exists to remove. The record keeps the reason — including
+    // the server's own rejection ("read body" vs a data rejection) — and
+    // says explicitly that it was truncated. Everything goes through the
+    // same NUL scrub: the original text may be what made the commit
+    // un-storable in the first place.
+    const why = truncateText(scrubJson(rejected.message) as string, 512);
+    const detail = truncateText(
+      scrubJson(req.error ?? req.outcome) as string,
+      RECORDED_ERROR_BYTES,
+    );
+    const msg = `commit rejected deterministically (${why}): ${detail}`;
     const scrubbed: CommitRequest = {
       outcome: "fail",
       // A fail+retryable commit (e.g. a provider error whose message was
@@ -493,15 +507,26 @@ export class Secretary {
       return;
     } catch (e) {
       if (!(e instanceof StateError && e.status === 400)) throw e;
+      rejected = e;
     }
     await commit({
       outcome: "fail",
       retryable: false,
       events: [],
-      error: `${msg}; original commit events could not be stored`,
+      error:
+        truncateText(
+          `${msg} (second rejection: ${scrubJson(rejected.message) as string})`,
+          RECORDED_ERROR_BYTES,
+        ) + "; original commit events could not be stored",
     });
   }
 }
+
+// Recorded-error budget: a persisted failure only needs the reason, not
+// megabytes. Kept far below the state service's 1 MiB body limit so the
+// minimal fallback commit is always storable.
+const RECORDED_ERROR_BYTES = 8 * 1024;
+const TRUNC_MARK = "…[truncated]";
 
 /** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
 function scrubJson(v: unknown): unknown {
@@ -513,6 +538,20 @@ function scrubJson(v: unknown): unknown {
     );
   }
   return v;
+}
+
+/**
+ * Bound a string's UTF-8 encoding, cutting only at a code-point boundary
+ * so multibyte and control characters can never push the result past
+ * maxBytes. Truncation is explicit — the marker is part of the record.
+ */
+function truncateText(s: string, maxBytes: number): string {
+  const enc = new TextEncoder().encode(s);
+  if (enc.length <= maxBytes) return s;
+  const markLen = new TextEncoder().encode(TRUNC_MARK).length;
+  let end = Math.max(0, maxBytes - markLen);
+  while (end > 0 && ((enc[end] ?? 0) & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(enc.subarray(0, end)) + TRUNC_MARK;
 }
 
 const SYSTEM =

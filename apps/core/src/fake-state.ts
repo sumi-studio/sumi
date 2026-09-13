@@ -351,6 +351,12 @@ export class FakeState implements StateClient {
         "commit contains a NUL byte jsonb cannot store",
       );
     }
+    // The Go server rejects bodies over maxBody (1 MiB, "read body")
+    // before decode — mirror that boundary so oversized-commit fallback
+    // tiers are reachable in unit tests.
+    if (new TextEncoder().encode(JSON.stringify(req)).length > 1 << 20) {
+      throw new StateError(400, "read body");
+    }
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
