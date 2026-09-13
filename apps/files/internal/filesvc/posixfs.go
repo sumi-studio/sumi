@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // posixRoot is the service's view of one canonical namespace: a directory on a
@@ -43,7 +45,21 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrIsDir    = errors.New("is a directory")
 	ErrNotDir   = errors.New("not a directory")
+	ErrReserved = errors.New("path uses the service staging prefix")
 )
+
+// stagingPrefix marks service-internal temp siblings. User-facing ops reject
+// it so the namespace listing can hide staging files without hiding user data.
+const stagingPrefix = ".filesv-tmp-"
+
+func checkReserved(path string) error {
+	for _, seg := range strings.Split(path, "/") {
+		if strings.HasPrefix(seg, stagingPrefix) {
+			return ErrReserved
+		}
+	}
+	return nil
+}
 
 func newRoot(root string) (*posixRoot, error) {
 	r, err := filepath.EvalSymlinks(root)
@@ -125,6 +141,21 @@ func (p *posixRoot) resolve(scope, path string) (string, error) {
 		return "", ErrEscape
 	}
 	return resolved, nil
+}
+
+// resolveParent resolves the parent directory of (scope, path) and returns
+// the unresolved host path beneath it. Use for ops that must act on the
+// final element literally (remove, rename source): an in-scope symlink that
+// points outside must itself be removable.
+func (p *posixRoot) resolveParent(scope, path string) (string, error) {
+	if path == "" || path == "/" {
+		return "", ErrNotDir
+	}
+	parent, err := p.resolve(scope, filepath.Dir("/"+path))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(path)), nil
 }
 
 type FileInfo struct {
@@ -210,13 +241,17 @@ func (p *posixRoot) list(scope, path string, limit int, cursor string) ([]ListEn
 	out := make([]ListEntry, 0, limit)
 	next := ""
 	for i := start; i < len(names) && len(out) < limit; i++ {
-		fi, err := os.Stat(filepath.Join(host, names[i]))
+		// Lstat: a symlink's target may be outside the scope or even outside
+		// the filesystem — report the link, not its target's metadata.
+		fi, err := os.Lstat(filepath.Join(host, names[i]))
 		if err != nil {
 			continue // raced delete — listing stays honest for what exists
 		}
 		kind := "file"
 		if fi.IsDir() {
 			kind = "dir"
+		} else if fi.Mode()&os.ModeSymlink != 0 {
+			kind = "symlink"
 		}
 		out = append(out, ListEntry{Name: names[i], Kind: kind, Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano()})
 		next = names[i]
@@ -227,7 +262,9 @@ func (p *posixRoot) list(scope, path string, limit int, cursor string) ([]ListEn
 	return out, next, nil
 }
 
-func (p *posixRoot) read(scope, path string, off, length int64) ([]byte, FileInfo, error) {
+// open returns the file positioned at off plus its metadata. The caller
+// streams the body — no request-controlled allocation ever happens here.
+func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, error) {
 	host, err := p.resolve(scope, path)
 	if err != nil {
 		return nil, FileInfo{}, err
@@ -239,41 +276,35 @@ func (p *posixRoot) read(scope, path string, off, length int64) ([]byte, FileInf
 		}
 		return nil, FileInfo{}, err
 	}
-	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return nil, FileInfo{}, err
 	}
 	if st.IsDir() {
+		f.Close()
 		return nil, FileInfo{}, ErrIsDir
 	}
 	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			f.Close()
 			return nil, FileInfo{}, err
 		}
 	}
-	var data []byte
-	if length > 0 {
-		data = make([]byte, length)
-		n, err := io.ReadFull(f, data)
-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			return nil, FileInfo{}, err
-		}
-		data = data[:n]
-	} else {
-		data, err = io.ReadAll(f)
-		if err != nil {
-			return nil, FileInfo{}, err
-		}
-	}
-	return data, info, nil
+	return f, info, nil
 }
 
 // atomicWrite stages content to a temp sibling, fsyncs, renames over the
 // target, and fsyncs the directory. A name never resolves to torn content.
 // Caller holds the version CAS; this is the durable part of the write.
-func (p *posixRoot) atomicWrite(scope, path string, content []byte) (FileInfo, error) {
+// exclusive=true publishes the staged file with link(2), which fails with
+// EEXIST if anything already occupies the name — the create-only check is
+// atomic against executor-side creates, not just advisory.
+func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool) (FileInfo, error) {
+	if err := checkReserved(path); err != nil {
+		return FileInfo{}, err
+	}
 	if err := p.ensureScope(scope); err != nil {
 		return FileInfo{}, err
 	}
@@ -289,7 +320,7 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte) (FileInfo, e
 	if _, err := rand.Read(rnd); err != nil {
 		return FileInfo{}, err
 	}
-	tmp := filepath.Join(dir, ".filesv-tmp-"+hex.EncodeToString(rnd))
+	tmp := filepath.Join(dir, stagingPrefix+hex.EncodeToString(rnd))
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return FileInfo{}, err
@@ -308,10 +339,22 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte) (FileInfo, e
 		os.Remove(tmp)
 		return FileInfo{}, err
 	}
-	if err := os.Rename(tmp, host); err != nil {
+	if exclusive {
+		err = os.Link(tmp, host)
+	} else {
+		err = os.Rename(tmp, host)
+	}
+	if err != nil {
 		os.Remove(tmp)
+		if errors.Is(err, fs.ErrExist) {
+			return FileInfo{}, ErrConflict
+		}
+		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTDIR) {
+			return FileInfo{}, ErrNotDir
+		}
 		return FileInfo{}, err
 	}
+	os.Remove(tmp) // link() leaves the staging name; drop it
 	if d, err := os.Open(dir); err == nil {
 		d.Sync()
 		d.Close()
@@ -319,26 +362,42 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte) (FileInfo, e
 	return p.stat(scope, path)
 }
 
-func (p *posixRoot) rename(scope, from, to string) (FileInfo, error) {
-	src, err := p.resolve(scope, from)
+func (p *posixRoot) rename(scope, from, to string, noReplace bool) (FileInfo, error) {
+	if err := checkReserved(to); err != nil {
+		return FileInfo{}, err
+	}
+	src, err := p.resolveParent(scope, from)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	dst, err := p.resolve(scope, to)
+	dst, err := p.resolveParent(scope, to)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	if _, err := os.Stat(src); err != nil {
+	if _, err := os.Lstat(src); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return FileInfo{}, ErrNotFound
 		}
 		return FileInfo{}, err
 	}
+	if strings.HasPrefix(dst, src+string(filepath.Separator)) {
+		return FileInfo{}, ErrEscape // cannot move a dir beneath itself
+	}
 	// Guard: a non-empty directory rename over an existing non-empty dir is not
 	// atomic on POSIX; the contract does not promise it. Files and empty dirs
-	// rename atomically.
-	if err := os.Rename(src, dst); err != nil {
-		return FileInfo{}, err
+	// rename atomically. noReplace uses renameat2(RENAME_NOREPLACE) so a
+	// racing creator cannot be silently overwritten.
+	var rerr error
+	if noReplace {
+		rerr = unix.Renameat2(unix.AT_FDCWD, src, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE)
+	} else {
+		rerr = os.Rename(src, dst)
+	}
+	if rerr != nil {
+		if errors.Is(rerr, fs.ErrExist) {
+			return FileInfo{}, ErrConflict
+		}
+		return FileInfo{}, rerr
 	}
 	if d, err := os.Open(filepath.Dir(dst)); err == nil {
 		d.Sync()
@@ -348,13 +407,16 @@ func (p *posixRoot) rename(scope, from, to string) (FileInfo, error) {
 }
 
 func (p *posixRoot) remove(scope, path string) error {
-	host, err := p.resolve(scope, path)
+	host, err := p.resolveParent(scope, path)
 	if err != nil {
 		return err
 	}
 	if err := os.Remove(host); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return ErrNotFound
+		}
+		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+			return ErrNotEmpty
 		}
 		return err
 	}
@@ -366,6 +428,9 @@ func (p *posixRoot) remove(scope, path string) error {
 }
 
 func (p *posixRoot) mkdir(scope, path string) (FileInfo, error) {
+	if err := checkReserved(path); err != nil {
+		return FileInfo{}, err
+	}
 	if err := p.ensureScope(scope); err != nil {
 		return FileInfo{}, err
 	}
@@ -388,4 +453,27 @@ func (p *posixRoot) ensureScope(scope string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
-var _ = time.Now // keep time import for future fingerprint variants
+// sweepStaging removes service staging files older than 10 minutes — e.g.
+// left behind by a SIGKILL mid-write. Run at startup and periodically.
+// Safe while the service is live only because the prefix is reserved.
+func (p *posixRoot) sweepStaging() {
+	scopes, err := os.ReadDir(p.root)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-10 * time.Minute)
+	for _, sc := range scopes {
+		if !sc.IsDir() {
+			continue
+		}
+		filepath.WalkDir(filepath.Join(p.root, sc.Name()), func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasPrefix(d.Name(), stagingPrefix) {
+				return nil
+			}
+			if fi, err := d.Info(); err == nil && fi.ModTime().Before(cutoff) {
+				os.Remove(path)
+			}
+			return nil
+		})
+	}
+}

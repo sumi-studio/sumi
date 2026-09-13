@@ -15,9 +15,9 @@ import (
 // VersionStore is the persistence surface the service needs — *Store satisfies
 // it against real PG; tests substitute a fake.
 type VersionStore interface {
-	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, fn func() (FileInfo, error)) (int64, FileInfo, error)
-	Rename(ctx context.Context, scope, from, to string, iv IfVersion, fn func() (FileInfo, error)) (int64, FileInfo, error)
-	Remove(ctx context.Context, scope, path string, iv IfVersion, fn func() error) error
+	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
+	Rename(ctx context.Context, scope, from, to string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
+	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
 }
@@ -45,7 +45,22 @@ func NewAt(root string, store VersionStore, tokens map[string]map[string]bool) (
 	if err != nil {
 		return nil, err
 	}
+	r.sweepStaging()
 	return &Service{root: r, store: store, tokens: tokens}, nil
+}
+
+// probe returns a fingerprint probe the store calls under the row lock.
+func (s *Service) probe(scope, path string) FPProbe {
+	return func() (string, bool, error) {
+		info, err := s.root.stat(scope, path)
+		if errors.Is(err, ErrNotFound) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		return info.Fingerprint, true, nil
+	}
 }
 
 func (s *Service) authorized(r *http.Request, scope string) bool {
@@ -177,17 +192,40 @@ func (s *Service) handleList(w http.ResponseWriter, r *http.Request, scope, path
 }
 
 func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path string, q url.Values) {
-	var off, length int64
+	var off, length int64 = 0, -1
+	bad := false
 	if v := q.Get("offset"); v != "" {
-		off, _ = strconv.ParseInt(v, 10, 64)
+		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n < 0 {
+			bad = true
+		} else {
+			off = n
+		}
 	}
 	if v := q.Get("len"); v != "" {
-		length, _ = strconv.ParseInt(v, 10, 64)
+		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n < 0 {
+			bad = true
+		} else {
+			length = n
+		}
 	}
-	data, info, err := s.root.read(scope, path, off, length)
+	if bad {
+		writeErr(w, 400, "bad_range", "offset/len must be non-negative integers")
+		return
+	}
+	f, info, err := s.root.open(scope, path, off)
 	if err != nil {
 		s.mapErr(w, err)
 		return
+	}
+	defer f.Close()
+	// Clamp to what exists; bound the copy to the file size so a huge len
+	// can never drive allocation or over-read.
+	n := info.Size - off
+	if n < 0 {
+		n = 0
+	}
+	if length >= 0 && length < n {
+		n = length
 	}
 	ver, recordedFP, _ := s.store.ObservedVersion(r.Context(), scope, path)
 	changed := ver > 0 && recordedFP != "" && recordedFP != info.Fingerprint
@@ -196,10 +234,26 @@ func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path
 		w.Header().Set("X-External-Change", "true")
 	}
 	w.Header().Set("content-type", "application/octet-stream")
-	w.Write(data)
+	w.Header().Set("content-length", strconv.FormatInt(n, 10))
+	// If the backend wedges mid-read (object store down), close the file
+	// under the copy so the request cannot hang holding the socket forever.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-r.Context().Done():
+			f.Close()
+		case <-done:
+		}
+	}()
+	io.CopyN(w, f, n)
 }
 
 func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, path string) {
+	if path == "" || path == "/" {
+		writeErr(w, 400, "bad_path", "write requires a file path")
+		return
+	}
 	iv, err := parseIfVersion(r.Header.Get("If-Version"))
 	if err != nil {
 		writeErr(w, 400, "bad_if_version", err.Error())
@@ -210,16 +264,11 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 		writeErr(w, 413, "too_large", "body exceeds service ceiling")
 		return
 	}
+	exclusive := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
 	ver, _, err := s.store.WithWrite(r.Context(), scope, path, "write", iv,
+		s.probe(scope, path),
 		func() (FileInfo, error) {
-			if iv.Mode == "none" {
-				if _, serr := s.root.stat(scope, path); serr == nil {
-					return FileInfo{}, ErrConflict
-				} else if !errors.Is(serr, ErrNotFound) {
-					return FileInfo{}, serr
-				}
-			}
-			return s.root.atomicWrite(scope, path, body)
+			return s.root.atomicWrite(scope, path, body, exclusive)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -229,9 +278,27 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 }
 
 type renameReq struct {
-	From      string `json:"from"`
-	To        string `json:"to"`
-	IfVersion any    `json:"if_version"`
+	From      string          `json:"from"`
+	To        string          `json:"to"`
+	IfVersion json.RawMessage `json:"if_version"`
+}
+
+// parseIfVersionJSON accepts a JSON string ("any"|"none"|"<n>") or a JSON
+// integer. Anything else — absent, null, float, bool — is a 400. Rename must
+// never silently degrade a missing or malformed condition into "any".
+func parseIfVersionJSON(raw json.RawMessage) (IfVersion, error) {
+	if len(raw) == 0 {
+		return IfVersion{}, errors.New("if_version is required (any|none|<n>)")
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil {
+		return parseIfVersion(str)
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return IfVersion{Mode: "eq", Version: n}, nil
+	}
+	return IfVersion{}, errors.New("bad if_version")
 }
 
 func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope string) {
@@ -240,13 +307,18 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 		writeErr(w, 400, "bad_request", err.Error())
 		return
 	}
-	iv, err := parseIfVersion(fmt.Sprint(rr.IfVersion))
+	iv, err := parseIfVersionJSON(rr.IfVersion)
 	if err != nil {
-		iv = IfVersion{Mode: "any"}
+		writeErr(w, 400, "bad_if_version", err.Error())
+		return
 	}
+	// none / eq 0 = "destination must not exist" — enforced atomically by
+	// renameat2(RENAME_NOREPLACE), not just by the version row.
+	noReplace := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
 	ver, _, err := s.store.Rename(r.Context(), scope, rr.From, rr.To, iv,
+		s.probe(scope, rr.To),
 		func() (FileInfo, error) {
-			return s.root.rename(scope, rr.From, rr.To)
+			return s.root.rename(scope, rr.From, rr.To, noReplace)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -265,6 +337,7 @@ func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope stri
 	}
 	ver, _, err := s.store.WithWrite(r.Context(), scope, body.Path, "mkdir",
 		IfVersion{Mode: "any"},
+		s.probe(scope, body.Path),
 		func() (FileInfo, error) {
 			return s.root.mkdir(scope, body.Path)
 		})
@@ -281,9 +354,10 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, pa
 		writeErr(w, 400, "bad_if_version", err.Error())
 		return
 	}
-	err = s.store.Remove(r.Context(), scope, path, iv, func() error {
-		return s.root.remove(scope, path)
-	})
+	err = s.store.Remove(r.Context(), scope, path, iv, s.probe(scope, path),
+		func() error {
+			return s.root.remove(scope, path)
+		})
 	if err != nil {
 		s.mapErr(w, err)
 		return
@@ -312,15 +386,25 @@ func (s *Service) handleChanges(w http.ResponseWriter, r *http.Request, scope st
 
 func (s *Service) mapErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrExternalChange):
+		writeErr(w, 409, "external_change",
+			"path changed outside the service since the declared version")
 	case errors.Is(err, ErrConflict):
 		writeErr(w, 409, "version_conflict", err.Error())
 	case errors.Is(err, ErrNoSuchFile), errors.Is(err, ErrNotFound):
-		writeErr(w, 404, "not_found", err.Error())
+		writeErr(w, 404, "not_found", "path not found")
 	case errors.Is(err, ErrEscape):
-		writeErr(w, 403, "escape_denied", err.Error())
+		writeErr(w, 403, "escape_denied", "path escapes scope root")
+	case errors.Is(err, ErrReserved):
+		writeErr(w, 400, "reserved_name", "name is reserved for service staging")
 	case errors.Is(err, ErrIsDir), errors.Is(err, ErrNotDir):
 		writeErr(w, 400, "wrong_kind", err.Error())
+	case errors.Is(err, ErrNotEmpty):
+		writeErr(w, 409, "dir_not_empty", err.Error())
+	case errors.Is(err, ErrUnavailable):
+		writeErr(w, 503, "unavailable", "operation timed out; safe to retry")
 	default:
-		writeErr(w, 500, "internal", err.Error())
+		// Never leak host paths or syscall details in error bodies.
+		writeErr(w, 500, "internal", "internal error")
 	}
 }
