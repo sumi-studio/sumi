@@ -192,7 +192,9 @@ export class OpenAIProvider implements ModelProvider {
           }
           // Some OpenAI-compatible routers signal failure as an in-band
           // error chunk on a 200 stream — it is a failed call, not text.
-          if (json.error !== undefined) {
+          // `!= null`: routers (LiteLLM et al.) also serialize
+          // "error": null on ordinary chunks — that is no error at all.
+          if (json.error != null) {
             const err = json.error;
             const em =
               typeof err === "string"

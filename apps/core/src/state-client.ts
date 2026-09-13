@@ -177,7 +177,21 @@ export class HttpStateClient implements StateClient {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      try {
+        return (await res.json()) as T;
+      } catch (e) {
+        // A 200 with an unreadable body is an infrastructure blip — a
+        // truncated proxy/middlebox response or a service bug — not a
+        // code defect. Surface it as a transient 5xx so callers back
+        // off instead of exiting (final-review NF2). The real status
+        // stays in the message.
+        throw new StateError(
+          503,
+          `state service returned an unreadable ${res.status} body: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
     let message = `state service ${res.status}`;
     try {
       const parsed = (await res.json()) as { error?: string };

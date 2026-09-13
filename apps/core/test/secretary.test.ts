@@ -10,7 +10,11 @@ import {
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { assemble, Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import { type StateClient, StateError } from "../src/state-client.ts";
+import {
+  HttpStateClient,
+  type StateClient,
+  StateError,
+} from "../src/state-client.ts";
 import { toolSpecs } from "../src/tools.ts";
 import type { Event } from "../src/types.ts";
 
@@ -1552,4 +1556,137 @@ test("a rejected claim still journals its tool_call before the tool_result (F6)"
     resIdx > callIdx,
     "the rejection result follows its call symmetrically",
   );
+});
+
+// --- Final-review NF2/NF3/NF4 repair coverage --------------------------------
+
+test("a corrupt 200 body from the state service classifies as transient (NF2)", async () => {
+  const client = new HttpStateClient("http://unused", "tok", async () => ({
+    ok: true,
+    status: 200,
+    json: async () => {
+      throw new SyntaxError("Unexpected end of JSON input");
+    },
+    text: async () => "garbage",
+  }));
+  await assert.rejects(
+    client.personaState(PERSONA),
+    (e: unknown) =>
+      e instanceof StateError && e.status === 503 && /unreadable 200/.test(e.message),
+    "an unreadable ok body surfaces as a transient 5xx",
+  );
+});
+
+test("an unreadable state response retries in-process rather than exiting (NF2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-70", "hi");
+  let corrupt = true;
+  const flicker: StateClient = Object.create(state, {
+    loadTurn: {
+      value: async (
+        ...args: Parameters<StateClient["loadTurn"]>
+      ): ReturnType<StateClient["loadTurn"]> => {
+        if (corrupt) {
+          corrupt = false;
+          throw new StateError(
+            503,
+            "state service returned an unreadable 200 body: Unexpected end of JSON input",
+          );
+        }
+        return state.loadTurn(...args);
+      },
+    },
+  });
+  const s = new Secretary(cfg(flicker, "h", { pollIntervalMs: 5 }));
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    if (state.inputs.find((i) => i.input_id === "in-70")!.status === "done") {
+      break;
+    }
+    assert.ok(Date.now() < deadline, "corrupt response never recovered");
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  ac.abort();
+  await done;
+});
+
+test("a transient error on the post-deadline acquire keeps retrying (NF3)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-71", "hi");
+  const t0 = Date.now();
+  // A live holder whose lease outlives the newcomer's wait window
+  // (ttl 600 > newcomer deadline ~400) but then lapses.
+  await state.acquireWriter(PERSONA, "local-live", 600);
+  // Inject a transport failure on the acquire immediately after the
+  // first post-deadline 409 — i.e. on the loop's "final attempt".
+  let sawLateConflict = false;
+  let injected = false;
+  const flicker: StateClient = Object.create(state, {
+    acquireWriter: {
+      value: async (
+        ...args: Parameters<StateClient["acquireWriter"]>
+      ): ReturnType<StateClient["acquireWriter"]> => {
+        if (sawLateConflict && !injected) {
+          injected = true;
+          throw new TypeError("fetch failed");
+        }
+        try {
+          return await state.acquireWriter(...args);
+        } catch (e) {
+          if (
+            e instanceof StateError &&
+            e.status === 409 &&
+            Date.now() - t0 >= 350
+          ) {
+            sawLateConflict = true;
+          }
+          throw e;
+        }
+      },
+    },
+  });
+  const s = new Secretary(
+    cfg(flicker, "local-new", { leaseTtlMs: 200, pollIntervalMs: 5 }),
+  );
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    if (state.inputs.find((i) => i.input_id === "in-71")!.status === "done") {
+      break;
+    }
+    assert.ok(
+      Date.now() < deadline,
+      "post-deadline transient error exited the process",
+    );
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.ok(injected, "the post-deadline attempt was exercised");
+  ac.abort();
+  await done;
+});
+
+test("SIGTERM while waiting out a held lease exits cleanly (NF4)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  // A live holder whose lease outlives the whole test.
+  await state.acquireWriter(PERSONA, "local-live", 30_000);
+  const logs: string[] = [];
+  const s = new Secretary(
+    cfg(state, "local-new", {
+      leaseTtlMs: 400,
+      pollIntervalMs: 5,
+      log: (m) => logs.push(m),
+    }),
+  );
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  await new Promise((r) => setTimeout(r, 250)); // mid lease-wait
+  ac.abort();
+  await assert.doesNotReject(done, "abort during lease-wait is a clean stop");
+  assert.ok(logs.some((m) => m.includes("waiting for expiry")));
 });

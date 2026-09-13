@@ -280,7 +280,10 @@ export class Secretary {
           await this.start();
           break;
         } catch (e) {
-          if (signal?.aborted) throw e;
+          // An abort while waiting out a held lease is a clean stop,
+          // not a failure — resolve rather than rethrowing the 409
+          // (final-review NF4). shutdown() is a no-op without a lease.
+          if (signal?.aborted) return;
           if (e instanceof StateError && e.status === 409) {
             // The lease is held by another holder. On an ordinary
             // restart (default holder is local-<pid>) that holder is our
@@ -315,9 +318,25 @@ export class Secretary {
             }
             // Deadline passed: one final acquire — a merely-expired
             // predecessor is gone by now, so this either succeeds or
-            // confirms a live holder outlasted the window.
-            await this.start();
-            break;
+            // confirms a live holder outlasted the window. Its errors
+            // still go through classification (final-review NF3): a
+            // transient state hiccup at this exact moment keeps backing
+            // off like any other attempt instead of exiting; a renewed
+            // 409 confirms the live holder and yields honestly.
+            try {
+              await this.start();
+              break;
+            } catch (e2) {
+              if (signal?.aborted) return;
+              if (!this.isTransient(e2)) throw e2;
+              failures++;
+              this.log("state service unavailable; retrying writer acquire", {
+                attempt: failures,
+                error: String(e2),
+              });
+              await backoff();
+            }
+            continue;
           }
           if (!this.isTransient(e)) throw e;
           failures++;

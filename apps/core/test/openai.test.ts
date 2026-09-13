@@ -262,3 +262,25 @@ test("unparseable tool arguments are a retryable failure, not a call", async () 
     },
   );
 });
+
+test('an "error": null chunk is not an error — stream completes (NF1)', async () => {
+  await withServer(
+    (_req, res) =>
+      // LiteLLM and some OpenAI-compatible routers serialize a null
+      // error field on ordinary chunks.
+      sse([
+        chunk({ error: null }),
+        text("hello"),
+        fin("stop"),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      const evs = await collect(provider(base));
+      assert.equal(
+        evs.filter((e) => e.type === "text").map((e) => e.delta).join(""),
+        "hello",
+      );
+      assert.ok(evs.some((e) => e.type === "done"));
+    },
+  );
+});
