@@ -53,6 +53,34 @@ procedure. Add the hostname
 The browser establishes a new session for this origin; an existing Tailnet-origin
 cookie is not transferred.
 
+### Same-tab Firebase sign-in
+
+The alpha Worker transparently proxies `/__/auth/` GET/POST requests to
+`sumi-studio.firebaseapp.com`, selected by `SUMI_FIREBASE_AUTH_DOMAIN` in the
+Worker environment. It strips Sumi credentials and disables caching. This is
+Firebase's [same-origin redirect setup](https://firebase.google.com/docs/auth/web/redirect-best-practices#option-3-proxy-auth-requests-to-firebaseappcom):
+the browser must stay on the application origin for the helper iframe to read
+the redirect result when third-party storage is blocked.
+
+Before switching the alpha frontend to redirect sign-in:
+
+- Add `https://sumi-alpha.pdhaku0.workers.dev/__/auth/handler` to the Google
+  OAuth client's authorized redirect URIs and the GitHub OAuth app's callback
+  URLs. Keep existing callback URLs needed by other deployments.
+- Build alpha assets with
+  `VITE_FIREBASE_AUTH_DOMAIN=sumi-alpha.pdhaku0.workers.dev`. The other Firebase
+  client values still describe project `sumi-studio`.
+- Verify `/__/auth/handler` and `/__/auth/iframe` return Firebase helper HTML,
+  with no SPA fallback or redirect to `firebaseapp.com`. Verify both providers
+  accept the new callback; reaching a provider's login page alone does not
+  establish a completed authentication round trip.
+
+The application CSP permits its own helper iframe. The proxy preserves the
+Firebase helper's response policy rather than applying the application's
+`frame-ancestors 'none'` policy to it. Existing local development environments
+still need an equivalent same-origin setup when using real redirect auth;
+the auth emulator is independent of the hosted-helper proxy.
+
 From `apps/web`, with an absolute path to verified assets:
 
 ```sh
