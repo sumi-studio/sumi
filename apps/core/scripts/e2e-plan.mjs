@@ -49,7 +49,7 @@ async function childMain() {
     if (!v) throw new Error(`missing env ${n}`);
     return v;
   };
-  const script = JSON.parse(env("SUMI_SCRIPT")); // {text, calls:[{tool,request}]}
+  const script = JSON.parse(env("SUMI_SCRIPT")); // {rounds:[{text,calls:[{tool,request}]}]}
   const dieAfterClaims = Number(process.env.SUMI_DIE_AFTER_CLAIMS ?? 0);
   const dieBeforeCommit = process.env.SUMI_DIE_BEFORE_COMMIT === "1";
   const resendPlan = process.env.SUMI_RESEND_PLAN === "1";
@@ -58,16 +58,20 @@ async function childMain() {
 
   class ScriptedProvider {
     name = "scripted";
-    async *stream() {
-      console.log("[child] MODEL CONSULTED");
-      yield { type: "text", delta: script.text };
-      for (const [i, c] of (script.calls ?? []).entries()) {
+    async *stream(req) {
+      // The round being consulted is explicit in the request — a retry that
+      // replays recorded rounds must never re-consult them.
+      const round = req.round ?? 0;
+      console.log(`[child] MODEL CONSULTED round=${round}`);
+      const decision = script.rounds?.[round] ?? { text: "", calls: [] };
+      yield { type: "text", delta: decision.text };
+      for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
           type: "tool_call",
-          call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+          call: { id: `call-${round}-${i}`, name: c.tool, arguments: c.request },
         };
       }
-      yield { type: "done", usage: { scripted: true } };
+      yield { type: "done", usage: { scripted: true, round } };
     }
   }
 
@@ -315,15 +319,21 @@ async function main() {
       .filter((e) => e.kind === "note")
       .map((e) => e.payload.text);
 
-  // --- scenario 1: decision A persisted → kill after effect → plan B provider
-  //     is never consulted; A continues exactly once -------------------------
-  log("scenario 1: kill after first effect; replacement provider must not run");
+  // --- scenario 1: decision A persisted → kill after effect → recorded round
+  //     replays verbatim; the model is consulted only for the round that was
+  //     never recorded (the final reply, fed by committed receipts) ---------
+  log("scenario 1: kill after first effect; recorded round must replay");
   const in1 = (await submit("input-one")).json.input.input_id;
   const scriptA = JSON.stringify({
-    text: "reply-A",
-    calls: [
-      { tool: "journal.note", request: { text: "note-A0" } },
-      { tool: "journal.note", request: { text: "note-A1" } },
+    rounds: [
+      {
+        text: "reply-A",
+        calls: [
+          { tool: "journal.note", request: { text: "note-A0" } },
+          { tool: "journal.note", request: { text: "note-A1" } },
+        ],
+      },
+      { text: "reply-A-final", calls: [] },
     ],
   });
   runChild({ SUMI_SCRIPT: scriptA, SUMI_DIE_AFTER_CLAIMS: "1" }, 9);
@@ -334,14 +344,24 @@ async function main() {
 
   const out2 = runChild({
     SUMI_SCRIPT: JSON.stringify({
-      text: "reply-B",
-      calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+      rounds: [
+        {
+          text: "reply-B",
+          calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+        },
+        { text: "reply-B-final", calls: [] },
+      ],
     }),
     SUMI_SPOOF_CLAIM: "1",
   });
   assert(
-    !out2.includes("MODEL CONSULTED"),
-    "retry consulted the model despite a recorded plan",
+    !out2.includes("MODEL CONSULTED round=0"),
+    "retry re-consulted a recorded round",
+    out2,
+  );
+  assert(
+    out2.includes("MODEL CONSULTED round=1"),
+    "retry must consult the model for the unrecorded final round",
     out2,
   );
   // The agreed boundary explicitly rejects a supplied legacy
@@ -364,18 +384,24 @@ async function main() {
   const replies1 = await outboxFor(in1);
   assert(replies1.length === 1, `expected 1 reply, got ${replies1.length}`);
   assert(
-    replies1[0].payload.output.text === "reply-A",
-    `committed ${replies1[0].payload.output.text}, expected reply-A`,
+    replies1[0].payload.output.text === "reply-B-final",
+    `committed ${replies1[0].payload.output.text}, expected reply-B-final — ` +
+      "the final round was unrecorded, so the retry's own consultation answers it",
   );
-  log("  plan A continued; B never consulted; effects exactly once");
+  log("  plan A round 0 replayed; effects exactly once; reply post-dates effects");
 
   // --- scenario 2: lost savePlan/claim responses resend identically ---------
   log("scenario 2: lost plan-save and claim responses replay identically");
   const in2 = (await submit("input-two")).json.input.input_id;
   const out3 = runChild({
     SUMI_SCRIPT: JSON.stringify({
-      text: "reply-C",
-      calls: [{ tool: "journal.note", request: { text: "note-C" } }],
+      rounds: [
+        {
+          text: "reply-C",
+          calls: [{ tool: "journal.note", request: { text: "note-C" } }],
+        },
+        { text: "reply-C-final", calls: [] },
+      ],
     }),
     SUMI_RESEND_PLAN: "1",
     SUMI_RESEND_CLAIM: "1",
@@ -403,15 +429,21 @@ async function main() {
   const in3 = (await submit("input-three")).json.input.input_id;
   runChild(
     {
-      SUMI_SCRIPT: JSON.stringify({ text: "reply-D", calls: [] }),
+      SUMI_SCRIPT: JSON.stringify({
+        rounds: [{ text: "reply-D", calls: [] }],
+      }),
       SUMI_DIE_BEFORE_COMMIT: "1",
     },
     9,
   );
   const out4 = runChild({
     SUMI_SCRIPT: JSON.stringify({
-      text: "reply-E",
-      calls: [{ tool: "journal.note", request: { text: "note-E" } }],
+      rounds: [
+        {
+          text: "reply-E",
+          calls: [{ tool: "journal.note", request: { text: "note-E" } }],
+        },
+      ],
     }),
   });
   assert(
@@ -428,6 +460,186 @@ async function main() {
     "replacement plan must not execute",
   );
   log("  zero-call decision replayed verbatim");
+
+  // --- scenario 4: deterministic bad tool data resolves honestly ----------
+  // CR3-B1 (ported from 0cd5410, adapted to multi-round plans): a decision
+  // that can never persist must fail the input non-retryable — recorded,
+  // observable in the outbox, and never blocking later inputs.
+  log("scenario 4: deterministic bad tool data resolves; queue unblocked");
+  const in4 = (await submit("input-four")).json.input.input_id;
+  const out5 = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [
+        {
+          text: "reply",
+          calls: [{ tool: "journal.note", request: { text: "a\0b" } }],
+        },
+        { text: "unreachable", calls: [] },
+      ],
+    }),
+  });
+  assert(
+    out5.includes("decision could not be recorded"),
+    "NUL decision was not recorded as a non-retryable failure",
+    out5,
+  );
+  const in4State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in4}`,
+    ptoken,
+  );
+  assert(
+    in4State.json?.input?.status === "done",
+    `poisoned input must resolve (done), got ${in4State.text}`,
+  );
+  const failed4 = await outboxFor(in4);
+  assert(
+    failed4.length === 1 && failed4[0].kind === "turn_failed",
+    `a terminal failure must reach the outbox, got ${JSON.stringify(failed4)}`,
+  );
+  // The queue is unblocked: a later normal input completes on the same
+  // persona with no residue from the failed decision.
+  const in5 = (await submit("input-five")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [
+        {
+          text: "reply-F",
+          calls: [{ tool: "journal.note", request: { text: "note-F" } }],
+        },
+        { text: "reply-F-final", calls: [] },
+      ],
+    }),
+  });
+  const replies5 = await outboxFor(in5);
+  assert(
+    replies5.length === 1 &&
+      replies5[0].payload.output.text === "reply-F-final" &&
+      (await noteTexts()).includes("note-F"),
+    "the input after a poisoned decision must complete normally",
+  );
+  log("  NUL decision failed non-retryable; next input completed");
+
+  // CR3-B1 (claim side): a plan-valid but semantically invalid argument is
+  // a recorded tool error, fed back to the model, and the turn commits —
+  // not a retried 500.
+  const in6 = (await submit("input-six")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [
+        {
+          text: "scheduling",
+          calls: [
+            {
+              tool: "schedule.set",
+              request: {
+                wake_at: "2030-01-01T00:00:00Z",
+                miss_policy: "bogus",
+              },
+            },
+          ],
+        },
+        { text: "I could not set that reminder", calls: [] },
+      ],
+    }),
+  });
+  const evs6 = await events();
+  const toolErr = evs6.find(
+    (e) =>
+      e.kind === "tool_result" && /miss_policy/.test(e.payload.error ?? ""),
+  );
+  assert(toolErr, "invalid miss_policy must surface as a tool_result error");
+  const replies6 = await outboxFor(in6);
+  assert(
+    replies6.length === 1 &&
+      replies6[0].payload.output.text === "I could not set that reminder",
+    "the tool-error-informed reply must commit",
+  );
+  const in6State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in6}`,
+    ptoken,
+  );
+  assert(
+    in6State.json?.input?.status === "done",
+    `bad-policy input must resolve (done), got ${in6State.text}`,
+  );
+  log("  invalid miss_policy recorded as a tool error; input resolved");
+
+  // CR3-B2: a second schedule.set reusing an id must not report a stale
+  // success — different contents are an explicit tool error.
+  const in7 = (await submit("input-seven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [
+        {
+          text: "reminder set",
+          calls: [
+            {
+              tool: "schedule.set",
+              request: {
+                schedule_id: "rem-e2e",
+                wake_at: "2030-01-01T00:00:00Z",
+                payload: { text: "first" },
+                miss_policy: "coalesce",
+              },
+            },
+          ],
+        },
+        { text: "reminder set", calls: [] },
+      ],
+    }),
+  });
+  const evs7 = await events();
+  assert(
+    evs7.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        e.payload.response?.schedule?.schedule_id === "rem-e2e",
+    ),
+    "initial schedule.set did not commit",
+  );
+  const in8 = (await submit("input-eight")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [
+        {
+          text: "reminder again",
+          calls: [
+            {
+              tool: "schedule.set",
+              request: {
+                schedule_id: "rem-e2e",
+                wake_at: "2031-06-01T00:00:00Z",
+                payload: { text: "different" },
+                miss_policy: "coalesce",
+              },
+            },
+          ],
+        },
+        { text: "that reminder id is taken", calls: [] },
+      ],
+    }),
+  });
+  const evs8 = await events();
+  assert(
+    evs8.some(
+      (e) =>
+        e.kind === "tool_result" &&
+        /already exists with different contents/.test(e.payload.error ?? ""),
+    ),
+    "conflicting schedule_id reuse must be an explicit tool error",
+  );
+  const in8State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in8}`,
+    ptoken,
+  );
+  assert(
+    in8State.json?.input?.status === "done",
+    `conflicting-reuse input must resolve (done), got ${in8State.text}`,
+  );
+  log("  schedule_id reuse with different contents is an honest error");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

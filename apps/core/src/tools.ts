@@ -31,10 +31,6 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
           type: "object",
           description: "input payload delivered at wake",
         },
-        schedule_id: {
-          type: "string",
-          description: "optional stable id for idempotent set",
-        },
       },
       required: ["wake_at"],
     },

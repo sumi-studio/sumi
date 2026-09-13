@@ -11,6 +11,11 @@ import type { ModelEvent, ModelProvider, ModelRequest } from "../provider.ts";
  *       ("+N" means N milliseconds from now)
  *   "!slow <ms> <text>"    → delay before answering (used to kill mid-turn)
  *   anything else          → echo reply text
+ *
+ * Round-aware like a real model: directives are parsed on round 0 only.
+ * Later rounds (after tool results were fed back) emit a plain echo reply
+ * — the committed reply post-dates the tool effects, matching the real
+ * conversational contract.
  */
 export class MockProvider implements ModelProvider {
   readonly name = "mock";
@@ -27,12 +32,12 @@ export class MockProvider implements ModelProvider {
     let reply = `echo: ${text}`;
     const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
 
-    const slow = /^!slow\s+(\d+)\s*(.*)$/s.exec(text);
+    const slow = request.round === 0 ? /^!slow\s+(\d+)\s*(.*)$/s.exec(text) : null;
     if (slow) {
       const delay = Number(slow[1]);
       await waitWithSignal(delay, request.signal);
       reply = `echo: ${slow[2] ?? ""}`;
-    } else if (text.startsWith("!")) {
+    } else if (request.round === 0 && text.startsWith("!")) {
       const m = /^!(\S+)\s+(.+)$/s.exec(text);
       if (m) {
         const name = m[1] ?? "";

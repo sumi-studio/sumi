@@ -226,10 +226,10 @@ func TestCrashMidTurnRecovery(t *testing.T) {
 	}
 }
 
-// mustPlan records a durable decision for the turn's input.
+// mustPlan records a durable round-0 decision for the turn's input.
 func mustPlan(t *testing.T, s *Store, pa, turnID string, gen int64, calls ...PlanCall) TurnPlan {
 	t.Helper()
-	p, created, err := s.SavePlan(context.Background(), pa, turnID, gen,
+	p, created, err := s.SavePlan(context.Background(), pa, turnID, gen, 0,
 		Decision{Text: "reply", Calls: calls})
 	if err != nil || !created {
 		t.Fatalf("save plan: %+v created=%v err=%v", p, created, err)
@@ -685,7 +685,7 @@ func TestPlanSaveReplayConflict(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 	// No turn → no plan authorship.
-	if _, _, err := s.SavePlan(ctx, pa, "ghost", lease.Generation,
+	if _, _, err := s.SavePlan(ctx, pa, "ghost", lease.Generation, 0,
 		Decision{Text: "x", Calls: []PlanCall{}}); !errors.Is(err, ErrTurnNotFound) {
 		t.Fatalf("plan on missing turn err = %v, want ErrTurnNotFound", err)
 	}
@@ -697,34 +697,34 @@ func TestPlanSaveReplayConflict(t *testing.T) {
 		{Tool: "schedule.set", Request: map[string]any{"schedule_id": "s-9",
 			"wake_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}},
 	}, Usage: map[string]any{"input_tokens": 7}}
-	p, created, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec)
+	p, created, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec)
 	if err != nil || !created || p.InputID != "in-1" || p.TurnID != "t-1" {
 		t.Fatalf("save: %+v created=%v err=%v", p, created, err)
 	}
-	if len(p.Plan.Calls) != 2 || p.Plan.Text != "hi there" {
+	if len(p.Plan) != 1 || len(p.Plan[0].Calls) != 2 || p.Plan[0].Text != "hi there" {
 		t.Fatalf("stored plan: %+v", p.Plan)
 	}
 	// Identical resave replays the stored row (lost-response retry).
-	p2, created2, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec)
+	p2, created2, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec)
 	if err != nil || created2 || p2.TurnID != "t-1" {
 		t.Fatalf("identical resave: %+v created=%v err=%v", p2, created2, err)
 	}
 	// Conflicting decision under the same input is rejected.
 	diverged := dec
 	diverged.Text = "changed"
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, diverged); !errors.Is(err, ErrTurnConflict) {
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, diverged); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("divergent plan err = %v, want ErrTurnConflict", err)
 	}
 	// loadTurn surfaces the recorded plan.
 	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10)
-	if err != nil || load.Plan == nil || load.Plan.Plan.Text != "hi there" {
+	if err != nil || load.Plan == nil || load.Plan.Plan[0].Text != "hi there" {
 		t.Fatalf("load plan: %+v err=%v", load.Plan, err)
 	}
 	// A finished turn cannot author a plan.
 	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{Outcome: "complete"}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec); !errors.Is(err, ErrTurnConflict) {
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("plan on finished turn err = %v, want ErrTurnConflict", err)
 	}
 }
@@ -770,7 +770,7 @@ func TestPlanContinuesAcrossRecovery(t *testing.T) {
 		t.Fatalf("load gen2: %+v err=%v", load, err)
 	}
 	// Attempt 2 sees the recorded plan — not asked to re-plan.
-	if load.Plan == nil || len(load.Plan.Plan.Calls) != 2 || load.Plan.TurnID != "t-1" {
+	if load.Plan == nil || len(load.Plan.Plan) != 1 || len(load.Plan.Plan[0].Calls) != 2 || load.Plan.TurnID != "t-1" {
 		t.Fatalf("plan on attempt 2: %+v", load.Plan)
 	}
 	// Position 0 replays attempt 1's receipt under a fresh caller
@@ -925,7 +925,7 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 	if err != nil || load.Turn == nil || load.Turn.Attempt != 2 {
 		t.Fatalf("retry load: %+v err=%v", load, err)
 	}
-	if load.Plan == nil || load.Plan.Plan.Calls[0].Tool != "journal.note" {
+	if load.Plan == nil || load.Plan.Plan[0].Calls[0].Tool != "journal.note" {
 		t.Fatalf("plan lost across retryable fail: %+v", load.Plan)
 	}
 	// The already-executed call replays its receipt on the new attempt.
@@ -933,5 +933,255 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 		"op-2", "journal.note", 0, map[string]any{"text": "keep"})
 	if err != nil || fresh || op.OperationID != "op-1" {
 		t.Fatalf("retry replay: %+v fresh=%v err=%v", op, fresh, err)
+	}
+}
+
+// Multi-round plan: a later round is appended after earlier rounds' effects
+// committed — including by a new attempt after recovery — and claims address
+// flat positions across all rounds.
+func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l1, err := s.AcquireWriter(ctx, pa, "gen1", 30*time.Millisecond)
+	if err != nil {
+		t.Fatalf("acquire gen1: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l1.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load gen1: %v", err)
+	}
+	mustPlan(t, s, pa, "t-1", l1.Generation,
+		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "r0-note"}})
+	// The round-0 effect commits; the writer dies before consulting round 1.
+	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
+		"op-a", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || !fresh {
+		t.Fatalf("claim gen1: fresh=%v err=%v", fresh, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	l2, err := s.AcquireWriter(ctx, pa, "gen2", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire gen2: %v", err)
+	}
+	if _, err := s.Recover(ctx, pa, l2.Generation); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	load, err := s.LoadTurn(ctx, pa, l2.Generation, "t-2", 10)
+	if err != nil || load.Plan == nil || len(load.Plan.Plan) != 1 {
+		t.Fatalf("load gen2: %+v err=%v", load, err)
+	}
+	// Position 0 replays under the new attempt.
+	if op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+		"op-b", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || fresh || op.OperationID != "op-a" {
+		t.Fatalf("replay gen2: fresh=%v err=%v", fresh, err)
+	}
+	// The new attempt appends round 1 to the same durable record.
+	p, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
+		Decision{Text: "final reply", Calls: []PlanCall{
+			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+		}})
+	if err != nil || !created || len(p.Plan) != 2 {
+		t.Fatalf("append round 1: %+v created=%v err=%v", p, created, err)
+	}
+	// Round 1's call is flat position 1 — it claims and executes once.
+	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+		"op-c", "journal.note", 1, map[string]any{"text": "r1-note"}); err != nil || !fresh {
+		t.Fatalf("claim flat pos 1: fresh=%v err=%v", fresh, err)
+	}
+	// Skipping a round and rewriting a recorded round both conflict.
+	if _, _, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 3,
+		Decision{Text: "gap"}); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("gap round err = %v, want ErrTurnConflict", err)
+	}
+	if _, _, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 0,
+		Decision{Text: "rewrite", Calls: []PlanCall{}}); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("rewrite round err = %v, want ErrTurnConflict", err)
+	}
+	// Identical resend of round 1 replays.
+	if _, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
+		Decision{Text: "final reply", Calls: []PlanCall{
+			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+		}}); err != nil || created {
+		t.Fatalf("resend round 1: created=%v err=%v", created, err)
+	}
+}
+
+// CR3-B1 (ported from 0cd5410, adapted to round-aware SavePlan):
+// deterministically invalid tool data is a 400-class rejection at the
+// plan/claim boundaries, never a retryable 500 — the input resolves with a
+// recorded error instead of blocking every later input forever.
+func TestDeterministicToolDataRejected(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	// A decision containing NUL cannot be persisted — rejected at SavePlan,
+	// the first persistence boundary, before any effect is reached.
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0,
+		Decision{Text: "reply\x00stop"}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL text savePlan err = %v, want ErrBadRequest", err)
+	}
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0,
+		Decision{Text: "ok", Calls: []PlanCall{
+			{Tool: "journal.note", Request: map[string]any{"text": "a\x00b"}},
+		}}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL request savePlan err = %v, want ErrBadRequest", err)
+	}
+	// The rejected saves recorded nothing: the same turn can still store a
+	// clean decision at round 0.
+	badPolicyReq := map[string]any{
+		"schedule_id": "rem",
+		"wake_at":     time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"miss_policy": "bogus",
+	}
+	mustPlan(t, s, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "schedule.set", Request: badPolicyReq})
+
+	// A plan-valid but semantically invalid argument (miss_policy not in
+	// the enum) is rejected as a bad request, not a constraint 500.
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-bad-policy", "schedule.set", 0, badPolicyReq); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("bogus miss_policy claim err = %v, want ErrBadRequest", err)
+	}
+	// A NUL in the claim request is a 400 before plan binding — it can
+	// never match or execute.
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-nul", "journal.note", 0,
+		map[string]any{"text": "a\x00b"}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL claim err = %v, want ErrBadRequest", err)
+	}
+}
+
+// CR3-B2 (ported from 0cd5410): reusing a schedule_id must not silently
+// return the old row as a fresh success. Identical contents over a
+// still-pending row replay; different contents or a dead schedule are
+// explicit tool errors.
+func TestScheduleSetIDReuse(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	wake1 := time.Now().Add(-time.Minute).UTC().Truncate(time.Microsecond)
+	req1 := map[string]any{
+		"schedule_id": "rem",
+		"wake_at":     wake1.Format(time.RFC3339Nano),
+		"payload":     map[string]any{"text": "hi"},
+		"miss_policy": "coalesce",
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
+	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-1", "schedule.set", 0, req1)
+	if err != nil || !fresh || op.Status != "done" {
+		t.Fatalf("initial schedule.set: %+v fresh=%v err=%v", op, fresh, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation,
+		CommitRequest{Outcome: "complete"}); err != nil {
+		t.Fatalf("commit t-1: %v", err)
+	}
+
+	// in-2 reuses the id with different contents → bad request, row kept.
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-2", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit in-2: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10); err != nil {
+		t.Fatalf("load t-2: %v", err)
+	}
+	req2 := map[string]any{
+		"schedule_id": "rem",
+		"wake_at":     wake1.Add(24 * time.Hour).Format(time.RFC3339Nano),
+		"payload":     map[string]any{"text": "hi"},
+		"miss_policy": "coalesce",
+	}
+	mustPlan(t, s, pa, "t-2", lease.Generation, PlanCall{Tool: "schedule.set", Request: req2})
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
+		"op-2", "schedule.set", 0, req2); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("conflicting reuse err = %v, want ErrBadRequest", err)
+	}
+	var storedWake time.Time
+	var status, mp string
+	if err := pool.QueryRow(ctx,
+		`SELECT wake_at, status, miss_policy FROM core_schedules WHERE persona_id = $1 AND schedule_id = 'rem'`,
+		pa).Scan(&storedWake, &status, &mp); err != nil {
+		t.Fatalf("read schedule: %v", err)
+	}
+	if !storedWake.Equal(wake1) || status != "pending" || mp != "coalesce" {
+		t.Fatalf("existing schedule mutated: wake=%v status=%s miss_policy=%s", storedWake, status, mp)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", lease.Generation,
+		CommitRequest{Outcome: "fail", Error: "tool error recorded"}); err != nil {
+		t.Fatalf("commit t-2: %v", err)
+	}
+
+	// in-3 reuses the id with identical contents while pending → true
+	// idempotent set: the existing row is returned, no duplicate.
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-3", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit in-3: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-3", 10); err != nil {
+		t.Fatalf("load t-3: %v", err)
+	}
+	mustPlan(t, s, pa, "t-3", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
+	op, fresh, err = s.ClaimOperation(ctx, pa, "t-3", lease.Generation,
+		"op-3", "schedule.set", 0, req1)
+	if err != nil || !fresh || op.Status != "done" {
+		t.Fatalf("identical pending reuse: %+v fresh=%v err=%v", op, fresh, err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_schedules WHERE persona_id = $1 AND schedule_id = 'rem'`, pa).
+		Scan(&count); err != nil || count != 1 {
+		t.Fatalf("schedule rows = %d err=%v, want 1", count, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-3", lease.Generation,
+		CommitRequest{Outcome: "complete"}); err != nil {
+		t.Fatalf("commit t-3: %v", err)
+	}
+
+	// Fire it, then an identical reuse must not report a stale success.
+	fired, err := s.DispatchDueSchedules(ctx, pa, lease.Generation, time.Now(), 10)
+	if err != nil || len(fired) != 1 {
+		t.Fatalf("dispatch: %+v err=%v", fired, err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-4", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit in-4: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-4", 10); err != nil {
+		t.Fatalf("load t-4: %v", err)
+	}
+	mustPlan(t, s, pa, "t-4", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
+	if _, _, err := s.ClaimOperation(ctx, pa, "t-4", lease.Generation,
+		"op-4", "schedule.set", 0, req1); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("fired schedule reuse err = %v, want ErrBadRequest", err)
 	}
 }

@@ -27,8 +27,7 @@
  * own secret store, never in DO storage.
  */
 
-import type { ModelProvider } from "../provider.ts";
-import { MockProvider } from "../providers/mock.ts";
+import { providerFromEnv } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -87,7 +86,11 @@ export class SecretaryObject {
 
   /** Build the per-persona secretary; overridable for tests. */
   protected newSecretary(personaId: string): Secretary {
-    const provider: ModelProvider = new MockProvider(); // real provider wiring lands with secrets
+    // Same SUMI_MODEL_* contract as the local host — a persona's secretary
+    // runs the identical provider config under workerd and Node.
+    const provider = providerFromEnv((n) =>
+      typeof this.env[n] === "string" ? (this.env[n] as string) : undefined,
+    );
     return new Secretary({
       personaId,
       holderId: `workerd-${personaId}`,

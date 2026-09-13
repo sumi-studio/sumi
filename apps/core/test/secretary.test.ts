@@ -9,34 +9,44 @@ import type {
 import { MockProvider } from "../src/providers/mock.ts";
 import { assemble, Secretary, type SecretaryConfig } from "../src/secretary.ts";
 import { type StateClient, StateError } from "../src/state-client.ts";
+import { toolSpecs } from "../src/tools.ts";
 import type { Event } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000001";
 
-/** Emits exactly one scripted decision; counts how often it was consulted. */
+/** Emits one scripted decision per round; records which rounds were consulted. */
 class ScriptedProvider implements ModelProvider {
   readonly name = "scripted";
-  consultations = 0;
-  private readonly script: {
+  consultations: number[] = [];
+  requests: ModelRequest[] = [];
+  private readonly rounds: {
     text: string;
     calls?: { tool: string; request: Record<string, unknown> }[];
-  };
-  constructor(script: {
-    text: string;
-    calls?: { tool: string; request: Record<string, unknown> }[];
-  }) {
-    this.script = script;
+  }[];
+  constructor(
+    script:
+      | { text: string; calls?: { tool: string; request: Record<string, unknown> }[] }
+      | {
+          rounds: {
+            text: string;
+            calls?: { tool: string; request: Record<string, unknown> }[];
+          }[];
+        },
+  ) {
+    this.rounds = "rounds" in script ? script.rounds : [script];
   }
-  async *stream(_req: ModelRequest): AsyncIterable<ModelEvent> {
-    this.consultations++;
-    yield { type: "text", delta: this.script.text };
-    for (const [i, c] of (this.script.calls ?? []).entries()) {
+  async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+    this.consultations.push(req.round);
+    this.requests.push(req);
+    const r = this.rounds[req.round] ?? { text: "", calls: [] };
+    yield { type: "text", delta: r.text };
+    for (const [i, c] of (r.calls ?? []).entries()) {
       yield {
         type: "tool_call",
-        call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+        call: { id: `call-${req.round}-${i}`, name: c.tool, arguments: c.request },
       };
     }
-    yield { type: "done", usage: { scripted: true } };
+    yield { type: "done", usage: { scripted: true, round: req.round } };
   }
 }
 
@@ -239,7 +249,8 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
       { tool: "journal.note", request: { text: "note-A1" } },
     ],
   });
-  // Attempt 1 commits the position-0 effect, then dies before commitTurn.
+  // Attempt 1 commits the position-0 effect, then dies before commitTurn —
+  // only round 0 is recorded when the process goes away.
   let claims = 0;
   const crashy: StateClient = Object.create(state, {
     claimOperation: {
@@ -265,19 +276,29 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
     "the position-0 effect committed before the crash",
   );
 
-  // Attempt 2 carries a provider that WOULD decide differently. The
-  // recorded plan wins and the model is never consulted.
+  // Attempt 2 carries a provider that WOULD decide differently at round 0.
+  // The recorded round is replayed verbatim — the model is consulted only
+  // for the still-unrecorded final round, fed by the committed receipts.
   const planB = new ScriptedProvider({
-    text: "reply-B",
-    calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+    rounds: [
+      {
+        text: "reply-B",
+        calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+      },
+      { text: "reply-from-attempt-2" },
+    ],
   });
   const s2 = new Secretary(cfg(state, "h", { provider: planB }));
   await s2.start(); // same holder: re-acquires, bumps generation, recovers
   assert.equal(await s2.step(), "turn");
   assert.equal(await s2.step(), "idle");
 
-  assert.equal(planA.consultations, 1);
-  assert.equal(planB.consultations, 0, "retried attempt must not re-plan");
+  assert.deepEqual(planA.consultations, [0]);
+  assert.deepEqual(
+    planB.consultations,
+    [1],
+    "retried attempt replays recorded round 0 and consults only round 1",
+  );
   const evs = await state.events(PERSONA, 0);
   const texts = evs.filter((e) => e.kind === "note").map((e) => e.payload.text);
   assert.deepEqual(texts.sort(), ["note-A0", "note-A1"]);
@@ -291,8 +312,8 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
   assert.equal(outbox.length, 1);
   assert.equal(
     (outbox[0]!.payload as { output: { text: string } }).output.text,
-    "reply-A",
-    "the recorded plan's text is committed, not the retry's",
+    "reply-from-attempt-2",
+    "the final round was never recorded — the retry's consultation answers it",
   );
   assert.equal(state.inputs.find((i) => i.input_id === "in-7")!.status, "done");
 });
@@ -307,13 +328,14 @@ test("savePlan: identical resend returns the stored plan; conflict is rejected",
   const { turn } = await state.loadTurn(PERSONA, gen, "t-1", 10);
   const req = {
     turnId: turn!.turn_id,
+    round: 0,
     text: "reply",
     calls: [{ tool: "journal.note", request: { text: "n" } }],
     usage: { in: 1, out: 2 },
   };
   const first = await state.savePlan(PERSONA, gen, req);
   assert.equal(first.created, true);
-  assert.equal(first.plan.plan.text, "reply");
+  assert.equal(first.plan.plan[0]!.text, "reply");
   // Lost-response resend: identical body → stored row, not a new write.
   const replay = await state.savePlan(PERSONA, gen, req);
   assert.equal(replay.created, false);
@@ -355,6 +377,7 @@ test("claims require the recorded plan and must match its positions", async () =
   );
   await state.savePlan(PERSONA, gen, {
     turnId: turn!.turn_id,
+    round: 0,
     text: "reply",
     calls: [{ tool: "journal.note", request: { text: "n" } }],
     usage: {},
@@ -387,6 +410,7 @@ test("server-derived effect identity: a new operation_id on retry replays the re
   const { turn } = await state.loadTurn(PERSONA, gen, "t-old", 10);
   await state.savePlan(PERSONA, gen, {
     turnId: turn!.turn_id,
+    round: 0,
     text: "reply",
     calls: [{ tool: "journal.note", request: { text: "committed" } }],
     usage: {},
@@ -441,13 +465,13 @@ test("zero-call plan round-trips; a crash before commit replays it without the m
   await s1.start();
   await assert.rejects(s1.step(), /hard exit/);
   assert.equal(state.plans.size, 1, "the zero-call decision was persisted");
-  assert.equal([...state.plans.values()][0]!.plan.calls.length, 0);
+  assert.equal([...state.plans.values()][0]!.plan[0]!.calls.length, 0);
 
   const planD = new ScriptedProvider({ text: "reply-D" });
   const s2 = new Secretary(cfg(state, "h", { provider: planD }));
   await s2.start();
   assert.equal(await s2.step(), "turn");
-  assert.equal(planD.consultations, 0, "zero-call plan replays unsupervised");
+  assert.deepEqual(planD.consultations, [], "zero-call plan replays unsupervised");
   const outbox = await state.outbox(PERSONA, 0);
   assert.equal(
     (outbox[0]!.payload as { output: { text: string } }).output.text,
@@ -466,6 +490,7 @@ test("conflicting stored plan on save fails the turn loudly, non-retryable", asy
   const { turn } = await state.loadTurn(PERSONA, gen, "t-old", 10);
   await state.savePlan(PERSONA, gen, {
     turnId: turn!.turn_id,
+    round: 0,
     text: "A",
     calls: [],
     usage: {},
@@ -542,6 +567,7 @@ test("a store replaying a receipt for a different request is still caught client
   const { turn } = await inner.loadTurn(PERSONA, gen, "t-old", 10);
   await inner.savePlan(PERSONA, gen, {
     turnId: turn!.turn_id,
+    round: 0,
     text: "reply",
     calls: [{ tool: "journal.note", request: { text: "A" } }],
     usage: {},
@@ -628,4 +654,417 @@ test("same-holder acquire bumps generation; release keeps monotonic fencing", as
   await state.releaseWriter(PERSONA, "h", l2.generation);
   const l3 = await state.acquireWriter(PERSONA, "h", 30_000);
   assert.equal(l3.generation, l2.generation + 1);
+});
+
+test("tool results feed back into a truthful final reply (multi-round)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-15", "remember my bike");
+  const provider = new ScriptedProvider({
+    rounds: [
+      {
+        text: "noting that",
+        calls: [{ tool: "journal.note", request: { text: "has a red bike" } }],
+      },
+      { text: "Done — I noted your red bike." },
+    ],
+  });
+  const s = new Secretary(cfg(state, "h", { provider }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+
+  assert.deepEqual(provider.consultations, [0, 1]);
+  // The second consultation carries the assistant tool_calls plus the
+  // committed tool result — the reply is informed by what actually ran.
+  const round1 = provider.requests[1]!;
+  const toolMsg = round1.messages.find((m) => m.role === "tool")!;
+  assert.equal(toolMsg.toolCallId, "call-0-0");
+  assert.equal(toolMsg.name, "journal.note");
+  assert.match(toolMsg.content, /seq/);
+  const assistantMsg = round1.messages.find(
+    (m) => m.role === "assistant" && m.toolCalls?.length,
+  )!;
+  assert.equal(assistantMsg.toolCalls![0]!.name, "journal.note");
+
+  const evs = await state.events(PERSONA, 0);
+  // The note event lands at claim time (atomic with the effect); the turn's
+  // own events land at commit. Assert structure, not raw seq interleave.
+  const kinds = evs.map((e) => e.kind);
+  assert.equal(kinds.filter((k) => k === "note").length, 1);
+  assert.equal(kinds.filter((k) => k === "tool_call").length, 1);
+  assert.equal(kinds.filter((k) => k === "tool_result").length, 1);
+  assert.equal(kinds.filter((k) => k === "assistant_message").length, 2);
+  assert.ok(
+    kinds.indexOf("tool_call") < kinds.indexOf("tool_result"),
+    "tool_call journals before its result",
+  );
+  assert.equal(
+    evs[evs.length - 1]!.payload.text,
+    "Done — I noted your red bike.",
+    "the final assistant message is the post-tool reply",
+  );
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(
+    (outbox[0]!.payload as { output: { text: string } }).output.text,
+    "Done — I noted your red bike.",
+  );
+});
+
+test("plan rounds are append-only across attempts (lost save before round 1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-16", "hi");
+  const gen = (await state.acquireWriter(PERSONA, "h", 30_000)).generation;
+  const { turn } = await state.loadTurn(PERSONA, gen, "t-1", 10);
+  const r0 = {
+    turnId: turn!.turn_id,
+    round: 0,
+    text: "r0",
+    calls: [{ tool: "journal.note", request: { text: "n0" } }],
+    usage: {},
+  };
+  assert.equal((await state.savePlan(PERSONA, gen, r0)).created, true);
+  // Round 1 appended by a later attempt of the same input's lineage.
+  const r1 = { ...r0, round: 1, text: "r1", calls: [] };
+  assert.equal((await state.savePlan(PERSONA, gen, r1)).created, true);
+  // Resaving a recorded round replays; a different decision conflicts.
+  assert.equal((await state.savePlan(PERSONA, gen, r0)).created, false);
+  await assert.rejects(
+    state.savePlan(PERSONA, gen, { ...r0, text: "different" }),
+    (e: unknown) => e instanceof StateError && e.status === 409,
+  );
+  // Skipping a round conflicts.
+  await assert.rejects(
+    state.savePlan(PERSONA, gen, { ...r0, round: 3 }),
+    (e: unknown) => e instanceof StateError && e.status === 409,
+  );
+  // Claims address flat positions across rounds.
+  await state.savePlan(PERSONA, gen, { ...r0, round: 2, text: "r2", calls: [{ tool: "journal.note", request: { text: "n2" } }] });
+  const claim = await state.claimOperation(PERSONA, gen, {
+    operationId: "op-1",
+    turnId: turn!.turn_id,
+    tool: "journal.note",
+    callIndex: 1,
+    request: { text: "n2" },
+  });
+  assert.equal(claim.fresh, true);
+});
+
+test("attempt cap: a failing provider cannot consume an input forever", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-17", "hi");
+  let consultations = 0;
+  const down: ModelProvider = {
+    name: "down",
+    stream() {
+      consultations++;
+      throw new Error("provider down");
+    },
+  };
+  const s = new Secretary(
+    cfg(state, "h", {
+      provider: down,
+      maxAttempts: 2,
+      retryBackoffMs: 1,
+    }),
+  );
+  await s.start();
+  assert.equal(await s.step(), "turn"); // attempt 1: fails, requeued
+  assert.equal(await s.step(), "turn"); // attempt 2: last allowed — terminal
+  assert.equal(await s.step(), "idle");
+  assert.equal(consultations, 2);
+  const input = state.inputs.find((i) => i.input_id === "in-17")!;
+  assert.equal(input.status, "done", "input ends, not requeued forever");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-17" && t.status === "failed",
+  )!;
+  assert.match(failed.error ?? "", /provider down/);
+});
+
+test("lease renews while a model call is in flight", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-18", "slow question");
+  let renewals = 0;
+  const counting: StateClient = Object.create(state, {
+    renewWriter: {
+      value: async (
+        ...args: Parameters<StateClient["renewWriter"]>
+      ): ReturnType<StateClient["renewWriter"]> => {
+        renewals++;
+        return state.renewWriter(...args);
+      },
+    },
+  });
+  const slow: ModelProvider = {
+    name: "slow",
+    async *stream() {
+      // Longer than two renewal ticks — the lease must outlive the stream.
+      await new Promise((r) => setTimeout(r, 200));
+      yield { type: "text", delta: "done thinking" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(
+    cfg(counting, "h", {
+      provider: slow,
+      leaseTtlMs: 30_000,
+      renewEveryMs: 50,
+    }),
+  );
+  await s.start();
+  const before = renewals;
+  assert.equal(await s.step(), "turn");
+  assert.ok(
+    renewals > before,
+    "the lease renewed at least once while the model call was in flight",
+  );
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(outbox.length, 1);
+});
+
+// --- CR3-B1/B2 repairs ported from 0cd5410 (deterministic tool data) ------
+
+test("a decision containing NUL data fails the input non-retryable; the next input completes (CR3-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-20", "hi");
+  // The consultation decides a call whose request can never persist
+  // (jsonb cannot hold NUL); it must not be retried.
+  const bad = new ScriptedProvider({
+    rounds: [
+      {
+        text: "r",
+        calls: [
+          { tool: "journal.note", request: { text: "a\0b" } },
+        ],
+      },
+      { text: "unreachable" },
+    ],
+  });
+  const s = new Secretary(cfg(state, "h", { provider: bad }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.deepEqual(
+    bad.consultations,
+    [0],
+    "savePlan 400 is not retried and the model is not re-consulted",
+  );
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-20" && t.status === "failed",
+  );
+  assert.ok(failed, "turn must record the non-retryable failure");
+  assert.match(failed!.error ?? "", /decision could not be recorded/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-20")!.status,
+    "done",
+  );
+  // The requester sees the request ended — the failure is the reply.
+  const out = await state.outbox(PERSONA, 0);
+  const failedRecord = out.find((o) => o.kind === "turn_failed");
+  assert.ok(failedRecord, "a terminal failure must reach the outbox");
+  assert.equal(failedRecord!.payload.input_id, "in-20");
+  // The queue is unblocked: a subsequent normal input completes.
+  state.addInput(PERSONA, "in-21", "hello");
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-21")!.status,
+    "done",
+  );
+});
+
+test("schedule.set with an invalid miss_policy is a recorded tool error, not a retried failure (CR3-B1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-22", "remind me");
+  const bad = new ScriptedProvider({
+    rounds: [
+      {
+        text: "scheduling",
+        calls: [
+          {
+            tool: "schedule.set",
+            request: {
+              wake_at: "2030-01-01T00:00:00Z",
+              miss_policy: "bogus",
+            },
+          },
+        ],
+      },
+      { text: "could not set that reminder" },
+    ],
+  });
+  const s = new Secretary(cfg(state, "h", { provider: bad }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const evs = await state.events(PERSONA, 0);
+  const tr = evs.find((e) => e.kind === "tool_result" && e.payload.error);
+  assert.ok(tr, "the tool error must be observable in the journal");
+  assert.match(String(tr!.payload.error), /miss_policy/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-22")!.status,
+    "done",
+    "the input resolves — no poison retry loop",
+  );
+  assert.equal(state.schedules.size, 0, "no schedule was created");
+  // The round-1 consultation saw the recorded tool error.
+  const r1 = bad.requests[1]!;
+  assert.match(
+    r1.messages.find((m) => m.role === "tool")!.content,
+    /miss_policy/,
+  );
+});
+
+test("schedule.set schedule_id reuse: identical pending replays; different contents or a fired row is a tool error (CR3-B2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const s = new Secretary(cfg(state));
+  await s.start();
+  const gen = s.generation!;
+  const req1 = {
+    schedule_id: "rem",
+    wake_at: "2000-01-01T00:00:00Z",
+    payload: { text: "hi" },
+    miss_policy: "coalesce",
+  };
+  const setSchedule = async (
+    inputId: string,
+    turnId: string,
+    request: Record<string, unknown>,
+  ) => {
+    state.addInput(PERSONA, inputId, "x");
+    await state.loadTurn(PERSONA, gen, turnId, 10);
+    await state.savePlan(PERSONA, gen, {
+      turnId,
+      round: 0,
+      text: "r",
+      calls: [{ tool: "schedule.set", request }],
+      usage: {},
+    });
+    try {
+      return await state.claimOperation(PERSONA, gen, {
+        operationId: `${turnId}:op:0`,
+        turnId,
+        tool: "schedule.set",
+        callIndex: 0,
+        request,
+      });
+    } finally {
+      // The secretary always resolves the turn after a claim — a 400 is
+      // recorded as a tool_result error and the turn commits complete.
+      await state.commitTurn(PERSONA, turnId, gen, {
+        outcome: "complete",
+        events: [],
+      });
+    }
+  };
+
+  // in-30 creates the schedule.
+  const c1 = await setSchedule("in-30", "t-1", req1);
+  assert.equal(c1.fresh, true);
+
+  // in-31 reuses the id with different contents → explicit 400; the
+  // existing row is untouched.
+  await assert.rejects(
+    setSchedule("in-31", "t-2", { ...req1, wake_at: "2030-01-01T00:00:00Z" }),
+    (e: unknown) => e instanceof StateError && e.status === 400,
+  );
+  const kept = state.schedules.get(`${PERSONA}|rem`)!;
+  assert.equal(
+    kept.wake_at,
+    new Date("2000-01-01T00:00:00Z").toISOString(),
+  );
+  assert.equal(kept.status, "pending");
+
+  // in-32 reuses the id with identical contents while pending → the
+  // existing row is returned; no duplicate, no false "newly decided".
+  const c3 = await setSchedule("in-32", "t-3", req1);
+  assert.equal(c3.fresh, true);
+  assert.equal(
+    [...state.schedules.values()].filter((x) => x.schedule_id === "rem")
+      .length,
+    1,
+  );
+
+  // Fire it: an identical reuse now names a dead row → honest error.
+  const fired = await state.dispatchSchedules(PERSONA, gen);
+  assert.equal(fired.length, 1);
+  await assert.rejects(setSchedule("in-33", "t-4", req1), (e: unknown) => {
+    return e instanceof StateError && e.status === 400;
+  });
+});
+
+test("the model-visible schedule.set spec does not expose schedule_id", async () => {
+  const spec = toolSpecs().find((t) => t.name === "schedule.set")!;
+  const props = Object.keys(
+    (spec.parameters as { properties: Record<string, unknown> }).properties,
+  );
+  assert.deepEqual(props.sort(), ["payload", "wake_at"]);
+});
+
+// --- Opus closure residuals (INTEGRATION-FOLLOWUP) -------------------------
+
+test("a provider error containing NUL still persists as a recorded terminal failure", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-40", "hi");
+  const poisoned: ModelProvider = {
+    name: "poisoned",
+    async *stream() {
+      throw new Error("provider blew up\0with NUL");
+    },
+  };
+  const s = new Secretary(
+    cfg(state, "h", { provider: poisoned, maxAttempts: 1 }),
+  );
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-40" && t.status === "failed",
+  );
+  assert.ok(failed, "the failure itself must persist");
+  assert.ok(!(failed!.error ?? "").includes("\0"), "error is sanitized");
+  assert.match(failed!.error ?? "", /provider blew up/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-40")!.status,
+    "done",
+    "the input resolves instead of poisoning the queue",
+  );
+  const out = await state.outbox(PERSONA, 0);
+  assert.ok(
+    out.some(
+      (o) => o.kind === "turn_failed" && o.payload.input_id === "in-40",
+    ),
+    "requester sees a terminal turn_failed record",
+  );
+});
+
+test("a NUL in reply text is normalized, not fatal; tool args stay strict", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-41", "hi");
+  const nulReply: ModelProvider = {
+    name: "nul-reply",
+    async *stream() {
+      yield { type: "text", delta: "hello\0 there" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: nulReply }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const input = state.inputs.find((i) => i.input_id === "in-41")!;
+  assert.equal(input.status, "done", "a NUL reply must not kill the work");
+  const out = await state.outbox(PERSONA, 0);
+  const reply = out.find(
+    (o) => o.kind === "turn_completed" && o.payload.input_id === "in-41",
+  )!;
+  assert.equal(
+    (reply.payload.output as { text: string }).text,
+    "hello there",
+    "stored reply text has the NUL normalized out",
+  );
 });

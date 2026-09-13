@@ -16,6 +16,23 @@ import type {
   WriterLease,
 } from "./types.ts";
 
+const MISS_POLICIES = new Set([
+  "fire_late",
+  "coalesce",
+  "expire",
+  "report_missed",
+]);
+
+/** True when any string in a JSON-shaped value contains NUL. */
+function hasNul(v: unknown): boolean {
+  if (typeof v === "string") return v.includes("\u0000");
+  if (Array.isArray(v)) return v.some(hasNul);
+  if (v !== null && typeof v === "object") {
+    return Object.values(v).some(hasNul);
+  }
+  return false;
+}
+
 /**
  * In-memory StateClient implementing the same contract semantics as the Go
  * service — fencing, idempotent claims, atomic internal effects, recovery —
@@ -240,16 +257,18 @@ export class FakeState implements StateClient {
   }
 
   /**
-   * Persist one input's decision before its effects run (F1). The input is
-   * derived from the running turn — the caller can never mis-assert it.
-   * One plan per input: identical resend returns the stored row, a
-   * conflicting decision is rejected 409 (semantic JSON compare).
+   * Persist one round of an input's decisions before that round's effects
+   * run (F1). The input is derived from the running turn — the caller can
+   * never mis-assert it. One plan per input, append-only rounds: resaving
+   * a recorded round is idempotent only when identical, a different
+   * decision at a recorded position or a skipped round is rejected 409.
    */
   async savePlan(
     persona: string,
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -263,22 +282,46 @@ export class FakeState implements StateClient {
     if (turn.generation !== generation || turn.status !== "running") {
       throw new StateError(409, "conflicting turn state");
     }
+    // Go rejects a decision containing NUL at SavePlan — jsonb cannot
+    // store it, and retrying can never succeed.
+    if (hasNul(req.text) || hasNul(req.calls) || hasNul(req.usage ?? {})) {
+      throw new StateError(
+        400,
+        "decision contains a NUL byte jsonb cannot store",
+      );
+    }
+    const decision = {
+      text: req.text,
+      calls: req.calls,
+      usage: req.usage ?? {},
+    };
     const key = `${persona}|${turn.input_id}`;
     const stored = this.plans.get(key);
     if (stored) {
-      const same =
-        stored.plan.text === req.text &&
-        jsonEqual(stored.plan.calls, req.calls) &&
-        jsonEqual(stored.plan.usage, req.usage ?? {});
-      if (!same) throw new StateError(409, "conflicting stored plan");
-      return { plan: stored, created: false };
+      const existing = stored.plan[req.round];
+      if (existing) {
+        const same =
+          existing.text === decision.text &&
+          jsonEqual(existing.calls, decision.calls) &&
+          jsonEqual(existing.usage, decision.usage);
+        if (!same) throw new StateError(409, "conflicting stored plan round");
+        return { plan: stored, created: false };
+      }
+      if (req.round !== stored.plan.length) {
+        throw new StateError(409, "plan round skips recorded rounds");
+      }
+      stored.plan.push(decision);
+      return { plan: stored, created: true };
+    }
+    if (req.round !== 0) {
+      throw new StateError(409, "first plan round must be round 0");
     }
     const plan: TurnPlan = {
       persona_id: persona,
       input_id: turn.input_id,
       turn_id: req.turnId,
       generation,
-      plan: { text: req.text, calls: req.calls, usage: req.usage ?? {} },
+      plan: [decision],
       created_at: new Date().toISOString(),
     };
     this.plans.set(key, plan);
@@ -303,6 +346,13 @@ export class FakeState implements StateClient {
       }
       return turn;
     }
+    // Parity with Go: event payloads land in jsonb — a NUL anywhere in the
+    // commit's events is a deterministic 400, not a retryable 500. The
+    // stored error is diagnostic: Go strips NUL from it, so do the same.
+    if (hasNul(req.events)) {
+      throw new StateError(400, "commit events contain a NUL byte jsonb cannot store");
+    }
+    req = { ...req, error: req.error === undefined ? req.error : req.error.replace(/\u0000/g, "") };
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -343,6 +393,20 @@ export class FakeState implements StateClient {
       } else {
         input.status = "done";
         input.done_at = new Date().toISOString();
+        // Parity with Go: a terminal failure must be visible to the
+        // requester — the failure itself is the reply.
+        this.outboxEntries.push({
+          persona_id: persona,
+          seq: ++this.outboxSeq,
+          kind: "turn_failed",
+          payload: {
+            turn_id: turnId,
+            input_id: input.input_id,
+            error: turn.error,
+          },
+          created_at: new Date().toISOString(),
+          delivered_at: null,
+        });
       }
     }
     turn.finished_at = new Date().toISOString();
@@ -377,6 +441,14 @@ export class FakeState implements StateClient {
     if (op.tool !== "schedule.set" && op.tool !== "journal.note") {
       throw new StateError(400, `unknown tool: ${op.tool}`);
     }
+    // A NUL in the request is a deterministic data error (jsonb cannot
+    // store it) — checked before the fence/plan checks like Go.
+    if (hasNul(op.request)) {
+      throw new StateError(
+        400,
+        `${op.tool} request contains a NUL byte jsonb cannot store`,
+      );
+    }
     this.mustHold(persona, generation);
     // Operations are attributed to the live turn: it must exist and be
     // running under this generation (Go claim enforces the same).
@@ -388,13 +460,13 @@ export class FakeState implements StateClient {
       throw new StateError(409, "conflicting turn state");
     }
     // Plan binding (F1): no plan → no claims. The claim must equal the
-    // recorded plan.calls[call_index] — an off-plan position, request, or
-    // tool can never start a fresh effect, whatever the caller sent.
+    // recorded call at the flat position across all rounds — an off-plan
+    // position, request, or tool can never start a fresh effect.
     const plan = this.plans.get(`${persona}|${turn.input_id}`);
     if (!plan) {
       throw new StateError(409, "no plan recorded for this input");
     }
-    const planned = plan.plan.calls[op.callIndex];
+    const planned = plan.plan.flatMap((r) => r.calls)[op.callIndex];
     if (
       !planned ||
       planned.tool !== op.tool ||
@@ -438,20 +510,59 @@ export class FakeState implements StateClient {
       completed_at: new Date().toISOString(),
     };
     if (op.tool === "schedule.set") {
+      const missPolicy = (op.request.miss_policy as string) ?? "fire_late";
+      if (!MISS_POLICIES.has(missPolicy)) {
+        throw new StateError(
+          400,
+          "schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed",
+        );
+      }
+      const wakeAt = new Date(String(op.request.wake_at));
+      if (Number.isNaN(wakeAt.getTime())) {
+        throw new StateError(400, "schedule.set requires RFC3339 wake_at");
+      }
       const sid = (op.request.schedule_id as string) ?? `sch-${Date.now()}`;
-      const sch: Schedule = this.schedules.get(`${persona}|${sid}`) ?? {
-        persona_id: persona,
-        schedule_id: sid,
-        wake_at: String(op.request.wake_at),
-        payload: (op.request.payload as Record<string, unknown>) ?? {},
-        miss_policy: "fire_late",
-        status: "pending",
-        claimed_generation: null,
-        created_at: new Date().toISOString(),
-        fired_at: null,
-      };
-      this.schedules.set(`${persona}|${sid}`, sch);
-      operation.response = { schedule: sch };
+      const existing = this.schedules.get(`${persona}|${sid}`);
+      if (existing) {
+        // Crash replay never reaches here — receipts are keyed by plan
+        // position. An identical request over a pending row is a true
+        // idempotent set; anything else must not report a wake that was
+        // not created.
+        const identical =
+          new Date(existing.wake_at).getTime() === wakeAt.getTime() &&
+          existing.miss_policy === missPolicy &&
+          jsonEqual(
+            existing.payload,
+            (op.request.payload as Record<string, unknown>) ?? {},
+          );
+        if (!identical) {
+          throw new StateError(
+            400,
+            `schedule.set schedule_id ${sid} already exists with different contents`,
+          );
+        }
+        if (existing.status !== "pending") {
+          throw new StateError(
+            400,
+            `schedule.set schedule_id ${sid} is already ${existing.status}`,
+          );
+        }
+        operation.response = { schedule: existing };
+      } else {
+        const sch: Schedule = {
+          persona_id: persona,
+          schedule_id: sid,
+          wake_at: wakeAt.toISOString(),
+          payload: (op.request.payload as Record<string, unknown>) ?? {},
+          miss_policy: missPolicy as Schedule["miss_policy"],
+          status: "pending",
+          claimed_generation: null,
+          created_at: new Date().toISOString(),
+          fired_at: null,
+        };
+        this.schedules.set(`${persona}|${sid}`, sch);
+        operation.response = { schedule: sch };
+      }
     } else {
       const ev: Event = {
         persona_id: persona,

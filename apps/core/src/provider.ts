@@ -11,6 +11,11 @@ export interface ChatMessage {
   /** Present on tool-result messages. */
   toolCallId?: string;
   name?: string;
+  /**
+   * Present on assistant messages that carry this round's decided tool
+   * calls — used to feed committed tool results back to the model.
+   */
+  toolCalls?: ToolCall[];
 }
 
 export interface ToolSpec {
@@ -33,6 +38,12 @@ export type ModelEvent =
 export interface ModelRequest {
   personaId: string;
   turnId: string;
+  /**
+   * Which model consultation this is within the turn: 0 is the initial
+   * decision; each round whose tool calls have been durably executed is
+   * fed back as messages and consulted as the next round.
+   */
+  round: number;
   messages: ChatMessage[];
   tools: ToolSpec[];
   signal?: AbortSignal;

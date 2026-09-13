@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,6 +40,45 @@ var (
 	ErrUnknownTool     = errors.New("unknown tool")
 	ErrBadRequest      = errors.New("bad request")
 )
+
+// dataErr maps deterministic PostgreSQL data errors — class 22 data
+// exceptions (e.g. 22P05 unsupported Unicode escape) and 23514 check
+// violations — to ErrBadRequest. They are caused by the submitted
+// content, are never transient, and must surface as 400 so the caller
+// records a tool/decision error instead of retrying the same write
+// forever. (CR3-B1 repair, ported from 0cd5410.)
+func dataErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) &&
+		(strings.HasPrefix(pgErr.Code, "22") || pgErr.Code == "23514") {
+		return fmt.Errorf("%w: %s", ErrBadRequest, pgErr.Message)
+	}
+	return err
+}
+
+// hasNUL reports whether any string in v contains NUL — PostgreSQL jsonb
+// cannot store it (22P05). Checked explicitly so the failure is a clean
+// 400 at the first persistence boundary rather than a wrapped driver
+// error at a later one.
+func hasNUL(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case map[string]any:
+		for _, e := range t {
+			if hasNUL(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range t {
+			if hasNUL(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 type Persona struct {
 	PersonaID   string    `json:"persona_id"`
@@ -169,25 +209,29 @@ type PlanCall struct {
 	Request map[string]any `json:"request"`
 }
 
-// Decision is what the model decided for an input: reply text, the ordered
-// tool calls to execute, and reported usage. It is persisted before any
-// effect runs; recovery continues it instead of re-planning.
+// Decision is what the model decided in one round of a turn: the text it
+// produced, the ordered tool calls to execute, and reported usage. Each
+// round is persisted before any of its effects run; recovery continues it
+// instead of re-planning.
 type Decision struct {
 	Text  string         `json:"text"`
 	Calls []PlanCall     `json:"calls"`
 	Usage map[string]any `json:"usage"`
 }
 
-// TurnPlan is the durable record of one input's decision. One row per input,
-// immutable once written: a replayed identical save returns the stored row,
-// a conflicting save is rejected.
+// TurnPlan is the durable record of one input's decisions. One row per
+// input; Plan is the append-only list of rounds — a recorded round never
+// changes, a new round may only be appended by the live turn. A replayed
+// identical save returns the stored row; a conflicting save is rejected.
+// A round with zero calls is the turn's final decision — its text is the
+// reply, informed by the committed tool results of earlier rounds.
 type TurnPlan struct {
-	PersonaID  string    `json:"persona_id"`
-	InputID    string    `json:"input_id"`
-	TurnID     string    `json:"turn_id"`
-	Generation int64     `json:"generation"`
-	Plan       Decision  `json:"plan"`
-	CreatedAt  time.Time `json:"created_at"`
+	PersonaID  string     `json:"persona_id"`
+	InputID    string     `json:"input_id"`
+	TurnID     string     `json:"turn_id"`
+	Generation int64      `json:"generation"`
+	Plan       []Decision `json:"plan"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 // LoadResult is one coarse read: the running or freshly begun turn, its
@@ -483,7 +527,7 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		return stored, false, nil
 	}
 	if err != nil {
-		return Input{}, false, fmt.Errorf("submit input: %w", err)
+		return Input{}, false, fmt.Errorf("submit input: %w", dataErr(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Input{}, false, err
@@ -528,12 +572,23 @@ func (s *Store) GetInput(ctx context.Context, personaID, inputID string) (Input,
 	return in, turn, err
 }
 
-// SavePlan durably records the model's decision for the input a running
-// turn is resolving — the "decision before effects" boundary (F1). The
-// caller names the turn; the input is derived server-side from the turn row
-// so it cannot be mis-asserted. One plan per input, immutable: replaying an
-// identical save returns the stored row; a conflicting save conflicts.
-func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generation int64, decision Decision) (TurnPlan, bool, error) {
+// SavePlan durably records one round of the model's decisions for the input
+// a running turn is resolving — the "decision before effects" boundary (F1),
+// extended so tool results can be fed back for a truthful final reply: the
+// model may be consulted again after a round's effects commit, and each new
+// round is appended to the same durable record before its own effects run.
+//
+// The caller names the turn and the round index; the input is derived
+// server-side from the turn row so it cannot be mis-asserted. The stored
+// plan is append-only: re-saving an existing round is idempotent only when
+// identical (a lost-response resend), a different decision at a recorded
+// position or a gap in the round sequence is a contract violation (409).
+// Rounds may be appended by a later attempt of the same input — the plan
+// belongs to the input's resolution lineage, not to one attempt.
+func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generation int64, round int64, decision Decision) (TurnPlan, bool, error) {
+	if round < 0 {
+		return TurnPlan{}, false, fmt.Errorf("%w: round must be >= 0", ErrBadRequest)
+	}
 	if decision.Calls == nil {
 		decision.Calls = []PlanCall{}
 	}
@@ -548,9 +603,21 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 			decision.Calls[i].Request = map[string]any{}
 		}
 	}
-	planJSON, err := json.Marshal(decision)
+	decJSON, err := json.Marshal(decision)
 	if err != nil {
 		return TurnPlan{}, false, err
+	}
+	// The plan is the first persistence boundary for model output: a NUL
+	// anywhere in it cannot be stored as jsonb, and retrying the save can
+	// never succeed. Reject it as a deterministic decision error here —
+	// before any effect boundary is reached. (CR3-B1 repair, ported from
+	// 0cd5410.)
+	var genericDecision any
+	if err := json.Unmarshal(decJSON, &genericDecision); err != nil {
+		return TurnPlan{}, false, err
+	}
+	if hasNUL(genericDecision) {
+		return TurnPlan{}, false, fmt.Errorf("%w: decision contains a NUL byte jsonb cannot store", ErrBadRequest)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -577,48 +644,82 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	if turnGen != generation || turnStatus != "running" {
 		return TurnPlan{}, false, ErrTurnConflict
 	}
-	var p TurnPlan
+	// Serialize appends against other writers on this row.
+	var storedRounds int64
+	var haveRow bool
 	err = tx.QueryRow(ctx, `
-		INSERT INTO core_turn_plans (persona_id, input_id, turn_id, generation, plan)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (persona_id, input_id) DO NOTHING
-		RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
-		personaID, inputID, turnID, generation, planJSON).
-		Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// A plan already exists for this input. Idempotent only when the
-		// decision is identical — a different plan under the same input is
-		// a contract violation, never a supersession.
-		var same bool
-		if err := tx.QueryRow(ctx, `
-			SELECT plan = $3::jsonb FROM core_turn_plans
-			WHERE persona_id = $1 AND input_id = $2`,
-			personaID, inputID, planJSON).Scan(&same); err != nil {
-			return TurnPlan{}, false, err
+		SELECT COALESCE(jsonb_array_length(plan), 0) FROM core_turn_plans
+		WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&storedRounds)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if round != 0 {
+			return TurnPlan{}, false, fmt.Errorf("%w: first plan round must be round 0", ErrTurnConflict)
 		}
-		if !same {
-			return TurnPlan{}, false, fmt.Errorf("%w: input already has a different recorded plan", ErrTurnConflict)
-		}
-		stored, err := s.planForInput(ctx, tx, personaID, inputID)
+	case err != nil:
+		return TurnPlan{}, false, err
+	default:
+		haveRow = true
+	}
+	var p TurnPlan
+	if !haveRow {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO core_turn_plans (persona_id, input_id, turn_id, generation, plan)
+			VALUES ($1, $2, $3, $4, jsonb_build_array($5::jsonb))
+			RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
+			personaID, inputID, turnID, generation, decJSON).
+			Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
 		if err != nil {
-			return TurnPlan{}, false, err
+			return TurnPlan{}, false, fmt.Errorf("save plan: %w", dataErr(err))
 		}
-		if stored == nil {
-			return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
-		}
-		p = *stored
 		if err := tx.Commit(ctx); err != nil {
 			return TurnPlan{}, false, err
 		}
-		return p, false, nil
+		return p, true, nil
 	}
+	switch {
+	case round < storedRounds:
+		// Re-saving a recorded round is idempotent only when identical —
+		// a different decision at a recorded position is a contract
+		// violation, never a supersession.
+		var same bool
+		if err := tx.QueryRow(ctx, `
+			SELECT plan->($3::int) = $4::jsonb FROM core_turn_plans
+			WHERE persona_id = $1 AND input_id = $2`,
+			personaID, inputID, round, decJSON).Scan(&same); err != nil {
+			return TurnPlan{}, false, err
+		}
+		if !same {
+			return TurnPlan{}, false, fmt.Errorf("%w: round %d already recorded with a different decision", ErrTurnConflict, round)
+		}
+	case round == storedRounds:
+		err = tx.QueryRow(ctx, `
+			UPDATE core_turn_plans SET plan = plan || $3::jsonb
+			WHERE persona_id = $1 AND input_id = $2
+			RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
+			personaID, inputID, json.RawMessage("["+string(decJSON)+"]")).
+			Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
+		if err != nil {
+			return TurnPlan{}, false, fmt.Errorf("append plan round: %w", dataErr(err))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return TurnPlan{}, false, err
+		}
+		return p, true, nil
+	default:
+		return TurnPlan{}, false, fmt.Errorf("%w: plan round %d skips recorded rounds (have %d)", ErrTurnConflict, round, storedRounds)
+	}
+	stored, err := s.planForInput(ctx, tx, personaID, inputID)
 	if err != nil {
-		return TurnPlan{}, false, fmt.Errorf("save plan: %w", err)
+		return TurnPlan{}, false, err
+	}
+	if stored == nil {
+		return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TurnPlan{}, false, err
 	}
-	return p, true, nil
+	return *stored, false, nil
 }
 
 // planForInput returns the recorded decision for an input, or nil.
@@ -796,6 +897,11 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if req.Outcome != "complete" && req.Outcome != "fail" {
 		return nil, fmt.Errorf("%w: outcome must be complete or fail", ErrBadRequest)
 	}
+	// Error text is diagnostic, not authoritative content: strip bytes PG
+	// text/jsonb cannot hold so a poisoned provider message cannot make the
+	// failure itself unpersistable and loop attempts forever. Normalized
+	// before the commit_request marshals so replays compare identically.
+	req.Error = strings.ReplaceAll(req.Error, "\x00", "")
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -895,6 +1001,19 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				UPDATE core_inputs SET status = 'done', done_at = now()
 				WHERE persona_id = $1 AND input_id = $2`, personaID, t.InputID); err != nil {
 				return nil, err
+			}
+			// A terminal failure resolves the input — the requester must see
+			// the request ended, not wait silently. The failure is the reply.
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO core_outbox (persona_id, seq, kind, payload)
+				SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'turn_failed', $2
+				FROM core_outbox WHERE persona_id = $1::uuidv7`,
+				personaID, map[string]any{
+					"turn_id":  turnID,
+					"input_id": t.InputID,
+					"error":    req.Error,
+				}); err != nil {
+				return nil, fmt.Errorf("append outbox: %w", err)
 			}
 		}
 	}
@@ -1094,6 +1213,11 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		if missPolicy == "" {
 			missPolicy = "fire_late"
 		}
+		switch missPolicy {
+		case "fire_late", "coalesce", "expire", "report_missed":
+		default:
+			return nil, false, fmt.Errorf("%w: schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed", ErrBadRequest)
+		}
 		var sch Schedule
 		err = tx.QueryRow(ctx, `
 			INSERT INTO core_schedules (persona_id, schedule_id, wake_at, payload, miss_policy, status)
@@ -1103,15 +1227,34 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			personaID, scheduleID, wakeAt, payload, missPolicy).
 			Scan(&sch.PersonaID, &sch.ScheduleID, &sch.WakeAt, &sch.Payload, &sch.MissPolicy, &sch.Status, &sch.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Schedule already exists under this id — replay it.
+			// The id is taken. Crash replay never reaches here — the
+			// operation receipt is keyed by plan position — so a conflict
+			// is a fresh claim reusing the id. An identical request over a
+			// still-pending row is a true idempotent set; anything else
+			// (different contents, or a fired/cancelled/expired row) must
+			// not report a wake that was not created. (CR3-B2 repair,
+			// ported from 0cd5410.)
 			err = tx.QueryRow(ctx, `
 				SELECT persona_id, schedule_id, wake_at, payload, miss_policy, status, created_at
 				FROM core_schedules WHERE persona_id = $1 AND schedule_id = $2`,
 				personaID, scheduleID).
 				Scan(&sch.PersonaID, &sch.ScheduleID, &sch.WakeAt, &sch.Payload, &sch.MissPolicy, &sch.Status, &sch.CreatedAt)
+			if err != nil {
+				return nil, false, fmt.Errorf("schedule.set: %w", dataErr(err))
+			}
+			identical := sch.WakeAt.Equal(wakeAt) &&
+				sch.MissPolicy == missPolicy &&
+				jsonbEqual(sch.Payload, payload)
+			if !identical {
+				return nil, false, fmt.Errorf("%w: schedule.set schedule_id %q already exists with different contents", ErrBadRequest, scheduleID)
+			}
+			if sch.Status != "pending" {
+				return nil, false, fmt.Errorf("%w: schedule.set schedule_id %q is already %s", ErrBadRequest, scheduleID, sch.Status)
+			}
+			return map[string]any{"schedule": sch}, true, nil
 		}
 		if err != nil {
-			return nil, false, fmt.Errorf("schedule.set: %w", err)
+			return nil, false, fmt.Errorf("schedule.set: %w", dataErr(err))
 		}
 		return map[string]any{"schedule": sch}, true, nil
 	case "journal.note":
@@ -1127,7 +1270,7 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			RETURNING seq`,
 			personaID, turnID, map[string]any{"text": text}).Scan(&seq)
 		if err != nil {
-			return nil, false, fmt.Errorf("journal.note: %w", err)
+			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
 	default:
@@ -1155,6 +1298,11 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	if request == nil {
 		request = map[string]any{}
+	}
+	// The request is about to be bound against the recorded plan as jsonb:
+	// a NUL in it is a deterministic data error, never a transient one.
+	if hasNUL(request) {
+		return Operation{}, false, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1185,23 +1333,23 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	// The claim must be an entry of the input's recorded plan: the decision
 	// is durable before effects, so an off-plan call — absent plan, index
 	// out of range, or a different tool/request at that position — is a
-	// contract violation, never a fresh effect.
+	// contract violation, never a fresh effect. call_index addresses a flat
+	// position across every recorded round's calls in order.
 	if callIndex < 0 {
 		return Operation{}, false, fmt.Errorf("%w: call_index must be >= 0", ErrBadRequest)
 	}
-	var planned bool
-	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(
-			((plan->'calls'->($3::int))->>'tool') = $4
-			AND ((plan->'calls'->($3::int))->'request') = $5::jsonb,
-			false)
-		FROM core_turn_plans WHERE persona_id = $1 AND input_id = $2`,
-		personaID, inputID, callIndex, tool, request).Scan(&planned)
-	if errors.Is(err, pgx.ErrNoRows) {
-		planned = false
-	} else if err != nil {
-		return Operation{}, false, err
+	plan, err := s.planForInput(ctx, tx, personaID, inputID)
+	if err != nil {
+		return Operation{}, false, dataErr(err)
 	}
+	var flat []PlanCall
+	if plan != nil {
+		for _, round := range plan.Plan {
+			flat = append(flat, round.Calls...)
+		}
+	}
+	planned := callIndex < len(flat) && flat[callIndex].Tool == tool &&
+		jsonbEqual(flat[callIndex].Request, request)
 	if !planned {
 		return Operation{}, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
 	}
@@ -1254,7 +1402,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		return op, false, nil
 	}
 	if err != nil {
-		return Operation{}, false, fmt.Errorf("claim operation: %w", err)
+		return Operation{}, false, fmt.Errorf("claim operation: %w", dataErr(err))
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
@@ -1269,7 +1417,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			RETURNING status, response, completed_at`,
 			personaID, operationID, generation, response).
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
-			return Operation{}, false, fmt.Errorf("finish internal operation: %w", err)
+			return Operation{}, false, fmt.Errorf("finish internal operation: %w", dataErr(err))
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
