@@ -4,21 +4,21 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { type CDPSession, chromium } from "@playwright/test";
+import {
+  buildProductionArtifactOnce,
+  webDirectory,
+} from "./production-artifact-build.ts";
 
 const run = promisify(execFile);
-const scriptsDirectory = dirname(fileURLToPath(import.meta.url));
-const webDirectory = resolve(scriptsDirectory, "..");
 const wranglerEntry = resolve(
   webDirectory,
   "node_modules/wrangler/bin/wrangler.js",
 );
 const productionWranglerConfig = resolve(webDirectory, "wrangler.jsonc");
-const runtimeReleaseSha = "fedcba9876543210fedcba9876543210fedcba98";
 
 test("readiness ignores raw 404s until the Worker denial is canonical", async () => {
   const responses = [
@@ -68,25 +68,17 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
   timeout: 120_000,
 }, async () => {
   const runtimeDirectory = await mkdtemp(resolve(tmpdir(), "sumi-workerd-"));
-  const artifactDirectory = resolve(runtimeDirectory, "dist");
   const wranglerConfig = resolve(runtimeDirectory, "wrangler.jsonc");
   let cancellationOrigin: CancellationOrigin | undefined;
   try {
-    await run("pnpm", ["run", "build"], {
-      cwd: webDirectory,
-      env: {
-        ...process.env,
-        SUMI_RELEASE_SHA: runtimeReleaseSha,
-        SUMI_WEB_DIST_DIR: artifactDirectory,
-      },
-      maxBuffer: 16 * 1024 * 1024,
-    });
+    const artifact = await buildProductionArtifactOnce();
+    const artifactDirectory = artifact.directory;
     await writeRuntimeWranglerConfig(wranglerConfig, artifactDirectory);
 
     const releaseManifest = JSON.parse(
       await readFile(resolve(artifactDirectory, "release.json"), "utf8"),
     ) as { release_sha?: unknown };
-    assert.deepEqual(releaseManifest, { release_sha: runtimeReleaseSha });
+    assert.deepEqual(releaseManifest, { release_sha: artifact.releaseSha });
 
     const version = await run(process.execPath, [wranglerEntry, "--version"], {
       cwd: runtimeDirectory,

@@ -1,0 +1,43 @@
+name: Web and shared TypeScript checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  web-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Check shared client and Web types
+        run: |
+          corepack pnpm --filter @sumi/api-client check-types
+          corepack pnpm --filter @sumi/web check-types
+
+      - name: Verify shared API contracts
+        run: corepack pnpm --filter @sumi/api-client test
+
+      - name: Run Web tests
+        run: corepack pnpm --filter @sumi/web test
