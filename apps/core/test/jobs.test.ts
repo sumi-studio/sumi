@@ -48,13 +48,20 @@ class ScriptedProvider implements ModelProvider {
   }) {
     this.script = script;
   }
-  async *stream(_req: ModelRequest): AsyncIterable<ModelEvent> {
+  async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
     this.consultations++;
+    // Multi-round turns re-consult after committed tool results: the
+    // script's calls are the round-0 decision; later rounds are text-only
+    // so the turn ends instead of re-deciding the same call.
+    const round = req.round ?? 0;
     yield { type: "text", delta: this.script.text };
-    for (const [i, c] of (this.script.calls ?? []).entries()) {
+    for (const [i, c] of (round === 0
+      ? (this.script.calls ?? [])
+      : []
+    ).entries()) {
       yield {
         type: "tool_call",
-        call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+        call: { id: `call-${round}-${i}`, name: c.tool, arguments: c.request },
       };
     }
     yield { type: "done", usage: {} };
@@ -268,7 +275,9 @@ test("secretary job.start creates a queued job with a derived id", async () => {
   assert.equal(jobs[0]?.job_id, "op:in-1:0");
   assert.equal(jobs[0]?.status, "queued");
   assert.equal(jobs[0]?.kind, "subprocess");
-  assert.equal(provider.consultations, 1);
+  // Multi-round: round 0 decides job.start; round 1 is consulted for the
+  // final reply informed by the committed tool result.
+  assert.equal(provider.consultations, 2);
 });
 
 // A job_completed notification is an ordinary input: the same continuing

@@ -59,16 +59,30 @@ async function childMain() {
 
   class ScriptedProvider {
     name = "scripted";
-    async *stream() {
-      console.log("[child] MODEL CONSULTED");
-      yield { type: "text", delta: script.text };
-      for (const [i, c] of (script.calls ?? []).entries()) {
+    async *stream(req) {
+      // Multi-round turns re-consult after committed tool results: the
+      // script may be {rounds:[...]} (e2e-plan convention) or a flat
+      // {text,calls} — the flat form is the round-0 decision; later rounds
+      // default to text-only so the turn ends.
+      const round = req.round ?? 0;
+      console.log(`[child] MODEL CONSULTED round=${round}`);
+      const decision = script.rounds
+        ? (script.rounds[round] ?? { text: "", calls: [] })
+        : round === 0
+          ? script
+          : { text: "", calls: [] };
+      yield { type: "text", delta: decision.text ?? "" };
+      for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
           type: "tool_call",
-          call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+          call: {
+            id: `call-${round}-${i}`,
+            name: c.tool,
+            arguments: c.request,
+          },
         };
       }
-      yield { type: "done", usage: { scripted: true } };
+      yield { type: "done", usage: { scripted: true, round } };
     }
   }
 

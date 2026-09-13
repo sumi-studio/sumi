@@ -123,7 +123,11 @@ export interface PlanCall {
   request: Json;
 }
 
-/** The model's decision for one input, persisted before any effect runs. */
+/**
+ * The model's decision in one round of a turn, persisted before any of that
+ * round's effects run. A round with zero calls is final — its text is the
+ * reply, informed by the committed tool results of earlier rounds.
+ */
 export interface Decision {
   text: string;
   calls: PlanCall[];
@@ -131,15 +135,18 @@ export interface Decision {
 }
 
 /**
- * Durable record of one input's decision — one row per input, immutable.
- * A retried attempt continues this plan instead of re-planning.
+ * Durable record of one input's decisions — one row per input. `plan` is
+ * the append-only list of rounds: a recorded round never changes, a new
+ * round may only be appended by the live turn. A retried attempt continues
+ * the recorded rounds instead of re-planning them; the model is consulted
+ * again only for the first round not yet recorded.
  */
 export interface TurnPlan {
   persona_id: string;
   input_id: string;
   turn_id: string;
   generation: number;
-  plan: Decision;
+  plan: Decision[];
   created_at: string;
 }
 
@@ -164,6 +171,12 @@ export interface CommitRequest {
   usage?: Json;
   error?: string;
   retryable?: boolean;
+  /**
+   * Provider-supplied retry pacing (Retry-After) for a retryable
+   * failure: the requeue's not_before is at least now+retry_after_ms
+   * (server clamps). Absent/0 = the default per-attempt backoff.
+   */
+  retry_after_ms?: number;
 }
 
 /**

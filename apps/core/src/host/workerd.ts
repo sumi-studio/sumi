@@ -21,14 +21,15 @@
  *   SUMI_STATE_URL    — base URL of the Go state service
  *   SUMI_MODEL_*      — provider config (same as local host)
  *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
+ *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
+ *                       binding is missing (default 30min)
  *   SECRETARY         — Durable Object namespace binding
  * Persona capability tokens are provisioned per-persona via the admin
  * surface (POST /internal/core/personas) — the worker stores them in its
  * own secret store, never in DO storage.
  */
 
-import type { ModelProvider } from "../provider.ts";
-import { MockProvider } from "../providers/mock.ts";
+import { providerFromEnv } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -59,11 +60,29 @@ interface EnvLike {
 /** DO-storage key for the persona this object serves (routing metadata). */
 const PERSONA_KEY = "sumi/persona_id";
 const DEFAULT_HEARTBEAT_MS = 30_000;
+// While a persona's token binding is missing, a heartbeat-paced retry
+// only loops the same error — but a permanently disarmed DO never
+// recovers once the binding lands (fresh-review F5). The dormant cadence
+// is long: provisioning is a rare operator action, and a fetch wake or a
+// new activation still drains immediately.
+const DEFAULT_DORMANT_REARM_MS = 30 * 60_000;
+
+/**
+ * Thrown when no SUMI_PERSONA_TOKEN_* binding exists for a persona — a
+ * provisioning gap no amount of retrying fixes. alarm() logs it once and
+ * re-arms on the long dormant cadence instead of a per-heartbeat error
+ * loop or a permanent disarm.
+ */
+export class MissingPersonaTokenError extends Error {
+  constructor(persona: string) {
+    super(`missing persona token binding for ${persona}`);
+    this.name = "MissingPersonaTokenError";
+  }
+}
 
 function envToken(env: EnvLike, persona: string): string {
   const v = env[`SUMI_PERSONA_TOKEN_${persona.replace(/-/g, "_")}`];
-  if (typeof v !== "string" || !v)
-    throw new Error(`missing persona token binding for ${persona}`);
+  if (typeof v !== "string" || !v) throw new MissingPersonaTokenError(persona);
   return v;
 }
 
@@ -72,6 +91,7 @@ export class SecretaryObject {
   private personaId = "";
   private drainPromise: Promise<void> | null = null;
   private wakeAgain = false;
+  private missingTokenLogged = false;
   private readonly ctx: AlarmState;
   private readonly env: EnvLike;
 
@@ -85,9 +105,18 @@ export class SecretaryObject {
     return Number.isFinite(v) && v >= 250 ? v : DEFAULT_HEARTBEAT_MS;
   }
 
+  private dormantRearmMs(): number {
+    const v = Number(this.env.SUMI_DORMANT_REARM_MS);
+    return Number.isFinite(v) && v >= 1_000 ? v : DEFAULT_DORMANT_REARM_MS;
+  }
+
   /** Build the per-persona secretary; overridable for tests. */
   protected newSecretary(personaId: string): Secretary {
-    const provider: ModelProvider = new MockProvider(); // real provider wiring lands with secrets
+    // Same SUMI_MODEL_* contract as the local host — a persona's secretary
+    // runs the identical provider config under workerd and Node.
+    const provider = providerFromEnv((n) =>
+      typeof this.env[n] === "string" ? (this.env[n] as string) : undefined,
+    );
     return new Secretary({
       personaId,
       holderId: `workerd-${personaId}`,
@@ -112,8 +141,14 @@ export class SecretaryObject {
       );
     }
     if (!this.personaId) {
+      // Construct before persisting: an unprovisioned persona (no token
+      // binding, bad provider config) must not arm a heartbeat that can
+      // never succeed — the persona id lands in storage only once the
+      // secretary could actually be built. (Review-A F2 / B F3.)
+      const s = this.newSecretary(personaId);
       this.personaId = personaId;
       await this.ctx.storage.put(PERSONA_KEY, personaId);
+      this.secretary = s;
     }
     this.secretary ??= this.newSecretary(personaId);
     return this.secretary;
@@ -150,13 +185,35 @@ export class SecretaryObject {
       (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
       "";
     if (!persona) return; // never activated — nothing to re-arm either
+    let rearmIn = this.heartbeatMs();
     try {
       const s = await this.build(persona);
+      this.missingTokenLogged = false;
       await this.requestDrain(s);
+    } catch (e) {
+      if (e instanceof MissingPersonaTokenError) {
+        // The binding is absent until provisioned — re-arming at
+        // heartbeat pace only loops the same uncaught error, but
+        // disarming entirely leaves an activated persona asleep forever
+        // (fresh-review F5). Log once and re-arm on the long dormant
+        // cadence: no model/state calls while the token is absent, yet
+        // the persona recovers on its own once the binding exists.
+        rearmIn = this.dormantRearmMs();
+        if (!this.missingTokenLogged) {
+          this.missingTokenLogged = true;
+          console.log(
+            `[core] no persona token binding for ${persona}; dormant re-arm in ${rearmIn}ms`,
+          );
+        }
+      } else {
+        console.log(
+          `[core] alarm error: ${e instanceof Error ? e.message : e}`,
+        );
+      }
     } finally {
-      // Re-arm even on drain failure: an error must not permanently disarm
-      // the persona's writer.
-      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
+      // Re-arm on every outcome — nothing must permanently disarm an
+      // activated writer.
+      await this.ctx.storage.setAlarm(Date.now() + rearmIn);
     }
   }
 
@@ -207,6 +264,12 @@ export class SecretaryObject {
       }
       await s.stop();
     } catch (e) {
+      // A mid-drain error (state outage, transient step failure) leaves
+      // the Secretary running and the lease held — deliberately: the next
+      // alarm's start() renews the same generation and continues the
+      // in-flight turn instead of fencing it into a new attempt
+      // (fresh-review F6). A real fence loss still surfaces via
+      // FencedError on the next step.
       console.log(
         `[core] drain error: ${e instanceof Error ? (e.stack ?? e.message) : e}`,
       );
