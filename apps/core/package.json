@@ -10,6 +10,7 @@
     "check-types": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.ts",
     "test:e2e": "node scripts/e2e-local.mjs",
+    "test:e2e:workerd": "node scripts/e2e-workerd.mjs",
     "dev:local": "node src/host/local.ts",
     "dev:worker": "wrangler dev --config wrangler.jsonc"
   },

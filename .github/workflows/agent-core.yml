@@ -1,0 +1,77 @@
+name: Agent core checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-core-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  agent-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Ephemeral Postgres mirrors the local sumi-core-alpha-pg fixture
+    # (sumi/sumi-dev, db "sumi"). state-dev applies migrations on startup, so
+    # no separate migrate step or seeded data is needed.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sumi
+          POSTGRES_PASSWORD: sumi-dev
+          POSTGRES_DB: sumi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sumi -d sumi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SUMI_TEST_DB_URL: postgres://sumi:sumi-dev@localhost:5432/sumi?sslmode=disable
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+
+      - name: Install locked dependencies
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile --filter @sumi/agent-core...
+
+      - name: Check agent core types
+        run: corepack pnpm --filter @sumi/agent-core check-types
+
+      - name: Run agent core unit tests
+        run: corepack pnpm --filter @sumi/agent-core test
+
+      - name: Run local core e2e (real Go state service + real PostgreSQL)
+        run: corepack pnpm --filter @sumi/agent-core test:e2e
+
+      - name: Run workerd smoke (local wrangler dev + real state service)
+        run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
+
+      # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
+      # real model calls or secrets, no Cloudflare deployment, no remote
+      # database. The workerd smoke exercises the Durable Object wake path via
+      # local wrangler dev; deployed-worker alarm scheduling is not covered.
