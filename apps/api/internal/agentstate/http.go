@@ -159,8 +159,7 @@ func storeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 	case isDataError(err):
 		// Deterministic data errors (class 22, 23514) can never succeed on
-		// retry; report them as 400, not a transient-looking 500. (CR3-B1
-		// repair, ported from 0cd5410.)
+		// retry; report them as 400, not a transient-looking 500.
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal error")

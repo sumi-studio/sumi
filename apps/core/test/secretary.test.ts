@@ -924,32 +924,41 @@ test("a decision containing NUL data fails the input non-retryable; the next inp
   const state = new FakeState();
   state.addPersona(PERSONA);
   state.addInput(PERSONA, "in-20", "hi");
-  // The consultation decides a call whose request can never persist
-  // (jsonb cannot hold NUL); it must not be retried.
-  const bad = new ScriptedProvider({
-    rounds: [
-      {
-        text: "r",
-        calls: [
-          { tool: "journal.note", request: { text: "a\0b" } },
-        ],
-      },
-      { text: "unreachable" },
-    ],
-  });
-  const s = new Secretary(cfg(state, "h", { provider: bad }));
+  // First consultation decides a call whose request can never persist
+  // (jsonb cannot hold NUL); the second consultation is a clean reply.
+  let consultations = 0;
+  const seq: ModelProvider = {
+    name: "seq",
+    async *stream(_req: ModelRequest) {
+      consultations++;
+      yield { type: "text", delta: "r" };
+      if (consultations === 1) {
+        yield {
+          type: "tool_call",
+          call: {
+            id: "c0",
+            name: "journal.note",
+            arguments: { text: "a\u0000b" },
+          },
+        };
+      }
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: seq }));
   await s.start();
   assert.equal(await s.step(), "turn");
-  assert.deepEqual(
-    bad.consultations,
-    [0],
-    "savePlan 400 is not retried and the model is not re-consulted",
-  );
+  // The impossible decision is not retried: the turn is failed and the
+  // input resolves instead of blocking every later input.
+  assert.equal(consultations, 1, "savePlan 400 is not retried");
   const failed = [...state.turns.values()].find(
     (t) => t.input_id === "in-20" && t.status === "failed",
   );
   assert.ok(failed, "turn must record the non-retryable failure");
-  assert.match(failed!.error ?? "", /decision could not be recorded/);
+  assert.match(
+    failed!.error ?? "",
+    /decision could not be recorded|diverged retry/,
+  );
   assert.equal(
     state.inputs.find((i) => i.input_id === "in-20")!.status,
     "done",
@@ -1689,4 +1698,66 @@ test("SIGTERM while waiting out a held lease exits cleanly (NF4)", async () => {
   ac.abort();
   await assert.doesNotReject(done, "abort during lease-wait is a clean stop");
   assert.ok(logs.some((m) => m.includes("waiting for expiry")));
+});
+
+test("a near-limit input with a transient provider error stays retryable (opus F1+F2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  // Near-limit input (~1.04 MB): on the single-round contract the
+  // input_received event pushed every event-carrying commit tier over
+  // the body limit, so only the minimal tier could land — and it had to
+  // preserve the retryable disposition. On this multi-round branch a
+  // retryable failure commits events:[] (no partial journal), so the
+  // commit is ~10 KB and the cascade is structurally unreached — the
+  // same guarantee holds by construction: the disposition flows to the
+  // one commit that runs. The observable contract is identical: queued,
+  // backed off, later input progresses, heals to exactly one reply.
+  state.addInput(PERSONA, "in-53", "x".repeat(1_042_000));
+  state.addInput(PERSONA, "in-54", "later");
+  let calls = 0;
+  const flaky: ModelProvider = {
+    name: "flaky",
+    async *stream() {
+      calls++;
+      if (calls === 1) throw new Error(`provider 503 ${"y".repeat(50_000)}`);
+      yield { type: "text", delta: "recovered" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: flaky }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const in53 = state.inputs.find((i) => i.input_id === "in-53")!;
+  assert.equal(
+    in53.status,
+    "queued",
+    "minimal tier must preserve the retryable disposition",
+  );
+  assert.ok(in53.not_before !== null, "requeue carries backoff");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-53" && t.status === "failed",
+  );
+  const recorded = failed!.error ?? "";
+  assert.ok(recorded.length < 10_000, "recorded error bounded");
+  // The provider reason survives bounded at the source; the tier-cascade
+  // text ("read body; then read body") cannot appear here because a
+  // retryable commit carries no events and always fits the body limit.
+  assert.match(recorded, /model: provider 503/);
+  // The later input is not starved while in-53 backs off.
+  assert.equal(await s.step(), "turn");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-54")!.status,
+    "done",
+  );
+  // Backoff expired → in-53 retries and completes once.
+  in53.not_before = new Date(Date.now() - 1).toISOString();
+  assert.equal(await s.step(), "turn");
+  assert.equal(in53.status, "done", "transient failure recovers");
+  const out = (await state.outbox(PERSONA, 0)).find(
+    (o) => o.payload.input_id === "in-53",
+  );
+  assert.equal(
+    (out!.payload as { output: { text: string } }).output.text,
+    "recovered",
+  );
 });

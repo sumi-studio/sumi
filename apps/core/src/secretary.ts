@@ -844,8 +844,7 @@ export class Secretary {
    * finalizes the turn and honestly notes that the events could not be
    * stored. Anything else (5xx, network) is transient and propagates —
    * the running turn is recovered and retried; storage unavailability
-   * must never become a fabricated record. (Review-B F1; adapted from
-   * foundation repair b4cdc722.)
+   * must never become a fabricated record.
    */
   private async commitTurnFinal(turn: Turn, req: CommitRequest): Promise<void> {
     const { state, personaId } = this.cfg;

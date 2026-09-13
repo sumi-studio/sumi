@@ -46,7 +46,7 @@ var (
 // violations — to ErrBadRequest. They are caused by the submitted
 // content, are never transient, and must surface as 400 so the caller
 // records a tool/decision error instead of retrying the same write
-// forever. (CR3-B1 repair, ported from 0cd5410.)
+// forever.
 func dataErr(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) &&
@@ -56,10 +56,10 @@ func dataErr(err error) error {
 	return err
 }
 
-// hasNUL reports whether any string in v contains NUL — PostgreSQL jsonb
-// cannot store it (22P05). Checked explicitly so the failure is a clean
-// 400 at the first persistence boundary rather than a wrapped driver
-// error at a later one.
+// hasNUL reports whether any string in v (after JSON normalization)
+// contains NUL — PostgreSQL jsonb cannot store it (22P05). Checked
+// explicitly so the failure is a clean 400 at the first persistence
+// boundary rather than a wrapped driver error at a later one.
 func hasNUL(v any) bool {
 	switch t := v.(type) {
 	case string:
@@ -619,8 +619,7 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	// The plan is the first persistence boundary for model output: a NUL
 	// anywhere in it cannot be stored as jsonb, and retrying the save can
 	// never succeed. Reject it as a deterministic decision error here —
-	// before any effect boundary is reached. (CR3-B1 repair, ported from
-	// 0cd5410.)
+	// before any effect boundary is reached.
 	var genericDecision any
 	if err := json.Unmarshal(decJSON, &genericDecision); err != nil {
 		return TurnPlan{}, false, err
@@ -720,7 +719,7 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	}
 	stored, err := s.planForInput(ctx, tx, personaID, inputID)
 	if err != nil {
-		return TurnPlan{}, false, err
+		return TurnPlan{}, false, fmt.Errorf("save plan: %w", dataErr(err))
 	}
 	if stored == nil {
 		return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
@@ -1279,8 +1278,7 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			// is a fresh claim reusing the id. An identical request over a
 			// still-pending row is a true idempotent set; anything else
 			// (different contents, or a fired/cancelled/expired row) must
-			// not report a wake that was not created. (CR3-B2 repair,
-			// ported from 0cd5410.)
+			// not report a wake that was not created.
 			err = tx.QueryRow(ctx, `
 				SELECT persona_id, schedule_id, wake_at, payload, miss_policy, status, created_at
 				FROM core_schedules WHERE persona_id = $1 AND schedule_id = $2`,

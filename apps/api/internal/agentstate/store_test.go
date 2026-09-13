@@ -1023,10 +1023,9 @@ func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
 	}
 }
 
-// CR3-B1 (ported from 0cd5410, adapted to round-aware SavePlan):
-// deterministically invalid tool data is a 400-class rejection at the
-// plan/claim boundaries, never a retryable 500 — the input resolves with a
-// recorded error instead of blocking every later input forever.
+// CR3-B1: deterministically invalid tool data is a 400-class rejection at
+// the plan/claim boundaries, never a retryable 500 — the input resolves
+// with a recorded error instead of blocking every later input forever.
 func TestDeterministicToolDataRejected(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
@@ -1057,7 +1056,7 @@ func TestDeterministicToolDataRejected(t *testing.T) {
 		t.Fatalf("NUL request savePlan err = %v, want ErrBadRequest", err)
 	}
 	// The rejected saves recorded nothing: the same turn can still store a
-	// clean decision at round 0.
+	// clean decision.
 	badPolicyReq := map[string]any{
 		"schedule_id": "rem",
 		"wake_at":     time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
@@ -1076,15 +1075,14 @@ func TestDeterministicToolDataRejected(t *testing.T) {
 	// never match or execute.
 	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-nul", "journal.note", 0,
-		map[string]any{"text": "a\x00b"}); !errors.Is(err, ErrBadRequest) {
+		map[string]any{"text": "a\u0000b"}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL claim err = %v, want ErrBadRequest", err)
 	}
 }
 
-// CR3-B2 (ported from 0cd5410): reusing a schedule_id must not silently
-// return the old row as a fresh success. Identical contents over a
-// still-pending row replay; different contents or a dead schedule are
-// explicit tool errors.
+// CR3-B2: reusing a schedule_id must not silently return the old row as a
+// fresh success. Identical contents over a still-pending row replay;
+// different contents or a dead schedule are explicit tool errors.
 func TestScheduleSetIDReuse(t *testing.T) {
 	s, pool := newStore(t)
 	ctx := context.Background()
@@ -1101,6 +1099,7 @@ func TestScheduleSetIDReuse(t *testing.T) {
 		"payload":     map[string]any{"text": "hi"},
 		"miss_policy": "coalesce",
 	}
+	// in-1 sets the schedule.
 	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
 		Payload: map[string]any{"text": "x"}}); err != nil {
 		t.Fatalf("submit: %v", err)
@@ -1259,7 +1258,7 @@ func TestCommitUnstorablePayloadRejected(t *testing.T) {
 
 // Fresh-review F2: a retryable failure requeues with backoff (not_before)
 // instead of instantly reclaiming — the queue stays fair and the retry
-// rate is bounded. (Ported from foundation repair b4cdc722.)
+// rate is bounded.
 func TestRetryableFailureRequeuesWithBackoff(t *testing.T) {
 	s, pool := newStore(t)
 	ctx := context.Background()

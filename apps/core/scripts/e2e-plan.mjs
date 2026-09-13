@@ -520,9 +520,8 @@ async function main() {
   log("  zero-call decision replayed verbatim");
 
   // --- scenario 4: deterministic bad tool data resolves honestly ----------
-  // CR3-B1 (ported from 0cd5410, adapted to multi-round plans): a decision
-  // that can never persist must fail the input non-retryable — recorded,
-  // observable in the outbox, and never blocking later inputs.
+  // CR3-B1: a decision that can never persist must fail the input
+  // non-retryable — recorded, observable, and never blocking later inputs.
   log("scenario 4: deterministic bad tool data resolves; queue unblocked");
   const in4 = (await submit("input-four")).json.input.input_id;
   const out5 = runChild({
@@ -1013,6 +1012,74 @@ async function main() {
   );
   sseServer.close();
   log("  outage, Retry-After, in-band error, truncated stream all survived; heal completed once");
+  // --- scenario 8: near-limit input + transient error keeps retryable --
+  // Opus F1/F2: when the input_received event alone (~1.04 MB) pushes
+  // every event-carrying commit tier over the body limit, only the
+  // minimal commit can land. That tier must still preserve a retryable
+  // disposition — a transient provider error on a near-limit message is
+  // not a terminal failure — and the record keeps both server rejection
+  // reasons ahead of the bounded detail.
+  log("scenario 8: near-limit input + transient error still retries");
+  const bigText = "x".repeat(1_042_000); // ~1.02 MiB — accepted at submit
+  const sub16 = await req(
+    "POST",
+    `/internal/core/personas/${personaId}/inputs`,
+    ptoken,
+    {
+      input_id: `in-${randomUUID()}`,
+      kind: "message",
+      payload: { text: bigText },
+      actor_kind: "human",
+      actor_id: "e2e",
+      source_surface: "e2e",
+    },
+  );
+  assert(sub16.status === 201, `near-limit submit ${sub16.status}`);
+  const in16 = sub16.json.input.input_id;
+  const in17 = (await submit("input-fifteen")).json.input.input_id;
+  const near = runChild({
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 4_000 }), // ~24 KB error
+  });
+  assert(
+    near.includes("turn failed at model"),
+    "transient error should be recorded",
+    near,
+  );
+  // in16 is honestly queued for retry — on this branch a retryable
+  // failure commits events:[] so it lands on the first tier, and the
+  // retryable disposition flows through directly. If it had been
+  // dropped the input would read `done` + failed.
+  const st16 = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in16}`,
+    ptoken,
+  );
+  assert(
+    st16.json?.input?.status === "queued",
+    `near-limit input must stay queued for retry, got ${st16.text}`,
+  );
+  // On this branch a retrying input commits no per-attempt journal —
+  // claimed + reparked is observable via a queued status + not_before.
+  const st17 = await getInput(in17);
+  assert(
+    st17?.status === "queued" && st17?.not_before !== null,
+    `later input must progress during the near-limit input's backoff, got ${JSON.stringify(st17)}`,
+  );
+  // Provider heals: wait for both reparks to expire so a single heal
+  // child claims them — a parked input is not claimable yet.
+  await waitClaimable(in16);
+  await waitClaimable(in17);
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ rounds: [{ text: "reply-I", calls: [] }] }),
+  });
+  for (const id of [in16, in17]) {
+    const replies = await outboxFor(id);
+    assert(
+      replies.length === 1 && replies[0].payload.output.text === "reply-I",
+      `input ${id} must complete once after the provider recovers`,
+    );
+  }
+  log("  minimal-tier commit kept retryable; near-limit input recovered");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

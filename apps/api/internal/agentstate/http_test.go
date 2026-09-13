@@ -317,10 +317,9 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 	}
 }
 
-// CR3-B1 over HTTP (ported from 0cd5410, adapted to round-aware savePlan):
-// deterministic bad tool data is a 400, never a transient-looking 500 — so
-// the secretary records a tool error and the input resolves instead of
-// blocking the queue.
+// CR3-B1 over HTTP: deterministic bad tool data is a 400, never a
+// transient-looking 500 — so the secretary records a tool error and the
+// input resolves instead of blocking the queue.
 func TestHTTPDeterministicToolData400(t *testing.T) {
 	_, mux := newHTTPServer(t)
 	pa := pid(t)
