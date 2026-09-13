@@ -1,8 +1,14 @@
 import { jsonEqual } from "./json.ts";
 import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
-import { FencedError, type StateClient, StateError } from "./state-client.ts";
+import {
+  FencedError,
+  type StateClient,
+  StateError,
+  UnauthorizedError,
+} from "./state-client.ts";
 import { toolSpecs } from "./tools.ts";
 import type {
+  CommitRequest,
   Decision,
   Event,
   EventInput,
@@ -44,12 +50,6 @@ export interface SecretaryConfig {
    * non-retryable. Default 6.
    */
   maxToolRounds?: number;
-  /**
-   * Base backoff slept after committing a retryable model failure —
-   * multiplied by the attempt number, capped at 30s. Bounds burn rate when
-   * a provider is down. Default 1500ms.
-   */
-  retryBackoffMs?: number;
   idgen: () => string;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -133,7 +133,7 @@ export class Secretary {
         // plan — is done-failed here, before any further model consult or
         // effect claim, so it cannot consume indefinitely or starve the
         // inputs queued behind it.
-        await state.commitTurn(personaId, turn.turn_id, gen, {
+        await this.commitTurnFinal(turn, {
           outcome: "fail",
           retryable: false,
           error: `attempt cap ${maxAttempts} exceeded for input`,
@@ -159,9 +159,51 @@ export class Secretary {
     }
   }
 
+  /**
+   * True when a state-call failure is worth riding out inside the loop:
+   * transport errors (service restart, PG blip, fetch timeouts) and
+   * 5xx/429 responses. Auth and deterministic 4xx rejections are not
+   * transient — retrying a wrong token or a contract violation only
+   * burns the attempt budget. (Review-A F1.)
+   */
+  private isTransient(e: unknown): boolean {
+    if (e instanceof FencedError || e instanceof UnauthorizedError) {
+      return false;
+    }
+    if (e instanceof StateError) return e.status >= 500 || e.status === 429;
+    return true; // fetch TypeError, AbortError, DNS — no status at all
+  }
+
+  private transientBackoff(failures: number): number {
+    return Math.min(30_000, 500 * 2 ** Math.min(failures, 6));
+  }
+
   /** Long-running loop; resolves when stopped (signal, fence loss, error). */
   async run(signal?: AbortSignal): Promise<void> {
-    if (!this.running) await this.start();
+    // A transient state-API failure — service restart, PG connection blip
+    // — must not kill the secretary: the canonical record is in PG and a
+    // bounded-backoff retry is the same recovery an external supervisor
+    // would drive, inside the loop. Cancellation still exits promptly;
+    // fencing still stops the writer.
+    let failures = 0;
+    const backoff = () =>
+      sleep(this.transientBackoff(failures), signal);
+    if (!this.running) {
+      for (;;) {
+        try {
+          await this.start();
+          break;
+        } catch (e) {
+          if (signal?.aborted || !this.isTransient(e)) throw e;
+          failures++;
+          this.log("state service unavailable; retrying writer acquire", {
+            attempt: failures,
+            error: String(e),
+          });
+          await backoff();
+        }
+      }
+    }
     const renewEvery = Math.max(500, this.cfg.renewEveryMs);
     let lastRenew = 0;
     while (this.running && !signal?.aborted) {
@@ -180,11 +222,24 @@ export class Secretary {
           this.log("lease renewal failed", { error: String(e) });
         }
       }
-      const result = await this.step();
-      if (result === "idle") {
-        await sleep(this.cfg.pollIntervalMs, signal);
-      } else if (result === "stopped") {
-        break;
+      try {
+        const result = await this.step();
+        failures = 0;
+        if (result === "idle") {
+          await sleep(this.cfg.pollIntervalMs, signal);
+        } else if (result === "stopped") {
+          break;
+        }
+      } catch (e) {
+        if (!this.running || signal?.aborted) break;
+        if (!this.isTransient(e)) throw e;
+        failures++;
+        this.log("state call failed; backing off", {
+          attempt: failures,
+          backoff_ms: this.transientBackoff(failures),
+          error: String(e),
+        });
+        await backoff();
       }
     }
     await this.shutdown();
@@ -264,7 +319,6 @@ export class Secretary {
     context: Event[],
     plan: TurnPlan | null,
   ): Promise<void> {
-    const { state, personaId } = this.cfg;
     const gen = turn.generation;
     const maxRounds = this.cfg.maxToolRounds ?? 6;
     this.inFlight = new AbortController();
@@ -288,18 +342,10 @@ export class Secretary {
         let decision = rounds[r];
         if (!decision) {
           const outcome = await this.decide(turn, events, messages, r);
-          if ("failed" in outcome) {
-            if (outcome.retryable) {
-              // Bounded burn (CR3-N1): pace the requeue so a down provider
-              // cannot spin attempts back-to-back inside one process.
-              const base = this.cfg.retryBackoffMs ?? 1500;
-              await sleep(
-                Math.min(30_000, base * Math.max(1, turn.attempt)),
-                this.inFlight.signal,
-              );
-            }
-            return; // failure committed inside decide()
-          }
+          // Failure committed inside decide(); a retryable one is paced
+          // durably by the requeue's not_before backoff, so the loop is
+          // free to serve other inputs immediately.
+          if ("failed" in outcome) return;
           rounds = outcome.rounds;
           decision = rounds[r];
           if (!decision) throw new Error("stored plan missing saved round");
@@ -325,7 +371,7 @@ export class Secretary {
 
         if (decision.calls.length === 0) {
           // Final round: the reply text post-dates every committed effect.
-          await state.commitTurn(personaId, turn.turn_id, gen, {
+          await this.commitTurnFinal(turn, {
             outcome: "complete",
             events,
             output: { text: decision.text, tool_results: results },
@@ -345,7 +391,7 @@ export class Secretary {
           // The model kept calling tools past the round cap. Its effects
           // are committed and journaled truthfully; the turn fails
           // non-retryable rather than consulting forever.
-          await state.commitTurn(personaId, turn.turn_id, gen, {
+          await this.commitTurnFinal(turn, {
             outcome: "fail",
             retryable: false,
             error: `tool round cap ${maxRounds} reached`,
@@ -520,7 +566,7 @@ export class Secretary {
       // it into the attempt-cap check. A retryable failure leaves no
       // partial journal — the next attempt re-emits its full event set.
       const retryable = turn.attempt < (this.cfg.maxAttempts ?? 5);
-      await state.commitTurn(personaId, turn.turn_id, gen, {
+      await this.commitTurnFinal(turn, {
         outcome: "fail",
         retryable,
         error: `model: ${msg}`,
@@ -599,22 +645,97 @@ export class Secretary {
     events: { kind: string; payload: Record<string, unknown> }[],
     error: string,
   ): Promise<void> {
-    await this.cfg.state.commitTurn(
-      this.cfg.personaId,
-      turn.turn_id,
-      turn.generation,
-      {
-        outcome: "fail",
-        retryable: false,
-        error: stripNul(error),
-        events,
-      },
-    );
+    await this.commitTurnFinal(turn, {
+      outcome: "fail",
+      retryable: false,
+      error: stripNul(error),
+      events,
+    });
     this.log("turn failed permanently", {
       turn_id: turn.turn_id,
       error,
     });
   }
+
+  /**
+   * Commit a turn so a deterministic rejection cannot strand the input.
+   *
+   * A commit payload can itself be un-storable: model output or error
+   * text containing NUL (jsonb rejects it) or a body over the request
+   * limit both surface as a deterministic 400. Retrying the identical
+   * commit can never succeed, and abandoning the turn leaves the input
+   * claimed by a running turn that every recovery cycle fails to
+   * finalize — a permanent poison loop.
+   *
+   * On 400 the commit is retried once with un-storable bytes scrubbed
+   * and — for a complete outcome — downgraded to a recorded
+   * non-retryable failure rather than a fabricated success (effects
+   * already applied stay recorded; they are never un-committed). If the
+   * scrubbed payload is still rejected, a minimal failure commit
+   * finalizes the turn and honestly notes that the events could not be
+   * stored. Anything else (5xx, network) is transient and propagates —
+   * the running turn is recovered and retried; storage unavailability
+   * must never become a fabricated record. (Review-B F1; adapted from
+   * foundation repair b4cdc722.)
+   */
+  private async commitTurnFinal(turn: Turn, req: CommitRequest): Promise<void> {
+    const { state, personaId } = this.cfg;
+    const commit = (r: CommitRequest) =>
+      state.commitTurn(personaId, turn.turn_id, turn.generation, r);
+    let why = "unknown rejection";
+    try {
+      await commit(req);
+      return;
+    } catch (e) {
+      if (!(e instanceof StateError && e.status === 400)) throw e;
+      why = e.message;
+    }
+    // The explanation itself goes through the same scrub — the original
+    // error text may be exactly what made the payload un-storable.
+    const msg = scrubJson(
+      `commit rejected deterministically (${why}): ${req.error ?? req.outcome}`,
+    ) as string;
+    const scrubbed: CommitRequest = {
+      outcome: "fail",
+      // A fail+retryable commit (e.g. a provider error whose message was
+      // un-storable) keeps its retryable disposition — the input still
+      // deserves the retry. Only an un-storable *complete* downgrade is
+      // terminal, since its output cannot be honestly recorded.
+      retryable: req.outcome === "fail" && req.retryable === true,
+      events: (req.events ?? []).map((e) => ({
+        kind: e.kind,
+        payload: scrubJson(e.payload) as Record<string, unknown>,
+      })),
+      error: msg,
+    };
+    try {
+      await commit(scrubbed);
+      this.log("turn committed as scrubbed failure", {
+        turn_id: turn.turn_id,
+      });
+      return;
+    } catch (e) {
+      if (!(e instanceof StateError && e.status === 400)) throw e;
+    }
+    await commit({
+      outcome: "fail",
+      retryable: false,
+      events: [],
+      error: `${msg}; original commit events could not be stored`,
+    });
+  }
+}
+
+/** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
+function scrubJson(v: unknown): unknown {
+  if (typeof v === "string") return v.replaceAll("\u0000", "\uFFFD");
+  if (Array.isArray(v)) return v.map(scrubJson);
+  if (v !== null && typeof v === "object") {
+    return Object.fromEntries(
+      Object.entries(v).map(([k, x]) => [k, scrubJson(x)]),
+    );
+  }
+  return v;
 }
 
 const SYSTEM =

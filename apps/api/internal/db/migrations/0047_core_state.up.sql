@@ -43,6 +43,10 @@ CREATE TABLE core_inputs (
     turn_id            text,
     created_at         timestamptz NOT NULL DEFAULT now(),
     done_at            timestamptz,
+    -- Retry backoff: a retryable-failed input requeues with a future
+    -- not_before so it cannot instantly reclaim the queue and starve
+    -- later inputs or hammer the provider.
+    not_before         timestamptz,
     PRIMARY KEY (persona_id, input_id)
 );
 CREATE INDEX core_inputs_pending ON core_inputs(persona_id, created_at)

@@ -63,8 +63,14 @@ async function childMain() {
       // replays recorded rounds must never re-consult them.
       const round = req.round ?? 0;
       console.log(`[child] MODEL CONSULTED round=${round}`);
+      if (script.throw) throw new Error(script.throw);
       const decision = script.rounds?.[round] ?? { text: "", calls: [] };
-      yield { type: "text", delta: decision.text };
+      // pad_kb inflates the reply in-process — a 700KiB script cannot
+      // travel through an env var (MAX_ARG_STRLEN).
+      const text = decision.pad_kb
+        ? decision.text + "x".repeat(decision.pad_kb * 1024)
+        : decision.text;
+      yield { type: "text", delta: text };
       for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
           type: "tool_call",
@@ -640,6 +646,113 @@ async function main() {
     `conflicting-reuse input must resolve (done), got ${in8State.text}`,
   );
   log("  schedule_id reuse with different contents is an honest error");
+
+  // --- scenario 5: failure disposition -------------------------------------
+  // Review-B F1 / fresh reviews: a provider that always throws (with a NUL
+  // in its message — un-storable bytes in diagnostic text) must fail each
+  // attempt retryably, paced by the durable not_before backoff — not hot-
+  // loop or crash the process — and each input resolves honestly at the
+  // attempt cap with a turn_failed record. A later queued input is served
+  // during the backoff, not starved behind the failing one.
+  log("scenario 5: failing provider resolves honestly under bounded backoff");
+  const in9 = (await submit("input-nine")).json.input.input_id;
+  const in10 = (await submit("input-ten")).json.input.input_id;
+  const getInput = async (id) =>
+    (
+      await req(
+        "GET",
+        `/internal/core/personas/${personaId}/inputs/${id}`,
+        ptoken,
+      )
+    ).json?.input;
+  let consults = 0;
+  let parkedSeen = false;
+  const stormStart = Date.now();
+  // Each child drains for its idle grace and exits; a parked input simply
+  // survives to the next run — the durable backoff carries across boots.
+  for (let boot = 0; boot < 4; boot++) {
+    const out = runChild({
+      SUMI_SCRIPT: JSON.stringify({ throw: "provider exploded \u0000" }),
+    });
+    consults += (out.match(/MODEL CONSULTED/g) ?? []).length;
+    const i9 = await getInput(in9);
+    const i10 = await getInput(in10);
+    if (i9?.not_before && i9?.status === "queued") parkedSeen = true;
+    if (i10?.not_before && i10?.status === "queued") parkedSeen = true;
+    if (i9?.status === "done" && i10?.status === "done") break;
+  }
+  const stormMs = Date.now() - stormStart;
+  assert(
+    consults >= 4 && consults <= 12,
+    `failing provider must be bounded by not_before + attempt cap, got ${consults} consults`,
+  );
+  assert(
+    stormMs >= 2000,
+    `retries must be paced by durable backoff, storm took only ${stormMs}ms`,
+  );
+  assert(
+    parkedSeen,
+    "durable not_before backoff must be observable while inputs retry",
+  );
+  for (const id of [in9, in10]) {
+    const st = await getInput(id);
+    assert(
+      st?.status === "done",
+      `input ${id} must resolve honestly, got ${JSON.stringify(st)}`,
+    );
+    const fails = await outboxFor(id);
+    assert(
+      fails.length === 1 &&
+        fails[0].kind === "turn_failed" &&
+        /provider exploded/.test(fails[0].payload.error ?? ""),
+      `input ${id} needs one honest turn_failed record, got ${JSON.stringify(fails)}`,
+    );
+  }
+  log("  bounded paced retries; both inputs resolved with turn_failed");
+
+  // The queue is healthy after the storm: a fresh input completes normally.
+  const in11 = (await submit("input-eleven")).json.input.input_id;
+  runChild({
+    SUMI_SCRIPT: JSON.stringify({ rounds: [{ text: "reply-G", calls: [] }] }),
+  });
+  const replies11 = await outboxFor(in11);
+  assert(
+    replies11.length === 1 && replies11[0].payload.output.text === "reply-G",
+    "post-storm input must complete",
+  );
+  log("  queue healthy after the failure storm");
+
+  // Review-B F1 repro: a reply that fits savePlan but whose commit body
+  // (events + output + stored commit_request) exceeds maxBody used to
+  // crash-loop the writer until the attempt cap masked the cause. Now the
+  // deterministic 400 is scrubbed and the turn ends as a recorded failure.
+  const in12 = (await submit("input-twelve")).json.input.input_id;
+  const big = runChild({
+    SUMI_SCRIPT: JSON.stringify({
+      rounds: [{ text: "big:", pad_kb: 700, calls: [] }],
+    }),
+  });
+  assert(
+    !big.includes("fatal") || big.includes("committed as scrubbed"),
+    `oversize commit must not kill the process\n${big}`,
+  );
+  const in12State = await req(
+    "GET",
+    `/internal/core/personas/${personaId}/inputs/${in12}`,
+    ptoken,
+  );
+  assert(
+    in12State.json?.input?.status === "done",
+    `oversize-commit input must resolve, got ${in12State.text}`,
+  );
+  const fails12 = await outboxFor(in12);
+  assert(
+    fails12.length === 1 &&
+      fails12[0].kind === "turn_failed" &&
+      /commit rejected deterministically/.test(fails12[0].payload.error ?? ""),
+    `oversize commit must record an honest failure, got ${JSON.stringify(fails12).slice(0, 400)}`,
+  );
+  log("  un-storable commit resolves as recorded failure — no crash loop");
 
   svc.kill("SIGKILL");
   log("PASS — durable-plan scenarios green on real PG + real Go + real Node");

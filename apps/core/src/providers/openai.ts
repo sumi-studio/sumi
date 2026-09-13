@@ -111,9 +111,10 @@ export class OpenAIProvider implements ModelProvider {
         },
       );
       if (!res.ok || !res.body) {
-        throw new Error(
-          `model request failed: ${res.status} ${await res.text()}`,
-        );
+        // Untrusted bytes bounded: a multi-MB or NUL-laden error body is
+        // diagnostic text, and it flows into a commit's error field.
+        const body = (await res.text()).slice(0, 4096);
+        throw new Error(`model request failed: ${res.status} ${body}`);
       }
 
       const calls = new Map<number, { id: string; name: string; args: string }>();
@@ -179,7 +180,7 @@ export class OpenAIProvider implements ModelProvider {
           args = JSON.parse(c.args || "{}") as Record<string, unknown>;
         } catch {
           throw new Error(
-            `model emitted unparseable tool arguments for ${c.name}: ${c.args}`,
+            `model emitted unparseable tool arguments for ${c.name}: ${c.args.slice(0, 1024)}`,
           );
         }
         const call: ToolCall = {

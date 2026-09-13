@@ -59,10 +59,21 @@ interface EnvLike {
 const PERSONA_KEY = "sumi/persona_id";
 const DEFAULT_HEARTBEAT_MS = 30_000;
 
+/**
+ * Thrown when no SUMI_PERSONA_TOKEN_* binding exists for a persona — a
+ * provisioning gap no amount of retrying fixes. alarm() treats it as
+ * terminal-for-this-activation instead of a per-heartbeat error loop.
+ */
+export class MissingPersonaTokenError extends Error {
+  constructor(persona: string) {
+    super(`missing persona token binding for ${persona}`);
+    this.name = "MissingPersonaTokenError";
+  }
+}
+
 function envToken(env: EnvLike, persona: string): string {
   const v = env[`SUMI_PERSONA_TOKEN_${persona.replace(/-/g, "_")}`];
-  if (typeof v !== "string" || !v)
-    throw new Error(`missing persona token binding for ${persona}`);
+  if (typeof v !== "string" || !v) throw new MissingPersonaTokenError(persona);
   return v;
 }
 
@@ -71,6 +82,7 @@ export class SecretaryObject {
   private personaId = "";
   private drainPromise: Promise<void> | null = null;
   private wakeAgain = false;
+  private missingTokenLogged = false;
   private readonly ctx: AlarmState;
   private readonly env: EnvLike;
 
@@ -115,8 +127,14 @@ export class SecretaryObject {
       );
     }
     if (!this.personaId) {
+      // Construct before persisting: an unprovisioned persona (no token
+      // binding, bad provider config) must not arm a heartbeat that can
+      // never succeed — the persona id lands in storage only once the
+      // secretary could actually be built. (Review-A F2 / B F3.)
+      const s = this.newSecretary(personaId);
       this.personaId = personaId;
       await this.ctx.storage.put(PERSONA_KEY, personaId);
+      this.secretary = s;
     }
     this.secretary ??= this.newSecretary(personaId);
     return this.secretary;
@@ -153,13 +171,33 @@ export class SecretaryObject {
       (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
       "";
     if (!persona) return; // never activated — nothing to re-arm either
+    let unprovisioned = false;
     try {
       const s = await this.build(persona);
       await this.requestDrain(s);
+    } catch (e) {
+      if (e instanceof MissingPersonaTokenError) {
+        // The binding is absent until provisioned — re-arming only loops
+        // the same uncaught error every heartbeat. Log once and disarm; a
+        // fresh wake (fetch) after provisioning re-arms the heartbeat.
+        unprovisioned = true;
+        if (!this.missingTokenLogged) {
+          this.missingTokenLogged = true;
+          console.log(
+            `[core] no persona token binding for ${persona}; heartbeat disarmed until next wake`,
+          );
+        }
+      } else {
+        console.log(
+          `[core] alarm error: ${e instanceof Error ? e.message : e}`,
+        );
+      }
     } finally {
-      // Re-arm even on drain failure: an error must not permanently disarm
-      // the persona's writer.
-      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
+      // Re-arm on every failure except an activation that can never
+      // succeed — anything else must not permanently disarm the writer.
+      if (!unprovisioned) {
+        await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
+      }
     }
   }
 

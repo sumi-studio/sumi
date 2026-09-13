@@ -630,6 +630,7 @@ test("assemble flattens tool results to assistant text (no orphaned tool role)",
     turn_id: null,
     created_at: new Date().toISOString(),
     done_at: null,
+    not_before: null,
   };
   const messages = assemble(context, input);
   assert.equal(
@@ -767,11 +768,12 @@ test("attempt cap: a failing provider cannot consume an input forever", async ()
     cfg(state, "h", {
       provider: down,
       maxAttempts: 2,
-      retryBackoffMs: 1,
     }),
   );
   await s.start();
-  assert.equal(await s.step(), "turn"); // attempt 1: fails, requeued
+  assert.equal(await s.step(), "turn"); // attempt 1: fails, requeued with not_before
+  // Expire the durable retry backoff to reach the next attempt now.
+  state.inputs.find((i) => i.input_id === "in-17")!.not_before = null;
   assert.equal(await s.step(), "turn"); // attempt 2: last allowed — terminal
   assert.equal(await s.step(), "idle");
   assert.equal(consultations, 2);
@@ -1067,4 +1069,137 @@ test("a NUL in reply text is normalized, not fatal; tool args stay strict", asyn
     "hello there",
     "stored reply text has the NUL normalized out",
   );
+});
+
+test("a deterministic commit rejection resolves as a recorded failure, not a poison loop (fresh F1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-40", "hi");
+  // The store deterministically rejects the first commit (e.g. payload
+  // the database cannot store); the core must record an honest failure —
+  // not leave the input claimed by an un-finalizable running turn.
+  const rejectOnce: StateClient = Object.create(state, {
+    commitTurn: {
+      value: async (
+        ...args: Parameters<StateClient["commitTurn"]>
+      ): ReturnType<StateClient["commitTurn"]> => {
+        const req = args[3];
+        if (req.outcome === "complete") {
+          throw new StateError(400, "commit contains a NUL byte jsonb cannot store");
+        }
+        return state.commitTurn(...args);
+      },
+    },
+  });
+  const s = new Secretary(cfg(rejectOnce, "h", {
+    provider: new ScriptedProvider({ text: "reply", calls: [] }),
+  }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-40" && t.status === "failed",
+  );
+  assert.ok(failed, "un-storable commit must resolve as a recorded failure");
+  assert.match(failed!.error ?? "", /commit rejected deterministically/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-40")!.status,
+    "done",
+    "input resolves — no running-turn poison loop",
+  );
+  // The journal still carries the attempt's events (scrubbed).
+  assert.ok(
+    (await state.events(PERSONA, 0)).some(
+      (e) => e.kind === "assistant_message",
+    ),
+    "journal keeps the committed events",
+  );
+});
+
+test("an un-storable provider error commits scrubbed and retryable — with backoff, then recovers (fresh F1+F2)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-41", "hi");
+  let calls = 0;
+  const failingThenFine: ModelProvider = {
+    name: "flaky",
+    async *stream(_req: ModelRequest) {
+      calls++;
+      if (calls === 1) throw new Error("provider exploded \u0000");
+      yield { type: "text", delta: "recovered" };
+      yield { type: "done", usage: {} };
+    },
+  };
+  const s = new Secretary(cfg(state, "h", { provider: failingThenFine }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  // The NUL-bearing error was normalized and committed retryable: the
+  // input is queued with a backoff delay, not hot-looping.
+  const bad = state.inputs.find((i) => i.input_id === "in-41")!;
+  assert.equal(bad.status, "queued");
+  assert.ok(bad.not_before !== null, "requeue carries not_before backoff");
+  assert.ok(Date.parse(bad.not_before) > Date.now());
+  assert.equal(calls, 1, "no immediate retry — backoff parks the input");
+  // While in-41 is parked, a later queued input is claimed and completes.
+  state.addInput(PERSONA, "in-42", "later");
+  assert.equal(await s.step(), "turn");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-42")!.status,
+    "done",
+    "later input is not starved by the retrying one",
+  );
+  // Once the backoff expires the failed input retries and recovers.
+  bad.not_before = new Date(Date.now() - 1).toISOString();
+  assert.equal(await s.step(), "turn");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-41")!.status,
+    "done",
+    "the retryable input recovers once its delay passes",
+  );
+  const out = (await state.outbox(PERSONA, 0)).find(
+    (o) => o.payload.input_id === "in-41",
+  );
+  assert.equal(
+    (out!.payload as { output: { text: string } }).output.text,
+    "recovered",
+  );
+});
+
+test("a run() loop rides out a transient state outage with backoff (review-A F1)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  // Fail every state call with a transport-style error until switched off.
+  let down = true;
+  const flaky: StateClient = new Proxy(state, {
+    get(target, prop, recv) {
+      const v = Reflect.get(target, prop, recv);
+      if (typeof v !== "function" || prop === "addPersona" || prop === "addInput") return v;
+      return async (...args: unknown[]) => {
+        if (down) throw new TypeError("fetch failed");
+        return (v as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  const s = new Secretary(
+    cfg(flaky, "h", { provider: new ScriptedProvider({ text: "ok", calls: [] }) }),
+  );
+  const ac = new AbortController();
+  const done = s.run(ac.signal);
+  // Let a couple of backoff cycles happen while the service is "down".
+  await new Promise((r) => setTimeout(r, 1_300));
+  state.addInput(PERSONA, "in-50", "hello");
+  down = false;
+  const deadline = Date.now() + 10_000;
+  while (
+    state.inputs.find((i) => i.input_id === "in-50")!.status !== "done" &&
+    Date.now() < deadline
+  ) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-50")!.status,
+    "done",
+    "the input completes after the outage ends — no permanent exit",
+  );
+  ac.abort();
+  await done;
 });
