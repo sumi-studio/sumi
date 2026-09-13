@@ -5,9 +5,11 @@ import type {
   Operation,
   OutboxEntry,
   PersonaState,
+  PlanCall,
   RecoverResult,
   Schedule,
   Turn,
+  TurnPlan,
   WriterLease,
 } from "./types.ts";
 
@@ -65,6 +67,21 @@ export interface StateClient {
     turnId: string,
     contextLimit: number,
   ): Promise<LoadResult>;
+  /**
+   * Persist the model's decision for the claimed input before any of its
+   * effects run. Idempotent: an identical resend returns the stored plan
+   * with `created: false`; a conflicting plan is rejected 409.
+   */
+  savePlan(
+    persona: string,
+    generation: number,
+    req: {
+      turnId: string;
+      text: string;
+      calls: PlanCall[];
+      usage: Record<string, unknown>;
+    },
+  ): Promise<{ plan: TurnPlan; created: boolean }>;
   commitTurn(
     persona: string,
     turnId: string,
@@ -72,6 +89,12 @@ export interface StateClient {
     req: CommitRequest,
   ): Promise<Turn>;
   events(persona: string, afterSeq: number, limit?: number): Promise<Event[]>;
+  /**
+   * Claim one position of the recorded plan. The service derives the durable
+   * effect identity server-side (input_id + call_index) and verifies the
+   * claimed (tool, request) equals plan.calls[call_index] — a caller never
+   * supplies an idempotency key.
+   */
   claimOperation(
     persona: string,
     generation: number,
@@ -79,7 +102,7 @@ export interface StateClient {
       operationId: string;
       turnId: string;
       tool: string;
-      idempotencyKey: string;
+      callIndex: number;
       request: Record<string, unknown>;
     },
   ): Promise<{ operation: Operation; fresh: boolean }>;
@@ -226,6 +249,28 @@ export class HttpStateClient implements StateClient {
       },
     );
   }
+  savePlan(
+    persona: string,
+    generation: number,
+    req: {
+      turnId: string;
+      text: string;
+      calls: PlanCall[];
+      usage: Record<string, unknown>;
+    },
+  ) {
+    return this.call<{ plan: TurnPlan; created: boolean }>(
+      "POST",
+      `/internal/core/personas/${persona}/turns/plan`,
+      {
+        generation,
+        turn_id: req.turnId,
+        text: req.text,
+        calls: req.calls,
+        usage: req.usage,
+      },
+    );
+  }
   async commitTurn(
     persona: string,
     turnId: string,
@@ -253,10 +298,13 @@ export class HttpStateClient implements StateClient {
       operationId: string;
       turnId: string;
       tool: string;
-      idempotencyKey: string;
+      callIndex: number;
       request: Record<string, unknown>;
     },
   ) {
+    // No client idempotency_key: effect identity is server-derived
+    // (input_id + call_index) so a caller can never choose a fresh key
+    // for an already-decided position.
     return this.call<{ operation: Operation; fresh: boolean }>(
       "POST",
       `/internal/core/personas/${persona}/operations/claim`,
@@ -265,7 +313,7 @@ export class HttpStateClient implements StateClient {
         operation_id: op.operationId,
         turn_id: op.turnId,
         tool: op.tool,
-        idempotency_key: op.idempotencyKey,
+        call_index: op.callIndex,
         request: op.request,
       },
     );

@@ -1,8 +1,15 @@
 import { jsonEqual } from "./json.ts";
 import type { ChatMessage, ModelProvider, ToolCall } from "./provider.ts";
-import { FencedError, StateError, type StateClient } from "./state-client.ts";
+import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import { toolSpecs } from "./tools.ts";
-import type { Event, Input, Turn, WriterLease } from "./types.ts";
+import type {
+  Decision,
+  Event,
+  Input,
+  Turn,
+  TurnPlan,
+  WriterLease,
+} from "./types.ts";
 
 export interface SecretaryConfig {
   personaId: string;
@@ -31,20 +38,18 @@ export type StepResult = "turn" | "idle" | "stopped";
  * abandoned work, then loop: dispatch due schedules → claim input + begin
  * turn → stream model → ledger tool calls → commit turn + outbox.
  *
- * Guarantees delegated to the state service: writer fencing, idempotent
- * claims, atomic internal tool effects, durable results before success is
- * observable. This class holds no canonical state — killing it at any point
- * is safe; the next generation recovers.
+ * Guarantees delegated to the state service: writer fencing, plan-bound
+ * idempotent claims, atomic internal tool effects, durable results before
+ * success is observable. This class holds no canonical state — killing it
+ * at any point is safe; the next generation recovers.
  *
- * Crash-safety scope: a retried turn replays committed tool effects by
- * (persona, tool, `input_id:tool:N`) idempotency key. That is exactly-once
- * only while the retried model emits the same plan (true for the
- * deterministic mock, NOT guaranteed for a real provider). A retried call
- * whose request differs from the stored receipt is detected here and fails
- * the turn loudly rather than double-executing or returning another call's
- * result; durable plan recovery (replay the recorded plan instead of
- * re-planning) is the pending contract extension — see the F1 proposal in
- * the alpha kickoff artifacts.
+ * Crash-safety scope (F1 durable plans): the model's decision is persisted
+ * for the input before any of its effects run. A retried attempt continues
+ * the recorded plan — the model is never re-consulted — and claims are
+ * bound to plan positions server-side, so a retried turn can neither
+ * duplicate a committed effect nor receive another request's receipt.
+ * Scope: one plan per input, single pass — the recorded decision is not
+ * revised mid-turn (plan revisions are a later contract).
  */
 export class Secretary {
   private lease: WriterLease | null = null;
@@ -90,14 +95,14 @@ export class Secretary {
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
       const turnId = this.cfg.idgen();
-      const { turn, input, context } = await state.loadTurn(
+      const { turn, input, context, plan } = await state.loadTurn(
         personaId,
         gen,
         turnId,
         this.cfg.contextLimit,
       );
       if (!turn || !input) return "idle";
-      await this.runTurn(turn, input, context);
+      await this.runTurn(turn, input, context, plan);
       return "turn";
     } catch (e) {
       if (e instanceof FencedError) {
@@ -165,23 +170,23 @@ export class Secretary {
   }
 
   /**
-   * Process one claimed turn: stream the model, ledger every tool call,
-   * then commit events + outcome + outbox in one transaction. Failures
-   * before commit leave the turn running for a future generation to
-   * recover — results are durable before success is observable.
+   * Process one claimed turn. The durable plan is the authority: if the
+   * input already has a recorded decision the model is never consulted —
+   * this attempt executes the stored plan's calls. Otherwise the model
+   * streams once and the decision is persisted via savePlan before any
+   * effect runs. Failures before commit leave the turn running for a
+   * future generation to recover — results are durable before success is
+   * observable.
    */
   private async runTurn(
     turn: Turn,
     input: Input,
     context: Event[],
+    plan: TurnPlan | null,
   ): Promise<void> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
     this.inFlight = new AbortController();
-    const messages = assemble(context, input);
-    let text = "";
-    const calls: ToolCall[] = [];
-    let usage: Record<string, unknown> = {};
     const events: { kind: string; payload: Record<string, unknown> }[] = [
       {
         kind: "input_received",
@@ -196,29 +201,10 @@ export class Secretary {
         },
       },
     ];
-    try {
-      for await (const ev of this.cfg.provider.stream({
-        personaId,
-        turnId: turn.turn_id,
-        messages,
-        tools: toolSpecs(),
-        signal: this.inFlight.signal,
-      })) {
-        if (ev.type === "text") text += ev.delta;
-        else if (ev.type === "tool_call") calls.push(ev.call);
-        else usage = ev.usage;
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      await state.commitTurn(personaId, turn.turn_id, gen, {
-        outcome: "fail",
-        retryable: true,
-        error: `model: ${msg}`,
-        events,
-      });
-      this.log("turn failed at model", { turn_id: turn.turn_id, error: msg });
-      return;
-    }
+
+    const decision =
+      plan?.plan ?? (await this.decide(turn, input, context, events));
+    if (!decision) return; // failure already committed inside decide()
 
     const results: {
       tool: string;
@@ -226,20 +212,18 @@ export class Secretary {
       result: unknown;
       replayed: boolean;
     }[] = [];
-    for (let i = 0; i < calls.length; i++) {
-      const call = calls[i];
+    for (let i = 0; i < decision.calls.length; i++) {
+      const call = decision.calls[i];
       if (!call) continue;
-      // Deterministic per input+position: a retried turn replays stored
-      // results instead of re-executing effects.
-      const idempotencyKey = `${input.input_id}:tool:${i}`;
+      const callId = call.call_id ?? "";
       let claim: Awaited<ReturnType<StateClient["claimOperation"]>>;
       try {
         claim = await state.claimOperation(personaId, gen, {
           operationId: `${turn.turn_id}:op:${i}`,
           turnId: turn.turn_id,
-          tool: call.name,
-          idempotencyKey,
-          request: call.arguments,
+          tool: call.tool,
+          callIndex: i,
+          request: call.request,
         });
       } catch (e) {
         if (e instanceof FencedError) throw e;
@@ -248,21 +232,21 @@ export class Secretary {
           // Definite rejection (bad request / unsupported tool): record it as
           // the tool result rather than abandoning the whole turn.
           results.push({
-            tool: call.name,
-            call_id: call.id,
+            tool: call.tool,
+            call_id: callId,
             result: { error: msg },
             replayed: false,
           });
           events.push({
             kind: "tool_result",
-            payload: { tool: call.name, call_id: call.id, error: msg },
+            payload: { tool: call.tool, call_id: callId, error: msg },
           });
           continue;
         }
         if (e instanceof StateError && e.status === 409) {
-          // The idempotency key is taken by a different request: a committed
-          // effect and this retry's plan diverge. Fail loudly — replaying the
-          // stored receipt or re-executing would both be wrong.
+          // Plan-boundary violation: missing plan, off-plan position, or a
+          // replay that diverges from the committed effect. Fail loudly —
+          // replaying a stored receipt or re-executing would both be wrong.
           await this.failDivergent(turn, events, msg);
           return;
         }
@@ -271,16 +255,13 @@ export class Secretary {
         throw e;
       }
       const { operation, fresh } = claim;
-      if (!fresh && !jsonEqual(operation.request, call.arguments)) {
-        // The stored receipt answers a different request than this retry
-        // emitted — the model changed its plan after an effect committed.
-        // Same loud-failure path as a 409 claim conflict. (The Go boundary is
-        // being changed to reject this at claim time; this client-side check
-        // keeps the guarantee on a store that still replays silently.)
+      if (!fresh && !jsonEqual(operation.request, call.request)) {
+        // Defense in depth: a store that replays a receipt for a different
+        // request than the plan position's is detected client-side too.
         await this.failDivergent(
           turn,
           events,
-          `${call.name} request differs from committed operation ${operation.operation_id}`,
+          `${call.tool} request differs from committed operation ${operation.operation_id}`,
         );
         return;
       }
@@ -300,54 +281,130 @@ export class Secretary {
           true,
         );
         results.push({
-          tool: call.name,
-          call_id: call.id,
+          tool: call.tool,
+          call_id: callId,
           result: { error: "uncompleted operation" },
           replayed: false,
         });
         continue;
       }
       results.push({
-        tool: call.name,
-        call_id: call.id,
+        tool: call.tool,
+        call_id: callId,
         result: operation.response,
         replayed: !fresh,
       });
       events.push({
         kind: "tool_call",
-        payload: { tool: call.name, call_id: call.id, request: call.arguments },
+        payload: { tool: call.tool, call_id: callId, request: call.request },
       });
       events.push({
         kind: "tool_result",
         payload: {
-          tool: call.name,
-          call_id: call.id,
+          tool: call.tool,
+          call_id: callId,
           response: operation.response,
           replayed: !fresh,
         },
       });
     }
 
-    events.push({ kind: "assistant_message", payload: { text } });
+    events.push({
+      kind: "assistant_message",
+      payload: { text: decision.text },
+    });
     await state.commitTurn(personaId, turn.turn_id, gen, {
       outcome: "complete",
       events,
-      output: { text, tool_results: results },
-      usage,
+      output: { text: decision.text, tool_results: results },
+      usage: decision.usage,
     });
     this.log("turn committed", {
       turn_id: turn.turn_id,
       input_id: input.input_id,
-      tools: calls.length,
+      tools: decision.calls.length,
+      replayed_plan: plan !== null,
     });
   }
 
   /**
-   * A retried turn emitted a plan that conflicts with an already-committed
-   * operation. Commit a non-retryable failure: the input is done, the journal
-   * keeps the events so far, and the turn row records why — no fabricated
-   * tool result, no poison requeue loop, no duplicate effect. The durable
-   * plan contract (F1 proposal) removes the divergence class entirely.
+   * Consult the model once and persist its decision via savePlan before any
+   * effect runs. Returns the stored decision, or null when the turn was
+   * already resolved (model failure committed retryable, or a conflicting
+   * stored plan committed non-retryable). A crash before savePlan loses
+   * nothing — no effect could have committed, so re-planning is safe.
+   */
+  private async decide(
+    turn: Turn,
+    input: Input,
+    context: Event[],
+    events: { kind: string; payload: Record<string, unknown> }[],
+  ): Promise<Decision | null> {
+    const { state, personaId } = this.cfg;
+    const gen = turn.generation;
+    let text = "";
+    const calls: ToolCall[] = [];
+    let usage: Record<string, unknown> = {};
+    const messages = assemble(context, input);
+    try {
+      for await (const ev of this.cfg.provider.stream({
+        personaId,
+        turnId: turn.turn_id,
+        messages,
+        tools: toolSpecs(),
+        signal: this.inFlight?.signal,
+      })) {
+        if (ev.type === "text") text += ev.delta;
+        else if (ev.type === "tool_call") calls.push(ev.call);
+        else usage = ev.usage;
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await state.commitTurn(personaId, turn.turn_id, gen, {
+        outcome: "fail",
+        retryable: true,
+        error: `model: ${msg}`,
+        events,
+      });
+      this.log("turn failed at model", { turn_id: turn.turn_id, error: msg });
+      return null;
+    }
+    try {
+      const saved = await state.savePlan(personaId, gen, {
+        turnId: turn.turn_id,
+        text,
+        calls: calls.map((c) => ({
+          call_id: c.id,
+          tool: c.name,
+          request: c.arguments,
+        })),
+        usage,
+      });
+      // Always execute the stored row — a lost-response resend returns the
+      // identical plan; a conflict never silently substitutes.
+      return saved.plan.plan;
+    } catch (e) {
+      if (e instanceof FencedError) throw e;
+      if (e instanceof StateError && e.status === 409) {
+        // A different plan is already recorded for this input. Fail loudly
+        // rather than executing off the wrong decision.
+        const msg = e instanceof Error ? e.message : String(e);
+        await this.failDivergent(turn, events, `conflicting plan: ${msg}`);
+        return null;
+      }
+      // Transient: no effect committed yet — leave the turn running for
+      // recovery to retry the save (idempotent on identical body).
+      throw e;
+    }
+  }
+
+  /**
+   * The state service reported a durable-plan boundary violation — a
+   * conflicting plan write, a missing plan, an off-plan claim, or a replay
+   * diverging from a committed effect. Commit a non-retryable failure: the
+   * input is done, the journal keeps the events so far, and the turn row
+   * records why — no fabricated tool result, no poison requeue loop, no
+   * duplicate effect.
    */
   private async failDivergent(
     turn: Turn,

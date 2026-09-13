@@ -110,10 +110,43 @@ export interface PersonaState {
   latest_event_seq: number;
 }
 
+/**
+ * One decided tool call inside a durable plan. call_id is the model's own
+ * identifier (kept verbatim for later provider tool_calls reconstruction);
+ * the call's position in calls is its durable identity.
+ */
+export interface PlanCall {
+  call_id?: string;
+  tool: string;
+  request: Json;
+}
+
+/** The model's decision for one input, persisted before any effect runs. */
+export interface Decision {
+  text: string;
+  calls: PlanCall[];
+  usage: Json;
+}
+
+/**
+ * Durable record of one input's decision — one row per input, immutable.
+ * A retried attempt continues this plan instead of re-planning.
+ */
+export interface TurnPlan {
+  persona_id: string;
+  input_id: string;
+  turn_id: string;
+  generation: number;
+  plan: Decision;
+  created_at: string;
+}
+
 export interface LoadResult {
   turn: Turn | null;
   input: Input | null;
   context: Event[];
+  /** The input's recorded decision — null when none has been saved yet. */
+  plan: TurnPlan | null;
 }
 
 export interface RecoverResult {

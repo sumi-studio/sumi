@@ -1,12 +1,44 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
+import type {
+  ModelEvent,
+  ModelProvider,
+  ModelRequest,
+} from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { assemble, Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import { StateError, type StateClient } from "../src/state-client.ts";
+import { type StateClient, StateError } from "../src/state-client.ts";
 import type { Event } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000001";
+
+/** Emits exactly one scripted decision; counts how often it was consulted. */
+class ScriptedProvider implements ModelProvider {
+  readonly name = "scripted";
+  consultations = 0;
+  private readonly script: {
+    text: string;
+    calls?: { tool: string; request: Record<string, unknown> }[];
+  };
+  constructor(script: {
+    text: string;
+    calls?: { tool: string; request: Record<string, unknown> }[];
+  }) {
+    this.script = script;
+  }
+  async *stream(_req: ModelRequest): AsyncIterable<ModelEvent> {
+    this.consultations++;
+    yield { type: "text", delta: this.script.text };
+    for (const [i, c] of (this.script.calls ?? []).entries()) {
+      yield {
+        type: "tool_call",
+        call: { id: `call-${i}`, name: c.tool, arguments: c.request },
+      };
+    }
+    yield { type: "done", usage: { scripted: true } };
+  }
+}
 
 function cfg(
   state: StateClient,
@@ -196,85 +228,349 @@ test("transient claim failure leaves the turn running; retry recovers (F4)", asy
   assert.equal(state.inputs.find((i) => i.input_id === "in-6")!.status, "done");
 });
 
-test("claim conflict: retried plan diverging from a committed effect fails loudly (F1 floor)", async () => {
+test("durable plan: crash after an effect → retry continues the recorded plan (F1)", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
-  state.addInput(PERSONA, "in-7", '!journal.note {"text":"changed mind"}');
-  const s = new Secretary(cfg(state));
-  await s.start();
-  const gen = s.generation!;
-  // Attempt 1 under a real running turn: claim the input, commit the
-  // effect, then crash before commitTurn (what recover() cleans up).
-  await state.loadTurn(PERSONA, gen, "t-old", 10);
-  const { operation } = await state.claimOperation(PERSONA, gen, {
-    operationId: "t-old:op:0",
-    turnId: "t-old",
-    tool: "journal.note",
-    idempotencyKey: "in-7:tool:0",
-    request: { text: "committed version" },
+  state.addInput(PERSONA, "in-7", "remember things");
+  const planA = new ScriptedProvider({
+    text: "reply-A",
+    calls: [
+      { tool: "journal.note", request: { text: "note-A0" } },
+      { tool: "journal.note", request: { text: "note-A1" } },
+    ],
   });
-  assert.equal(operation.status, "done");
-  await state.recover(PERSONA, gen); // interrupt t-old, requeue in-7
-
-  assert.equal(await s.step(), "turn"); // fails loudly, does not throw
-  const turn = [...state.turns.values()].find(
-    (t) => t.input_id === "in-7" && t.turn_id !== "t-old",
-  )!;
-  assert.equal(turn.status, "failed");
-  assert.match(turn.error ?? "", /diverged retry/);
-  const input = state.inputs.find((i) => i.input_id === "in-7")!;
-  assert.equal(input.status, "done"); // non-retryable — no poison loop
-  const notes = (await state.events(PERSONA, 0)).filter(
-    (e) => e.kind === "note",
-  );
-  assert.equal(notes.length, 1); // no duplicate effect
-  assert.equal(notes[0]!.payload.text, "committed version");
-});
-
-test("silent replay with a different request is caught client-side (pre-B2 store)", async () => {
-  // A store that replays stored ops without comparing the request — the
-  // current pre-fix Go behavior. The core must still detect divergence.
-  const inner = new FakeState();
-  inner.addPersona(PERSONA);
-  inner.addInput(PERSONA, "in-8", '!journal.note {"text":"B"}');
-  const lenient: StateClient = Object.create(inner, {
+  // Attempt 1 commits the position-0 effect, then dies before commitTurn.
+  let claims = 0;
+  const crashy: StateClient = Object.create(state, {
     claimOperation: {
       value: async (
         p: string,
         g: number,
         op: Parameters<StateClient["claimOperation"]>[2],
       ) => {
-        const existing = [...inner.ops.values()].find(
-          (o) =>
-            o.persona_id === p &&
-            o.tool === op.tool &&
-            o.idempotency_key === op.idempotencyKey,
-        );
-        if (existing) return { operation: existing, fresh: false };
-        return inner.claimOperation(p, g, op);
+        const r = await state.claimOperation(p, g, op);
+        if (++claims === 1) throw new Error("simulated hard exit");
+        return r;
       },
     },
   });
-  const s = new Secretary(cfg(lenient));
+  const s1 = new Secretary(cfg(crashy, "h", { provider: planA }));
+  await s1.start();
+  await assert.rejects(s1.step(), /hard exit/);
+  assert.equal(
+    (await state.events(PERSONA, 0)).filter(
+      (e) => e.kind === "note" && e.payload.text === "note-A0",
+    ).length,
+    1,
+    "the position-0 effect committed before the crash",
+  );
+
+  // Attempt 2 carries a provider that WOULD decide differently. The
+  // recorded plan wins and the model is never consulted.
+  const planB = new ScriptedProvider({
+    text: "reply-B",
+    calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+  });
+  const s2 = new Secretary(cfg(state, "h", { provider: planB }));
+  await s2.start(); // same holder: re-acquires, bumps generation, recovers
+  assert.equal(await s2.step(), "turn");
+  assert.equal(await s2.step(), "idle");
+
+  assert.equal(planA.consultations, 1);
+  assert.equal(planB.consultations, 0, "retried attempt must not re-plan");
+  const evs = await state.events(PERSONA, 0);
+  const texts = evs.filter((e) => e.kind === "note").map((e) => e.payload.text);
+  assert.deepEqual(texts.sort(), ["note-A0", "note-A1"]);
+  assert.ok(
+    evs.some(
+      (e) => e.kind === "tool_result" && e.payload.replayed === true,
+    ),
+    "position 0 replayed its stored receipt",
+  );
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(outbox.length, 1);
+  assert.equal(
+    (outbox[0]!.payload as { output: { text: string } }).output.text,
+    "reply-A",
+    "the recorded plan's text is committed, not the retry's",
+  );
+  assert.equal(state.inputs.find((i) => i.input_id === "in-7")!.status, "done");
+});
+
+test("savePlan: identical resend returns the stored plan; conflict is rejected", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-8", "hi");
+  const s = new Secretary(cfg(state));
   await s.start();
   const gen = s.generation!;
-  // Same crash shape as the strict-store test: a real running turn commits
-  // the effect, then dies; the retried attempt's position-0 call differs.
-  await inner.loadTurn(PERSONA, gen, "t-old", 10);
+  const { turn } = await state.loadTurn(PERSONA, gen, "t-1", 10);
+  const req = {
+    turnId: turn!.turn_id,
+    text: "reply",
+    calls: [{ tool: "journal.note", request: { text: "n" } }],
+    usage: { in: 1, out: 2 },
+  };
+  const first = await state.savePlan(PERSONA, gen, req);
+  assert.equal(first.created, true);
+  assert.equal(first.plan.plan.text, "reply");
+  // Lost-response resend: identical body → stored row, not a new write.
+  const replay = await state.savePlan(PERSONA, gen, req);
+  assert.equal(replay.created, false);
+  assert.equal(replay.plan.turn_id, "t-1");
+  // Key order / equivalent JSON must not false-conflict.
+  const reordered = {
+    ...req,
+    calls: [{ request: { text: "n" }, tool: "journal.note" }],
+  };
+  assert.equal((await state.savePlan(PERSONA, gen, reordered)).created, false);
+  // A different decision for the same input is a contract violation.
+  await assert.rejects(
+    state.savePlan(PERSONA, gen, { ...req, text: "different" }),
+    (e: unknown) => e instanceof StateError && e.status === 409,
+  );
+});
+
+test("claims require the recorded plan and must match its positions", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-9", "hi");
+  const s = new Secretary(cfg(state));
+  await s.start();
+  const gen = s.generation!;
+  const { turn } = await state.loadTurn(PERSONA, gen, "t-1", 10);
+  const claim = (over: Partial<Parameters<StateClient["claimOperation"]>[2]>) =>
+    state.claimOperation(PERSONA, gen, {
+      operationId: "op-x",
+      turnId: turn!.turn_id,
+      tool: "journal.note",
+      callIndex: 0,
+      request: { text: "n" },
+      ...over,
+    });
+  // No plan → no claims.
+  await assert.rejects(
+    claim({}),
+    (e: unknown) => e instanceof StateError && e.status === 409,
+  );
+  await state.savePlan(PERSONA, gen, {
+    turnId: turn!.turn_id,
+    text: "reply",
+    calls: [{ tool: "journal.note", request: { text: "n" } }],
+    usage: {},
+  });
+  // Off-plan request, off-plan tool, and out-of-range index all conflict.
+  for (const bad of [
+    { request: { text: "different" } },
+    { tool: "schedule.set", request: { text: "n" } },
+    { callIndex: 1 },
+  ]) {
+    await assert.rejects(
+      claim(bad),
+      (e: unknown) => e instanceof StateError && e.status === 409,
+    );
+  }
+  // On-plan claim executes and replays.
+  assert.equal((await claim({})).fresh, true);
+  const replay = await claim({ operationId: "op-y" });
+  assert.equal(replay.fresh, false);
+  assert.equal(replay.operation.operation_id, "op-x");
+});
+
+test("server-derived effect identity: a new operation_id on retry replays the receipt", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-10", "hi");
+  const s = new Secretary(cfg(state));
+  await s.start();
+  const gen = s.generation!;
+  const { turn } = await state.loadTurn(PERSONA, gen, "t-old", 10);
+  await state.savePlan(PERSONA, gen, {
+    turnId: turn!.turn_id,
+    text: "reply",
+    calls: [{ tool: "journal.note", request: { text: "committed" } }],
+    usage: {},
+  });
+  await state.claimOperation(PERSONA, gen, {
+    operationId: "t-old:op:0",
+    turnId: "t-old",
+    tool: "journal.note",
+    callIndex: 0,
+    request: { text: "committed" },
+  });
+  await state.recover(PERSONA, gen); // interrupt t-old, requeue in-10
+
+  // A later attempt under a new turn_id/operation_id hits the same
+  // server-derived key (input_id + call_index): replay, never a second effect.
+  const { turn: t2 } = await state.loadTurn(PERSONA, gen, "t-new", 10);
+  const replay = await state.claimOperation(PERSONA, gen, {
+    operationId: "t-new:op:0",
+    turnId: t2!.turn_id,
+    tool: "journal.note",
+    callIndex: 0,
+    request: { text: "committed" },
+  });
+  assert.equal(replay.fresh, false);
+  assert.equal(replay.operation.operation_id, "t-old:op:0");
+  assert.equal(
+    (await state.events(PERSONA, 0)).filter((e) => e.kind === "note").length,
+    1,
+  );
+});
+
+test("zero-call plan round-trips; a crash before commit replays it without the model", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-11", "just text");
+  const planC = new ScriptedProvider({ text: "reply-C", calls: [] });
+  let commits = 0;
+  const crashy: StateClient = Object.create(state, {
+    commitTurn: {
+      value: async (
+        p: string,
+        t: string,
+        g: number,
+        req: Parameters<StateClient["commitTurn"]>[3],
+      ) => {
+        if (++commits === 1) throw new Error("simulated hard exit");
+        return state.commitTurn(p, t, g, req);
+      },
+    },
+  });
+  const s1 = new Secretary(cfg(crashy, "h", { provider: planC }));
+  await s1.start();
+  await assert.rejects(s1.step(), /hard exit/);
+  assert.equal(state.plans.size, 1, "the zero-call decision was persisted");
+  assert.equal([...state.plans.values()][0]!.plan.calls.length, 0);
+
+  const planD = new ScriptedProvider({ text: "reply-D" });
+  const s2 = new Secretary(cfg(state, "h", { provider: planD }));
+  await s2.start();
+  assert.equal(await s2.step(), "turn");
+  assert.equal(planD.consultations, 0, "zero-call plan replays unsupervised");
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(
+    (outbox[0]!.payload as { output: { text: string } }).output.text,
+    "reply-C",
+  );
+});
+
+test("conflicting stored plan on save fails the turn loudly, non-retryable", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-12", "hi");
+  const s = new Secretary(cfg(state, "h", { provider: new ScriptedProvider({ text: "B" }) }));
+  await s.start();
+  const gen = s.generation!;
+  // A prior attempt recorded a different decision, then died.
+  const { turn } = await state.loadTurn(PERSONA, gen, "t-old", 10);
+  await state.savePlan(PERSONA, gen, {
+    turnId: turn!.turn_id,
+    text: "A",
+    calls: [],
+    usage: {},
+  });
+  await state.recover(PERSONA, gen);
+  // Corrupt/misbehaving client path: loadTurn reports no plan (so the core
+  // consults the model) while the store still holds one — savePlan 409s.
+  const blind: StateClient = Object.create(state, {
+    loadTurn: {
+      value: async (
+        ...args: Parameters<StateClient["loadTurn"]>
+      ): ReturnType<StateClient["loadTurn"]> => {
+        const r = await state.loadTurn(...args);
+        return { ...r, plan: null };
+      },
+    },
+  });
+  const s2 = new Secretary(cfg(blind, "h", { provider: new ScriptedProvider({ text: "B" }) }));
+  await s2.start();
+  assert.equal(await s2.step(), "turn");
+  const failed = [...state.turns.values()].find(
+    (t) => t.input_id === "in-12" && t.status === "failed",
+  );
+  assert.ok(failed, "turn must fail loudly on the plan conflict");
+  assert.match(failed!.error ?? "", /conflicting plan|diverged retry/);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-12")!.status,
+    "done",
+    "non-retryable — no poison loop",
+  );
+});
+
+test("transient savePlan failure leaves the turn running; nothing is committed", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-13", '!journal.note {"text":"x"}');
+  let saves = 0;
+  const flaky: StateClient = Object.create(state, {
+    savePlan: {
+      value: async (
+        ...args: Parameters<StateClient["savePlan"]>
+      ): ReturnType<StateClient["savePlan"]> => {
+        if (++saves === 1)
+          throw new StateError(503, "simulated transient pool exhaustion");
+        return state.savePlan(...args);
+      },
+    },
+  });
+  const s = new Secretary(cfg(flaky));
+  await s.start();
+  await assert.rejects(s.step(), /transient pool exhaustion/);
+  assert.equal((await state.personaState(PERSONA)).running_turn !== null, true);
+  assert.equal(state.plans.size, 0, "no decision was persisted");
+  assert.equal(state.inputs.find((i) => i.input_id === "in-13")!.status, "claimed");
+  // Recovery replays the running turn, re-plans (nothing committed), succeeds.
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+  assert.equal(
+    (await state.events(PERSONA, 0)).filter((e) => e.kind === "note").length,
+    1,
+  );
+});
+
+test("a store replaying a receipt for a different request is still caught client-side", async () => {
+  // Defense in depth below the plan binding: if a store ever returned a
+  // stored op whose request differs from the claimed plan position, the
+  // core fails loudly instead of committing a fabricated result.
+  const inner = new FakeState();
+  inner.addPersona(PERSONA);
+  inner.addInput(PERSONA, "in-14", "hi");
+  const s0 = new Secretary(cfg(inner, "h"));
+  await s0.start();
+  const gen = s0.generation!;
+  const { turn } = await inner.loadTurn(PERSONA, gen, "t-old", 10);
+  await inner.savePlan(PERSONA, gen, {
+    turnId: turn!.turn_id,
+    text: "reply",
+    calls: [{ tool: "journal.note", request: { text: "A" } }],
+    usage: {},
+  });
   await inner.claimOperation(PERSONA, gen, {
     operationId: "t-old:op:0",
     turnId: "t-old",
     tool: "journal.note",
-    idempotencyKey: "in-8:tool:0",
+    callIndex: 0,
     request: { text: "A" },
   });
   await inner.recover(PERSONA, gen);
-  assert.equal(await s.step(), "turn");
-  const turn = [...inner.turns.values()].find(
-    (t) => t.input_id === "in-8" && t.turn_id !== "t-old",
+  const stored = [...inner.ops.values()][0]!;
+  const lenient: StateClient = Object.create(inner, {
+    claimOperation: {
+      value: async () => ({
+        operation: { ...stored, request: { text: "different" } },
+        fresh: false,
+      }),
+    },
+  });
+  const s2 = new Secretary(cfg(lenient, "h"));
+  await s2.start();
+  assert.equal(await s2.step(), "turn");
+  const failed = [...inner.turns.values()].find(
+    (t) => t.input_id === "in-14" && t.turn_id !== "t-old",
   )!;
-  assert.equal(turn.status, "failed");
-  assert.match(turn.error ?? "", /diverged retry/);
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error ?? "", /diverged retry/);
 });
 
 test("assemble flattens tool results to assistant text (no orphaned tool role)", () => {

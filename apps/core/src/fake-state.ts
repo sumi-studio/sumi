@@ -1,5 +1,5 @@
 import { jsonEqual } from "./json.ts";
-import { FencedError, StateError, type StateClient } from "./state-client.ts";
+import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import type {
   CommitRequest,
   Event,
@@ -8,9 +8,11 @@ import type {
   Operation,
   OutboxEntry,
   PersonaState,
+  PlanCall,
   RecoverResult,
   Schedule,
   Turn,
+  TurnPlan,
   WriterLease,
 } from "./types.ts";
 
@@ -33,6 +35,8 @@ export class FakeState implements StateClient {
   turns = new Map<string, Turn>();
   eventLog: Event[] = [];
   ops = new Map<string, Operation>(); // key: persona|tool|idem
+  /** One durable plan per input — key: persona|input_id. Immutable. */
+  plans = new Map<string, TurnPlan>();
   schedules = new Map<string, Schedule>();
   outboxEntries: OutboxEntry[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
@@ -199,12 +203,13 @@ export class FakeState implements StateClient {
         context: this.eventLog
           .filter((e) => e.persona_id === persona)
           .slice(-contextLimit),
+        plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
       };
     }
     const input = this.inputs.find(
       (i) => i.persona_id === persona && i.status === "queued",
     );
-    if (!input) return { turn: null, input: null, context: [] };
+    if (!input) return { turn: null, input: null, context: [], plan: null };
     input.status = "claimed";
     input.claimed_generation = generation;
     input.turn_id = turnId;
@@ -230,7 +235,54 @@ export class FakeState implements StateClient {
       context: this.eventLog
         .filter((e) => e.persona_id === persona)
         .slice(-contextLimit),
+      plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
     };
+  }
+
+  /**
+   * Persist one input's decision before its effects run (F1). The input is
+   * derived from the running turn — the caller can never mis-assert it.
+   * One plan per input: identical resend returns the stored row, a
+   * conflicting decision is rejected 409 (semantic JSON compare).
+   */
+  async savePlan(
+    persona: string,
+    generation: number,
+    req: {
+      turnId: string;
+      text: string;
+      calls: PlanCall[];
+      usage: Record<string, unknown>;
+    },
+  ): Promise<{ plan: TurnPlan; created: boolean }> {
+    this.mustHold(persona, generation);
+    const turn = this.turns.get(req.turnId);
+    if (!turn || turn.persona_id !== persona) {
+      throw new StateError(404, "turn not found");
+    }
+    if (turn.generation !== generation || turn.status !== "running") {
+      throw new StateError(409, "conflicting turn state");
+    }
+    const key = `${persona}|${turn.input_id}`;
+    const stored = this.plans.get(key);
+    if (stored) {
+      const same =
+        stored.plan.text === req.text &&
+        jsonEqual(stored.plan.calls, req.calls) &&
+        jsonEqual(stored.plan.usage, req.usage ?? {});
+      if (!same) throw new StateError(409, "conflicting stored plan");
+      return { plan: stored, created: false };
+    }
+    const plan: TurnPlan = {
+      persona_id: persona,
+      input_id: turn.input_id,
+      turn_id: req.turnId,
+      generation,
+      plan: { text: req.text, calls: req.calls, usage: req.usage ?? {} },
+      created_at: new Date().toISOString(),
+    };
+    this.plans.set(key, plan);
+    return { plan, created: true };
   }
 
   async commitTurn(
@@ -315,7 +367,7 @@ export class FakeState implements StateClient {
       operationId: string;
       turnId: string;
       tool: string;
-      idempotencyKey: string;
+      callIndex: number;
       request: Record<string, unknown>;
     },
   ): Promise<{ operation: Operation; fresh: boolean }> {
@@ -335,7 +387,26 @@ export class FakeState implements StateClient {
     if (turn.generation !== generation || turn.status !== "running") {
       throw new StateError(409, "conflicting turn state");
     }
-    const k = this.key(persona, op.tool, op.idempotencyKey);
+    // Plan binding (F1): no plan → no claims. The claim must equal the
+    // recorded plan.calls[call_index] — an off-plan position, request, or
+    // tool can never start a fresh effect, whatever the caller sent.
+    const plan = this.plans.get(`${persona}|${turn.input_id}`);
+    if (!plan) {
+      throw new StateError(409, "no plan recorded for this input");
+    }
+    const planned = plan.plan.calls[op.callIndex];
+    if (
+      !planned ||
+      planned.tool !== op.tool ||
+      !jsonEqual(planned.request, op.request)
+    ) {
+      throw new StateError(409, "claim diverges from recorded plan");
+    }
+    // Effect identity is server-derived: input_id + call_index. A
+    // caller-supplied key or a new operation_id can never mint a second
+    // effect for a decided position.
+    const idempotencyKey = `${turn.input_id}:tool:${op.callIndex}`;
+    const k = this.key(persona, op.tool, idempotencyKey);
     const existing = this.ops.get(k);
     if (existing) {
       // A replayed key is idempotent only for the identical request —
@@ -358,7 +429,7 @@ export class FakeState implements StateClient {
       operation_id: op.operationId,
       turn_id: op.turnId,
       tool: op.tool,
-      idempotency_key: op.idempotencyKey,
+      idempotency_key: idempotencyKey,
       request: op.request,
       status: "done",
       response: null,
