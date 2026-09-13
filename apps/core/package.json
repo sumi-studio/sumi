@@ -1,0 +1,24 @@
+{
+  "name": "@sumi/agent-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:e2e": "node scripts/e2e-local.mjs",
+    "test:e2e:plan": "node scripts/e2e-plan.mjs",
+    "test:e2e:workerd": "node scripts/e2e-workerd.mjs",
+    "dev:local": "node src/host/local.ts",
+    "dev:worker": "wrangler dev --config wrangler.jsonc"
+  },
+  "devDependencies": {
+    "@sumi/typescript-config": "workspace:*",
+    "@types/node": "^24.13.2",
+    "typescript": "~6.0.3",
+    "wrangler": "4.120.1"
+  }
+}

@@ -24,6 +24,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
@@ -645,6 +646,18 @@ func newApplicationFromEnv() (*application, error) {
 		chatGPTLogin.RegisterRoutes(mux)
 	}
 	modelConnectionService.RegisterRoutes(mux)
+	// Persona-scoped core-state service for the shared TypeScript secretary
+	// core. Opt-in: mounted only when a service token is configured and the
+	// control-plane database exists. Developer/operator credential scope; see
+	// internal/agentstate for the authorization model.
+	if coreToken := strings.TrimSpace(os.Getenv("SUMI_CORE_STATE_TOKEN")); coreToken != "" && database != nil {
+		if len(coreToken) < 16 {
+			closeOnError()
+			return nil, errors.New("SUMI_CORE_STATE_TOKEN must be at least 16 characters")
+		}
+		agentstate.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
+		log.Print("core state routes ready (/internal/core, scoped tokens)")
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
