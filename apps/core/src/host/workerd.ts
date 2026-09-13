@@ -29,7 +29,7 @@
  * own secret store, never in DO storage.
  */
 
-import { providerFromEnv } from "./provider-env.ts";
+import { providerForPersona } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -112,18 +112,24 @@ export class SecretaryObject {
 
   /** Build the per-persona secretary; overridable for tests. */
   protected newSecretary(personaId: string): Secretary {
-    // Same SUMI_MODEL_* contract as the local host — a persona's secretary
-    // runs the identical provider config under workerd and Node.
-    const provider = providerFromEnv((n) =>
-      typeof this.env[n] === "string" ? (this.env[n] as string) : undefined,
+    const state = new HttpStateClient(
+      this.env.SUMI_STATE_URL,
+      envToken(this.env, personaId),
+    );
+    // The persona's selected model connection is authoritative — resolved
+    // through the state service for every model call, with env config only
+    // for an unselected persona (same contract as the local host).
+    const provider = providerForPersona(
+      state,
+      personaId,
+      (n) =>
+        typeof this.env[n] === "string" ? (this.env[n] as string) : undefined,
+      (msg, fields) => console.log(`[core] ${msg}`, fields ?? {}),
     );
     return new Secretary({
       personaId,
       holderId: `workerd-${personaId}`,
-      state: new HttpStateClient(
-        this.env.SUMI_STATE_URL,
-        envToken(this.env, personaId),
-      ),
+      state,
       provider,
       leaseTtlMs: 30_000,
       renewEveryMs: 10_000,

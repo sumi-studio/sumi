@@ -186,7 +186,9 @@ type PersonaState struct {
 	Persona          Persona      `json:"persona"`
 	Lease            *WriterLease `json:"lease"`
 	QueuedInputs     int          `json:"queued_inputs"`
+	WaitingInputs    int          `json:"waiting_inputs"`
 	RunningTurn      *string      `json:"running_turn"`
+	PendingApprovals int          `json:"pending_approvals"`
 	PendingSchedules int          `json:"pending_schedules"`
 	LatestEventSeq   int64        `json:"latest_event_seq"`
 }
@@ -207,9 +209,15 @@ type EventInput struct {
 // PlanCall is one decided tool call inside a durable plan. call_id is the
 // model's own identifier (kept verbatim for later provider tool_calls
 // reconstruction); the call's position in calls is the durable identity.
+// Route is the immutable invocation route the model chose for this call
+// (ADR 0013 §1): "normal" runs under the agent's own authority, "elevated"
+// explicitly asks a human for a one-shot decision. It is part of the
+// recorded decision — a missing or unknown route is rejected, never
+// silently interpreted as normal.
 type PlanCall struct {
 	CallID  string         `json:"call_id,omitempty"`
 	Tool    string         `json:"tool"`
+	Route   string         `json:"route"`
 	Request map[string]any `json:"request"`
 }
 
@@ -252,9 +260,10 @@ type LoadResult struct {
 
 // CommitRequest is the single end-of-turn write: journal entries plus the
 // turn outcome. Complete marks the input done and appends the outbox record;
-// a failed retryable outcome requeues the input.
+// a failed retryable outcome requeues the input. "await" parks the turn and
+// input behind a pending tool approval until a human decision lands.
 type CommitRequest struct {
-	Outcome   string         `json:"outcome"` // "complete" | "fail"
+	Outcome   string         `json:"outcome"` // "complete" | "fail" | "await"
 	Events    []EventInput   `json:"events"`
 	Output    map[string]any `json:"output"`
 	Usage     map[string]any `json:"usage"`
@@ -321,17 +330,24 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 	return p, true, nil
 }
 
-func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaState, error) {
-	var st PersonaState
+func (s *Store) persona(ctx context.Context, personaID string) (Persona, error) {
+	var p Persona
 	err := s.pool.QueryRow(ctx,
 		`SELECT persona_id, human_id, display_name, created_at FROM core_personas WHERE persona_id = $1`,
-		personaID).Scan(&st.Persona.PersonaID, &st.Persona.HumanID, &st.Persona.DisplayName, &st.Persona.CreatedAt)
+		personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return st, ErrPersonaNotFound
+		return p, ErrPersonaNotFound
 	}
+	return p, err
+}
+
+func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaState, error) {
+	var st PersonaState
+	p, err := s.persona(ctx, personaID)
 	if err != nil {
 		return st, err
 	}
+	st.Persona = p
 	var lease WriterLease
 	err = s.pool.QueryRow(ctx,
 		`SELECT persona_id, generation, holder_id, acquired_at, expires_at FROM core_writer_leases WHERE persona_id = $1`,
@@ -347,6 +363,11 @@ func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaStat
 		personaID).Scan(&st.QueuedInputs); err != nil {
 		return st, err
 	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM core_inputs WHERE persona_id = $1 AND status = 'waiting'`,
+		personaID).Scan(&st.WaitingInputs); err != nil {
+		return st, err
+	}
 	var running *string
 	if err := s.pool.QueryRow(ctx,
 		`SELECT turn_id FROM core_turns WHERE persona_id = $1 AND status = 'running'`,
@@ -354,6 +375,11 @@ func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaStat
 		return st, err
 	}
 	st.RunningTurn = running
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM core_tool_approvals WHERE persona_id = $1 AND status = 'pending'`,
+		personaID).Scan(&st.PendingApprovals); err != nil {
+		return st, err
+	}
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM core_schedules WHERE persona_id = $1 AND status = 'pending'`,
 		personaID).Scan(&st.PendingSchedules); err != nil {
@@ -608,6 +634,9 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 		if decision.Calls[i].Tool == "" {
 			return TurnPlan{}, false, fmt.Errorf("%w: plan call %d missing tool", ErrBadRequest, i)
 		}
+		if decision.Calls[i].Route != "normal" && decision.Calls[i].Route != "elevated" {
+			return TurnPlan{}, false, fmt.Errorf("%w: plan call %d missing or unknown invocation route", ErrBadRequest, i)
+		}
 		if decision.Calls[i].Request == nil {
 			decision.Calls[i].Request = map[string]any{}
 		}
@@ -839,9 +868,12 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 		if err != nil {
 			return res, fmt.Errorf("claim input: %w", err)
 		}
+		// A turn that parked behind a human approval is not a failed
+		// attempt: waiting on a person must not burn the input's attempt
+		// cap, however many gated calls its plan holds.
 		var attempt int
 		if err := tx.QueryRow(ctx,
-			`SELECT COUNT(*) + 1 FROM core_turns WHERE persona_id = $1 AND input_id = $2`,
+			`SELECT COUNT(*) + 1 FROM core_turns WHERE persona_id = $1 AND input_id = $2 AND status <> 'awaiting'`,
 			personaID, in.InputID).Scan(&attempt); err != nil {
 			return res, err
 		}
@@ -903,8 +935,8 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 // Re-committing an already-finished turn replays the stored result, so a
 // lost commit response is safe.
 func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, generation int64, req CommitRequest) (*Turn, error) {
-	if req.Outcome != "complete" && req.Outcome != "fail" {
-		return nil, fmt.Errorf("%w: outcome must be complete or fail", ErrBadRequest)
+	if req.Outcome != "complete" && req.Outcome != "fail" && req.Outcome != "await" {
+		return nil, fmt.Errorf("%w: outcome must be complete, fail, or await", ErrBadRequest)
 	}
 	// Error text is diagnostic, not authoritative content: strip bytes PG
 	// text/jsonb cannot hold so a poisoned provider message cannot make the
@@ -955,9 +987,6 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if t.Generation != generation {
 		return nil, ErrTurnConflict
 	}
-	if req.Outcome != "complete" && req.Outcome != "fail" {
-		return nil, fmt.Errorf("%w: outcome must be complete or fail", ErrBadRequest)
-	}
 	reqJSON, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -966,6 +995,68 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		return nil, dataErr(err)
 	}
 	switch req.Outcome {
+	case "await":
+		// The turn parks behind pending tool approvals. Lock the pending
+		// rows first so a decision landing mid-commit is serialized: the
+		// input waits only when an approval is still undecided; if a human
+		// decided between the claim and this commit, the input requeues
+		// directly so the resume attempt sees the recorded decision.
+		pending, err := s.pendingApprovalsForInput(ctx, tx, personaID, t.InputID)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.QueryRow(ctx, `
+			UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
+			WHERE persona_id = $1 AND turn_id = $2
+			RETURNING status, finished_at`,
+			personaID, turnID, reqJSON).
+			Scan(&t.Status, &t.FinishedAt); err != nil {
+			return nil, fmt.Errorf("await turn: %w", dataErr(err))
+		}
+		if len(pending) == 0 {
+			// Every approval this input parked for is already decided —
+			// resume immediately instead of waiting on a decision that
+			// already landed.
+			if _, err := tx.Exec(ctx, `
+				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
+					turn_id = NULL, not_before = NULL
+				WHERE persona_id = $1 AND input_id = $2`,
+				personaID, t.InputID); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err := tx.Exec(ctx, `
+				UPDATE core_inputs SET status = 'waiting'
+				WHERE persona_id = $1 AND input_id = $2`,
+				personaID, t.InputID); err != nil {
+				return nil, err
+			}
+			// Surface the pending requests on the outbox so a delivery
+			// surface can bring the human's attention to them — the
+			// approval rows themselves remain the decision record.
+			reqs := make([]map[string]any, 0, len(pending))
+			for _, a := range pending {
+				reqs = append(reqs, map[string]any{
+					"approval_id":   a.ApprovalID,
+					"tool":          a.Tool,
+					"route":         a.Route,
+					"required_by":   a.RequiredBy,
+					"request":       a.Request,
+					"action_digest": a.ActionDigest,
+				})
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO core_outbox (persona_id, seq, kind, payload)
+				SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'approval_requested', $2
+				FROM core_outbox WHERE persona_id = $1::uuidv7`,
+				personaID, map[string]any{
+					"turn_id":   turnID,
+					"input_id":  t.InputID,
+					"approvals": reqs,
+				}); err != nil {
+				return nil, fmt.Errorf("append outbox: %w", dataErr(err))
+			}
+		}
 	case "complete":
 		if err := tx.QueryRow(ctx, `
 			UPDATE core_turns SET status = 'done', finished_at = now(), output = $3, usage = $4, commit_request = $5
@@ -1229,13 +1320,6 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 	return out, rows.Err()
 }
 
-// isInternalTool lists the tools whose effects this slice can apply
-// atomically inside the claim transaction. Anything else has no execution
-// path yet and must not be claimable.
-func isInternalTool(tool string) bool {
-	return tool == "schedule.set" || tool == "journal.note"
-}
-
 // internalToolResponse applies a state-internal tool's effect inside the
 // claim transaction: the operation record and its effect are atomic, so a
 // crash cannot leave an unrecorded effect or a dangling record.
@@ -1318,6 +1402,26 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
+	case "message.send":
+		text, _ := request["text"].(string)
+		if text == "" {
+			return nil, false, fmt.Errorf("%w: message.send requires text", ErrBadRequest)
+		}
+		// The effect is an outbox entry the delivery layer reads — the
+		// durable record of the secretary's outward message. Approval
+		// gating happens before this point; reaching it means the call ran
+		// under its recorded authority.
+		var seq int64
+		err := tx.QueryRow(ctx, `
+			INSERT INTO core_outbox (persona_id, seq, kind, payload)
+			SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'secretary_message', $2
+			FROM core_outbox WHERE persona_id = $1::uuidv7
+			RETURNING seq`,
+			personaID, map[string]any{"text": text, "turn_id": turnID}).Scan(&seq)
+		if err != nil {
+			return nil, false, fmt.Errorf("message.send: %w", dataErr(err))
+		}
+		return map[string]any{"seq": seq, "kind": "secretary_message"}, true, nil
 	default:
 		return nil, false, nil
 	}
@@ -1327,19 +1431,21 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // Idempotent by (persona, tool, idempotency_key): a replayed claim returns the
 // stored operation including its response, so effects are not re-run.
 //
-// State-internal tools (schedule.set, journal.note) apply their effect in the
-// claim transaction and return done immediately. External tools are claimed
-// 'running' and must be completed via CompleteOperation; a crash between the
-// external effect and its completion leaves a 'running' record that the next
-// generation reclaims — reconciliation by querying the external system is the
-// caller's duty, the ledger alone cannot prove an ambiguous external effect.
-func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, bool, error) {
+// State-internal tools apply their effect in the claim transaction and
+// return done immediately. A call that requires human approval — the tool's
+// intrinsic registration, or the recorded plan call's elevated route —
+// parks instead: the operation waits in 'awaiting_approval' and a pending
+// core_tool_approvals row is returned with it. Once a human decision lands,
+// the next claim consumes the one-shot grant and applies the effect
+// atomically (approve_once), or replays the finalized denial (deny_once).
+// External tools would be claimed 'running' and completed via
+// CompleteOperation; no external executor exists in this slice.
+func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, *ToolApproval, bool, error) {
 	if !isInternalTool(tool) {
 		// This slice has no external executor; claiming an unregistered tool
 		// would record a permanently dangling 'running' operation. Reject at
-		// the boundary — the authorized external-tool contract (M08) adds its
-		// own claim path.
-		return Operation{}, false, fmt.Errorf("%w: %s", ErrUnknownTool, tool)
+		// the boundary.
+		return Operation{}, nil, false, fmt.Errorf("%w: %s", ErrUnknownTool, tool)
 	}
 	if request == nil {
 		request = map[string]any{}
@@ -1347,15 +1453,15 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	// The request is about to be bound against the recorded plan as jsonb:
 	// a NUL in it is a deterministic data error, never a transient one.
 	if hasNUL(request) {
-		return Operation{}, false, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
+		return Operation{}, nil, false, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Operation{}, false, err
+		return Operation{}, nil, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return Operation{}, false, err
+		return Operation{}, nil, false, err
 	}
 	// Operations are attributed to a turn; that turn must be the live one —
 	// running under this generation — so an effect cannot be recorded
@@ -1367,13 +1473,13 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		`SELECT input_id, generation, status FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
 		personaID, turnID).Scan(&inputID, &turnGen, &turnStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Operation{}, false, ErrTurnNotFound
+		return Operation{}, nil, false, ErrTurnNotFound
 	}
 	if err != nil {
-		return Operation{}, false, err
+		return Operation{}, nil, false, err
 	}
 	if turnGen != generation || turnStatus != "running" {
-		return Operation{}, false, ErrTurnConflict
+		return Operation{}, nil, false, ErrTurnConflict
 	}
 	// The claim must be an entry of the input's recorded plan: the decision
 	// is durable before effects, so an off-plan call — absent plan, index
@@ -1381,11 +1487,11 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	// contract violation, never a fresh effect. call_index addresses a flat
 	// position across every recorded round's calls in order.
 	if callIndex < 0 {
-		return Operation{}, false, fmt.Errorf("%w: call_index must be >= 0", ErrBadRequest)
+		return Operation{}, nil, false, fmt.Errorf("%w: call_index must be >= 0", ErrBadRequest)
 	}
 	plan, err := s.planForInput(ctx, tx, personaID, inputID)
 	if err != nil {
-		return Operation{}, false, dataErr(err)
+		return Operation{}, nil, false, dataErr(err)
 	}
 	var flat []PlanCall
 	if plan != nil {
@@ -1396,35 +1502,46 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	planned := callIndex < len(flat) && flat[callIndex].Tool == tool &&
 		jsonbEqual(flat[callIndex].Request, request)
 	if !planned {
-		return Operation{}, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
+		return Operation{}, nil, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
 	}
 	// Effect identity is server-owned: derived from the turn's input and the
 	// plan position. A caller-chosen key could otherwise mint a second
 	// effect for the same planned call.
 	idemKey := inputID + ":tool:" + strconv.Itoa(callIndex)
+	// The requirement is derived from the recorded call, not asserted by
+	// the caller: an intrinsic tool requirement cannot be lowered by a
+	// "normal" route, and an elevated route cannot be retroactively
+	// dropped — the plan record is the route's durable identity.
+	requiredBy := approvalRequirement(tool, flat[callIndex].Route)
 	// Claim first: the idempotency insert decides whether this call owns the
 	// effect. The internal effect is applied only on a fresh claim, then the
 	// operation is finalized in the same transaction — record and effect are
-	// atomic.
+	// atomic. For gated calls the insert parks the operation instead.
+	opStatus := "running"
+	if requiredBy != "" {
+		opStatus = "awaiting_approval"
+	}
 	var op Operation
+	freshInsert := true
 	err = tx.QueryRow(ctx, `
 		INSERT INTO core_operations (persona_id, operation_id, turn_id, tool, idempotency_key, request, status, claimed_generation)
-		VALUES ($1, $2, $3, $4, $5, $6, 'running', $7)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (persona_id, tool, idempotency_key) DO NOTHING
 		RETURNING persona_id, operation_id, turn_id, tool, idempotency_key, request, status, response, claimed_generation, created_at, completed_at`,
-		personaID, operationID, turnID, tool, idemKey, request, generation).
+		personaID, operationID, turnID, tool, idemKey, request, opStatus, generation).
 		Scan(&op.PersonaID, &op.OperationID, &op.TurnID, &op.Tool, &op.IdempotencyKey, &op.Request,
 			&op.Status, &op.Response, &op.ClaimedGeneration, &op.CreatedAt, &op.CompletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
+		freshInsert = false
 		op, err = s.operationByKey(ctx, tx, personaID, tool, idemKey)
 		if err != nil {
-			return Operation{}, false, err
+			return Operation{}, nil, false, err
 		}
 		// A replayed key is idempotent only for the identical request —
 		// returning the stored receipt for a different request would record
 		// an effect that never ran.
 		if !jsonbEqual(op.Request, request) {
-			return Operation{}, false, fmt.Errorf("%w: idempotency_key replay carries a different request", ErrTurnConflict)
+			return Operation{}, nil, false, fmt.Errorf("%w: idempotency_key replay carries a different request", ErrTurnConflict)
 		}
 		if op.Status == "running" && op.ClaimedGeneration != generation {
 			// The claiming generation is fenced; reclaim for re-execution.
@@ -1432,28 +1549,56 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 				UPDATE core_operations SET claimed_generation = $4, turn_id = $5
 				WHERE persona_id = $1 AND tool = $2 AND idempotency_key = $3 AND status = 'running'`,
 				personaID, tool, idemKey, generation, turnID); err != nil {
-				return Operation{}, false, err
+				return Operation{}, nil, false, err
 			}
 			op.ClaimedGeneration = generation
 			op.TurnID = turnID
 			if err := tx.Commit(ctx); err != nil {
-				return Operation{}, false, err
+				return Operation{}, nil, false, err
 			}
-			return op, true, nil
+			return op, nil, true, nil
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Operation{}, false, err
-		}
-		return op, false, nil
 	}
 	if err != nil {
-		return Operation{}, false, fmt.Errorf("claim operation: %w", dataErr(err))
+		return Operation{}, nil, false, fmt.Errorf("claim operation: %w", dataErr(err))
+	}
+	if requiredBy != "" {
+		return s.claimGated(ctx, tx, personaID, inputID, callIndex, op, flat[callIndex].Route, requiredBy, freshInsert)
+	}
+	if !freshInsert {
+		// Stored receipt or finalized denial record — replay as-is.
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, nil, false, nil
+	}
+	// A normal-route call cannot quietly redo what the human refused: when
+	// this input already holds a denied approval for the identical tool and
+	// request, the call finalizes failed with that denial instead of running
+	// under the agent's own authority.
+	denied, err := s.deniedIdenticalCall(ctx, tx, personaID, inputID, tool, request)
+	if err != nil {
+		return Operation{}, nil, false, err
+	}
+	if denied != nil {
+		if err := tx.QueryRow(ctx, `
+			UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
+			WHERE persona_id = $1 AND operation_id = $2
+			RETURNING status, response, completed_at`,
+			personaID, op.OperationID, denialResponse(denied)).
+			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
+			return Operation{}, nil, false, fmt.Errorf("finish denied operation: %w", dataErr(err))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, denied, true, nil
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
 	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
 	if err != nil {
-		return Operation{}, false, err
+		return Operation{}, nil, false, err
 	}
 	if internal {
 		if err := tx.QueryRow(ctx, `
@@ -1462,13 +1607,109 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			RETURNING status, response, completed_at`,
 			personaID, operationID, generation, response).
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
-			return Operation{}, false, fmt.Errorf("finish internal operation: %w", dataErr(err))
+			return Operation{}, nil, false, fmt.Errorf("finish internal operation: %w", dataErr(err))
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Operation{}, false, err
+		return Operation{}, nil, false, err
 	}
-	return op, true, nil
+	return op, nil, true, nil
+}
+
+// claimGated continues ClaimOperation for a call that requires a human
+// decision. The operation row exists at 'awaiting_approval' (fresh insert)
+// or is a replay. The approval row is created pending on the first claim
+// and is the authority for what happens next: pending → the caller parks;
+// approved → the one-shot grant is consumed and the effect applied in this
+// same transaction; denied → the stored failed operation is returned.
+func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID string, callIndex int, op Operation, route, requiredBy string, freshInsert bool) (Operation, *ToolApproval, bool, error) {
+	if op.Status != "awaiting_approval" {
+		// Done or finalized-failed (denied): replay the stored record, with
+		// the decision that produced it.
+		a, err := s.approvalForCall(ctx, tx, personaID, inputID, callIndex, false)
+		if err != nil {
+			return Operation{}, nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, a, false, nil
+	}
+	if freshInsert {
+		// Park the call: the durable approval request is created with the
+		// operation's recorded route, exact request, and action digest.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO core_tool_approvals
+				(approval_id, persona_id, input_id, call_index, operation_id, turn_id,
+				 tool, route, required_by, request, action_digest, status)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+			ON CONFLICT (persona_id, input_id, call_index) DO NOTHING`,
+			approvalID(personaID, inputID, callIndex),
+			personaID, inputID, callIndex,
+			op.OperationID, op.TurnID, op.Tool, route, requiredBy,
+			op.Request, actionDigest(op.Tool, route, op.Request)); err != nil {
+			return Operation{}, nil, false, fmt.Errorf("record approval request: %w", err)
+		}
+	}
+	a, err := s.approvalForCall(ctx, tx, personaID, inputID, callIndex, true)
+	if err != nil {
+		return Operation{}, nil, false, err
+	}
+	if a == nil {
+		return Operation{}, nil, false, fmt.Errorf("approval record missing for gated operation %s", op.OperationID)
+	}
+	switch a.Status {
+	case "pending":
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, a, freshInsert, nil
+	case "approved":
+		if a.ConsumedAt != nil {
+			// The grant was already consumed — the operation finalized in
+			// that transaction, so replay the stored record.
+			if err := tx.Commit(ctx); err != nil {
+				return Operation{}, nil, false, err
+			}
+			return op, a, false, nil
+		}
+		// One-shot consumption + effect + receipt are one transaction: the
+		// approved call executes exactly once under its granted provenance.
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_tool_approvals SET consumed_at = now()
+			WHERE persona_id = $1 AND approval_id = $2 AND consumed_at IS NULL`,
+			personaID, a.ApprovalID); err != nil {
+			return Operation{}, nil, false, err
+		}
+		now := time.Now()
+		a.ConsumedAt = &now
+		response, internal, err := s.internalToolResponse(ctx, tx, personaID, op.TurnID, op.Tool, op.Request)
+		if err != nil {
+			return Operation{}, nil, false, err
+		}
+		if internal {
+			if err := tx.QueryRow(ctx, `
+				UPDATE core_operations SET status = 'done', response = $3, completed_at = now()
+				WHERE persona_id = $1 AND operation_id = $2 AND status = 'awaiting_approval'
+				RETURNING status, response, completed_at`,
+				personaID, op.OperationID, response).
+				Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
+				return Operation{}, nil, false, fmt.Errorf("finish approved operation: %w", dataErr(err))
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, a, true, nil
+	default: // denied
+		// The resolve path finalized the operation failed in the same
+		// transaction; replay the stored outcome — never re-run, never
+		// silently re-prompt.
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, a, false, nil
+	}
 }
 
 func (s *Store) operationByKey(ctx context.Context, db queryRower, personaID, tool, idemKey string) (Operation, error) {

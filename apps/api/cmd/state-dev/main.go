@@ -9,17 +9,22 @@
 //	SUMI_DB_URL            postgres connection string (required)
 //	SUMI_CORE_STATE_TOKEN  admin/service bearer; also mints persona tokens (required)
 //	SUMI_STATE_LISTEN      listen address (default 127.0.0.1:8180)
+//	SUMI_MODEL_CONNECTION_KEY  base64-encoded 32-byte key for the user
+//	                         model-connection store; absent = metadata-only
 package main
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 )
 
 func main() {
@@ -46,7 +51,21 @@ func main() {
 		log.Fatalf("migrate: %v", err)
 	}
 	mux := http.NewServeMux()
-	agentstate.NewServer(pool.Pool, token).RegisterRoutes(mux)
+	coreState := agentstate.NewServer(pool.Pool, token)
+	if raw := strings.TrimSpace(os.Getenv("SUMI_MODEL_CONNECTION_KEY")); raw != "" {
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 {
+			log.Fatal("SUMI_MODEL_CONNECTION_KEY must encode 32 bytes")
+		}
+		conns, err := modelconnections.New(pool.Pool, key)
+		if err != nil {
+			log.Fatalf("model connection store: %v", err)
+		}
+		coreState.SetModelConnections(conns)
+	} else {
+		coreState.SetModelConnections(modelconnections.MetadataOnly(pool.Pool))
+	}
+	coreState.RegisterRoutes(mux)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))

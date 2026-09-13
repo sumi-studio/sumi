@@ -19,6 +19,7 @@ import type {
   EventInput,
   Input,
   Json,
+  PlanCall,
   Turn,
   TurnPlan,
   WriterLease,
@@ -508,6 +509,26 @@ export class Secretary {
         for (const call of decision.calls) {
           const res = await this.executeCall(turn, call, results.length, events);
           if (res === null) return; // divergent — failure committed
+          if (res === "awaited") {
+            // A gated call parked: its planned operation and the pending
+            // approval are durable, so the commit can wait on them. The
+            // store moves the input to waiting and emits the request
+            // notification; an authenticated decision requeues the input
+            // and the next attempt resumes this exact call. The turn is
+            // recorded awaiting — never auto-executed after a restart.
+            // Only the request itself is journaled now: the resuming attempt
+            // replays this plan and journals the whole turn once, so the
+            // input and its reply are not recorded twice.
+            await this.commitTurnFinal(turn, {
+              outcome: "await",
+              events: events.filter((e) => e.kind === "approval_requested"),
+            });
+            this.log("turn awaiting approval", {
+              turn_id: turn.turn_id,
+              input_id: input.input_id,
+            });
+            return;
+          }
           const result = { call_id: call.call_id ?? "", tool: call.tool, ...res };
           results.push(result);
           roundResults.push(result);
@@ -558,6 +579,7 @@ export class Secretary {
           toolCalls: decision.calls.map((c) => ({
             id: c.call_id ?? "",
             name: c.tool,
+            route: c.route,
             arguments: c.request,
           })),
         });
@@ -578,15 +600,16 @@ export class Secretary {
 
   /**
    * Execute one planned call at its flat position. Returns the result to
-   * feed back to the model, or null when a plan-boundary failure was
-   * committed and the turn is over.
+   * feed back to the model, "awaited" when the call parked behind a pending
+   * human decision, or null when a plan-boundary failure was committed and
+   * the turn is over.
    */
   private async executeCall(
     turn: Turn,
-    call: { call_id?: string; tool: string; request: Json },
+    call: PlanCall,
     flatIndex: number,
     events: EventInput[],
-  ): Promise<{ result: unknown; replayed: boolean } | null> {
+  ): Promise<{ result: unknown; replayed: boolean } | "awaited" | null> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
     const callId = call.call_id ?? "";
@@ -632,7 +655,24 @@ export class Secretary {
       // turn running for a future generation to recover and retry.
       throw e;
     }
-    const { operation, fresh } = claim;
+    const { operation, approval, fresh } = claim;
+    if (operation.status === "awaiting_approval") {
+      // Gated call: the store durably recorded the planned operation and a
+      // pending approval before returning — no effect ran. Record exactly
+      // what is waiting on the human, then park.
+      events.push({
+        kind: "approval_requested",
+        payload: {
+          tool: call.tool,
+          call_id: callId,
+          route: call.route,
+          approval_id: approval?.approval_id ?? null,
+          required_by: approval?.required_by ?? null,
+          request: call.request,
+        },
+      });
+      return "awaited";
+    }
     if (!fresh && !jsonEqual(operation.request, call.request)) {
       // Defense in depth: a store that replays a receipt for a different
       // request than the plan position's is detected client-side too.
@@ -662,8 +702,35 @@ export class Secretary {
     }
     events.push({
       kind: "tool_call",
-      payload: { tool: call.tool, call_id: callId, request: call.request },
+      payload: {
+        tool: call.tool,
+        call_id: callId,
+        request: call.request,
+        route: call.route,
+      },
     });
+    if (operation.status === "failed") {
+      // Durable denial (or another finalized failure): the decided call
+      // must not be silently retried or bypassed — the failure itself is
+      // the result the model sees, journaled as denied.
+      const err =
+        operation.response !== null &&
+        typeof operation.response === "object" &&
+        "error" in operation.response
+          ? String((operation.response as { error: unknown }).error)
+          : "operation failed";
+      events.push({
+        kind: "tool_result",
+        payload: {
+          tool: call.tool,
+          call_id: callId,
+          error: err,
+          denied: approval?.status === "denied" || undefined,
+          replayed: !fresh,
+        },
+      });
+      return { result: { error: err }, replayed: !fresh };
+    }
     events.push({
       kind: "tool_result",
       payload: {
@@ -762,6 +829,7 @@ export class Secretary {
         calls: calls.map((c) => ({
           call_id: c.id,
           tool: c.name,
+          route: c.route,
           request: c.arguments,
         })),
         usage: stripNulDeep(usage) as Record<string, unknown>,
@@ -943,6 +1011,8 @@ function truncateText(s: string, maxBytes: number): string {
 const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
+  "message.send speaks into the shared channel as you — every call waits for the human's explicit approval before it is sent. " +
+  "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";

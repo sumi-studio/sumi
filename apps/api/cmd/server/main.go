@@ -655,7 +655,9 @@ func newApplicationFromEnv() (*application, error) {
 			closeOnError()
 			return nil, errors.New("SUMI_CORE_STATE_TOKEN must be at least 16 characters")
 		}
-		agentstate.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
+		coreState := agentstate.NewServer(database.Pool, coreToken)
+		coreState.SetModelConnections(modelConnections)
+		coreState.RegisterRoutes(mux)
 		log.Print("core state routes ready (/internal/core, scoped tokens)")
 	}
 	mux.HandleFunc("GET /health", handler.Health)

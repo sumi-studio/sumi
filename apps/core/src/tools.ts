@@ -6,10 +6,15 @@ import type { ToolSpec } from "./provider.ts";
  * state-internal tools are registered: their effects commit atomically
  * inside the claim transaction (no crash window between effect and receipt).
  *
- * External-side-effect tools (send email, post to Slack, call a paid API)
- * are deliberately NOT in this registry — they need the authorized-tool
- * contract (durable intent → guarded execution → receipt) before the model
- * may invoke them. See progress.md.
+ * message.send is outward-facing — speaking into the shared channel as the
+ * secretary — so the state service holds every call for an explicit human
+ * decision before its effect may run (ADR 0013). The model may also elevate
+ * any call itself via the route field of the provider envelope; it can
+ * never lower an intrinsic requirement.
+ *
+ * Other external-side-effect tools (send email, call a paid API) are
+ * deliberately NOT in this registry — they need an external executor before
+ * the model may invoke them.
  */
 
 export interface RegisteredTool extends ToolSpec {
@@ -45,6 +50,19 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       properties: {
         text: { type: "string", description: "the note content" },
         kind: { type: "string", description: "optional note kind/tag" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    internal: true,
+    name: "message.send",
+    description:
+      "Send a message into the shared channel as yourself. This is an outward-facing act: every call waits for an explicit human approval before it is delivered. The call returns once decided.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "the message text" },
       },
       required: ["text"],
     },

@@ -245,7 +245,7 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 	}
 	// Save the decision.
 	planBody := `{"generation":` + gen + `,"turn_id":"` + turnID + `","round":0,"text":"noted",
-		"calls":[{"tool":"journal.note","request":{"text":"keep me"}}]}`
+		"calls":[{"tool":"journal.note","route":"normal","request":{"text":"keep me"}}]}`
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok, planBody)
 	if rec.Code != 200 {
 		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
@@ -351,7 +351,7 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 	// A clean plan still saves after the rejection.
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
 		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"scheduling",
-		"calls":[{"tool":"schedule.set","request":{"wake_at":"2030-01-01T00:00:00Z","miss_policy":"bogus"}}]}`)
+		"calls":[{"tool":"schedule.set","route":"normal","request":{"wake_at":"2030-01-01T00:00:00Z","miss_policy":"bogus"}}]}`)
 	if rec.Code != 200 {
 		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
 	}

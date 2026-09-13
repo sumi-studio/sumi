@@ -16,7 +16,7 @@
  * Kill -9 safe at any point: nothing canonical lives in this process.
  */
 
-import { providerFromEnv } from "./provider-env.ts";
+import { providerForPersona } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -32,12 +32,22 @@ async function main() {
     env("SUMI_STATE_URL"),
     env("SUMI_PERSONA_TOKEN"),
   );
+  const personaId = env("SUMI_PERSONA_ID");
   const leaseTtl = Number(process.env.SUMI_LEASE_TTL_MS ?? 30_000);
   const secretary = new Secretary({
-    personaId: env("SUMI_PERSONA_ID"),
+    personaId,
     holderId: process.env.SUMI_HOLDER_ID ?? `local-${process.pid}`,
     state,
-    provider: providerFromEnv((n) => process.env[n]),
+    // The selected model connection is authoritative: re-resolved through
+    // the state service for every model call; env only applies when the
+    // persona has no selection at all.
+    provider: providerForPersona(
+      state,
+      personaId,
+      (n) => process.env[n],
+      (msg, fields) =>
+        console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),
+    ),
     leaseTtlMs: leaseTtl,
     renewEveryMs: Math.max(250, Math.floor(leaseTtl / 3)),
     contextLimit: 60,

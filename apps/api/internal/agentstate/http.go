@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 )
 
 // uuidv7Re matches the uuidv7 domain: malformed persona ids in the path are
@@ -37,10 +38,18 @@ type Server struct {
 	store   *Store
 	secret  []byte
 	maxBody int64
+	conns   *modelconnections.Store
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
 	return &Server{store: NewStore(pool), secret: []byte(adminSecret), maxBody: 1 << 20}
+}
+
+// SetModelConnections wires the user model-connection store so
+// GET .../model can resolve the persona's explicit selection. Without it
+// the route reports "unset" rather than guessing at a provider.
+func (s *Server) SetModelConnections(conns *modelconnections.Store) {
+	s.conns = conns
 }
 
 // PersonaToken derives the scoped capability for one persona.
@@ -94,6 +103,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/operations/{operation}/complete", s.completeOperation)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/schedules/dispatch", s.dispatchSchedules)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/outbox", s.outbox)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals", s.listApprovals)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals/{approval}", s.getApproval)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/approvals/{approval}/decision", s.decideApproval)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/model", s.modelBinding)
 }
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -151,12 +164,16 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func storeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
-		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound):
+		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
+		errors.Is(err, ErrApprovalNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict):
+	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
+		errors.Is(err, ErrApprovalConflict):
 		writeError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
+	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool), errors.Is(err, ErrApprovalDecidedBy):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrApprovalForbidden):
+		writeError(w, http.StatusForbidden, err.Error())
 	case isDataError(err):
 		// Deterministic data errors (class 22, 23514) can never succeed on
 		// retry; report them as 400, not a transient-looking 500.
@@ -518,13 +535,13 @@ func (s *Server) claimOperation(w http.ResponseWriter, r *http.Request) {
 	if !requireGen(w, req.Generation) {
 		return
 	}
-	op, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
+	op, approval, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
 		req.OperationID, req.Tool, *req.CallIndex, req.Request)
 	if err != nil {
 		storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"operation": op, "fresh": fresh})
+	writeJSON(w, http.StatusOK, map[string]any{"operation": op, "approval": approval, "fresh": fresh})
 }
 
 func (s *Server) completeOperation(w http.ResponseWriter, r *http.Request) {

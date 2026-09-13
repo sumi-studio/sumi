@@ -295,6 +295,13 @@ func (s *Store) Metadata(ctx context.Context, human, id string) (Access, error) 
 	if !s.CredentialsAvailable() {
 		return Access{}, ErrUnavailable
 	}
+	return s.Describe(ctx, human, id)
+}
+
+// Describe returns non-secret connection metadata (identity, preset,
+// endpoint, model, version) without requiring the credential key — a
+// metadata-only store can still describe the selection authoritatively.
+func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) {
 	parsed, err := uuid.Parse(id)
 	if err != nil {
 		return Access{}, ErrNotFound
