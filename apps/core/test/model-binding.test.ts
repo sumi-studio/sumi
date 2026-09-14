@@ -450,3 +450,32 @@ test("the intent clear is fenced to staged and active personas", async () => {
     (e: unknown) => e instanceof StateError && e.status === 409,
   );
 });
+
+test("the operator env fallback validates its URL at construction", async () => {
+  const { providerFromEnv } = await import("../src/host/provider-env.ts");
+  const env = (over: Record<string, string | undefined>) => (name: string) =>
+    over[name];
+  // An unparseable base URL fails at boot, not as a per-request defect.
+  assert.throws(
+    () =>
+      providerFromEnv(
+        env({
+          SUMI_MODEL_PROVIDER: "openai",
+          SUMI_MODEL_BASE_URL: "not a url",
+          SUMI_MODEL_API_KEY: "k",
+          SUMI_MODEL_MODEL: "m",
+        }),
+      ),
+    /SUMI_MODEL_BASE_URL is not a URL/,
+  );
+  // A well-formed env produces a working provider.
+  const p = providerFromEnv(
+    env({
+      SUMI_MODEL_PROVIDER: "openai",
+      SUMI_MODEL_BASE_URL: "http://127.0.0.1:1",
+      SUMI_MODEL_API_KEY: "k",
+      SUMI_MODEL_MODEL: "m",
+    }),
+  );
+  assert.equal(p.name, "openai");
+});

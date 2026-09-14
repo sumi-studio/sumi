@@ -262,8 +262,17 @@ export function providerFromEnv(
 ): ModelProvider {
   const kind = get("SUMI_MODEL_PROVIDER") ?? "mock";
   if (kind === "openai") {
+    const baseUrl = required(get, "SUMI_MODEL_BASE_URL");
+    // The connection path's URL is validated by the Go store; the env
+    // path has no such boundary, so an unparseable base URL must fail
+    // here at boot — not as a per-request fetch defect.
+    try {
+      new URL(baseUrl);
+    } catch {
+      throw new Error(`SUMI_MODEL_BASE_URL is not a URL: ${baseUrl}`);
+    }
     return new OpenAIProvider({
-      baseUrl: required(get, "SUMI_MODEL_BASE_URL"),
+      baseUrl,
       apiKey: required(get, "SUMI_MODEL_API_KEY"),
       model: required(get, "SUMI_MODEL_MODEL"),
       headers: jsonObj(get, "SUMI_MODEL_HEADERS_JSON") as

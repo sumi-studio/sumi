@@ -157,6 +157,13 @@ export function parseCallEnvelope(
  * must still map to a valid wire name when its tool is no longer
  * advertised in the current request, so the fallback cannot depend on
  * the request's tool list.
+ *
+ * The transform is the same function `toolNameMaps` applies to the
+ * advertised set, and collisions there fail the request at build time —
+ * a recorded call therefore only ever existed under `sanitizeToolName`
+ * of its canonical name. The replay fallback thus reproduces the exact
+ * wire name the call was originally sent under; it is not a
+ * second-choice or suffixed variant.
  */
 export function sanitizeToolName(name: string): string {
   let wire = name.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -166,8 +173,9 @@ export function sanitizeToolName(name: string): string {
 
 /**
  * Per-request translation between canonical tool names and wire names.
- * Sanitization is lossy, so a collision between two tools in one request
- * fails loudly at request-build time rather than misrouting a call.
+ * Sanitization is lossy, so a collision between two advertised tools in
+ * one request fails loudly at request-build time — no tool call could
+ * ever have been recorded under an ambiguous wire name.
  */
 export function toolNameMaps(tools: { name: string }[]): {
   toWire: Map<string, string>;
@@ -227,19 +235,45 @@ export async function httpError(res: Response): Promise<ModelError> {
 }
 
 /**
+ * Messages a fetch implementation produces for request-construction
+ * defects — never transport conditions — across both runtimes the core
+ * supports:
+ *
+ *   undici (Node):  "Failed to parse URL from …",
+ *                   'Headers.append: "…" is an invalid header value.',
+ *                   "Cannot convert argument to a ByteString"
+ *   workerd:        "Invalid URL: …"
+ *                   (a header value outside Latin-1 is NOT rejected by
+ *                   workerd — it is UTF-8-encoded with a console warning —
+ *                   so assertExtraHeaders is the only guard there)
+ *
+ * A construction defect can never succeed on retry, so it is the only
+ * failure classified deterministic here. Everything else — including a
+ * TypeError of unrecognized provenance — stays retryable: undici
+ * transport failures arrive as `TypeError: fetch failed` carrying the
+ * socket error as `cause`, and workerd surfaces transport loss as a
+ * plain `Error: Network connection lost.` (neither a TypeError nor a
+ * recognized signature). Runtime taxonomies differ enough that
+ * "TypeError without a cause" alone is not a safe determinism test.
+ */
+const CONSTRUCTION_DEFECT =
+  /invalid url|failed to parse url|invalid header|bytestring/i;
+
+/**
  * Classify a fetch() rejection: caller cancellation propagates
- * untouched; our wall deadline and network failures are transient
- * provider errors worth retrying. A bare TypeError with no underlying
- * cause is different: undici uses it for deterministic request defects
- * (an unrepresentable header value, an unparsable URL) that can never
- * succeed on retry — those fail honestly instead of spending the
- * transient-retry window. Transport failures always arrive as
- * `TypeError: fetch failed` carrying the socket error as `cause`.
+ * untouched; recognized request-construction defects fail
+ * deterministically; everything else is a transient provider/transport
+ * error worth retrying. Header and URL defects are primarily prevented
+ * at the configuration boundaries (assertExtraHeaders, Go endpoint
+ * validation, env URL parsing) — this classifier is the backstop.
  */
 export function networkError(e: unknown, signal?: AbortSignal): ModelError {
   if (signal?.aborted) throw e;
   const reason = e instanceof Error ? e.message : String(e);
-  const deterministic = e instanceof TypeError && !(e.cause instanceof Error);
+  const deterministic =
+    e instanceof TypeError &&
+    !(e.cause instanceof Error) &&
+    CONSTRUCTION_DEFECT.test(reason);
   return new ModelError(`model request failed: ${reason}`, {
     retryable: !deterministic,
   });

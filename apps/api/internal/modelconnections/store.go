@@ -181,9 +181,15 @@ func validateShape(in Input) error {
 	if in.APIKey != nil && (!bounded(*in.APIKey, 65536) || strings.TrimSpace(*in.APIKey) != *in.APIKey) {
 		return invalid("API key is empty, too long, or has surrounding whitespace")
 	}
-	if in.MaxOutputTokens != nil &&
-		(*in.MaxOutputTokens < 1 || *in.MaxOutputTokens > maxOutputTokensBound) {
-		return invalid(fmt.Sprintf("maxOutputTokens must be between 1 and %d", maxOutputTokensBound))
+	if in.MaxOutputTokens != nil {
+		if *in.MaxOutputTokens < 1 || *in.MaxOutputTokens > maxOutputTokensBound {
+			return invalid(fmt.Sprintf("maxOutputTokens must be between 1 and %d", maxOutputTokensBound))
+		}
+		// Only the Anthropic and Responses adapters put a bound on the
+		// wire; on any other preset the saved value would do nothing.
+		if in.Preset != "anthropic" && in.Preset != "openai-responses" {
+			return invalid(fmt.Sprintf("maxOutputTokens has no effect on preset %q — only anthropic and openai-responses send an output bound", in.Preset))
+		}
 	}
 	// Extra headers live inside the sealed credential: setting or clearing
 	// them (present field, even an empty map) requires the key alongside.

@@ -722,3 +722,51 @@ test("a transport TypeError with a socket cause stays retryable", async () => {
     (e: unknown) => e instanceof ModelError && e.retryable,
   );
 });
+
+// Runtime witnesses from the actual second host (wrangler dev / real
+// workerd 1.20260804.1): a connection-refused fetch rejects with a plain
+// Error "Network connection lost." — not a TypeError at all — while an
+// unparseable URL rejects with TypeError "Invalid URL: …" carrying no
+// cause. Determinism is matched on the construction-defect signature,
+// not on "TypeError without cause", which is undici-specific.
+test("a workerd transport failure (plain Error) stays retryable", async () => {
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" },
+    (() =>
+      Promise.reject(new Error("Network connection lost."))) as typeof fetch,
+  );
+  await assert.rejects(
+    collect(p),
+    (e: unknown) => e instanceof ModelError && e.retryable,
+  );
+});
+
+test("a workerd invalid-URL TypeError is deterministic", async () => {
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" },
+    (() =>
+      Promise.reject(new TypeError("Invalid URL: not a url"))) as typeof fetch,
+  );
+  await assert.rejects(
+    collect(p),
+    (e: unknown) => e instanceof ModelError && !e.retryable,
+  );
+});
+
+// A TypeError whose provenance we cannot recognize is not assumed
+// deterministic: it consumes one bounded retry window rather than
+// silently misclassifying a transport outage as a config defect — or
+// vice versa.
+test("an unrecognized bare TypeError stays retryable", async () => {
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" },
+    (() =>
+      Promise.reject(
+        new TypeError("undefined is not a function"),
+      )) as typeof fetch,
+  );
+  await assert.rejects(
+    collect(p),
+    (e: unknown) => e instanceof ModelError && e.retryable,
+  );
+});

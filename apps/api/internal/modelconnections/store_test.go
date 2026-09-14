@@ -346,6 +346,7 @@ func TestMaxOutputTokensPersistsAsConnectionMetadata(t *testing.T) {
 	s := fixture(t)
 	ctx := context.Background()
 	in := input()
+	in.Preset = "anthropic" // a bound is only meaningful on bound-sending presets
 	bound := 8192
 	in.MaxOutputTokens = &bound
 	c, err := s.Save(ctx, owner, "", in)
@@ -389,5 +390,13 @@ func TestMaxOutputTokensPersistsAsConnectionMetadata(t *testing.T) {
 		if _, err = s.Save(ctx, owner, c.ID, in); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("accepted bound %d: %v", v, err)
 		}
+	}
+	// On a chat-completions preset no adapter sends an output bound — a
+	// saved value would be a silently ineffective setting, so it is
+	// refused at the write boundary rather than stored.
+	in.MaxOutputTokens = &bound
+	in.Preset = "openai-chat"
+	if _, err = s.Save(ctx, owner, c.ID, in); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("accepted a bound on a chat preset: %v", err)
 	}
 }

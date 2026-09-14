@@ -527,7 +527,7 @@ func TestModelBindingFollowsSelection(t *testing.T) {
 	}
 	apiKey := "sk-binding-test"
 	outputBound := 8192
-	conn, err := conns.Save(ctx, human, "", modelconnections.Input{Name: "Work", Preset: "openai-chat",
+	conn, err := conns.Save(ctx, human, "", modelconnections.Input{Name: "Work", Preset: "openai-responses",
 		BaseURL: "https://api.example.com/v1", Model: "model-a", APIKey: &apiKey,
 		MaxOutputTokens: &outputBound,
 		ExtraHeaders:    map[string]string{"X-Gateway-Session": "gw-9"}})
@@ -540,7 +540,7 @@ func TestModelBindingFollowsSelection(t *testing.T) {
 	}
 	_, b := get(token)
 	if b.Selection != "api" || b.Connection == nil || b.Connection.ID != connID || b.Connection.Model != "model-a" ||
-		b.Connection.Preset != "openai-chat" || b.Connection.Version == "" || b.APIKey != apiKey || !b.CredentialAvailable {
+		b.Connection.Preset != "openai-responses" || b.Connection.Version == "" || b.APIKey != apiKey || !b.CredentialAvailable {
 		t.Fatalf("api binding = %+v", b)
 	}
 	if b.Connection.ExtraHeaders["X-Gateway-Session"] != "gw-9" {

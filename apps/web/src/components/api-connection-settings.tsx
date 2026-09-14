@@ -16,6 +16,12 @@ const blank: ConnectionInput = {
   baseUrl: "",
   model: "",
 };
+// Only these presets put an output bound on the wire (Anthropic
+// max_tokens / Responses max_output_tokens); the chat-completions
+// adapter sends none, so offering the field there would save a setting
+// that does nothing.
+const OUTPUT_BOUND_PRESETS = new Set(["anthropic", "openai-responses"]);
+const OUTPUT_BOUND_MAX = 1_000_000;
 const inputClass =
   "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm";
 export function APIConnectionSettings({
@@ -33,6 +39,7 @@ export function APIConnectionSettings({
   const [form, setForm] = useState<ConnectionInput>(blank);
   const [key, setKey] = useState("");
   const [headersText, setHeadersText] = useState("");
+  const [maxOutText, setMaxOutText] = useState("");
   const [clearHeaders, setClearHeaders] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   const lifetime = useRef<AbortController | null>(null);
@@ -80,12 +87,14 @@ export function APIConnectionSettings({
             preset: connection.preset,
             baseUrl: connection.baseUrl,
             model: connection.model,
-            maxOutputTokens: connection.maxOutputTokens,
           }
         : blank,
     );
     setKey("");
     setHeadersText("");
+    setMaxOutText(
+      connection?.maxOutputTokens ? String(connection.maxOutputTokens) : "",
+    );
     setClearHeaders(false);
     setRemoving(null);
     setError("");
@@ -163,6 +172,9 @@ export function APIConnectionSettings({
                             if (editing === c.id) {
                               setEditing(undefined);
                               setKey("");
+                              setHeadersText("");
+                              setMaxOutText("");
+                              setClearHeaders(false);
                             }
                           }
                         })
@@ -248,9 +260,32 @@ export function APIConnectionSettings({
                 );
                 return;
               }
+              // The bound is a whole number on the wire — validate the
+              // full text (a number input can hold "1e3"; truncating it
+              // to 1 would silently send a different bound).
+              const boundSupported = OUTPUT_BOUND_PRESETS.has(form.preset);
+              const rawBound = maxOutText.trim();
+              let maxOutputTokens: number | undefined;
+              if (boundSupported && rawBound) {
+                if (
+                  !/^\d+$/.test(rawBound) ||
+                  Number(rawBound) < 1 ||
+                  Number(rawBound) > OUTPUT_BOUND_MAX
+                ) {
+                  setError(
+                    `最大出力トークンは1〜${OUTPUT_BOUND_MAX.toLocaleString()}の整数で入力してください。`,
+                  );
+                  return;
+                }
+                maxOutputTokens = Number(rawBound);
+              }
               await client.save(
                 {
                   ...form,
+                  // Unsupported presets never carry the bound — an
+                  // ineffective saved value would be invisible to the
+                  // user and is rejected by the server as well.
+                  maxOutputTokens: boundSupported ? maxOutputTokens : undefined,
                   ...(key ? { apiKey: key } : {}),
                   ...(clearHeaders
                     ? { extraHeaders: {} }
@@ -264,6 +299,7 @@ export function APIConnectionSettings({
               if (!signal.aborted) {
                 setKey("");
                 setHeadersText("");
+                setMaxOutText("");
                 setClearHeaders(false);
                 setEditing(undefined);
                 setNotice(
@@ -334,33 +370,28 @@ export function APIConnectionSettings({
               placeholder="プロバイダーのモデルID"
             />
           </label>
-          <label className="block text-sm">
-            最大出力トークン（任意）
-            <input
-              className={inputClass}
-              type="number"
-              min={1}
-              max={1000000}
-              step={1}
-              value={form.maxOutputTokens ?? ""}
-              disabled={busy}
-              onChange={(e) => {
-                const raw = e.target.value;
-                const n = raw === "" ? undefined : Number.parseInt(raw, 10);
-                setForm({
-                  ...form,
-                  maxOutputTokens:
-                    n !== undefined && Number.isInteger(n) && n > 0
-                      ? n
-                      : undefined,
-                });
-              }}
-              placeholder="プロバイダー既定"
-            />
-            <span className="mt-1 block text-muted-foreground text-xs">
-              モデルの出力上限が既定より小さい場合に設定します。上限を超える値はプロバイダーが拒否します。
-            </span>
-          </label>
+          {OUTPUT_BOUND_PRESETS.has(form.preset) && (
+            <label className="block text-sm">
+              最大出力トークン（任意）
+              <input
+                className={inputClass}
+                type="text"
+                inputMode="numeric"
+                value={maxOutText}
+                disabled={busy}
+                onChange={(e) => setMaxOutText(e.target.value)}
+                placeholder={
+                  form.preset === "anthropic" ? "16384" : "モデル既定"
+                }
+              />
+              <span className="mt-1 block text-muted-foreground text-xs">
+                {form.preset === "anthropic"
+                  ? "空欄なら16,384を送ります。モデルの出力上限がそれより小さい場合はその値に設定してください。"
+                  : "空欄ならこの項目を送らず、モデル自身の上限が使われます。出力を制限したい場合に設定してください。"}
+                上限を超える値はプロバイダーが拒否します。
+              </span>
+            </label>
+          )}
           <label className="block text-sm">
             APIキー
             <input
@@ -388,7 +419,7 @@ export function APIConnectionSettings({
               value={headersText}
               disabled={busy || clearHeaders}
               onChange={(e) => setHeadersText(e.target.value)}
-              placeholder={"X-Header-Name: 値"}
+              placeholder={"X-Header-Name: value"}
               spellCheck={false}
             />
           </label>
@@ -418,6 +449,7 @@ export function APIConnectionSettings({
                 setEditing(undefined);
                 setKey("");
                 setHeadersText("");
+                setMaxOutText("");
                 setClearHeaders(false);
               }}
             >
