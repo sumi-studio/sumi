@@ -106,6 +106,7 @@ async function childMain() {
           call: {
             id: `call-${round}-${i}`,
             name: c.tool,
+            route: c.route ?? "normal",
             arguments: c.request,
           },
         };
@@ -153,7 +154,7 @@ async function main() {
   const API_DIR = resolve(import.meta.dirname, "../../api");
   const SELF = resolve(import.meta.dirname, "e2e-jobs.mjs");
   const RUNNER_HOST = resolve(import.meta.dirname, "../src/host/job-runner.ts");
-  const PORT = 9450 + (process.pid % 10);
+  const PORT = Number(process.env.SUMI_E2E_PORT ?? 9450 + (process.pid % 10));
   const BASE = `http://127.0.0.1:${PORT}`;
   const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
   const WORKSPACE = mkdtempSync(join(tmpdir(), "sumi-jobs-ws-"));

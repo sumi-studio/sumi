@@ -236,3 +236,30 @@ test("a carried model intent blocks model calls until the destination binds", as
     assert.equal(fb2.calls, 1);
   });
 });
+
+test("the intent clear is fenced to staged and active personas", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.setModelIntent(PERSONA, { kind: "none" });
+  // The intent is part of the sealed cut: clearing under seal would strip
+  // what the next export ships — refused like the Go store.
+  state.setPersonaAuthority(PERSONA, "sealed");
+  await assert.rejects(async () => state.clearModelIntent(PERSONA), (e: unknown) =>
+    e instanceof StateError && e.status === 409,
+  );
+  assert.equal(state.personas.get(PERSONA)?.model_intent?.kind, "none");
+  // staged and active personas may clear — the destination escape.
+  state.setPersonaAuthority(PERSONA, "staged");
+  state.clearModelIntent(PERSONA);
+  assert.equal(state.personas.get(PERSONA)?.model_intent, null);
+  state.setModelIntent(PERSONA, { kind: "api" });
+  state.setPersonaAuthority(PERSONA, "active");
+  state.clearModelIntent(PERSONA);
+  assert.equal(state.personas.get(PERSONA)?.model_intent, null);
+  // A transferred persona is no longer this placement's to edit.
+  state.setModelIntent(PERSONA, { kind: "none" });
+  state.setPersonaAuthority(PERSONA, "transferred");
+  await assert.rejects(async () => state.clearModelIntent(PERSONA), (e: unknown) =>
+    e instanceof StateError && e.status === 409,
+  );
+});

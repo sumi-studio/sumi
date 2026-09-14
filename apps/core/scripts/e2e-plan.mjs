@@ -90,7 +90,12 @@ async function childMain() {
       for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
           type: "tool_call",
-          call: { id: `call-${round}-${i}`, name: c.tool, arguments: c.request },
+          call: {
+            id: `call-${round}-${i}`,
+            name: c.tool,
+            route: c.route ?? "normal",
+            arguments: c.request,
+          },
         };
       }
       yield { type: "done", usage: { scripted: true, round } };
@@ -231,7 +236,7 @@ async function main() {
   }
   const API_DIR = resolve(import.meta.dirname, "../../api");
   const SELF = resolve(import.meta.dirname, "e2e-plan.mjs");
-  const PORT = 9390 + (process.pid % 500);
+  const PORT = Number(process.env.SUMI_E2E_PORT ?? 9390 + (process.pid % 500));
   const BASE = `http://127.0.0.1:${PORT}`;
   const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
 

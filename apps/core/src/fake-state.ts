@@ -281,6 +281,21 @@ export class FakeState implements StateClient {
     rec.model_intent = intent;
   }
 
+  /** Mirror of the Go clear route: the intent is part of a sealed cut, so
+   * clearing is fenced to staged/active personas — a sealed or transferred
+   * one refuses (409) like the real store. */
+  clearModelIntent(personaId: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    if (rec.authority !== "staged" && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: persona authority is ${rec.authority}`,
+      );
+    }
+    rec.model_intent = null;
+  }
+
   /** Mirror of the Go bind route: an unbound staged/active persona binds; a bound or moved one refuses. */
   bindHuman(personaId: string, humanId: string) {
     const rec = this.personas.get(personaId);

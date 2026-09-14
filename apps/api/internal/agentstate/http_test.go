@@ -510,6 +510,28 @@ func TestModelIntentRebindingAndBindRoute(t *testing.T) {
 		`{"human_id":"`+other+`"}`); rec.Code != 409 {
 		t.Fatalf("rebind to another human: %d", rec.Code)
 	}
+	// A sealed persona's intent is part of the transfer cut: clearing it
+	// between seal and export would strip what the bundle ships, so the
+	// write is fenced to staged/active personas.
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_personas SET authority='sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, mux, "DELETE", "/internal/core/personas/"+pa+"/model/intent", testAdminSecret, ""); rec.Code != 409 {
+		t.Fatalf("clear intent under seal: %d %s", rec.Code, rec.Body)
+	}
+	var intent json.RawMessage
+	if err := srv.store.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pa).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(intent) == 0 {
+		t.Fatal("sealed clear mutated the persona's model_intent")
+	}
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_personas SET authority='active' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
 	// The operator's explicit fresh start: clearing the intent restores
 	// ordinary selection semantics — api resolves, none of it silently.
 	rec = do(t, mux, "DELETE", "/internal/core/personas/"+pa+"/model/intent", tok, "")

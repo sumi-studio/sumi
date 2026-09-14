@@ -428,17 +428,31 @@ func (s *Store) BindHuman(ctx context.Context, personaID, humanID string) (Perso
 // explicit "start fresh on this placement" escape for needs_rebinding. The
 // intent is preference, not a credential, so clearing it restores ordinary
 // unset/selection semantics — it can never grant a connection the
-// destination human did not choose.
+// destination human did not choose. The escape is fenced to staged and
+// active personas: on a sealed or transferred one the intent is part of the
+// sealed cut — Export reads it live, so clearing under seal would strip the
+// intent from what ships and silently substitute the destination's default.
+// The honest path there is abort → clear → re-seal.
 func (s *Store) ClearModelIntent(ctx context.Context, personaID string) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE core_personas SET model_intent = NULL WHERE persona_id = $1`, personaID)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE core_personas SET model_intent = NULL
+		WHERE persona_id = $1 AND authority IN ('staged','active')`, personaID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrPersonaNotFound
+	if tag.RowsAffected() > 0 {
+		return nil
 	}
-	return nil
+	var authority string
+	switch err := s.pool.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1`, personaID).Scan(&authority); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrPersonaNotFound
+	case err != nil:
+		return err
+	default:
+		return fmt.Errorf("%w: persona authority is %s", ErrPersonaInactive, authority)
+	}
 }
 
 func (s *Store) persona(ctx context.Context, personaID string) (Persona, error) {

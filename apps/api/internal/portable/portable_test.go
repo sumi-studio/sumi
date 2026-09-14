@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -1782,6 +1783,33 @@ func mutateTableRows(t *testing.T, bundle []byte, table string, fn func(data map
 	}))
 }
 
+// tableRow returns the decoded data of the row in table whose primary key
+// field (approval_id, operation_id, persona_id, …) equals id.
+func tableRow(t *testing.T, bundle []byte, table, id string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(string(bundle), "\n") {
+		var row map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		var tbl string
+		if err := json.Unmarshal(row["table"], &tbl); err != nil || tbl != table {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(row["data"], &data); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"approval_id", "operation_id", "input_id", "persona_id"} {
+			if v, ok := data[key]; ok && v == id {
+				return data
+			}
+		}
+	}
+	t.Fatalf("no %s row for %s in bundle", table, id)
+	return nil
+}
+
 // A grant approved at the source but not yet executed is consent under the
 // source's account. Imported under a different human without a
 // same-authority assertion, it is re-pended — the original decision kept
@@ -2132,5 +2160,292 @@ func TestUnboundImportBindsAndActivates(t *testing.T) {
 	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, stranger)
 	if _, _, err := cloud.state.EnsurePersona(ctx, pid2, &stranger, "x"); !errors.Is(err, agentstate.ErrPersonaBound) {
 		t.Fatalf("ensure with a different human: %v, want bound conflict", err)
+	}
+}
+
+// --- Abort/clear lifecycle: intent restore and sealed-cut fence (f75/f76) ---
+
+// modelIntent reads the persona's carried intent column.
+func modelIntent(t *testing.T, p placement, personaID string) json.RawMessage {
+	t.Helper()
+	var intent json.RawMessage
+	if err := p.pool.QueryRow(context.Background(),
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, personaID).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	return intent
+}
+
+// binding resolves the persona's model binding through the real HTTP
+// handler on a metadata-only connection store.
+func binding(t *testing.T, p placement, personaID string) (int, agentstate.ModelBinding) {
+	t.Helper()
+	srv := agentstate.NewServer(p.pool, "portable-test-admin-secret")
+	srv.SetModelConnections(modelconnections.MetadataOnly(p.pool))
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	req := httptest.NewRequest("GET", "/internal/core/personas/"+personaID+"/model", nil)
+	req.Header.Set("Authorization", "Bearer "+srv.PersonaToken(personaID))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var b agentstate.ModelBinding
+	if rec.Code == 200 {
+		if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec.Code, b
+}
+
+// A cancelled transfer restores the source's pre-seal model semantics: the
+// intent snapshot is a transfer artifact, so a persona that never moved
+// gets NULL back (its live selection decides again), while a persona that
+// itself arrived carrying an unresolved intent keeps that intent — the
+// obligation it still owes.
+func TestAbortRestoresSourceModelIntent(t *testing.T) {
+	ctx := context.Background()
+	local, cloud, edge := newPlacement(t), newPlacement(t), newPlacement(t)
+
+	pid := newID(t)
+	human := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
+	must(drop(local.state.EnsurePersona(ctx, pid, &human, "never-moved")))
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	sealed := must(local.svc.Seal(ctx, pid, "move-abort-1", placementID(t, cloud)))
+	var intent map[string]any
+	if err := json.Unmarshal(modelIntent(t, local, pid), &intent); err != nil || intent["kind"] != "none" {
+		t.Fatalf("sealed intent %s", modelIntent(t, local, pid))
+	}
+	if len(sealed.PriorModelIntent) != 0 {
+		t.Fatalf("a never-moved persona recorded prior intent %s", sealed.PriorModelIntent)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-abort-1")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	retired := retireDest(t, cloud, pid, "move-abort-1", "")
+	must(local.svc.Abort(ctx, pid, "move-abort-1", retired.RetireProof))
+	if got := modelIntent(t, local, pid); got != nil {
+		t.Fatalf("abort left intent %s on a persona that never moved", got)
+	}
+	// The human now picks an api connection — an ordinary account change.
+	// With the transfer artifact gone the binding resolves it; nothing is
+	// stranded in needs_rebinding.
+	connID := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		human, connID, uuid.NewString())
+	mustExec(t, local, `UPDATE model_connection_selections SET kind='api', connection_id=$2::uuid WHERE human_id=$1`,
+		human, connID)
+	if code, b := binding(t, local, pid); code != 200 || b.Selection != "api" {
+		t.Fatalf("post-abort binding: %d %+v", code, b)
+	}
+
+	// A persona that itself arrived by transfer: pid2 carries an api
+	// intent onto cloud where its bound human has no selection yet, so
+	// the intent is still owed. Sealing it onward must preserve that
+	// intent (no selection to snapshot), and aborting that second move
+	// restores it — the persona is still gated, exactly as before.
+	pid2 := newID(t)
+	src2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, src2)
+	must(drop(local.state.EnsurePersona(ctx, pid2, &src2, "configured")))
+	conn2 := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		src2, conn2, uuid.NewString())
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind, connection_id) VALUES ($1, 'api', $2::uuid)`, src2, conn2)
+	must(local.svc.Seal(ctx, pid2, "move-in-2", placementID(t, cloud)))
+	b2, _ := exportBytes(t, local, pid2, "move-in-2")
+	dst2 := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dst2)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(b2), &dst2, false)))
+	activated := must(cloud.svc.Activate(ctx, pid2, "move-in-2"))
+	must(local.svc.Complete(ctx, pid2, "move-in-2", activated.ActivateProof))
+	if code, b := binding(t, cloud, pid2); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("carried intent should gate on cloud: %d %+v", code, b)
+	}
+	carried := modelIntent(t, cloud, pid2)
+	// Seal onward with no selection present: the carried intent is what
+	// the persona owes, so it — not NULL — is what the next bundle carries.
+	sealed2 := must(cloud.svc.Seal(ctx, pid2, "move-out-2", placementID(t, edge)))
+	b3, _ := exportBytes(t, cloud, pid2, "move-out-2")
+	must(drop(edge.svc.Import(ctx, bytes.NewReader(b3), nil, false)))
+	var edgeIntent map[string]any
+	if err := json.Unmarshal(modelIntent(t, edge, pid2), &edgeIntent); err != nil || edgeIntent["kind"] != "api" {
+		t.Fatalf("the second move carried intent %s, want the unresolved api intent", modelIntent(t, edge, pid2))
+	}
+	retired2 := retireDest(t, edge, pid2, "move-out-2", "")
+	must(cloud.svc.Abort(ctx, pid2, "move-out-2", retired2.RetireProof))
+	if got := modelIntent(t, cloud, pid2); !bytes.Equal(got, carried) {
+		t.Fatalf("abort restored %s, want the carried intent %s", got, carried)
+	}
+	var prior map[string]any
+	if err := json.Unmarshal(sealed2.PriorModelIntent, &prior); err != nil || prior["kind"] != "api" {
+		t.Fatalf("second seal recorded prior intent %s", sealed2.PriorModelIntent)
+	}
+	if code, b := binding(t, cloud, pid2); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("the restored intent must still gate: %d %+v", code, b)
+	}
+}
+
+// The intent is part of the sealed cut — Export reads it live — so the
+// clear escape is fenced to staged and active personas. On a sealed source
+// it refuses; the honest path (retire → abort → clear → re-seal) works.
+func TestSealedCutRefusesIntentClear(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	human := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
+	must(drop(local.state.EnsurePersona(ctx, pid, &human, "configured-none")))
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	must(local.svc.Seal(ctx, pid, "move-strip", placementID(t, cloud)))
+
+	// The store fence and the HTTP fence agree: sealed refuses.
+	if err := local.state.ClearModelIntent(ctx, pid); !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("clear on a sealed persona: %v, want inactive", err)
+	}
+	srv := agentstate.NewServer(local.pool, "portable-test-admin-secret")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	req := httptest.NewRequest("DELETE", "/internal/core/personas/"+pid+"/model/intent", nil)
+	req.Header.Set("Authorization", "Bearer portable-test-admin-secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 409 {
+		t.Fatalf("HTTP clear on a sealed persona: %d %s", rec.Code, rec.Body)
+	}
+	// The export still carries the intent — the bundle is not stripped.
+	bundle, _ := exportBytes(t, local, pid, "move-strip")
+	var prow struct {
+		Data struct {
+			ModelIntent map[string]any `json:"model_intent"`
+		} `json:"data"`
+	}
+	for _, line := range bytes.Split(bundle, []byte("\n")) {
+		if bytes.Contains(line, []byte(`"table":"core_personas"`)) {
+			if err := json.Unmarshal(line, &prow); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if prow.Data.ModelIntent["kind"] != "none" {
+		t.Fatalf("bundle intent after refused clear: %v", prow.Data.ModelIntent)
+	}
+
+	// The staged destination may clear it — the recovery escape is real.
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	if err := cloud.state.ClearModelIntent(ctx, pid); err != nil {
+		t.Fatalf("clear on a staged destination persona: %v", err)
+	}
+	if got := modelIntent(t, cloud, pid); got != nil {
+		t.Fatalf("staged clear left intent %s", got)
+	}
+	// Honest source path: retire, abort (restores the pre-seal NULL),
+	// then clearing is permitted and a re-seal works.
+	retired := retireDest(t, cloud, pid, "move-strip", "")
+	must(local.svc.Abort(ctx, pid, "move-strip", retired.RetireProof))
+	if err := local.state.ClearModelIntent(ctx, pid); err != nil {
+		t.Fatalf("clear on the aborted-and-active source: %v", err)
+	}
+	if _, err := local.svc.Seal(ctx, pid, "move-reseal", placementID(t, cloud)); err != nil {
+		t.Fatalf("re-seal after abort+clear: %v", err)
+	}
+	if got := modelIntent(t, local, pid); got == nil || !bytes.Contains(got, []byte(`"none"`)) {
+		t.Fatalf("re-seal re-snapshotted intent %s", got)
+	}
+}
+
+// Crafted incoherence in the persona row and in decision fields is refused
+// transactionally; a pending approval carrying prior_* history is a legal
+// re-pend artifact and is carried through.
+func TestImportRejectsMalformedIntentAndDebris(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-shape", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-shape")
+
+	cases := map[string]struct {
+		bundle []byte
+		want   string
+	}{
+		"intent is not an object": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = 42
+			}), "model_intent_malformed"},
+		"intent kind is not a string": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"kind": 42}
+			}), "model_intent_malformed"},
+		"intent kind is unknown": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"kind": "bogus"}
+			}), "model_intent_malformed"},
+		"intent lacks kind": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"note": "x"}
+			}), "model_intent_malformed"},
+		"pending approval with decision debris": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["decided_by_kind"] = "human"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "pending_approval_decided_fields"},
+		"decided approval without a decider kind": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "decided_approval_incomplete"},
+	}
+	n := 0
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			n++
+			tid := fmt.Sprintf("move-shape-%02d", n)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(retargetTransfer(t, tc.bundle, tid)), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused cut left a persona behind: %v", err)
+			}
+		})
+	}
+
+	// Positive: a pending approval carrying prior_* decision history is
+	// exactly what a cross-authority re-pend produces — legal, carried,
+	// and preserved verbatim through a second move.
+	legal := retargetTransfer(t, mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+		d["prior_decision"] = "approve_once"
+		d["prior_decided_by_kind"] = "human"
+		d["prior_decided_by_id"] = srcHuman
+		d["prior_decided_at"] = "2026-09-14T00:00:00Z"
+	}), "move-shape-legal")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(legal), nil, false)))
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "pending" || a.PriorDecision == nil || *a.PriorDecision != "approve_once" ||
+		a.PriorDecidedByID == nil || *a.PriorDecidedByID != srcHuman {
+		t.Fatalf("carried re-pend provenance %+v", a)
+	}
+	// Moving again while still pending keeps the provenance: bind, activate,
+	// seal, export — the second bundle carries the same prior_* record.
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(cloud.state.BindHuman(ctx, pid, dstHuman))
+	must(cloud.svc.Activate(ctx, pid, "move-shape-legal"))
+	must(cloud.svc.Seal(ctx, pid, "move-shape-again", placementID(t, local)))
+	again, _ := exportBytes(t, cloud, pid, "move-shape-again")
+	againAppr := tableRow(t, again, "core_tool_approvals", apprID)
+	if againAppr["prior_decision"] != "approve_once" ||
+		againAppr["prior_decided_by_id"] != srcHuman || againAppr["status"] != "pending" {
+		t.Fatalf("second move lost re-pend provenance: %v", againAppr)
 	}
 }

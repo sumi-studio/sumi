@@ -154,27 +154,32 @@ type Continuity struct {
 // Complete and Abort require, and each names the destination placement in
 // its HMAC input.
 type Receipt struct {
-	Direction     string           `json:"direction"`
-	TransferID    string           `json:"transfer_id"`
-	PersonaID     string           `json:"persona_id"`
-	Status        string           `json:"status"`
-	FormatVersion int              `json:"format_version"`
-	DestinationID string           `json:"destination_id,omitempty"`
-	HumanID       *string          `json:"human_id,omitempty"`
+	Direction     string  `json:"direction"`
+	TransferID    string  `json:"transfer_id"`
+	PersonaID     string  `json:"persona_id"`
+	Status        string  `json:"status"`
+	FormatVersion int     `json:"format_version"`
+	DestinationID string  `json:"destination_id,omitempty"`
+	HumanID       *string `json:"human_id,omitempty"`
 	// SameHuman records the import-time assertion that the bound human is
 	// the same authority that decided the bundle's approvals; a replay
 	// asserting differently conflicts rather than silently changing what
 	// was staged.
-	SameHuman     bool             `json:"same_human,omitempty"`
-	ContentSHA256 string           `json:"content_sha256,omitempty"`
-	ActivateProof string           `json:"activate_proof,omitempty"`
-	RetireProof   string           `json:"retire_proof,omitempty"`
-	SealedAt      time.Time        `json:"sealed_at"`
-	Cut           Cut              `json:"cut"`
-	Rows          map[string]int64 `json:"rows"`
-	Continuity    Continuity       `json:"continuity"`
-	NotIncluded   []Exclusion      `json:"not_included"`
-	UpdatedAt     time.Time        `json:"updated_at"`
+	SameHuman bool `json:"same_human,omitempty"`
+	// PriorModelIntent is export-side bookkeeping: the intent the seal's
+	// snapshot replaced, so Abort can restore the source's pre-transfer
+	// semantics — NULL for a persona that never arrived by transfer, the
+	// still-unresolved carried intent for one that did.
+	PriorModelIntent json.RawMessage  `json:"prior_model_intent,omitempty"`
+	ContentSHA256    string           `json:"content_sha256,omitempty"`
+	ActivateProof    string           `json:"activate_proof,omitempty"`
+	RetireProof      string           `json:"retire_proof,omitempty"`
+	SealedAt         time.Time        `json:"sealed_at"`
+	Cut              Cut              `json:"cut"`
+	Rows             map[string]int64 `json:"rows"`
+	Continuity       Continuity       `json:"continuity"`
+	NotIncluded      []Exclusion      `json:"not_included"`
+	UpdatedAt        time.Time        `json:"updated_at"`
 
 	// key is the transfer's HMAC key, loaded from the ledger column for
 	// proof verification. It is never serialized into a receipt or stored

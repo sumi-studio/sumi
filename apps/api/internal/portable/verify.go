@@ -105,19 +105,24 @@ var cutChecks = []struct{ name, sql string }{
 		SELECT count(*) FROM core_tool_approvals a
 		JOIN core_operations o ON o.persona_id = a.persona_id AND o.operation_id = a.operation_id
 		WHERE a.persona_id = $1 AND a.request <> o.request`},
-	// A pending approval carries no decision and is never consumed.
+	// A pending approval carries no current decision record — no debris
+	// fields that only a decided row may hold. prior_* is deliberately NOT
+	// checked here: a cross-authority import legitimately re-pends a grant
+	// while preserving the source's decision as prior provenance.
 	{"pending_approval_decided_fields", `
 		SELECT count(*) FROM core_tool_approvals a
 		WHERE a.persona_id = $1 AND a.status = 'pending' AND (
 			a.decision IS NOT NULL OR a.decision_id IS NOT NULL
-			OR a.decided_by_id IS NOT NULL OR a.decided_at IS NOT NULL
-			OR a.consumed_at IS NOT NULL)`},
+			OR a.decided_by_kind IS NOT NULL OR a.decided_by_id IS NOT NULL
+			OR a.provenance IS NOT NULL
+			OR a.decided_at IS NOT NULL OR a.consumed_at IS NOT NULL)`},
 	// A decided approval carries its whole decision record.
 	{"decided_approval_incomplete", `
 		SELECT count(*) FROM core_tool_approvals a
 		WHERE a.persona_id = $1 AND a.status IN ('approved','denied') AND (
 			a.decision IS NULL OR a.decision_id IS NULL
-			OR a.decided_by_id IS NULL OR a.decided_at IS NULL)`},
+			OR a.decided_by_kind IS NULL OR a.decided_by_id IS NULL
+			OR a.decided_at IS NULL)`},
 	{"approval_decision_status_mismatch", `
 		SELECT count(*) FROM core_tool_approvals a
 		WHERE a.persona_id = $1 AND (
@@ -174,6 +179,18 @@ var cutChecks = []struct{ name, sql string }{
 	{"outbox_seq_not_contiguous", `
 		SELECT CASE WHEN count(*) = COALESCE(max(seq), 0) AND COALESCE(min(seq), 1) >= 1 THEN 0 ELSE 1 END
 		FROM core_outbox WHERE persona_id = $1`},
+	// A carried model intent is either absent or a supported shape: an
+	// object whose kind names a known selection kind. A malformed intent —
+	// non-object, missing kind, unknown kind — would silently degrade the
+	// needs_rebinding gate to unset and let the environment default run.
+	// Corruption detection, not authenticity: like every check here, this
+	// proves the cut is coherent, never that the bundle is genuine.
+	{"model_intent_malformed", `
+		SELECT count(*) FROM core_personas p
+		WHERE p.persona_id = $1 AND p.model_intent IS NOT NULL AND (
+			jsonb_typeof(p.model_intent) IS DISTINCT FROM 'object'
+			OR jsonb_typeof(p.model_intent->'kind') IS DISTINCT FROM 'string'
+			OR p.model_intent->>'kind' NOT IN ('none','api','chatgpt'))`},
 	{"generation_not_below_epoch", `
 		SELECT count(*) FROM (
 			SELECT generation AS g FROM core_turns WHERE persona_id = $1

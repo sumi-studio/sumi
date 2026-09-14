@@ -315,15 +315,26 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 	// connection rows cannot be assumed to exist. Snapshot it onto the
 	// persona as non-secret intent — an explicit 'none', or the selected
 	// connection's kind and metadata without any credential — so the
-	// bundle carries what the user chose. At the destination the intent is
-	// enforced, not silently substituted: modelBinding reports
-	// needs_rebinding until the destination human selects a connection of
-	// the same kind (or the intent is explicitly cleared), and the core
-	// refuses to run a model rather than falling back to an environment
-	// default. A persona with no selection snapshots NULL and keeps the
-	// destination's ordinary unset semantics.
+	// bundle carries what the user chose. A persona that itself arrived by
+	// transfer may still carry an unresolved intent: when there is no
+	// selection to snapshot, that intent is what the persona owes, so it
+	// is kept rather than silently erased. The value this snapshot
+	// replaces is recorded on the export receipt so Abort can restore the
+	// pre-seal semantics exactly.
+	// At the destination the intent is enforced, not silently substituted:
+	// modelBinding reports needs_rebinding until the destination human
+	// selects a connection of the same kind (or the intent is explicitly
+	// cleared), and the core refuses to run a model rather than falling
+	// back to an environment default. A persona with no selection and no
+	// carried intent snapshots NULL and keeps the destination's ordinary
+	// unset semantics.
+	var priorIntent json.RawMessage
+	if err := tx.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, personaID).Scan(&priorIntent); err != nil {
+		return Receipt{}, err
+	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE core_personas p SET model_intent = (
+		UPDATE core_personas p SET model_intent = COALESCE((
 			SELECT jsonb_build_object('kind', m.kind, 'connection', CASE
 				WHEN m.kind = 'api' THEN (
 					SELECT jsonb_build_object(
@@ -337,7 +348,7 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 					FROM chatgpt_connections g WHERE g.human_id = m.human_id)
 				ELSE NULL END)
 			FROM model_connection_selections m
-			WHERE m.human_id = p.human_id)
+			WHERE m.human_id = p.human_id), p.model_intent)
 		WHERE p.persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
 	}
@@ -393,6 +404,10 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		Continuity:    cont,
 		NotIncluded:   NotIncluded,
 		UpdatedAt:     sealedAt.UTC(),
+		// The intent this seal's snapshot replaced — Abort restores it so a
+		// cancelled transfer returns the source to exactly its pre-transfer
+		// model semantics.
+		PriorModelIntent: priorIntent,
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -508,8 +523,21 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof 
 			"the addressed placement has not retired it (check its import status)",
 			ErrTransferConflict, retireProof, transferID, rec.DestinationID)
 	}
+	// The seal-time intent snapshot is a transfer artifact and dies with the
+	// transfer: restore the intent the seal recorded as replaced. For a
+	// persona that never moved that is NULL — the live selection drives the
+	// binding again, so an ordinary model-kind change after the abort is not
+	// stranded in needs_rebinding. For a persona that itself arrived by
+	// transfer, a still-unresolved incoming intent is restored rather than
+	// silently erased.
+	var intentRestore *string
+	if len(rec.PriorModelIntent) > 0 {
+		s := string(rec.PriorModelIntent)
+		intentRestore = &s
+	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE core_personas SET authority = 'active', transfer_id = NULL WHERE persona_id = $1`, personaID); err != nil {
+		`UPDATE core_personas SET authority = 'active', transfer_id = NULL, model_intent = $2::jsonb WHERE persona_id = $1`,
+		personaID, intentRestore); err != nil {
 		return Receipt{}, err
 	}
 	// Expire the parked lease so the next writer acquires generation+1.
