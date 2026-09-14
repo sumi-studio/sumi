@@ -442,24 +442,39 @@ kill_pid() {
   return 0
 }
 
+# The /proc scans below use builtins only. They visit every process on the
+# host; the former awk + tr forks per process made one scan ~3 s on a busy
+# 550-process host and minutes when fork latency rose under load, before
+# `start` could even spawn the service.
+#
+# proc_forked_by_us PID — PID is (or was) a child of the launcher shell or of
+# the subshell running the scan. Those subshells (pipelines, $(...)) carry
+# the launcher's own argv, which lies under its prefix. A vanished PID counts
+# as ours: there is nothing left to report or signal.
+proc_forked_by_us() {
+  local st; local -a f
+  read -r st 2>/dev/null <"/proc/$1/stat" || return 0
+  read -ra f <<<"${st##*) }"   # after "pid (comm) ": f[1] is the ppid
+  [[ ${f[1]} == "$$" || ${f[1]} == "$BASHPID" ]]
+}
+
 # proc_pids_for ABS-PATH — pids whose argv contains the path as an exact
 # element (service binary argv[0], or the node host's .ts argument). Exact
 # matching: a path substring in some unrelated command line never qualifies.
 proc_pids_for() {
-  local want=$1 p pid arg ppid
+  local want=$1 p pid arg
+  local -a argv
   for p in /proc/[0-9]*/cmdline; do
     pid=${p#/proc/}; pid=${pid%/cmdline}
-    # $$ excludes the launcher shell; $BASHPID excludes the $(...) subshell
-    # running this scan — its argv still shows our own prefix-anchored path.
-    # Process-substitution forks ({ tr … || :; } below) are children of
-    # that subshell and briefly carry the same argv before exec — exclude
-    # anything we just forked by parent pid too.
-    [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
-    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
-    [[ $ppid == "$$" || $ppid == "$BASHPID" ]] && continue
-    while IFS= read -r arg; do
-      [[ $arg == "$want" ]] && { printf '%s\n' "$pid"; break; }
-    done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
+    # $$ is the launcher shell, $BASHPID the $(...) subshell running this
+    # scan — both show our own prefix-anchored argv
+    [[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+    mapfile -d '' -t argv 2>/dev/null <"$p" || continue
+    for arg in "${argv[@]}"; do
+      [[ $arg == "$want" ]] || continue
+      proc_forked_by_us "$pid" || printf '%s\n' "$pid"
+      break
+    done
   done
   return 0
 }
@@ -526,15 +541,17 @@ anchored_pids() {
 # longer exist on disk by then) and to refuse install over live processes
 # the exact-path glob can no longer see (deleted payload, lost pidfile).
 proc_pids_under() {
-  local root=$1 p pid arg ppid
+  local root=$1 p pid arg
+  local -a argv
   for p in /proc/[0-9]*/cmdline; do
     pid=${p#/proc/}; pid=${pid%/cmdline}
-    [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
-    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
-    [[ $ppid == "$$" || $ppid == "$BASHPID" ]] && continue
-    while IFS= read -r arg; do
-      case $arg in "$root"/*) printf '%s\n' "$pid"; break;; esac
-    done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
+    [[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+    mapfile -d '' -t argv 2>/dev/null <"$p" || continue
+    for arg in "${argv[@]}"; do
+      case $arg in "$root"/*) ;; *) continue;; esac
+      proc_forked_by_us "$pid" || printf '%s\n' "$pid"
+      break
+    done
   done
   return 0
 }

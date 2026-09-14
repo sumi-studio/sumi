@@ -368,15 +368,30 @@ o() { env HOME="$OSH" SUMI_LOCAL_HOME="$O_HOME" SUMI_LOCAL_PREFIX="$O_PREFIX" "$
 # config then), so the preflight must still open plaintext and let the
 # service report the real error.
 o install --db-url "postgres://sumi:wrong-password@$A_PGADDR/sumi?sslmode=disable&sslnegotiation=direct" --listen 127.0.0.1:$P4 >/dev/null
-t0=$SECONDS
-out="$(o start 2>&1)" && rc=0 || rc=$?
-dt=$((SECONDS - t0))
+# The promise is about detection: from the spawn announcement to the failure
+# report, not the preflight and /proc sweeps before the spawn. Each output
+# line is stamped as it arrives; whole-start latency is reported separately.
+# /proc/uptime is independent of wall-clock corrections on this Linux host.
+now() { local uptime rest; read -r uptime rest </proc/uptime; printf '%s' "$uptime"; }
+stamp() { local l; while IFS= read -r l; do printf '%s %s\n' "$(now)" "$l"; done; }
+secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", b - a }'; }
+t0="$(now)"
+out="$(o start 2>&1 | stamp)" && rc=0 || rc=$?
+total="$(secs "$t0" "$(now)")"
+spawn_at="$(awk '/starting state service/ { print $1; exit }' <<<"$out")"
+report_at="$(awk '/ERROR: state service/ { print $1; exit }' <<<"$out")"
 [[ $rc != 0 && $out == *"exited during startup"* && $out == *"password authentication failed"* ]] \
-  && ok "startup death reported with the service's own error (${dt}s)" \
+  && ok "startup death reported with the service's own error" \
   || bad "startup failure not diagnosable: rc=$rc $(echo "$out" | tail -4)"
-((dt < 20)) \
-  && ok "reported before the 30s health deadline" \
-  || bad "failed start still waited out the health deadline (${dt}s)"
+if [[ -n $spawn_at && -n $report_at ]]; then
+  detect="$(secs "$spawn_at" "$report_at")"
+  awk -v d="$detect" 'BEGIN { exit !(d >= 0 && d < 20) }' \
+    && ok "death reported ${detect}s after spawn, well inside the 30s health deadline" \
+    || bad "failed start still waited out the health deadline (${detect}s after spawn)"
+else
+  bad "spawn/report lines not found in start output: $(echo "$out" | tail -3)"
+fi
+echo "  note: whole failed start took ${total}s (preflight and sweeps before spawn included)"
 [[ $out != *wrong-password* ]] \
   && ok "failure report redacts the DB password" \
   || bad "failure report leaked the DB password"
