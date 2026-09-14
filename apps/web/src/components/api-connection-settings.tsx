@@ -224,10 +224,14 @@ export function APIConnectionSettings({
               const previous = state?.connections.find(
                 (connection) => connection.id === editing,
               );
-              const revokesCredential =
-                !!key ||
+              // Entering a new key replaces the sealed credential;
+              // preset/URL/model changes keep it — the same key is
+              // reused under the new settings.
+              const replacesCredential = !!key;
+              const changedSettings =
+                previous?.preset !== form.preset ||
                 previous?.baseUrl !== form.baseUrl ||
-                previous?.preset !== form.preset;
+                previous?.model !== form.model;
               // "Name: value" per line. Stored headers are write-only:
               // an empty field means "keep what is stored".
               const extraHeaders: Record<string, string> = {};
@@ -305,10 +309,10 @@ export function APIConnectionSettings({
                 setNotice(
                   state?.selection?.kind === "api" &&
                     state.selection.connectionId === editing
-                    ? revokesCredential
+                    ? replacesCredential
                       ? "接続を保存しました。以前の認証情報は次のリクエストから使われなくなり、作業が止まってから新しい設定で起動します。"
-                      : previous?.model !== form.model
-                        ? "モデルを保存しました。作業が一区切りついてから切り替わります。"
+                      : changedSettings
+                        ? "接続を保存しました。認証情報はそのまま引き継がれ、作業が一区切りついてから新しい設定で起動します。"
                         : "接続を保存しました。"
                     : "接続を保存しました。「使う」を押すと切り替わります。",
                 );

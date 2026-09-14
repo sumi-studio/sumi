@@ -1168,7 +1168,12 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1
@@ -1217,7 +1222,12 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1
@@ -1287,7 +1297,12 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1

@@ -12,6 +12,7 @@ import {
   isContextLengthRefusal,
   networkError,
   parseCallEnvelope,
+  redirectRefusal,
   requestDeadline,
   sanitizeToolName,
   sseEvents,
@@ -88,6 +89,9 @@ export class AnthropicProvider implements ModelProvider {
             ...this.cfg.headers,
           },
           signal: deadline.signal,
+          // Never follow a redirect: this request carries credentials
+          // and fetch forwards x-api-key/extra headers cross-origin.
+          redirect: "manual",
           body: JSON.stringify({
             model: this.cfg.model,
             stream: true,
@@ -108,6 +112,8 @@ export class AnthropicProvider implements ModelProvider {
       } catch (e) {
         throw networkError(e, request.signal);
       }
+      const refused = redirectRefusal(res);
+      if (refused) throw refused;
       if (!res.ok || !res.body) {
         throw await httpError(res);
       }

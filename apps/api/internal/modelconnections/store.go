@@ -204,11 +204,16 @@ func validateEndpoint(baseURL string) error {
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(baseURL) > 2048 {
 		return invalid("base URL must be a public https URL without credentials, query, or fragment")
 	}
-	// Activation additionally requires transport-level destination enforcement.
+	// Only the literal URL is checked: hostnames are never resolved, so a
+	// public name may still point at a private address at request time.
+	// Redirect refusal is enforced at the transport layer in the core's
+	// provider adapters (redirect "manual" + 3xx rejection); private-range
+	// egress for resolved addresses is deployment policy, not implemented
+	// here or in the adapters.
 	host := strings.ToLower(u.Hostname())
 	ip := net.ParseIP(host)
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || (ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast())) {
-		return invalid("base URL must resolve to a public host")
+		return invalid("base URL must be a public host")
 	}
 	return nil
 }

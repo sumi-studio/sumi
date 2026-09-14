@@ -280,6 +280,37 @@ export function networkError(e: unknown, signal?: AbortSignal): ModelError {
 }
 
 /**
+ * Refuse redirects on credential-bearing model requests. Every adapter
+ * call carries the auth header plus configured extras. Cross-origin
+ * redirects were witnessed forwarding `x-api-key` and configured secret
+ * headers to a different origin on both undici and workerd.
+ * `redirect: "error"`
+ * is not portable (workerd rejects the value outright) and surfaces as a
+ * generic TypeError on undici, so adapters send `redirect: "manual"` and
+ * this check classifies an explicitly observed 3xx as a deterministic
+ * configuration problem instead: a redirecting endpoint is misconfigured
+ * for this use. The refusal is terminal — retrying re-sends the same
+ * credentials to the same redirector.
+ *
+ * Detection covers both response shapes a "manual" response can take:
+ * the opaque-redirect filtered response (`type === "opaqueredirect"`,
+ * status 0) and the raw 3xx response undici and workerd both surface.
+ * The refusal message never echoes the `Location` target — the redirect
+ * destination is untrusted data, not configuration.
+ */
+export function redirectRefusal(res: Response): ModelError | null {
+  const status = res.status;
+  if (res.type !== "opaqueredirect" && (status < 300 || status >= 400)) {
+    return null;
+  }
+  return new ModelError(
+    `model endpoint answered a redirect (HTTP ${status || "3xx"}); ` +
+      "credential-bearing requests never follow redirects — configure the final URL on the connection",
+    { retryable: false },
+  );
+}
+
+/**
  * Machine-readable codes the OpenAI-compatible ecosystem uses for a
  * context-capacity refusal. Authoritative even when the display message
  * contains broad words such as "tokens".

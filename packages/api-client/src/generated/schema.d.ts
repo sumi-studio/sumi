@@ -549,7 +549,7 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
@@ -562,7 +562,7 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
@@ -582,7 +582,7 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
