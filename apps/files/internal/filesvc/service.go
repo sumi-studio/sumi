@@ -21,9 +21,13 @@ import (
 // VersionStore is the persistence surface the service needs — *Store satisfies
 // it against real PG; tests substitute a fake.
 type VersionStore interface {
-	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
-	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
-	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error
+	// The fn callbacks report whether the filesystem commit point was
+	// reached — an error with committed=true means "landed but
+	// unobserved" and the intent must be kept for reconciliation, not
+	// dropped as a rejection (F-RA-5/f120).
+	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error)
+	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error)
+	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
 }
@@ -55,17 +59,20 @@ func NewAt(root string, store VersionStore, tokens map[string]map[string]bool) (
 	return &Service{root: r, store: store, tokens: tokens}, nil
 }
 
-// probe returns a fingerprint probe the store calls under the row lock.
+// probe returns a filesystem probe the store calls under the row lock.
+// It reports the live FileInfo (kind + fingerprint) so the store can
+// record source-kind evidence for later settlement; ErrNotFound means
+// "absent", any other error is unverifiable.
 func (s *Service) probe(scope, path string) FPProbe {
-	return func() (string, bool, error) {
+	return func() (FileInfo, bool, error) {
 		info, err := s.root.stat(scope, path)
-		if errors.Is(err, ErrNotFound) {
-			return "", false, nil
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+			return FileInfo{}, false, nil
 		}
 		if err != nil {
-			return "", false, err
+			return FileInfo{}, false, err
 		}
-		return info.Fingerprint, true, nil
+		return info, true, nil
 	}
 }
 
@@ -139,7 +146,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	q := r.URL.Query()
-	path := q.Get("path")
+	// Every caller-supplied path is normalized once at the boundary into
+	// the canonical form the store uses for keys and intents: "./x",
+	// "/x", and "a//b" name the same logical filesystem object (f121).
+	path, perr := relPath(q.Get("path"))
+	if perr != nil {
+		s.mapErr(w, perr)
+		return
+	}
 	switch {
 	case op == "stat" && r.Method == "GET":
 		s.handleStat(w, r, scope, path)
@@ -302,7 +316,7 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 	ver, _, err := s.store.WithWrite(r.Context(), scope, path, "write", iv,
 		hex.EncodeToString(sum[:]),
 		s.probe(scope, path),
-		func() (FileInfo, error) {
+		func() (FileInfo, bool, error) {
 			return s.root.atomicWrite(scope, path, body, exclusive)
 		})
 	if err != nil {
@@ -347,13 +361,23 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 		writeErr(w, 400, "bad_if_version", err.Error())
 		return
 	}
+	from, ferr := relPath(rr.From)
+	to, terr := relPath(rr.To)
+	if ferr != nil {
+		s.mapErr(w, ferr)
+		return
+	}
+	if terr != nil {
+		s.mapErr(w, terr)
+		return
+	}
 	// none / eq 0 = "destination must not exist" — enforced atomically by
 	// renameat2(RENAME_NOREPLACE), not just by the version row.
 	noReplace := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
-	ver, _, err := s.store.Rename(r.Context(), scope, rr.From, rr.To, iv,
-		s.probe(scope, rr.To), s.probe(scope, rr.From),
-		func() (FileInfo, error) {
-			return s.root.rename(scope, rr.From, rr.To, noReplace)
+	ver, _, err := s.store.Rename(r.Context(), scope, from, to, iv,
+		s.probe(scope, to), s.probe(scope, from),
+		func() (FileInfo, bool, error) {
+			return s.root.rename(scope, from, to, noReplace)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -370,11 +394,16 @@ func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope stri
 		writeErr(w, 400, "bad_request", err.Error())
 		return
 	}
-	ver, _, err := s.store.WithWrite(r.Context(), scope, body.Path, "mkdir",
+	mpath, merr := relPath(body.Path)
+	if merr != nil {
+		s.mapErr(w, merr)
+		return
+	}
+	ver, _, err := s.store.WithWrite(r.Context(), scope, mpath, "mkdir",
 		IfVersion{Mode: "any"}, "dir",
-		s.probe(scope, body.Path),
-		func() (FileInfo, error) {
-			return s.root.mkdir(scope, body.Path)
+		s.probe(scope, mpath),
+		func() (FileInfo, bool, error) {
+			return s.root.mkdir(scope, mpath)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -390,7 +419,7 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, pa
 		return
 	}
 	err = s.store.Remove(r.Context(), scope, path, iv, s.probe(scope, path),
-		func() error {
+		func() (bool, error) {
 			return s.root.remove(scope, path)
 		})
 	if err != nil {
@@ -458,21 +487,25 @@ func isStoreErr(err error) bool {
 func (s *Service) StartReconciler(ctx context.Context) {
 	st, ok := s.store.(interface {
 		SetReconcile(StatFn, HashFn, func() error)
+		SetReconcileView(func(context.Context) (ReconView, error))
 		ReconcileLoop(context.Context)
 	})
 	if !ok {
 		return
 	}
-	// Under require_mount the reconciler must not trust an "absent" stat
-	// while the canonical mount is down — a clean unmount leaves a bare
-	// directory where everything reads missing (f102). Without
-	// require_mount the root is an ordinary directory and absence is
-	// already trustworthy, so no gate is wired.
-	var check func() error
-	if s.root.requireMount {
-		check = s.root.checkMount
-	}
-	st.SetReconcile(s.root.stat, s.root.hash, check)
+	// Ops-side probes (declare-time evidence hashing); the pass-pinned
+	// view below is what judgments are made under.
+	st.SetReconcile(s.root.stat, s.root.hash, nil)
+	// Each pass acquires one view: under require_mount the mount check runs
+	// first, then the root descriptor is pinned for the whole pass, so an
+	// unmount mid-drain answers ENOTCONN on the dead mount rather than
+	// ENOENT on the bare directory left behind — "unverifiable", never
+	// "absent" (f102/F-RA-1). Without require_mount the root is an
+	// ordinary directory: pinning still binds the pass to that root inode
+	// (a renamed-away root cannot masquerade as absence).
+	st.SetReconcileView(func(ctx context.Context) (ReconView, error) {
+		return s.root.pin(s.root.requireMount)
+	})
 	go st.ReconcileLoop(ctx)
 }
 
@@ -496,8 +529,10 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrNotEmpty):
 		writeErr(w, 409, "dir_not_empty", err.Error())
 	case errors.Is(err, ErrUnsettled):
-		writeErr(w, 503, "pending_settlement",
-			"a mutation touching this path is still settling; safe to retry")
+		// The error message carries the unsettled path and, when the
+		// filesystem could not be observed at all, the recorded stall
+		// cause — uncertainty is reported, not smoothed over (f119).
+		writeErr(w, 503, "pending_settlement", err.Error())
 	case errors.Is(err, ErrUnavailable):
 		writeErr(w, 503, "unavailable", "operation timed out; safe to retry")
 	case isStoreErr(err):

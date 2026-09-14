@@ -258,6 +258,10 @@ func checkZeroMetadataCache(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
 	}
+	return checkZeroMetadataCacheData(cfg)
+}
+
+func checkZeroMetadataCacheData(cfg []byte) error {
 	var c map[string]any
 	if err := json.Unmarshal(cfg, &c); err != nil {
 		return fmt.Errorf("%w: mount config unparseable", ErrMountPolicy)
@@ -388,14 +392,22 @@ func validScope(scope string) error {
 // tokens onto another scope's files (operation-review P2b/F7) — refused,
 // while ordinary symlinks INSIDE the scope remain supported.
 func (p *posixRoot) scopeDir(scope string, create bool) (*os.File, error) {
-	if err := validScope(scope); err != nil {
-		return nil, err
-	}
 	rfd, err := p.rootFD()
 	if err != nil {
 		return nil, err
 	}
 	defer rfd.Close()
+	return scopeDirFrom(rfd, scope, create)
+}
+
+// scopeDirFrom resolves the scope dir beneath an already-open root fd —
+// the pinned-view variant used by the reconciler so a mid-pass unmount
+// reports ENOTCONN on the dead mount instead of ENOENT on the bare
+// directory left behind (F-RA-1).
+func scopeDirFrom(rfd *os.File, scope string, create bool) (*os.File, error) {
+	if err := validScope(scope); err != nil {
+		return nil, err
+	}
 	if create {
 		err := unix.Mkdirat(int(rfd.Fd()), scope, 0o755)
 		if err != nil && !errors.Is(err, unix.EEXIST) {
@@ -546,7 +558,19 @@ func kindOf(mode fs.FileMode) string {
 }
 
 func (p *posixRoot) stat(scope, path string) (FileInfo, error) {
-	sfd, err := p.scopeDir(scope, false)
+	rfd, err := p.rootFD()
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer rfd.Close()
+	return statFrom(rfd, scope, path)
+}
+
+// statFrom stats beneath a pinned root fd — the reconciler's view so an
+// "absent" verdict is bound to the filesystem the pass verified, never
+// to a bare directory left behind by a mid-pass unmount.
+func statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
+	sfd, err := scopeDirFrom(rfd, scope, false)
 	if err != nil {
 		return FileInfo{}, err
 	}
@@ -643,7 +667,16 @@ func (p *posixRoot) list(scope, path string, limit int, cursor string) ([]ListEn
 // wedge the handler goroutine (final-review A F1); it is cleared by the
 // fstat type check — only regular files are served.
 func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, error) {
-	sfd, err := p.scopeDir(scope, false)
+	rfd, err := p.rootFD()
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	defer rfd.Close()
+	return openFrom(rfd, scope, path, off)
+}
+
+func openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, error) {
+	sfd, err := scopeDirFrom(rfd, scope, false)
 	if err != nil {
 		return nil, FileInfo{}, err
 	}
@@ -685,7 +718,16 @@ func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, err
 // reconciler compares it against an intent's recorded expectation to
 // detect content that is not what the service wrote.
 func (p *posixRoot) hash(scope, path string) (string, error) {
-	f, _, err := p.open(scope, path, 0)
+	rfd, err := p.rootFD()
+	if err != nil {
+		return "", err
+	}
+	defer rfd.Close()
+	return hashFrom(rfd, scope, path)
+}
+
+func hashFrom(rfd *os.File, scope, path string) (string, error) {
+	f, _, err := openFrom(rfd, scope, path, 0)
 	if err != nil {
 		return "", err
 	}
@@ -697,6 +739,97 @@ func (p *posixRoot) hash(scope, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// rootView is a reconcile-pass view of the filesystem pinned to one open
+// root descriptor. Every judgment the pass makes resolves beneath this
+// fd: if the canonical mount is unmounted mid-pass, fd-relative ops fail
+// ENOTCONN on the dead mount — an honest "unverifiable" — instead of
+// silently reading the bare directory the mountpoint leaves behind
+// (F-RA-1).
+type rootView struct {
+	rfd *os.File
+}
+
+// pin anchors a reconcile pass to the filesystem mounted at the canonical
+// root. With requireMount the OPENED DESCRIPTOR's mount identity is
+// verified (statx AT_EMPTY_PATH mount ID → mountinfo → verdict → JuiceFS
+// .config resolved beneath the same fd): verifying the path and then
+// opening it would leave a race where an intervening unmount pins the
+// bare directory, which answers "absent" for everything — exactly the
+// F-RA-1 defect. After a successful pin the fd either keeps answering on
+// a live mount or fails ENOTCONN on the dead one; it can never observe
+// the post-unmount placeholder.
+func (p *posixRoot) pin(requireMount bool) (*rootView, error) {
+	rfd, err := p.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	if requireMount {
+		if err := p.verifyPinnedMount(rfd); err != nil {
+			rfd.Close()
+			return nil, err
+		}
+	}
+	return &rootView{rfd: rfd}, nil
+}
+
+// verifyPinnedMount is checkMountInner re-expressed against the pinned
+// descriptor itself: the mount ID the fd is actually attached to, looked
+// up in mountinfo, must be a mountpoint AT the service root of an
+// accepted fstype; a JuiceFS mount must additionally serve its zero-cache
+// .config beneath this very fd.
+func (p *posixRoot) verifyPinnedMount(rfd *os.File) error {
+	var stx unix.Statx_t
+	if err := unix.Statx(int(rfd.Fd()), "",
+		unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &stx); err != nil ||
+		stx.Mask&unix.STATX_MNT_ID == 0 {
+		return ErrMountUnavailable
+	}
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ErrMountUnavailable
+	}
+	visible, ok := findMount(parseMountInfo(data), stx.Mnt_id)
+	if !ok {
+		return ErrMountUnavailable
+	}
+	if err := mountVerdict(visible, p.root); err != nil {
+		return err
+	}
+	if visible.fstype == "fuse.juicefs" {
+		cfg, err := openBeneath(rfd, ".config", unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			if errors.Is(err, ErrMountUnavailable) {
+				return err
+			}
+			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
+		}
+		defer cfg.Close()
+		var cstx unix.Statx_t
+		if err := unix.Statx(int(cfg.Fd()), "",
+			unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &cstx); err != nil ||
+			cstx.Mask&unix.STATX_MNT_ID == 0 || cstx.Mnt_id != stx.Mnt_id {
+			return fmt.Errorf("%w: .config is not served by the verified mount",
+				ErrMountPolicy)
+		}
+		content, err := io.ReadAll(cfg)
+		if err != nil {
+			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
+		}
+		return checkZeroMetadataCacheData(content)
+	}
+	return nil
+}
+
+func (v *rootView) Stat(scope, path string) (FileInfo, error) {
+	return statFrom(v.rfd, scope, path)
+}
+
+func (v *rootView) Hash(scope, path string) (string, error) {
+	return hashFrom(v.rfd, scope, path)
+}
+
+func (v *rootView) Close() error { return v.rfd.Close() }
+
 // atomicWrite stages content to a temp sibling, fsyncs, renames over the
 // target, and fsyncs the directory. A name never resolves to torn content.
 // Caller holds the version CAS; this is the durable part of the write.
@@ -706,51 +839,56 @@ func (p *posixRoot) hash(scope, path string) (string, error) {
 // Non-exclusive publish uses renameat2(2), which replaces whatever name
 // exists (including a dangling symlink — A F3) atomically and entirely
 // within the pinned parent directory.
-func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool) (FileInfo, error) {
+// The bool result reports whether the commit point was REACHED — the
+// publish call (linkat/renameat2) succeeded. A trailing stat error after
+// that means "the write landed but we could not observe the result"; the
+// caller must preserve the intent for reconciliation rather than drop it
+// as never-committed (F-RA-5/f120).
+func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool) (FileInfo, bool, error) {
 	if err := checkReserved(path); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	rel, err := relPath(path)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	if rel == "" {
-		return FileInfo{}, ErrNotDir
+		return FileInfo{}, false, ErrNotDir
 	}
 	sfd, err := p.scopeDir(scope, true)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer sfd.Close()
 	dirRel, name := splitRel(rel)
 	pfd, err := openDirBeneath(sfd, dirRel, true)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer pfd.Close()
 	rnd := make([]byte, 8)
 	if _, err := rand.Read(rnd); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	tmp := stagingPrefix + hex.EncodeToString(rnd)
 	tf, err := openBeneath(pfd, tmp,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0o644)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	if _, err := tf.Write(content); err != nil {
 		tf.Close()
 		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
-		return FileInfo{}, mapPathErr(err)
+		return FileInfo{}, false, mapPathErr(err)
 	}
 	if err := tf.Sync(); err != nil {
 		tf.Close()
 		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
-		return FileInfo{}, mapPathErr(err)
+		return FileInfo{}, false, mapPathErr(err)
 	}
 	if err := tf.Close(); err != nil {
 		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
-		return FileInfo{}, mapPathErr(err)
+		return FileInfo{}, false, mapPathErr(err)
 	}
 	if exclusive {
 		err = unix.Linkat(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0)
@@ -759,11 +897,16 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	}
 	if err != nil {
 		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
-		return FileInfo{}, mapPublishErr(err, exclusive)
+		return FileInfo{}, false, mapPublishErr(err, exclusive)
 	}
 	unix.Unlinkat(int(pfd.Fd()), tmp, 0) // linkat leaves the staging name
 	syncDir(pfd)
-	return p.stat(scope, path)
+	info, serr := p.stat(scope, path)
+	if serr != nil {
+		// The publish committed; only the observation failed.
+		return FileInfo{}, true, serr
+	}
+	return info, true, nil
 }
 
 // mapPublishErr translates the kernel's rename/link/linkat errors into
@@ -797,46 +940,49 @@ func mapPublishErr(err error, exclusive bool) error {
 // renameat2(RENAME_NOREPLACE); the plain form passes flags=0, which unlike
 // os.Rename performs no userspace kind pre-check — the kernel handles
 // dir-over-empty-dir, and returns typed errors for real mismatches.
-func (p *posixRoot) rename(scope, from, to string, noReplace bool) (FileInfo, error) {
+// The bool result reports whether renameat2 committed — a trailing stat
+// failure after that point means "landed but unobserved", not "never
+// ran" (F-RA-5/f120).
+func (p *posixRoot) rename(scope, from, to string, noReplace bool) (FileInfo, bool, error) {
 	if err := checkReserved(to); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	if err := checkReserved(from); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	relFrom, err := relPath(from)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	relTo, err := relPath(to)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	if relFrom == "" || relTo == "" {
-		return FileInfo{}, ErrNotDir
+		return FileInfo{}, false, ErrNotDir
 	}
 	if relTo == relFrom || strings.HasPrefix(relTo, relFrom+"/") {
-		return FileInfo{}, ErrEscape // cannot move a dir beneath itself
+		return FileInfo{}, false, ErrEscape // cannot move a dir beneath itself
 	}
 	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer sfd.Close()
 	srcDir, srcName := splitRel(relFrom)
 	dstDir, dstName := splitRel(relTo)
 	srcPfd, err := openDirBeneath(sfd, srcDir, false)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer srcPfd.Close()
 	dstPfd, err := openDirBeneath(sfd, dstDir, false)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer dstPfd.Close()
 	if _, _, _, _, err := statAt(srcPfd, srcName); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	var flags uint
 	if noReplace {
@@ -844,29 +990,35 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool) (FileInfo, er
 	}
 	err = unix.Renameat2(int(srcPfd.Fd()), srcName, int(dstPfd.Fd()), dstName, flags)
 	if err != nil {
-		return FileInfo{}, mapPublishErr(err, noReplace)
+		return FileInfo{}, false, mapPublishErr(err, noReplace)
 	}
 	syncDir(dstPfd)
-	return p.stat(scope, to)
+	info, serr := p.stat(scope, to)
+	if serr != nil {
+		return FileInfo{}, true, serr
+	}
+	return info, true, nil
 }
 
-func (p *posixRoot) remove(scope, path string) error {
+// The bool result reports whether an unlinkat committed — an error after
+// that point is observation, not non-commit (F-RA-5/f120).
+func (p *posixRoot) remove(scope, path string) (bool, error) {
 	rel, err := relPath(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if rel == "" {
-		return ErrNotDir // removing the scope root itself is not an op
+		return false, ErrNotDir // removing the scope root itself is not an op
 	}
 	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer sfd.Close()
 	dirRel, name := splitRel(rel)
 	pfd, err := openDirBeneath(sfd, dirRel, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer pfd.Close()
 	err = unix.Unlinkat(int(pfd.Fd()), name, 0)
@@ -876,37 +1028,44 @@ func (p *posixRoot) remove(scope, path string) error {
 	if err != nil {
 		switch {
 		case errors.Is(err, unix.ENOENT):
-			return ErrNotFound
+			return false, ErrNotFound
 		case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
-			return ErrNotEmpty
+			return false, ErrNotEmpty
 		default:
-			return mapPathErr(err)
+			return false, mapPathErr(err)
 		}
 	}
 	syncDir(pfd)
-	return nil
+	return true, nil
 }
 
-func (p *posixRoot) mkdir(scope, path string) (FileInfo, error) {
+// The bool result reports whether the directory exists after the call —
+// mkdir's commit point is inside openDirBeneath; a failure of the
+// trailing stat means "exists but unobserved" (F-RA-5/f120).
+func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	if err := checkReserved(path); err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	rel, err := relPath(path)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	sfd, err := p.scopeDir(scope, true)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	defer sfd.Close()
 	pfd, err := openDirBeneath(sfd, rel, true)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, false, err
 	}
 	pfd.Close()
 	syncDir(sfd)
-	return p.stat(scope, path)
+	info, serr := p.stat(scope, path)
+	if serr != nil {
+		return FileInfo{}, true, serr
+	}
+	return info, true, nil
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.

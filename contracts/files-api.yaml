@@ -42,30 +42,76 @@ info:
     recorded owner can be taken over; a temporary DB loss with no
     successor recovers in place.
     Settlement honesty: while any intent overlapping the target paths is
-    still pending, a conflicting mutation is refused with 503
+    unsettled, a conflicting mutation is refused with 503
     pending_settlement — the outcome of the earlier filesystem work is
     uncertain, and new rows minted inside its subtree could be stranded
-    by a late-landing rename. Intents are only settled by the instance
+    by a late-landing rename. The refusal is path-local: disjoint
+    operations proceed normally, and intents whose destination leg is
+    empty never match unrelated paths. The error message carries the
+    blocking intent's recorded cause when the filesystem could not be
+    observed at all. Intents are only settled by the instance
     that declared them (its fs goroutine) or — after the settle grace —
     by the live owner. The grace is measured from intent declare time
     and covers in-kernel/daemon-accepted completion after owner death;
     it is a best-effort bound, not proof that a partitioned-but-alive
-    owner's syscall can never land late — such a landing leaves a
-    detectable unversioned/divergent file, never a falsely clean record.
-    Every settlement path (apply AND intent/row drops) verifies the
+    owner's syscall can never land late.
+    Every settlement path (apply AND intent/row resolution) verifies the
     recorded store owner inside its transaction, so a displaced process
     cannot delete rows a live successor would roll forward.
-    The reconciler trusts "absent" only when the filesystem root is
-    verified: under REQUIRE_MOUNT a failed mount check skips the whole
-    pass (a clean unmount leaves a bare directory where everything reads
-    missing), so mount interruptions never erase pending intents or
-    acknowledged rows. Rename settlement additionally proves destination
-    identity from the declare-time fingerprint — directories by inode
-    continuity, files by inode+size+mtime (inode numbers can be recycled
-    by delete+create, so identity alone is not proof of content). A
-    destination that merely exists, or whose content evidence does not
-    match, is never claimed as the moved source: the intent is dropped
-    and all version rows are kept rather than laundering foreign bytes.
+    Verdict classes: only ENOENT and ENOTDIR count as observed absence —
+    a path addressed through a non-directory provably does not exist as
+    addressed. Every other stat failure (EACCES, EIO, ENOTCONN, a dead
+    FUSE mount) is unverifiable: the intent stays pending indefinitely
+    with its cause recorded (stalled), keeps excluding conflicting ops
+    on that path, and is never resolved by a timer. Restoring filesystem
+    observability lets the next pass settle it truthfully. A removal
+    settled by observed absence cleans the dead version rows but journals
+    NO remove event — observed absence is not a performed removal, and
+    the event log must not invent who removed the file.
+    Every filesystem observation the reconciler makes — including
+    "absent" — is bound to a single root descriptor pinned for the whole
+    pass. Under REQUIRE_MOUNT the descriptor's own mount identity is
+    verified (statx MNT_ID on the opened fd, then mountinfo + cache
+    policy read beneath the fd), so an unmount mid-pass answers
+    "unverifiable" (ENOTCONN on the dead mount) instead of "absent" on
+    the bare directory the mountpoint leaves behind — acknowledged rows
+    and pending intents are never deleted on an observation the pass
+    cannot trust.
+    fs commit vs reply: mutation syscalls report whether their commit
+    point was reached separately from the error. A publish that
+    succeeded followed by a failed trailing stat is "landed but
+    unobserved" — the intent is kept for reconciliation, never dropped
+    as a rejection; an ambiguous transport-class error is likewise kept,
+    because on FUSE a lost reply can follow an applied request. Only a
+    definitive pre-commit rejection (absent source, kind mismatch,
+    permission, conflict) drops an intent outright.
+    Rename settlement proves the destination IS the moved source, never
+    that it merely exists: the recorded source kind must match, the
+    inode must be continuous, and then — for files — the recorded
+    content hash must equal the destination's bytes (inode numbers are
+    recycled by delete+create, and preserved timestamps are forgeable);
+    for directories, at least one recorded member's full fingerprint —
+    including ctime, which copy/restore cannot preserve — must appear at
+    the corresponding destination path and no sampled member may
+    contradict. A directory with no recorded members to corroborate is
+    unproven. An unproven destination is never claimed: the intent is
+    resolved, every version row is kept, and no rename event is
+    journaled — foreign bytes are never laundered into the service's
+    audit trail. Hash equality alone is never used to invent a rename:
+    two independently created files with identical bytes produce an
+    unproven outcome, not an adoption.
+    Late landings: a resolved intent keeps its evidence (pre-state
+    fingerprint, expected hash, source kind) as a tombstone for a
+    retention horizon; every pass re-judges tombstones and can still
+    apply a provably-landed effect — including moving rows minted after
+    the drop whose recorded fingerprints prove a late rename physically
+    carried them. This retention is an evidence horizon, not a
+    quiescence proof: a filesystem effect landing after the horizon
+    cannot be re-judged (no evidence remains), and a successor op
+    admitted after the exclusion window that minted rows under the old
+    subtree can still be stranded with its version at the old path —
+    reported honestly as external_change/404-at-recorded-path, never as
+    a clean record.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so
@@ -111,7 +157,11 @@ info:
     which in-scope object an op targets (ordinary concurrent-modification
     semantics), but never escapes the scope root. Paths containing ".."
     and absolute escapes remain refused; only single-scope namespaces are
-    reachable. Reads serve regular files only: special files (fifo,
+    reachable. Caller-supplied paths are canonicalized at the API
+    boundary — "./x", "/x", and "a//b" all name the same logical path for
+    version rows, pending-intent exclusion, and filesystem resolution,
+    so spelling variants can neither split identity nor bypass
+    settlement. Reads serve regular files only: special files (fifo,
     socket, device) stat as kind=special and read as 400 wrong_kind —
     the open is non-blocking, so a FIFO can never wedge a handler.
 paths:

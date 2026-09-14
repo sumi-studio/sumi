@@ -52,11 +52,11 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 			if cur != iv.Version {
 				return 0, ErrConflict
 			}
-			liveFP, exists, err := probe()
+			live, exists, err := probe()
 			if err != nil {
 				return 0, err
 			}
-			if !exists || (f.fps[k] != "" && liveFP != f.fps[k]) {
+			if !exists || (f.fps[k] != "" && live.Fingerprint != f.fps[k]) {
 				return 0, ErrExternalChange
 			}
 		}
@@ -71,14 +71,14 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 	return f.seq, nil
 }
 
-func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
 	k := scope + "/" + path
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, path, iv, probe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
-	info, err := fn()
+	info, _, err := fn()
 	if err != nil {
 		if had {
 			f.vers[k] = prev // roll back the row on FS failure (seq is consumed)
@@ -92,14 +92,14 @@ func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv If
 	return ver, info, nil
 }
 
-func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
 	k := scope + "/" + to
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, to, iv, casProbe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
-	info, err := fn()
+	info, _, err := fn()
 	if err != nil {
 		if had {
 			f.vers[k] = prev
@@ -125,7 +125,7 @@ func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVer
 	return ver, info, nil
 }
 
-func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error {
+func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error {
 	k := scope + "/" + path
 	cur := f.vers[k]
 	if cur == 0 && (iv.Mode == "eq" || iv.Mode == "none") {
@@ -135,15 +135,15 @@ func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion
 		return ErrConflict
 	}
 	if iv.Mode == "eq" {
-		liveFP, exists, err := probe()
+		live, exists, err := probe()
 		if err != nil {
 			return err
 		}
-		if !exists || (f.fps[k] != "" && liveFP != f.fps[k]) {
+		if !exists || (f.fps[k] != "" && live.Fingerprint != f.fps[k]) {
 			return ErrExternalChange
 		}
 	}
-	if err := fn(); err != nil {
+	if _, err := fn(); err != nil {
 		return err
 	}
 	for kk := range f.vers {
@@ -916,5 +916,54 @@ func TestSweepNestedStaging(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("nested staging file not swept: %v", err)
+	}
+}
+
+// f121/F-RA-2: alternate spellings of one filesystem path — "./x", "/x",
+// doubled separators — must normalize to the same logical object and the
+// same version row at the service boundary. Otherwise they split
+// file_version identity and bypass pending-intent exclusion.
+func TestCanonicalPathSpellings(t *testing.T) {
+	svc, _ := testSvc(t)
+	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=./a.txt", "tok-a", "hello",
+		map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("write ./a.txt: %d %s", w.Code, w.Body)
+	}
+	// The bare spelling sees the same object and the same version.
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=a.txt", "tok-a", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":1`) {
+		t.Fatalf("stat a.txt after ./ write: %d %s", w.Code, w.Body)
+	}
+	// Leading-slash spelling resolves identically.
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=/a.txt", "tok-a", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":1`) {
+		t.Fatalf("stat /a.txt: %d %s", w.Code, w.Body)
+	}
+	// Doubled separators inside a directory.
+	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"sub"}`, nil)
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=sub//b.txt", "tok-a", "x",
+		map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("write sub//b.txt: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=sub/b.txt", "tok-a", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("stat sub/b.txt after sub// write: %d %s", w.Code, w.Body)
+	}
+	// Rename legs normalize too: "./a.txt" and "/renamed.txt" work.
+	w = req(t, svc, "POST", "/v1/files/ws1/rename", "tok-a",
+		`{"from":"./a.txt","to":"/renamed.txt","if_version":"any"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("rename with alternate spellings: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=renamed.txt", "tok-a", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("renamed.txt not found: %d %s", w.Code, w.Body)
+	}
+	// ".." is still rejected at the boundary, not clamped.
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=../escape", "tok-a", "", nil)
+	if w.Code != 403 {
+		t.Fatalf(".. path: want 403, got %d %s", w.Code, w.Body)
 	}
 }

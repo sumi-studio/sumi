@@ -77,16 +77,18 @@ func newPGStore(t *testing.T, dsn, root string) *Store {
 // "ino:size:mtime:ctime" format — rename identity proof in the reconciler
 // exercises the same checks production runs.
 type fakeDisk struct {
-	files map[string]string // scope/path -> content ("dir" = dir)
-	inos  map[string]uint64
-	mts   map[string]int64
-	next  uint64
-	clock int64
+	files   map[string]string // scope/path -> content ("dir" = dir)
+	inos    map[string]uint64
+	mts     map[string]int64
+	statErr map[string]error // injected unobservable errors (EACCES/ENOTCONN/…)
+	next    uint64
+	clock   int64
 }
 
 func newFakeDisk() *fakeDisk {
 	return &fakeDisk{files: map[string]string{},
-		inos: map[string]uint64{}, mts: map[string]int64{}}
+		inos: map[string]uint64{}, mts: map[string]int64{},
+		statErr: map[string]error{}}
 }
 
 func (d *fakeDisk) put(scope, path, content string) {
@@ -131,8 +133,38 @@ func (d *fakeDisk) del(scope, path string) {
 	delete(d.mts, k)
 }
 
+// fail injects an unverifiable observation error; heal clears it.
+func (d *fakeDisk) fail(scope, path string, err error) {
+	d.statErr[scope+"/"+path] = err
+}
+func (d *fakeDisk) heal(scope, path string) { delete(d.statErr, scope+"/"+path) }
+
+// setIno forges an inode — simulates kernel inode recycling.
+func (d *fakeDisk) setIno(scope, path string, ino uint64) {
+	d.inos[scope+"/"+path] = ino
+}
+
+// ancestorErr reports ErrNotDir when a path is addressed through a
+// non-directory ancestor — a definitive current-path fact (f119).
+func (d *fakeDisk) ancestorErr(scope, path string) error {
+	segs := strings.Split(path, "/")
+	for i := 1; i < len(segs); i++ {
+		anc := scope + "/" + strings.Join(segs[:i], "/")
+		if c, ok := d.files[anc]; ok && c != "dir" {
+			return ErrNotDir
+		}
+	}
+	return nil
+}
+
 func (d *fakeDisk) stat(scope, path string) (FileInfo, error) {
 	k := scope + "/" + path
+	if err, ok := d.statErr[k]; ok {
+		return FileInfo{}, err
+	}
+	if err := d.ancestorErr(scope, path); err != nil {
+		return FileInfo{}, err
+	}
 	c, ok := d.files[k]
 	if !ok {
 		return FileInfo{}, ErrNotFound
@@ -146,6 +178,12 @@ func (d *fakeDisk) stat(scope, path string) (FileInfo, error) {
 
 func (d *fakeDisk) hash(scope, path string) (string, error) {
 	k := scope + "/" + path
+	if err, ok := d.statErr[k]; ok {
+		return "", err
+	}
+	if err := d.ancestorErr(scope, path); err != nil {
+		return "", err
+	}
 	c, ok := d.files[k]
 	if !ok || c == "dir" {
 		return "", ErrNotFound
@@ -174,10 +212,10 @@ func insertIntent(t *testing.T, s *Store, it intent) int64 {
 	defer cancel()
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha, at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind, at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
 		s.rootID, it.owner, it.scope, it.op, it.path, it.toPath,
-		it.version, it.preFP, it.expectSHA, it.at).Scan(&id)
+		it.version, it.preFP, it.expectSHA, it.srcKind, it.at).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert intent: %v", err)
 	}
@@ -237,12 +275,12 @@ func TestPGWriteSettlesIntent(t *testing.T) {
 	disk := newFakeDisk()
 	s.SetReconcile(disk.stat, disk.hash, nil)
 
-	probeAbsent := func() (string, bool, error) { return "", false, nil }
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	ver, _, err := s.WithWrite(context.Background(), "ws", "a.txt", "write",
 		IfVersion{Mode: "none"}, sha("hello"), probeAbsent,
-		func() (FileInfo, error) {
+		func() (FileInfo, bool, error) {
 			disk.put("ws", "a.txt", "hello")
-			return FileInfo{Kind: "file", Fingerprint: "fp-a"}, nil
+			return FileInfo{Kind: "file", Fingerprint: "fp-a"}, true, nil
 		})
 	if err != nil {
 		t.Fatalf("write: %v", err)
@@ -380,23 +418,27 @@ func TestPGStaleRenameKeepsNewerRows(t *testing.T) {
 	ctx := context.Background()
 	// Declare-time state: d1/old.txt (v2). The intent minted v4.
 	// Post-commit: d1 recreated with new.txt (v5) by a later op.
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO file_version (scope, path, version, fp) VALUES
-		 ('ws','d1/old.txt',2,'fp-old'), ('ws','d1/new.txt',5,'fp-new')`)
-	if err != nil {
-		t.Fatalf("seed rows: %v", err)
-	}
-	// Disk after: rename ran (d2 is the moved d1 — same inode), and the
-	// source path was recreated with a new dir (new inode).
 	disk.put("ws", "d1", "dir")
 	d1Info, _ := disk.stat("ws", "d1")
 	preFP := d1Info.Fingerprint
+	disk.put("ws", "d1/old.txt", "old-bytes")
+	oldInfo, _ := disk.stat("ws", "d1/old.txt")
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES
+		 ('ws','d1/old.txt',2,$1), ('ws','d1/new.txt',5,'fp-new')`,
+		oldInfo.Fingerprint)
+	if err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+	// Disk after: rename ran (d2 is the moved d1 — same inode, and its
+	// recorded member d1/old.txt corroborates at d2/old.txt), and the
+	// source path was recreated with a new dir (new inode).
 	disk.mv("ws", "d1", "d2")
 	disk.put("ws", "d1", "dir") // recreated — new inode, differs from preFP
 
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "d1", toPath: "d2",
-		version: 4, preFP: preFP, at: time.Now().Add(-time.Minute),
+		version: 4, preFP: preFP, srcKind: "dir", at: time.Now().Add(-time.Minute),
 	})
 	if got := s.Reconcile(context.Background()); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
@@ -430,10 +472,10 @@ func TestPGApplyIsIdempotent(t *testing.T) {
 	})
 	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
 		path: "f.txt", version: 46}
-	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}); err != nil {
+	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", nil); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"})
+	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", nil)
 	if !errors.Is(err, errIntentSettled) {
 		t.Fatalf("second apply = %v, want errIntentSettled", err)
 	}
@@ -553,7 +595,7 @@ func TestPGDropFencedForeignOwner(t *testing.T) {
 	if s.dropIntentGhosts(ctx, it, true) {
 		t.Fatal("dropIntentGhosts deleted under a foreign owner")
 	}
-	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}); err == nil {
+	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", nil); err == nil {
 		t.Fatal("apply ran under a foreign owner")
 	}
 	if n := intentCount(t, s); n != 1 {
@@ -579,10 +621,10 @@ func TestPGDeclareBlockedByPendingIntent(t *testing.T) {
 	// A rename intent a→b whose fs outcome is not yet settled.
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "a", toPath: "b",
-		version: 30, at: time.Now(),
+		version: 30, srcKind: "dir", at: time.Now(),
 	})
-	probeAbsent := func() (string, bool, error) { return "", false, nil }
-	noop := func() (FileInfo, error) { return FileInfo{Kind: "file"}, nil }
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	noop := func() (FileInfo, bool, error) { return FileInfo{Kind: "file"}, true, nil }
 
 	for _, p := range []string{"a", "a/new.txt", "b", "b/x.txt"} {
 		_, _, err := s.WithWrite(ctx, "ws", p, "write",
@@ -594,9 +636,9 @@ func TestPGDeclareBlockedByPendingIntent(t *testing.T) {
 	// An unrelated path is unaffected.
 	ver, _, err := s.WithWrite(ctx, "ws", "c.txt", "write",
 		IfVersion{Mode: "none"}, sha("c"), probeAbsent,
-		func() (FileInfo, error) {
+		func() (FileInfo, bool, error) {
 			disk.put("ws", "c.txt", "c")
-			return FileInfo{Kind: "file", Fingerprint: "fp-c"}, nil
+			return FileInfo{Kind: "file", Fingerprint: "fp-c"}, true, nil
 		})
 	if err != nil || ver < 1 {
 		t.Fatalf("unrelated write blocked: ver=%d err=%v", ver, err)
@@ -635,7 +677,8 @@ func TestPGRenameReconcileForeignDest(t *testing.T) {
 	}
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "e1", toPath: "e2",
-		version: 20, preFP: preFP, at: time.Now().Add(-time.Minute),
+		version: 20, preFP: preFP, srcKind: "file", expectSHA: sha("orig"),
+		at: time.Now().Add(-time.Minute),
 	})
 	if got := s.Reconcile(ctx); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
@@ -677,7 +720,8 @@ func TestPGRenameReconcileIdentityMatch(t *testing.T) {
 	}
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "f1.txt", toPath: "f2.txt",
-		version: 21, preFP: preFP, at: time.Now().Add(-time.Minute),
+		version: 21, preFP: preFP, srcKind: "file", expectSHA: sha("payload"),
+		at: time.Now().Add(-time.Minute),
 	})
 	if got := s.Reconcile(ctx); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
@@ -719,7 +763,8 @@ func TestPGRenameReconcileDivergedFile(t *testing.T) {
 	}
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "g1.txt", toPath: "g2.txt",
-		version: 22, preFP: preFP, at: time.Now().Add(-time.Minute),
+		version: 22, preFP: preFP, srcKind: "file", expectSHA: sha("payload"),
+		at: time.Now().Add(-time.Minute),
 	})
 	if got := s.Reconcile(ctx); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
@@ -729,5 +774,516 @@ func TestPGRenameReconcileDivergedFile(t *testing.T) {
 	}
 	if v, _ := versionOf(t, s, "ws", "g1.txt"); v != 10 {
 		t.Fatalf("source row lost: version %d", v)
+	}
+}
+
+// resolveIntent marks an intent reconciler-resolved (tombstoned), as a
+// first settlement pass would — used to exercise late-landing re-judgment.
+func resolveIntent(t *testing.T, s *Store, id int64) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(),
+		`UPDATE file_op SET resolved_at=now() WHERE id=$1`, id); err != nil {
+		t.Fatalf("resolve intent: %v", err)
+	}
+}
+
+func pendingCount(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM file_op WHERE resolved_at IS NULL`).Scan(&n); err != nil {
+		t.Fatalf("count pending: %v", err)
+	}
+	return n
+}
+
+func stalledCause(t *testing.T, s *Store, id int64) string {
+	t.Helper()
+	var cause string
+	var stalledAt any
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT coalesce(last_error,''), stalled_at FROM file_op WHERE id=$1`,
+		id).Scan(&cause, &stalledAt); err != nil {
+		t.Fatalf("read stall: %v", err)
+	}
+	if stalledAt == nil {
+		t.Fatalf("intent %d not marked stalled", id)
+	}
+	return cause
+}
+
+// f118/B-1: a pending non-rename intent (to_path=”) must block only its
+// own subtree — before the fix, the ” leg equality made every pending
+// write block every other operation.
+func TestPGEmptyLegDoesNotBlockDisjoint(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "w1.txt",
+		version: 50, expectSHA: sha("w1"), at: time.Now(),
+	})
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+
+	// The pending path itself is excluded.
+	_, _, err := s.WithWrite(ctx, "ws", "w1.txt", "write",
+		IfVersion{Mode: "any"}, "", probeAbsent,
+		func() (FileInfo, bool, error) { return FileInfo{}, true, nil })
+	if !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("write over pending path: %v, want ErrUnsettled", err)
+	}
+	// Disjoint write, mkdir and rename all proceed.
+	if _, _, err := s.WithWrite(ctx, "ws", "w2.txt", "write",
+		IfVersion{Mode: "none"}, sha("w2"), probeAbsent,
+		func() (FileInfo, bool, error) {
+			disk.put("ws", "w2.txt", "w2")
+			return FileInfo{Kind: "file", Fingerprint: "fp-w2"}, true, nil
+		}); err != nil {
+		t.Fatalf("disjoint write blocked by '' to_path: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "d1", "mkdir",
+		IfVersion{Mode: "any"}, "dir", probeAbsent,
+		func() (FileInfo, bool, error) {
+			disk.put("ws", "d1", "dir")
+			return FileInfo{Kind: "dir", Fingerprint: "fp-d1"}, true, nil
+		}); err != nil {
+		t.Fatalf("disjoint mkdir blocked by '' to_path: %v", err)
+	}
+	if _, _, err := s.Rename(ctx, "ws", "w2.txt", "w3.txt",
+		IfVersion{Mode: "any"}, probeAbsent, probeAbsent,
+		func() (FileInfo, bool, error) {
+			disk.mv("ws", "w2.txt", "w3.txt")
+			return FileInfo{Kind: "file", Fingerprint: "fp-w3"}, true, nil
+		}); err != nil {
+		t.Fatalf("disjoint rename blocked by '' to_path: %v", err)
+	}
+}
+
+// F-RA-5/f120: a mutation that COMMITTED but whose observation failed must
+// keep its intent — the error class alone must never erase the record of
+// possibly-committed work.
+func TestPGCommittedButUnobservedKeepsIntent(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	_, _, err := s.WithWrite(ctx, "ws", "cx.txt", "write",
+		IfVersion{Mode: "none"}, sha("cx"), probeAbsent,
+		func() (FileInfo, bool, error) {
+			disk.put("ws", "cx.txt", "cx")
+			// Publish committed; the trailing stat failed.
+			return FileInfo{}, true, ErrUnavailable
+		})
+	if err == nil {
+		t.Fatal("unobserved commit reported clean success")
+	}
+	if n := pendingCount(t, s); n != 1 {
+		t.Fatalf("committed-but-unobserved intent erased: pending=%d", n)
+	}
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "cx.txt"); v == 0 {
+		t.Fatal("landed write never minted its version")
+	}
+}
+
+// F-RA-5 converse: a DEFINITIVE pre-commit rejection (permission) drops the
+// intent cleanly — no pending residue, no version row.
+func TestPGDefinitivePreCommitDropsIntent(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	_, _, err := s.WithWrite(ctx, "ws", "deny.txt", "write",
+		IfVersion{Mode: "none"}, sha("x"), probeAbsent,
+		func() (FileInfo, bool, error) {
+			return FileInfo{}, false, ErrAccess // rejected before publish
+		})
+	if !errors.Is(err, ErrAccess) {
+		t.Fatalf("write err = %v, want ErrAccess", err)
+	}
+	if n := intentCount(t, s); n != 0 {
+		t.Fatalf("pre-commit rejection left %d intents", n)
+	}
+	if v, _ := versionOf(t, s, "ws", "deny.txt"); v != 0 {
+		t.Fatalf("rejected write minted version %d", v)
+	}
+}
+
+// F-RA-5 ambiguity leg: a transport-class error WITHOUT a proven commit is
+// not a rejection either — the outcome is unknown and the intent survives.
+func TestPGAmbiguousErrorKeepsIntent(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	_, _, err := s.WithWrite(ctx, "ws", "amb.txt", "write",
+		IfVersion{Mode: "none"}, sha("amb"), probeAbsent,
+		func() (FileInfo, bool, error) {
+			return FileInfo{}, false, ErrUnavailable // reply may be lost
+		})
+	if err == nil {
+		t.Fatal("ambiguous fs error reported as success")
+	}
+	if n := pendingCount(t, s); n != 1 {
+		t.Fatalf("ambiguous intent erased: pending=%d", n)
+	}
+	// Nothing landed: reconcile observes provable absence and resolves it.
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "amb.txt"); v != 0 {
+		t.Fatalf("ghost version minted for never-landed write: %d", v)
+	}
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("resolved intent not tombstoned: total=%d", n)
+	}
+}
+
+// f119/B-2: an intent whose path cannot be observed (EACCES) is durable
+// uncertainty — it stays pending with its cause recorded, blocks only its
+// own subtree, and never resolves on a timer. Restoring observability
+// settles it truthfully.
+func TestPGUnverifiableStallsDurably(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "jam.txt",
+		version: 60, expectSHA: sha("jam"), at: time.Now().Add(-time.Hour),
+	})
+	disk.fail("ws", "jam.txt", ErrAccess)
+
+	for i := 0; i < 3; i++ {
+		if got := s.Reconcile(ctx); got != 0 {
+			t.Fatalf("reconcile resolved an unverifiable intent: %d", got)
+		}
+	}
+	if cause := stalledCause(t, s, id); !strings.Contains(cause, "permission") {
+		t.Fatalf("stall cause %q does not record the access failure", cause)
+	}
+	// Conflicting op sees the cause; disjoint ops proceed.
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	_, _, err := s.WithWrite(ctx, "ws", "jam.txt", "write",
+		IfVersion{Mode: "any"}, "", probeAbsent,
+		func() (FileInfo, bool, error) { return FileInfo{}, true, nil })
+	if !errors.Is(err, ErrUnsettled) || !strings.Contains(err.Error(), "permission") {
+		t.Fatalf("blocked op lacks cause: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "free.txt", "write",
+		IfVersion{Mode: "none"}, sha("f"), probeAbsent,
+		func() (FileInfo, bool, error) {
+			disk.put("ws", "free.txt", "f")
+			return FileInfo{Kind: "file", Fingerprint: "fp-f"}, true, nil
+		}); err != nil {
+		t.Fatalf("disjoint write blocked by stalled intent: %v", err)
+	}
+	// Observability restored: the landed bytes settle truthfully.
+	disk.heal("ws", "jam.txt")
+	disk.put("ws", "jam.txt", "jam")
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d after heal", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "jam.txt"); v != 60 {
+		t.Fatalf("version = %d, want 60", v)
+	}
+}
+
+// f119/B-2 converse: ENOTDIR is a definitive CURRENT-path fact — a path
+// addressed through a non-directory cannot exist as addressed. The intent
+// settles by observed absence (no invented causality).
+func TestPGNotDirSettlesAbsence(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	// A file where the intent expects a directory ancestor.
+	disk.put("ws", "f", "a-file-not-a-dir")
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "f/inner.txt",
+		version: 61, expectSHA: sha("inner"), at: time.Now().Add(-time.Hour),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if n := pendingCount(t, s); n != 0 {
+		t.Fatalf("ENOTDIR intent still pending: %d", n)
+	}
+	if v, _ := versionOf(t, s, "ws", "f/inner.txt"); v != 0 {
+		t.Fatalf("version minted under a non-directory: %d", v)
+	}
+}
+
+// Remove settled by observed absence emits NO remove event — we observed
+// the path absent; the journal must not claim the service removed it.
+func TestPGRemoveAbsentNoEvent(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','gone.txt',9,'fp-g')`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "remove", path: "gone.txt",
+		version: 62, at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "gone.txt"); v != 0 {
+		t.Fatalf("ghost row for absent path survived: %d", v)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op='remove' AND path='gone.txt'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("remove event invented for unperformed removal (%d)", n)
+	}
+}
+
+// F-RA-4/f122: the intent is marked inflight BEFORE its row commits, so a
+// reconcile pass that observes the row while the fs op still runs can
+// never misjudge it as abandoned.
+func TestPGInflightMarkedBeforeVisible(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := s.WithWrite(ctx, "ws", "race.txt", "write",
+			IfVersion{Mode: "none"}, sha("r"), probeAbsent,
+			func() (FileInfo, bool, error) {
+				close(started)
+				<-release
+				disk.put("ws", "race.txt", "r")
+				return FileInfo{Kind: "file", Fingerprint: "fp-r"}, true, nil
+			})
+		done <- err
+	}()
+	<-started
+	// The intent row is committed and visible NOW; a pass must skip it.
+	if got := s.Reconcile(ctx); got != 0 {
+		t.Fatalf("reconcile judged a live inflight intent: settled %d", got)
+	}
+	if n := pendingCount(t, s); n != 1 {
+		t.Fatalf("inflight intent vanished mid-flight: %d", n)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if v, _ := versionOf(t, s, "ws", "race.txt"); v == 0 {
+		t.Fatal("completed write minted no version")
+	}
+}
+
+// f106: a directory whose destination recycles the source inode but holds
+// FOREIGN members is not the moved tree — no adoption, rows preserved.
+func TestPGRenameDirRecycledInodeForeign(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "h1", "dir")
+	h1, _ := disk.stat("ws", "h1")
+	preFP := h1.Fingerprint
+	disk.put("ws", "h1/k.txt", "kid")
+	kid, _ := disk.stat("ws", "h1/k.txt")
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','h1/k.txt',12,$1)`,
+		kid.Fingerprint)
+	if err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	// Source tree deleted; a DIFFERENT dir takes the name and is forged to
+	// the source's inode (recycling). Its child has different fingerprints.
+	disk.del("ws", "h1/k.txt")
+	disk.del("ws", "h1")
+	disk.put("ws", "h2", "dir")
+	disk.put("ws", "h2/k.txt", "stranger") // same name, foreign inode+times
+	disk.setIno("ws", "h2", h1Ino(t, preFP))
+
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "h1", toPath: "h2",
+		version: 23, preFP: preFP, srcKind: "dir", at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "h2"); v != 0 {
+		t.Fatalf("foreign dir adopted as moved source: version %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "h2/k.txt"); v != 0 {
+		t.Fatalf("foreign member laundered: version %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "h1/k.txt"); v != 12 {
+		t.Fatalf("source member row lost: %d", v)
+	}
+}
+
+func h1Ino(t *testing.T, fp string) uint64 {
+	t.Helper()
+	ino, _, _, ok := fpParts(fp)
+	if !ok {
+		t.Fatalf("bad fp %q", fp)
+	}
+	var n uint64
+	if _, err := fmt.Sscanf(ino, "%d", &n); err != nil {
+		t.Fatalf("ino %q: %v", ino, err)
+	}
+	return n
+}
+
+// f106: a dir with NO recorded members to corroborate stays unproven —
+// an inode alone never proves a whole directory moved.
+func TestPGRenameDirNoMembersUnproven(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "z1", "dir")
+	z1, _ := disk.stat("ws", "z1")
+	preFP := z1.Fingerprint
+	disk.mv("ws", "z1", "z2") // genuinely moved — but no rows recorded members
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "z1", toPath: "z2",
+		version: 24, preFP: preFP, srcKind: "dir", at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "z2"); v != 0 {
+		t.Fatalf("zero-evidence dir adopted: version %d", v)
+	}
+}
+
+// f104 tombstone re-judgment: a resolved write intent whose bytes land
+// LATE still mints its version — evidence retention enables truthful
+// roll-forward instead of stranding.
+func TestPGTombstoneLateWriteRollForward(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "late.txt",
+		version: 70, expectSHA: sha("late"), at: time.Now().Add(-time.Hour),
+	})
+	// First pass: absent — intent tombstoned (resolved, evidence kept).
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("first reconcile settled %d", got)
+	}
+	_ = id
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("tombstone erased evidence: total=%d", n)
+	}
+	// The write lands after the drop. Tombstone re-judgment is rate-
+	// limited; reset the scan clock to stand in for the interval elapsing.
+	disk.put("ws", "late.txt", "late")
+	s.lastTombScan.Store(0)
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("tombstone re-judgment settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "late.txt"); v != 70 {
+		t.Fatalf("late-landed write not rolled forward: %d", v)
+	}
+}
+
+// f104 tombstone rename: a resolved rename whose fs effect lands late is
+// rolled forward, and rows minted post-drop whose recorded fp proves they
+// were physically carried by the move are rescued to the destination.
+func TestPGTombstoneLateRenameRescue(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "s1", "dir")
+	s1, _ := disk.stat("ws", "s1")
+	disk.put("ws", "s1/k.txt", "kid")
+	kid, _ := disk.stat("ws", "s1/k.txt")
+	disk.put("ws", "s1/post.txt", "post")
+	post, _ := disk.stat("ws", "s1/post.txt")
+	// k.txt predates the intent (v2 < 5); post.txt was minted AFTER the
+	// intent dropped (v9) — the fs move still carried it physically.
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES
+		 ('ws','s1/k.txt',2,$1), ('ws','s1/post.txt',9,$2)`,
+		kid.Fingerprint, post.Fingerprint)
+	if err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+	disk.mv("ws", "s1", "s2") // the delayed fs effect lands
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "s1", toPath: "s2",
+		version: 5, preFP: s1.Fingerprint, srcKind: "dir",
+		at: time.Now().Add(-time.Hour),
+	})
+	resolveIntent(t, s, id) // tombstoned — first pass judged it while absent
+
+	s.lastTombScan.Store(0) // stand in for tombstoneScanInterval elapsing
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("tombstone re-judgment settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "s2"); v != 5 {
+		t.Fatalf("destination version = %d, want 5", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "s2/k.txt"); v != 2 {
+		t.Fatalf("pre-intent member version = %d, want 2", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "s2/post.txt"); v != 9 {
+		t.Fatalf("post-drop member not rescued: %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "s1/post.txt"); v != 0 {
+		t.Fatalf("rescued row still at old path: %d", v)
 	}
 }

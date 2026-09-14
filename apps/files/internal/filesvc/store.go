@@ -70,12 +70,14 @@ type Store struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	scopeMu   sync.Map     // scope string -> *sync.Mutex
-	inflight  sync.Map     // intent id -> struct{} — fs goroutines executing in this process
-	statFn    StatFn       // set by the service once the fs root exists
-	hashFn    HashFn       // content probe for expected-outcome verification
-	fsCheck   func() error // when set, verdict that the fs root is trustworthy (canonical mount live)
-	reconcile chan struct{}
+	scopeMu      sync.Map                                 // scope string -> *sync.Mutex
+	inflight     sync.Map                                 // intent id -> struct{} — fs goroutines executing in this process
+	statFn       StatFn                                   // set by the service once the fs root exists
+	hashFn       HashFn                                   // content probe for expected-outcome verification
+	fsCheck      func() error                             // when set, verdict that the fs root is trustworthy (canonical mount live)
+	viewFn       func(context.Context) (ReconView, error) // pass-pinned fs view; supersedes statFn/hashFn/fsCheck when set
+	reconcile    chan struct{}
+	lastTombScan atomic.Int64 // unix nanos of the last tombstone re-judgment
 }
 
 // StatFn stats a scope-relative path — injected by the service so the
@@ -87,6 +89,18 @@ type StatFn func(scope, path string) (FileInfo, error)
 // external bytes are never laundered into a service version.
 type HashFn func(scope, path string) (string, error)
 
+// ReconView is one reconcile pass's pinned view of the filesystem. Every
+// judgment resolves beneath a descriptor opened at pass start, so a
+// mid-pass unmount reports an unreachable filesystem (honest
+// "unverifiable") rather than the bare directory it leaves behind
+// (F-RA-1). Acquiring the view is itself the mount gate — the service
+// runs the mount check before pinning.
+type ReconView interface {
+	Stat(scope, path string) (FileInfo, error)
+	Hash(scope, path string) (string, error)
+	Close() error
+}
+
 // writerLockKey is the session advisory-lock key for the single-writer
 // contract (per database). hashtext is stable across PG versions.
 const writerLockKey = int64(0x73756d6966696c65) // "sumifile"
@@ -96,6 +110,16 @@ const writerLockKey = int64(0x73756d6966696c65) // "sumifile"
 // but a mutation already accepted by a FUSE daemon can complete briefly
 // after process death; the grace covers that residual window.
 const deadGrace = 20 * time.Second
+
+// tombstoneScanInterval is the cadence at which resolved intents are
+// re-judged for late filesystem effects. Pending intents are judged every
+// pass; tombstones only at this interval. Without it, a large tombstone
+// set makes every pass re-stat every tombstoned path — holding the pinned
+// root descriptor almost continuously, which keeps the mount busy and
+// breaks ordinary unmount. The interval is the honest detection latency
+// for a late-landing effect; the retention horizon (tombstoneRetain) is
+// unchanged.
+const tombstoneScanInterval = 30 * time.Second
 
 func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
@@ -152,6 +176,15 @@ func (s *Store) SetReconcile(fn StatFn, hash HashFn, check func() error) {
 	s.statFn = fn
 	s.hashFn = hash
 	s.fsCheck = check
+}
+
+// SetReconcileView wires a pass-pinned filesystem view (F-RA-1): each
+// reconcile pass acquires it once and judges every intent beneath that
+// descriptor. Acquiring the view IS the mount gate — the service runs the
+// canonical-mount check inside it before pinning, so a failed acquisition
+// means "root not verifiable" and the whole pass is skipped.
+func (s *Store) SetReconcileView(fn func(context.Context) (ReconView, error)) {
+	s.viewFn = fn
 }
 
 // Deposed reports whether the writer lock was lost — the service maps it
@@ -325,21 +358,11 @@ func (s *Store) watchWriter() {
 			s.lockConn = conn
 			s.lockMu.Unlock()
 			// Re-verify after acquiring: a successor may have bound while
-			// we waited on the lock.
-			cctx, ccancel = context.WithTimeout(context.Background(), s.dbTimeout)
-			oerr = conn.QueryRow(cctx,
-				`SELECT owner FROM store_meta WHERE id`).Scan(&owner)
-			ccancel()
-			if oerr != nil {
-				s.lockMu.Lock()
-				s.lockConn = nil
-				s.lockMu.Unlock()
-				conn.Close(context.Background())
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			if owner != s.owner {
-				log.Printf("store: another instance (%s) owns this database — exiting", owner)
+			// we waited on the lock. bindRoot also covers a missing
+			// store_meta row (manual DB damage) by rebinding instead of
+			// spinning deposed forever (A F-RA minor).
+			if berr := s.bindRoot(context.Background()); berr != nil {
+				log.Printf("store: rebind after re-acquire failed: %v — exiting", berr)
 				os.Exit(1)
 			}
 			log.Printf("store: %s re-acquired the writer lock", s.owner)
@@ -362,6 +385,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated timestamptz NOT NULL DEFAULT now(),
 			PRIMARY KEY (scope, path)
 		);
+		ALTER TABLE file_version ADD COLUMN IF NOT EXISTS content_sha text NOT NULL DEFAULT '';
 		CREATE TABLE IF NOT EXISTS file_event (
 			seq       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 			scope     text NOT NULL,
@@ -391,11 +415,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			version    bigint NOT NULL,
 			pre_fp     text NOT NULL DEFAULT '',
 			expect_sha text NOT NULL DEFAULT '',
-			at         timestamptz NOT NULL DEFAULT now()
+			src_kind   text NOT NULL DEFAULT '',
+			at         timestamptz NOT NULL DEFAULT now(),
+			resolved_at timestamptz,
+			stalled_at  timestamptz,
+			last_error  text NOT NULL DEFAULT ''
 		);
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS root text NOT NULL DEFAULT '';
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '';
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS expect_sha text NOT NULL DEFAULT '';
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS src_kind text NOT NULL DEFAULT '';
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS stalled_at timestamptz;
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS last_error text NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS file_op_scope ON file_op(scope, path);
 		SELECT setval('file_version_seq',
 			GREATEST(COALESCE((SELECT MAX(version) FROM file_version), 0),
@@ -424,8 +456,10 @@ type IfVersion struct {
 	Version int64
 }
 
-// FPProbe returns the live fingerprint and existence of a path on disk.
-type FPProbe func() (fp string, exists bool, err error)
+// FPProbe returns the live FileInfo and existence of a path on disk —
+// fingerprint AND kind, so rename evidence (src_kind) comes from the same
+// observation as pre_fp.
+type FPProbe func() (info FileInfo, exists bool, err error)
 
 // intent is one committed mutation intent row.
 type intent struct {
@@ -437,7 +471,8 @@ type intent struct {
 	toPath    string // rename destination
 	version   int64  // pre-minted version this op will record
 	preFP     string // fingerprint of path (rename: of source) at declare time
-	expectSHA string // write: sha256 hex of intended bytes; mkdir: "dir"; "": unverified
+	expectSHA string // write: sha256 hex of intended bytes; rename of file: sha256 of source; mkdir: "dir"; "": unverified
+	srcKind   string // rename: kind of the source at declare ("" = unknown → unprovable)
 	at        time.Time
 }
 
@@ -453,32 +488,76 @@ func (s *Store) dbCtx(ctx context.Context) (context.Context, context.CancelFunc)
 }
 
 // runFs executes the filesystem mutation on a goroutine that OWNS the
-// intent's settlement: on return it applies (success) or drops the intent
-// (a definite fs error means the syscall did not commit). The caller waits
-// only up to opTimeout; a slow-but-landing fs op still settles itself
-// honestly — it is never abandoned to a grace-expiry drop (f82).
+// intent's settlement. The intent is already marked inflight at declare
+// commit (F-RA-4). On return it applies (success), drops the intent (a
+// definitive pre-commit rejection), or leaves it for the reconciler when
+// the outcome is unknown: fs ops are composite, and an error after the
+// commit point — or a transport-class error where the reply may have
+// been lost — must not destroy the only record that can settle the
+// possibly-committed work (F-RA-5/f120). The caller waits only up to
+// opTimeout; a slow-but-landing fs op still settles itself honestly (f82).
 type fsResult struct {
 	info      FileInfo
 	err       error
 	settleErr error // non-nil: fs committed but the journal did not yet
 }
 
-func (s *Store) runFs(it intent, fn func() (FileInfo, error)) <-chan fsResult {
+// fsErrDefinitive reports whether err is a pre-commit rejection — the
+// errno semantics guarantee the mutation did not happen (missing source,
+// kind mismatch, permission, conflict, policy). Transport/outcome-class
+// errors (ErrMountUnavailable, ErrUnavailable, anything unmapped) are NOT
+// definitive: on FUSE a lost reply can follow an applied request.
+func fsErrDefinitive(err error) bool {
+	switch {
+	case errors.Is(err, ErrNotFound), errors.Is(err, ErrNotDir),
+		errors.Is(err, ErrIsDir), errors.Is(err, ErrWrongKind),
+		errors.Is(err, ErrAccess), errors.Is(err, ErrReserved),
+		errors.Is(err, ErrEscape), errors.Is(err, ErrConflict),
+		errors.Is(err, ErrNotEmpty), errors.Is(err, ErrMountPolicy):
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) runFs(it intent, fn func() (FileInfo, bool, error)) <-chan fsResult {
 	ch := make(chan fsResult, 1)
-	s.inflight.Store(it.id, struct{}{})
 	go func() {
 		defer s.inflight.Delete(it.id)
-		info, ferr := fn()
+		info, committed, ferr := fn()
 		var settleErr error
-		if ferr != nil {
+		switch {
+		case ferr == nil:
+			// success path below
+		case it.op == "remove" && errors.Is(ferr, ErrNotFound):
+			// Desired absence already holds — the rows are dead state.
+			// Clean them WITHOUT an event: we observed absence, we did
+			// not cause it (observed-absence vs performed-removal).
+			s.dropIntentGhosts(context.Background(), it, true)
+		case !committed && fsErrDefinitive(ferr):
+			// Rejected before commit — provably no fs effect.
 			s.dropIntent(context.Background(), it)
-		} else if err := s.apply(context.Background(), it, info); err != nil && !errors.Is(err, errIntentSettled) {
-			// fs committed but the apply did not (DB down, deposed, or a
-			// restart). The intent survives for the reconciler.
-			log.Printf("store: apply of intent %d (%s %s/%s) failed: %v — left for reconcile",
-				it.id, it.op, it.scope, it.path, err)
+		default:
+			// committed (post-commit observation failure) or ambiguous
+			// (lost-reply class): the outcome is unknown — keep the
+			// intent for the reconciler's disk verdict.
+			log.Printf("store: intent %d (%s %s/%s) fs outcome unknown (%v) — left for reconcile",
+				it.id, it.op, it.scope, it.path, ferr)
 			s.kickReconcile()
-			settleErr = err
+		}
+		if ferr == nil {
+			sha := it.expectSHA
+			if it.op == "mkdir" {
+				sha = "" // "dir" is a kind marker, not a content hash
+			}
+			if err := s.apply(context.Background(), it, info, sha, nil); err != nil && !errors.Is(err, errIntentSettled) {
+				// fs committed but the apply did not (DB down, deposed,
+				// or a restart). The intent survives for the reconciler.
+				log.Printf("store: apply of intent %d (%s %s/%s) failed: %v — left for reconcile",
+					it.id, it.op, it.scope, it.path, err)
+				s.kickReconcile()
+				settleErr = err
+			}
 		}
 		ch <- fsResult{info, ferr, settleErr}
 	}()
@@ -528,11 +607,11 @@ func checkVersion(ctx context.Context, tx pgx.Tx, scope, path string, iv IfVersi
 			if ver != iv.Version {
 				return ErrConflict
 			}
-			liveFP, exists, perr := probe()
+			live, exists, perr := probe()
 			if perr != nil {
 				return perr
 			}
-			if !exists || (recFP != "" && liveFP != recFP) {
+			if !exists || (recFP != "" && live.Fingerprint != recFP) {
 				return ErrExternalChange
 			}
 		}
@@ -571,11 +650,11 @@ func checkVersion(ctx context.Context, tx pgx.Tx, scope, path string, iv IfVersi
 		if ver != iv.Version {
 			return ErrConflict
 		}
-		liveFP, exists, perr := probe()
+		live, exists, perr := probe()
 		if perr != nil {
 			return perr
 		}
-		if !exists || (recFP != "" && liveFP != recFP) {
+		if !exists || (recFP != "" && live.Fingerprint != recFP) {
 			return ErrExternalChange
 		}
 		return nil
@@ -609,43 +688,72 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 	if op == "rename" {
 		casPath = toPath
 	}
-	if err := checkVersion(ctx, tx, scope, casPath, iv, casProbe, op == "remove"); err != nil {
-		return intent{}, err
-	}
-	// Refuse work whose paths overlap a still-pending intent (f104): a
-	// mutation that outlived its request may land on the filesystem at
-	// any time, and a new op inside its source/destination subtree could
-	// mint rows that settlement then strands — a rename moving the file
-	// while its row stays at the old path. Because declares serialize on
-	// the scope mutex, a pending row here always means an earlier op's
-	// settle is outstanding (timed-out fs call, failed apply, or a dead
-	// owner's intent awaiting reconcile). The pending intent owns the
-	// affected area until it settles; the caller retries. Path pairs are
-	// subtree-overlapping in either direction; an empty leg can never
-	// match a real relative path (''||'/' is '/', and '' = only '').
-	var pendingID int64
+	// Refuse work whose paths overlap a still-pending intent (f104) — or a
+	// recently-resolved tombstone still inside its hot window (a dropped
+	// rename can still have a filesystem effect in flight; admitting new
+	// ops into its area could mint rows that a late landing then strands).
+	// Every leg is guarded on a non-empty literal — '' must never act as a
+	// leg (B-1/f118: to_path='' = to_path='' used to block ALL non-rename
+	// ops). The pending check runs BEFORE the CAS probe so a jammed path
+	// reports pending_settlement, not whatever error the probe happens to
+	// hit. The blocking intent's recorded error (if it is stalled on an
+	// unverifiable path) is surfaced to the caller.
+	var blockOp, blockPath, blockErr string
 	err = tx.QueryRow(ctx,
-		`SELECT id FROM file_op WHERE scope=$1 AND (
-		     path=$2 OR starts_with(path, $2||'/') OR starts_with($2, path||'/')
-		  OR to_path=$2 OR starts_with(to_path, $2||'/') OR starts_with($2, to_path||'/')
-		  OR path=$3 OR starts_with(path, $3||'/') OR starts_with($3, path||'/')
-		  OR to_path=$3 OR starts_with(to_path, $3||'/') OR starts_with($3, to_path||'/'))
+		`SELECT op, path, coalesce(last_error,'') FROM file_op WHERE scope=$1 AND
+		   (resolved_at IS NULL OR resolved_at > now() - $4::interval) AND (
+		     ($2 <> '' AND (
+		        path=$2 OR starts_with(path, $2||'/') OR starts_with($2, path||'/')
+		     OR (to_path <> '' AND (to_path=$2 OR starts_with(to_path, $2||'/') OR starts_with($2, to_path||'/')))))
+		  OR ($3 <> '' AND (
+		        path=$3 OR starts_with(path, $3||'/') OR starts_with($3, path||'/')
+		     OR (to_path <> '' AND (to_path=$3 OR starts_with(to_path, $3||'/') OR starts_with($3, to_path||'/'))))))
 		 LIMIT 1`,
-		scope, path, toPath).Scan(&pendingID)
+		scope, path, toPath, deadGrace.String()).Scan(&blockOp, &blockPath, &blockErr)
 	if err == nil {
+		if blockErr != "" {
+			return intent{}, fmt.Errorf("%w: %s %s unverifiable: %s", ErrUnsettled, blockOp, blockPath, blockErr)
+		}
 		return intent{}, ErrUnsettled
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return intent{}, err
 	}
+	if err := checkVersion(ctx, tx, scope, casPath, iv, casProbe, op == "remove"); err != nil {
+		return intent{}, err
+	}
 	it := intent{owner: s.owner, scope: scope, op: op, path: path, toPath: toPath, expectSHA: expectSHA}
 	if preProbe != nil {
-		fp, exists, perr := preProbe()
+		pre, exists, perr := preProbe()
 		if perr != nil {
 			return intent{}, perr
 		}
 		if exists {
-			it.preFP = fp
+			it.preFP = pre.Fingerprint
+			it.srcKind = pre.Kind
+		}
+	}
+	// Rename of a file: capture content evidence so settlement can tell
+	// "the moved source" from "foreign bytes with recycled metadata"
+	// (f106/B-4). Prefer the version row's recorded content hash — valid
+	// only while its fp still equals the live one — over re-reading the
+	// file. A file we cannot hash cannot carry proof, so the declare is
+	// refused rather than silently downgraded to metadata-only.
+	if op == "rename" && it.srcKind == "file" && it.expectSHA == "" {
+		var recFP, recSHA string
+		rerr := tx.QueryRow(ctx,
+			`SELECT fp, content_sha FROM file_version WHERE scope=$1 AND path=$2`,
+			scope, path).Scan(&recFP, &recSHA)
+		if rerr == nil && recFP == it.preFP && recSHA != "" {
+			it.expectSHA = recSHA
+		} else if rerr != nil && !errors.Is(rerr, pgx.ErrNoRows) {
+			return intent{}, rerr
+		} else if s.hashFn != nil {
+			sha, herr := s.hashFn(scope, path)
+			if herr != nil {
+				return intent{}, herr
+			}
+			it.expectSHA = sha
 		}
 	}
 	if err := tx.QueryRow(ctx,
@@ -653,13 +761,20 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 		return intent{}, err
 	}
 	err = tx.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-		s.rootID, s.owner, scope, op, path, toPath, it.version, it.preFP, it.expectSHA).Scan(&it.id)
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		s.rootID, s.owner, scope, op, path, toPath, it.version, it.preFP, it.expectSHA, it.srcKind).Scan(&it.id)
 	if err != nil {
 		return intent{}, err
 	}
+	// Mark inflight BEFORE commit: the intent row is only visible to the
+	// reconciler after commit, so the mark always lands first — no pass
+	// can ever observe a committed own-intent that is not registered as
+	// in-flight and misjudge it as abandoned (F-RA-4/f122). If commit
+	// fails the intent never existed, so the mark is removed.
+	s.inflight.Store(it.id, struct{}{})
 	if err := tx.Commit(ctx); err != nil {
+		s.inflight.Delete(it.id)
 		return intent{}, err
 	}
 	return it, nil
@@ -685,7 +800,16 @@ var errIntentSettled = errors.New("intent already settled")
 // already produced (f79/B-F1). The store_meta owner check fences a zombie
 // process whose lock session died: its apply aborts and the intent stays
 // for the live owner to settle.
-func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
+// contentSHA is the content hash of the minted state when known (writes:
+// the bytes written; reconciled writes: the observed hash; proven file
+// renames: the verified source hash). It feeds the declare-time evidence
+// cache so later renames need not re-read the file.
+// rescue lists additional subtree paths to move on a rename regardless of
+// the version guard — used only by tombstone re-judgment, where each such
+// row's content was proven present at the destination by fingerprint
+// before apply runs (a late-landing rename physically carried rows minted
+// after the intent's drop; their fp match is the evidence, f104).
+func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, rescue []string) error {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -739,8 +863,9 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE file_version SET path = $3 || substr(path, length($2)+1)
-			 WHERE scope=$1 AND starts_with(path, $2 || '/') AND version < $4`,
-			it.scope, it.path, it.toPath, it.version); err != nil {
+			 WHERE scope=$1 AND starts_with(path, $2 || '/')
+			   AND (version < $4 OR path = ANY($5))`,
+			it.scope, it.path, it.toPath, it.version, rescue); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,
@@ -749,12 +874,13 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
 			return err
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO file_version (scope, path, version, fp, updated)
-			 VALUES ($1,$2,$3,$4,now())
+			`INSERT INTO file_version (scope, path, version, fp, updated, content_sha)
+			 VALUES ($1,$2,$3,$4,now(),$5)
 			 ON CONFLICT (scope,path) DO UPDATE
-			 SET version=EXCLUDED.version, fp=EXCLUDED.fp, updated=now()
+			 SET version=EXCLUDED.version, fp=EXCLUDED.fp, updated=now(),
+			     content_sha=EXCLUDED.content_sha
 			 WHERE file_version.version < EXCLUDED.version`,
-			it.scope, it.toPath, it.version, info.Fingerprint); err != nil {
+			it.scope, it.toPath, it.version, info.Fingerprint, contentSHA); err != nil {
 			return err
 		}
 	default: // write, mkdir
@@ -763,12 +889,13 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
 		// pending while a subsequent op committed), the existing row
 		// reflects newer disk state and wins.
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO file_version (scope, path, version, fp, updated)
-			 VALUES ($1,$2,$3,$4,now())
+			`INSERT INTO file_version (scope, path, version, fp, updated, content_sha)
+			 VALUES ($1,$2,$3,$4,now(),$5)
 			 ON CONFLICT (scope,path) DO UPDATE
-			 SET version=EXCLUDED.version, fp=EXCLUDED.fp, updated=now()
+			 SET version=EXCLUDED.version, fp=EXCLUDED.fp, updated=now(),
+			     content_sha=EXCLUDED.content_sha
 			 WHERE file_version.version < EXCLUDED.version`,
-			it.scope, it.path, it.version, info.Fingerprint); err != nil {
+			it.scope, it.path, it.version, info.Fingerprint, contentSHA); err != nil {
 			return err
 		}
 	}
@@ -863,6 +990,88 @@ func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) b
 	return tx.Commit(ctx) == nil
 }
 
+// tombstoneRetain bounds how long a reconciler-resolved intent keeps its
+// evidence (pre_fp/expect_sha/src_kind) for late-landing re-judgment
+// (f104/F-RA-6). It is an evidence horizon, not a quiescence proof: an fs
+// effect landing after it can still strand rows minted post-resolution —
+// a documented residual, never silently claimed.
+var tombstoneRetain = 24 * time.Hour
+
+// tombstoneIntent marks an intent resolved WITHOUT deleting its evidence:
+// the reconciler keeps re-judging tombstones so a filesystem effect that
+// lands after the drop is still settled truthfully (roll-forward), and the
+// hot window keeps new ops out of the affected subtree for one grace
+// period. Owner-fenced like dropIntent.
+func (s *Store) tombstoneIntent(ctx context.Context, it intent) bool {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return false
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error=''
+		 WHERE id=$1 AND resolved_at IS NULL`, it.id); err != nil {
+		return false
+	}
+	return tx.Commit(ctx) == nil
+}
+
+// tombstoneIntentGhosts: tombstone + dead-row cleanup in one tx — the
+// intent's evidence is retained while rows the disk proves absent are
+// deleted (no event: observed absence is not a performed operation).
+func (s *Store) tombstoneIntentGhosts(ctx context.Context, it intent, subtree bool) bool {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return false
+	}
+	var derr error
+	if subtree {
+		_, derr = tx.Exec(ctx,
+			`DELETE FROM file_version WHERE scope=$1 AND (path=$2 OR starts_with(path, $2 || '/'))
+			 AND version < $3`,
+			it.scope, it.path, it.version)
+	} else {
+		_, derr = tx.Exec(ctx,
+			`DELETE FROM file_version WHERE scope=$1 AND path=$2 AND version < $3`,
+			it.scope, it.path, it.version)
+	}
+	if derr != nil {
+		return false
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error=''
+		 WHERE id=$1 AND resolved_at IS NULL`, it.id); err != nil {
+		return false
+	}
+	return tx.Commit(ctx) == nil
+}
+
+// markStalled records that an intent cannot be judged right now: the
+// filesystem answered with a non-definitive error (unreachable,
+// permission-denied). The intent stays pending — the row is the durable
+// record of "outcome unknown" and is never dropped on a timer; the cause
+// is surfaced to callers the exclusion refuses (f119/B-2).
+func (s *Store) markStalled(ctx context.Context, it intent, cause error) {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET stalled_at=COALESCE(stalled_at, now()), last_error=$2
+		 WHERE id=$1 AND resolved_at IS NULL`, it.id, cause.Error()); err != nil {
+		log.Printf("reconcile: mark stalled intent %d: %v", it.id, err)
+	}
+}
+
 func (s *Store) kickReconcile() {
 	select {
 	case s.reconcile <- struct{}{}:
@@ -874,7 +1083,7 @@ func (s *Store) kickReconcile() {
 // settling goroutine apply the version row + event. Serialized per scope.
 // expectSHA is the sha256 hex of the intended content (or "dir" for
 // mkdir); the reconciler uses it to detect external bytes.
-func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -898,7 +1107,7 @@ func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVers
 
 // rename — renameat2(RENAME_NOREPLACE) for create-only modes), then moves
 // the source subtree's rows to the destination in the apply tx.
-func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -919,7 +1128,7 @@ func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion
 
 // Remove drops the version rows for the removed path and any descendants
 // after the fs removal, under the same intent journal.
-func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error {
+func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -928,7 +1137,7 @@ func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, pr
 	if err != nil {
 		return err
 	}
-	r := s.waitFs(s.runFs(it, func() (FileInfo, error) { return FileInfo{}, fn() }))
+	r := s.waitFs(s.runFs(it, func() (FileInfo, bool, error) { _, ferr := fn(); return FileInfo{}, ferr == nil, ferr }))
 	if r.err != nil {
 		return r.err
 	}
@@ -1021,53 +1230,138 @@ func (s *Store) ReconcileLoop(ctx context.Context) {
 	}
 }
 
-// Reconcile processes all pending intents once. Returns how many it settled.
+// funcView adapts injected stat/hash probes to a ReconView — used by
+// tests; production wires a descriptor-pinned view via SetReconcileView.
+type funcView struct {
+	stat StatFn
+	hash HashFn
+}
+
+func (v funcView) Stat(scope, path string) (FileInfo, error) { return v.stat(scope, path) }
+func (v funcView) Hash(scope, path string) (string, error)   { return v.hash(scope, path) }
+func (v funcView) Close() error                              { return nil }
+
+// Reconcile processes all pending intents once, then re-judges retained
+// tombstones. Returns how many it settled. The pass judges only beneath a
+// view acquired up front: for the production store this is a pinned root
+// descriptor taken after the mount check, so a mid-pass unmount answers
+// "unreachable" on the dead mount instead of "absent" on the bare
+// directory it leaves behind (f102/F-RA-1). Intents that cannot be
+// judged stay pending (or tombstoned) with their evidence intact.
 func (s *Store) Reconcile(ctx context.Context) int {
-	if s.statFn == nil || s.deposed.Load() {
+	if s.deposed.Load() {
 		return 0
 	}
-	// An "absent" answer is only trustworthy when the filesystem root is
-	// verified present: a clean unmount leaves a bare directory where
-	// every stat returns ErrNotFound, which would otherwise erase pending
-	// intents and the acknowledged rows they cover (f102/B-F-A). While
-	// the check fails, no intent is judged — records wait for a pass
-	// where absence can actually be proven.
-	if s.fsCheck != nil {
-		if err := s.fsCheck(); err != nil {
+	var view ReconView
+	if s.viewFn != nil {
+		v, err := s.viewFn(ctx)
+		if err != nil {
 			log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", err)
 			return 0
 		}
-	}
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	rows, err := s.pool.Query(dctx,
-		`SELECT id, owner, scope, op, path, to_path, version, pre_fp, expect_sha, at
-		 FROM file_op WHERE root = $1 ORDER BY id`,
-		s.rootID)
-	if err != nil {
-		return 0
-	}
-	var its []intent
-	for rows.Next() {
-		var it intent
-		if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
-			&it.version, &it.preFP, &it.expectSHA, &it.at); err != nil {
-			rows.Close()
+		view = v
+	} else {
+		if s.statFn == nil {
 			return 0
 		}
-		its = append(its, it)
+		if s.fsCheck != nil {
+			if err := s.fsCheck(); err != nil {
+				log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", err)
+				return 0
+			}
+		}
+		view = funcView{s.statFn, s.hashFn}
 	}
-	rows.Close()
+	defer view.Close()
+
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind, at`
+	load := func(where string, args ...any) []intent {
+		rows, err := s.pool.Query(dctx,
+			`SELECT `+cols+` FROM file_op WHERE root=$1 AND `+where+` ORDER BY id`, args...)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		var out []intent
+		for rows.Next() {
+			var it intent
+			if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
+				&it.version, &it.preFP, &it.expectSHA, &it.srcKind, &it.at); err != nil {
+				return out
+			}
+			out = append(out, it)
+		}
+		return out
+	}
+	pending := load(`resolved_at IS NULL`, s.rootID)
+	// Tombstone re-judgment is rate-limited: scanning every resolved
+	// intent every pass would pin the root descriptor (and the mount)
+	// nearly 100% of the time. Late effects are detected within
+	// tombstoneScanInterval rather than instantly.
+	scanTombs := time.Now().UnixNano()-s.lastTombScan.Load() >= tombstoneScanInterval.Nanoseconds()
+	var tombs []intent
+	if scanTombs {
+		tombs = load(`resolved_at IS NOT NULL AND resolved_at > now() - $2::interval`,
+			s.rootID, tombstoneRetain.String())
+	}
+
 	settled := 0
-	for _, it := range its {
+	for _, it := range pending {
 		if s.deposed.Load() {
 			break // fenced mid-pass: the writer lock was lost (f103)
 		}
-		if s.reconcileOne(ctx, it) {
+		if s.reconcileOne(ctx, it, view, false) {
 			settled++
 		}
 	}
+	if scanTombs {
+		s.lastTombScan.Store(time.Now().UnixNano())
+		for _, it := range tombs {
+			if s.deposed.Load() {
+				break
+			}
+			// Re-judgment: a tombstoned intent can only be APPLIED (its fs
+			// effect provably landed late) — never re-dropped; evidence stays
+			// until the retention horizon.
+			if s.reconcileOne(ctx, it, view, true) {
+				settled++
+			}
+		}
+	}
+	s.sweepTombstones(ctx)
 	return settled
+}
+
+// sweepTombstones deletes resolved intents past the evidence horizon —
+// the only hard-delete of reconciler-resolved intents. Owner-fenced.
+func (s *Store) sweepTombstones(ctx context.Context) {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM file_op WHERE resolved_at IS NOT NULL AND resolved_at < now() - $1::interval`,
+		tombstoneRetain.String()); err != nil {
+		return
+	}
+	tx.Commit(ctx)
+}
+
+// absentVerdict reports whether a stat error is a definitive current-path
+// absence: ENOENT, or ENOTDIR — a path addressed through a non-directory
+// provably does not exist AS ADDRESSED (f119/B-2). This is a fact about
+// the present, not proof the operation never ran — it settles effect, not
+// history. Every other error means "could not observe" — unverifiable.
+func absentVerdict(err error) bool {
+	return errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir)
 }
 
 // fpParts splits a live fingerprint "ino:size:mtime_ns:ctime_ns". The
@@ -1085,19 +1379,31 @@ func fpParts(fp string) (ino, size, mtime string, ok bool) {
 	return a[0], a[1], a[2], true
 }
 
-func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
-	if it.owner == s.owner {
-		if _, ok := s.inflight.Load(it.id); ok {
-			return false // its fs goroutine still owns settlement
-		}
-		// Own intent whose settle failed — fn already returned, the disk
-		// verdict is final.
-	} else {
-		// Dead owner's intent. Holding the writer lock proves that owner
-		// cannot start new work; deadGrace covers mutations a FUSE daemon
-		// may still be completing on its behalf.
-		if time.Since(it.at) < deadGrace {
-			return false
+// reconcileOne settles one intent by disk verdict beneath the pass view.
+// tombstoned=true re-judges a resolved intent: the ONLY possible outcome
+// is a late apply (the fs effect provably landed after the drop) —
+// tombstones are never re-dropped, stalled, or ghost-cleaned again.
+//
+// Error classification (f119/B-2): ErrNotFound and ErrNotDir are
+// definitive CURRENT-path absence (a path under a non-directory cannot
+// exist as addressed); every other error means the filesystem could not
+// be observed — the intent stays pending, marked stalled with the cause,
+// and is never resolved on a timer.
+func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tombstoned bool) bool {
+	if !tombstoned {
+		if it.owner == s.owner {
+			if _, ok := s.inflight.Load(it.id); ok {
+				return false // its fs goroutine still owns settlement
+			}
+			// Own intent whose settle failed — fn already returned, the
+			// disk verdict is final.
+		} else {
+			// Dead owner's intent. Holding the writer lock proves that
+			// owner cannot start new work; deadGrace covers mutations a
+			// FUSE daemon may still be completing on its behalf.
+			if time.Since(it.at) < deadGrace {
+				return false
+			}
 		}
 	}
 	mu := s.lockScope(it.scope)
@@ -1106,130 +1412,277 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 
 	switch it.op {
 	case "rename":
-		toInfo, terr := s.statFn(it.scope, it.toPath)
-		frInfo, ferr := s.statFn(it.scope, it.path)
-		// The destination counts as the moved source only when identity
-		// survives the move (f106/A-F1). A destination that merely EXISTS
-		// could be an unrelated external create — applying then would
-		// mint a clean version + rename event for foreign bytes and move
-		// the source's rows onto paths that never held them. Proof:
-		//   - dirs: inode continuity (a cross-dir rename legitimately
-		//     changes the dir's own mtime via its '..' entry; child rows
-		//     keep their own fingerprints either way).
-		//   - files: inode + size + mtime. Inode alone is not enough —
-		//     deleting the source and recreating the destination can
-		//     recycle the inode number, so content evidence must also
-		//     match the declare-time fingerprint (ctime legitimately
-		//     changes on rename and is not compared).
-		// Unproven destinations are never claimed: the intent is dropped
-		// and all version rows are kept, so nothing is laundered and
-		// acknowledged history is preserved.
-		srcIno, srcSize, srcMt, haveSrc := fpParts(it.preFP)
-		toIno, toSize, toMt, haveTo := fpParts(toInfo.Fingerprint)
-		proven := haveSrc && haveTo && srcIno == toIno
-		if proven && toInfo.Kind == "file" {
-			proven = srcSize == toSize && srcMt == toMt
+		toInfo, terr := view.Stat(it.scope, it.toPath)
+		frInfo, ferr := view.Stat(it.scope, it.path)
+		if ferr != nil && !absentVerdict(ferr) {
+			if !tombstoned {
+				s.markStalled(ctx, it, ferr)
+			}
+			return false
+		}
+		if terr != nil && !absentVerdict(terr) {
+			if !tombstoned {
+				s.markStalled(ctx, it, terr)
+			}
+			return false
+		}
+		proven := false
+		if terr == nil {
+			var perr error
+			proven, perr = s.renameProven(ctx, it, toInfo, view)
+			if perr != nil {
+				if !tombstoned {
+					s.markStalled(ctx, it, perr)
+				}
+				return false
+			}
 		}
 		switch {
 		case ferr == nil && frInfo.Fingerprint == it.preFP:
-			// Source byte-identical to declare (same inode+times) — the
-			// rename provably never ran, whatever sits at the
-			// destination. Drop only the intent; rows stay.
-			return s.dropIntent(ctx, it)
+			// Source byte-identical to declare — the rename provably
+			// never ran, whatever sits at the destination.
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntent(ctx, it)
 		case ferr == nil:
-			// Source exists but changed — recreated or edited. The
-			// rename can only have run if the destination is the moved
-			// original; apply moves subtree rows (version-guarded so the
-			// recreation's newer rows keep their paths). Anything else —
-			// foreign or absent destination — means no provable rename:
-			// drop the intent, keep every row.
+			// Source exists but changed — the rename can only have run
+			// if the destination is the moved original.
 			if terr == nil && proven {
-				if err := s.apply(ctx, it, toInfo); err != nil {
+				return s.applyRename(ctx, it, toInfo, view, tombstoned)
+			}
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntent(ctx, it)
+		default: // source absent
+			if terr == nil && proven {
+				return s.applyRename(ctx, it, toInfo, view, tombstoned)
+			}
+			if absentVerdict(terr) {
+				// Both legs absent — the subtree is gone either way.
+				if tombstoned {
 					return false
 				}
-				return true
-			}
-			return s.dropIntent(ctx, it)
-		case errors.Is(ferr, ErrNotFound):
-			// Source gone: either the rename ran (destination present)
-			// or the source was removed without it.
-			if terr == nil && proven {
-				if err := s.apply(ctx, it, toInfo); err != nil {
-					return false
-				}
-				return true
-			}
-			if errors.Is(terr, ErrNotFound) {
-				// Both legs absent — the subtree is gone either way;
-				// its pre-intent rows are dead state.
-				return s.dropIntentGhosts(ctx, it, true)
+				return s.tombstoneIntentGhosts(ctx, it, true)
 			}
 			if terr == nil {
-				// Destination exists but is not the moved source:
-				// uncertain outcome — drop the intent, keep all rows.
-				log.Printf("reconcile: rename %s/%s -> %s destination not the moved source; dropping intent, keeping rows",
+				log.Printf("reconcile: rename %s/%s -> %s destination not the moved source; resolving intent, keeping rows",
 					it.scope, it.path, it.toPath)
 			}
-			return s.dropIntent(ctx, it)
-		default:
-			return false // fs unreachable — retry next pass
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntent(ctx, it)
 		}
 	default: // write, mkdir, remove
-		info, err := s.statFn(it.scope, it.path)
-		if err != nil {
-			log.Printf("reconcile: stat %s %s/%s -> %v", it.op, it.scope, it.path, err)
-		}
-		if errors.Is(err, ErrNotFound) {
-			if it.op == "remove" {
-				// Path absent: the removal landed.
-				if err := s.apply(ctx, it, FileInfo{}); err != nil {
-					log.Printf("reconcile: apply remove %s/%s: %v", it.scope, it.path, err)
-					return false
-				}
-				return true
+		info, serr := view.Stat(it.scope, it.path)
+		switch {
+		case absentVerdict(serr):
+			if tombstoned {
+				return false // still absent; tombstone stays for the horizon
 			}
-			// Absent + settled owner: the write/mkdir never landed
-			// (its fs goroutine is gone or already failed). Any row
-			// for the path is a ghost — clean it too. Absence is only
-			// trusted because the pass was mount-gated (f102).
-			return s.dropIntentGhosts(ctx, it, false)
-		}
-		if err != nil {
-			return false // fs unreachable — retry next pass
+			if it.op == "remove" {
+				// Desired absence holds — clean dead rows, journal no
+				// event: observed absence is not a performed removal.
+				return s.tombstoneIntentGhosts(ctx, it, true)
+			}
+			// Absent + settled owner: the write/mkdir never landed. Any
+			// row for the path is a ghost — clean it; keep the intent's
+			// evidence for late-landing re-judgment.
+			return s.tombstoneIntentGhosts(ctx, it, false)
+		case serr != nil:
+			// Unverifiable — could not observe. Never resolved by timer.
+			if !tombstoned {
+				s.markStalled(ctx, it, serr)
+			}
+			return false
 		}
 		if it.op == "remove" {
-			// Path still exists — removal never committed.
-			return s.dropIntent(ctx, it)
+			// Path still exists — the removal never committed.
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntent(ctx, it)
 		}
 		if it.preFP != "" && info.Fingerprint == it.preFP {
-			// Byte-identical fingerprint since declare — our mutation
+			// Byte-identical fingerprint since declare — the mutation
 			// never ran (a landed write always mints a new inode/fp).
-			return s.dropIntent(ctx, it)
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntent(ctx, it)
 		}
+		contentSHA := ""
 		if it.op == "mkdir" {
 			if info.Kind != "dir" {
-				// A non-dir at the path means the mkdir never ran —
-				// whatever is there is not ours.
-				return s.dropIntent(ctx, it)
+				// A non-dir at the path means the mkdir never ran.
+				if tombstoned {
+					return false
+				}
+				return s.tombstoneIntent(ctx, it)
 			}
-		} else if it.expectSHA != "" && s.hashFn != nil {
+		} else if it.expectSHA != "" {
 			// Write: verify the landed bytes are the intended ones.
-			sha, herr := s.hashFn(it.scope, it.path)
-			if herr != nil || sha != it.expectSHA {
+			sha, herr := view.Hash(it.scope, it.path)
+			if herr != nil {
+				if !tombstoned {
+					s.markStalled(ctx, it, herr)
+				}
+				return false
+			}
+			contentSHA = sha
+			if sha != it.expectSHA {
 				// The content at the path is NOT what this op wrote —
 				// either our write landed and was then edited, or the
 				// write never ran and something else created the file.
 				// Record the version with a diverged fingerprint so
-				// stat/CAS report external_change; the journal event
-				// still records that this version was minted here.
+				// stat/CAS report external_change (f83).
 				log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)
 				info.Fingerprint = divergedFP(it.expectSHA)
 			}
 		}
-		if err := s.apply(ctx, it, info); err != nil {
+		if err := s.apply(ctx, it, info, contentSHA, nil); err != nil {
 			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 			return false
 		}
 		return true
 	}
+}
+
+// renameProven reports whether the destination is provably the moved
+// declare-time source — identity evidence, not mere existence (f106).
+//   - kind: destination kind must equal the declared source kind.
+//   - inode continuity: pre_fp ino == dest ino on both kinds (necessary,
+//     never sufficient alone — ext4 recycles inodes on delete+recreate).
+//   - file: size+mtime match AND content hash == the intent's recorded
+//     expect_sha. Metadata-only identity is forgeable (same-size content
+//     with preserved mtime on a recycled inode), so files require bytes.
+//   - dir: member corroboration — among the move-eligible version rows
+//     under the source (version < intent version), at least one sampled
+//     member must appear at the corresponding destination path with its
+//     recorded fingerprint exactly (fp includes ctime, which copy/restore
+//     cannot preserve — a matching member IS the recorded inode), and no
+//     sampled member may contradict (present with a different fp). A dir
+//     with no move-eligible rows carries no corroboratable evidence and
+//     stays unproven. Unsampled members move on the dir-level evidence;
+//     their per-member fp still exposes any foreign content at stat time.
+//
+// A non-nil error means the destination could not be judged this pass —
+// retry, not verdict.
+func (s *Store) renameProven(ctx context.Context, it intent, toInfo FileInfo, view ReconView) (bool, error) {
+	if it.srcKind == "" || it.srcKind != toInfo.Kind {
+		return false, nil
+	}
+	srcIno, srcSize, srcMt, haveSrc := fpParts(it.preFP)
+	toIno, toSize, toMt, haveTo := fpParts(toInfo.Fingerprint)
+	if !haveSrc || !haveTo || srcIno != toIno {
+		return false, nil
+	}
+	switch it.srcKind {
+	case "file":
+		if srcSize != toSize || srcMt != toMt || it.expectSHA == "" {
+			return false, nil
+		}
+		sha, err := view.Hash(it.scope, it.toPath)
+		if err != nil {
+			return false, err
+		}
+		return sha == it.expectSHA, nil
+	case "dir":
+		dctx, cancel := s.dbCtx(ctx)
+		defer cancel()
+		rows, err := s.pool.Query(dctx,
+			`SELECT path, fp FROM file_version
+			 WHERE scope=$1 AND starts_with(path, $2||'/') AND version < $3
+			 ORDER BY path LIMIT 64`,
+			it.scope, it.path, it.version)
+		if err != nil {
+			return false, err
+		}
+		type member struct{ p, fp string }
+		var members []member
+		for rows.Next() {
+			var m member
+			if rows.Scan(&m.p, &m.fp) == nil {
+				members = append(members, m)
+			}
+		}
+		rows.Close()
+		if len(members) == 0 {
+			return false, nil // nothing recorded to corroborate with
+		}
+		matched := 0
+		for _, m := range members {
+			st, serr := view.Stat(it.scope, it.toPath+m.p[len(it.path):])
+			switch {
+			case serr == nil && st.Fingerprint == m.fp:
+				matched++
+			case absentVerdict(serr):
+				// member absent — consistent with a post-move delete
+			case serr == nil:
+				// present with a different fp — positive evidence this
+				// is NOT simply the moved subtree
+				return false, nil
+			default:
+				return false, serr // could not observe this member
+			}
+		}
+		return matched >= 1, nil
+	default:
+		return false, nil
+	}
+}
+
+// applyRename applies a proven rename intent. For a tombstone being
+// re-judged, it first collects rows minted after the intent's declare
+// whose recorded fingerprint appears at the corresponding destination
+// path — evidence the late-landing rename physically carried them —
+// and moves those rows too instead of stranding them (f104/F-RA-6).
+func (s *Store) applyRename(ctx context.Context, it intent, toInfo FileInfo, view ReconView, tombstoned bool) bool {
+	var rescue []string
+	if tombstoned {
+		rescue = s.movedRows(ctx, it, view)
+	}
+	sha := ""
+	if it.srcKind == "file" {
+		sha = it.expectSHA // verified equal by the proof
+	}
+	if err := s.apply(ctx, it, toInfo, sha, rescue); err != nil {
+		log.Printf("reconcile: apply rename %s/%s -> %s: %v", it.scope, it.path, it.toPath, err)
+		return false
+	}
+	return true
+}
+
+// movedRows lists subtree rows minted after the intent's declare
+// (version >= it.version — post-resolution work the exclusion hot window
+// could not cover) whose destination member carries the recorded
+// fingerprint: evidence the late rename moved that object too. Rows
+// without a matching destination member stay at their paths — stranded
+// honestly, never claimed.
+func (s *Store) movedRows(ctx context.Context, it intent, view ReconView) []string {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(dctx,
+		`SELECT path, fp FROM file_version
+		 WHERE scope=$1 AND starts_with(path, $2||'/') AND version >= $3
+		 ORDER BY path LIMIT 256`,
+		it.scope, it.path, it.version)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var rescue []string
+	for rows.Next() {
+		var p, fp string
+		if rows.Scan(&p, &fp) != nil || fp == "" {
+			continue
+		}
+		st, serr := view.Stat(it.scope, it.toPath+p[len(it.path):])
+		if serr == nil && st.Fingerprint == fp {
+			rescue = append(rescue, p)
+		}
+	}
+	return rescue
 }
