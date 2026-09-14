@@ -55,7 +55,7 @@ Installing drops a `sumi-local` shim in `~/.local/bin`.
 
 | Path | Contents | Survives `uninstall`? |
 | --- | --- | --- |
-| `~/.local/lib/sumi-local` (`--prefix`) | executables: service binary, `core/` TypeScript sources, CLI | no — removed |
+| `~/.local/lib/sumi-local` (`--prefix`) | executables: service binary, `core/` TypeScript sources, CLI, `.sumi-local-prefix` ownership marker | no — payload entries removed; foreign files kept |
 | `$XDG_STATE_HOME/sumi/local` (`--home`) | `config.env` (0600: identity, secrets, model), `.sumi-local-home` ownership marker, `run/` pids, `log/`, `workspace/` | yes — `--purge` to delete |
 | `~/.local/bin/sumi-local` | CLI symlink | no — removed |
 | managed PG volume | canonical database (managed mode) | yes — `--purge` deletes it, after an ownership check |
@@ -64,10 +64,16 @@ Identity lives in `config.env`: `SUMI_PERSONA_ID` is generated once at
 first install and preserved on reinstall — that is what makes the
 reinstalled secretary *the same individual* with the same history.
 `.sumi-local-home` is the ownership marker `install` writes next to it:
-it records `SUMI_LOCAL_ID` so `uninstall`/`--purge` can still prove the
-home is a sumi-local install — and find its managed docker resources —
-even after `config.env` is deleted or corrupted. Generic directories
-(`run/`, `log/`, `workspace/`) are *not* ownership evidence.
+it records `SUMI_LOCAL_ID` *and* the install prefix, so `uninstall`/
+`--purge` can still prove the home is a sumi-local install, find its
+payload root, and name its managed docker resources even after
+`config.env` is deleted or corrupted. `.sumi-local-prefix` in the install
+prefix records the same id, which is what links a home/prefix pair: a
+prefix marked for a different install is refused, and a config whose id
+disagrees with the home marker refuses destructive action rather than
+picking a side. Generic directories (`run/`, `log/`, `workspace/`) are
+*not* ownership evidence, and `config.env` itself is parsed as data —
+its contents are never executed as shell.
 
 ## Multiple installs / non-default paths
 
@@ -89,15 +95,24 @@ export SUMI_LOCAL_PREFIX=/path/to/prefix
 sumi-local start
 ```
 
+The two must name the *same* install: `config.env` records
+`SUMI_LOCAL_INSTALLED_PREFIX`, and lifecycle commands refuse a
+`SUMI_LOCAL_HOME`/`SUMI_LOCAL_PREFIX` pair that points at two different
+installs before touching either side. When only `SUMI_LOCAL_HOME` is set,
+the recorded prefix is used, so a moved install stays self-locating.
+
 If a previous install's config was deleted but its managed volume remains,
 a fresh install at the same home **refuses to adopt it** — restore the old
 `config.env` to keep that secretary's data, or remove the volume yourself
-for a fresh start. `uninstall` refuses to remove a prefix that lacks this
-install's payload markers, refuses to purge a home with neither
-`config.env` nor the `.sumi-local-home` marker, and refuses to delete a
-docker volume that isn't labeled for this install's compose project. If
-`config.env` is lost, `stop`/`uninstall` still stop recorded processes and
-the marker-derived managed container, with docker project-label checks —
+for a fresh start. `uninstall` refuses to remove a prefix with no
+`.sumi-local-prefix` marker or a marker naming a different install,
+refuses to purge a home with neither `config.env` nor the
+`.sumi-local-home` marker (and a `--home` that isn't a directory), and
+refuses to delete a docker volume that isn't labeled for this install's
+compose project. When it does remove a prefix, it deletes only the known
+payload entries — unrelated files you placed there stay. If `config.env`
+is lost, `stop`/`uninstall` still stop recorded processes and the
+marker-derived managed container, with docker project-label checks —
 a deleted config is never treated as license to guess and remove
 resources.
 
@@ -135,10 +150,21 @@ from the environment without editing `config.env` — see
   port held by a foreign process is refused, never adopted or killed.
 - `stop` terminates the secretary first (SIGTERM → graceful lease
   release), then the service, then managed Postgres. Stale pid files are
-  checked against `/proc/<pid>/cmdline` before any signal. If a pid file
-  was lost but the listen port stays occupied, `stop` warns instead of
-  claiming success — identify the holder with `ss -tlnp`, verify its
-  path is this install's prefix, and only then terminate it.
+  checked against `/proc/<pid>/cmdline` before any signal, and pidfiles
+  inside a home that isn't proven to be an install are never deleted.
+  If a pid file was *lost*, `stop`/`restart`/`uninstall` still find the
+  orphaned service and core hosts by scanning `/proc` for processes
+  anchored on this install's prefix — a lost record cannot strand them,
+  and `restart` cannot spawn a duplicate core. If after that the listen
+  port stays occupied by a process this install cannot verify, `stop`
+  warns instead of claiming success — identify the holder with
+  `ss -tlnp`, verify its path is this install's prefix, and only then
+  terminate it.
+- `uninstall --purge` asks for confirmation *before* anything is stopped
+  or removed: it prints the full doomed list, and cancelling leaves
+  processes, containers, and files untouched. It exits 0 even when the
+  CLI shim is absent or belongs to another install, and reports anything
+  it could not verify as still running rather than claiming success.
 - Managed Postgres is addressed by its docker-assigned port at every
   `start`; docker re-allocates that port on container restart, so after a
   `docker restart`/`docker stop`/`docker start` of the managed container
@@ -165,7 +191,9 @@ from the environment without editing `config.env` — see
 - Before signaling a pidfile's process, `stop`/`uninstall` verify both the
   recorded `/proc` start-time and an absolute-path cmdline match anchored
   on this install's prefix — a stale or foreign pidfile can't get another
-  install's process killed.
+  install's process killed. The same absolute-path anchor gates the
+  lost-pidfile recovery sweep, so only processes this install could have
+  spawned are ever signaled.
 
 ## Distribution
 

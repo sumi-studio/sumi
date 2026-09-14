@@ -34,9 +34,19 @@ T_STUB_PORT=$((T_PORT + 1))
 T_HOME=${SUMI_LOCAL_TEST_HOME:-$(mktemp -d /tmp/sumi-local-test-home.XXXXXX)}
 T_PREFIX=${SUMI_LOCAL_TEST_PREFIX:-$(mktemp -d /tmp/sumi-local-test-prefix.XXXXXX)}
 T_WORK=${SUMI_LOCAL_TEST_WORK:-$(mktemp -d /tmp/sumi-local-test-work.XXXXXX)}
+# The install links a CLI shim into $HOME/.local/bin — the OS HOME must be
+# isolated too, or the test would mutate the real user's shim.
+REAL_HOME=$HOME
+T_OSHOME=${SUMI_LOCAL_TEST_OSHOME:-$(mktemp -d /tmp/sumi-local-test-oshome.XXXXXX)}
 LOGS=${SUMI_LOCAL_TEST_LOGS:-$T_WORK/evidence-logs}
 KEEP=${SUMI_LOCAL_TEST_KEEP:-0}
 
+export HOME=$T_OSHOME
+# keep the real user's build caches so the isolated HOME does not trigger
+# a cold Go rebuild
+[[ -d $REAL_HOME/.cache/go-build ]] && export GOCACHE="$REAL_HOME/.cache/go-build"
+[[ -d $REAL_HOME/go/pkg/mod ]] && export GOMODCACHE="$REAL_HOME/go/pkg/mod"
+REAL_SHIM_BEFORE="$(readlink "$REAL_HOME/.local/bin/sumi-local" 2>/dev/null || echo __absent__)"
 export SUMI_LOCAL_HOME=$T_HOME
 export SUMI_LOCAL_PREFIX=$T_PREFIX
 # Short lease + idle window so crash recovery and schedule polling are quick.
@@ -59,8 +69,13 @@ cleanup() {
   "$LAUNCH" stop >/dev/null 2>&1 || true
   if [[ $KEEP != 1 ]]; then
     "$LAUNCH" uninstall --purge --yes >/dev/null 2>&1 || true
-    rm -rf "$T_HOME" "$T_PREFIX" "$T_WORK" 2>/dev/null || true
+    rm -rf "$T_HOME" "$T_PREFIX" "$T_WORK" "$T_OSHOME" 2>/dev/null || true
   fi
+  # the real user's shim must be exactly as we found it
+  local after
+  after="$(readlink "$REAL_HOME/.local/bin/sumi-local" 2>/dev/null || echo __absent__)"
+  [[ $after == "$REAL_SHIM_BEFORE" ]] \
+    || printf 'FAIL: real user shim changed: %s -> %s\n' "$REAL_SHIM_BEFORE" "$after" >&2
   exit $rc
 }
 trap cleanup EXIT

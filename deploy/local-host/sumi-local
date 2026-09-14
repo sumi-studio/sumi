@@ -96,31 +96,80 @@ canon() { realpath -m "$1"; }
 # keeps two installs' data isolated.
 install_id() { printf 'sl%s' "$(printf '%s' "$1" | sha256sum | cut -c1-10)"; }
 
-HOME_DIR= PREFIX= CONFIG=
+HOME_DIR= PREFIX= CONFIG= CONFIG_PREFIX_MISMATCH=0 CONFIG_MARKER_MISMATCH=0
+
+# Destructive/signaling callers refuse an incoherent target — a prefix
+# that is not the one this install recorded, or a marker/config id split.
+# Acting on either would hit another install's processes, payloads, or data.
+require_consistent_pair() {
+  ((CONFIG_PREFIX_MISMATCH)) \
+    && die "SUMI_LOCAL_PREFIX=$PREFIX does not match the prefix recorded by this install (${SUMI_LOCAL_INSTALLED_PREFIX}) — refusing to act on a mismatched pair; fix the environment or edit $CONFIG"
+  ((CONFIG_MARKER_MISMATCH)) \
+    && die "$CONFIG disagrees with $(MARKER_FILE) on the install id — refusing destructive action on inconsistent identity; reconcile the marker or config first"
+  return 0
+}
+# config_pairs FILE — print "KEY<TAB>value" for each KEY= line, without
+# ever executing the file. install writes values single-quoted via shq;
+# the shq '\'' escape is undone here. A corrupt or foreign config.env is
+# inert data — it must not become shell code during lifecycle commands.
+config_pairs() {
+  node -e '
+    const fs=require("fs");
+    let t; try { t=fs.readFileSync(process.argv[1],"utf8"); } catch { process.exit(1); }
+    for (const l of t.split("\n")) {
+      const m=l.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m) continue;
+      let v=m[2];
+      if (v.length>=2 && v.startsWith("\x27") && v.endsWith("\x27"))
+        v=v.slice(1,-1).replace(/\x27\\\x27\x27/g,"\x27");
+      else if (v.length>=2 && v.startsWith("\x22") && v.endsWith("\x22"))
+        v=v.slice(1,-1);
+      process.stdout.write(m[1]+"\t"+v+"\n");
+    }' "$1"
+}
+
+# config_val FILE KEY — print the single value (data-only, same rules).
+config_val() {
+  node -e '
+    const fs=require("fs");
+    let t; try { t=fs.readFileSync(process.argv[1],"utf8"); } catch { process.exit(1); }
+    for (const l of t.split("\n")) {
+      const m=l.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m || m[1]!==process.argv[2]) continue;
+      let v=m[2];
+      if (v.length>=2 && v.startsWith("\x27") && v.endsWith("\x27"))
+        v=v.slice(1,-1).replace(/\x27\\\x27\x27/g,"\x27");
+      else if (v.length>=2 && v.startsWith("\x22") && v.endsWith("\x22"))
+        v=v.slice(1,-1);
+      process.stdout.write(v+"\n"); break;
+    }' "$1" "$2"
+}
+
 load_config() {
   HOME_DIR="$(canon "$(sumi_home)")"
   PREFIX="$(canon "$(sumi_prefix)")"
   CONFIG="$HOME_DIR/config.env"
   [[ -f $CONFIG ]] || return 1
-  bash -n "$CONFIG" 2>/dev/null \
-    || { info "config at $CONFIG is not valid shell (corrupt?)"; return 1; }
-  local k
+  local k v
   local -a saved=()
   for k in "${OVERRIDABLE[@]}"; do
     if [[ -n ${!k:-} ]]; then saved+=("$k=${!k}"); fi
   done
-  set -a
-  # shellcheck disable=SC1090
-  source "$CONFIG"
-  set +a
-  for k in "${saved[@]}"; do export "${k?}"; done
+  local had_pairs=0
+  local -A pairs=()
+  while IFS=$'\t' read -r k v; do
+    case $k in SUMI_*) pairs[$k]=$v; had_pairs=1;; esac
+  done < <(config_pairs "$CONFIG")
+  ((had_pairs)) || { info "config at $CONFIG has no readable KEY= lines (corrupt?)"; return 1; }
   # soft-fail with a reason so callers like `uninstall` can recover from a
-  # corrupt config instead of aborting mid-cleanup
-  local v
+  # corrupt config instead of aborting mid-cleanup. Nothing is exported
+  # until every required key is present — a partial config leaks nothing.
   for v in SUMI_LOCAL_ID SUMI_LOCAL_LISTEN SUMI_LOCAL_DB_MODE \
            SUMI_CORE_STATE_TOKEN SUMI_PERSONA_ID; do
-    [[ -n ${!v:-} ]] || { info "config incomplete: missing $v"; return 1; }
+    [[ -n ${pairs[$v]:-} ]] || { info "config incomplete: missing $v"; return 1; }
   done
+  for k in "${!pairs[@]}"; do export "$k=${pairs[$k]}"; done
+  for k in "${saved[@]}"; do export "${k?}"; done
   : "${SUMI_PERSONA_NAME:=Sumi}"
   : "${SUMI_MODEL_PROVIDER:=mock}"
   if [[ $SUMI_LOCAL_DB_MODE == managed ]]; then
@@ -135,6 +184,31 @@ load_config() {
   else
     [[ -n ${SUMI_DB_URL:-} ]] || { info "config incomplete: missing SUMI_DB_URL"; return 1; }
   fi
+  # The config records the prefix it was installed with. An explicit
+  # SUMI_LOCAL_PREFIX env still selects the install; a mismatch means the
+  # caller pointed home and prefix at different installs — destructive
+  # callers must refuse that pair. With no env selector, the recorded
+  # prefix makes the install self-locating.
+  CONFIG_PREFIX_MISMATCH=0
+  if [[ -n ${SUMI_LOCAL_INSTALLED_PREFIX:-} ]]; then
+    local rec; rec="$(canon "$SUMI_LOCAL_INSTALLED_PREFIX")"
+    if [[ -n ${SUMI_LOCAL_PREFIX:-} ]]; then
+      [[ $rec != "$PREFIX" ]] && CONFIG_PREFIX_MISMATCH=1
+    else
+      PREFIX=$rec
+      export SUMI_LOCAL_PREFIX=$PREFIX
+    fi
+  fi
+  # Marker and config must tell the same identity story. A marker older
+  # than a moved-home reinstall would steer config-less teardown at
+  # another install's resources — flag it and let destructive callers
+  # refuse rather than pick a side.
+  CONFIG_MARKER_MISMATCH=0
+  if [[ -f $(MARKER_FILE) ]]; then
+    local mid; mid="$(marker_id "$(MARKER_FILE)")"
+    [[ -n $mid && $mid != "$SUMI_LOCAL_ID" ]] && CONFIG_MARKER_MISMATCH=1
+  fi
+  return 0
 }
 
 RUN_DIR() { printf '%s/run' "$HOME_DIR"; }
@@ -148,6 +222,10 @@ MARKER_FILE() { printf '%s/.sumi-local-home' "$HOME_DIR"; }
 # Parse the install id recorded in a marker file (never sourced — a foreign
 # directory's file must not become shell code).
 marker_id() { sed -n "s/^SUMI_LOCAL_ID=['\"]\\{0,1\\}\\(sl[0-9a-f]\\{10\\}\\).*/\\1/p" "$1" 2>/dev/null; }
+
+# The home marker also records the install prefix so config-less recovery
+# locates the real payload root instead of trusting the env-selected one.
+marker_prefix() { config_val "$1" SUMI_LOCAL_PREFIX; }
 
 require_installed() {
   [[ -x $(SERVICE_BIN) ]] || die "missing $(SERVICE_BIN) — run: $PROG install"
@@ -262,24 +340,100 @@ wait_lease() { # holder_id pidfile seconds
   return 1
 }
 
-kill_pid() { # pidfile grace-seconds absolute-cmdline-substring — TERM, then KILL
-  local f=$1 grace=$2 pat=$3 pid st deadline
+# kill_pid pidfile grace path-substring [may-rm] — verify identity BEFORE any
+# file deletion, and never remove a pidfile inside a home we cannot prove is
+# ours (may-rm=0). Signals only ever go to processes whose recorded start-time
+# and absolute-prefix cmdline both match.
+kill_pid() {
+  local f=$1 grace=$2 pat=$3 may_rm=${4:-1} pid st deadline
   [[ -f $f ]] || return 0
-  read -r pid st <"$f" || return 0
-  rm -f "$f"
-  [[ $pid =~ ^[0-9]+$ && -d /proc/$pid ]] || return 0
-  if { [[ -n $st ]] && [[ $(proc_starttime "$pid") != "$st" ]]; } \
-     || ! tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$pat"; then
-    info "pid $pid is not this install's process (stale or foreign pidfile) — leaving it alone"
+  read -r pid st <"$f" || { ((may_rm)) && rm -f "$f"; return 0; }
+  if [[ $pid =~ ^[0-9]+$ && -d /proc/$pid ]]; then
+    if { [[ -n $st ]] && [[ $(proc_starttime "$pid") != "$st" ]]; } \
+       || ! tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$pat"; then
+      info "pid $pid is not this install's process (stale or foreign pidfile) — leaving it alone"
+      ((may_rm)) && rm -f "$f"
+      return 0
+    fi
+    ((may_rm)) && rm -f "$f"
+    kill -TERM "$pid" 2>/dev/null || true
+    deadline=$((SECONDS + grace))
+    while ((SECONDS < deadline)); do
+      [[ -d /proc/$pid ]] || return 0
+      sleep 0.2
+    done
+    kill -KILL "$pid" 2>/dev/null || true
     return 0
   fi
-  kill -TERM "$pid" 2>/dev/null || true
+  ((may_rm)) && rm -f "$f"   # dead pid — stale record
+  return 0
+}
+
+# proc_pids_for ABS-PATH — pids whose argv contains the path as an exact
+# element (service binary argv[0], or the node host's .ts argument). Exact
+# matching: a path substring in some unrelated command line never qualifies.
+proc_pids_for() {
+  local want=$1 p pid arg
+  for p in /proc/[0-9]*/cmdline; do
+    pid=${p#/proc/}; pid=${pid%/cmdline}
+    # $$ excludes the launcher shell; $BASHPID excludes the $(...) subshell
+    # running this scan — its argv still shows our own prefix-anchored path
+    [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
+    while IFS= read -r arg; do
+      [[ $arg == "$want" ]] && { printf '%s\n' "$pid"; break; }
+    done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
+  done
+  return 0
+}
+
+# kill_anchored ABS-PATH grace — TERM, then KILL, every process provably
+# anchored on this install's prefix. Recovers orphans left by lost pidfiles.
+kill_anchored() {
+  local want=$1 grace=$2 pids p deadline alive
+  pids="$(proc_pids_for "$want")"
+  [[ -n $pids ]] || return 0
+  info "stopping unrecorded process(es) anchored on $want"
+  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
   deadline=$((SECONDS + grace))
   while ((SECONDS < deadline)); do
-    [[ -d /proc/$pid ]] || return 0
+    alive=0
+    for p in $pids; do
+      [[ -d /proc/$p ]] && [[ $(awk '{print $3}' "/proc/$p/stat" 2>/dev/null) != Z ]] \
+        && { alive=1; break; }
+    done
+    ((alive)) || return 0
     sleep 0.2
   done
-  kill -KILL "$pid" 2>/dev/null || true
+  for p in $pids; do
+    [[ -d /proc/$p ]] && kill -KILL "$p" 2>/dev/null
+  done
+  return 0
+}
+
+# stop_own_procs grace — every process this install could have spawned:
+# the state service plus each core host entry under $PREFIX/core/host/.
+stop_own_procs() {
+  kill_anchored "$(SERVICE_BIN)" "$1"
+  local h
+  for h in "$PREFIX"/core/host/*.ts; do
+    [[ -e $h ]] && kill_anchored "$h" "$1"
+  done
+  return 0
+}
+
+# proc_pids_under DIR — pids with any argv element beneath DIR. Used for
+# truthful survivors reporting after payload removal (exact paths may no
+# longer exist on disk by then).
+proc_pids_under() {
+  local root=$1 p pid arg
+  for p in /proc/[0-9]*/cmdline; do
+    pid=${p#/proc/}; pid=${pid%/cmdline}
+    [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
+    while IFS= read -r arg; do
+      case $arg in "$root"/*) printf '%s\n' "$pid"; break;; esac
+    done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
+  done
+  return 0
 }
 
 lock() {
@@ -316,20 +470,53 @@ cmd_install() {
     || die "--model-provider must be mock or openai (got '$mprovider')"
   home="$(canon "${home:-$(sumi_home)}")"
   prefix="$(canon "${prefix:-$(sumi_prefix)}")"
+  [[ ! -e $home || -d $home ]] \
+    || die "--home $home exists but is not a directory"
+  [[ ! -e $prefix || -d $prefix ]] \
+    || die "--prefix $prefix exists but is not a directory"
+  # The install id is decided BEFORE anything is created: an existing
+  # config's id is authoritative (moved home, config-only recovery), else
+  # the path-derived id for a fresh install.
+  local claim_id=""
+  if [[ -f $home/config.env ]]; then
+    claim_id="$(marker_id "$home/config.env")"
+  fi
+  claim_id="${claim_id:-$(install_id "$home")}"
+  # Refuse to claim a prefix that is marked for a different install — two
+  # installs cannot share one payload root. Checked before we create
+  # anything inside it.
+  if [[ -f $prefix/.sumi-local-prefix ]]; then
+    local prev_prefix_id; prev_prefix_id="$(marker_id "$prefix/.sumi-local-prefix")"
+    [[ -z $prev_prefix_id || $prev_prefix_id == "$claim_id" ]] \
+      || die "prefix $prefix belongs to a different install ($prev_prefix_id vs $claim_id) — two installs cannot share a prefix; choose a distinct --prefix"
+  fi
+  # A populated, unmarked prefix is claimed but its foreign entries are
+  # never ours — uninstall removes only known payload paths. Warn so the
+  # boundary stays visible.
+  if [[ -d $prefix && ! -f $prefix/.sumi-local-prefix ]]; then
+    local pextra
+    pextra="$(cd "$prefix" && ls -A | grep -vFx -e bin -e core -e docs \
+              -e compose.pg.yaml -e config.example.env -e VERSION | head -5 || true)"
+    [[ -n $pextra ]] \
+      && info "note: $prefix contains pre-existing entries; uninstall will remove only the $PROG payload and keep the rest"
+  fi
   mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
-  # Claim the home before any payload/config work: .sumi-local-home is the
-  # durable ownership marker — it makes even a failed install recognizable
-  # (and cleanable) as ours, and records the install id so uninstall/purge
-  # can recover managed resource names if config.env is later lost. The
-  # config's id wins when a config already exists (e.g. a moved home).
-  if [[ ! -f $home/.sumi-local-home ]]; then
-    local claim_id
-    if [[ -f $home/config.env ]]; then
-      claim_id="$(marker_id "$home/config.env")"
-    fi
-    printf 'SUMI_LOCAL_ID=%s\n' "$(shq "${claim_id:-$(install_id "$home")}")" \
-      >"$home/.sumi-local-home"
+  # Claim the home and prefix before any payload/config work. The markers
+  # make even a failed install recognizable (and cleanable) as ours, and
+  # record the install id so uninstall/purge can recover managed resource
+  # names if config.env is later lost. The config's id wins when a config
+  # already exists (e.g. a moved home).
+  printf 'SUMI_LOCAL_ID=%s\n' "$(shq "$claim_id")" >"$prefix/.sumi-local-prefix"
+  [[ -f $home/.sumi-local-home ]] \
+    || { printf 'SUMI_LOCAL_ID=%s\n' "$(shq "$claim_id")"
+         printf 'SUMI_LOCAL_PREFIX=%s\n' "$(shq "$prefix")"; } >"$home/.sumi-local-home"
+  # warn when claiming a populated, unmarked dir — purge would remove it all
+  if [[ ! -f $home/config.env ]]; then
+    local extra
+    extra="$(cd "$home" && ls -A | grep -vFx -e run -e log -e workspace -e .sumi-local-home | head -5 || true)"
+    [[ -n $extra ]] \
+      && info "note: $home contains pre-existing entries; uninstall --purge would remove the whole directory — pick a dedicated --home to keep them separate"
   fi
 
   # --- payloads -------------------------------------------------------------
@@ -367,7 +554,12 @@ cmd_install() {
     chmod +x "$prefix/bin/sumi-local"
   fi
   mkdir -p "$HOME/.local/bin"
-  ln -sf "$prefix/bin/sumi-local" "$HOME/.local/bin/sumi-local"
+  local shim_dst="$HOME/.local/bin/sumi-local"
+  if [[ -e $shim_dst || -L $shim_dst ]] \
+     && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/sumi-local" ]]; then
+    info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
+  fi
+  ln -sf "$prefix/bin/sumi-local" "$shim_dst"
 
   # --- config ---------------------------------------------------------------
   local cfg="$home/config.env"
@@ -375,6 +567,16 @@ cmd_install() {
     info "kept existing $cfg — secretary identity, database and secrets unchanged"
     if [[ -n $db_url$listen$pname$mprovider$mbase$mkey$mname || $managed == 1 ]]; then
       info "note: install options affecting identity/database/model were ignored; edit $cfg to change them"
+    fi
+    # A reinstall with a different --prefix moves the install — re-record
+    # it, or later commands would refuse the pair as mismatched.
+    local cur_pref
+    cur_pref="$(config_val "$cfg" SUMI_LOCAL_INSTALLED_PREFIX || true)"
+    if [[ -n $cur_pref && $(canon "$cur_pref") != "$prefix" ]]; then
+      sed -i "s|^SUMI_LOCAL_INSTALLED_PREFIX=.*|SUMI_LOCAL_INSTALLED_PREFIX=$(shq "$prefix")|" "$cfg"
+      info "recorded prefix updated to $prefix (install moved)"
+    elif [[ -z $cur_pref ]]; then
+      printf 'SUMI_LOCAL_INSTALLED_PREFIX=%s\n' "$(shq "$prefix")" >>"$cfg"
     fi
   else
     local token persona iid
@@ -416,7 +618,10 @@ cmd_install() {
       printf '# Kept mode 0600; do not share or commit this file.\n\n'
       printf '# Installation id — names the managed docker resources; stable for\n'
       printf '# the lifetime of this install.\n'
-      printf 'SUMI_LOCAL_ID=%s\n\n' "$(shq "$iid")"
+      printf 'SUMI_LOCAL_ID=%s\n' "$(shq "$iid")"
+      printf '# Prefix this home was installed with — keeps home/prefix pairs\n'
+      printf '# consistent across later commands.\n'
+      printf 'SUMI_LOCAL_INSTALLED_PREFIX=%s\n\n' "$(shq "$prefix")"
       printf 'SUMI_LOCAL_LISTEN=%s\n' "$(shq "${listen:-127.0.0.1:8470}")"
       printf 'SUMI_LOCAL_DB_MODE=%s\n\n' "$(shq "$mode")"
       if [[ $mode == external ]]; then
@@ -441,6 +646,14 @@ cmd_install() {
     chmod 600 "$cfg"
     info "wrote $cfg (persona $persona, install $iid)"
   fi
+  # The marker mirrors the effective install id — config's id when kept,
+  # the fresh id otherwise — so it can never drift stale after a
+  # moved-home reinstall (a stale id would later name another install's
+  # resources). The recorded prefix is refreshed alongside it.
+  local eff_id; eff_id="$(marker_id "$cfg")"
+  { printf 'SUMI_LOCAL_ID=%s\n' "$(shq "${eff_id:-$claim_id}")"
+    printf 'SUMI_LOCAL_PREFIX=%s\n' "$(shq "$prefix")"; } >"$home/.sumi-local-home"
+
   cat <<EOF
 [$PROG] installed.
   executables : $prefix
@@ -579,6 +792,7 @@ build_core_env() { # array-name
 
 cmd_start() {
   load_config || die "not installed, or config unreadable ($CONFIG) — run: $PROG install"
+  require_consistent_pair
   check_listen || die "refusing to start"
   require_installed
   require_proc
@@ -613,6 +827,9 @@ cmd_start() {
   fi
   if ! pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
     rm -f "$(RUN_DIR)/service.pid"
+    # a lost pidfile can leave our own service orphaned on the port —
+    # it is provably ours (argv[0] anchors on this prefix), so stop it
+    kill_anchored "$(SERVICE_BIN)" 5
     if port_busy; then
       die "$(base_url) is occupied by a process this install did not start — refusing to adopt or kill it"
     fi
@@ -664,6 +881,9 @@ cmd_start() {
       continue
     fi
     rm -f "$pid_file"
+    # a lost pidfile leaves an orphan that would double-run this persona —
+    # kill it (verified ours by its absolute path) before spawning
+    kill_anchored "$PREFIX/core/host/$h" 5
     info "starting core host $h…"
     (exec 9>&-; exec nohup env "${cenv[@]}" node "$PREFIX/core/host/$h") >>"$(LOG_DIR)/${h%.ts}.log" 2>&1 &
     write_pid "$pid_file" "$!" || die "could not record core pid identity"
@@ -705,19 +925,33 @@ cmd_stop() {
   require_proc
   if ! load_config; then
     # config missing or corrupt — still stop what we can prove is ours:
-    # pidfiles re-verify absolute process paths, and the install marker
-    # recovers the managed container's name for a label-checked stop.
+    # pidfiles re-verify absolute process paths (and are never deleted in
+    # an unproven home), and the install marker recovers the managed
+    # container's name for a label-checked stop.
     [[ -f $(MARKER_FILE) || -d $(RUN_DIR) ]] \
       || die "not installed — nothing to stop (no config, marker, or pidfiles under $HOME_DIR)"
     info "config unavailable — stopping via recorded evidence only"
-    # only lock when the home is proven ours; lock() would create run/
-    [[ -f $(MARKER_FILE) ]] && lock
+    local proven=0
+    if [[ -f $(MARKER_FILE) ]]; then
+      proven=1; lock
+      # the marker also records the real install prefix — prefer it over
+      # the env-selected/default guess for the orphan sweep and pid anchors
+      if [[ -z ${SUMI_LOCAL_PREFIX:-} ]]; then
+        local mp; mp="$(marker_prefix "$(MARKER_FILE)")"
+        [[ -n $mp ]] && PREFIX="$(canon "$mp")"
+      fi
+    fi
     local f stopped=0
     for f in "$(RUN_DIR)"/*.pid; do
-      [[ -f $f ]] && { kill_pid "$f" 10 "$(pid_pat "$f")"; stopped=1; }
+      if [[ -f $f ]]; then
+        kill_pid "$f" 10 "$(pid_pat "$f")" "$proven"
+        stopped=1
+      fi
     done
-    local mid
-    mid="$(marker_id "$(MARKER_FILE)")"
+    # proven home: also sweep orphan processes whose pidfiles were lost
+    ((proven)) && stop_own_procs 5
+    local mid=""
+    [[ -f $(MARKER_FILE) ]] && mid="$(marker_id "$(MARKER_FILE)")"
     if [[ -n $mid ]] && docker inspect "sumi-local-pg-$mid" >/dev/null 2>&1; then
       SUMI_LOCAL_PG_PROJECT="sumi-local-$mid"
       if owned_container "sumi-local-pg-$mid"; then
@@ -729,21 +963,25 @@ cmd_stop() {
     ((stopped)) || info "no recorded processes were running"
     return 0
   fi
+  require_consistent_pair
   lock
   local f
   for f in "$(RUN_DIR)"/*.pid; do
     [[ -f $f ]] || continue
     [[ $f == */service.pid ]] && continue # service goes last
     info "stopping $(basename "$f" .pid)…"
-    kill_pid "$f" 15 "$(pid_pat "$f")"
+    kill_pid "$f" 15 "$(pid_pat "$f")" 1
   done
   info "stopping state service…"
-  kill_pid "$(RUN_DIR)/service.pid" 10 "$(SERVICE_BIN)"
+  kill_pid "$(RUN_DIR)/service.pid" 10 "$(SERVICE_BIN)" 1
+  # lost pidfiles must not strand our own processes — sweep anything still
+  # anchored on this prefix
+  stop_own_procs 5
   [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]] && pg_down
   check_listen >/dev/null 2>&1 || true
   if [[ -n $LISTEN_PORT ]] && port_busy; then
-    # a pidfile could be lost while the service keeps running — never claim
-    # we stopped a listener we cannot verify
+    # a listener we could not verify as ours is still holding the port —
+    # never claim we stopped it
     info "warning: $(base_url) is still occupied by a process this install cannot verify — left running, NOT stopped. Identify it yourself first (e.g. ss -ltnp 'sport = :$LISTEN_PORT'), confirm it is $PREFIX/bin/sumi-local-service, then terminate it."
   fi
   info "stopped. State remains in $HOME_DIR and the database."
@@ -909,6 +1147,10 @@ cmd_doctor() {
   [[ -x $(SERVICE_BIN) ]] && ok "service binary" || bad "missing $(SERVICE_BIN)"
   [[ -f $(CORE_ENTRY) ]] && ok "core payload" || bad "missing $(CORE_ENTRY)"
   check_listen && ok "listen $SUMI_LOCAL_LISTEN" || bad "listen address"
+  ((CONFIG_PREFIX_MISMATCH)) \
+    && bad "SUMI_LOCAL_PREFIX=$PREFIX ≠ recorded prefix $SUMI_LOCAL_INSTALLED_PREFIX"
+  ((CONFIG_MARKER_MISMATCH)) \
+    && bad "config.env and .sumi-local-home disagree on the install id"
   [[ $SUMI_MODEL_PROVIDER == openai ]] && {
     [[ -n ${SUMI_MODEL_BASE_URL:-} && -n ${SUMI_MODEL_API_KEY:-} && -n ${SUMI_MODEL_MODEL:-} ]] \
       && ok "model: openai $SUMI_MODEL_MODEL via $SUMI_MODEL_BASE_URL" \
@@ -973,6 +1215,7 @@ cmd_uninstall() {
   local have_config=0
   if load_config; then
     have_config=1
+    require_consistent_pair
   else
     [[ -f $CONFIG ]] \
       && info "warning: $CONFIG exists but is incomplete/corrupt — continuing from the install marker"
@@ -981,14 +1224,22 @@ cmd_uninstall() {
     unset SUMI_LOCAL_ID SUMI_LOCAL_DB_MODE SUMI_DB_URL SUMI_PERSONA_ID \
           SUMI_CORE_STATE_TOKEN SUMI_LOCAL_LISTEN SUMI_LOCAL_PG_CONTAINER \
           SUMI_LOCAL_PG_VOLUME SUMI_LOCAL_PG_PROJECT SUMI_LOCAL_PG_LISTEN \
-          SUMI_LOCAL_PG_PASSWORD
+          SUMI_LOCAL_PG_PASSWORD SUMI_LOCAL_INSTALLED_PREFIX
   fi
   # Ownership evidence is config.env or the .sumi-local-home marker written
   # by install — never generic directory names like run/, log/, workspace/,
   # which unrelated directories may contain (and run/ could be created by
   # an earlier sumi-local call itself).
-  local marker_id="" home_owned=0
-  [[ -f $(MARKER_FILE) ]] && marker_id="$(marker_id "$(MARKER_FILE)")"
+  local mid="" home_owned=0
+  if [[ -f $(MARKER_FILE) ]]; then
+    mid="$(marker_id "$(MARKER_FILE)")"
+    # config-less recovery: the marker records the real install prefix —
+    # prefer it over an unset env selector's default guess
+    if [[ -z ${SUMI_LOCAL_PREFIX:-} ]] && ((!have_config)); then
+      local mp; mp="$(marker_prefix "$(MARKER_FILE)")"
+      [[ -n $mp ]] && PREFIX="$(canon "$mp")"
+    fi
+  fi
   # A complete config.env or the install marker is ownership evidence; a
   # corrupt/foreign file merely named config.env is not.
   ((have_config)) || [[ -f $(MARKER_FILE) ]] && home_owned=1
@@ -996,7 +1247,7 @@ cmd_uninstall() {
   # authoritative, e.g. after the home was moved), then the marker. Never
   # guessed from the path alone: a deleted config is not permission to
   # delete resources a guessed hash happens to name.
-  local iid="${SUMI_LOCAL_ID:-$marker_id}"
+  local iid="${SUMI_LOCAL_ID:-$mid}"
   local pg_ctr="" pg_vol="" pg_proj=""
   if [[ -n $iid ]]; then
     pg_ctr="${SUMI_LOCAL_PG_CONTAINER:-sumi-local-pg-$iid}"
@@ -1004,23 +1255,73 @@ cmd_uninstall() {
     pg_proj="sumi-local-$iid"
     : "${SUMI_LOCAL_PG_PROJECT:=$pg_proj}"
   fi
+
+  # --- guards: everything below runs BEFORE any mutation ------------------
+  # A non-directory --home (regular file, device, …) is never a state home.
+  [[ ! -e $HOME_DIR || -d $HOME_DIR ]] \
+    || die "SUMI_LOCAL_HOME=$HOME_DIR is not a directory — refusing (check the path)"
   if ((purge)) && [[ -d $HOME_DIR ]] && ((home_owned == 0)); then
     die "refusing to purge $HOME_DIR — no config.env or .sumi-local-home marker; it does not look like a $PROG state home (check SUMI_LOCAL_HOME)"
   fi
   ((purge)) && [[ -d $HOME_DIR ]] \
     && { [[ $HOME_DIR != / && $HOME_DIR != "$HOME" ]] \
          || die "refusing to purge $HOME_DIR — not a $PROG state home"; }
+
+  # The prefix must prove it is THIS install: a .sumi-local-prefix marker
+  # carrying the same install id. A bare payload, or an unproven home
+  # naming a real prefix, never authorizes deletion.
+  local prefix_owned=0
+  if [[ -e $PREFIX ]]; then
+    if [[ ! -f $PREFIX/.sumi-local-prefix ]]; then
+      # never delete unproven content — but an unmarked prefix does not
+      # block cleanup of a proven home
+      info "leaving $PREFIX untouched — no .sumi-local-prefix marker; not provably a $PROG install root (check SUMI_LOCAL_PREFIX; remove manually if it is stale payload)"
+    else
+      local prefix_id; prefix_id="$(marker_id "$PREFIX/.sumi-local-prefix")"
+      if ((home_owned == 0)); then
+        die "refusing to remove $PREFIX — $HOME_DIR has no $PROG install evidence, so the pair cannot be verified (check SUMI_LOCAL_HOME; if the state home was deleted, remove the prefix manually)"
+      elif [[ -n $prefix_id && -n $iid && $prefix_id != "$iid" ]]; then
+        die "refusing to remove $PREFIX — it belongs to a different install ($prefix_id vs $iid)"
+      fi
+      prefix_owned=1
+    fi
+  fi
+
+  # --- confirmation before any mutation -----------------------------------
+  if ((purge)); then
+    local -a doomed=()
+    [[ -d $HOME_DIR ]] && doomed+=("$HOME_DIR")
+    ((prefix_owned)) && doomed+=("$PREFIX")
+    [[ -n $pg_vol ]] && doomed+=("docker volume $pg_vol")
+    doomed+=("managed container/network for project ${pg_proj:-<none>} (running install is stopped first)")
+    ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == external ]] \
+      && doomed+=("NOTE: external database rows are NOT removed — drop the database yourself if wanted")
+    if ((!have_config)) && [[ -z $iid ]]; then
+      doomed+=("NOTE: no install id recoverable — if this was a managed install, look for 'sumi-local-*' docker objects yourself")
+    fi
+    printf 'This permanently deletes the secretary identity, its history, and queued work:\n' >&2
+    printf '  %s\n' "${doomed[@]}" >&2
+    if ((yes == 0)); then
+      printf 'Type "purge" to confirm: ' >&2
+      local ans; read -r ans
+      [[ $ans == purge ]] || die "aborted — nothing was changed"
+    fi
+  fi
+
+  # --- mutations -----------------------------------------------------------
   # Lock (which creates run/) only when the home is proven ours — never
-  # create artifacts inside a foreign directory. When ownership is
-  # unproven but a run/ already exists, still evaluate its pidfiles
-  # read-only: kill_pid only signals processes it can verify as ours via
-  # the absolute-prefix anchor, and nothing is created.
+  # create artifacts inside a foreign directory. Pidfiles in an unproven
+  # home are still evaluated (signals only reach verified own processes)
+  # but never deleted.
   ((home_owned)) && lock
   if ((home_owned)) || [[ -d $(RUN_DIR) ]]; then
     local f
     for f in "$(RUN_DIR)"/*.pid; do
-      [[ -f $f ]] && kill_pid "$f" 10 "$(pid_pat "$f")"
+      [[ -f $f ]] && kill_pid "$f" 10 "$(pid_pat "$f")" "$home_owned"
     done
+    # lost pidfiles must not strand our own processes — sweep whatever is
+    # still anchored on this prefix before tearing down its database
+    ((home_owned)) && stop_own_procs 5
   elif [[ -e $HOME_DIR ]]; then
     info "$HOME_DIR has no $PROG install evidence — nothing to stop there"
   fi
@@ -1045,20 +1346,6 @@ cmd_uninstall() {
     fi
   fi
   if ((purge)); then
-    local -a doomed=("$HOME_DIR")
-    [[ -n $pg_vol ]] && doomed+=("docker volume $pg_vol")
-    ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == external ]] \
-      && doomed+=("NOTE: external database rows are NOT removed — drop the database yourself if wanted")
-    if ((!have_config)) && [[ -z $iid ]]; then
-      doomed+=("NOTE: no install id recoverable — if this was a managed install, look for 'sumi-local-*' docker objects yourself")
-    fi
-    printf 'This permanently deletes the secretary identity, its history, and queued work:\n' >&2
-    printf '  %s\n' "${doomed[@]}" >&2
-    if ((yes == 0)); then
-      printf 'Type "purge" to confirm: ' >&2
-      local ans; read -r ans
-      [[ $ans == purge ]] || die "aborted"
-    fi
     if [[ -n $pg_vol ]] && docker volume inspect "$pg_vol" >/dev/null 2>&1; then
       # the volume holds the secretary's whole authored history — delete it
       # only when docker itself attributes it to this install's project
@@ -1068,11 +1355,17 @@ cmd_uninstall() {
         && info "removed volume $pg_vol" \
         || info "warning: could not remove volume $pg_vol"
     fi
-    rm -rf "$HOME_DIR"
-    info "purged state home and managed data"
+    if [[ -d $HOME_DIR ]]; then
+      rm -rf "$HOME_DIR"
+      info "purged state home $HOME_DIR"
+    fi
   elif [[ -d $HOME_DIR ]]; then
     if ((home_owned)); then
-      info "kept state home $HOME_DIR (identity, history, secrets)"
+      if ((have_config)); then
+        info "kept state home $HOME_DIR (identity, history, secrets)"
+      else
+        info "kept state home $HOME_DIR (install marker — no config)"
+      fi
       [[ -n $pg_vol ]] && docker volume inspect "$pg_vol" >/dev/null 2>&1 \
         && info "kept managed volume $pg_vol"
       info "to delete the data too: $PROG uninstall --purge"
@@ -1080,18 +1373,37 @@ cmd_uninstall() {
       info "left $HOME_DIR untouched — no $PROG install evidence (check SUMI_LOCAL_HOME)"
     fi
   fi
-  if [[ -e $PREFIX ]]; then
-    # verify this is an actual sumi-local install before rm -rf — a bad
-    # SUMI_LOCAL_PREFIX must not delete an unrelated directory
-    [[ -f $PREFIX/bin/sumi-local-service || -f $PREFIX/bin/sumi-local ]] \
-      || die "refusing to remove $PREFIX — missing bin/sumi-local-service marker (check SUMI_LOCAL_PREFIX)"
-    [[ $PREFIX != / && $PREFIX != "$HOME" ]] \
-      || die "refusing to remove $PREFIX — not a $PROG install root"
-    rm -rf "$PREFIX"
-    info "removed executables at $PREFIX"
+  if ((prefix_owned)); then
+    # remove only our payload entries, then rmdir — foreign files a user
+    # dropped into the prefix are never ours to delete
+    local e leftover
+    for e in bin core docs compose.pg.yaml config.example.env VERSION \
+             .sumi-local-prefix; do
+      rm -rf "$PREFIX/$e"
+    done
+    leftover="$(ls -A "$PREFIX" 2>/dev/null || true)"
+    if [[ -n $leftover ]]; then
+      info "removed $PROG payloads; kept unexpected entries in $PREFIX (not ours):"
+      printf '%s\n' "$leftover" | while IFS= read -r l; do printf '  %s\n' "$l" >&2; done
+    else
+      rmdir "$PREFIX" 2>/dev/null \
+        && info "removed executables at $PREFIX" \
+        || info "removed $PROG payloads under $PREFIX"
+    fi
   fi
   local shim="$HOME/.local/bin/sumi-local"
   [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/sumi-local" ]] && rm -f "$shim"
+  # truthful survivors report: processes still anchored on this prefix, or
+  # a listener still holding the port, must be named rather than implied gone
+  local left; left="$(proc_pids_under "$PREFIX")"
+  [[ -n $left ]] \
+    && info "warning: processes still running with paths under $PREFIX (pids: $(printf '%s' "$left" | tr '\n' ' ')) — verify and stop them yourself"
+  if ((have_config)); then
+    check_listen >/dev/null 2>&1 || true
+    [[ -n $LISTEN_PORT ]] && port_busy \
+      && info "warning: $(base_url) is still occupied by a process this install could not verify — left running. Identify it first (ss -ltnp 'sport = :$LISTEN_PORT'), confirm it was this install's, then terminate it."
+  fi
+  return 0
 }
 
 cmd_version() {
