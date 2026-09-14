@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -576,6 +577,135 @@ func TestSharedIntakeAuthorHearsModeratorDelete(t *testing.T) {
 		SELECT count(*) FROM agent_attention_deliveries
 		WHERE message_id=$1 AND personality_agent_id=$2`, second.MessageID, w.agent.ID).Scan(&own); err != nil || own != 0 {
 		t.Fatalf("self-delete issued %d deliveries: %v", own, err)
+	}
+}
+
+// A reply to another member's message is ambient context for an observer.
+// Editing that reply must not promote the observer's attention to "reply"
+// merely because the message is a reply — reply_to names the parent author
+// alone, exactly as at append time (board finding 132 / review-b F2).
+func TestSharedIntakeEditOfReplyToOtherKeepsObserveAttention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newFollowupsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+
+	question := w.send(t, ctx, ch.PlaceID, w.humanA, "質問です")
+	senderB := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := senderB.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Content: "これが答えです", ReplyTo: question.MessageID,
+		ClientNonce: "fu-ambient-reply",
+	})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 2 {
+		t.Fatalf("drain originals: %+v %v", stats, err)
+	}
+	if _, err := senderB.EditMessage(ctx, ch.PlaceID, reply.MessageID, "これが訂正後の答えです", reply.Revision); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain edit: %+v %v", stats, err)
+	}
+	if _, err := senderB.DeleteMessage(ctx, ch.PlaceID, reply.MessageID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain delete: %+v %v", stats, err)
+	}
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 4 {
+		t.Fatalf("inputs = %d, want question + reply + edit + tombstone", len(inputs))
+	}
+	if inputs[1].Attention != "observe" {
+		t.Fatalf("ambient reply input attention = %q", inputs[1].Attention)
+	}
+	for i, name := range []string{"edit", "tombstone"} {
+		in := inputs[2+i]
+		if in.Payload["message_id"] != reply.MessageID || in.Attention != "observe" {
+			t.Fatalf("%s input = %+v", name, in)
+		}
+		if _, ok := in.Payload["reply_to_message_id"]; ok {
+			t.Fatalf("%s input carries reply_to that does not address this secretary: %+v", name, in.Payload)
+		}
+	}
+	if inputs[2].Payload["message_change"] != "edited" || inputs[3].Payload["message_change"] != "deleted" {
+		t.Fatalf("change kinds = %q / %q", inputs[2].Payload["message_change"], inputs[3].Payload["message_change"])
+	}
+}
+
+// The reply that actually answers the secretary's own message keeps reply
+// attention through later edits, and its tombstone keeps the reply_to
+// provenance naming the secretary's parent message.
+func TestSharedIntakeEditOfReplyToSecretaryKeepsReplyAttention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newFollowupsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "セクレタリーの質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Content: "回答します", ReplyTo: question.MessageID,
+		ClientNonce: "fu-addressed-reply",
+	})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain reply: %+v %v", stats, err)
+	}
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後の回答", reply.Revision); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain edit: %+v %v", stats, err)
+	}
+	if _, err := replier.DeleteMessage(ctx, ch.PlaceID, reply.MessageID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain delete: %+v %v", stats, err)
+	}
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 3 {
+		t.Fatalf("inputs = %d, want reply + edit + tombstone", len(inputs))
+	}
+	edit := inputs[1]
+	if edit.Payload["message_change"] != "edited" || edit.Payload["message_id"] != reply.MessageID ||
+		edit.Payload["reply_to_message_id"] != question.MessageID || edit.Attention != "reply" {
+		t.Fatalf("edit input = %+v", edit)
+	}
+	tombstone := inputs[2]
+	if tombstone.Payload["message_change"] != "deleted" ||
+		tombstone.Payload["reply_to_message_id"] != question.MessageID || tombstone.Attention != "observe" {
+		t.Fatalf("tombstone input = %+v", tombstone)
+	}
+}
+
+// The legacy agentevents adapter cannot represent edited/deleted events:
+// they fail clear into a terminal unsupported_route suppression instead of
+// degrading into an unmarked external_event or retrying forever.
+func TestSharedIntakeLegacyGatewayFailsClearOnChangeEvents(t *testing.T) {
+	gateway := &AgentAttentionGateway{}
+	_, _, err := gateway.input(AgentAttentionEvent{Change: AttentionChangeDeleted})
+	if !errors.Is(err, errUnsupportedAttentionEvent) {
+		t.Fatalf("deleted event input() = %v", err)
+	}
+	if _, _, err := gateway.input(AgentAttentionEvent{Change: AttentionChangeEdited}); !errors.Is(err, errUnsupportedAttentionEvent) {
+		t.Fatalf("edited event input() = %v", err)
+	}
+	if reason, terminal := terminalDeliveryReason(err); !terminal || reason != "unsupported_route" {
+		t.Fatalf("terminalDeliveryReason = %q,%v", reason, terminal)
+	}
+	if _, _, err := gateway.input(AgentAttentionEvent{}); errors.Is(err, errUnsupportedAttentionEvent) {
+		t.Fatal("plain event must not hit the change guard")
 	}
 }
 

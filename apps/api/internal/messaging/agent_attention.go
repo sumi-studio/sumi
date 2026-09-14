@@ -260,6 +260,19 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 			}
 		}
 	}
+	// reply_to on an event means "this message answers yours" — it is bound
+	// to the parent author at append time, never a generic provenance copy.
+	// An ambient recipient's change event must not inherit it: being a reply
+	// does not make the reply address every observer.
+	var parentAuthor ParticipantRef
+	if message.ReplyTo != "" {
+		err := tx.QueryRow(ctx, `SELECT author_kind, author_id FROM messages
+			WHERE place_id = $1 AND message_id = $2`,
+			place.PlaceID, message.ReplyTo).Scan(&parentAuthor.Kind, &parentAuthor.ID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+	}
 	for _, decision := range recipients {
 		if decision.Participant == s.Scope.Actor {
 			continue // the actor already knows what it changed
@@ -277,7 +290,15 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		event.Kind, event.PersonalityAgentID = AgentAttentionMessage, decision.Participant.ID
 		event.Change, event.Reason = change, decision.Reason
 		event.OccurredAt = changedAt
-		event.ReplyToMessageID = message.ReplyTo
+		if parentAuthor.Kind == KindPersonalityAgent && parentAuthor == decision.Participant {
+			event.ReplyToMessageID = message.ReplyTo
+			// Mirror the append rule: reply attention is re-authorized
+			// against the parent only when it stands on its own (an
+			// independent notification reason already survives the
+			// parent's disappearance). A tombstone never depends on the
+			// parent still being there.
+			event.ReplyRequired = change == AttentionChangeEdited && decision.Reason == ""
+		}
 		if change == AttentionChangeDeleted {
 			event.Content = ""
 		} else {
@@ -568,6 +589,8 @@ func terminalDeliveryReason(err error) (string, bool) {
 		return "recipient_transferred", true
 	case errors.Is(err, errAttentionInputConflict):
 		return "input_conflict", true
+	case errors.Is(err, errUnsupportedAttentionEvent):
+		return "unsupported_route", true
 	}
 	return "", false
 }
