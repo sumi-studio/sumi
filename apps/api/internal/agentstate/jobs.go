@@ -183,47 +183,59 @@ func (s *Store) SubmitJob(ctx context.Context, personaID, jobID, kind string, re
 // submitJobTx is the insert-or-replay core shared by the API route and the
 // job.start tool effect (which runs inside the operation claim transaction).
 func (s *Store) submitJobTx(ctx context.Context, tx pgx.Tx, personaID, jobID, kind string, request map[string]any, createdBy string) (Job, bool, error) {
-	var j Job
-	err := tx.QueryRow(ctx, `
-		INSERT INTO core_jobs (persona_id, job_id, kind, request, status, created_by)
-		SELECT $1::uuidv7, $2, $3, $4, 'queued', $5
-		FROM core_personas WHERE persona_id = $1::uuidv7
-		ON CONFLICT (persona_id, job_id) DO NOTHING
-		RETURNING `+jobCols,
-		personaID, jobID, kind, request, createdBy).
-		Scan(&j.PersonaID, &j.JobID, &j.Kind, &j.Request, &j.Status,
-			&j.ClaimedBy, &j.ClaimExpiresAt, &j.CreatedBy, &j.CreatedAt,
-			&j.StartedAt, &j.FinishedAt, &j.CancelRequestedAt, &j.Result,
-			&j.Error, &j.NotifiedAt)
+	// Share-lock the persona row, the same rule SubmitInput follows: a
+	// transfer seal holds it FOR NO KEY UPDATE while it checks for in-flight
+	// jobs, so a submit either lands before the seal's check (and the seal
+	// then refuses) or sees the sealed authority and is refused — a queued
+	// job can never slip between the check and the commit. Replays of an
+	// existing job stay answerable in every authority, like input receipts.
+	var authority string
+	err := tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1 FOR SHARE`,
+		personaID).Scan(&authority)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_personas WHERE persona_id = $1)`,
-			personaID).Scan(&exists); err != nil {
-			return Job{}, false, err
-		}
-		if !exists {
-			return Job{}, false, ErrPersonaNotFound
-		}
+		return Job{}, false, ErrPersonaNotFound
+	}
+	if err != nil {
+		return Job{}, false, dataErr(err)
+	}
+	var j Job
+	err = pgx.ErrNoRows
+	if authority == "active" {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO core_jobs (persona_id, job_id, kind, request, status, created_by)
+			SELECT $1::uuidv7, $2, $3, $4, 'queued', $5
+			FROM core_personas WHERE persona_id = $1::uuidv7
+			ON CONFLICT (persona_id, job_id) DO NOTHING
+			RETURNING `+jobCols,
+			personaID, jobID, kind, request, createdBy).
+			Scan(&j.PersonaID, &j.JobID, &j.Kind, &j.Request, &j.Status,
+				&j.ClaimedBy, &j.ClaimExpiresAt, &j.CreatedBy, &j.CreatedAt,
+				&j.StartedAt, &j.FinishedAt, &j.CancelRequestedAt, &j.Result,
+				&j.Error, &j.NotifiedAt)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
 		// Replay is only valid when every caller-supplied field matches the
 		// stored request — an idempotent retry, not a different job.
 		var same bool
 		if err := tx.QueryRow(ctx, `
 			SELECT kind = $3 AND request = $4::jsonb
 			FROM core_jobs WHERE persona_id = $1 AND job_id = $2`,
-			personaID, jobID, kind, request).Scan(&same); err != nil {
+			personaID, jobID, kind, request).Scan(&same); err == nil {
+			if !same {
+				return Job{}, false, fmt.Errorf("%w: job_id replay carries a different request", ErrJobConflict)
+			}
+			stored, err := scanJob(tx.QueryRow(ctx,
+				`SELECT `+jobCols+` FROM core_jobs WHERE persona_id = $1 AND job_id = $2`,
+				personaID, jobID))
+			if err != nil {
+				return Job{}, false, err
+			}
+			return stored, false, nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return Job{}, false, err
 		}
-		if !same {
-			return Job{}, false, fmt.Errorf("%w: job_id replay carries a different request", ErrJobConflict)
-		}
-		stored, err := scanJob(tx.QueryRow(ctx,
-			`SELECT `+jobCols+` FROM core_jobs WHERE persona_id = $1 AND job_id = $2`,
-			personaID, jobID))
-		if err != nil {
-			return Job{}, false, err
-		}
-		return stored, false, nil
+		return Job{}, false, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
 	}
 	if err != nil {
 		return Job{}, false, fmt.Errorf("submit job: %w", dataErr(err))
@@ -524,14 +536,20 @@ func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds
 		}
 	}
 
+	// The claim is gated on the persona being active: submission and the
+	// transfer seal are serialized so no claimable job can exist on a
+	// non-active persona, and this predicate keeps that true even if one
+	// ever does — a sealed or transferred placement must not start work.
 	rows, err = tx.Query(ctx, `
 		UPDATE core_jobs SET status = 'running', claimed_by = $2,
 			claim_expires_at = now() + $4::interval,
 			started_at = COALESCE(started_at, now())
 		WHERE (persona_id, job_id) IN (
-			SELECT persona_id, job_id FROM core_jobs
-			WHERE persona_id = $1 AND status = 'queued' AND kind = ANY($3::text[])
-			ORDER BY created_at, job_id LIMIT $5 FOR UPDATE SKIP LOCKED
+			SELECT j.persona_id, j.job_id FROM core_jobs j
+			WHERE j.persona_id = $1 AND j.status = 'queued' AND j.kind = ANY($3::text[])
+				AND EXISTS (SELECT 1 FROM core_personas p
+				            WHERE p.persona_id = j.persona_id AND p.authority = 'active')
+			ORDER BY j.created_at, j.job_id LIMIT $5 FOR UPDATE SKIP LOCKED
 		)
 		RETURNING `+jobCols,
 		personaID, runnerID, kinds, lease, limit)

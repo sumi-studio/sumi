@@ -164,7 +164,7 @@ func storeError(w http.ResponseWriter, err error) {
 		errors.Is(err, ErrJobNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
-		errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed):
+		errors.Is(err, ErrPersonaInactive), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
 		writeError(w, http.StatusBadRequest, err.Error())

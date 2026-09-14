@@ -77,6 +77,9 @@ jobs:
       - name: Run workerd smoke (local wrangler dev + real state service)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
 
+      - name: Run Local→Cloud transfer e2e (two state services, two PostgreSQL databases)
+        run: corepack pnpm --filter @sumi/agent-core test:e2e:portable
+
       # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
       # real model calls or secrets, no Cloudflare deployment, no remote
       # database. The workerd smoke exercises the Durable Object wake path via

@@ -21,6 +21,12 @@ Three separate authorities, deliberately not conflated:
   choose an idempotency key, so a replayed claim can never mint a second
   job. Direct API submissions carry a caller-chosen `job_id` with
   identical-replay / divergent-conflict semantics.
+- **Placement** — a job is bound to the placement that queued it. Submission
+  share-locks the persona row and requires `authority = 'active'` — the same
+  rule as inputs — so a secretary mid-transfer cannot accept work its move
+  would strand, and a claim only ever starts a job for an active persona.
+  `core_jobs` rows are never carried by a transfer; the seal refuses while
+  any job is non-terminal (docs/agent/portable-state.md).
 
 ## Lifecycle
 

@@ -39,6 +39,10 @@ var (
 	ErrOpNotFound      = errors.New("operation not found")
 	ErrUnknownTool     = errors.New("unknown tool")
 	ErrBadRequest      = errors.New("bad request")
+	// ErrPersonaInactive: the persona is sealed for, staged by, or already
+	// moved by a transfer (internal/portable), so this placement may not run
+	// it or accept new inputs for it.
+	ErrPersonaInactive = errors.New("persona is not active in this placement")
 )
 
 // dataErr maps deterministic PostgreSQL data errors — class 22 data
@@ -85,6 +89,9 @@ type Persona struct {
 	HumanID     *string   `json:"human_id"`
 	DisplayName string    `json:"display_name"`
 	CreatedAt   time.Time `json:"created_at"`
+	// Authority is active, sealed, staged or transferred (migration 0049).
+	Authority  string  `json:"authority"`
+	TransferID *string `json:"transfer_id"`
 }
 
 type WriterLease struct {
@@ -280,11 +287,18 @@ func NewStore(pool *pgxpool.Pool) *Store {
 // requireGeneration locks the writer lease row and verifies the presented
 // generation. Holding the row lock for the rest of the transaction also
 // serializes mutations from callers sharing one generation.
+//
+// The persona's placement authority is part of the fence: a sealed, staged or
+// transferred persona admits no mutation even under a matching generation, so
+// a staged import can never be driven by a caller that guesses its epoch.
 func requireGeneration(ctx context.Context, tx pgx.Tx, personaID string, generation int64) error {
 	var current int64
+	var authority string
 	err := tx.QueryRow(ctx,
-		`SELECT generation FROM core_writer_leases WHERE persona_id = $1 FOR UPDATE`,
-		personaID).Scan(&current)
+		`SELECT l.generation, p.authority
+		 FROM core_writer_leases l JOIN core_personas p ON p.persona_id = l.persona_id
+		 WHERE l.persona_id = $1 FOR UPDATE OF l`,
+		personaID).Scan(&current, &authority)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrGenerationFence
 	}
@@ -293,6 +307,9 @@ func requireGeneration(ctx context.Context, tx pgx.Tx, personaID string, generat
 	}
 	if current != generation {
 		return ErrGenerationFence
+	}
+	if authority != "active" {
+		return fmt.Errorf("%w: persona authority is %s", ErrGenerationFence, authority)
 	}
 	return nil
 }
@@ -303,13 +320,13 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 		INSERT INTO core_personas (persona_id, human_id, display_name)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (persona_id) DO NOTHING
-		RETURNING persona_id, human_id, display_name, created_at`,
+		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id`,
 		personaID, humanID, displayName).
-		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt)
+		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = s.pool.QueryRow(ctx,
-			`SELECT persona_id, human_id, display_name, created_at FROM core_personas WHERE persona_id = $1`,
-			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt)
+			`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return p, false, ErrPersonaNotFound
 		}
@@ -324,8 +341,9 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaState, error) {
 	var st PersonaState
 	err := s.pool.QueryRow(ctx,
-		`SELECT persona_id, human_id, display_name, created_at FROM core_personas WHERE persona_id = $1`,
-		personaID).Scan(&st.Persona.PersonaID, &st.Persona.HumanID, &st.Persona.DisplayName, &st.Persona.CreatedAt)
+		`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
+		personaID).Scan(&st.Persona.PersonaID, &st.Persona.HumanID, &st.Persona.DisplayName, &st.Persona.CreatedAt,
+		&st.Persona.Authority, &st.Persona.TransferID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, ErrPersonaNotFound
 	}
@@ -368,12 +386,15 @@ func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaStat
 }
 
 // AcquireWriter takes the persona writer lease when free, expired, or already
-// held by the same holder, returning the new fencing generation.
+// held by the same holder, returning the new fencing generation. Only an
+// active persona can be acquired; a transfer seal also parks the lease on a
+// far-future expiry, so a concurrent acquire cannot slip past the seal.
 func (s *Store) AcquireWriter(ctx context.Context, personaID, holderID string, ttl time.Duration) (WriterLease, error) {
 	var lease WriterLease
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO core_writer_leases (persona_id, generation, holder_id, expires_at)
-		SELECT $1::uuidv7, 1, $2, now() + $3::interval FROM core_personas WHERE persona_id = $1::uuidv7
+		SELECT $1::uuidv7, 1, $2, now() + $3::interval FROM core_personas
+		WHERE persona_id = $1::uuidv7 AND authority = 'active'
 		ON CONFLICT (persona_id) DO UPDATE SET
 			generation  = core_writer_leases.generation + 1,
 			holder_id   = EXCLUDED.holder_id,
@@ -385,14 +406,18 @@ func (s *Store) AcquireWriter(ctx context.Context, personaID, holderID string, t
 		personaID, holderID, ttl).
 		Scan(&lease.PersonaID, &lease.Generation, &lease.HolderID, &lease.AcquiredAt, &lease.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if err := s.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_personas WHERE persona_id = $1)`,
-			personaID).Scan(&exists); err != nil {
+		var authority string
+		err := s.pool.QueryRow(ctx,
+			`SELECT authority FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&authority)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return lease, ErrPersonaNotFound
+		}
+		if err != nil {
 			return lease, err
 		}
-		if !exists {
-			return lease, ErrPersonaNotFound
+		if authority != "active" {
+			return lease, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
 		}
 		return lease, ErrWriterHeld
 	}
@@ -423,10 +448,12 @@ func (s *Store) RenewWriter(ctx context.Context, personaID, holderID string, gen
 // the generation must be monotonic per persona, so the next acquire goes
 // through the ON CONFLICT path and returns generation+1. A deleted row
 // would restart generation at 1 and admit a stale holder's in-flight
-// mutation under the recycled fencing token.
+// mutation under the recycled fencing token. The expiry is a fixed past
+// instant, not now(): a now()-written "dead" marker can look live to a
+// later transaction after the host clock steps backward.
 func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, generation int64) error {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE core_writer_leases SET expires_at = now()
+		`UPDATE core_writer_leases SET expires_at = 'epoch'::timestamptz
 		 WHERE persona_id = $1 AND generation = $2 AND holder_id = $3`,
 		personaID, generation, holderID)
 	if err != nil {
@@ -483,30 +510,39 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		return Input{}, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Share-lock the persona row: a transfer seal updates it, so a new input
+	// either commits before the seal (and is inside the export cut) or sees
+	// the new authority and is refused. Refusal is explicit — the ingress
+	// still holds the input — never a silent drop. Replays of an accepted
+	// input stay answerable in every authority.
+	var authority string
+	err = tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1 FOR SHARE`,
+		in.PersonaID).Scan(&authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Input{}, false, ErrPersonaNotFound
+	}
+	if err != nil {
+		return Input{}, false, dataErr(err)
+	}
 	var stored Input
-	err = tx.QueryRow(ctx, `
+	err = pgx.ErrNoRows
+	if authority == "active" {
+		err = tx.QueryRow(ctx, `
 		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id,
 			source_surface, thread_id, occurred_at, attention, status)
 		SELECT $1::uuidv7, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued'
 		FROM core_personas WHERE persona_id = $1::uuidv7
 		ON CONFLICT (persona_id, input_id) DO NOTHING
 		RETURNING `+inputCols,
-		in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
-		in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).
-		Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
-			&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
-			&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
-			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore)
+			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
+			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).
+			Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
+				&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
+				&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
+				&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		err = tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_personas WHERE persona_id = $1)`, in.PersonaID).Scan(&exists)
-		if err != nil {
-			return Input{}, false, err
-		}
-		if !exists {
-			return Input{}, false, ErrPersonaNotFound
-		}
 		// Replay of an existing input_id is only valid when every caller-
 		// supplied field matches what was stored — an idempotent retry, not
 		// a different input claiming the same id.
@@ -518,6 +554,9 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 			FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
 			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
 			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).Scan(&same)
+		if errors.Is(err, pgx.ErrNoRows) && authority != "active" {
+			return Input{}, false, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
+		}
 		if err != nil {
 			return Input{}, false, err
 		}
