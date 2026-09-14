@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -154,12 +153,124 @@ func rowLines(t *testing.T, p placement, personaID string) []byte {
 	if _, err := writeRows(ctx, tx, personaID, &buf); err != nil {
 		t.Fatalf("write rows: %v", err)
 	}
-	// admission_seq is destination-allocated on import, so normalize it
-	// before comparing a source's rows to a destination's.
-	return admissionSeqRe.ReplaceAll(buf.Bytes(), []byte(`"admission_seq":0`))
+	// admission_seq is destination-allocated on import, so normalize it out
+	// of each row's data before comparing a source's rows to a destination's.
+	// The comparison decodes each row instead of matching the bundle's byte
+	// shape, so a change in how PostgreSQL renders jsonb cannot silently
+	// disable it — TestImportIntoPopulatedDestinationKeepsAdmissionOrder
+	// compares across placements whose identity values genuinely differ and
+	// fails if no carried value is normalized.
+	var out bytes.Buffer
+	for _, line := range bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n")) {
+		var row rowRecord
+		if err := strictDecode(line, &row); err != nil {
+			t.Fatalf("bundle line does not decode: %v", err)
+		}
+		if col, ok := identityCols[row.Table]; ok {
+			row.Data = replaceField(t, row.Data, col, json.RawMessage(`0`))
+		}
+		enc, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Write(enc)
+		out.WriteByte('\n')
+	}
+	return out.Bytes()
 }
 
-var admissionSeqRe = regexp.MustCompile(`"admission_seq":\d+`)
+// replaceField returns data with one field's value swapped, preserving the
+// other fields byte-for-byte.
+func replaceField(t *testing.T, data json.RawMessage, name string, v json.RawMessage) json.RawMessage {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("row data is not a JSON object: %v", err)
+	}
+	if _, ok := fields[name]; !ok {
+		t.Fatalf("row data lacks field %s", name)
+	}
+	fields[name] = v
+	enc, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return enc
+}
+
+// rewriteBundleAdmissionSeqs returns a copy of bundle with each core_inputs
+// row's carried admission_seq replaced by seqs[i] in bundle order and the
+// trailer's digest recomputed over the new content, so the rewritten bundle
+// still passes import verification. It fails the test if the bundle carries
+// a different number of identity rows than len(seqs), if a rewritten row
+// does not carry the intended value, or if the result is byte-identical —
+// a change in the bundle's byte shape must never turn this into a no-op
+// that imports the original small values.
+func rewriteBundleAdmissionSeqs(t *testing.T, bundle []byte, seqs []int64) []byte {
+	t.Helper()
+	lines := bytes.Split(bundle, []byte("\n"))
+	if len(lines[len(lines)-1]) != 0 {
+		t.Fatal("bundle does not end with a newline")
+	}
+	lines = lines[:len(lines)-1]
+	var trailer Trailer
+	if err := strictDecode(lines[len(lines)-1], &trailer); err != nil || trailer.Record != "trailer" {
+		t.Fatalf("last bundle line is not a trailer: %v", err)
+	}
+	h := sha256.New()
+	var out bytes.Buffer
+	n := 0
+	for _, line := range lines[:len(lines)-1] {
+		var kind struct {
+			Record string `json:"record"`
+		}
+		if err := json.Unmarshal(line, &kind); err != nil {
+			t.Fatalf("malformed bundle line: %v", err)
+		}
+		if kind.Record == "row" {
+			var row rowRecord
+			if err := strictDecode(line, &row); err != nil {
+				t.Fatalf("row line: %v", err)
+			}
+			if col, ok := identityCols[row.Table]; ok {
+				if n >= len(seqs) {
+					t.Fatalf("bundle carries more %s.%s rows than the %d replacement values",
+						row.Table, col, len(seqs))
+				}
+				row.Data = replaceField(t, row.Data, col,
+					json.RawMessage(fmt.Sprintf("%d", seqs[n])))
+				var carried int64
+				if err := unmarshalField(row.Data, col, &carried); err != nil || carried != seqs[n] {
+					t.Fatalf("rewritten row carries %d, want %d: %v", carried, seqs[n], err)
+				}
+				var err error
+				line, err = json.Marshal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				n++
+			}
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	if n != len(seqs) {
+		t.Fatalf("rewrote %d identity values, want %d — the bundle's row shape changed", n, len(seqs))
+	}
+	trailer.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(trailer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(tl)
+	out.WriteByte('\n')
+	if bytes.Equal(out.Bytes(), bundle) {
+		t.Fatal("rewritten bundle is byte-identical to the original — the rewrite did not apply")
+	}
+	return out.Bytes()
+}
 
 func notesWithText(t *testing.T, p placement, personaID, text string) int {
 	t.Helper()
@@ -1493,6 +1604,13 @@ func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 	if fmt.Sprint(order) != "[m-1 m-2]" {
 		t.Fatalf("destination claim order %v, want [m-1 m-2]", order)
 	}
+	// Every other column carried verbatim across a populated destination.
+	// The source's admission_seq values (1, 2) and the destination's rebased
+	// ones genuinely differ here, so this comparison fails unless rowLines
+	// actually normalizes the identity column out of the row data.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
 
 	// The next admission to the staying persona orders after everything.
 	submit(t, cloud, other, "post-import", "after the move")
@@ -1525,18 +1643,17 @@ func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 	// A bundle carrying huge admission_seq values — e.g. exported from a
 	// long-lived multi-persona source — costs a bounded number of sequence
 	// allocations: one per carried row, independent of the numeric gap.
-	// (The values are rewritten in the bundle here to stand in for a source
-	// sequence that ran far ahead; carried-shape checks still apply.)
+	// rewriteBundleAdmissionSeqs decodes each row, swaps the carried value,
+	// and recomputes the trailer digest, so the ~4e9 values below are what
+	// the importer actually checks and stages — it fails rather than degrade
+	// to a no-op if the bundle's byte shape changes.
 	big := newID(t)
 	must(drop(local.state.EnsurePersona(ctx, big, nil, "Long-lived secretary")))
 	submit(t, local, big, "b-1", "old input")
 	submit(t, local, big, "b-2", "newer input")
 	must(local.svc.Seal(ctx, big, "move-big", placementID(t, cloud)))
 	bigBundle, _ := exportBytes(t, local, big, "move-big")
-	bigBundle = bytes.ReplaceAll(bigBundle,
-		[]byte(`"admission_seq":3`), []byte(`"admission_seq":4000000003`))
-	bigBundle = bytes.ReplaceAll(bigBundle,
-		[]byte(`"admission_seq":4`), []byte(`"admission_seq":4000000004`))
+	bigBundle = rewriteBundleAdmissionSeqs(t, bigBundle, []int64{4000000003, 4000000004})
 	before, _ = seqPos()
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bigBundle), &humanID); err != nil || !created {
 		t.Fatalf("big-seq import: created=%v err=%v", created, err)
