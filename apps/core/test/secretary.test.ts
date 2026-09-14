@@ -783,6 +783,8 @@ test("assemble and journal render message change updates, not rewrites", () => {
     created_at: new Date().toISOString(),
     done_at: null,
     not_before: null,
+    waiting_since: null,
+    waited_ms: 0,
   };
   const messages = assemble(journaled, tombstone);
   assert.equal(
