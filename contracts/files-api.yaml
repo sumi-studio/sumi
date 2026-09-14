@@ -23,7 +23,11 @@ info:
     mount the path actually resolves to (correct under mount stacking and
     MOVE_MOUNT_BENEATH), the mount must be mounted at that path and at the
     JuiceFS root "/" — subdirectory binds are refused because their .config
-    is a regular file, not daemon metadata. A known allowlist of
+    is a regular file, not daemon metadata. The /.config read is also
+    pinned to the verified mount: statx MNT_ID must match the root's, so a
+    file bind-mounted over it cannot forge zero timeouts. Requires kernel
+    >= 5.8 for STATX_MNT_ID; when the kernel cannot identify the mount the
+    gate fails closed with mount_unavailable. A known allowlist of
     kernel-coherent local filesystems (ext4, xfs, tmpfs, ...) passes;
     other FUSE and network filesystems are refused. REQUIRE_MOUNT=0
     disables the gate for simple local operation.

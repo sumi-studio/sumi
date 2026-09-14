@@ -140,11 +140,13 @@ func mountVerdict(visible mountInfoEntry, root string) error {
 //
 // A fuse.juicefs mount must be mounted at its root (not a subdirectory
 // bind, where a forged regular .config could stand in for daemon metadata)
-// and must prove zero metadata caching through the /.config control file
-// (synthesized by the JuiceFS daemon — not a regular file in the
-// namespace). Other FUSE types are refused as unverifiable, as are network
-// filesystems (nfs/cifs/etc. have their own client-side attribute caches
-// we cannot inspect). Only known kernel-coherent local filesystems pass.
+// and must prove zero metadata caching through the /.config control file.
+// /.config is verified to be served by the same mount as the root (equal
+// statx MNT_ID), so a file bind-mounted over it cannot substitute forged
+// timeouts for the daemon-synthesized values. Other FUSE types are
+// refused as unverifiable, as are network filesystems (nfs/cifs/etc.
+// have their own client-side attribute caches we cannot inspect). Only
+// known kernel-coherent local filesystems pass.
 // Fail closed by default, because the CAS fingerprint gate reads through
 // this mount and a nonzero attr cache silently re-opens the B1 clobber
 // window.
@@ -167,7 +169,21 @@ func (p *posixRoot) checkMount() error {
 		return err
 	}
 	if visible.fstype == "fuse.juicefs" {
-		return checkZeroMetadataCache(filepath.Join(p.root, ".config"))
+		// The .config we inspect must be served by the same verified
+		// mount — a file bind-mounted over it carries its own mount ID
+		// and could present forged zero timeouts (whispering-cardboard
+		// cfgbind finding).
+		cfgPath := filepath.Join(p.root, ".config")
+		var cstx unix.Statx_t
+		if err := unix.Statx(unix.AT_FDCWD, cfgPath,
+			unix.AT_STATX_DONT_SYNC, unix.STATX_MNT_ID, &cstx); err != nil {
+			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
+		}
+		if cstx.Mask&unix.STATX_MNT_ID == 0 || cstx.Mnt_id != stx.Mnt_id {
+			return fmt.Errorf("%w: .config is not served by the verified mount",
+				ErrMountPolicy)
+		}
+		return checkZeroMetadataCache(cfgPath)
 	}
 	return nil
 }
