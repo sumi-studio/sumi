@@ -947,9 +947,9 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'superseded'),
 			COUNT(*) FILTER (WHERE status = 'preparing'
-				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= clock_timestamp()))),
-			MIN(CASE WHEN status = 'preparing' THEN clock_timestamp()
-				WHEN status = 'sealed' THEN GREATEST(COALESCE(not_before, clock_timestamp()), clock_timestamp()) END),
+				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= statement_timestamp()))),
+			MIN(CASE WHEN status = 'preparing' THEN statement_timestamp()
+				WHEN status = 'sealed' THEN GREATEST(COALESCE(not_before, statement_timestamp()), statement_timestamp()) END),
 			COALESCE(MAX(last_seq), 0)
 		FROM core_memory_chunks WHERE persona_id = $1`, personaID).
 		Scan(&st.LiveRawTokens, &st.AppliedTokens, &st.Sealed, &st.Preparing,
@@ -1044,7 +1044,7 @@ func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generati
 		WHERE (persona_id, chunk_seq) = (
 			SELECT persona_id, chunk_seq FROM core_memory_chunks
 			WHERE persona_id = $1 AND status = 'sealed'
-				AND (not_before IS NULL OR not_before <= clock_timestamp())
+				AND (not_before IS NULL OR not_before <= statement_timestamp())
 			ORDER BY chunk_seq LIMIT 1 FOR UPDATE)
 		RETURNING `+chunkCols, personaID, generation))
 	if errors.Is(err, ErrChunkNotFound) {
