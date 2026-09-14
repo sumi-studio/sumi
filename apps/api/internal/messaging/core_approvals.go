@@ -2,11 +2,8 @@ package messaging
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strings"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -77,6 +74,8 @@ func (s *CoreApprovalsServer) session(w http.ResponseWriter, r *http.Request) (a
 }
 
 func (s *CoreApprovalsServer) serveList(w http.ResponseWriter, r *http.Request) {
+	// Another person's approvals must never sit in a shared cache.
+	w.Header().Set("Cache-Control", "no-store")
 	claims, ok := s.session(w, r)
 	if !ok {
 		return
@@ -98,21 +97,14 @@ type approvalDecisionBody struct {
 }
 
 func (s *CoreApprovalsServer) serveDecision(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	claims, ok := s.session(w, r)
 	if !ok {
 		return
 	}
 	approvalID := r.PathValue("approval")
 	var body approvalDecisionBody
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "read body")
-		return
-	}
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	record, err := s.Core.ApprovalByID(r.Context(), approvalID)

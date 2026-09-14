@@ -269,6 +269,66 @@ func TestCoreApprovalDecisionAuthority(t *testing.T) {
 	_ = readJSON(t, resp)
 }
 
+// Private approval responses must not sit in shared caches, and a decision
+// body is exactly one JSON value — trailing data is rejected before the
+// decision is recorded.
+func TestCoreApprovalsResponseHygiene(t *testing.T) {
+	ctx := context.Background()
+	cw := newCoreApprovalWorld(t, ctx)
+	a := cw.parkAgentApproval(t, ctx)
+
+	resp := approvalRequest(t, cw.ts, http.MethodGet, "/me/approvals", cw.humanA.ID, "")
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("GET Cache-Control = %q", got)
+	}
+	_ = readJSON(t, resp)
+
+	// Trailing bytes after the decision object are not part of it.
+	path := "/me/approvals/" + a.ApprovalID + "/decision"
+	resp = approvalRequest(t, cw.ts, http.MethodPost, path, cw.humanA.ID,
+		`{"decision":"approve_once","decision_id":"d-tg"} {"extra":true}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("trailing-garbage status = %d", resp.StatusCode)
+	}
+	_ = readJSON(t, resp)
+	resp = approvalRequest(t, cw.ts, http.MethodPost, path, cw.humanA.ID,
+		`{"decision":"approve_once","decision_id":"d-tg2"}garbage`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("raw-garbage status = %d", resp.StatusCode)
+	}
+	_ = readJSON(t, resp)
+
+	// Rejected bodies recorded nothing: the approval is still pending and no
+	// decision landed durably.
+	current, err := cw.core.ApprovalByID(ctx, a.ApprovalID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if current.Status != "pending" || current.Decision != nil {
+		t.Fatalf("approval after rejected bodies = %+v", current)
+	}
+	outbox, err := cw.core.Outbox(ctx, cw.agent.ID, 0, 50)
+	if err != nil {
+		t.Fatalf("outbox: %v", err)
+	}
+	for _, entry := range outbox {
+		if entry.Kind == "secretary_message" {
+			t.Fatalf("rejected decision produced an outbox effect: %+v", entry)
+		}
+	}
+
+	// A clean decision still lands and also carries no-store.
+	resp = approvalRequest(t, cw.ts, http.MethodPost, path, cw.humanA.ID,
+		`{"decision":"approve_once","decision_id":"d-ok"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("clean decision status = %d body=%v", resp.StatusCode, readJSON(t, resp))
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("POST Cache-Control = %q", got)
+	}
+	_ = readJSON(t, resp)
+}
+
 // The parked→decided nudge reaches only the deciding human's live Messaging
 // subscribers — other members of the same Workspace see nothing.
 func TestCoreApprovalChangedFanout(t *testing.T) {

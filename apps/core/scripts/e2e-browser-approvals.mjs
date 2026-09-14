@@ -170,12 +170,14 @@ async function req(method, path, { token, cookie, origin } = {}, body) {
   if (origin) headers.Origin = origin;
   const res = await fetch(BASE + path, {
     method, headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? undefined
+      : typeof body === "string" ? body : JSON.stringify(body),
   });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* non-JSON */ }
-  return { status: res.status, json, text };
+  return { status: res.status, json, text,
+    cacheControl: res.headers.get("cache-control") };
 }
 
 // Bind the core persona to human A under the secretary's identity — the same
@@ -234,6 +236,8 @@ once("park");
 
 let inboxA = await inbox(cookieA);
 assert(inboxA.status === 200, `inbox ${inboxA.status}: ${inboxA.text}`);
+assert(inboxA.cacheControl === "no-store",
+  `private inbox must not be cacheable (got ${inboxA.cacheControl})`);
 let rowsA = inboxA.json.approvals.filter((a) => a.input_id === inA);
 assert(rowsA.length === 1 && rowsA[0].status === "pending" &&
   rowsA[0].tool === "message.send" && rowsA[0].secretary_name === "E2E Secretary" &&
@@ -256,8 +260,20 @@ assert((await req("POST", `/me/approvals/${approvalA}/decision`,
   { decision: "approve_once", decision_id: "d-x" })).status === 403,
   "cross-origin decision must be refused");
 
+// A decision body is exactly one JSON value — trailing data is a 400 and
+// records nothing (the approval stays pending).
+assert((await req("POST", `/me/approvals/${approvalA}/decision`,
+  { cookie: cookieA, origin: BASE },
+  `{"decision":"approve_once","decision_id":"d-tg"} {"extra":1}`)).status === 400,
+  "a decision body with trailing JSON must be rejected");
+inboxA = await inbox(cookieA);
+assert(inboxA.json.approvals.find((a) => a.approval_id === approvalA)?.status === "pending",
+  "rejected trailing-JSON body must not record a decision");
+
 // The bound human approves; the decision is one-shot and idempotent.
 const approved = await decide(cookieA, approvalA, "approve_once", "d-1");
+assert(approved.cacheControl === "no-store",
+  `decision response must not be cacheable (got ${approved.cacheControl})`);
 assert(approved.status === 200 && approved.json.approval.status === "approved" &&
   approved.json.approval.decided_by_id === HUMAN_A,
   `approve: ${approved.status} ${approved.text}`);

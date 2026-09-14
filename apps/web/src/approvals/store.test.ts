@@ -32,6 +32,16 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("core approvals store", () => {
   beforeEach(() => {
     useCoreApprovals.getState().reset();
@@ -162,6 +172,78 @@ describe("core approvals store", () => {
 
     release(jsonResponse(200, { approval: approval({ status: "approved" }) }));
     await first;
+  });
+
+  it("does not resurrect a resolved card from a predecision refresh", async () => {
+    const staleList = deferred<Response>();
+    const decideResp = deferred<Response>();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockImplementationOnce(() => decideResp.promise)
+      .mockImplementationOnce(() => staleList.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useCoreApprovals.getState().refresh();
+    const pending = useCoreApprovals.getState().pending[0];
+
+    const deciding = useCoreApprovals
+      .getState()
+      .decide(pending, "approve_once");
+    // Issued while the decision is in flight; its snapshot predates it.
+    const lateRefresh = useCoreApprovals.getState().refresh();
+
+    decideResp.resolve(
+      jsonResponse(200, {
+        approval: approval({
+          status: "approved",
+          decision: "approve_once",
+          decided_at: "2026-09-15T01:00:00Z",
+        }),
+      }),
+    );
+    await deciding;
+    expect(useCoreApprovals.getState().resolved[0].status).toBe("approved");
+
+    // The older snapshot must not regress the committed decision.
+    staleList.resolve(jsonResponse(200, { approvals: [approval()] }));
+    await lateRefresh;
+    const s = useCoreApprovals.getState();
+    expect(s.pending).toHaveLength(0);
+    expect(s.resolved[0].status).toBe("approved");
+    expect(s.deciding["a-1"]).toBeUndefined();
+  });
+
+  it("discards an older refresh that lands after a newer one", async () => {
+    const first = deferred<Response>();
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const inflightOld = useCoreApprovals.getState().refresh();
+    await useCoreApprovals.getState().refresh();
+    expect(useCoreApprovals.getState().pending).toHaveLength(1);
+
+    // The earlier-issued response arrives last; the newer inbox stands.
+    first.resolve(jsonResponse(200, { approvals: [] }));
+    await inflightOld;
+    expect(useCoreApprovals.getState().pending).toHaveLength(1);
+    expect(useCoreApprovals.getState().status).toBe("ready");
+  });
+
+  it("reports a failed first load as error, not as a truthful empty", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(503, { error: "unavailable" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useCoreApprovals.getState().refresh();
+    const s = useCoreApprovals.getState();
+    expect(s.status).toBe("error");
+    expect(s.pending).toHaveLength(0);
+    expect(s.resolved).toHaveLength(0);
   });
 
   it("converges on the server record after a conflict", async () => {

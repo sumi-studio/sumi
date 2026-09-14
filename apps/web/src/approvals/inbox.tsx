@@ -1,3 +1,12 @@
+import {
+  Confirmation,
+  ConfirmationAccepted,
+  ConfirmationAction,
+  ConfirmationActions,
+  ConfirmationRejected,
+  ConfirmationRequest,
+  ConfirmationTitle,
+} from "@sumi/ui/ai-elements/confirmation";
 import { Button } from "@sumi/ui/components/button";
 import {
   Popover,
@@ -9,15 +18,6 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@sumi/ui/components/tooltip";
-import {
-  Confirmation,
-  ConfirmationAccepted,
-  ConfirmationAction,
-  ConfirmationActions,
-  ConfirmationRejected,
-  ConfirmationRequest,
-  ConfirmationTitle,
-} from "@sumi/ui/ai-elements/confirmation";
 import { Link } from "@tanstack/react-router";
 import { ShieldCheck } from "lucide-react";
 import { useEffect } from "react";
@@ -27,19 +27,20 @@ import { useCoreApprovals } from "./store";
 const POLL_INTERVAL_MS = 30_000;
 
 /**
- * Keeps the durable approval inbox converged while the shell is mounted:
+ * Keeps the durable approval inbox converged for one signed-in human:
  * initial read, slow poll, and refresh on focus/visibility. The live
  * `core_approval_changed` socket event refreshes it promptly; these fallbacks
  * cover a lost event or a decision committed by another tab.
+ *
+ * accountID is the session human — when it changes or the inbox unmounts
+ * (logout, account replacement) the cleanup resets the store, ending that
+ * account's ownership and fencing every continuation it left in flight.
  */
-function useApprovalsSync(enabled: boolean) {
+function useApprovalsSync(accountID: string) {
   const refresh = useCoreApprovals((state) => state.refresh);
   const reset = useCoreApprovals((state) => state.reset);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A changed accountID must end the previous human's ownership of the inbox.
   useEffect(() => {
-    if (!enabled) {
-      reset();
-      return;
-    }
     void refresh();
     const interval = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
     const onVisible = () => {
@@ -51,13 +52,15 @@ function useApprovalsSync(enabled: boolean) {
       window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
+      reset();
     };
-  }, [enabled, refresh, reset]);
+  }, [accountID, refresh, reset]);
 }
 
 /** Rail entry point for the session human's secretary approval inbox. */
-export function CoreApprovalsInbox() {
-  useApprovalsSync(true);
+export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
+  useApprovalsSync(accountID);
+  const status = useCoreApprovals((state) => state.status);
   const pending = useCoreApprovals((state) => state.pending);
   const resolved = useCoreApprovals((state) => state.resolved);
   const pendingCount = pending.length;
@@ -75,7 +78,9 @@ export function CoreApprovalsInbox() {
                   aria-label={
                     pendingCount > 0
                       ? `承認待ち ${pendingCount} 件`
-                      : "承認待ちはありません"
+                      : status === "ready"
+                        ? "承認待ちはありません"
+                        : "承認"
                   }
                   className="relative size-10"
                 />
@@ -101,7 +106,13 @@ export function CoreApprovalsInbox() {
         <p className="px-2 py-1 font-medium text-muted-foreground text-xs">
           承認
         </p>
-        {pending.length === 0 ? (
+        {status !== "ready" && pending.length === 0 ? (
+          <p className="px-2 py-3 text-muted-foreground text-sm">
+            {status === "error"
+              ? "承認の一覧を読み込めませんでした。"
+              : "読み込み中…"}
+          </p>
+        ) : pending.length === 0 ? (
           <p className="px-2 py-3 text-muted-foreground text-sm">
             承認待ちはありません
           </p>

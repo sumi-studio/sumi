@@ -16,6 +16,16 @@ import type { ApprovalDecision, CoreApproval } from "./model";
  * decision_id to the approval until it resolves: a retried send after a lost
  * response replays the recorded decision on the server instead of minting a
  * conflicting command.
+ *
+ * Two fences keep asynchronous continuations honest:
+ * - inboxEpoch bounds every continuation to the account/session lifetime
+ *   that issued it. reset() — run when the inbox unmounts on logout or the
+ *   signed-in human changes — invalidates in-flight refreshes and decisions,
+ *   so a late response can never write another person's rows or errors.
+ * - commitVersion orders commits inside one lifetime: a refresh only writes
+ *   its snapshot if nothing newer (a decision result or another refresh)
+ *   committed since it was issued, so a pre-decision snapshot cannot
+ *   resurrect a resolved card or erase newer state.
  */
 export type ApprovalsStatus = "idle" | "loading" | "ready" | "error";
 
@@ -36,6 +46,9 @@ interface ApprovalsState {
 // unanswered decision: a lost response's retry must carry the identical id.
 const decisionIDs = new Map<string, string>();
 
+let inboxEpoch = 0;
+let commitVersion = 0;
+
 function sortResolved(approvals: CoreApproval[]): CoreApproval[] {
   return [...approvals].sort((a, b) =>
     (b.decided_at ?? "").localeCompare(a.decided_at ?? ""),
@@ -50,21 +63,32 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   decisionErrors: {},
 
   async refresh() {
+    const epoch = inboxEpoch;
+    const version = commitVersion;
+    // A first (or post-error) load is honestly "loading", never "empty".
+    if (get().status !== "ready") set({ status: "loading" });
     let approvals: CoreApproval[];
     try {
       approvals = await listCoreApprovals();
     } catch (error) {
+      if (epoch !== inboxEpoch || version !== commitVersion) return;
       // A dead session is not a transient blip — clear the inbox so a stale
       // pending card is never left looking decidable.
       if (error instanceof ApprovalsAPIError && error.status === 401) {
+        commitVersion++;
         set({ status: "error", pending: [], resolved: [] });
         return;
       }
+      // A transient failure keeps last-known-good data; only a load with
+      // nothing honest to show reports an error instead of a fake "empty".
+      commitVersion++;
       set((state) => ({
-        status: state.status === "idle" ? "error" : state.status,
+        status: state.status === "ready" ? "ready" : "error",
       }));
       return;
     }
+    if (epoch !== inboxEpoch || version !== commitVersion) return;
+    commitVersion++;
     const pending = approvals.filter((a) => a.status === "pending");
     const live = new Set(pending.map((a) => a.approval_id));
     for (const id of [...decisionIDs.keys()]) {
@@ -81,6 +105,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   },
 
   async decide(approval, decision) {
+    const epoch = inboxEpoch;
     const state = get();
     if (state.deciding[approval.approval_id]) return;
     if (approval.status !== "pending") return;
@@ -99,6 +124,8 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
         decision,
         decisionId,
       );
+      if (epoch !== inboxEpoch) return;
+      commitVersion++;
       decisionIDs.delete(approval.approval_id);
       set((s) => ({
         pending: s.pending.filter(
@@ -106,13 +133,13 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
         ),
         resolved: sortResolved([
           resolved,
-          ...s.resolved.filter(
-            (a) => a.approval_id !== approval.approval_id,
-          ),
+          ...s.resolved.filter((a) => a.approval_id !== approval.approval_id),
         ]),
         deciding: omitKey(s.deciding, approval.approval_id),
       }));
     } catch (error) {
+      if (epoch !== inboxEpoch) return;
+      commitVersion++;
       const code =
         error instanceof ApprovalsAPIError ? error.code : "network_error";
       const status = error instanceof ApprovalsAPIError ? error.status : 0;
@@ -123,7 +150,12 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
           [approval.approval_id]: code,
         },
       }));
-      if (status === 401 || status === 403 || status === 404 || status === 409) {
+      if (
+        status === 401 ||
+        status === 403 ||
+        status === 404 ||
+        status === 409
+      ) {
         // The durable record moved without this tab — converge on it.
         await get().refresh();
       }
@@ -131,6 +163,8 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   },
 
   reset() {
+    inboxEpoch++;
+    commitVersion++;
     decisionIDs.clear();
     set({
       status: "idle",
