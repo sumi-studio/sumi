@@ -9233,6 +9233,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unarmed_admission_hook_does_not_park_durable_admission() {
+        // Regression guard for the shutdown-test deadlock: a hook installed
+        // only to observe the post-commit cancel barrier must not arm the
+        // registration/delivery pauses. Those pauses wait inside
+        // admit_ordered_commit — the first while it still holds the pump
+        // lock — so an implicitly armed pause parked the admission on a
+        // notify nobody sent and blocked orderly teardown behind the same
+        // lock.
+        let store = Arc::new(
+            Store::session_test_store("admission-hook-unarmed")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook {
+            pause_after_post_commit_delivery_cancel: true,
+            ..seams::DurableAdmissionHook::default()
+        };
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+        let epoch = DeliveryEpoch::for_test("admission-hook-unarmed");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = adapter
+            .install_delivery_epoch(epoch, 0, events, pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("delivery epoch installs");
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+        let capability = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+        let admission = tokio::time::timeout(
+            Duration::from_secs(1),
+            adapter.admit_ordered_commit(&capability, 1),
+        )
+        .await
+        .expect("an unarmed admission hook must not park the admission")
+        .expect("durable admission succeeds");
+        assert_eq!(
+            admission,
+            session::DurableEventAdmission::Enqueued { epoch }
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        let delivered = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("durable frame reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&delivered.2).unwrap(), 1);
+        assert_eq!(delivered.0, epoch);
+
+        adapter.set_durable_admission_hook(None);
+        adapter.invalidate_delivery_epoch(epoch).await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("forwarder terminates")
+            .expect("forwarder joins");
+    }
+
+    #[tokio::test]
+    async fn armed_registration_pause_holds_pump_lock_until_released() {
+        // Mechanism proof for the deadlock the unarmed hook now avoids: while
+        // an admission waits on allow_registration it still holds the pump
+        // lock, so a concurrent acquisition — finish_runtime's epoch
+        // cancellation path — cannot run until the pause is released.
+        let store = Arc::new(
+            Store::session_test_store("admission-hook-armed")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone())
+            .bind_delivery_authorization(DeliveryAuthorization::Raw)
+            .unwrap();
+        let hook = seams::DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            ..seams::DurableAdmissionHook::default()
+        };
+        adapter.set_durable_admission_hook(Some(hook.clone()));
+        let epoch = DeliveryEpoch::for_test("admission-hook-armed");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (_online_tx, online) = watch::channel(true);
+        let events = EventSender {
+            tx: event_tx,
+            online,
+        };
+        let pump_cancel = CancellationToken::new();
+        let runtime = adapter
+            .install_delivery_epoch(epoch, 0, events, pump_cancel.child_token())
+            .await
+            .unwrap()
+            .expect("delivery epoch installs");
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+
+        let admit_adapter = adapter.clone();
+        let admission = tokio::spawn(async move {
+            let capability = PostCommitEpochCapability::unbound_test(CancellationToken::new());
+            admit_adapter.admit_ordered_commit(&capability, 1).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.reserved.notified())
+            .await
+            .expect("admission reaches the armed registration pause");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), adapter.active_delivery_epoch())
+                .await
+                .is_err(),
+            "the armed registration pause must still hold the pump lock"
+        );
+        hook.allow_registration.notify_one();
+        let admission = tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .expect("released admission completes")
+            .expect("admission task joins")
+            .expect("durable admission succeeds");
+        assert_eq!(
+            admission,
+            session::DurableEventAdmission::Enqueued { epoch }
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("durable frame reaches T24")
+            .expect("T24 lane remains open");
+        assert_eq!(outbound_frame_event_seq(&delivered.2).unwrap(), 1);
+
+        adapter.set_durable_admission_hook(None);
+        adapter.invalidate_delivery_epoch(epoch).await.unwrap();
+        pump_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), runtime.join())
+            .await
+            .expect("forwarder terminates")
+            .expect("forwarder joins");
+    }
+
+    #[tokio::test]
     async fn redaction_only_store_adapter_replays_and_delivers_projection_without_volatiles() {
         let store = Arc::new(
             Store::session_test_store("t17-t24-redaction-only")
@@ -9692,7 +9834,11 @@ mod tests {
         let base_adapter = seams::T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
-        let hook = seams::DurableAdmissionHook::default();
+        let hook = seams::DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            pause_before_durable_delivery: true,
+            ..seams::DurableAdmissionHook::default()
+        };
         base_adapter.set_durable_admission_hook(Some(hook.clone()));
 
         let epoch = DeliveryEpoch::for_test("t26-exact-order");
@@ -9846,7 +9992,11 @@ mod tests {
         let base_adapter = seams::T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
-        let hook = seams::DurableAdmissionHook::default();
+        let hook = seams::DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            pause_before_durable_delivery: true,
+            ..seams::DurableAdmissionHook::default()
+        };
         base_adapter.set_durable_admission_hook(Some(hook.clone()));
 
         let epoch = DeliveryEpoch::for_test("atomic-admission-old");
@@ -10059,7 +10209,11 @@ mod tests {
         let adapter = seams::T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
-        let hook = seams::DurableAdmissionHook::default();
+        let hook = seams::DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            pause_before_durable_delivery: true,
+            ..seams::DurableAdmissionHook::default()
+        };
         adapter.set_durable_admission_hook(Some(hook.clone()));
         let epoch = DeliveryEpoch::for_test("emergency-fence-cleanup");
         let (event_tx, mut event_rx) = mpsc::channel(1);

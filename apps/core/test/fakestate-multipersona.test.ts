@@ -122,3 +122,96 @@ test("fake-state: commit dedups input_received like the Go store", async () => {
   );
   assert.equal(after.length, 2);
 });
+
+// f-memory-86 parity: a receipt naming an input that does not exist is
+// refused by the commit — nothing is journaled, and the same commit works
+// once the input exists (matching the Go store's rejection contract).
+test("fake-state: commit rejects receipt for absent input, retry works", async () => {
+  const s = new FakeState();
+  s.addPersona(PA);
+  s.addInput(PA, "in-1", "one");
+  const g = (await s.acquireWriter(PA, "h", 60_000)).generation;
+  await s.loadTurn(PA, g, "t-1", 50);
+  await assert.rejects(
+    s.commitTurn(PA, "t-1", g, {
+      outcome: "complete",
+      events: [
+        {
+          kind: "input_received",
+          payload: { input_id: "in-1", kind: "message", text: "one" },
+        },
+        {
+          kind: "input_received",
+          payload: { input_id: "ghost-1", kind: "message", text: "early" },
+        },
+      ],
+      output: { text: "ok" },
+    }),
+    /absent input/,
+  );
+  assert.equal((await s.events(PA, 0)).length, 0, "refusal journals nothing");
+  s.addInput(PA, "ghost-1", "arrived late");
+  await s.commitTurn(PA, "t-1", g, {
+    outcome: "complete",
+    events: [
+      {
+        kind: "input_received",
+        payload: { input_id: "in-1", kind: "message", text: "one" },
+      },
+      {
+        kind: "input_received",
+        payload: { input_id: "ghost-1", kind: "message", text: "arrived late" },
+      },
+      { kind: "assistant_message", payload: { text: "done" } },
+    ],
+    output: { text: "done" },
+  });
+  const receipts = (await s.events(PA, 0)).filter(
+    (e) => e.kind === "input_received",
+  );
+  assert.equal(receipts.length, 2);
+});
+
+// f-memory-87 parity: input_id is a string — the documented input-ID type.
+// Non-string identities (numeric, null, missing, object) refuse the commit;
+// the fake does not emulate PostgreSQL `->>` text forms for malformed ids.
+test("fake-state: commit rejects non-string input_id receipts", async () => {
+  const s = new FakeState();
+  s.addPersona(PA);
+  s.addInput(PA, "5", "five");
+  const g = (await s.acquireWriter(PA, "h", 60_000)).generation;
+  await s.loadTurn(PA, g, "t-1", 50);
+  for (const bad of [5, null, undefined, { a: 1 }, true, ""]) {
+    await assert.rejects(
+      s.commitTurn(PA, "t-1", g, {
+        outcome: "complete",
+        events: [
+          {
+            kind: "input_received",
+            payload: { input_id: "5", kind: "message", text: "five" },
+          },
+          { kind: "input_received", payload: { input_id: bad } },
+        ],
+        output: { text: "ok" },
+      }),
+      /input_id/,
+      `malformed input_id ${JSON.stringify(bad)} must refuse`,
+    );
+  }
+  assert.equal((await s.events(PA, 0)).length, 0, "refusals journal nothing");
+  await s.commitTurn(PA, "t-1", g, {
+    outcome: "complete",
+    events: [
+      {
+        kind: "input_received",
+        payload: { input_id: "5", kind: "message", text: "five" },
+      },
+      { kind: "assistant_message", payload: { text: "ok" } },
+    ],
+    output: { text: "ok" },
+  });
+  const receipts = (await s.events(PA, 0)).filter(
+    (e) => e.kind === "input_received",
+  );
+  assert.equal(receipts.length, 1);
+});
