@@ -117,11 +117,23 @@ func lockHuman(ctx context.Context, tx pgx.Tx, human string) error {
 	return tx.QueryRow(ctx, "SELECT human_id::text FROM humans WHERE human_id=$1 FOR UPDATE", human).Scan(&id)
 }
 func (s *Store) Save(ctx context.Context, human, id string, in Input) (Connection, error) {
-	if !s.CredentialsAvailable() {
-		return Connection{}, ErrUnavailable
-	}
 	if err := Validate(in); err != nil {
 		return Connection{}, err
+	}
+	return s.save(ctx, human, id, in)
+}
+
+// SaveUnchecked is Save without transport validation — for dev/test
+// harnesses (state-dev fixture seeding) that must point a connection at a
+// loopback stub. The credential is still sealed through the armed store;
+// an unarmed store refuses.
+func (s *Store) SaveUnchecked(ctx context.Context, human, id string, in Input) (Connection, error) {
+	return s.save(ctx, human, id, in)
+}
+
+func (s *Store) save(ctx context.Context, human, id string, in Input) (Connection, error) {
+	if !s.CredentialsAvailable() {
+		return Connection{}, ErrUnavailable
 	}
 	create := id == ""
 	if create {
@@ -295,6 +307,13 @@ func (s *Store) Metadata(ctx context.Context, human, id string) (Access, error) 
 	if !s.CredentialsAvailable() {
 		return Access{}, ErrUnavailable
 	}
+	return s.Describe(ctx, human, id)
+}
+
+// Describe returns non-secret connection metadata (identity, preset,
+// endpoint, model, version) without requiring the credential key — a
+// metadata-only store can still describe the selection authoritatively.
+func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) {
 	parsed, err := uuid.Parse(id)
 	if err != nil {
 		return Access{}, ErrNotFound

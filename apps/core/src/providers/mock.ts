@@ -5,10 +5,12 @@ import type { ModelEvent, ModelProvider, ModelRequest } from "../provider.ts";
  * coverage only; it is not a stand-in for a real model acceptance run.
  *
  * Directives parsed from the input text (`payload.text` of the latest input):
- *   "!<tool> <json-args>"  → one tool call, e.g.
+ *   "!<tool> <json-args>"  → one normal-route tool call, e.g.
  *     !journal.note {"text":"remember x"}
  *     !schedule.set {"wake_at":"+500", "payload":{"note":"ping"}}
  *       ("+N" means N milliseconds from now)
+ *   "!elevated <tool> <json-args>" → the same call on the elevated route
+ *     (the model asking the human for a one-shot approval, ADR 0013 §1)
  *   "!slow <ms> <text>"    → delay before answering (used to kill mid-turn)
  *   anything else          → echo reply text
  *
@@ -30,7 +32,11 @@ export class MockProvider implements ModelProvider {
     // the marker so `!tool` still parses.
     const text = lastUserText(request).replace(/^\[[^\]]*\]\s*/, "");
     let reply = `echo: ${text}`;
-    const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
+    const toolCalls: {
+      name: string;
+      route: "normal" | "elevated";
+      args: Record<string, unknown>;
+    }[] = [];
 
     const slow = request.round === 0 ? /^!slow\s+(\d+)\s*(.*)$/s.exec(text) : null;
     if (slow) {
@@ -38,10 +44,11 @@ export class MockProvider implements ModelProvider {
       await waitWithSignal(delay, request.signal);
       reply = `echo: ${slow[2] ?? ""}`;
     } else if (request.round === 0 && text.startsWith("!")) {
-      const m = /^!(\S+)\s+(.+)$/s.exec(text);
+      const m = /^!(elevated\s+)?(\S+)\s+(.+)$/s.exec(text);
       if (m) {
-        const name = m[1] ?? "";
-        const raw = m[2];
+        const route = m[1] ? "elevated" : "normal";
+        const name = m[2] ?? "";
+        const raw = m[3];
         try {
           const args = JSON.parse(raw ?? "{}") as Record<string, unknown>;
           if (
@@ -56,8 +63,8 @@ export class MockProvider implements ModelProvider {
           if (!("schedule_id" in args) && name === "schedule.set") {
             args.schedule_id = `sched-${request.turnId}`;
           }
-          toolCalls.push({ name, args });
-          reply = `tool:${name}`;
+          toolCalls.push({ name, route, args });
+          reply = `tool:${route}:${name}`;
         } catch {
           reply = `echo: unparseable tool args`;
         }
@@ -74,6 +81,7 @@ export class MockProvider implements ModelProvider {
         call: {
           id: `call-${call.name}-0`,
           name: call.name,
+          route: call.route,
           arguments: call.args,
         },
       };

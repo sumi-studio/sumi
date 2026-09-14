@@ -1,4 +1,6 @@
 import type {
+  Approval,
+  ApprovalDecision,
   ClaimedMemoryChunk,
   CommitRequest,
   Event,
@@ -7,6 +9,7 @@ import type {
   LoadResult,
   MemoryChunk,
   MemoryStatus,
+  ModelBinding,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -110,6 +113,12 @@ export interface StateClient {
    * effect identity server-side (input_id + call_index) and verifies the
    * claimed (tool, request) equals the recorded call at that flat position
    * across all plan rounds — a caller never supplies an idempotency key.
+   *
+   * A gated call (intrinsic tool requirement or elevated route, ADR 0013)
+   * parks instead of running: the returned operation is
+   * "awaiting_approval" and `approval` carries the durable pending record.
+   * After the human approves, the next claim of the same position executes
+   * exactly once; after denial the claim replays the durable failure.
    */
   claimOperation(
     persona: string,
@@ -121,7 +130,32 @@ export interface StateClient {
       callIndex: number;
       request: Record<string, unknown>;
     },
-  ): Promise<{ operation: Operation; fresh: boolean }>;
+  ): Promise<{
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  }>;
+  /**
+   * Pending tool approvals for the persona — the human decision surface.
+   * Passing `approvalId` fetches one record.
+   */
+  listApprovals(persona: string, approvalId?: string): Promise<Approval[]>;
+  /**
+   * The authenticated human's one-shot decision on an approval. Identical
+   * replays (same decision_id) return the stored record; a different
+   * decision after the fact is rejected.
+   */
+  resolveApproval(
+    persona: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): Promise<Approval>;
+  /**
+   * The persona's resolved model binding — the user-selected connection's
+   * identity and model. Authoritative: the core must use exactly this
+   * binding or report it unavailable; never substitute another provider.
+   */
+  modelBinding(persona: string): Promise<ModelBinding>;
   completeOperation(
     persona: string,
     operationId: string,
@@ -183,6 +217,12 @@ export interface StateClient {
     afterSeq: number,
     limit?: number,
   ): Promise<OutboxEntry[]>;
+  /**
+   * The tools this store can actually execute for the persona — internal
+   * tools plus host-registered delegated effects (e.g. messaging.send only
+   * when Messaging is wired). The core offers the model exactly this set.
+   */
+  listTools(persona: string): Promise<string[]>;
   personaState(persona: string): Promise<PersonaState>;
   /**
    * Record a background job for later runner claiming. Idempotent on
@@ -441,7 +481,11 @@ export class HttpStateClient implements StateClient {
     // No client idempotency_key: effect identity is server-derived
     // (input_id + call_index) so a caller can never choose a fresh key
     // for an already-decided position.
-    return this.call<{ operation: Operation; fresh: boolean }>(
+    return this.call<{
+      operation: Operation;
+      approval: Approval | null;
+      fresh: boolean;
+    }>(
       "POST",
       `/internal/core/personas/${persona}/operations/claim`,
       {
@@ -452,6 +496,38 @@ export class HttpStateClient implements StateClient {
         call_index: op.callIndex,
         request: op.request,
       },
+    );
+  }
+  async listApprovals(persona: string, approvalId?: string) {
+    if (approvalId) {
+      const one = await this.call<{ approval: Approval }>(
+        "GET",
+        `/internal/core/personas/${persona}/approvals/${encodeURIComponent(approvalId)}`,
+      );
+      return [one.approval];
+    }
+    const res = await this.call<{ approvals: Approval[] }>(
+      "GET",
+      `/internal/core/personas/${persona}/approvals`,
+    );
+    return res.approvals;
+  }
+  async resolveApproval(
+    persona: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+  ) {
+    const res = await this.call<{ approval: Approval }>(
+      "POST",
+      `/internal/core/personas/${persona}/approvals/${approvalId}/decision`,
+      decision as unknown as Record<string, unknown>,
+    );
+    return res.approval;
+  }
+  modelBinding(persona: string) {
+    return this.call<ModelBinding>(
+      "GET",
+      `/internal/core/personas/${persona}/model`,
     );
   }
   async completeOperation(
@@ -537,6 +613,13 @@ export class HttpStateClient implements StateClient {
       `/internal/core/personas/${persona}/outbox?after_seq=${afterSeq}&limit=${limit}`,
     );
     return res.outbox;
+  }
+  async listTools(persona: string) {
+    const res = await this.call<{ tools: string[] }>(
+      "GET",
+      `/internal/core/personas/${persona}/tools`,
+    );
+    return res.tools;
   }
   personaState(persona: string) {
     return this.call<PersonaState>(
