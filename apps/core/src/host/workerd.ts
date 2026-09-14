@@ -30,7 +30,10 @@
  * result, and stops at the lifetime end otherwise — a stop records nothing,
  * so the state service counts an interruption rather than a failed attempt.
  * After a drain that left preparation waiting, the alarm is armed for when
- * it can start (at least 1s ahead).
+ * it can start (at least 1s ahead). When the model layer reports itself
+ * unavailable the secretary shelves memory work for a pause interval, so
+ * this wake rests on the shelf/heartbeat cadence — an unbound persona does
+ * not spin claim/probe/release at the 1s floor.
  *
  * Env bindings (worker config):
  *   SUMI_STATE_URL    — base URL of the Go state service
@@ -44,6 +47,8 @@
  *                       (default and maximum 14min, under the 15min limit)
  *   SUMI_MEMORY_PREPARATION_TIMEOUT_MS — bound on one preparation branch
  *                       (default 10min; clamped to fit the alarm lifetime)
+ *   SUMI_MEMORY_UNAVAILABLE_PAUSE_MS — shelf for pending memory while the
+ *                       model layer is unusable (default 30s)
  *   SECRETARY         — Durable Object namespace binding
  * Persona capability tokens are provisioned per-persona via the admin
  * surface (POST /internal/core/personas) — the worker stores them in its
@@ -212,6 +217,11 @@ export class SecretaryObject {
       pollIntervalMs: 0,
       scheduleEveryMs: 1_000,
       memoryPreparationTimeoutMs: this.memoryPreparationTimeoutMs(),
+      memoryUnavailablePauseMs: this.envMs(
+        "SUMI_MEMORY_UNAVAILABLE_PAUSE_MS",
+        1_000,
+        30_000,
+      ),
       idgen: () => crypto.randomUUID(),
     });
   }

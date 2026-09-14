@@ -62,6 +62,9 @@ async function main() {
     memoryPreparationTimeoutMs: process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS
       ? Number(process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS)
       : undefined,
+    memoryUnavailablePauseMs: process.env.SUMI_MEMORY_UNAVAILABLE_PAUSE_MS
+      ? Number(process.env.SUMI_MEMORY_UNAVAILABLE_PAUSE_MS)
+      : undefined,
     idgen: () => crypto.randomUUID(),
     log: (msg, fields) =>
       console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),
