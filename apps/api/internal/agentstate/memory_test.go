@@ -128,18 +128,33 @@ func TestMemorySealClaimComplete(t *testing.T) {
 	if len(claimed.Context.Events) != 4 {
 		t.Fatalf("parent context events: %d", len(claimed.Context.Events))
 	}
-	if claimed.Chunk.Attempts != 1 {
-		t.Fatalf("attempts: %d", claimed.Chunk.Attempts)
+	// A claim spends nothing: attempts count recorded failures only.
+	if claimed.Chunk.Attempts != 0 || claimed.Chunk.Interruptions != 0 || claimed.Chunk.ClaimedAt == nil {
+		t.Fatalf("fresh claim accounting: %+v", claimed.Chunk)
 	}
 
 	// One preparation branch at a time: a repeated claim (the first
-	// response lost) re-claims the same chunk rather than opening a second.
+	// response lost) counts the orphaned claim as an interruption, paces it,
+	// and never opens a second branch or spends an attempt.
 	again, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
-	if again.Chunk == nil || again.Chunk.ChunkSeq != 1 || again.Chunk.Attempts != 2 {
-		t.Fatalf("second claim should re-claim chunk 1: %+v", again.Chunk)
+	if again.Chunk != nil {
+		t.Fatalf("orphaned claim must be paced, not re-claimed at once: %+v", again.Chunk)
+	}
+	c1, err := s.chunk(ctx, s.pool, pa, 1)
+	if err != nil || c1.Status != "sealed" || c1.Interruptions != 1 || c1.Attempts != 0 ||
+		c1.NotBefore == nil || !c1.NotBefore.After(time.Now()) {
+		t.Fatalf("interrupted claim: %+v %v", c1, err)
+	}
+	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Claimable != 0 || st.NextClaimableAt == nil {
+		t.Fatalf("status while paced: %+v %v", st, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	again, err = s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || again.Chunk == nil || again.Chunk.ChunkSeq != 1 || again.Chunk.Attempts != 0 {
+		t.Fatalf("claim after pacing: %+v %v", again.Chunk, err)
 	}
 	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Preparing != 1 || st.Sealed != 0 {
 		t.Fatalf("status after re-claim: %+v %v", st, err)
@@ -305,14 +320,16 @@ func TestMemoryRecoverResealsStalePreparing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chunk: %v", err)
 	}
-	if c.Status != "sealed" {
-		t.Fatalf("stale preparing chunk not resealed: %+v", c)
+	// The lost claim is an interruption, not a failed attempt.
+	if c.Status != "sealed" || c.Interruptions != 1 || c.Attempts != 0 || c.ClaimedGeneration != nil {
+		t.Fatalf("stale preparing chunk not resealed as an interruption: %+v", c)
 	}
 	// The dead generation's outcome can no longer land.
 	if _, err := s.CompleteMemoryChunk(ctx, pa, gen1, 1, "late", false); !errors.Is(err, ErrGenerationFence) {
 		t.Fatalf("fenced complete: %v", err)
 	}
-	// The new generation prepares it instead.
+	// The new generation prepares it instead, once the short pacing passes.
+	time.Sleep(300 * time.Millisecond)
 	re, err := s.ClaimMemoryChunk(ctx, pa, gen2, 50)
 	if err != nil || re.Chunk == nil {
 		t.Fatalf("reclaim: %v", err)
@@ -753,8 +770,9 @@ func TestMemoryRenderedContextByCapacity(t *testing.T) {
 
 // A claim whose response was lost, or a branch stopped mid-preparation,
 // leaves the chunk 'preparing' under the live generation. The next claim
-// re-claims it instead of stalling preparation until a restart; interrupted
-// attempts still spend the budget and end visibly as 'failed'.
+// counts it as an interruption and paces it instead of stalling preparation
+// until a restart. Interruptions never spend the failure budget; their own
+// bound ends a host that dies on every claim visibly as 'failed'.
 func TestMemoryClaimReclaimsOrphanedPreparing(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
@@ -763,31 +781,45 @@ func TestMemoryClaimReclaimsOrphanedPreparing(t *testing.T) {
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	seedSealed(t, s, pa, gen, 2)
-	for attempt := 1; attempt <= memoryChunkMaxAttempts; attempt++ {
-		claimed, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
-		if err != nil || claimed.Chunk == nil {
-			t.Fatalf("claim %d: %v %+v", attempt, err, claimed)
-		}
-		if claimed.Chunk.ChunkSeq != 1 || claimed.Chunk.Attempts != attempt ||
-			len(claimed.TargetEvents) != 2 {
-			t.Fatalf("claim %d: %+v", attempt, claimed.Chunk)
+	clearBackoff := func() {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE core_memory_chunks SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+			t.Fatalf("clear backoff: %v", err)
 		}
 	}
-	// The re-claimed chunk can still complete under the same generation.
-	st, err := s.MemoryStatus(ctx, pa)
-	if err != nil || st.Preparing != 1 {
-		t.Fatalf("status: %+v %v", st, err)
-	}
-	// One more interrupted claim: budget spent → failed, nothing claimable.
 	claimed, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
-	if err != nil || claimed.Chunk != nil {
-		t.Fatalf("exhausted claim: %v %+v", err, claimed.Chunk)
+	if err != nil || claimed.Chunk == nil || len(claimed.TargetEvents) != 2 {
+		t.Fatalf("first claim: %v %+v", err, claimed)
+	}
+	for i := 1; i <= memoryChunkMaxInterruptions; i++ {
+		// The previous claim never recorded an outcome: the next claim
+		// interrupts it and paces the chunk.
+		n, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+		if err != nil || n.Chunk != nil {
+			t.Fatalf("claim over orphan %d: %v %+v", i, err, n.Chunk)
+		}
+		c, err := s.chunk(ctx, s.pool, pa, 1)
+		if err != nil || c.Interruptions != i || c.Attempts != 0 {
+			t.Fatalf("interruption %d: %+v %v", i, c, err)
+		}
+		if i == memoryChunkMaxInterruptions {
+			break
+		}
+		if c.Status != "sealed" || c.NotBefore == nil {
+			t.Fatalf("interruption %d must reseal with pacing: %+v", i, c)
+		}
+		clearBackoff()
+		re, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+		if err != nil || re.Chunk == nil || re.Chunk.ChunkSeq != 1 || re.Chunk.Attempts != 0 {
+			t.Fatalf("re-claim %d: %v %+v", i, err, re.Chunk)
+		}
 	}
 	c, err := s.chunk(ctx, s.pool, pa, 1)
 	if err != nil {
 		t.Fatalf("chunk: %v", err)
 	}
-	if c.Status != "failed" || c.LastError == nil || !strings.Contains(*c.LastError, "did not finish") {
+	if c.Status != "failed" || c.Attempts != 0 || c.LastError == nil ||
+		!strings.Contains(*c.LastError, "interrupted") {
 		t.Fatalf("exhausted chunk: %+v", c)
 	}
 	if !contextSeqs(loadContext(t, s, pa, gen))[1] {

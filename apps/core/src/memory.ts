@@ -16,11 +16,17 @@
  * exceeds the 40k threshold. Events that arrived after a chunk was sealed —
  * corrections, new experiences — are outside its range and are never
  * touched by application.
+ *
+ * Lifecycle: a branch that ends with an answer or a genuine failure records
+ * it (failures spend the chunk's attempts). A branch stopped by its host or
+ * by losing the writer fence records nothing and makes no further model
+ * call; the state service counts that claim as an interruption instead.
  */
 
 import {
   ModelError,
   type ChatMessage,
+  type ModelEvent,
   type ModelProvider,
   type ToolSpec,
 } from "./provider.ts";
@@ -29,6 +35,7 @@ import type {
   Event,
   MemoryBlock,
   MemoryChunk,
+  OmittedMemory,
   OmittedRange,
 } from "./types.ts";
 import { FencedError, StateError, type StateClient } from "./state-client.ts";
@@ -37,6 +44,12 @@ import { FencedError, StateError, type StateClient } from "./state-client.ts";
 export const L0_CHUNK_MIN_TOKENS = 10_000;
 /** Prepared replacements apply only while live raw estimate exceeds this. */
 export const L0_LIVE_LIMIT_TOKENS = 40_000;
+/**
+ * Default wall-clock bound on one preparation branch. A real-model
+ * preparation has been observed at ~104s; the bound only catches a stream
+ * that never ends, and it is recorded as a retryable failure.
+ */
+export const DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * The L1 preparation instruction — carried over from the previous runtime's
@@ -57,7 +70,8 @@ export const COMPACT_L1_PROMPT =
 
 /** Render one applied memory block the way the previous runtime did: a
  * synthetic context note at the chunk's original position — not a
- * fabricated received message — carrying its re-read source. */
+ * fabricated received message — carrying when its records were made (the
+ * temporal anchor), their journal locator, and its re-read source. */
 export function memoryBlockMessage(block: MemoryBlock): ChatMessage {
   const source = JSON.stringify({
     operation: "read",
@@ -67,7 +81,7 @@ export function memoryBlockMessage(block: MemoryBlock): ChatMessage {
   return {
     role: "user",
     content:
-      `[Memory fragment — journal seq ${block.first_seq} through ${block.last_seq}.]\n` +
+      `[Memory fragment recorded ${block.first_time} through ${block.last_time}; journal seq ${block.first_seq} through ${block.last_seq}.]\n` +
       `Source: conversation_history(${source}). For further pages, pass next_after_seq as after_seq with the same chunk_seq.\n` +
       block.text,
   };
@@ -121,47 +135,60 @@ export function omittedNoticeMessage(om: OmittedRange): ChatMessage {
   };
 }
 
+/** A notice that older applied memory fragments are outside the sent
+ * context because the fragments in context are bounded in size. It names
+ * where they are and how to open their originals; it is not a summary. */
+export function memoryOmittedNoticeMessage(om: OmittedMemory): ChatMessage {
+  const source = JSON.stringify({
+    operation: "read",
+    from_seq: om.first_seq,
+    limit: 5,
+  });
+  const fragments = om.count === 1 ? "fragment" : "fragments";
+  return {
+    role: "user",
+    content:
+      `[${om.count} older memory ${fragments} you organized — journal seq ${om.first_seq} through ${om.last_seq}, recorded ${om.first_time} through ${om.last_time} — are outside your current context because the memory fragments kept in context are limited in size. ` +
+      `The fragments and their original records remain stored; nothing was summarized in their place. Open the original records with conversation_history(${source}).]`,
+  };
+}
+
 /**
  * Render the journal as the model sees it: the raw event window plus applied
  * replacement blocks, each emitted at the position where its covered events
- * were (before the first following event). Blocks whose range ends before
- * the raw window lead the context; a block covering the newest events
- * trails it — in every case the original ordering holds. Raw records left
- * outside the send cap are marked by one notice at their position.
+ * were. Raw records left outside the send cap and applied blocks left
+ * outside the memory cap are each marked by one notice at their position.
+ * Every item is ordered by the first journal seq it stands for, so the
+ * original ordering holds.
  */
 export function renderJournalContext(
   events: Event[],
   memory: MemoryBlock[] = [],
   omitted: OmittedRange | null = null,
+  memoryOmitted: OmittedMemory | null = null,
 ): ChatMessage[] {
-  const messages: ChatMessage[] = [];
-  let bi = 0;
-  const emitBlock = () => {
-    const b = memory[bi];
-    if (!b) return;
-    bi++;
-    messages.push(memoryBlockMessage(b));
-  };
+  const items: { seq: number; message: ChatMessage }[] = [];
+  if (memoryOmitted) {
+    items.push({
+      seq: memoryOmitted.first_seq,
+      message: memoryOmittedNoticeMessage(memoryOmitted),
+    });
+  }
   if (omitted) {
-    while (
-      bi < memory.length &&
-      (memory[bi]?.last_seq ?? 0) < omitted.first_seq
-    ) {
-      emitBlock();
-    }
-    messages.push(omittedNoticeMessage(omitted));
+    items.push({
+      seq: omitted.first_seq,
+      message: omittedNoticeMessage(omitted),
+    });
+  }
+  for (const b of memory) {
+    items.push({ seq: b.first_seq, message: memoryBlockMessage(b) });
   }
   for (const ev of events) {
-    while (bi < memory.length && (memory[bi]?.last_seq ?? 0) < ev.seq) {
-      emitBlock();
-    }
     const m = eventMessage(ev);
-    if (m) messages.push(m);
+    if (m) items.push({ seq: ev.seq, message: m });
   }
-  while (bi < memory.length) {
-    emitBlock();
-  }
-  return messages;
+  // Array sort is stable: ties keep the order pushed above.
+  return items.sort((a, b) => a.seq - b.seq).map((i) => i.message);
 }
 
 /** The compact_target user message: the sealed range's stored events,
@@ -203,9 +230,10 @@ export function branchMessages(
   const messages: ChatMessage[] = [
     { role: "system", content: system },
     ...renderJournalContext(
-      claimed.context.events,
+      claimed.context.events ?? [],
       claimed.context.memory ?? [],
       claimed.context.omitted ?? null,
+      claimed.context.memory_omitted ?? null,
     ),
   ];
   if (claimed.chunk) {
@@ -228,7 +256,13 @@ export interface MemoryPreparationDeps {
   system: string;
   /** The parent's tool definitions; offered unchanged, never executed. */
   tools: ToolSpec[];
+  /**
+   * Aborted when the host stops or the writer fence is lost: the branch
+   * ends at once, records nothing and makes no further model call.
+   */
   signal?: AbortSignal;
+  /** Wall-clock bound on the model call; exceeding it is a recorded failure. */
+  timeoutMs?: number;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -303,6 +337,17 @@ async function recordMemoryOutcome(
         };
         continue;
       }
+      // Any other deterministic rejection (a conflicting stored state) can
+      // never land by retrying: leave the chunk to the state service's
+      // interruption accounting instead of holding the host in a loop.
+      if (e instanceof StateError && e.status < 500 && e.status !== 429) {
+        log("memory outcome rejected; not retried", {
+          chunk_seq: chunkSeq,
+          status: e.status,
+          error: e.message.slice(0, 1024),
+        });
+        return;
+      }
       const wait = Math.min(500 * 2 ** Math.min(attempt, 5), 10_000);
       try {
         await sleep(wait, deps.signal);
@@ -314,19 +359,55 @@ async function recordMemoryOutcome(
 }
 
 /**
+ * Iterate a provider stream, but stop waiting the moment `signal` aborts —
+ * a provider that ignores cancellation must not hold the host's lifetime.
+ */
+async function* untilAborted(
+  stream: AsyncIterable<ModelEvent>,
+  signal: AbortSignal,
+): AsyncGenerator<ModelEvent> {
+  const it = stream[Symbol.asyncIterator]();
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException("aborted", "AbortError"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  aborted.catch(() => {});
+  try {
+    for (;;) {
+      const next = await Promise.race([it.next(), aborted]);
+      if (next.done) return;
+      yield next.value;
+    }
+  } catch (e) {
+    // Let an abandoned provider finish on its own; nothing awaits it.
+    void Promise.resolve(it.return?.()).catch(() => {});
+    throw e;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
  * One preparation branch: claim the oldest sealable chunk, consult the model
  * with the parent's context, then record the verdict. Completing never
  * changes the sent context — application is the state service's separate,
  * threshold-gated step.
  *
- * Never throws except FencedError: every other failure is recorded on the
- * chunk (retryable ones return it to the shelf with backoff; a spent budget
- * marks it 'failed', visible rather than silently skipped).
+ * Never throws except FencedError: every answer or genuine failure is
+ * recorded on the chunk (retryable failures — provider errors, a stream that
+ * ends incomplete, truncated or empty output, the timeout — return it to the
+ * shelf with backoff; a spent budget marks it 'failed', visible rather than
+ * silently skipped). A stop or fence loss records nothing.
  */
 export async function runMemoryPreparation(
   deps: MemoryPreparationDeps,
 ): Promise<void> {
   const { personaId, generation, state, provider } = deps;
+  const log = deps.log ?? (() => {});
+  // A stopped or fenced writer claims nothing and spends no model call.
+  if (deps.signal?.aborted) return;
   const claimed = await state.claimMemoryChunk(
     personaId,
     generation,
@@ -334,41 +415,92 @@ export async function runMemoryPreparation(
   );
   const chunk = claimed.chunk;
   if (!chunk) return;
+  if (deps.signal?.aborted) return;
+
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS;
+  const call = new AbortController();
+  let timedOut = false;
+  const onStop = () => call.abort();
+  deps.signal?.addEventListener("abort", onStop, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    call.abort();
+  }, timeoutMs);
   let text = "";
   let toolCalls = 0;
+  let usage: Record<string, unknown> | null = null;
+  let streamError: unknown = null;
   try {
-    for await (const ev of provider.stream({
+    const stream = provider.stream({
       personaId,
       turnId: `memory-l1-${chunk.chunk_seq}`,
       round: 0,
       messages: branchMessages(claimed, deps.system),
       tools: deps.tools,
-      signal: deps.signal,
-    })) {
+      signal: call.signal,
+    });
+    for await (const ev of untilAborted(stream, call.signal)) {
       if (ev.type === "text") text += ev.delta;
       else if (ev.type === "tool_call") toolCalls++;
+      else usage = ev.usage;
     }
   } catch (e) {
-    // A stop aborts the stream; the chunk stays claimed and the next claim
-    // or generation re-prepares it — an abort is not a model failure.
-    if (deps.signal?.aborted) return;
-    const retryable = !(e instanceof ModelError) || e.retryable;
-    await recordMemoryOutcome(deps, chunk.chunk_seq, {
-      kind: "failed",
-      error: `model: ${(e instanceof Error ? e.message : String(e)).slice(0, 4 * 1024)}`,
-      retryable,
-    });
+    streamError = e;
+  } finally {
+    clearTimeout(timer);
+    deps.signal?.removeEventListener("abort", onStop);
+  }
+
+  if (deps.signal?.aborted) {
+    // Host stop or fence loss: not a model failure. The claim stays
+    // unresolved and the next claim or generation counts an interruption.
+    log("memory preparation interrupted", { chunk_seq: chunk.chunk_seq });
     return;
   }
-  if (deps.signal?.aborted) return;
+  const fail = (error: string, retryable: boolean) =>
+    recordMemoryOutcome(deps, chunk.chunk_seq, {
+      kind: "failed",
+      error,
+      retryable,
+    });
+  if (timedOut) {
+    await fail(`preparation did not finish within ${timeoutMs}ms`, true);
+    return;
+  }
+  if (streamError !== null) {
+    const e = streamError;
+    const retryable = !(e instanceof ModelError) || e.retryable;
+    await fail(
+      `model: ${(e instanceof Error ? e.message : String(e)).slice(0, 4 * 1024)}`,
+      retryable,
+    );
+    return;
+  }
   if (toolCalls > 0) {
     // Tools are offered for an identical prefix but never run here; an
     // output that tried to act instead of replacing is not adopted.
-    await recordMemoryOutcome(deps, chunk.chunk_seq, {
-      kind: "failed",
-      error: `preparation output attempted ${toolCalls} tool call(s); tools are not executed in memory preparation`,
-      retryable: true,
-    });
+    await fail(
+      `preparation output attempted ${toolCalls} tool call(s); tools are not executed in memory preparation`,
+      true,
+    );
+    return;
+  }
+  // Same classification as the previous runtime's compactor: a response
+  // that did not finish normally, or finished empty, is incomplete and
+  // retried within the budget — never adopted, never terminal at once.
+  if (usage === null) {
+    await fail(
+      "incomplete preparation response: stream ended without completion",
+      true,
+    );
+    return;
+  }
+  const finish = usage.finish_reason;
+  if (typeof finish === "string" && finish !== "stop") {
+    await fail(
+      `incomplete preparation response: finish_reason=${finish}`,
+      true,
+    );
     return;
   }
   const trimmed = text.trim();
@@ -377,11 +509,10 @@ export async function runMemoryPreparation(
     return;
   }
   if (!trimmed) {
-    await recordMemoryOutcome(deps, chunk.chunk_seq, {
-      kind: "failed",
-      error: "empty replacement output",
-      retryable: false,
-    });
+    await fail(
+      "incomplete preparation response: empty replacement output",
+      true,
+    );
     return;
   }
   // PG text cannot hold NUL — strip it rather than let an un-storable

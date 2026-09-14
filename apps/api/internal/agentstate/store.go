@@ -251,6 +251,9 @@ type LoadResult struct {
 	// Omitted is the extent of older raw records outside the send cap —
 	// still stored and readable through conversation_history; nil if none.
 	Omitted *OmittedRange `json:"omitted"`
+	// MemoryOmitted is the extent of older applied memory blocks outside
+	// the memory cap — stored, originals readable; nil if none.
+	MemoryOmitted *OmittedMemory `json:"memory_omitted"`
 	// Plan is the input's recorded decision, if one exists — returned on
 	// both the fresh-claim and running-turn replay paths so a retried
 	// attempt continues the recorded plan rather than re-planning.
@@ -811,11 +814,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
 				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 		if errors.Is(err, pgx.ErrNoRows) {
-			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit)
+			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
 			if err != nil {
 				return res, err
 			}
-			res.Context, res.Memory, res.Omitted = rc.Events, rc.Memory, rc.Omitted
+			res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 			if err := tx.Commit(ctx); err != nil {
 				return res, err
 			}
@@ -873,11 +876,18 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			return res, err
 		}
 	}
-	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit)
+	// The turn presents its own input (and its recorded plan re-presents any
+	// mid-turn effects), so records an earlier attempt already journaled for
+	// this input are left out of the rendered history.
+	exclude := ""
+	if res.Input != nil {
+		exclude = res.Input.InputID
+	}
+	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, exclude)
 	if err != nil {
 		return res, err
 	}
-	res.Context, res.Memory, res.Omitted = rc.Events, rc.Memory, rc.Omitted
+	res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -948,8 +958,31 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	if err := s.appendEventsTx(ctx, tx, personaID, turnID, req.Events); err != nil {
+	// Exactly one input_received per input: if a mid-turn effect already
+	// journaled this input (see ensureInputReceived), the turn's own copy is
+	// skipped; otherwise the committed one is remembered as the input's.
+	// commit_request keeps the request as sent, so replays still compare.
+	events, err := withoutJournaledInput(ctx, tx, personaID, t.InputID, req.Events)
+	if err != nil {
+		return nil, err
+	}
+	var base int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM core_events WHERE persona_id = $1`,
+		personaID).Scan(&base); err != nil {
+		return nil, err
+	}
+	if err := s.appendEventsTx(ctx, tx, personaID, turnID, events); err != nil {
 		return nil, dataErr(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_inputs SET received_seq = (
+			SELECT MIN(seq) FROM core_events
+			WHERE persona_id = $1 AND seq > $3 AND kind = 'input_received'
+				AND payload->>'input_id' = $2)
+		WHERE persona_id = $1 AND input_id = $2 AND received_seq IS NULL`,
+		personaID, t.InputID, base); err != nil {
+		return nil, err
 	}
 	switch req.Outcome {
 	case "complete":
@@ -1190,11 +1223,9 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	}
 	// Return memory chunks a fenced generation was preparing to the shelf
 	// so the live generation can reprepare them — the originals never left
-	// the context while preparation ran.
-	if _, err := tx.Exec(ctx, `
-		UPDATE core_memory_chunks SET status = 'sealed', claimed_generation = NULL
-		WHERE persona_id = $1 AND status = 'preparing' AND claimed_generation <> $2`,
-		personaID, generation); err != nil {
+	// the context while preparation ran. The lost claim counts as an
+	// interruption, not a failed attempt.
+	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1231,10 +1262,86 @@ func isInternalTool(tool string) bool {
 	return tool == "schedule.set" || tool == "journal.note" || tool == "conversation_history"
 }
 
+// ensureInputReceived journals the input a turn is serving before a
+// mid-turn effect lands in the journal, so the effect follows its cause in
+// seq order (and in the memory chunk the seal walk cuts at that input). The
+// payload is the one the core commits for the same input. received_seq makes
+// it happen once per input: later effects, retried attempts and the turn's
+// own commit all see the input as already journaled.
+func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, turnID string) error {
+	var received *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&received); err != nil {
+		return fmt.Errorf("input for journal: %w", err)
+	}
+	if received != nil {
+		return nil
+	}
+	in, err := scanInput(tx.QueryRow(ctx,
+		`SELECT `+inputCols+` FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID))
+	if err != nil {
+		return err
+	}
+	var attempt int
+	if err := tx.QueryRow(ctx,
+		`SELECT attempt FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&attempt); err != nil {
+		return err
+	}
+	var text any
+	if t, ok := in.Payload["text"].(string); ok {
+		text = t
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
+		SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, $2, 'input_received', $3
+		FROM core_events WHERE persona_id = $1::uuidv7
+		RETURNING seq`,
+		personaID, turnID, map[string]any{
+			"input_id":       in.InputID,
+			"kind":           in.Kind,
+			"text":           text,
+			"actor_kind":     in.ActorKind,
+			"source_surface": in.SourceSurface,
+			"attempt":        attempt,
+		}).Scan(&seq); err != nil {
+		return fmt.Errorf("journal input: %w", dataErr(err))
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE core_inputs SET received_seq = $3 WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID, seq)
+	return err
+}
+
+// withoutJournaledInput drops the turn's own input_received event when the
+// input is already in the journal.
+func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID, inputID string, events []EventInput) ([]EventInput, error) {
+	var received *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&received); err != nil {
+		return nil, err
+	}
+	if received == nil {
+		return events, nil
+	}
+	out := make([]EventInput, 0, len(events))
+	for _, e := range events {
+		if id, _ := e.Payload["input_id"].(string); e.Kind == "input_received" && id == inputID {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 // internalToolResponse applies a state-internal tool's effect inside the
 // claim transaction: the operation record and its effect are atomic, so a
 // crash cannot leave an unrecorded effect or a dangling record.
-func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, tool string, request map[string]any) (map[string]any, bool, error) {
+func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, inputID, turnID, tool string, request map[string]any) (map[string]any, bool, error) {
 	switch tool {
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
@@ -1301,6 +1408,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		text, _ := request["text"].(string)
 		if text == "" {
 			return nil, false, fmt.Errorf("%w: journal.note requires text", ErrBadRequest)
+		}
+		if err := ensureInputReceived(ctx, tx, personaID, inputID, turnID); err != nil {
+			return nil, false, err
 		}
 		var seq int64
 		err := tx.QueryRow(ctx, `
@@ -1452,7 +1562,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
-	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
+	response, internal, err := s.internalToolResponse(ctx, tx, personaID, inputID, turnID, tool, request)
 	if err != nil {
 		return Operation{}, false, err
 	}

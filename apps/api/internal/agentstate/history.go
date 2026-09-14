@@ -4,16 +4,20 @@
 // recorded history — it is not the model "remembering" internally, and its
 // results are stored records, not new instructions.
 //
-// Search is a literal case-sensitive substring scan over each event's search
-// projection (its text field, or the serialized payload for tool records):
-// omitted fields are not searchable, so no match does not prove absence.
-// Read returns the original stored journal events — after a chunk is
-// applied, the originals remain readable through chunk_seq — paged by a
-// 16,384-Unicode-character budget over the stable journal_event_v1
-// serialization, with content_offset fragments for oversized records.
+// Search and read share one serialization. Read returns the original stored
+// journal events — after a chunk is applied, the originals remain readable
+// through chunk_seq — as journal_event_v1 JSON (sorted keys, no added
+// spaces, no HTML escaping), paged by a 16,384-Unicode-character budget with
+// content_offset fragments for oversized records. Search is a literal
+// case-sensitive substring scan over each record's stored text field and
+// that same journal_event_v1 serialization, so a substring copied from a
+// read result finds its record again. A search scans a bounded number of
+// records per call and says where it stopped; no match does not prove
+// absence.
 package agentstate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +34,14 @@ const maxReadJSONChars = 16 * 1024
 
 const journalEventFormat = "journal_event_v1"
 
+// historySearchScanRecords bounds the journal records one search call scans,
+// so a rare query over a long life cannot turn one tool call into a full
+// journal scan; the result says where the scan stopped and continues there.
+const historySearchScanRecords = 2_000
+
+// historySearchBatch is the row batch a search reads at a time.
+const historySearchBatch = 256
+
 type historyArgs struct {
 	operation     string
 	query         *string
@@ -39,20 +51,6 @@ type historyArgs struct {
 	afterSeq      *int64
 	contentOffset *int64
 	limit         int
-}
-
-// searchProjection is the text a search scans: the record's own text when it
-// has one, else the serialized payload (tool calls/results and other
-// structured records stay findable by their contents).
-func searchProjection(e Event) string {
-	if t, ok := e.Payload["text"].(string); ok {
-		return t
-	}
-	raw, err := json.Marshal(e.Payload)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
 }
 
 func parseHistoryArgs(request map[string]any) (historyArgs, error) {
@@ -115,6 +113,9 @@ func parseHistoryArgs(request map[string]any) (historyArgs, error) {
 	if (op == "search") != (a.query != nil) {
 		return a, fmt.Errorf("%w: search requires query and read must not carry one", ErrBadRequest)
 	}
+	if a.query != nil && *a.query == "" {
+		return a, fmt.Errorf("%w: search query must not be empty", ErrBadRequest)
+	}
 	if a.contentOffset != nil && (op != "read" || a.seq == nil) {
 		return a, fmt.Errorf("%w: content_offset is only valid with read + seq", ErrBadRequest)
 	}
@@ -161,47 +162,100 @@ func historyDetails(args historyArgs, messages []map[string]any, nextAfterSeq, n
 		"journal_event_format":     journalEventFormat,
 		"content_complete_meaning": "entire stored event representation returned in this call; does not imply provider vision support",
 		"fragment_continuation":    "follow next_read to the end of this event before resuming the original query with after_seq=resume_after_seq; concatenated fragments form the journal_event_v1 JSON",
-		"search_coverage":          "stored text fields and serialized tool records only; no match is not proof that a record is absent",
+		"search_coverage":          "literal case-sensitive substring of each record's stored text field or of its journal_event_v1 JSON exactly as read returns it (sorted keys, no added spaces); at most 2000 records are scanned per call, continue with next_after_seq; no match is not proof that a record is absent",
 	}
 }
 
-func (s *Store) historySearch(ctx context.Context, tx pgx.Tx, personaID string, args historyArgs) (map[string]any, error) {
-	var after int64
-	if args.afterSeq != nil {
-		after = *args.afterSeq
+// searchHit is one matching record and the text its snippet comes from.
+type searchHit struct {
+	event  Event
+	text   string
+	source string
+}
+
+// matchRecord reports whether query is a literal substring of the record's
+// stored text field or of its journal_event_v1 serialization.
+func matchRecord(e Event, query string) (*searchHit, error) {
+	if t, ok := e.Payload["text"].(string); ok && strings.Contains(t, query) {
+		return &searchHit{event: e, text: t, source: "text"}, nil
 	}
-	// Fetch one extra row to know whether the result set continues.
-	rows, err := tx.Query(ctx, `
-		SELECT persona_id, seq, turn_id, kind, payload, created_at
-		FROM core_events
-		WHERE persona_id = $1 AND seq > $2
-			AND STRPOS(COALESCE(payload->>'text', payload::text), $3) > 0
-		ORDER BY seq LIMIT $4`, personaID, after, *args.query, args.limit+1)
+	serialized, err := journalEventJSON(e)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("render journal event: %w", err)
 	}
-	var events []Event
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
-			rows.Close()
+	if strings.Contains(serialized, query) {
+		return &searchHit{event: e, text: serialized, source: journalEventFormat}, nil
+	}
+	return nil, nil
+}
+
+func (s *Store) historySearch(ctx context.Context, tx pgx.Tx, personaID string, args historyArgs) (map[string]any, error) {
+	var cursor int64
+	if args.afterSeq != nil {
+		cursor = *args.afterSeq
+	}
+	var hits []*searchHit
+	scanned := 0
+	budgetReached := false
+scan:
+	for {
+		rows, err := tx.Query(ctx, `
+			SELECT persona_id, seq, turn_id, kind, payload, created_at
+			FROM core_events
+			WHERE persona_id = $1 AND seq > $2
+			ORDER BY seq LIMIT $3`, personaID, cursor, historySearchBatch)
+		if err != nil {
 			return nil, err
 		}
-		events = append(events, e)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
+		var batch []Event
+		for rows.Next() {
+			var e Event
+			if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			batch = append(batch, e)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		for _, e := range batch {
+			if scanned >= historySearchScanRecords {
+				budgetReached = true
+				break scan
+			}
+			scanned++
+			cursor = e.Seq
+			hit, err := matchRecord(e, *args.query)
+			if err != nil {
+				return nil, err
+			}
+			if hit != nil {
+				hits = append(hits, hit)
+				// One hit past the page proves the result set continues.
+				if len(hits) > args.limit {
+					break scan
+				}
+			}
+		}
+		if len(batch) < historySearchBatch {
+			break
+		}
 	}
 	var nextAfterSeq any
-	if len(events) > args.limit {
-		nextAfterSeq = events[args.limit-1].Seq
-		events = events[:args.limit]
+	switch {
+	case len(hits) > args.limit:
+		hits = hits[:args.limit]
+		nextAfterSeq = hits[args.limit-1].event.Seq
+	case budgetReached:
+		// The scan budget ran out before the journal did: resume after the
+		// last record actually scanned, not after the last hit.
+		nextAfterSeq = cursor
 	}
-	messages := make([]map[string]any, 0, len(events))
-	for _, e := range events {
-		text := searchProjection(e)
-		matchStart := indexOf(text, *args.query)
+	messages := make([]map[string]any, 0, len(hits))
+	for _, h := range hits {
+		matchStart := indexOf(h.text, *args.query)
 		if matchStart < 0 {
 			matchStart = 0
 		}
@@ -209,21 +263,25 @@ func (s *Store) historySearch(ctx context.Context, tx pgx.Tx, personaID string, 
 		if start < 0 {
 			start = 0
 		}
-		snippetRunes := []rune(text)
+		snippetRunes := []rune(h.text)
 		end := start + 500
 		if end > len(snippetRunes) {
 			end = len(snippetRunes)
 		}
 		truncated := start > 0 || end < len(snippetRunes)
 		messages = append(messages, map[string]any{
-			"source":             map[string]any{"seq": e.Seq, "turn_id": e.TurnID, "kind": e.Kind},
-			"timestamp":          e.CreatedAt,
+			"source":             map[string]any{"seq": h.event.Seq, "turn_id": h.event.TurnID, "kind": h.event.Kind},
+			"timestamp":          h.event.CreatedAt,
 			"snippet":            string(snippetRunes[start:end]),
+			"snippet_source":     h.source,
 			"snippet_char_start": start,
 			"snippet_truncated":  truncated,
 		})
 	}
-	return historyDetails(args, messages, nextAfterSeq, nil), nil
+	details := historyDetails(args, messages, nextAfterSeq, nil)
+	details["scanned_records"] = scanned
+	details["scan_budget_reached"] = budgetReached
+	return details, nil
 }
 
 // indexOf returns the character (not byte) index of the first occurrence of
@@ -236,16 +294,21 @@ func indexOf(s, sub string) int {
 	return utf8.RuneCountInString(s[:bi])
 }
 
-// journalEventJSON is the stable serialization a read returns and fragments.
+// journalEventJSON is the stable serialization a read returns and fragments
+// and a search matches: sorted keys, compact, and no HTML escaping, so the
+// characters are the ones the model sees after the tool result is relayed.
 func journalEventJSON(e Event) (string, error) {
-	raw, err := json.Marshal(map[string]any{
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	err := enc.Encode(map[string]any{
 		"seq":        e.Seq,
 		"turn_id":    e.TurnID,
 		"kind":       e.Kind,
 		"created_at": e.CreatedAt,
 		"payload":    e.Payload,
 	})
-	return string(raw), err
+	return strings.TrimSuffix(buf.String(), "\n"), err
 }
 
 func (s *Store) historyRead(ctx context.Context, tx pgx.Tx, personaID string, args historyArgs) (map[string]any, error) {

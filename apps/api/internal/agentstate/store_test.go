@@ -322,8 +322,11 @@ func TestJournalNoteTool(t *testing.T) {
 	if err != nil || !fresh || op.Status != "done" || op.Response["seq"] == nil {
 		t.Fatalf("note claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
+	// The note follows the input that caused it: the effect journals its
+	// input first, so seq order is causal.
 	evs, err := s.Events(ctx, pa, 0, 10)
-	if err != nil || len(evs) != 1 || evs[0].Kind != "note" {
+	if err != nil || len(evs) != 2 || evs[0].Kind != "input_received" ||
+		evs[0].Payload["input_id"] != "in-1" || evs[1].Kind != "note" {
 		t.Fatalf("events: %+v err=%v", evs, err)
 	}
 }

@@ -7,8 +7,10 @@ import type {
   Input,
   Json,
   LoadResult,
+  MemoryBlock,
   MemoryChunk,
   MemoryStatus,
+  OmittedMemory,
   Operation,
   RenderedContext,
   OutboxEntry,
@@ -47,7 +49,14 @@ function retryBackoffMs(attempt: number): number {
 // Memory thresholds mirrored from the Go store (agentstate/memory.go).
 const L0_CHUNK_MIN_TOKENS = 10_000;
 const L0_LIVE_LIMIT_TOKENS = 40_000;
+/** Recorded preparation failures a chunk may spend. */
 const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
+/** Claims ending without a recorded outcome before a chunk is marked failed. */
+const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
+/** Estimated tokens of applied memory blocks admitted into one context. */
+const MEMORY_SEND_CAP_TOKENS = 25_000;
+/** Journal records one conversation_history search call scans. */
+const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
 const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
@@ -58,6 +67,63 @@ function estEventTokens(kind: string, payload: Record<string, unknown>): number 
 }
 function estTextTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/**
+ * journal_event_v1: the serialization read returns and search matches —
+ * sorted object keys and no added spaces, like Go's map encoding with HTML
+ * escaping off.
+ */
+function journalEventJson(e: Event): string {
+  return JSON.stringify(
+    {
+      seq: e.seq,
+      turn_id: e.turn_id,
+      kind: e.kind,
+      created_at: e.created_at,
+      payload: e.payload,
+    },
+    (_k, v: unknown) =>
+      v !== null && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(
+            Object.keys(v)
+              .sort()
+              .map((k) => [k, (v as Record<string, unknown>)[k]]),
+          )
+        : v,
+  );
+}
+
+/** Go admitApplied: newest blocks first while they fit the memory cap; the
+ * older remainder is left out as one explicit range. */
+function admitApplied(
+  blocks: MemoryBlock[],
+): [MemoryBlock[], OmittedMemory | null] {
+  let used = 0;
+  let cut = blocks.length;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i] as MemoryBlock;
+    if (used + b.est_tokens > MEMORY_SEND_CAP_TOKENS) break;
+    used += b.est_tokens;
+    cut = i;
+  }
+  if (cut === 0) return [blocks, null];
+  const older = blocks.slice(0, cut);
+  const first = older[0] as MemoryBlock;
+  const last = older[older.length - 1] as MemoryBlock;
+  return [
+    blocks.slice(cut),
+    {
+      count: older.length,
+      first_chunk_seq: first.chunk_seq,
+      last_chunk_seq: last.chunk_seq,
+      first_seq: first.first_seq,
+      last_seq: last.last_seq,
+      first_time: first.first_time,
+      last_time: last.last_time,
+      est_tokens: older.reduce((n, b) => n + b.est_tokens, 0),
+    },
+  ];
 }
 
 /**
@@ -87,6 +153,8 @@ export class FakeState implements StateClient {
   memoryChunks: MemoryChunk[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
+  /** Seq of each input's one input_received event (core_inputs.received_seq). */
+  private receivedSeq = new Map<string, number>();
   private seq = 0;
   private outboxSeq = 0;
   private chunkSeq = 0;
@@ -220,17 +288,8 @@ export class FakeState implements StateClient {
         s.claimed_generation = null;
       }
     }
-    // Memory chunks a fenced generation was preparing return to the shelf.
-    for (const c of this.memoryChunks) {
-      if (
-        c.persona_id === persona &&
-        c.status === "preparing" &&
-        c.claimed_generation !== generation
-      ) {
-        c.status = "sealed";
-        c.claimed_generation = null;
-      }
-    }
+    // Memory chunks a fenced generation was preparing count an interruption.
+    this.interruptPreparing(persona, generation);
     return {
       interrupted_turns: interrupted,
       requeued_inputs: requeued,
@@ -256,12 +315,14 @@ export class FakeState implements StateClient {
       }
       const input = this.inputs.find((i) => i.input_id === running.input_id);
       if (!input) throw new Error("running turn input missing");
-      const rc = this.renderedContext(persona, contextLimit);
+      const rc = this.renderedContext(persona, contextLimit, input.input_id);
       return {
         turn: running,
         input,
         context: rc.events,
-        memory: rc.memory, omitted: rc.omitted,
+        memory: rc.memory,
+        omitted: rc.omitted,
+        memory_omitted: rc.memory_omitted,
         plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
       };
     }
@@ -275,7 +336,15 @@ export class FakeState implements StateClient {
     );
     if (!input) {
       const rc = this.renderedContext(persona, contextLimit);
-      return { turn: null, input: null, context: rc.events, memory: rc.memory, omitted: rc.omitted, plan: null };
+      return {
+        turn: null,
+        input: null,
+        context: rc.events,
+        memory: rc.memory,
+        omitted: rc.omitted,
+        memory_omitted: rc.memory_omitted,
+        plan: null,
+      };
     }
     input.status = "claimed";
     input.claimed_generation = generation;
@@ -297,12 +366,14 @@ export class FakeState implements StateClient {
       error: null,
     };
     this.turns.set(turnId, turn);
-    const rc = this.renderedContext(persona, contextLimit);
+    const rc = this.renderedContext(persona, contextLimit, input.input_id);
     return {
       turn,
       input,
       context: rc.events,
-      memory: rc.memory, omitted: rc.omitted,
+      memory: rc.memory,
+      omitted: rc.omitted,
+      memory_omitted: rc.memory_omitted,
       plan: this.plans.get(`${persona}|${input.input_id}`) ?? null,
     };
   }
@@ -310,17 +381,28 @@ export class FakeState implements StateClient {
   /**
    * The journal as the model sees it: the newest events not covered by an
    * applied chunk up to the send cap (newest always included), plus every
-   * applied block, plus the extent of older raw records left out — same
-   * contract as Go renderedContext.
+   * applied block admitted under the memory cap, plus the extents of older
+   * raw records and applied blocks left out — same contract as Go
+   * renderedContext. Records written by the loading input's own turns (a
+   * note claimed before a crash, with its input_received) are left to that
+   * turn, which presents its input itself.
    */
-  private renderedContext(persona: string, limit: number): RenderedContext {
+  private renderedContext(
+    persona: string,
+    limit: number,
+    excludeInputId = "",
+  ): RenderedContext {
     const applied = this.memoryChunks.filter(
       (c) => c.persona_id === persona && c.status === "applied",
     );
     const uncovered = this.eventLog.filter(
       (e) =>
         e.persona_id === persona &&
-        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq),
+        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
+        !(
+          excludeInputId !== "" &&
+          this.turns.get(e.turn_id)?.input_id === excludeInputId
+        ),
     );
     const rowCap =
       limit <= 0 ? CONTEXT_MAX_EVENTS : Math.min(limit, CONTEXT_MAX_EVENTS);
@@ -354,17 +436,23 @@ export class FakeState implements StateClient {
             last_time: newestOmitted.created_at,
           }
         : null;
-    const memory = applied
+    const at = (seq: number) =>
+      this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
+        ?.created_at ?? "";
+    const blocks = applied
       .sort((a, b) => a.chunk_seq - b.chunk_seq)
       .map((c) => ({
         chunk_seq: c.chunk_seq,
         layer: c.layer,
         first_seq: c.first_seq,
         last_seq: c.last_seq,
+        first_time: at(c.first_seq),
+        last_time: at(c.last_seq),
         text: c.replacement ?? "",
         est_tokens: c.replacement_est_tokens ?? 0,
       }));
-    return { events, memory, omitted };
+    const [memory, memoryOmitted] = admitApplied(blocks);
+    return { events, memory, omitted, memory_omitted: memoryOmitted };
   }
 
   /**
@@ -471,15 +559,35 @@ export class FakeState implements StateClient {
       throw new StateError(400, "read body");
     }
     req = { ...req, error: req.error === undefined ? req.error : req.error.replace(/\u0000/g, "") };
+    // Exactly one input_received per input: a note claimed earlier already
+    // journaled it in causal order, so the commit's copy is dropped (Go
+    // withoutJournaledInput + received_seq).
+    const receivedKey = `${persona}|${turn.input_id}`;
+    const journaled = this.receivedSeq.has(receivedKey);
     for (const ev of req.events) {
+      if (
+        journaled &&
+        ev.kind === "input_received" &&
+        ev.payload.input_id === turn.input_id
+      ) {
+        continue;
+      }
+      const seq = ++this.seq;
       this.eventLog.push({
         persona_id: persona,
-        seq: ++this.seq,
+        seq,
         turn_id: turnId,
         kind: ev.kind,
         payload: ev.payload,
         created_at: new Date().toISOString(),
       });
+      if (
+        ev.kind === "input_received" &&
+        ev.payload.input_id === turn.input_id &&
+        !this.receivedSeq.has(receivedKey)
+      ) {
+        this.receivedSeq.set(receivedKey, seq);
+      }
     }
     const input = this.inputs.find((i) => i.input_id === turn.input_id);
     if (!input) throw new Error("turn input missing");
@@ -693,6 +801,9 @@ export class FakeState implements StateClient {
         operation.response = { schedule: sch };
       }
     } else if (op.tool === "journal.note") {
+      // The note is part of this input's experience: the input is journaled
+      // first, once, so the note never precedes what it responds to.
+      this.ensureInputReceived(persona, turn);
       const ev: Event = {
         persona_id: persona,
         seq: ++this.seq,
@@ -740,6 +851,7 @@ export class FakeState implements StateClient {
     if (operation === "search" !== (query !== undefined)) {
       throw bad("search requires query and read must not carry one");
     }
+    if (query === "") throw bad("search query must not be empty");
     if (limit < 1 || limit > 20 || !Number.isInteger(limit)) {
       throw bad("limit must be an integer in [1, 20]");
     }
@@ -766,47 +878,67 @@ export class FakeState implements StateClient {
       fragment_continuation:
         "follow next_read to the end of this event before resuming the original query with after_seq=resume_after_seq; concatenated fragments form the journal_event_v1 JSON",
       search_coverage:
-        "stored text fields and serialized tool records only; no match is not proof that a record is absent",
+        "literal case-sensitive substring of each record's stored text field or of its journal_event_v1 JSON exactly as read returns it (sorted keys, no added spaces); at most 2000 records are scanned per call, continue with next_after_seq; no match is not proof that a record is absent",
     });
-    const projection = (e: Event): string =>
-      typeof e.payload.text === "string"
-        ? (e.payload.text as string)
-        : JSON.stringify(e.payload);
     const source = (e: Event): Json => ({
       seq: e.seq,
       turn_id: e.turn_id,
       kind: e.kind,
     });
-    const journalJson = (e: Event): string =>
-      JSON.stringify({
-        seq: e.seq,
-        turn_id: e.turn_id,
-        kind: e.kind,
-        created_at: e.created_at,
-        payload: e.payload,
-      });
+    const journalJson = journalEventJson;
     if (operation === "search") {
-      const after = afterSeq ?? 0;
-      const hits = all.filter(
-        (e) => e.seq > after && projection(e).includes(query as string),
-      );
-      const page = hits.slice(0, limit);
-      const last = page[page.length - 1];
-      const nextAfterSeq = hits.length > limit && last ? last.seq : null;
-      const messages = page.map((e) => {
-        const text = projection(e);
-        const matchStart = Math.max(0, text.indexOf(query as string));
+      const q = query as string;
+      const hits: { e: Event; text: string; source: string }[] = [];
+      let scanned = 0;
+      let budgetReached = false;
+      let cursor = afterSeq ?? 0;
+      for (const e of all) {
+        if (e.seq <= (afterSeq ?? 0)) continue;
+        if (scanned >= HISTORY_SEARCH_SCAN_RECORDS) {
+          budgetReached = true;
+          break;
+        }
+        scanned++;
+        cursor = e.seq;
+        const t = e.payload.text;
+        if (typeof t === "string" && t.includes(q)) {
+          hits.push({ e, text: t, source: "text" });
+        } else {
+          const serialized = journalJson(e);
+          if (serialized.includes(q)) {
+            hits.push({ e, text: serialized, source: "journal_event_v1" });
+          }
+        }
+        if (hits.length > limit) break;
+      }
+      let nextAfterSeq: number | null = null;
+      if (hits.length > limit) {
+        hits.length = limit;
+        nextAfterSeq = (hits[limit - 1] as { e: Event }).e.seq;
+      } else if (budgetReached) {
+        nextAfterSeq = cursor;
+      }
+      const messages = hits.map((h) => {
+        const runes = [...h.text];
+        const byteIndex = h.text.indexOf(q);
+        const matchStart =
+          byteIndex < 0 ? 0 : [...h.text.slice(0, byteIndex)].length;
         const start = Math.max(0, matchStart - 80);
-        const snippet = [...text].slice(start, start + 500).join("");
+        const end = Math.min(start + 500, runes.length);
         return {
-          source: source(e),
-          timestamp: e.created_at,
-          snippet,
+          source: source(h.e),
+          timestamp: h.e.created_at,
+          snippet: runes.slice(start, end).join(""),
+          snippet_source: h.source,
           snippet_char_start: start,
-          snippet_truncated: start > 0 || start + 500 < [...text].length,
+          snippet_truncated: start > 0 || end < runes.length,
         };
       });
-      return details(messages, nextAfterSeq, null);
+      return {
+        ...details(messages, nextAfterSeq, null),
+        scanned_records: scanned,
+        scan_budget_reached: budgetReached,
+      };
     }
     // read
     let events: Event[];
@@ -906,16 +1038,7 @@ export class FakeState implements StateClient {
     generation: number,
   ): Promise<MemoryStatus> {
     this.mustHold(persona, generation);
-    for (const c of this.memoryChunks) {
-      if (
-        c.persona_id === persona &&
-        c.status === "preparing" &&
-        c.claimed_generation !== generation
-      ) {
-        c.status = "sealed";
-        c.claimed_generation = null;
-      }
-    }
+    this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
     let covered = Math.max(0, ...mine().map((c) => c.last_seq));
@@ -947,8 +1070,10 @@ export class FakeState implements StateClient {
           replacement: null,
           replacement_est_tokens: null,
           attempts: 0,
+          interruptions: 0,
           last_error: null,
           claimed_generation: null,
+          claimed_at: null,
           not_before: null,
           created_at: new Date().toISOString(),
           prepared_at: null,
@@ -996,6 +1121,20 @@ export class FakeState implements StateClient {
       .reduce((s, e) => s + estEventTokens(e.kind, e.payload), 0);
     const count = (s: MemoryChunk["status"]) =>
       mine.filter((c) => c.status === s).length;
+    const now = Date.now();
+    const readyAt = (c: MemoryChunk): number | null =>
+      c.status === "preparing"
+        ? now
+        : c.status === "sealed"
+          ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
+          : null;
+    const ready = mine
+      .map(readyAt)
+      .filter((t): t is number => t !== null);
+    const appliedBlocks = mine
+      .filter((c) => c.status === "applied")
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .map((c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock);
     return {
       live_raw_tokens:
         mine
@@ -1010,10 +1149,16 @@ export class FakeState implements StateClient {
       applied: count("applied"),
       kept: count("kept"),
       failed: count("failed"),
+      claimable: ready.filter((t) => t <= now).length,
+      next_claimable_at: ready.length
+        ? new Date(Math.min(...ready)).toISOString()
+        : null,
+      applied_omitted: admitApplied(appliedBlocks)[1]?.count ?? 0,
       covered_seq: covered,
       latest_seq: Math.max(0, ...events.map((e) => e.seq)),
       chunk_min_tokens: L0_CHUNK_MIN_TOKENS,
       live_limit_tokens: L0_LIVE_LIMIT_TOKENS,
+      memory_send_cap_tokens: MEMORY_SEND_CAP_TOKENS,
     };
   }
 
@@ -1024,39 +1169,26 @@ export class FakeState implements StateClient {
   ): Promise<ClaimedMemoryChunk> {
     this.mustHold(persona, generation);
     const mine = this.memoryChunks.filter((c) => c.persona_id === persona);
-    const empty = {
+    const empty = () => ({
       chunk: null,
       target_events: [],
       context: this.renderedContext(persona, contextLimit),
-    };
-    // An orphaned 'preparing' chunk (lost claim response, stopped branch) is
-    // re-claimed first; interrupted attempts spend the budget — same as Go.
-    let c: MemoryChunk | undefined;
-    for (;;) {
-      c =
-        mine.find((x) => x.status === "preparing") ??
-        mine
-          .filter(
-            (x) =>
-              x.status === "sealed" &&
-              (x.not_before === null || Date.parse(x.not_before) <= Date.now()),
-          )
-          .sort((a, b) => a.chunk_seq - b.chunk_seq)[0];
-      if (!c) return empty;
-      if (c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) break;
-      c.status = "failed";
-      c.claimed_generation = null;
-      c.not_before = null;
-      c.last_error = [
-        c.last_error,
-        `preparation did not finish within ${MEMORY_CHUNK_MAX_ATTEMPTS} attempts`,
-      ]
-        .filter(Boolean)
-        .join("; ");
-    }
+    });
+    // Every 'preparing' chunk is an orphan from the caller's view (one branch
+    // at a time): its claim ended without an outcome, so it counts an
+    // interruption — not an attempt — and waits out a short pacing.
+    this.interruptPreparing(persona, null);
+    const c = mine
+      .filter(
+        (x) =>
+          x.status === "sealed" &&
+          (x.not_before === null || Date.parse(x.not_before) <= Date.now()),
+      )
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)[0];
+    if (!c) return empty();
     c.status = "preparing";
     c.claimed_generation = generation;
-    c.attempts += 1;
+    c.claimed_at = new Date().toISOString();
     c.not_before = null;
     return {
       chunk: c,
@@ -1094,14 +1226,23 @@ export class FakeState implements StateClient {
     if (!c) throw new StateError(404, "memory chunk not found");
     if (c.status === "preparing") {
       if (c.claimed_generation !== generation) throw new FencedError();
+      const rest = estTextTokens(replacement);
       if (keepUnchanged) {
         c.status = "kept";
+      } else if (rest >= c.est_tokens) {
+        // A replacement that does not shrink the range is kept visible but
+        // never applied: the originals stay in context.
+        c.status = "kept";
+        c.replacement = replacement;
+        c.replacement_est_tokens = rest;
+        c.last_error = `replacement did not shrink the range (${rest} >= ${c.est_tokens} estimated tokens); originals kept`;
       } else {
         c.status = "prepared";
         c.replacement = replacement;
-        c.replacement_est_tokens = estTextTokens(replacement);
+        c.replacement_est_tokens = rest;
       }
       c.claimed_generation = null;
+      c.claimed_at = null;
       c.prepared_at = new Date().toISOString();
       return c;
     }
@@ -1111,8 +1252,8 @@ export class FakeState implements StateClient {
       c.status === "applied"
     ) {
       const same =
-        keepUnchanged === (c.status === "kept") &&
-        (c.replacement ?? "") === replacement;
+        (keepUnchanged && c.status === "kept" && c.replacement === null) ||
+        (!keepUnchanged && c.replacement === replacement);
       if (!same) {
         throw new StateError(
           409,
@@ -1144,20 +1285,85 @@ export class FakeState implements StateClient {
         `chunk ${chunkSeq} is not preparing under this generation`,
       );
     }
+    // A recorded failure is the only thing that spends attempts.
+    c.attempts += 1;
+    c.claimed_generation = null;
+    c.claimed_at = null;
+    c.last_error = failure.error;
     if (failure.retryable && c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) {
       c.status = "sealed";
-      c.claimed_generation = null;
-      c.last_error = failure.error;
       c.not_before = new Date(
         Date.now() + retryBackoffMs(c.attempts),
       ).toISOString();
     } else {
       c.status = "failed";
-      c.claimed_generation = null;
-      c.last_error = failure.error;
       c.not_before = null;
     }
     return c;
+  }
+
+  /**
+   * Go interruptPreparing: a 'preparing' claim that ended without an
+   * outcome (host stopped, fence lost, lost response) counts one
+   * interruption and returns to the shelf after a short pacing; too many
+   * mark the chunk failed, visible with its originals kept.
+   */
+  private interruptPreparing(persona: string, exceptGeneration: number | null) {
+    for (const c of this.memoryChunks) {
+      if (
+        c.persona_id !== persona ||
+        c.status !== "preparing" ||
+        (exceptGeneration !== null && c.claimed_generation === exceptGeneration)
+      ) {
+        continue;
+      }
+      const prior = c.interruptions;
+      c.interruptions += 1;
+      c.claimed_generation = null;
+      c.claimed_at = null;
+      if (c.interruptions >= MEMORY_CHUNK_MAX_INTERRUPTIONS) {
+        c.status = "failed";
+        c.not_before = null;
+        c.last_error = [
+          c.last_error,
+          `preparation was interrupted ${MEMORY_CHUNK_MAX_INTERRUPTIONS} times without a recorded outcome`,
+        ]
+          .filter(Boolean)
+          .join("; ");
+      } else {
+        c.status = "sealed";
+        c.not_before = new Date(
+          Date.now() + Math.min(200 * 2 ** Math.min(prior, 8), 30_000),
+        ).toISOString();
+      }
+    }
+  }
+
+  /** Go ensureInputReceived: journal the turn's input once, before a note. */
+  private ensureInputReceived(persona: string, turn: Turn) {
+    const key = `${persona}|${turn.input_id}`;
+    if (this.receivedSeq.has(key)) return;
+    const input = this.inputs.find(
+      (i) => i.persona_id === persona && i.input_id === turn.input_id,
+    );
+    if (!input) throw new Error("turn input missing");
+    const seq = ++this.seq;
+    this.eventLog.push({
+      persona_id: persona,
+      seq,
+      turn_id: turn.turn_id,
+      kind: "input_received",
+      payload: {
+        input_id: input.input_id,
+        kind: input.kind,
+        text: typeof input.payload.text === "string" ? input.payload.text : null,
+        actor_kind: input.actor_kind,
+        source_surface: input.source_surface,
+        attempt: turn.attempt,
+      },
+      created_at: new Date().toISOString(),
+    });
+    this.receivedSeq.set(key, seq);
   }
 
   async completeOperation(

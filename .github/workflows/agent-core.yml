@@ -77,7 +77,16 @@ jobs:
       - name: Run workerd smoke (local wrangler dev + real state service)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
 
+      - name: Run workerd memory lifecycle e2e (local wrangler dev + real state service)
+        env:
+          SUMI_E2E_PSQL: psql ${{ env.SUMI_TEST_DB_URL }} -Atc
+        run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd:memory
+
       # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
       # real model calls or secrets, no Cloudflare deployment, no remote
       # database. The workerd smoke exercises the Durable Object wake path via
       # local wrangler dev; deployed-worker alarm scheduling is not covered.
+      # The workerd memory e2e scripts an OpenAI-compatible SSE endpoint to
+      # exercise preparation lifetime (a branch past the 25s turn budget, a
+      # provider failure, a killed host); local workerd does not enforce the
+      # deployed 15-minute alarm wall time.

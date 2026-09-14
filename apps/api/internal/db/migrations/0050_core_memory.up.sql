@@ -14,10 +14,15 @@
 --               time); reverts to sealed when a new generation recovers
 --   prepared  — replacement candidate on the shelf; NOT in the sent context
 --   applied   — replacement text renders at the chunk's original position
---   kept      — the model answered KEEP_UNCHANGED; originals stay, never
---               reprepared
+--   kept      — the model answered KEEP_UNCHANGED, or its replacement did not
+--               shrink the range; originals stay, never reprepared
 --   failed    — retry budget exhausted; originals stay and the failure is
 --               visible in memory status rather than silently skipped
+--
+-- attempts counts recorded preparation failures only. interruptions counts
+-- claims that ended without any recorded outcome (host stopped, writer
+-- fenced, claim response lost); they are paced and bounded separately so a
+-- slow-but-finite preparation is never failed by its host's lifecycle.
 CREATE TABLE core_memory_chunks (
     persona_id             uuidv7      NOT NULL REFERENCES core_personas(persona_id) ON DELETE CASCADE,
     chunk_seq              bigint      NOT NULL,
@@ -30,8 +35,10 @@ CREATE TABLE core_memory_chunks (
     replacement            text,
     replacement_est_tokens bigint,
     attempts               int         NOT NULL DEFAULT 0,
+    interruptions          int         NOT NULL DEFAULT 0,
     last_error             text,
     claimed_generation     bigint,
+    claimed_at             timestamptz,
     not_before             timestamptz,
     created_at             timestamptz NOT NULL DEFAULT now(),
     prepared_at            timestamptz,
@@ -42,3 +49,11 @@ CREATE TABLE core_memory_chunks (
 );
 CREATE INDEX core_memory_chunks_cover
     ON core_memory_chunks(persona_id, last_seq);
+
+-- The journal seq of an input's one input_received event. A turn journals
+-- its input at commit, but a state-internal effect (journal.note) lands in
+-- the journal mid-turn; that effect first journals the input that caused it,
+-- so the note follows its input in seq order and falls in the same memory
+-- chunk. Commit then skips the already-journaled input, keeping exactly one
+-- input_received per input across crashes and retries.
+ALTER TABLE core_inputs ADD COLUMN received_seq bigint;

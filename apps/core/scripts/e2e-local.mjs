@@ -23,7 +23,8 @@ if (!DB_URL) {
 }
 const API_DIR = resolve(import.meta.dirname, "../../api");
 const CORE_DIR = resolve(import.meta.dirname, "..");
-const PORT = 8390 + (process.pid % 1000);
+// SUMI_E2E_PORT pins the port when parallel worktrees own port ranges.
+const PORT = Number(process.env.SUMI_E2E_PORT ?? 8390 + (process.pid % 1000));
 const BASE = `http://127.0.0.1:${PORT}`;
 const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
 

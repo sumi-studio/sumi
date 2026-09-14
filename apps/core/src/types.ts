@@ -165,8 +165,25 @@ export interface LoadResult {
    * through conversation_history; null when nothing was left out.
    */
   omitted: OmittedRange | null;
+  /**
+   * Older applied memory blocks outside the memory cap — stored, their
+   * originals readable; null when every applied block was admitted.
+   */
+  memory_omitted?: OmittedMemory | null;
   /** The input's recorded decision — null when none has been saved yet. */
   plan: TurnPlan | null;
+}
+
+/** The extent of applied memory blocks left outside the sent context. */
+export interface OmittedMemory {
+  count: number;
+  first_chunk_seq: number;
+  last_chunk_seq: number;
+  first_seq: number;
+  last_seq: number;
+  first_time: string;
+  last_time: string;
+  est_tokens: number;
 }
 
 /** The extent of raw records left outside the sent context. */
@@ -195,9 +212,13 @@ export interface MemoryChunk {
     | "failed";
   replacement: string | null;
   replacement_est_tokens: number | null;
+  /** Recorded preparation failures (the only thing that spends the budget). */
   attempts: number;
+  /** Claims that ended without any recorded outcome (host lifecycle). */
+  interruptions: number;
   last_error: string | null;
   claimed_generation: number | null;
+  claimed_at: string | null;
   not_before: string | null;
   created_at: string;
   prepared_at: string | null;
@@ -210,6 +231,9 @@ export interface MemoryBlock {
   layer: number;
   first_seq: number;
   last_seq: number;
+  /** When the first and last covered events were recorded. */
+  first_time: string;
+  last_time: string;
   text: string;
   est_tokens: number;
 }
@@ -219,6 +243,7 @@ export interface RenderedContext {
   events: Event[];
   memory: MemoryBlock[];
   omitted: OmittedRange | null;
+  memory_omitted?: OmittedMemory | null;
 }
 
 /** The memory layer's current shape (read-only observability). */
@@ -231,10 +256,17 @@ export interface MemoryStatus {
   applied: number;
   kept: number;
   failed: number;
+  /** Chunks a claim could take now (sealed past backoff, or orphaned). */
+  claimable: number;
+  /** Earliest time a chunk becomes claimable; null when none waits. */
+  next_claimable_at: string | null;
+  /** Applied blocks left outside the memory cap. */
+  applied_omitted: number;
   covered_seq: number;
   latest_seq: number;
   chunk_min_tokens: number;
   live_limit_tokens: number;
+  memory_send_cap_tokens: number;
 }
 
 /**

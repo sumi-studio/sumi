@@ -11,6 +11,8 @@
  *   SUMI_PROVIDER_RETRY_BUDGET_MS  wall-clock budget for transient provider
  *                                  retries, measured from input submission
  *                                  (default 30 min)
+ *   SUMI_MEMORY_PREPARATION_TIMEOUT_MS  wall-clock bound on one memory
+ *                                  preparation branch (default 10 min)
  *   --once  drain pending work then exit (used by e2e + dev scripts)
  *
  * Kill -9 safe at any point: nothing canonical lives in this process.
@@ -47,6 +49,9 @@ async function main() {
     providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
       ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
       : undefined,
+    memoryPreparationTimeoutMs: process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS
+      ? Number(process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS)
+      : undefined,
     idgen: () => crypto.randomUUID(),
     log: (msg, fields) =>
       console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),
@@ -63,12 +68,16 @@ async function main() {
     while (Date.now() < deadline && Date.now() - lastWork < idleGraceMs) {
       const r = await secretary.step();
       // A memory preparation branch in flight is work too: stopping would
-      // abort it and leave the chunk to be re-claimed on the next run.
-      if (r === "turn" || secretary.memoryBusy) {
-        lastWork = Date.now();
-      } else {
-        await new Promise((res) => setTimeout(res, 100));
-      }
+      // interrupt it and leave the chunk to be prepared again next run.
+      if (r === "turn" || secretary.memoryBusy) lastWork = Date.now();
+      if (r !== "turn") await new Promise((res) => setTimeout(res, 100));
+    }
+    // The deadline bounds new work, not a preparation already running: the
+    // branch keeps its lease renewed and ends within its own timeout, by
+    // recording a result or a retryable failure. No new branch starts here.
+    if (secretary.memoryBusy) {
+      console.log("[core] --once: waiting for the running memory preparation");
+      await secretary.settleMemory();
     }
     await secretary.stop();
     return;
