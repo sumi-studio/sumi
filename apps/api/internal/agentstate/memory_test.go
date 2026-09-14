@@ -91,10 +91,65 @@ func chunkKinds(t *testing.T, s *Store, persona string) map[int64]string {
 	return kinds
 }
 
-// A committed turn whose window passes the forced limit seals at the first
-// safe interior boundary: before a new tool_call once every earlier call
-// resolved. The call→result group itself is never split.
-func TestMemoryForcedSealAtToolCallBoundary(t *testing.T) {
+// A committed stretch whose window passes the forced limit seals at a real
+// unit boundary: before an assistant_message that does not continue a tool
+// flow — here the first reply after an oversized input. The huge record
+// seals alone; the deciding text and the call/result flow it starts stay
+// one unit.
+func TestMemoryForcedSealBeforeLeadingAssistant(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	// seq: 1 input(~21k), 2 assistant(~10.3k), 3 call, 4 result,
+	// 5 assistant. The only safe interior boundary is before seq 2; every
+	// later assistant directly continues a tool flow.
+	commitEvents(t, s, pa, "t1", []EventInput{
+		{Kind: "input_received", Payload: map[string]any{
+			"input_id": "in-a", "kind": "message",
+			"payload": map[string]any{"text": strings.Repeat("z", 85_000)},
+			"actor_kind": "human"}},
+		{Kind: "assistant_message", Payload: map[string]any{"text": bigText()}},
+		{Kind: "tool_call", Payload: map[string]any{
+			"call_id": "a-c0", "tool": "conversation_history",
+			"request": map[string]any{"operation": "read"}}},
+		{Kind: "tool_result", Payload: map[string]any{
+			"call_id": "a-c0", "tool": "conversation_history",
+			"response": map[string]any{"ok": true}}},
+		{Kind: "assistant_message", Payload: map[string]any{"text": "done"}},
+	})
+	commitEvents(t, s, pa, "t2", exchange("b", "short"))
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	c1, err := s.chunk(ctx, s.pool, pa, 1)
+	if err != nil {
+		t.Fatalf("chunk 1: %v", err)
+	}
+	if c1.FirstSeq != 1 || c1.LastSeq != 1 || c1.EstTokens <= L0ForcedSealLimitTokens {
+		t.Fatalf("oversized input should seal alone, got %+v", c1)
+	}
+	c2, err := s.chunk(ctx, s.pool, pa, 2)
+	if err != nil {
+		t.Fatalf("chunk 2: %v", err)
+	}
+	if c2.FirstSeq != 2 || c2.LastSeq != 5 {
+		t.Fatalf("the tool flow should seal whole, got [%d,%d]",
+			c2.FirstSeq, c2.LastSeq)
+	}
+	kinds := chunkKinds(t, s, pa)
+	if kinds[c2.LastSeq+1] != "input_received" {
+		t.Fatalf("cut misplaced: next=%s", kinds[c2.LastSeq+1])
+	}
+}
+
+// A committed turn with tool flow has no safe interior boundary once its
+// window passes the forced limit — every continuation assistant follows a
+// tool_result, and a cut before a tool_call would split the deciding text
+// from its effects. The whole turn seals at the next input boundary.
+func TestMemoryForcedSealNeverSplitsToolFlow(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
@@ -102,8 +157,7 @@ func TestMemoryForcedSealAtToolCallBoundary(t *testing.T) {
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	// seq: 1 input, 2 assistant(~10.3k), 3 call, 4 result, 5 assistant(~10.3k),
-	// 6 call, 7 result, 8 assistant. Past 20k the only safe interior boundary
-	// is before seq 6.
+	// 6 call, 7 result, 8 assistant. No interior boundary exists.
 	commitEvents(t, s, pa, "t1", toolTurn("a", bigText(), bigText(), "done"))
 	commitEvents(t, s, pa, "t2", exchange("b", "short"))
 	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
@@ -113,25 +167,16 @@ func TestMemoryForcedSealAtToolCallBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chunk 1: %v", err)
 	}
-	if c1.FirstSeq != 1 || c1.LastSeq != 5 {
-		t.Fatalf("forced chunk should end before the second call group, got [%d,%d]",
-			c1.FirstSeq, c1.LastSeq)
-	}
-	if c1.EstTokens <= L0ChunkMinTokens {
-		t.Fatalf("forced chunk est %d should clear the minimum", c1.EstTokens)
+	if c1.FirstSeq != 1 || c1.LastSeq != 8 || c1.EstTokens <= L0ForcedSealLimitTokens {
+		t.Fatalf("the whole oversized turn should seal at the input boundary, got %+v", c1)
 	}
 	kinds := chunkKinds(t, s, pa)
-	if kinds[c1.LastSeq] != "assistant_message" || kinds[c1.LastSeq+1] != "tool_call" {
-		t.Fatalf("cut misplaced: last=%s next=%s", kinds[c1.LastSeq], kinds[c1.LastSeq+1])
+	if kinds[c1.LastSeq+1] != "input_received" {
+		t.Fatalf("cut misplaced: next=%s", kinds[c1.LastSeq+1])
 	}
-	// The remaining window is below the minimum, so nothing else seals yet:
-	// the tail stays raw, never force-cut to satisfy a count.
+	// The remainder is below the minimum and stays the live tail.
 	if _, err := s.chunk(ctx, s.pool, pa, 2); !errors.Is(err, ErrChunkNotFound) {
 		t.Fatalf("unexpected second chunk: %v", err)
-	}
-	st, err := s.MemoryStatus(ctx, pa)
-	if err != nil || st.LiveRawTokens <= 0 {
-		t.Fatalf("live tail should stay raw: %+v %v", st, err)
 	}
 }
 

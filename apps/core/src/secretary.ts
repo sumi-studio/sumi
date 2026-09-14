@@ -2,9 +2,9 @@ import { jsonEqual } from "./json.ts";
 import {
   capacityNoticeMessage,
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
-  estEventTokens,
   evictToBudget,
   renderJournalContext,
+  renderedViewTokens,
   runMemoryPreparation,
 } from "./memory.ts";
 import {
@@ -939,17 +939,15 @@ export class Secretary {
         ) {
           // A deterministic capacity refusal can never succeed with the
           // identical send. Continue the same request on a smaller
-          // temporary working view: oldest raw journal records drop first;
-          // applied memory blocks, standing notices, the current input and
-          // the in-turn suffix all stay. There is no configured provider
-          // window, so each recovery halves the remaining raw tail. The
-          // journal is never touched — the capacity notice names exactly
-          // which records left this send and how to reread them, and the
-          // next turn assembles the full context again.
-          const keptEst = keptEvents.reduce(
-            (s, ev) => s + estEventTokens(ev.kind, ev.payload),
-            0,
-          );
+          // temporary working view: the oldest eviction units — deciding
+          // text together with the call/result records it started — drop
+          // first; applied memory blocks, standing notices, the current
+          // input and the in-turn suffix all stay. There is no configured
+          // provider window, so each recovery halves the remaining
+          // rendered tail. The journal is never touched — the capacity
+          // notice names exactly which records left this send and how to
+          // reread them, and the next turn assembles the full context again.
+          const keptEst = renderedViewTokens(keptEvents);
           const { kept, evicted: dropped } = evictToBudget(
             keptEvents,
             Math.floor(keptEst / 2),

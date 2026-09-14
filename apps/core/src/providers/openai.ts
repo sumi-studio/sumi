@@ -418,9 +418,10 @@ const CONTEXT_LENGTH_PATTERNS = [
 /**
  * Whether an error response is a deterministic context-capacity refusal:
  * HTTP 413 or a recognized provider code is authoritative; otherwise the
- * message text decides, unless a known non-capacity code or a rate-limit
- * phrasing explains it better. The provider's own response is the only
- * signal — there is no configured context window to compare against.
+ * message text decides, unless a known non-capacity code, a rate-limit
+ * phrasing, or a retryable transport status explains it better. The
+ * provider's own response is the only signal — there is no configured
+ * context window to compare against.
  */
 function isContextLengthRefusal(
   status: number | null,
@@ -439,6 +440,14 @@ function isContextLengthRefusal(
     if (NON_OVERFLOW_CODES.has(c)) return false;
   }
   if (NON_OVERFLOW_PATTERNS.some((p) => p.test(text))) return false;
+  // A retryable transport status is authoritative in the non-capacity
+  // direction: a codeless 429/5xx whose display text happens to mention
+  // tokens is throttling or a server error, not a size refusal — the
+  // identical request can succeed once the condition clears. Message
+  // patterns classify only status-less (in-band) errors and 4xx rejects.
+  if (status !== null && (status === 408 || status === 429 || status >= 500)) {
+    return false;
+  }
   return CONTEXT_LENGTH_PATTERNS.some((p) => p.test(text));
 }
 

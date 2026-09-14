@@ -384,6 +384,39 @@ test("non-capacity errors are never classified as context refusal", async () => 
       });
     },
   );
+  // A retryable status is authoritative in the non-capacity direction even
+  // when bare token wording matches a refusal pattern: a codeless 429/5xx
+  // phrased in tokens is throttling or a server error, never a size refusal.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429);
+      res.end(JSON.stringify({ error: { message: "too many tokens" } }));
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  await withServer(
+    (_req, res) => {
+      res.writeHead(500);
+      res.end(
+        JSON.stringify({ error: { message: "token limit exceeded" } }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
 });
 
 test('an "error": null chunk is not an error — stream completes (NF1)', async () => {

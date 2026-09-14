@@ -1189,11 +1189,12 @@ export class FakeState implements StateClient {
     let covered = Math.max(0, ...mine().map((c) => c.last_seq));
     // Seal walk: accumulate the unsealed tail; cut a chunk just before each
     // input_received once the window reaches the minimum and no tool call
-    // in it is still waiting for its result. Past the forced limit,
-    // additional safe boundaries open — before an assistant_message that
-    // does not directly continue a tool flow, and before a new tool_call
-    // once every earlier call resolved — so one oversized committed turn
-    // still becomes bounded preparation targets. Same rules as the Go walk.
+    // in it is still waiting for its result. Past the forced limit, one
+    // further boundary kind opens — before an assistant_message that does
+    // not directly continue a tool flow. A turn's deciding text and the
+    // calls/results it started are one unit: never cut before a tool_call
+    // or tool_result, and a flow with no interior boundary seals whole past
+    // the limit. Same rules as the Go walk.
     const tail = this.eventLog.filter(
       (e) => e.persona_id === persona && e.seq > covered,
     );
@@ -1213,9 +1214,6 @@ export class FakeState implements StateClient {
             cut =
               windowEst > L0_FORCED_SEAL_LIMIT_TOKENS &&
               prevKind !== "tool_result";
-            break;
-          case "tool_call":
-            cut = windowEst > L0_FORCED_SEAL_LIMIT_TOKENS;
             break;
         }
       }

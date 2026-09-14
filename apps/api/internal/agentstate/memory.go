@@ -487,13 +487,16 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	// Seal walk: accumulate the unsealed tail; cut a chunk just before each
 	// input_received once the accumulation reaches the minimum and no tool
 	// call in the window is still waiting for its result. While the window
-	// exceeds L0ForcedSealLimitTokens, additional safe boundaries open —
+	// exceeds L0ForcedSealLimitTokens, one further boundary kind opens —
 	// before an assistant_message that does not directly continue a tool
-	// flow, and before a new tool_call once every earlier call resolved —
-	// so one oversized committed turn still becomes bounded preparation
-	// targets. Tool calls and results commit inside one turn transaction,
-	// so a dangling call can never sit at a turn boundary — the pending set
-	// is defensive depth.
+	// flow — so an oversized committed stretch still becomes bounded
+	// preparation targets where a meaningful unit boundary exists. A turn's
+	// deciding text and the calls/results it started are one unit: a cut
+	// before a tool_call would separate the rationale from its effects, and
+	// a turn with no interior boundary seals whole past the limit. Tool
+	// calls and results commit inside one turn transaction, so a dangling
+	// call can never sit at a turn boundary — the pending set is defensive
+	// depth.
 	rows, err := tx.Query(ctx, `
 		SELECT seq, kind, payload FROM core_events
 		WHERE persona_id = $1 AND seq > $2 ORDER BY seq`, personaID, covered)
@@ -536,12 +539,11 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 		// Boundary check happens BEFORE the event joins the window: the
 		// boundary event itself opens the next chunk. Every boundary
 		// requires a started window and no tool call still waiting for its
-		// result. Never cut before a tool_result — its call would be left
-		// in the previous chunk — and never before an assistant_message
-		// directly continuing a tool flow (it follows a tool_result):
-		// the flow's results and its continuation stay together. A forced
-		// boundary before a new tool_call can split the decided text from
-		// the effects it started, but each call→results group stays whole.
+		// result. Never cut before a tool_call or tool_result — the deciding
+		// assistant text and the effects it started are one unit — and never
+		// before an assistant_message directly continuing a tool flow (it
+		// follows a tool_result): the flow's results and its continuation
+		// stay together.
 		if windowStart >= 0 && len(pending) == 0 {
 			cut := false
 			switch e.kind {
@@ -550,8 +552,6 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 			case "assistant_message":
 				cut = windowEst > L0ForcedSealLimitTokens &&
 					prevKind != "tool_result"
-			case "tool_call":
-				cut = windowEst > L0ForcedSealLimitTokens
 			}
 			if cut {
 				last := window[len(window)-1].seq

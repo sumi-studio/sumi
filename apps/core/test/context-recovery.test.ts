@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
 import {
+  evictToBudget,
+  renderedViewTokens,
+  renderJournalContext,
+} from "../src/memory.ts";
+import {
   ModelError,
   type ModelEvent,
   type ModelProvider,
   type ModelRequest,
 } from "../src/provider.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
+import type { Event } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-0000000000b2";
 
@@ -258,7 +264,78 @@ test("recovery: a transient provider failure keeps its own retry semantics", asy
   await s.stop();
 });
 
-test("memory: the fake seal walk cuts an oversized committed turn at a safe boundary", async () => {
+test("recovery: eviction drops whole decision/call/result units and shrinks the real send", () => {
+  // A mixed journal: small exchanges, then a tool flow whose deciding text,
+  // call and result are one unit, then the newest records.
+  const mk = (
+    seq: number,
+    kind: string,
+    payload: Record<string, unknown>,
+  ): Event => ({
+    persona_id: PERSONA,
+    seq,
+    turn_id: "t",
+    kind,
+    payload,
+    created_at: "2026-09-15T00:00:00.000Z",
+  });
+  const big = "x".repeat(12_000);
+  const evs = [
+    mk(1, "input_received", { text: "first", actor_kind: "human" }),
+    mk(2, "assistant_message", { text: "I will look that up." }),
+    mk(3, "tool_call", {
+      call_id: "c1",
+      tool: "conversation_history",
+      request: { operation: "read", args: big }, // large invisible args
+    }),
+    mk(4, "tool_result", {
+      call_id: "c1",
+      tool: "conversation_history",
+      response: { data: big },
+    }),
+    mk(5, "assistant_message", { text: `It says ${big}` }),
+    mk(6, "input_received", { text: "second", actor_kind: "human" }),
+    mk(7, "assistant_message", { text: "recent tail" }),
+  ];
+  const fullWire = JSON.stringify(renderJournalContext(evs)).length;
+
+  // Budget that keeps the newest records but forces the oldest units out.
+  const { kept, evicted } = evictToBudget(evs, 4_000);
+  assert.ok(evicted.length > 0 && kept.length > 0);
+
+  // Unit atomicity: a kept tool_result always has its call and deciding
+  // text; an evicted call takes its result and deciding text with it.
+  const keptSeqs = new Set(kept.map((e) => e.seq));
+  const evictedSeqs = new Set(evicted.map((e) => e.seq));
+  for (const e of evs) {
+    if (e.kind === "tool_result") {
+      const call = evs.find(
+        (x) => x.kind === "tool_call" && x.payload.call_id === e.payload.call_id,
+      );
+      assert.ok(call, "result has a call");
+      assert.equal(
+        keptSeqs.has(e.seq),
+        keptSeqs.has(call.seq),
+        `call/result pairing preserved for ${String(e.payload.call_id)}`,
+      );
+    }
+  }
+  // No rendered `[tool ...]` result floats in the kept view without the
+  // text that decided it — the deciding message and its flow are one unit.
+  if (keptSeqs.has(4)) assert.ok(keptSeqs.has(2) && keptSeqs.has(3));
+  if (evictedSeqs.has(2)) assert.ok(evictedSeqs.has(3) && evictedSeqs.has(4));
+
+  // The rendered send actually shrinks — eviction is measured on what the
+  // provider would receive, not on invisible raw records.
+  const keptWire = JSON.stringify(renderJournalContext(kept)).length;
+  assert.ok(
+    keptWire < fullWire * 0.6,
+    `rendered send should shrink meaningfully (${keptWire} vs ${fullWire})`,
+  );
+  assert.ok(renderedViewTokens(kept) <= 4_000);
+});
+
+test("memory: the fake seal walk keeps an oversized committed turn whole", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const lease = await state.acquireWriter(PERSONA, "h", 30_000);
@@ -302,13 +379,16 @@ test("memory: the fake seal walk cuts an oversized committed turn at a safe boun
     }),
   );
   await state.memoryMaintain(PERSONA, lease.generation);
-  // Same as the Go walk: the ~21k window cuts before the second tool_call
-  // (seq 6) — inside the turn but never inside a call→result group.
+  // Same as the Go walk: no interior boundary exists inside the ~31k turn —
+  // every continuation assistant follows a tool_result and a cut before a
+  // tool_call would split deciding text from its effects. The whole turn
+  // seals at the next input.
   assert.equal(state.memoryChunks.length, 1);
   const c = state.memoryChunks[0]!;
   assert.equal(c.first_seq, 1);
-  assert.equal(c.last_seq, 5);
+  assert.equal(c.last_seq, 8);
   assert.equal(c.status, "sealed");
+  assert.ok(c.est_tokens > 20_000, "the indivisible turn exceeds the target");
   // And an indivisible flow seals whole past the limit — never split.
   const persona2 = "01930e00-0000-7000-8000-0000000000b3";
   state.addPersona(persona2);
