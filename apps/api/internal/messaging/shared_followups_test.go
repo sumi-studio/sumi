@@ -444,6 +444,141 @@ func TestSharedIntakeEditThenDeleteDeliversOnlyTombstone(t *testing.T) {
 	}
 }
 
+// A secretary reached only through reply attention (no notification intent
+// was recorded for the reply) still hears that reply's deletion — the prior
+// delivery row, not the intents table, is what proves they saw the message.
+func TestSharedIntakeReplyOnlyRecipientGetsTombstone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newFollowupsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "セクレタリーの質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Content: "回答します", ReplyTo: question.MessageID,
+		ClientNonce: "fu-reply-only",
+	})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain reply: %+v %v", stats, err)
+	}
+	if _, err := replier.DeleteMessage(ctx, ch.PlaceID, reply.MessageID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain delete: %+v %v", stats, err)
+	}
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 2 {
+		t.Fatalf("inputs = %d, want reply + tombstone", len(inputs))
+	}
+	tombstone := inputs[1]
+	if tombstone.Payload["message_change"] != "deleted" ||
+		tombstone.Payload["message_id"] != reply.MessageID ||
+		tombstone.ActorID != w.humanB.ID || tombstone.Attention != "observe" {
+		t.Fatalf("tombstone input = %+v", tombstone)
+	}
+}
+
+// A secretary first reached by a mention added in an edit holds a delivery
+// row, not an intent row — a later deletion must still reach it.
+func TestSharedIntakeEditMentionThenDeleteGetsTombstone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newFollowupsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	sender := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	msg := w.send(t, ctx, ch.PlaceID, w.humanB, "メンションなしの報告")
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 0 {
+		t.Fatalf("drain original: %+v %v", stats, err)
+	}
+	edited, err := sender.EditMessage(ctx, ch.PlaceID, msg.MessageID, "@Kuro 訂正でメンション追加", msg.Revision)
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain edit: %+v %v", stats, err)
+	}
+	// A second edit reaches the same recipient at the newer revision.
+	if _, err := sender.EditMessage(ctx, ch.PlaceID, msg.MessageID, "@Kuro さらに訂正", edited.Revision); err != nil {
+		t.Fatalf("second edit: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain second edit: %+v %v", stats, err)
+	}
+	if _, err := sender.DeleteMessage(ctx, ch.PlaceID, msg.MessageID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain delete: %+v %v", stats, err)
+	}
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 3 {
+		t.Fatalf("inputs = %d, want two edits + tombstone", len(inputs))
+	}
+	if inputs[0].Payload["message_change"] != "edited" || inputs[1].Payload["message_change"] != "edited" ||
+		inputs[1].Payload["message_revision"] != float64(edited.Revision+1) {
+		t.Fatalf("edit inputs = %+v", inputs)
+	}
+	if inputs[2].Payload["message_change"] != "deleted" || inputs[2].Payload["message_id"] != msg.MessageID {
+		t.Fatalf("tombstone = %+v", inputs[2].Payload)
+	}
+}
+
+// A secretary-authored message deleted by another authorized participant is
+// a fact about the author's own output: the author gets the tombstone even
+// though no delivery or intent ever named it, attributed to the deleter.
+func TestSharedIntakeAuthorHearsModeratorDelete(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newFollowupsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+
+	msg := w.send(t, ctx, ch.PlaceID, w.agent, "セクレタリー自身の投稿")
+	owner := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA)
+	if _, err := owner.DeleteMessage(ctx, ch.PlaceID, msg.MessageID); err != nil {
+		t.Fatalf("moderator delete: %v", err)
+	}
+	if stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25); err != nil || stats.Admitted != 1 {
+		t.Fatalf("drain: %+v %v", stats, err)
+	}
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 1 || inputs[0].Payload["message_change"] != "deleted" ||
+		inputs[0].Payload["message_id"] != msg.MessageID || inputs[0].Attention != "observe" {
+		t.Fatalf("author tombstone = %+v", inputs)
+	}
+	if inputs[0].ActorID != w.humanA.ID {
+		t.Fatalf("tombstone attributed to %s, want deleter %s", inputs[0].ActorID, w.humanA.ID)
+	}
+
+	// Contrast: the author deleting its own message tells it nothing new.
+	second := w.send(t, ctx, ch.PlaceID, w.agent, "自分で消す投稿")
+	pa := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)
+	if _, err := pa.DeleteMessage(ctx, ch.PlaceID, second.MessageID); err != nil {
+		t.Fatalf("self delete: %v", err)
+	}
+	var own int
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_attention_deliveries
+		WHERE message_id=$1 AND personality_agent_id=$2`, second.MessageID, w.agent.ID).Scan(&own); err != nil || own != 0 {
+		t.Fatalf("self-delete issued %d deliveries: %v", own, err)
+	}
+}
+
 // The real Node core against the real state service and real PostgreSQL: an
 // edit lands as a second journaled input_received carrying message_change,
 // and the original receipt keeps its own frozen provenance.

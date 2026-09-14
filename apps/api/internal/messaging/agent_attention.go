@@ -164,13 +164,15 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 
 // issueAgentMessageChange records an edit or a deletion of an already-posted
 // message as a new attention event — a current-view update, never a rewrite
-// of the event that delivered the original. Every PA the original selection
-// recorded keeps hearing about the change (their view of this message would
-// otherwise stay stale), and an edit additionally reaches members its new
-// content selects for the first time: a mention added by an edit is a real
-// call for attention, and the new reason refines a recorded recipient's
-// stale one. A deletion has no new content to select on, so only the
-// recorded recipients see the tombstone.
+// of the event that delivered the original. Recipients are the PAs the
+// message actually reached — recorded intents plus every live delivery row
+// (reply attention, poll-vote reports, reminders, edit-added mentions) — and,
+// when someone else makes the change, the message's own PA author: leaving
+// their view stale would let them keep answering a message that no longer
+// exists, or never learn their own message was removed. An edit additionally
+// reaches members its new content selects for the first time: a mention added
+// by an edit is a real call for attention, and the new reason refines a
+// recorded recipient's stale one. A deletion has no new content to select on.
 func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, place Place, message Message, change string, changedAt time.Time) error {
 	recipients := map[string]NotificationDecision{}
 	rows, err := tx.Query(ctx, `
@@ -193,6 +195,43 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		return err
 	}
 	rows.Close()
+	// Intents are only the recorded selection at append. Reply attention,
+	// poll-vote reports, reminders and mentions added by an earlier edit all
+	// landed delivery rows without an intent — every secretary the message
+	// already reached through a supported path keeps its view current. A
+	// suppressed row was proven undeliverable here, so it earns no attempt.
+	rows, err = tx.Query(ctx, `
+		SELECT DISTINCT ON (personality_agent_id)
+		       personality_agent_id, COALESCE(payload->>'reason','')
+		FROM agent_attention_deliveries
+		WHERE message_id = $1 AND suppressed_at IS NULL
+		ORDER BY personality_agent_id, available_at DESC, event_id DESC`, message.MessageID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var recipientID, reason string
+		if err := rows.Scan(&recipientID, &reason); err != nil {
+			rows.Close()
+			return err
+		}
+		ref := PersonalityAgent(recipientID)
+		if _, ok := recipients[ref.Key()]; !ok {
+			recipients[ref.Key()] = NotificationDecision{Participant: ref, Reason: reason}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	// A change by someone else is a fact about the author's own message —
+	// the author hears it even when no delivery or intent ever named them.
+	if message.Author.Kind == KindPersonalityAgent && message.Author != s.Scope.Actor {
+		if _, ok := recipients[message.Author.Key()]; !ok {
+			recipients[message.Author.Key()] = NotificationDecision{Participant: message.Author}
+		}
+	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
 		return err
@@ -222,6 +261,9 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		}
 	}
 	for _, decision := range recipients {
+		if decision.Participant == s.Scope.Actor {
+			continue // the actor already knows what it changed
+		}
 		// Tenure is re-authorized, not replayed from the intent record: a
 		// recipient who has since left the place has no view to update.
 		access, err := s.placeAccessAfterAuthorization(ctx, tx, place, decision.Participant)
