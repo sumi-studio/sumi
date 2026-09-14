@@ -345,14 +345,39 @@ check_listen() {
 
 port_busy() { (exec 3<>"/dev/tcp/$LISTEN_HOST/$LISTEN_PORT") 2>/dev/null; }
 
-wait_health() { # seconds
-  local deadline=$((SECONDS + $1))
+# proc_running PID STARTTIME — that exact process still exists and is not a
+# zombie. Unlike pid_alive this ignores argv, which is still the launcher's
+# subshell for a moment after spawn.
+proc_running() {
+  local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  local -a f; read -ra f <<<"${s##*) }"   # drop "pid (comm) " — comm may hold spaces
+  [[ ${f[0]} != Z && ${f[19]} == "$2" ]]
+}
+
+# wait_health SECONDS PIDFILE — 0 once the service answers /health; 2 as soon
+# as the spawned process is gone (a failed startup — DB refused, auth, bind —
+# is reported at once, not after the deadline); 1 on timeout.
+wait_health() {
+  local deadline=$((SECONDS + $1)) pid st
+  read -r pid st <"$2" 2>/dev/null || return 2
   while ((SECONDS < deadline)); do
     svc_health && return 0
+    proc_running "$pid" "$st" || return 2
     sleep 0.3
   done
   return 1
 }
+
+# log_excerpt FILE [BYTE-OFFSET] — the last lines written since OFFSET,
+# indented, with the credentials the hosts log (persona/fm tokens, a DB URL
+# password) redacted, so a failure is diagnosable from the terminal or a CI
+# log even after the state home is gone.
+log_excerpt() {
+  [[ -f $1 ]] || { printf '    (no %s)\n' "$1"; return 0; }
+  tail -c "+$((${2:-0} + 1))" "$1" | tail -n 15 \
+    | sed -E 's/(TOKEN=|fm=|Bearer )[^[:space:]&"]+/\1<redacted>/g; s#(://[^:/@[:space:]]*:)[^@[:space:]]+@#\1<redacted>@#g; s/^/    /'
+}
+log_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
 
 persona_state() { # prints persona state JSON or fails
   curl -sf --max-time 5 -H "Authorization: Bearer $(persona_token)" \
@@ -878,23 +903,32 @@ pg_up() {
   die "managed postgres did not become ready — see: docker logs $SUMI_LOCAL_PG_CONTAINER"
 }
 
-# Send a PG StartupMessage to the published addr (host:port) and require an
-# 'R' auth-request byte back — proves the TCP path serves postgres, which a
-# bare connect cannot (docker-proxy accepts then resets).
+# pg_tcp_ready ADDR [USER] [DB] [TIMEOUT_MS] [ACCEPT] — send a PG
+# StartupMessage to host:port and require a backend reply whose first byte
+# is in ACCEPT: R (auth request — the server accepts startups; managed
+# readiness) or RE (any backend answer, e.g. a bad-database error — external
+# reachability). A bare connect proves nothing: docker-proxy accepts on a
+# published port while nothing listens inside the container, then closes.
+# Every path exits explicitly — node exits 0 once its event loop drains, so
+# an unhandled clean close would read as "ready".
 pg_tcp_ready() {
   node -e '
     const net = require("net");
-    const [h, p] = process.argv[1].split(":");
-    const body = Buffer.from("user\0sumi\0database\0sumi\0\0");
+    const [addr, user, db, ms, accept] = process.argv.slice(1);
+    const i = addr.lastIndexOf(":");
+    const host = addr.slice(0, i).replace(/^\[(.*)\]$/, "$1");
+    const body = Buffer.from(`user\0${user}\0database\0${db}\0\0`);
     const head = Buffer.alloc(8);
     head.writeUInt32BE(8 + body.length); head.writeUInt32BE(196608, 4);
-    const s = net.connect(+p, h);
-    s.setTimeout(2000);
-    s.on("connect", () => s.end(Buffer.concat([head, body])));
-    s.on("data", d => process.exit(d[0] === 0x52 ? 0 : 1));
-    s.on("timeout", () => { s.destroy(); process.exit(1); });
-    s.on("error", () => process.exit(1));
-  ' "$1"
+    const done = code => { s.destroy(); process.exit(code); };
+    const s = net.connect(+addr.slice(i + 1), host);
+    s.setTimeout(+ms);
+    s.on("connect", () => s.write(Buffer.concat([head, body])));
+    s.on("data", d => done(accept.includes(String.fromCharCode(d[0])) ? 0 : 1));
+    s.on("timeout", () => done(1));
+    s.on("error", () => done(1));
+    s.on("close", () => done(1));
+  ' "$1" "${2:-sumi}" "${3:-sumi}" "${4:-2000}" "${5:-R}"
 }
 
 pg_down() { pg_compose stop >/dev/null 2>&1 || true; }
@@ -926,12 +960,16 @@ owned_network() {
      == "$SUMI_LOCAL_PG_PROJECT" ]]
 }
 
-db_probe() { # external mode: TCP-connect the DB host:port
-  local hp
-  hp="$(SUMI_DB_URL="$SUMI_DB_URL" node -e 'const u=new URL(process.env.SUMI_DB_URL);console.log(u.hostname,u.port||5432)' 2>/dev/null)" \
+db_probe() { # external mode: a PostgreSQL server must answer at the DB host:port
+  local t addr user db
+  t="$(SUMI_DB_URL="$SUMI_DB_URL" node -e '
+    const u=new URL(process.env.SUMI_DB_URL), d=decodeURIComponent;
+    const user=d(u.username)||"postgres";
+    console.log([u.hostname+":"+(u.port||5432), user, d(u.pathname.slice(1))||user].join("\t"))' 2>/dev/null)" \
     || { info "cannot parse SUMI_DB_URL"; return 1; }
-  (exec 3<>"/dev/tcp/${hp% *}/${hp#* }") 2>/dev/null \
-    || { info "cannot reach PostgreSQL at ${hp% *}:${hp#* }"; return 1; }
+  IFS=$'\t' read -r addr user db <<<"$t"
+  pg_tcp_ready "$addr" "$user" "$db" 5000 RE \
+    || { info "cannot reach PostgreSQL at $addr (refused, timed out, or no PostgreSQL reply)"; return 1; }
 }
 
 # Environment for every spawned host process, appended to the named array.
@@ -1026,6 +1064,8 @@ cmd_start() {
   fi
   if ! pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
     info "starting state service on $(base_url)…"
+    local svc_log svc_log_off hrc=0
+    svc_log="$(LOG_DIR)/service.log"; svc_log_off="$(log_size "$svc_log")"
     (
       exec 9>&-  # daemons must not inherit the operation lock
       exec nohup env \
@@ -1038,9 +1078,11 @@ cmd_start() {
     ) >>"$(LOG_DIR)/service.log" 2>&1 &
     write_pid "$(RUN_DIR)/service.pid" "$!" \
       || die "could not record service pid identity"
-    if ! wait_health 30; then
+    wait_health 30 "$(RUN_DIR)/service.pid" || hrc=$?
+    if ((hrc)); then
       kill_pid "$(RUN_DIR)/service.pid" 5 "$(SERVICE_BIN)"
-      die "state service failed to become healthy — see $(LOG_DIR)/service.log"
+      die "state service $( ((hrc == 2)) && echo "exited during startup" || echo "did not answer /health within 30s") (db $(printf '%s' "$SUMI_DB_URL" | sed -E 's#(://[^:/@]*:)[^@]*@#\1<redacted>@#')) — $svc_log since this start:
+$(log_excerpt "$svc_log" "$svc_log_off")"
     fi
     printf '%s' "$SUMI_DB_URL" >"$db_url_file"
   fi
@@ -1062,7 +1104,8 @@ cmd_start() {
   build_core_env cenv
   local extra
   for extra in ${SUMI_LOCAL_EXTRA_HOSTS:-}; do hosts+=("$extra"); done
-  local h pid_file
+  local h pid_file core_log_off
+  core_log_off="$(log_size "$(LOG_DIR)/local.log")"
   for h in "${hosts[@]}"; do
     [[ $h =~ ^[a-zA-Z0-9._-]+$ ]] || die "invalid host name in SUMI_LOCAL_EXTRA_HOSTS: $h"
     [[ -f $PREFIX/core/host/$h ]] \
@@ -1107,7 +1150,8 @@ cmd_start() {
   if ! wait_lease "$holder" "$(RUN_DIR)/local.pid" 45; then
     local st
     st="$(persona_state 2>/dev/null || true)"
-    die "secretary did not acquire the writer lease in 45s (holder now: '$(printf '%s' "$st" | json_get lease.holder_id)') — see $(LOG_DIR)/local.log"
+    die "secretary did not acquire the writer lease in 45s (holder now: '$(printf '%s' "$st" | json_get lease.holder_id)') — $(LOG_DIR)/local.log since this start:
+$(log_excerpt "$(LOG_DIR)/local.log" "$core_log_off")"
   fi
 
   cat <<EOF

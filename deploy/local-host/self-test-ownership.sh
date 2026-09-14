@@ -29,9 +29,17 @@
 #   - uninstall is idempotent: absent or foreign CLI shim still exits 0
 #   - the real user's ~/.local/bin/sumi-local is never touched (isolated
 #     OS HOME per fixture; sentinel checked before and after)
+#   - database readiness needs a PostgreSQL reply: a docker-proxy port with
+#     nothing behind it is refused before any service is spawned
+#   - a state service that dies at startup is reported at once, with its
+#     own (credential-redacted) log lines
 #
 # Usage:
 #   deploy/local-host/self-test-ownership.sh [workdir]
+# Env:
+#   SUMI_LOCAL_OWNERSHIP_PORT_BASE    listen ports base..base+9 (default: PB below)
+#   SUMI_LOCAL_OWNERSHIP_DOCKER_PREFIX name prefix for containers this test
+#                                      creates directly (default sumi-local-selftest)
 # Requires: docker + compose v2, go, node. Skips cleanly without docker.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -53,6 +61,10 @@ mkdir -p "$OSH" "$OSH2"
 [[ -d $REAL_HOME/.cache/go-build ]] && export GOCACHE="$REAL_HOME/.cache/go-build"
 [[ -d $REAL_HOME/go/pkg/mod ]] && export GOMODCACHE="$REAL_HOME/go/pkg/mod"
 REAL_SHIM_BEFORE="$(readlink "$REAL_HOME/.local/bin/sumi-local" 2>/dev/null || echo __absent__)"
+
+PB=${SUMI_LOCAL_OWNERSHIP_PORT_BASE:-9550}
+for i in 0 1 2 3 4 5 6 7 8 9; do printf -v "P$i" '%s' "$((PB + i))"; done
+NL_CTR="${SUMI_LOCAL_OWNERSHIP_DOCKER_PREFIX:-sumi-local-selftest}-nolisten-$$"
 
 A_HOME="$FIX/home-a"; A_PREFIX="$FIX/prefix-a"
 B_HOME="$FIX/home-b"; B_PREFIX="$FIX/prefix-b"
@@ -94,10 +106,11 @@ done
 
 cleanup() {
   local x
-  for x in a b c d e f f2 h i j k m n p q r s t v w x y z; do
+  for x in a b c d e f f2 h i j k l m n o p q r s t v w x y z; do
     "$x" stop >/dev/null 2>&1 || true
     "$x" uninstall --purge --yes >/dev/null 2>&1 || true
   done
+  docker rm -f "$NL_CTR" >/dev/null 2>&1 || true
   # r may have been moved to prefix-r2 mid-test
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" SUMI_LOCAL_PREFIX="$FIX/prefix-r2" \
     "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
@@ -106,8 +119,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== install A + B (managed, simultaneous, isolated OS HOME)"
-a install --managed-pg --listen 127.0.0.1:9550 >/dev/null
-b install --managed-pg --listen 127.0.0.1:9551 >/dev/null
+a install --managed-pg --listen 127.0.0.1:$P0 >/dev/null
+b install --managed-pg --listen 127.0.0.1:$P1 >/dev/null
 A_ID="$(id_of "$A_HOME")"
 B_ID="$(id_of "$B_HOME")"
 [[ $A_ID != "$B_ID" ]] \
@@ -258,7 +271,7 @@ echo "== populated prefix: only the payload is removed"
 H_HOME="$FIX/home-h"; H_PREFIX="$FIX/prefix-h"
 mkdir -p "$H_PREFIX"; echo keepme > "$H_PREFIX/userfile"
 h() { env HOME="$OSH" SUMI_LOCAL_HOME="$H_HOME" SUMI_LOCAL_PREFIX="$H_PREFIX" "$SRC" "$@"; }
-h install --managed-pg --listen 127.0.0.1:9556 >/dev/null
+h install --managed-pg --listen 127.0.0.1:$P6 >/dev/null
 expect_rc0 "uninstall of populated-prefix install" h uninstall --yes
 [[ -f $H_PREFIX/userfile && $(cat "$H_PREFIX/userfile") == keepme && ! -e $H_PREFIX/bin ]] \
   && ok "payload removed, foreign prefix entries kept" \
@@ -321,18 +334,62 @@ inputs_after="$(a_inputs)"
   && ok "history in A's volume survived uninstall+reinstall (inputs $inputs_before -> $inputs_after)" \
   || bad "history lost (inputs $inputs_before -> $inputs_after)"
 
+echo "== database readiness: a proxy accept is not a PostgreSQL server"
+# docker-proxy accepts on a published port while nothing listens inside the
+# container. The old probe read that as ready, so a fresh managed volume
+# could pass pg_up during the postgres image's initdb temp-server phase and
+# hand the service a port whose first ping fails.
+docker run -d --name "$NL_CTR" -p 127.0.0.1:0:5432 --entrypoint sleep postgres:17-alpine 600 >/dev/null
+NL_ADDR="$(docker port "$NL_CTR" 5432/tcp | head -1)"
+L_HOME="$FIX/home-l"; L_PREFIX="$FIX/prefix-l"
+l() { env HOME="$OSH" SUMI_LOCAL_HOME="$L_HOME" SUMI_LOCAL_PREFIX="$L_PREFIX" "$SRC" "$@"; }
+l install --db-url "postgres://sumi:x@$NL_ADDR/sumi?sslmode=disable" --listen 127.0.0.1:$P3 >/dev/null
+out="$(l start 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 && $out == *"cannot reach PostgreSQL at $NL_ADDR"* ]] \
+  && ok "start refuses a published port with no PostgreSQL behind it" \
+  || bad "proxy-only port treated as a database: rc=$rc $(echo "$out" | tail -3)"
+[[ ! -f $L_HOME/run/service.pid ]] && ! pgrep -f "$L_PREFIX/bin/sumi-local-service" >/dev/null \
+  && ok "no state service was spawned against it" \
+  || bad "state service spawned against a proxy-only port"
+docker rm -f "$NL_CTR" >/dev/null 2>&1 || true
+l uninstall --purge --yes >/dev/null 2>&1 || true
+
+echo "== a state service that dies at startup is reported at once, with its log"
+A_PGADDR="127.0.0.1:$(docker inspect "$A_CTR" --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}')"
+O_HOME="$FIX/home-o"; O_PREFIX="$FIX/prefix-o"
+o() { env HOME="$OSH" SUMI_LOCAL_HOME="$O_HOME" SUMI_LOCAL_PREFIX="$O_PREFIX" "$SRC" "$@"; }
+o install --db-url "postgres://sumi:wrong-password@$A_PGADDR/sumi?sslmode=disable" --listen 127.0.0.1:$P4 >/dev/null
+t0=$SECONDS
+out="$(o start 2>&1)" && rc=0 || rc=$?
+dt=$((SECONDS - t0))
+[[ $rc != 0 && $out == *"exited during startup"* && $out == *"password authentication failed"* ]] \
+  && ok "startup death reported with the service's own error (${dt}s)" \
+  || bad "startup failure not diagnosable: rc=$rc $(echo "$out" | tail -4)"
+((dt < 20)) \
+  && ok "reported before the 30s health deadline" \
+  || bad "failed start still waited out the health deadline (${dt}s)"
+[[ $out != *wrong-password* ]] \
+  && ok "failure report redacts the DB password" \
+  || bad "failure report leaked the DB password"
+! pgrep -f "$O_PREFIX/bin/sumi-local-service" >/dev/null \
+  && ok "no service process left behind" \
+  || bad "failed start left a service process"
+o uninstall --purge --yes >/dev/null 2>&1 || true
+a say "alpha unaffected" >/dev/null && ok "A unaffected by the failed foreign login" \
+  || bad "A broken after failed-login probe"
+
 echo "== orphan refusal: lost config + leftover volume"
 C_HOME="$FIX/home-c"; C_PREFIX="$FIX/prefix-c"
 c() { env HOME="$OSH" SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" "$@"; }
-c install --managed-pg --listen 127.0.0.1:9552 >/dev/null
+c install --managed-pg --listen 127.0.0.1:$P2 >/dev/null
 C_ID="$(id_of "$C_HOME")"
 c start >/dev/null; c stop >/dev/null
 rm -f "$C_HOME/config.env"
 expect_die "fresh install refuses orphan volume" "Refusing to adopt" \
-  env HOME="$OSH" SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:9552
+  env HOME="$OSH" SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:$P2
 docker rm -f "sumi-local-pg-$C_ID" >/dev/null 2>&1 || true
 docker volume rm "sumi-local-pgdata-$C_ID" >/dev/null 2>&1 || true
-c install --managed-pg --listen 127.0.0.1:9552 >/dev/null \
+c install --managed-pg --listen 127.0.0.1:$P2 >/dev/null \
   && ok "after explicit resource removal, fresh install proceeds" \
   || bad "fresh install still blocked after resource removal"
 env HOME="$OSH" SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
@@ -340,7 +397,7 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" u
 echo "== lost config — marker recovers managed resources + real prefix"
 D_HOME="$FIX/home-d"; D_PREFIX="$FIX/prefix-d"
 d() { env HOME="$OSH" SUMI_LOCAL_HOME="$D_HOME" SUMI_LOCAL_PREFIX="$D_PREFIX" "$SRC" "$@"; }
-d install --managed-pg --listen 127.0.0.1:9553 >/dev/null
+d install --managed-pg --listen 127.0.0.1:$P3 >/dev/null
 D_ID="$(id_of "$D_HOME")"
 d start >/dev/null
 d say "dee ping" >/dev/null && ok "D serving" || bad "D failed to start"
@@ -378,7 +435,7 @@ expect_rc0 "config-less purge via marker" \
 echo "== purge with orphaned processes: swept first, DB not pulled from under them"
 J_HOME="$FIX/home-j"; J_PREFIX="$FIX/prefix-j"
 j() { env HOME="$OSH" SUMI_LOCAL_HOME="$J_HOME" SUMI_LOCAL_PREFIX="$J_PREFIX" "$SRC" "$@"; }
-j install --managed-pg --listen 127.0.0.1:9557 >/dev/null
+j install --managed-pg --listen 127.0.0.1:$P7 >/dev/null
 J_ID="$(id_of "$J_HOME")"
 j start >/dev/null
 rm -f "$J_HOME/run/service.pid" "$J_HOME/run/local.pid"
@@ -394,7 +451,7 @@ fi
 echo "== corrupt config — inert data, purge still recovers via marker"
 E_HOME="$FIX/home-e"; E_PREFIX="$FIX/prefix-e"
 e() { env HOME="$OSH" SUMI_LOCAL_HOME="$E_HOME" SUMI_LOCAL_PREFIX="$E_PREFIX" "$SRC" "$@"; }
-e install --managed-pg --listen 127.0.0.1:9554 >/dev/null
+e install --managed-pg --listen 127.0.0.1:$P4 >/dev/null
 E_ID="$(id_of "$E_HOME")"
 e start >/dev/null
 { printf 'SUMI_LOCAL_ID='"'"'slbadbad00'"'"'\n'
@@ -416,7 +473,7 @@ out="$(e uninstall --purge --yes 2>&1)"
 echo "== marker/config id disagreement refuses destructive action"
 I_HOME="$FIX/home-i"; I_PREFIX="$FIX/prefix-i"
 i() { env HOME="$OSH" SUMI_LOCAL_HOME="$I_HOME" SUMI_LOCAL_PREFIX="$I_PREFIX" "$SRC" "$@"; }
-i install --managed-pg --listen 127.0.0.1:9558 >/dev/null
+i install --managed-pg --listen 127.0.0.1:$P8 >/dev/null
 i stop >/dev/null 2>&1 || true
 printf 'SUMI_LOCAL_ID='"'"'sl0deadbeef0'"'"'\n' > "$I_HOME/.sumi-local-home"  # hand-forged split
 out="$(i uninstall --yes 2>&1 || true)"
@@ -437,7 +494,7 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$G_HOME" SUMI_LOCAL_PREFIX="$FIX/prefix-failed"
 echo "== moved home: recorded id stays authoritative; reinstall resyncs marker"
 F_HOME="$FIX/home-f"; F_PREFIX="$FIX/prefix-f"
 f() { env HOME="$OSH" SUMI_LOCAL_HOME="$F_HOME" SUMI_LOCAL_PREFIX="$F_PREFIX" "$SRC" "$@"; }
-f install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+f install --managed-pg --listen 127.0.0.1:$P5 >/dev/null
 F_ID="$(id_of "$F_HOME")"
 f start >/dev/null; f stop >/dev/null
 mv "$F_HOME" "$FIX/home-f-moved"; F_HOME="$FIX/home-f-moved"
@@ -449,7 +506,7 @@ f uninstall --purge --yes >/dev/null 2>&1
 # now the R6 sequence: fresh install at a moved home whose marker is stale
 # must resync the marker to the effective id, never leave it stale
 F2_HOME="$FIX/home-f2"; F2_PREFIX="$FIX/prefix-f2"
-env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:$P5 >/dev/null
 F2_ID="$(id_of "$F2_HOME")"
 env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" stop >/dev/null 2>&1 || true
 mv "$F2_HOME" "$FIX/home-f2-moved"; F2_HOME="$FIX/home-f2-moved"
@@ -459,7 +516,7 @@ docker volume rm "sumi-local-pgdata-$F2_ID" >/dev/null 2>&1 || true
 # reinstall at the moved path with a NEW prefix (the old one is marked for
 # the stale id and is correctly refused to a new install)
 F2_PREFIX="$FIX/prefix-f2b"
-env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" install --managed-pg --listen 127.0.0.1:$P5 >/dev/null
 NEW_ID="$(id_of "$F2_HOME")"
 MARK_ID="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$F2_HOME/.sumi-local-home")"
 [[ $MARK_ID == "$NEW_ID" ]] \
@@ -470,11 +527,11 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" "$SRC" uninstall --purge --yes >/dev/
 echo "== external -> managed reinstall keeps a coherent identity"
 K_HOME="$FIX/home-k"; K_PREFIX="$FIX/prefix-k"
 env HOME="$OSH" SUMI_LOCAL_HOME="$K_HOME" SUMI_LOCAL_PREFIX="$K_PREFIX" "$SRC" \
-  install --db-url 'postgres://sumi:x@127.0.0.1:1/none' --listen 127.0.0.1:9559 >/dev/null
+  install --db-url 'postgres://sumi:x@127.0.0.1:1/none' --listen 127.0.0.1:$P9 >/dev/null
 K_ID="$(id_of "$K_HOME")"
 rm -f "$K_HOME/config.env"
 env HOME="$OSH" SUMI_LOCAL_HOME="$K_HOME" SUMI_LOCAL_PREFIX="$K_PREFIX" "$SRC" \
-  install --managed-pg --listen 127.0.0.1:9559 >/dev/null
+  install --managed-pg --listen 127.0.0.1:$P9 >/dev/null
 K_ID2="$(id_of "$K_HOME")"
 K_MARK="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$K_HOME/.sumi-local-home")"
 K_PMARK="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$K_PREFIX/.sumi-local-prefix")"
@@ -489,10 +546,10 @@ echo "== stale home + reused prefix path: old stop/start cannot touch the new in
 M_HOME="$FIX/home-m"; N_HOME="$FIX/home-n"; MN_PREFIX="$FIX/prefix-m"
 m() { env HOME="$OSH" SUMI_LOCAL_HOME="$M_HOME" SUMI_LOCAL_PREFIX="$MN_PREFIX" "$SRC" "$@"; }
 n() { env HOME="$OSH" SUMI_LOCAL_HOME="$N_HOME" SUMI_LOCAL_PREFIX="$MN_PREFIX" "$SRC" "$@"; }
-m install --managed-pg --listen 127.0.0.1:9551 >/dev/null
+m install --managed-pg --listen 127.0.0.1:$P1 >/dev/null
 m start >/dev/null
 m uninstall >/dev/null    # keeps home-m; removes the prefix payload+marker
-n install --managed-pg --listen 127.0.0.1:9552 >/dev/null   # same prefix path, new home/id
+n install --managed-pg --listen 127.0.0.1:$P2 >/dev/null   # same prefix path, new home/id
 n start >/dev/null
 n say "n lives" >/dev/null && ok "new install on reused prefix is serving" \
   || bad "new install failed to start"
@@ -520,8 +577,8 @@ M_ID="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$M_HOME/config.env" 2>/dev/
 
 # --- review-B F1: config-less stop must not honor a foreign env prefix --
 echo "== config-less stop with another install's env prefix is refused"
-p install --managed-pg --listen 127.0.0.1:9553 >/dev/null
-q install --managed-pg --listen 127.0.0.1:9554 >/dev/null
+p install --managed-pg --listen 127.0.0.1:$P3 >/dev/null
+q install --managed-pg --listen 127.0.0.1:$P4 >/dev/null
 p start >/dev/null; q start >/dev/null
 rm -f "$FIX/home-q/config.env"
 expect_die "config-less stop refuses env prefix of another install" \
@@ -546,19 +603,19 @@ p stop >/dev/null; p uninstall --purge --yes >/dev/null 2>&1 || true
 
 # --- review-A F-A2 / B F2: install over live processes is refused -------
 echo "== install refuses while the install's processes are running"
-r install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+r install --managed-pg --listen 127.0.0.1:$P5 >/dev/null
 r start >/dev/null
 expect_die "reinstall to a new prefix while running refused" "stop it first" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" "$SRC" install \
-    --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:9555
+    --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:$P5
 expect_die "same-prefix reinstall while running refused" "stop it first" \
-  r install --managed-pg --listen 127.0.0.1:9555
+  r install --managed-pg --listen 127.0.0.1:$P5
 r say "r lives" >/dev/null \
   && ok "running install unharmed by refused reinstall" \
   || bad "refused reinstall still touched the live install"
 r stop >/dev/null
 env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" "$SRC" install \
-  --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:9555 >/dev/null \
+  --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:$P5 >/dev/null \
   && ok "prefix move allowed once stopped" \
   || bad "stopped install could not move prefix"
 r2() { env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" SUMI_LOCAL_PREFIX="$FIX/prefix-r2" "$SRC" "$@"; }
@@ -596,29 +653,29 @@ OSH3="$FIX/os-home3"; mkdir -p "$OSH3/.local/bin"
 echo "my own tool" > "$OSH3/.local/bin/sumi-local"; chmod +x "$OSH3/.local/bin/sumi-local"
 expect_die "install refuses to overwrite a regular-file shim" "not a symlink" \
   env HOME="$OSH3" SUMI_LOCAL_HOME="$FIX/home-shim" SUMI_LOCAL_PREFIX="$FIX/prefix-shim" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9556
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P6
 [[ $(cat "$OSH3/.local/bin/sumi-local") == "my own tool" && ! -e $FIX/home-shim ]] \
   && ok "regular-file shim preserved; nothing was created" \
   || bad "regular-file shim was overwritten or install half-created dirs"
 
 # --- review-B F3/O2: CRLF config parses; duplicate keys last-wins -------
 echo "== CRLF config is readable; duplicate keys resolve last-wins"
-w install --managed-pg --listen 127.0.0.1:9557 >/dev/null
+w install --managed-pg --listen 127.0.0.1:$P7 >/dev/null
 sed -i 's/$/\r/' "$FIX/home-w/config.env"
-[[ $(w url 2>/dev/null) == *9557* ]] \
+[[ $(w url 2>/dev/null) == *$P7* ]] \
   && ok "CRLF config.env still parses" \
   || bad "CRLF config treated as corrupt"
-printf "SUMI_LOCAL_LISTEN='127.0.0.1:9558'\n" >> "$FIX/home-w/config.env"
-[[ $(w url 2>/dev/null) == *9558* ]] \
+printf "SUMI_LOCAL_LISTEN='127.0.0.1:$P8'\n" >> "$FIX/home-w/config.env"
+[[ $(w url 2>/dev/null) == *$P8* ]] \
   && ok "duplicate key resolves last-wins" \
   || bad "duplicate-key policy inconsistent: $(w url 2>/dev/null | head -1)"
 w uninstall --purge --yes >/dev/null 2>&1 || true
 
 # --- review-A F-A4: & | \ in a moved prefix must stay literal -----------
 echo "== moved prefix with shell-special chars is recorded literally"
-v install --managed-pg --listen 127.0.0.1:9559 >/dev/null
+v install --managed-pg --listen 127.0.0.1:$P9 >/dev/null
 env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" "$SRC" install \
-  --managed-pg --prefix "$FIX/prefix-v&amp;x" --listen 127.0.0.1:9559 >/dev/null
+  --managed-pg --prefix "$FIX/prefix-v&amp;x" --listen 127.0.0.1:$P9 >/dev/null
 [[ $(grep -cF "SUMI_LOCAL_INSTALLED_PREFIX='$FIX/prefix-v&amp;x'" "$FIX/home-v/config.env") == 1 ]] \
   && ok "recorded prefix with & is literal (no sed expansion)" \
   || bad "recorded prefix corrupted: $(grep SUMI_LOCAL_INSTALLED_PREFIX "$FIX/home-v/config.env")"
@@ -632,12 +689,12 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" SUMI_LOCAL_PREFIX="$FIX/prefix-v&a
 # --- review-B F1 / f89: config-less reinstall must check the marker's
 # recorded prefix for live processes BEFORE rewriting evidence ----------
 echo "== config-less reinstall/move refuses while recorded prefix is live"
-t install --managed-pg --listen 127.0.0.1:9552 >/dev/null
+t install --managed-pg --listen 127.0.0.1:$P2 >/dev/null
 t start >/dev/null
 rm -f "$FIX/home-t/config.env"
 T_MARK_BEFORE="$(cat "$FIX/home-t/.sumi-local-home")"
 out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" "$SRC" install \
-  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:9552 2>&1)" && rc=0 || rc=$?
+  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:$P2 2>&1)" && rc=0 || rc=$?
 [[ $rc != 0 && $out == *"still running"* && $out == *"stop it first"* ]] \
   && ok "config-less move refused while marker prefix is live" \
   || bad "config-less move over live processes not refused: rc=$rc $(echo "$out" | tail -2)"
@@ -655,7 +712,7 @@ T_ID="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$FIX/home-t/.sumi-local-hom
 docker rm -f "sumi-local-pg-$T_ID" >/dev/null 2>&1 || true
 docker volume rm "sumi-local-pgdata-$T_ID" >/dev/null 2>&1 || true
 out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" "$SRC" install \
-  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:9552 2>&1)" && rc=0 || rc=$?
+  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:$P2 2>&1)" && rc=0 || rc=$?
 [[ $rc == 0 ]] \
   && ok "config-less move proceeds once stopped" \
   || bad "stopped config-less move refused: $(echo "$out" | tail -2)"
@@ -664,13 +721,13 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" SUMI_LOCAL_PREFIX="$FIX/prefix-t2"
 
 # --- review-A F1 / f109: install joins the per-home operation lock -----
 echo "== install serializes with other lifecycle ops on the same home"
-x install --managed-pg --listen 127.0.0.1:9551 >/dev/null
+x install --managed-pg --listen 127.0.0.1:$P1 >/dev/null
 mkdir -p "$FIX/home-x/run"
 t0=$SECONDS
 flock "$FIX/home-x/run/lock" -c 'sleep 4' &
 LOCK_HOLDER=$!
 sleep 0.3   # let the holder take the lock
-out="$(x install --managed-pg --listen 127.0.0.1:9551 2>&1)" && rc=0 || rc=$?
+out="$(x install --managed-pg --listen 127.0.0.1:$P1 2>&1)" && rc=0 || rc=$?
 wait "$LOCK_HOLDER" 2>/dev/null || true
 [[ $rc == 0 && $((SECONDS - t0)) -ge 3 ]] \
   && ok "install waited on the per-home lock, then succeeded" \
@@ -681,37 +738,37 @@ x uninstall --purge --yes >/dev/null 2>&1 || true
 echo "== nested home/prefix pairs refused before anything is created"
 expect_die "prefix nested inside home refused" "must not nest" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-nest" SUMI_LOCAL_PREFIX="$FIX/home-nest/payload" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P2
 [[ ! -e $FIX/home-nest ]] \
   && ok "nested-prefix refusal created nothing" \
   || bad "nested-prefix refusal still created the home"
 expect_die "home nested inside prefix refused" "must not nest" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/prefix-nest/state" SUMI_LOCAL_PREFIX="$FIX/prefix-nest" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P2
 [[ ! -e $FIX/prefix-nest ]] \
   && ok "nested-home refusal created nothing" \
   || bad "nested-home refusal still created the prefix"
 expect_die "equal home/prefix refused" "must not nest" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/same" SUMI_LOCAL_PREFIX="$FIX/same" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P2
 
 # --- review-B F3 / f112: control-char paths + incomplete config --------
 echo "== control characters in paths and incomplete configs are refused"
 expect_die "newline in --prefix refused" "control characters" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-ctl" SUMI_LOCAL_PREFIX="$(printf '%s\nEVIL=x' "$FIX/prefix-ctl")" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3
 [[ ! -e $FIX/home-ctl && ! -e $FIX/prefix-ctl ]] \
   && ok "control-char refusal created nothing" \
   || bad "control-char install partially created dirs"
 expect_die "CR in --home refused" "control characters" \
   env HOME="$OSH" SUMI_LOCAL_HOME="$(printf '%s\r' "$FIX/home-cr")" SUMI_LOCAL_PREFIX="$FIX/prefix-cr" \
-    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553
-s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553 >/dev/null
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3
+s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3 >/dev/null
 S_CFG_BEFORE="$(cat "$FIX/home-s/config.env")"
 # strip required keys -> incomplete config must be refused, kept verbatim
 grep -v '^SUMI_CORE_STATE_TOKEN=' "$FIX/home-s/config.env" > "$FIX/home-s/config.tmp"
 mv "$FIX/home-s/config.tmp" "$FIX/home-s/config.env"
-out="$(s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553 2>&1)" && rc=0 || rc=$?
+out="$(s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3 2>&1)" && rc=0 || rc=$?
 [[ $rc != 0 && $out == *"incomplete"* && $out == *"SUMI_CORE_STATE_TOKEN"* && $out == *"move config.env aside"* ]] \
   && ok "incomplete config refused with a repair path" \
   || bad "incomplete config mishandled: rc=$rc $(echo "$out" | tail -2)"
@@ -759,7 +816,7 @@ docker volume rm "sumi-local-pgdata-$Y_ID" >/dev/null 2>&1
 
 # --- review-B F2 / f114: copied home adopts, never takes over ----------
 echo "== copied state home joins the running install, no takeover"
-z install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+z install --managed-pg --listen 127.0.0.1:$P5 >/dev/null
 z start >/dev/null
 z say "z ping" >/dev/null
 Z_SPID="$(cut -d' ' -f1 "$FIX/home-z/run/service.pid")"
@@ -792,7 +849,7 @@ rm -rf "$FIX/home-z2"
 
 # --- review-A F3 / f113: deleted-payload survivors are reported --------
 echo "== stop reports survivors invisible to the exact-path sweep"
-w install --managed-pg --listen 127.0.0.1:9556 >/dev/null
+w install --managed-pg --listen 127.0.0.1:$P6 >/dev/null
 w start >/dev/null
 cp "$FIX/prefix-w/core/host/local.ts" "$FIX/local.ts.saved"
 # F3's orphan: the payload file is gone AND the pidfile is lost — the
