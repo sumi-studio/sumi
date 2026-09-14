@@ -33,6 +33,11 @@
 #     nothing behind it is refused before any service is spawned
 #   - a state service that dies at startup is reported at once, with its
 #     own (credential-redacted) log lines
+#   - an unreadable config.env or home marker is named in a refusal that
+#     changes nothing (not a silent non-zero exit)
+#   - external-DB preflight opens what pgx will: an sslnegotiation=direct
+#     URL through a TLS-only terminator starts; direct under sslmode=disable
+#     stays plaintext
 #
 # Usage:
 #   deploy/local-host/self-test-ownership.sh [workdir]
@@ -106,11 +111,12 @@ done
 
 cleanup() {
   local x
-  for x in a b c d e f f2 h i j k l m n o p q r s t v w x y z; do
+  for x in a b c d e f f2 h i j k l m n o p q r s t td v w x y z; do
     "$x" stop >/dev/null 2>&1 || true
     "$x" uninstall --purge --yes >/dev/null 2>&1 || true
   done
   docker rm -f "$NL_CTR" >/dev/null 2>&1 || true
+  [[ -n ${TLSD_PID:-} ]] && kill "$TLSD_PID" 2>/dev/null || true
   # r may have been moved to prefix-r2 mid-test
   env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" SUMI_LOCAL_PREFIX="$FIX/prefix-r2" \
     "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
@@ -358,7 +364,10 @@ echo "== a state service that dies at startup is reported at once, with its log"
 A_PGADDR="127.0.0.1:$(docker inspect "$A_CTR" --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}')"
 O_HOME="$FIX/home-o"; O_PREFIX="$FIX/prefix-o"
 o() { env HOME="$OSH" SUMI_LOCAL_HOME="$O_HOME" SUMI_LOCAL_PREFIX="$O_PREFIX" "$SRC" "$@"; }
-o install --db-url "postgres://sumi:wrong-password@$A_PGADDR/sumi?sslmode=disable" --listen 127.0.0.1:$P4 >/dev/null
+# sslnegotiation=direct is inert under sslmode=disable (pgx has no TLS
+# config then), so the preflight must still open plaintext and let the
+# service report the real error.
+o install --db-url "postgres://sumi:wrong-password@$A_PGADDR/sumi?sslmode=disable&sslnegotiation=direct" --listen 127.0.0.1:$P4 >/dev/null
 t0=$SECONDS
 out="$(o start 2>&1)" && rc=0 || rc=$?
 dt=$((SECONDS - t0))
@@ -377,6 +386,38 @@ dt=$((SECONDS - t0))
 o uninstall --purge --yes >/dev/null 2>&1 || true
 a say "alpha unaffected" >/dev/null && ok "A unaffected by the failed foreign login" \
   || bad "A broken after failed-login probe"
+
+echo "== external DB behind a direct-TLS terminator (sslnegotiation=direct) starts"
+# pgx opens TLS from the first byte for sslnegotiation=direct; a terminator
+# that speaks only TLS never answers a plaintext probe, so the preflight
+# must open the same exchange the client will.
+TLSD="$FIX/tls-direct"; mkdir -p "$TLSD"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
+  -keyout "$TLSD/key.pem" -out "$TLSD/cert.pem" >/dev/null 2>&1
+A_PGPW="$(sed -n "s/^SUMI_LOCAL_PG_PASSWORD='\\(.*\\)'$/\\1/p" "$A_HOME/config.env" | tail -1)"
+docker exec "$A_CTR" psql -U sumi -d sumi -qc 'create database tlsdirect' >/dev/null
+node -e '
+  const [port, backend, cert, key] = process.argv.slice(1), fs = require("fs"), net = require("net");
+  const i = backend.lastIndexOf(":");
+  require("tls").createServer({ cert: fs.readFileSync(cert), key: fs.readFileSync(key), ALPNProtocols: ["postgresql"] }, c => {
+    const b = net.connect(+backend.slice(i + 1), backend.slice(0, i));
+    c.pipe(b); b.pipe(c);
+    const end = () => { c.destroy(); b.destroy(); };
+    for (const x of [c, b]) { x.on("error", end); x.on("close", end); }
+  }).on("tlsClientError", () => {}).listen(+port, "127.0.0.1");
+' "$P6" "$A_PGADDR" "$TLSD/cert.pem" "$TLSD/key.pem" &
+TLSD_PID=$!
+for _ in $(seq 1 25); do (exec 3<>"/dev/tcp/127.0.0.1/$P6") 2>/dev/null && break; sleep 0.2; done
+td() { env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-td" SUMI_LOCAL_PREFIX="$FIX/prefix-td" "$SRC" "$@"; }
+td install --db-url "postgres://sumi:$A_PGPW@127.0.0.1:$P6/tlsdirect?sslmode=require&sslnegotiation=direct" \
+  --listen 127.0.0.1:$P5 >/dev/null
+out="$(td start 2>&1)" && rc=0 || rc=$?
+[[ $rc == 0 ]] && td say "tls direct" >/dev/null \
+  && ok "direct-TLS URL: preflight passes and the service serves through the terminator" \
+  || bad "direct-TLS external DB refused: rc=$rc $(echo "$out" | tail -3)"
+td stop >/dev/null 2>&1 || true
+td uninstall --purge --yes >/dev/null 2>&1 || true
+kill "$TLSD_PID" 2>/dev/null || true
 
 echo "== orphan refusal: lost config + leftover volume"
 C_HOME="$FIX/home-c"; C_PREFIX="$FIX/prefix-c"
@@ -781,6 +822,36 @@ s url >/dev/null 2>&1 \
   && ok "repaired config is usable (same install, same identity)" \
   || bad "repaired config still unusable"
 s uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F1: unreadable config/marker is named, never a silent exit --
+echo "== unreadable config.env / home marker: named refusal, nothing changed"
+if ((EUID == 0)); then
+  ok "skipped as root (mode 000 does not restrict root)"
+else
+  s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3 >/dev/null
+  S_H="$FIX/home-s"; S_SUM="$(cksum <"$S_H/config.env")"
+  chmod 000 "$S_H/config.env"
+  out="$(s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:$P3 2>&1)" && rc=0 || rc=$?
+  chmod 600 "$S_H/config.env"
+  [[ $rc != 0 && $out == *"cannot read"*"config.env"* ]] \
+    && ok "install over an unreadable config.env names the file (rc=$rc)" \
+    || bad "unreadable config.env not diagnosed: rc=$rc out: $(echo "$out" | tail -2)"
+  [[ $(cksum <"$S_H/config.env") == "$S_SUM" ]] \
+    && ok "refused install left config.env byte-identical" \
+    || bad "refused install rewrote config.env"
+  mv "$S_H/config.env" "$FIX/s-config.saved"
+  chmod 000 "$S_H/.sumi-local-home"
+  out="$(s stop 2>&1)" && rc=0 || rc=$?
+  chmod 600 "$S_H/.sumi-local-home"
+  [[ $rc != 0 && $out == *"cannot read"*".sumi-local-home"* ]] \
+    && ok "config-less stop over an unreadable marker names the file (rc=$rc)" \
+    || bad "unreadable marker not diagnosed: rc=$rc out: $(echo "$out" | tail -2)"
+  mv "$FIX/s-config.saved" "$S_H/config.env"
+  [[ -f $S_H/.sumi-local-home && $(cksum <"$S_H/config.env") == "$S_SUM" ]] \
+    && ok "marker and config intact after both refusals" \
+    || bad "refusal removed or changed the marker/config"
+  s uninstall --purge --yes >/dev/null 2>&1 || true
+fi
 
 # --- review-A F4 / f111: volume-ownership refusal precedes teardown ----
 echo "== foreign-labelled volume refuses purge BEFORE own resources are removed"

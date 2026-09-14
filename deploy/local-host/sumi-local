@@ -136,9 +136,18 @@ config_pairs() {
     }' "$1"
 }
 
+# An existing state file we cannot read gets a named refusal. Under set -e
+# a failed read inside $(…) would otherwise end the command with the
+# reader's exit status and no message, before any explanatory branch runs.
+require_readable() {
+  [[ ! -e $1 || -r $1 ]] \
+    || die "cannot read $1 (permission denied) — nothing was changed; restore read access (e.g. chmod u+r) and retry"
+}
+
 # config_val FILE KEY — print the last value for KEY (data-only,
 # same rules — duplicate keys resolve last-wins).
 config_val() {
+  require_readable "$1"
   node -e '
     const fs=require("fs");
     let t; try { t=fs.readFileSync(process.argv[1],"utf8"); } catch { process.exit(1); }
@@ -185,6 +194,7 @@ load_config() {
   PREFIX="$(canon "$(sumi_prefix)")"
   CONFIG="$HOME_DIR/config.env"
   [[ -f $CONFIG ]] || return 1
+  [[ -r $CONFIG ]] || { info "cannot read $CONFIG (permission denied) — restore read access (e.g. chmod u+r)"; return 1; }
   local k v
   local -a saved=()
   for k in "${OVERRIDABLE[@]}"; do
@@ -257,7 +267,7 @@ MARKER_FILE() { printf '%s/.sumi-local-home' "$HOME_DIR"; }
 # Parse the install id recorded in a marker file (never sourced — a foreign
 # directory's file must not become shell code). Duplicate keys: last wins,
 # same policy as the config parser.
-marker_id() { sed -n "s/^SUMI_LOCAL_ID=['\"]\\{0,1\\}\\(sl[0-9a-f]\\{10\\}\\).*/\\1/p" "$1" 2>/dev/null | tail -n1; }
+marker_id() { require_readable "$1"; sed -n "s/^SUMI_LOCAL_ID=['\"]\\{0,1\\}\\(sl[0-9a-f]\\{10\\}\\).*/\\1/p" "$1" 2>/dev/null | tail -n1; }
 
 # The home marker also records the install prefix so config-less recovery
 # locates the real payload root instead of trusting the env-selected one.
@@ -903,33 +913,49 @@ pg_up() {
   die "managed postgres did not become ready — see: docker logs $SUMI_LOCAL_PG_CONTAINER"
 }
 
-# pg_tcp_ready ADDR [USER] [DB] [TIMEOUT_MS] [ACCEPT] — send a PG
-# StartupMessage to host:port and require a backend reply whose first byte
-# is in ACCEPT: R (auth request — the server accepts startups; managed
-# readiness) or RE (any backend answer, e.g. a bad-database error — external
-# reachability). A bare connect proves nothing: docker-proxy accepts on a
-# published port while nothing listens inside the container, then closes.
-# Every path exits explicitly — node exits 0 once its event loop drains, so
-# an unhandled clean close would read as "ready".
-pg_tcp_ready() {
+# pg_wire_probe MODE ADDR TIMEOUT_MS [USER] [DB] — open the first exchange
+# a PostgreSQL client would at host:port and require a PostgreSQL answer.
+# A bare connect proves nothing: docker-proxy accepts on a published port
+# while nothing listens inside the container, then closes. Every path exits
+# explicitly — node exits 0 once its event loop drains, so an unhandled
+# clean close would read as success.
+#   startup      StartupMessage; 0 on 'R' (auth request: accepting startups)
+#   startup-any  StartupMessage; 0 on 'R' or 'E' (any backend answer)
+#   sslrequest   SSLRequest; 0 on 'S' or 'N'
+#   tls          direct TLS handshake, ALPN "postgresql"; 0 once it completes
+pg_wire_probe() {
   node -e '
-    const net = require("net");
-    const [addr, user, db, ms, accept] = process.argv.slice(1);
+    const net = require("net"), tls = require("tls");
+    const [mode, addr, ms, user, db] = process.argv.slice(1);
     const i = addr.lastIndexOf(":");
-    const host = addr.slice(0, i).replace(/^\[(.*)\]$/, "$1");
-    const body = Buffer.from(`user\0${user}\0database\0${db}\0\0`);
-    const head = Buffer.alloc(8);
-    head.writeUInt32BE(8 + body.length); head.writeUInt32BE(196608, 4);
+    const host = addr.slice(0, i).replace(/^\[(.*)\]$/, "$1"), port = +addr.slice(i + 1);
+    let s;
     const done = code => { s.destroy(); process.exit(code); };
-    const s = net.connect(+addr.slice(i + 1), host);
+    if (mode === "tls") {
+      s = tls.connect({ host, port, ALPNProtocols: ["postgresql"], rejectUnauthorized: false,
+                        servername: net.isIP(host) ? undefined : host }, () => done(0));
+    } else {
+      let msg = Buffer.alloc(8), accept = "SN";
+      msg.writeUInt32BE(8); msg.writeUInt32BE(80877103, 4);
+      if (mode !== "sslrequest") {
+        const body = Buffer.from(`user\0${user}\0database\0${db}\0\0`);
+        msg.writeUInt32BE(8 + body.length); msg.writeUInt32BE(196608, 4);
+        msg = Buffer.concat([msg, body]);
+        accept = mode === "startup" ? "R" : "RE";
+      }
+      s = net.connect(port, host, () => s.write(msg));
+      s.on("data", d => done(accept.includes(String.fromCharCode(d[0])) ? 0 : 1));
+    }
     s.setTimeout(+ms);
-    s.on("connect", () => s.write(Buffer.concat([head, body])));
-    s.on("data", d => done(accept.includes(String.fromCharCode(d[0])) ? 0 : 1));
     s.on("timeout", () => done(1));
     s.on("error", () => done(1));
     s.on("close", () => done(1));
-  ' "$1" "${2:-sumi}" "${3:-sumi}" "${4:-2000}" "${5:-R}"
+  ' "$1" "$2" "$3" "${4:-sumi}" "${5:-sumi}"
 }
+
+# Managed readiness: the container runs with ssl off, and an 'E' reply means
+# the server is still starting up.
+pg_tcp_ready() { pg_wire_probe startup "$1" 2000; }
 
 pg_down() { pg_compose stop >/dev/null 2>&1 || true; }
 
@@ -960,16 +986,27 @@ owned_network() {
      == "$SUMI_LOCAL_PG_PROJECT" ]]
 }
 
-db_probe() { # external mode: a PostgreSQL server must answer at the DB host:port
-  local t addr user db
+# db_probe — external mode. The service hands SUMI_DB_URL to pgx, so probe
+# with the first exchange pgx itself opens for that URL: plaintext startup
+# for sslmode=disable/allow (pgx ignores sslnegotiation=direct without a
+# TLS config and tries plaintext first for allow), else a TLS handshake for
+# sslnegotiation=direct, else SSLRequest (prefer — the default — require,
+# verify-*). This proves a
+# PostgreSQL endpoint answers; authentication and certificate checks are
+# the service's to report (start prints its log lines when it exits).
+db_probe() {
+  local t addr user db mode
   t="$(SUMI_DB_URL="$SUMI_DB_URL" node -e '
-    const u=new URL(process.env.SUMI_DB_URL), d=decodeURIComponent;
+    const u=new URL(process.env.SUMI_DB_URL), d=decodeURIComponent, q=u.searchParams, e=process.env;
     const user=d(u.username)||"postgres";
-    console.log([u.hostname+":"+(u.port||5432), user, d(u.pathname.slice(1))||user].join("\t"))' 2>/dev/null)" \
+    const sslmode=q.get("sslmode")||e.PGSSLMODE||"prefer";
+    const neg=q.get("sslnegotiation")||e.PGSSLNEGOTIATION||"postgres";
+    const mode=(sslmode==="disable"||sslmode==="allow") ? "startup-any" : neg==="direct" ? "tls" : "sslrequest";
+    console.log([u.hostname+":"+(u.port||5432), user, d(u.pathname.slice(1))||user, mode].join("\t"))' 2>/dev/null)" \
     || { info "cannot parse SUMI_DB_URL"; return 1; }
-  IFS=$'\t' read -r addr user db <<<"$t"
-  pg_tcp_ready "$addr" "$user" "$db" 5000 RE \
-    || { info "cannot reach PostgreSQL at $addr (refused, timed out, or no PostgreSQL reply)"; return 1; }
+  IFS=$'\t' read -r addr user db mode <<<"$t"
+  pg_wire_probe "$mode" "$addr" 5000 "$user" "$db" \
+    || { info "cannot reach PostgreSQL at $addr (refused, timed out, or no PostgreSQL answer to a $mode probe)"; return 1; }
 }
 
 # Environment for every spawned host process, appended to the named array.
