@@ -28,6 +28,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     sessionSuspended,
     emailLinkCallbackPending,
     loading,
+    redirectSignInPending,
     sessionState,
     refreshSession,
   } = auth;
@@ -76,7 +77,15 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const ready = canUseDirectChat && sessionScopeReady && identityMatches;
   let status: ReactNode = null;
   if (loading || sessionState === "checking") {
-    status = <AuthStatus title="ログイン状態を確認しています…" />;
+    status = (
+      <AuthStatus
+        title={
+          redirectSignInPending
+            ? "ログインを完了しています…"
+            : "ログイン状態を確認しています…"
+        }
+      />
+    );
   } else if (canUseDirectChat && !sessionSuspended && !ready) {
     status = <AuthStatus title="セッションを切り替えています…" />;
   } else if (sessionState === "unauthenticated") {

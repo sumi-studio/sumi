@@ -94,6 +94,20 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/operations/{operation}/complete", s.completeOperation)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/schedules/dispatch", s.dispatchSchedules)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/outbox", s.outbox)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/memory", s.memoryStatus)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/maintain", s.memoryMaintain)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/claim", s.claimMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/complete", s.completeMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/fail", s.failMemoryChunk)
+	// Jobs: persona-token scoped, deliberately NOT writer-generation gated —
+	// a job's lifecycle and completion authority outlive the writer lease.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs", s.submitJob)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/jobs", s.listJobs)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/claim", s.claimJobs)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/jobs/{job}", s.getJob)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/cancel", s.cancelJob)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/heartbeat", s.heartbeatJob)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/complete", s.completeJob)
 }
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -151,9 +165,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func storeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
-		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound):
+		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
+		errors.Is(err, ErrJobNotFound), errors.Is(err, ErrChunkNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict):
+	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
+		errors.Is(err, ErrPersonaInactive), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
+		errors.Is(err, ErrMemoryConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -579,6 +596,139 @@ func (s *Server) dispatchSchedules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"fired": fired})
 }
 
+// memoryStatus reports the memory layer's current shape: live raw estimate,
+// per-status chunk counts, and how far the journal is covered.
+func (s *Server) memoryStatus(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.store.MemoryStatus(r.Context(), personaID)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// memoryMaintain is the writer's housekeeping step — it seals newly safe
+// journal ranges and applies shelved replacements while the live raw
+// estimate exceeds the limit.
+func (s *Server) memoryMaintain(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Generation int64 `json:"generation"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	st, err := s.store.MemoryMaintain(r.Context(), personaID, req.Generation)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// claimMemoryChunk claims the oldest sealable chunk for asynchronous L1
+// preparation — one branch at a time. The response carries the covered
+// events verbatim plus the rendered parent context at claim time.
+func (s *Server) claimMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Generation   int64 `json:"generation"`
+		ContextLimit int   `json:"context_limit"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	claimed, err := s.store.ClaimMemoryChunk(r.Context(), personaID, req.Generation, req.ContextLimit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, claimed)
+}
+
+// completeMemoryChunk shelves the finished replacement candidate ('prepared')
+// or records the model's KEEP_UNCHANGED decision ('kept'). Completion alone
+// never changes the sent context — application is a separate, threshold-
+// gated step.
+func (s *Server) completeMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "chunk must be an integer")
+		return
+	}
+	var req struct {
+		Generation    int64  `json:"generation"`
+		Replacement   string `json:"replacement"`
+		KeepUnchanged bool   `json:"keep_unchanged"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	chunk, err := s.store.CompleteMemoryChunk(r.Context(), personaID, req.Generation,
+		chunkSeq, req.Replacement, req.KeepUnchanged)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
+// failMemoryChunk records a failed preparation attempt: retryable failures
+// return the chunk to the shelf with backoff; an exhausted or non-retryable
+// failure is terminal ('failed'), visible rather than silently skipped.
+func (s *Server) failMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "chunk must be an integer")
+		return
+	}
+	var req struct {
+		Generation int64  `json:"generation"`
+		Error      string `json:"error"`
+		Retryable  bool   `json:"retryable"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	chunk, err := s.store.FailMemoryChunk(r.Context(), personaID, req.Generation,
+		chunkSeq, req.Error, req.Retryable)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
 func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
@@ -598,4 +748,184 @@ func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"outbox": entries})
+}
+
+// --- jobs (M09): secretary-independent background executions -------------
+
+// submitJob records a job for later runner claiming. Idempotent on job_id:
+// an identical resend replays the stored row (lost response), a divergent
+// one conflicts.
+func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		JobID   string         `json:"job_id"`
+		Kind    string         `json:"kind"`
+		Request map[string]any `json:"request"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.JobID == "" || req.Kind == "" || req.Request == nil {
+		writeError(w, http.StatusBadRequest, "job_id, kind, request required")
+		return
+	}
+	j, created, err := s.store.SubmitJob(r.Context(), personaID, req.JobID, req.Kind, req.Request, "api")
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"job": j, "created": created})
+}
+
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	j, err := s.store.GetJob(r.Context(), personaID, r.PathValue("job"))
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var statuses []string
+	if raw := r.URL.Query().Get("status"); raw != "" {
+		statuses = strings.Split(raw, ",")
+	}
+	var limit int
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, _ = strconv.Atoi(raw)
+	}
+	jobs, err := s.store.ListJobs(r.Context(), personaID, statuses, limit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// cancelJob is callable while the secretary is down: queued jobs become
+// cancelled immediately (with notification), running jobs become
+// cancel_requested for the owning runner to observe via heartbeat.
+func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	j, err := s.store.CancelJob(r.Context(), personaID, r.PathValue("job"))
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+// claimJobs is the runner's periodic call: it sweeps expired claims to 'lost'
+// (with notification) and claims up to limit queued jobs for this runner.
+func (s *Server) claimJobs(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		RunnerID string   `json:"runner_id"`
+		Kinds    []string `json:"kinds"`
+		LeaseMs  int64    `json:"lease_ms"`
+		Limit    int      `json:"limit"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.RunnerID == "" || len(req.Kinds) == 0 || req.LeaseMs <= 0 {
+		writeError(w, http.StatusBadRequest, "runner_id, kinds, positive lease_ms required")
+		return
+	}
+	claimed, swept, err := s.store.ClaimJobs(r.Context(), personaID, req.RunnerID, req.Kinds,
+		time.Duration(req.LeaseMs)*time.Millisecond, req.Limit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"claimed": claimed, "swept": swept})
+}
+
+// heartbeatJob extends the runner's claim and returns the current row so the
+// runner observes cancel_requested. When the job is no longer this runner's
+// (terminal, lost, claimed away) the response is 409 and carries the stored
+// row so the runner can stop the execution it still holds.
+func (s *Server) heartbeatJob(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		RunnerID string `json:"runner_id"`
+		LeaseMs  int64  `json:"lease_ms"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.RunnerID == "" || req.LeaseMs <= 0 {
+		writeError(w, http.StatusBadRequest, "runner_id and positive lease_ms required")
+		return
+	}
+	j, err := s.store.HeartbeatJob(r.Context(), personaID, r.PathValue("job"), req.RunnerID,
+		time.Duration(req.LeaseMs)*time.Millisecond)
+	if err != nil {
+		if errors.Is(err, ErrJobNotClaimed) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "job": j})
+			return
+		}
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+// completeJob records the runner-observed terminal outcome and queues the
+// secretary's notification in the same transaction. An identical resend
+// replays the stored record; a divergent terminal report conflicts.
+func (s *Server) completeJob(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		RunnerID string         `json:"runner_id"`
+		Status   string         `json:"status"`
+		Result   map[string]any `json:"result"`
+		Error    string         `json:"error"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.RunnerID == "" || req.Status == "" {
+		writeError(w, http.StatusBadRequest, "runner_id and status required")
+		return
+	}
+	j, err := s.store.CompleteJob(r.Context(), personaID, r.PathValue("job"), req.RunnerID,
+		req.Status, req.Result, req.Error)
+	if err != nil {
+		if errors.Is(err, ErrJobNotClaimed) || errors.Is(err, ErrJobConflict) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "job": j})
+			return
+		}
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": j})
 }
