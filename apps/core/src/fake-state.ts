@@ -103,6 +103,29 @@ const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
 const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
 
+/**
+ * An input_received event's identity — the journal's own
+ * payload->>'input_id' text form, matching the Go store's dedup/back-fill
+ * and the cut verifier. String ids are themselves; other JSON scalars use
+ * their text form so numeric 5 and string "5" name one input. A missing or
+ * null input_id yields null: the receipt names no input, is journaled as
+ * ghost content and is never deduplicated or linked.
+ */
+function receiptKey(
+  persona: string,
+  payload: Record<string, unknown>,
+): string | null {
+  const v = payload?.input_id;
+  if (v === null || v === undefined) return null;
+  const id =
+    typeof v === "string"
+      ? v
+      : typeof v === "number" || typeof v === "boolean"
+        ? String(v)
+        : JSON.stringify(v);
+  return `${persona}|${id}`;
+}
+
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
 function estEventTokens(kind: string, payload: Record<string, unknown>): number {
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
@@ -637,11 +660,13 @@ export class FakeState implements StateClient {
     const emitted = new Set<string>();
     for (const ev of req.events) {
       if (ev.kind === "input_received") {
-        const key = `${persona}|${ev.payload.input_id}`;
-        if (this.receivedSeq.has(key) || emitted.has(key)) {
-          continue;
+        const key = receiptKey(persona, ev.payload);
+        if (key !== null) {
+          if (this.receivedSeq.has(key) || emitted.has(key)) {
+            continue;
+          }
+          emitted.add(key);
         }
-        emitted.add(key);
       }
       const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
@@ -653,7 +678,8 @@ export class FakeState implements StateClient {
         created_at: new Date().toISOString(),
       });
       if (ev.kind === "input_received") {
-        this.receivedSeq.set(`${persona}|${ev.payload.input_id}`, seq);
+        const key = receiptKey(persona, ev.payload);
+        if (key !== null) this.receivedSeq.set(key, seq);
       }
     }
     const input = this.inputs.find(

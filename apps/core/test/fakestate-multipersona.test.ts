@@ -122,3 +122,89 @@ test("fake-state: commit dedups input_received like the Go store", async () => {
   );
   assert.equal(after.length, 2);
 });
+
+// f-memory-86 parity: a receipt journaled before its input exists is the
+// input's receipt — a second ghost copy and the input's own later commit
+// both dedup, matching the Go store's journal-receipt check plus
+// SubmitInput adoption.
+test("fake-state: ghost receipt then materialized input keeps one receipt", async () => {
+  const s = new FakeState();
+  s.addPersona(PA);
+  s.addInput(PA, "in-1", "one");
+  const g = (await s.acquireWriter(PA, "h", 60_000)).generation;
+  await s.loadTurn(PA, g, "t-1", 50);
+  await s.commitTurn(PA, "t-1", g, {
+    outcome: "complete",
+    events: [
+      {
+        kind: "input_received",
+        payload: { input_id: "in-1", kind: "message", text: "one" },
+      },
+      {
+        kind: "input_received",
+        payload: { input_id: "ghost-1", kind: "message", text: "early" },
+      },
+    ],
+    output: { text: "ok" },
+  });
+  // The ghost's input materializes; its own turn must not journal again.
+  s.addInput(PA, "ghost-1", "arrived late");
+  const l2 = await s.loadTurn(PA, g, "t-2", 50);
+  assert.equal(l2.input?.input_id, "ghost-1");
+  await s.commitTurn(PA, "t-2", g, {
+    outcome: "complete",
+    events: [
+      {
+        kind: "input_received",
+        payload: { input_id: "ghost-1", kind: "message", text: "arrived late" },
+      },
+      { kind: "assistant_message", payload: { text: "done" } },
+    ],
+    output: { text: "done" },
+  });
+  const receipts = (await s.events(PA, 0)).filter(
+    (e) =>
+      e.kind === "input_received" &&
+      (e.payload as Record<string, unknown>).input_id === "ghost-1",
+  );
+  assert.equal(receipts.length, 1);
+});
+
+// f-memory-87 parity: receipt identity is the journal's
+// payload->>'input_id' text form — numeric 5 and string "5" name one
+// input; a null input_id names none and is never deduplicated.
+test("fake-state: mixed-type input_id receipts dedup like PostgreSQL ->>", async () => {
+  const s = new FakeState();
+  s.addPersona(PA);
+  s.addInput(PA, "5", "five");
+  const g = (await s.acquireWriter(PA, "h", 60_000)).generation;
+  await s.loadTurn(PA, g, "t-1", 50);
+  await s.commitTurn(PA, "t-1", g, {
+    outcome: "complete",
+    events: [
+      {
+        kind: "input_received",
+        payload: { input_id: 5, kind: "message", text: "five" },
+      },
+      {
+        kind: "input_received",
+        payload: { input_id: "5", kind: "message", text: "five" },
+      },
+      { kind: "input_received", payload: { input_id: null } },
+      { kind: "input_received", payload: { input_id: null } },
+    ],
+    output: { text: "ok" },
+  });
+  const evs = (await s.events(PA, 0)).filter(
+    (e) => e.kind === "input_received",
+  );
+  const named = evs.filter(
+    (e) => (e.payload as Record<string, unknown>).input_id === "5" ||
+      (e.payload as Record<string, unknown>).input_id === 5,
+  );
+  const nullId = evs.filter(
+    (e) => (e.payload as Record<string, unknown>).input_id === null,
+  );
+  assert.equal(named.length, 1, "numeric and string receipts are one input");
+  assert.equal(nullId.length, 2, "null-id receipts are ghost content, kept");
+});

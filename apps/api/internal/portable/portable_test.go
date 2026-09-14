@@ -849,6 +849,117 @@ func TestSealAfterStoreProducedDuplicateReceipt(t *testing.T) {
 	}
 }
 
+// f-memory-86/f-memory-87, end to end: a commit journals a ghost receipt
+// for an input created later, and a mixed-type receipt pair dedups to one;
+// the accepted state must stay movable and keep working on the destination.
+func TestSealAfterGhostReceiptMaterializes(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Ghost receipt")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	submit(t, local, pid, "in-1", "hello")
+	submit(t, local, pid, "5", "five")
+	must(local.state.LoadTurn(ctx, pid, gen, "t-1", 50))
+	must(local.state.CommitTurn(ctx, pid, "t-1", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}}, // no such input yet
+			{Kind: "input_received", Payload: map[string]any{"input_id": float64(5)}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}))
+	// The ghost's input materializes later: SubmitInput adopts the journaled
+	// receipt. Input "5" was already journaled+linked by t-1's commit; its
+	// own turn and ghost-1's own turn cannot journal a second receipt.
+	submit(t, local, pid, "ghost-1", "arrived late")
+	load := must(local.state.LoadTurn(ctx, pid, gen, "t-2", 50))
+	if load.Input == nil || load.Input.InputID != "5" {
+		t.Fatalf("t-2 claimed %+v, want input 5", load.Input)
+	}
+	must(local.state.CommitTurn(ctx, pid, "t-2", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "five"}},
+		},
+		Output: map[string]any{"text": "five"},
+	}))
+	load = must(local.state.LoadTurn(ctx, pid, gen, "t-3", 50))
+	if load.Input == nil || load.Input.InputID != "ghost-1" {
+		t.Fatalf("t-3 claimed %+v, want ghost-1", load.Input)
+	}
+	must(local.state.CommitTurn(ctx, pid, "t-3", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "late reply"}},
+		},
+		Output: map[string]any{"text": "late reply"},
+	}))
+	var receipts int64
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pid).Scan(&receipts); err != nil || receipts != 3 {
+		t.Fatalf("journaled receipts = %d err=%v, want 3 (in-1, ghost-1, input 5)", receipts, err)
+	}
+	// Every journaled receipt that names an input is linked.
+	var unlinked int64
+	if err := local.pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`,
+		pid).Scan(&unlinked); err != nil || unlinked != 0 {
+		t.Fatalf("unlinked receipts = %d err=%v, want 0", unlinked, err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-ghost", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-ghost")
+	humanID := newID(t)
+	must(cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID))
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || !created {
+		t.Fatalf("import after ghost receipt: created=%v err=%v", created, err)
+	}
+	act := must(cloud.svc.Activate(ctx, pid, "move-ghost"))
+	must(local.svc.Complete(ctx, pid, "move-ghost", act.ActivateProof))
+	// The destination continues the life: a new input submitted on cloud
+	// gets its turn and journals exactly one new receipt — the carried
+	// markers (including the adopted ghost's) keep every prior receipt at
+	// one copy on each side.
+	cgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	submit(t, cloud, pid, "in-cloud", "hello from the cloud")
+	load = must(cloud.state.LoadTurn(ctx, pid, cgen, "ct-1", 50))
+	if load.Input == nil || load.Input.InputID != "in-cloud" {
+		t.Fatalf("destination turn claimed %+v, want in-cloud", load.Input)
+	}
+	must(cloud.state.CommitTurn(ctx, pid, "ct-1", cgen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-cloud"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi cloud"}},
+		},
+		Output: map[string]any{"text": "hi cloud"},
+	}))
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pid).Scan(&receipts); err != nil || receipts != 4 {
+		t.Fatalf("destination receipts = %d err=%v, want 4", receipts, err)
+	}
+	if err := cloud.pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`,
+		pid).Scan(&unlinked); err != nil || unlinked != 0 {
+		t.Fatalf("destination unlinked receipts = %d err=%v, want 0", unlinked, err)
+	}
+}
+
 func mutateLines(bundle []byte, fn func(lines []string) []string) []byte {
 	lines := strings.SplitAfter(string(bundle), "\n")
 	if lines[len(lines)-1] == "" {

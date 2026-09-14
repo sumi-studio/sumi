@@ -310,6 +310,218 @@ func TestCommitDeduplicatesInputReceived(t *testing.T) {
 	}
 }
 
+// unlinkedReceipts is the cut verifier's reverse link: every journaled
+// input_received that names an existing input must be the one its marker
+// points at.
+func unlinkedReceipts(t *testing.T, pool *pgxpool.Pool, pa string) int64 {
+	t.Helper()
+	var n int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`,
+		pa).Scan(&n); err != nil {
+		t.Fatalf("unlinked receipts: %v", err)
+	}
+	return n
+}
+
+// f-memory-86: a receipt journaled ahead of its input (a ghost) is adopted
+// when that input is later created — the journal keeps exactly one receipt
+// and the marker names it, so the accepted history stays sealable.
+func TestGhostReceiptAdoptedOnInputCreation(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for _, id := range []string{"in-1", "in-2"} {
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": id}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	// in-1's turn also journals a receipt naming ghost-1, which has no
+	// input row yet — legitimate journaled history.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit t-1: %v", err)
+	}
+	// A second receipt for the still-absent input is the same fact twice:
+	// the journal already carries one, so it is dropped even though no
+	// marker can exist yet.
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-2", 10); err != nil {
+		t.Fatalf("load t-2: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-2"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit t-2: %v", err)
+	}
+	var ghostSeq, ghostCount int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), min(seq) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = 'ghost-1'`,
+		pa).Scan(&ghostCount, &ghostSeq); err != nil || ghostCount != 1 {
+		t.Fatalf("ghost receipts = %d err=%v, want 1", ghostCount, err)
+	}
+	// Materializing the id adopts the journaled receipt as the marker.
+	if _, created, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "ghost-1",
+		Kind: "message", Payload: map[string]any{"text": "arrived late"}}); err != nil || !created {
+		t.Fatalf("submit ghost-1: created=%v err=%v", created, err)
+	}
+	var marker *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = 'ghost-1'`,
+		pa).Scan(&marker); err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+	if marker == nil || *marker != ghostSeq {
+		t.Fatalf("ghost-1 marker = %v, want adopted seq %d", marker, ghostSeq)
+	}
+	// The input's own turn cannot journal a second receipt.
+	load, err := s.LoadTurn(ctx, pa, l.Generation, "t-3", 10)
+	if err != nil || load.Input == nil || load.Input.InputID != "ghost-1" {
+		t.Fatalf("load t-3: %+v err=%v", load, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-3", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "done"}},
+		},
+		Output: map[string]any{"text": "done"},
+	}); err != nil {
+		t.Fatalf("commit t-3: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = 'ghost-1'`,
+		pa).Scan(&ghostCount); err != nil || ghostCount != 1 {
+		t.Fatalf("ghost receipts after own commit = %d err=%v, want 1", ghostCount, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
+// f-memory-87: a receipt's identity is the journal's payload->>'input_id'
+// text form, so numeric 5 and string "5" name one input — mixed-type
+// copies dedup the same way a later text lookup joins them.
+func TestCommitDeduplicatesMixedTypeInputIDs(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for _, id := range []string{"5", "7"} {
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": id}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	// One commit carrying both the numeric and the string form of input "5".
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": float64(5)}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit t-1: %v", err)
+	}
+	var count, seq int64
+	var marker *int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), min(seq) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = '5'`,
+		pa).Scan(&count, &seq); err != nil || count != 1 {
+		t.Fatalf("receipts for input 5 = %d err=%v, want 1", count, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = '5'`,
+		pa).Scan(&marker); err != nil || marker == nil || *marker != seq {
+		t.Fatalf("marker = %v err=%v, want %d", marker, err, seq)
+	}
+	// A later commit's numeric receipt for input "7" journals once; its
+	// string form after that dedups against the journaled receipt.
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-2", 10); err != nil {
+		t.Fatalf("load t-2: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": float64(7)}},
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit t-2: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-3", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit in-3: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-3", 10); err != nil {
+		t.Fatalf("load t-3: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-3", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-3"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "7"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": float64(7)}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": nil}},
+			{Kind: "input_received", Payload: map[string]any{"note": "no id"}},
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit t-3: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = '7'`,
+		pa).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("receipts for input 7 = %d err=%v, want 1", count, err)
+	}
+	// A receipt carrying no input_id names no input: it journals as ghost
+	// content, is never deduplicated and never links.
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' IS NULL`,
+		pa).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("null-id receipts = %d err=%v, want 2", count, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
 // mustPlan records a durable round-0 decision for the turn's input.
 func mustPlan(t *testing.T, s *Store, pa, turnID string, gen int64, calls ...PlanCall) TurnPlan {
 	t.Helper()

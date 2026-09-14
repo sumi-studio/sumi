@@ -146,15 +146,19 @@ evidence, so no lost response, retry or partition creates two writers:
   name that input's own `input_received` event in the carried journal, and
   every journaled `input_received` must be the one its input points at —
   otherwise the destination would drop the real event or journal it twice.
-  For receipts emitted by the core, the store enforces this invariant at
-  the write boundary: duplicate string IDs naming existing inputs are
-  dropped, and journaled receipts are linked to those inputs' markers.
-  Direct store-API calls can still create an unlinked receipt using a
-  non-string ID, or a receipt for an absent input whose ID is submitted
-  later. Such sequences are not emitted by the current core and are
-  refused at seal; additional input-record validation remains a follow-up.
-  FakeState handles those two edge cases differently and does not establish
-  their PostgreSQL behavior.
+  The store enforces this invariant at the write boundary rather than
+  discovering it at the cut. A receipt's identity is the journal's own
+  `payload->>'input_id'` text form — numeric `5` and string `"5"` name one
+  input, because that is what the marker lookup and the verifier compare.
+  A commit that presents a second copy of an already-journaled identity —
+  same batch, an earlier commit, or a receipt whose input row does not
+  exist yet — drops it as the same fact twice. Creating an input adopts
+  the earliest receipt already naming its id as `received_seq` (the same
+  for `SubmitInput`, scheduled wakes and job notifications), so a ghost
+  receipt becomes that input's receipt instead of a second, unlinked copy;
+  the input's own later turn dedups against the marker. A receipt with a
+  missing or null `input_id` names no input: it stays journaled ghost
+  content, is never deduplicated, and can never join a row.
 
 ## Secrets
 
