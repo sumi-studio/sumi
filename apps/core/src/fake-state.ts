@@ -1499,9 +1499,11 @@ export class FakeState implements StateClient {
       target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     });
-    // Every 'preparing' chunk is an orphan from the caller's view (one branch
-    // at a time): its claim ended without an outcome, so it counts an
-    // interruption — not an attempt — and waits out a short pacing.
+    // Every 'preparing' chunk is an orphan from the caller's view: its claim
+    // ended without an outcome, so it counts an interruption — not an
+    // attempt — and waits out a short pacing. (FakeState is single-threaded;
+    // the real store relies on pacing and generation fencing to converge
+    // concurrent claims, not on strict single-flight.)
     this.interruptPreparing(persona, null);
     const c = mine
       .filter(
@@ -1518,8 +1520,8 @@ export class FakeState implements StateClient {
     if (c.layer >= 2) {
       // An upper-layer target prepares from its selected sources' accepted
       // texts, not raw events. A stale target (a source no longer applied)
-      // is marked failed without spending attempts — unreachable while the
-      // one-in-flight rule holds, but the honest answer for a carried row.
+      // is marked failed without spending attempts — the honest answer for
+      // a carried row or one whose sources another target consumed.
       const at = (seq: number) =>
         this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
           ?.created_at ?? "";

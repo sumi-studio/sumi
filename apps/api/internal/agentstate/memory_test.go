@@ -342,7 +342,15 @@ func TestMemorySealClaimComplete(t *testing.T) {
 	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Claimable != 0 || st.NextClaimableAt == nil {
 		t.Fatalf("status while paced: %+v %v", st, err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// The recorded deadline is wall-clock; a host clock step can regress
+	// now() below it (observed on this WSL2 host), which would be a clock
+	// artifact rather than the eligibility contract under test. Push the
+	// deadline into the past directly instead of sleeping.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
+		t.Fatal(err)
+	}
 	again, err = s.ClaimMemoryChunk(ctx, pa, gen, 50)
 	if err != nil || again.Chunk == nil || again.Chunk.ChunkSeq != 1 || again.Chunk.Attempts != 0 {
 		t.Fatalf("claim after pacing: %+v %v", again.Chunk, err)
@@ -520,10 +528,17 @@ func TestMemoryRecoverResealsStalePreparing(t *testing.T) {
 		t.Fatalf("fenced complete: %v", err)
 	}
 	// The new generation prepares it instead, once the short pacing passes.
-	// not_before is written in the database's wall clock; on hosts whose wall
-	// clock drifts against the monotonic one (observed ~0.85x on WSL2) a thin
-	// sleep margin reclaims too early. Keep a wide margin for the 200ms floor.
-	time.Sleep(700 * time.Millisecond)
+	// The recorded deadline is wall-clock; a host clock step can regress
+	// now() below it (observed on this WSL2 host), so push it into the past
+	// directly rather than sleeping on a margin.
+	if c.NotBefore == nil {
+		t.Fatalf("interrupted chunk lost its pacing deadline: %+v", c)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
+		t.Fatal(err)
+	}
 	re, err := s.ClaimMemoryChunk(ctx, pa, gen2, 50)
 	if err != nil || re.Chunk == nil {
 		t.Fatalf("reclaim: %v", err)
@@ -1541,7 +1556,17 @@ func TestMemoryUpperClaimFencingAndInterruption(t *testing.T) {
 	if _, err := s.CompleteMemoryChunk(ctx, pa, gen1, 8, "late answer", false); !errors.Is(err, ErrGenerationFence) {
 		t.Fatalf("fenced upper complete: %v", err)
 	}
-	time.Sleep(700 * time.Millisecond)
+	// The interruption's deadline is wall-clock; a host clock step can
+	// regress now() below it (observed on this WSL2 host), so push it into
+	// the past directly rather than sleeping on a margin.
+	if c8.NotBefore == nil {
+		t.Fatalf("interrupted upper chunk lost its pacing deadline: %+v", c8)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 8`, pa); err != nil {
+		t.Fatal(err)
+	}
 	cl, err = s.ClaimMemoryChunk(ctx, pa, gen2, 50)
 	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
 		t.Fatalf("reclaim 8: %v %+v", err, cl.Chunk)

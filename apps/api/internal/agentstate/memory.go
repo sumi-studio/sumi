@@ -738,9 +738,9 @@ func appliedLayerTokens(ctx context.Context, db interface {
 
 // applyUpperTarget applies one prepared layer-2 target if its layer gate
 // still holds. A target whose sources are no longer all applied cannot be
-// reconstructed (unreachable while the one-in-flight rule holds, but the
-// check is the honest answer if a bundle or another path produced one):
-// it is marked failed, its sources untouched, without spending attempts.
+// reconstructed — a crafted or carried row, or a stale target whose sources
+// a different applied target consumed while it waited — so it is marked
+// failed, its sources untouched, without spending attempts.
 func applyUpperTarget(ctx context.Context, tx pgx.Tx, personaID string, target MemoryChunk) error {
 	type src struct {
 		seq, layer int64
@@ -947,9 +947,9 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'superseded'),
 			COUNT(*) FILTER (WHERE status = 'preparing'
-				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= now()))),
-			MIN(CASE WHEN status = 'preparing' THEN now()
-				WHEN status = 'sealed' THEN GREATEST(COALESCE(not_before, now()), now()) END),
+				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= clock_timestamp()))),
+			MIN(CASE WHEN status = 'preparing' THEN clock_timestamp()
+				WHEN status = 'sealed' THEN GREATEST(COALESCE(not_before, clock_timestamp()), clock_timestamp()) END),
 			COALESCE(MAX(last_seq), 0)
 		FROM core_memory_chunks WHERE persona_id = $1`, personaID).
 		Scan(&st.LiveRawTokens, &st.AppliedTokens, &st.Sealed, &st.Preparing,
@@ -1029,7 +1029,12 @@ func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generati
 	// branch of its own, so any 'preparing' row is orphaned: a dead
 	// generation's claim, a lost claim response, or a branch stopped before
 	// it recorded an outcome. It is counted as an interruption and paced —
-	// never as a failed attempt — which keeps one branch at a time.
+	// never as a failed attempt. This is convergence, not serialization:
+	// the scan and the claim are separate statements, so concurrent
+	// same-generation callers can both see an empty shelf and both claim —
+	// transiently two 'preparing' rows, never the same target. The pacing
+	// and generation fencing, not single-flight, are what the lifecycle
+	// relies on.
 	if err := interruptPreparing(ctx, tx, personaID, nil); err != nil {
 		return nil, err
 	}
@@ -1039,7 +1044,7 @@ func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generati
 		WHERE (persona_id, chunk_seq) = (
 			SELECT persona_id, chunk_seq FROM core_memory_chunks
 			WHERE persona_id = $1 AND status = 'sealed'
-				AND (not_before IS NULL OR not_before <= now())
+				AND (not_before IS NULL OR not_before <= clock_timestamp())
 			ORDER BY chunk_seq LIMIT 1 FOR UPDATE)
 		RETURNING `+chunkCols, personaID, generation))
 	if errors.Is(err, ErrChunkNotFound) {
@@ -1055,10 +1060,10 @@ func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generati
 	if c.Layer >= 2 {
 		// An upper-layer target's input is its selected sources' accepted
 		// texts with their locators — not raw events. The sources must all
-		// still be applied: a stale target (unreachable while the
-		// one-in-flight rule holds; possible only through a crafted or
-		// carried row) is marked failed without spending attempts rather
-		// than prepared from a different source set.
+		// still be applied: a stale target — a crafted or carried row, or a
+		// target whose sources a different applied target consumed while it
+		// waited — is marked failed without spending attempts rather than
+		// prepared from a different source set.
 		frows, err := tx.Query(ctx, `
 			SELECT s.chunk_seq, s.layer, s.first_seq, s.last_seq,
 				f.created_at, l.created_at, s.replacement, s.replacement_est_tokens, s.status

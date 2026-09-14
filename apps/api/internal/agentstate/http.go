@@ -649,8 +649,10 @@ func (s *Server) memoryMaintain(w http.ResponseWriter, r *http.Request) {
 }
 
 // claimMemoryChunk claims the oldest sealable chunk for asynchronous L1
-// preparation — one branch at a time. The response carries the covered
-// events verbatim plus the rendered parent context at claim time.
+// preparation. Concurrent same-generation callers may each hold a distinct
+// claim briefly; pacing and generation fencing converge them. The response
+// carries the covered events verbatim plus the rendered parent context at
+// claim time.
 func (s *Server) claimMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {

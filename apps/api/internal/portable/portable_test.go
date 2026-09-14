@@ -546,6 +546,38 @@ func chunkRow(t *testing.T, p placement, personaID string, chunkSeq int64) agent
 	return c
 }
 
+// mutRow rewrites the data object of every row of table whose data
+// matches; rebundle then recomputes the content digest, so a crafted row
+// reaches the import integrity checks instead of failing at the digest.
+func mutRow(t *testing.T, table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
+	t.Helper()
+	return func(line string) string {
+		var rec map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return line
+		}
+		var name string
+		if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
+			return line
+		}
+		var data map[string]any
+		if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
+			return line
+		}
+		mutate(data)
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec["data"] = raw
+		out, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out) + "\n"
+	}
+}
+
 // rebundle rewrites row lines in an exported bundle and recomputes the
 // content digest, so a deliberately bad row reaches the import integrity
 // checks instead of failing at the digest.
@@ -628,7 +660,18 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "provider timeout", true))
 	claimSeq(t, local, pid, gen, 4) // chunk 3 is backed off; 4 is next
 	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 4, "Day four, compressed.", false))
-	time.Sleep(700 * time.Millisecond) // past chunk 3's first-attempt backoff
+	// Chunk 3's backoff must be on the row; then push its deadline into
+	// the past directly — not_before is wall-clock and a host clock step
+	// (observed on this WSL2 host) can regress now() below a recorded
+	// deadline, which is a clock artifact, not the eligibility contract.
+	if c := chunkRow(t, local, pid, 3); c.NotBefore == nil {
+		t.Fatalf("chunk 3 lost its first-attempt backoff: %+v", c)
+	}
+	if _, err := local.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 3`, pid); err != nil {
+		t.Fatal(err)
+	}
 	claimSeq(t, local, pid, gen, 3)
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
 	// Chunk 5's claim is orphaned once (an interruption), then reclaimed —
@@ -715,10 +758,17 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatalf("failed verdict changed on the destination: %+v", c)
 	}
 
-	// Chunk 5's carried backoff may still be running; once claimable the
-	// destination's writer prepares it under its own generation.
-	if c := chunkRow(t, cloud, pid, 5); c.NotBefore != nil && c.NotBefore.After(time.Now()) {
-		time.Sleep(time.Until(*c.NotBefore) + 50*time.Millisecond)
+	// Chunk 5's carried interruption pacing must still be on the row;
+	// then push its deadline into the past directly rather than sleeping —
+	// not_before is wall-clock and a host clock step could keep the claim
+	// deferred, which is a clock artifact, not the contract under test.
+	if c := chunkRow(t, cloud, pid, 5); c.NotBefore == nil {
+		t.Fatalf("chunk 5 lost its carried interruption pacing: %+v", c)
+	}
+	if _, err := cloud.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 5`, pid); err != nil {
+		t.Fatal(err)
 	}
 	claimSeq(t, cloud, pid, dgen, 5)
 	must(cloud.state.CompleteMemoryChunk(ctx, pid, dgen, 5, "Day five, compressed.", false))
@@ -850,6 +900,151 @@ func TestTransferCarriesUpperMemory(t *testing.T) {
 	}
 }
 
+// An upper-layer row can pass the shape checks and still be a state the
+// honest pipeline cannot emit: an applied target whose sources were never
+// superseded (the range would render twice), or a source list with
+// correct endpoints but an interior hole (journal coverage consumed by
+// nothing). The seed below is the legitimate counterpart — an applied L2
+// block over superseded L1s, a failed earlier attempt whose sources a
+// later target consumed, and a sealed in-flight target over an applied
+// source — and it must keep crossing.
+func TestImportRefusesContradictoryUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("c-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ct-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ct-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	// A real history: an earlier consolidation over {1,2} failed
+	// terminally, a later attempt reintegrated {1,2,3} into the applied
+	// L2 block, and chunk 7 is a sealed reintegration target whose source
+	// is still applied. Every row is a state the pipeline itself writes.
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens, attempts, last_error)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, 0, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, 0, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'superseded', 'L1 of days three', 60, 0, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, 0, NULL),
+			($1, 5, 2, '{1,2,3}', 1, 6, 180, 'applied', 'L2: days one through three', 70, 0, NULL),
+			($1, 6, 2, '{1,2}', 1, 4, 120, 'failed', NULL, NULL, 3, 'provider refused'),
+			($1, 7, 2, '{4}', 7, 8, 120, 'sealed', NULL, NULL, 0, NULL)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-contra", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-contra")
+
+	chunk := func(seq int64) func(map[string]any) bool {
+		return func(d map[string]any) bool {
+			v, ok := d["chunk_seq"].(float64)
+			return ok && int64(v) == seq
+		}
+	}
+	cases := map[string]struct {
+		fn   func(string) string
+		want string
+	}{
+		// The applied L2 target's sources are still applied — the same
+		// journal range would render as both L1 fragments and the L2 block.
+		"applied target over a live source": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "applied" }), "memory_chunk_sources_invalid"},
+		// Sources {1,3} keep the target's endpoints right ([1,6]) but leave
+		// [3,4] — chunk 2's range — inside the claimed span yet named by no
+		// source.
+		"source list with an interior gap": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 3} }), "memory_chunk_sources_invalid"},
+		// Overlapping instead of gapped: widening chunk 1 to [1,4] makes
+		// the sources cover [1,6] twice over [3,4] with the target bounds
+		// unchanged.
+		"overlapping source ranges": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["last_seq"] = 4 }), "memory_chunk_sources_invalid"},
+		// The sources tile the range but are listed out of order — the
+		// settled-tuple dedup compares arrays order-sensitively, so this
+		// tuple would not match the canonical one it was settled as.
+		"reordered settled source tuple": {mutRow(t, "core_memory_chunks", chunk(6),
+			func(d map[string]any) { d["sources"] = []any{2, 1} }), "memory_chunk_sources_invalid"},
+		// A source is only ever consumed while applied and only ever
+		// retired as superseded: a sealed or failed source is a state the
+		// pipeline cannot produce.
+		"source still sealed": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "sealed" }), "memory_chunk_sources_invalid"},
+		// One source listed twice inflates the reference list without
+		// resolving to two chunks.
+		"repeated source reference": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 1} }), "memory_chunk_sources_invalid"},
+		// A target cannot consume across layers: {1,6} mixes an L1 source
+		// with the failed L2 row.
+		"cross-layer source": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 6} }), "memory_chunk_sources_invalid"},
+		// Chunk 5 demoted to 'failed' leaves chunks 1-3 superseded with no
+		// applied ancestor anywhere — their journal range renders as
+		// nothing on the destination.
+		"superseded coverage no applied ancestor": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["status"] = "failed" }), "memory_chunk_superseded_uncovered"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := rebundle(t, bundle, tc.fn)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused bundle left a persona behind: %v", err)
+			}
+		})
+	}
+
+	// The legitimate history still crosses: the failed target keeps its
+	// provenance over sources another target consumed, the sealed target
+	// keeps its applied source, and the destination activates and renders
+	// the applied upper block without double-rendering.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+		t.Fatalf("legitimate upper history import: created=%v err=%v", created, err)
+	}
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-contra"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-d1", 50))
+	if len(load.Memory) != 2 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Text != "L2: days one through three" ||
+		load.Memory[1].ChunkSeq != 4 || load.Memory[1].Text != "L1 of days four" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+	}
+	// The sealed reintegration target is claimable at the destination and
+	// resolves its still-applied source fragment.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 7 ||
+		len(claimed.TargetFragments) != 1 || claimed.TargetFragments[0].Text != "L1 of days four" {
+		t.Fatalf("destination claim on carried sealed target: %+v", claimed.Chunk)
+	}
+}
+
 // A carried chunk can never hold a live claim, and its range must resolve
 // inside the carried journal. Both are integrity violations a valid digest
 // cannot launder.
@@ -900,37 +1095,9 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-badmem", placementID(t, cloud)))
 	bundle, _ := exportBytes(t, local, pid, "move-badmem")
 
-	// mutRow rewrites the data object of every row of table whose data
-	// matches; rebundle then recomputes the content digest. Every case below
-	// is therefore a crafted/recomputed-digest bundle — state an honest
-	// store cannot emit — which is exactly the class verifyCut exists for.
-	mutRow := func(table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
-		return func(line string) string {
-			var rec map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				return line
-			}
-			var name string
-			if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
-				return line
-			}
-			var data map[string]any
-			if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
-				return line
-			}
-			mutate(data)
-			raw, err := json.Marshal(data)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rec["data"] = raw
-			out, err := json.Marshal(rec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return string(out) + "\n"
-		}
-	}
+	// Every case below is a crafted/recomputed-digest bundle — state an
+	// honest store cannot emit — which is exactly the class verifyCut
+	// exists for.
 	chunkRow := func(d map[string]any) bool { return d["chunk_seq"] != nil }
 	inputRow := func(id string) func(map[string]any) bool {
 		return func(d map[string]any) bool { return d["input_id"] == id }
@@ -968,33 +1135,33 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 		// applies it. kept is checked separately: keep-unchanged stores both
 		// NULL, non-shrinking keeps both set — one without the other is not a
 		// row the store writes.
-		"applied without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"applied without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "applied")), "memory_chunk_missing_payload"},
-		"prepared without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"prepared without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "prepared")), "memory_chunk_missing_payload"},
-		"kept text without estimate": {mutRow("core_memory_chunks", chunkRow, func(d map[string]any) {
+		"kept text without estimate": {mutRow(t, "core_memory_chunks", chunkRow, func(d map[string]any) {
 			d["status"] = "kept"
 			d["replacement"] = "condensed"
 		}), "memory_chunk_missing_payload"},
 		// f71/F2: negative sequence/counter values corrupt ordering and the
 		// live-raw accounting while staging cleanly.
-		"negative chunk_seq": {mutRow("core_memory_chunks", chunkRow,
+		"negative chunk_seq": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("chunk_seq", -7)), "memory_chunk_negative_values"},
-		"negative est_tokens": {mutRow("core_memory_chunks", chunkRow,
+		"negative est_tokens": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("est_tokens", -900000)), "memory_chunk_negative_values"},
-		"layer zero": {mutRow("core_memory_chunks", chunkRow,
+		"layer zero": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("layer", 0)), "memory_chunk_negative_values"},
 		// Upper-layer provenance: a layer-1 row never carries sources; a
 		// layer-2 target's sources must all resolve to carried chunks whose
 		// span is exactly the target's range.
-		"layer-1 row carrying sources": {mutRow("core_memory_chunks", chunkRow,
+		"layer-1 row carrying sources": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("sources", []any{1})), "memory_chunk_sources_invalid"},
-		"upper target with a dangling source": {mutRow("core_memory_chunks", chunkRow,
+		"upper target with a dangling source": {mutRow(t, "core_memory_chunks", chunkRow,
 			func(d map[string]any) {
 				d["layer"] = 2
 				d["sources"] = []any{999}
 			}), "memory_chunk_sources_invalid"},
-		"upper target with an empty source set": {mutRow("core_memory_chunks", chunkRow,
+		"upper target with an empty source set": {mutRow(t, "core_memory_chunks", chunkRow,
 			func(d map[string]any) {
 				d["layer"] = 2
 				d["sources"] = []any{}
@@ -1002,15 +1169,15 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 		// F-B2: received_seq that dangles, names the wrong kind, or names
 		// another input's event would make the destination skip journaling
 		// this input's input_received — its original record silently lost.
-		"received_seq another input's event": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq another input's event": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 1)), "input_received_seq_mismatch"},
-		"received_seq wrong kind": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq wrong kind": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 2)), "input_received_seq_mismatch"},
-		"received_seq dangling on queued input": {mutRow("core_inputs", inputRow("m-3"),
+		"received_seq dangling on queued input": {mutRow(t, "core_inputs", inputRow("m-3"),
 			set("received_seq", 99)), "input_received_seq_mismatch"},
 		// The reverse link: m-2's input_received exists in the journal, so a
 		// missing marker would let the destination journal it a second time.
-		"received_seq marker removed": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq marker removed": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", nil)), "input_received_seq_not_linked"},
 	}
 	for name, tc := range cases {
@@ -1040,7 +1207,7 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	cloud2 := newPlacement(t)
 	sourceless := rebundle(t, bundle, func(line string) string {
 		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
-		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
+		return mutRow(t, "core_memory_chunks", chunkRow, set("layer", 2))(line)
 	})
 	if _, _, err := cloud2.svc.Import(ctx, bytes.NewReader(sourceless), nil); err == nil ||
 		!errors.Is(err, ErrIntegrity) ||

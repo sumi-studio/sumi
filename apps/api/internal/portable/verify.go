@@ -85,19 +85,31 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE c.persona_id = $1 AND (
 			c.status = 'preparing' OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
 	// Upper-layer targets carry their provenance: every source must resolve
-	// to a carried same-persona chunk, all in one layer, and the target's
-	// journal range must be exactly its sources' span. A crafted bundle that
-	// dangles a source reference, mixes layers, or claims a range beyond its
-	// sources would activate a fragment that cannot be read back or checked.
+	// to a distinct carried same-persona chunk, all in one layer, and the
+	// target's journal range must be exactly its sources' span — anchored at
+	// both ends AND tiled inside, since bounds alone leave interior gaps and
+	// overlaps unchecked. The array itself must be in first_seq order: the
+	// selection emits it canonically and the settled-tuple dedup compares
+	// arrays order-sensitively, so a reordered carried tuple would silently
+	// relitigate a verdict it was meant to settle. A source is only ever
+	// selected while 'applied'; afterwards it is either still applied or
+	// superseded by the target that consumed it, so any other lifecycle
+	// status is a state the pipeline cannot emit. And applying a target
+	// supersedes its sources in the same transaction: an 'applied' target
+	// over still-live sources double-renders the range — only a crafted row
+	// holds that. Settled or in-flight targets legitimately keep 'applied'
+	// sources, and a failed or stale one's sources may already be
+	// superseded by a different applied target, so the superseded
+	// requirement binds 'applied' targets only.
 	{"memory_chunk_sources_invalid", `
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (
 			(c.layer = 1 AND c.sources IS NOT NULL)
 			OR (c.layer >= 2 AND (
 				c.sources IS NULL OR cardinality(c.sources) = 0
-				OR EXISTS (SELECT 1 FROM unnest(c.sources) AS s(seq)
-					WHERE NOT EXISTS (SELECT 1 FROM core_memory_chunks s2
-						WHERE s2.persona_id = c.persona_id AND s2.chunk_seq = s.seq))
+				OR (SELECT count(*) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> cardinality(c.sources)
 				OR (SELECT count(DISTINCT s2.layer) FROM core_memory_chunks s2
 					WHERE s2.persona_id = c.persona_id
 					AND s2.chunk_seq = ANY(c.sources)) <> 1
@@ -107,7 +119,52 @@ var cutChecks = []struct{ name, sql string }{
 				OR (SELECT max(s2.last_seq) FROM core_memory_chunks s2
 					WHERE s2.persona_id = c.persona_id
 					AND s2.chunk_seq = ANY(c.sources)) <> c.last_seq
+				OR c.sources <> (SELECT array_agg(s2.chunk_seq ORDER BY s2.first_seq)
+					FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources))
+				OR EXISTS (
+					SELECT 1 FROM (
+						SELECT s2.first_seq,
+							lag(s2.last_seq) OVER (ORDER BY s2.first_seq) AS prev_last
+						FROM core_memory_chunks s2
+						WHERE s2.persona_id = c.persona_id
+						AND s2.chunk_seq = ANY(c.sources)) tile
+					WHERE tile.first_seq <> tile.prev_last + 1)
+				OR EXISTS (SELECT 1 FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)
+					AND s2.status NOT IN ('applied', 'superseded'))
+				OR (c.status = 'applied' AND EXISTS (
+					SELECT 1 FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)
+					AND s2.status <> 'superseded'))
 			)))`},
+	// 'superseded' means an applied upper target rendered the row's range —
+	// the store only ever marks a source superseded inside the same
+	// transaction that applies its consumer. So every superseded row must be
+	// reachable as a source of an applied target, transitively through
+	// superseded intermediate targets (a valid L2 block can itself be
+	// reintegrated into a later applied ancestor). A superseded row with no
+	// applied ancestor leaves journal coverage rendered by nothing — the
+	// pipeline cannot produce that, so the bundle is crafted.
+	{"memory_chunk_superseded_uncovered", `
+		WITH RECURSIVE covered AS (
+			SELECT s2.chunk_seq AS seq FROM core_memory_chunks c
+			JOIN core_memory_chunks s2 ON s2.persona_id = c.persona_id
+				AND s2.chunk_seq = ANY(c.sources)
+			WHERE c.persona_id = $1 AND c.status = 'applied'
+			UNION
+			SELECT s2.chunk_seq FROM core_memory_chunks c
+			JOIN covered cov ON cov.seq = c.chunk_seq
+			JOIN core_memory_chunks s2 ON s2.persona_id = c.persona_id
+				AND s2.chunk_seq = ANY(c.sources)
+			WHERE c.persona_id = $1
+		)
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND c.status = 'superseded'
+			AND NOT EXISTS (SELECT 1 FROM covered cov WHERE cov.seq = c.chunk_seq)`},
 	// Chunk ranges are locators into the carried journal; a range that
 	// reaches past it would render a fragment for records that do not
 	// exist.
