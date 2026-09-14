@@ -212,6 +212,19 @@ export interface StateClient {
     chunkSeq: number,
     failure: { error: string; retryable: boolean },
   ): Promise<MemoryChunk>;
+  /**
+   * Return a claimed chunk to the shelf because the model layer was
+   * unavailable before any request was evaluated — an unbound selection,
+   * a missing credential, a binding-lookup outage. Records no verdict
+   * and spends no attempts or interruptions; the chunk waits out a short
+   * pacing, then proceeds once a usable binding exists.
+   */
+  reshelveMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    pause: { reason: string },
+  ): Promise<MemoryChunk>;
   outbox(
     persona: string,
     afterSeq: number,
@@ -485,18 +498,14 @@ export class HttpStateClient implements StateClient {
       operation: Operation;
       approval: Approval | null;
       fresh: boolean;
-    }>(
-      "POST",
-      `/internal/core/personas/${persona}/operations/claim`,
-      {
-        generation,
-        operation_id: op.operationId,
-        turn_id: op.turnId,
-        tool: op.tool,
-        call_index: op.callIndex,
-        request: op.request,
-      },
-    );
+    }>("POST", `/internal/core/personas/${persona}/operations/claim`, {
+      generation,
+      operation_id: op.operationId,
+      turn_id: op.turnId,
+      tool: op.tool,
+      call_index: op.callIndex,
+      request: op.request,
+    });
   }
   async listApprovals(persona: string, approvalId?: string) {
     if (approvalId) {
@@ -604,6 +613,19 @@ export class HttpStateClient implements StateClient {
       "POST",
       `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/fail`,
       { generation, error: failure.error, retryable: failure.retryable },
+    );
+    return res.chunk;
+  }
+  async reshelveMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    pause: { reason: string },
+  ) {
+    const res = await this.call<{ chunk: MemoryChunk }>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/reshelve`,
+      { generation, reason: pause.reason },
     );
     return res.chunk;
   }

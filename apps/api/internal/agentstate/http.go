@@ -137,6 +137,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/claim", s.claimMemoryChunk)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/complete", s.completeMemoryChunk)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/fail", s.failMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/reshelve", s.reshelveMemoryChunk)
 	// Jobs: persona-token scoped, deliberately NOT writer-generation gated —
 	// a job's lifecycle and completion authority outlive the writer lease.
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs", s.submitJob)
@@ -731,8 +732,10 @@ func (s *Server) memoryMaintain(w http.ResponseWriter, r *http.Request) {
 }
 
 // claimMemoryChunk claims the oldest sealable chunk for asynchronous L1
-// preparation — one branch at a time. The response carries the covered
-// events verbatim plus the rendered parent context at claim time.
+// preparation. Concurrent same-generation callers may each hold a distinct
+// claim briefly; pacing and generation fencing converge them. The response
+// carries the covered events verbatim plus the rendered parent context at
+// claim time.
 func (s *Server) claimMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
@@ -816,6 +819,38 @@ func (s *Server) failMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	chunk, err := s.store.FailMemoryChunk(r.Context(), personaID, req.Generation,
 		chunkSeq, req.Error, req.Retryable)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
+// reshelveMemoryChunk returns a claimed chunk to the shelf when the model
+// layer was unavailable before any request was sent — no verdict, no
+// attempt spent; the chunk stays in the pipeline for a usable binding.
+func (s *Server) reshelveMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "chunk must be an integer")
+		return
+	}
+	var req struct {
+		Generation int64  `json:"generation"`
+		Reason     string `json:"reason"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	chunk, err := s.store.ReshelveMemoryChunk(r.Context(), personaID, req.Generation,
+		chunkSeq, req.Reason)
 	if err != nil {
 		storeError(w, err)
 		return

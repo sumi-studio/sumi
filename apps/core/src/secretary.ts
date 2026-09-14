@@ -2,6 +2,7 @@ import { jsonEqual } from "./json.ts";
 import {
   capacityNoticeMessage,
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+  estTextTokens,
   evictToBudget,
   inputMarker,
   renderJournalContext,
@@ -9,8 +10,8 @@ import {
   runMemoryPreparation,
 } from "./memory.ts";
 import {
-  ModelError,
   type ChatMessage,
+  ModelError,
   type ModelProvider,
   type ToolCall,
   type ToolSpec,
@@ -242,7 +243,11 @@ export class Secretary {
       const now = Date.now();
       if (now - this.lastDispatch >= this.cfg.scheduleEveryMs) {
         this.lastDispatch = now;
-        const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
+        const fired = await state.dispatchSchedules(
+          personaId,
+          gen,
+          new Date(now),
+        );
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
       // Memory housekeeping between turns, while the conversation is idle
@@ -257,11 +262,7 @@ export class Secretary {
       // interruption and prepares it again once its short pacing passes.
       const mem = await state.memoryMaintain(personaId, gen);
       this.memoryShape = mem;
-      if (
-        opts.startMemory !== false &&
-        !this.memoryTask &&
-        mem.claimable > 0
-      ) {
+      if (opts.startMemory !== false && !this.memoryTask && mem.claimable > 0) {
         this.memoryAbort = new AbortController();
         this.memoryTask = this.prepareMemory(
           gen,
@@ -396,8 +397,7 @@ export class Secretary {
     // would drive, inside the loop. Cancellation still exits promptly;
     // fencing still stops the writer.
     let failures = 0;
-    const backoff = () =>
-      sleep(this.transientBackoff(failures), signal);
+    const backoff = () => sleep(this.transientBackoff(failures), signal);
     if (!this.running) {
       let heldDeadline = 0;
       for (;;) {
@@ -553,7 +553,9 @@ export class Secretary {
    * another. Bounded by that timeout plus a margin for recording the
    * outcome; resolves true when the branch settled.
    */
-  async settleMemory(maxWaitMs = this.memoryTimeoutMs + 30_000): Promise<boolean> {
+  async settleMemory(
+    maxWaitMs = this.memoryTimeoutMs + 30_000,
+  ): Promise<boolean> {
     const task = this.memoryTask;
     if (!task) return true;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -637,10 +639,7 @@ export class Secretary {
    * branch with no further model call, and the next generation counts the
    * claim as an interruption.
    */
-  private async prepareMemory(
-    gen: number,
-    signal: AbortSignal,
-  ): Promise<void> {
+  private async prepareMemory(gen: number, signal: AbortSignal): Promise<void> {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       await runMemoryPreparation({
@@ -732,9 +731,18 @@ export class Secretary {
 
         // Execute this round's calls at their flat positions across all
         // rounds — the durable effect identity is input_id + flat index.
-        const roundResults: { call_id: string; tool: string; result: unknown }[] = [];
+        const roundResults: {
+          call_id: string;
+          tool: string;
+          result: unknown;
+        }[] = [];
         for (const call of decision.calls) {
-          const res = await this.executeCall(turn, call, results.length, events);
+          const res = await this.executeCall(
+            turn,
+            call,
+            results.length,
+            events,
+          );
           if (res === null) return; // divergent — failure committed
           if (res === "awaited") {
             // A gated call parked: its planned operation and the pending
@@ -756,7 +764,11 @@ export class Secretary {
             });
             return;
           }
-          const result = { call_id: call.call_id ?? "", tool: call.tool, ...res };
+          const result = {
+            call_id: call.call_id ?? "",
+            tool: call.tool,
+            ...res,
+          };
           results.push(result);
           roundResults.push(result);
         }
@@ -1010,6 +1022,13 @@ export class Secretary {
     let keptEvents = view.events;
     const evicted: Event[] = [];
     let sendRecoveries = 0;
+    // The journal portion of the current send's estimate — raw records plus
+    // any capacity notice already in the view. A recovery only resends when
+    // the next view is strictly smaller than what the provider refused.
+    let lastViewEst = renderedViewTokens(keptEvents);
+    // Set when records could be dropped but the notice's own cost meant the
+    // resend would not have been smaller — reported honestly at the end.
+    let refusalNotSmaller = false;
 
     let text = "";
     let calls: ToolCall[] = [];
@@ -1058,37 +1077,49 @@ export class Secretary {
             Math.floor(keptEst / 2),
           );
           if (dropped.length > 0) {
-            keptEvents = kept;
-            evicted.push(...dropped);
-            sendRecoveries += 1;
-            sendMessages = [
-              system,
-              ...renderJournalContext(
-                kept,
-                view.memory,
-                view.omitted,
-                view.memoryOmitted,
-                [
-                  {
-                    seq: (evicted[evicted.length - 1]?.seq ?? 0) + 0.5,
-                    message: capacityNoticeMessage(evicted),
-                  },
-                ],
-              ),
-              ...suffix,
-            ];
-            this.log(
-              "provider refused context; retrying with a reduced working view",
-              {
-                turn_id: turn.turn_id,
-                round,
-                recovery: sendRecoveries,
-                excluded_records: evicted.length,
-                excluded_first_seq: evicted[0]?.seq,
-                excluded_last_seq: evicted[evicted.length - 1]?.seq,
-              },
-            );
-            continue;
+            // The notice itself occupies the view: a resend is only worth
+            // making when the reduced journal portion plus the notice is
+            // actually smaller than what just failed — for a tiny history
+            // the notice can cost more than the evicted records saved.
+            const candidate = [...evicted, ...dropped];
+            const notice = capacityNoticeMessage(candidate);
+            const nextViewEst =
+              renderedViewTokens(kept) + estTextTokens(notice.content);
+            if (nextViewEst < lastViewEst) {
+              lastViewEst = nextViewEst;
+              keptEvents = kept;
+              evicted.push(...dropped);
+              sendRecoveries += 1;
+              sendMessages = [
+                system,
+                ...renderJournalContext(
+                  kept,
+                  view.memory,
+                  view.omitted,
+                  view.memoryOmitted,
+                  [
+                    {
+                      seq: (evicted[evicted.length - 1]?.seq ?? 0) + 0.5,
+                      message: notice,
+                    },
+                  ],
+                ),
+                ...suffix,
+              ];
+              this.log(
+                "provider refused context; retrying with a reduced working view",
+                {
+                  turn_id: turn.turn_id,
+                  round,
+                  recovery: sendRecoveries,
+                  excluded_records: evicted.length,
+                  excluded_first_seq: evicted[0]?.seq,
+                  excluded_last_seq: evicted[evicted.length - 1]?.seq,
+                },
+              );
+              continue;
+            }
+            refusalNotSmaller = true;
           }
         }
         // Deterministic provider rejections cannot be fixed by retrying —
@@ -1117,7 +1148,9 @@ export class Secretary {
             ? `provider refused the request for context size` +
               (sendRecoveries > 0
                 ? `; ${sendRecoveries} reduced working-view attempt(s) were also refused`
-                : "; the working view had no reducible records") +
+                : refusalNotSmaller
+                  ? "; the reduced view would not have been smaller"
+                  : "; the working view had no reducible records") +
               `: ${msg}`
             : msg;
         await this.commitTurnFinal(turn, {

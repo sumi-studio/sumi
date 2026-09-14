@@ -37,10 +37,10 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
-import { StateError, type StateClient } from "../state-client.ts";
-import type { ModelBinding } from "../types.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
+import { type StateClient, StateError } from "../state-client.ts";
+import type { ModelBinding } from "../types.ts";
 
 /**
  * Connection presets whose wire protocol is OpenAI chat completions — the
@@ -102,6 +102,16 @@ export class SelectedModelProvider implements ModelProvider {
     this.opts = opts;
   }
 
+  /**
+   * Binding preflight: resolves the selection exactly as the next call
+   * would, without sending a request. Throws the same `ModelError` the
+   * call would raise — callers that gate work on a usable model (memory
+   * preparation) can pause instead of spending it.
+   */
+  async probe(): Promise<void> {
+    await this.resolve();
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const { provider, identity } = await this.resolve();
     for await (const ev of provider.stream(request)) {
@@ -127,10 +137,13 @@ export class SelectedModelProvider implements ModelProvider {
       // lookup failure retries like any provider outage.
       const msg = e instanceof Error ? e.message : String(e);
       const definite =
-        e instanceof StateError && e.status >= 400 && e.status < 500 &&
+        e instanceof StateError &&
+        e.status >= 400 &&
+        e.status < 500 &&
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
+        unavailable: true,
       });
     }
     switch (binding.selection) {
@@ -200,7 +213,7 @@ export class SelectedModelProvider implements ModelProvider {
 }
 
 function unusable(message: string): ModelError {
-  return new ModelError(message, { retryable: false });
+  return new ModelError(message, { retryable: false, unavailable: true });
 }
 
 export function providerFromEnv(
