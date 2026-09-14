@@ -2,6 +2,9 @@ import type { AuthFlowProvider, AuthIntent } from "./auth-flow-client";
 
 const emailFlowPrefix = "sumi.auth.email-flow.v1.";
 const consumedEmailFlowPrefix = "sumi.auth.email-flow-consumed.v1.";
+// The provider redirect returns into the same tab. A per-tab receipt keeps
+// the flow nonce out of persistent storage and out of every other tab.
+const redirectFlowKey = "sumi.auth.redirect-flow.v1";
 const credentialCleanupTimers = new Map<
   string,
   ReturnType<typeof globalThis.setTimeout>
@@ -22,6 +25,11 @@ export interface PendingEmailAuthFlow extends PendingAuthFlow {
   stage: "link_sent" | "firebase_complete";
   workspaceInviteCode?: string;
   credentialRecovery?: PendingCredentialRecovery;
+}
+
+export interface PendingRedirectAuthFlow extends PendingAuthFlow {
+  provider: RecoverableProvider;
+  stage: "redirect_sent";
 }
 
 export type RecoverableProvider = "google.com" | "github.com";
@@ -468,6 +476,88 @@ function isSerializedOAuthCredential(
   return [record.idToken, record.accessToken, record.pendingToken].some(
     (field) => typeof field === "string" && field.length > 0,
   );
+}
+
+/**
+ * Reports whether the receipt survived. Without it the return cannot be
+ * exchanged, so the caller must fail closed instead of navigating away.
+ */
+export function savePendingRedirectFlow(
+  flow: PendingRedirectAuthFlow,
+): boolean {
+  const raw = JSON.stringify(flow);
+  try {
+    sessionStorage.setItem(redirectFlowKey, raw);
+    return sessionStorage.getItem(redirectFlowKey) === raw;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reports whether a redirect receipt record exists, without validating it.
+ * Startup must attempt completion even for a malformed receipt so the return
+ * reports a recoverable error instead of landing on a silent login screen.
+ */
+export function hasPendingRedirectFlowRecord(): boolean {
+  try {
+    return sessionStorage.getItem(redirectFlowKey) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Loads a structurally valid receipt. Expiry is deliberately not checked:
+ * the server owns flow expiry, so an expired-looking receipt is still
+ * exchanged — the clock may be fast, and the server's rejection carries a
+ * real answer. Malformed records are cleared and reported missing.
+ */
+export function loadPendingRedirectFlow(): PendingRedirectAuthFlow | null {
+  try {
+    const raw = sessionStorage.getItem(redirectFlowKey);
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPendingRedirectFlow(parsed)) {
+      clearPendingRedirectFlow();
+      return null;
+    }
+    return parsed;
+  } catch {
+    clearPendingRedirectFlow();
+    return null;
+  }
+}
+
+/** Read and delete the receipt. A return may only be exchanged once. */
+export function takePendingRedirectFlow(): PendingRedirectAuthFlow | null {
+  const flow = loadPendingRedirectFlow();
+  clearPendingRedirectFlow();
+  return flow;
+}
+
+export function clearPendingRedirectFlow(): void {
+  try {
+    sessionStorage.removeItem(redirectFlowKey);
+  } catch {
+    // A stale receipt still fails closed: its flow expires server-side.
+  }
+}
+
+function isPendingRedirectFlow(
+  value: unknown,
+): value is PendingRedirectAuthFlow {
+  return (
+    isPendingFlow(value) &&
+    (value.provider === "google.com" || value.provider === "github.com") &&
+    "stage" in value &&
+    value.stage === "redirect_sent"
+  );
+}
+
+export function isExpiredFlow(flow: PendingAuthFlow): boolean {
+  const expiry = Date.parse(flow.expiresAt);
+  return !Number.isFinite(expiry) || expiry <= Date.now();
 }
 
 function isPendingFlow(value: unknown): value is PendingAuthFlow {

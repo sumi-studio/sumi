@@ -11,8 +11,11 @@
     "test": "node --test test/*.test.ts",
     "test:e2e": "node scripts/e2e-local.mjs",
     "test:e2e:plan": "node scripts/e2e-plan.mjs",
+    "test:e2e:jobs": "node scripts/e2e-jobs.mjs",
     "test:e2e:workerd": "node scripts/e2e-workerd.mjs",
+    "test:e2e:portable": "node scripts/e2e-portable.mjs",
     "dev:local": "node src/host/local.ts",
+    "dev:job-runner": "node src/host/job-runner.ts",
     "dev:worker": "wrangler dev --config wrangler.jsonc"
   },
   "devDependencies": {

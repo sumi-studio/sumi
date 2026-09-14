@@ -6,6 +6,8 @@ import type {
   CommitRequest,
   Event,
   Input,
+  Job,
+  JobTerminalReport,
   Json,
   LoadResult,
   ModelBinding,
@@ -26,6 +28,46 @@ const MISS_POLICIES = new Set([
   "expire",
   "report_missed",
 ]);
+
+const JOB_TERMINAL = new Set(["done", "failed", "cancelled", "lost"]);
+
+/** Mirrors Go validateJobRequest for kind 'subprocess'. */
+function validateSubprocessRequest(request: Record<string, unknown>) {
+  const cmd = request.command;
+  if (
+    !Array.isArray(cmd) ||
+    cmd.length === 0 ||
+    cmd.some((a) => typeof a !== "string" || a === "")
+  ) {
+    throw new StateError(
+      400,
+      "subprocess job requires a non-empty command array of strings",
+    );
+  }
+  if (request.cwd !== undefined && typeof request.cwd !== "string") {
+    throw new StateError(400, "subprocess cwd must be a string");
+  }
+  const t = request.timeout_ms;
+  if (
+    t !== undefined &&
+    (typeof t !== "number" || !Number.isInteger(t) || t <= 0 || t > 3_600_000)
+  ) {
+    throw new StateError(
+      400,
+      "subprocess timeout_ms must be an integer in (0, 3600000]",
+    );
+  }
+  if (request.env !== undefined) {
+    if (typeof request.env !== "object" || request.env === null) {
+      throw new StateError(400, "subprocess env must be an object of strings");
+    }
+    for (const [k, v] of Object.entries(request.env)) {
+      if (typeof v !== "string") {
+        throw new StateError(400, `subprocess env[${k}] must be a string`);
+      }
+    }
+  }
+}
 
 /** True when any string in a JSON-shaped value contains NUL. */
 function hasNul(v: unknown): boolean {
@@ -56,8 +98,23 @@ const TOOL_AUTHORITY: Record<
 > = {
   "schedule.set": { requiresApproval: false, elevatedOnly: false },
   "journal.note": { requiresApproval: false, elevatedOnly: false },
+  "job.start": { requiresApproval: false, elevatedOnly: false },
+  "job.status": { requiresApproval: false, elevatedOnly: false },
+  "job.cancel": { requiresApproval: false, elevatedOnly: false },
   "message.send": { requiresApproval: false, elevatedOnly: true },
 };
+
+// Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
+// or any non-RFC3339 shape is rejected even though new Date() would parse
+// it. The double must be at least as strict (review f42).
+const RFC3339_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function parseRFC3339(v: unknown): Date | null {
+  if (typeof v !== "string" || !RFC3339_RE.test(v)) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
 
 function approvalRequirement(
   tool: string,
@@ -79,8 +136,7 @@ function validateToolRequest(
 ): string | null {
   switch (tool) {
     case "schedule.set": {
-      const wakeAt = new Date(String(request.wake_at));
-      if (Number.isNaN(wakeAt.getTime())) {
+      if (parseRFC3339(request.wake_at) === null) {
         return "bad request: schedule.set requires RFC3339 wake_at";
       }
       const missPolicy = (request.miss_policy as string) || "fire_late";
@@ -147,7 +203,13 @@ function approvalId(persona: string, inputId: string, callIndex: number): string
 export class FakeState implements StateClient {
   personas = new Map<
     string,
-    { human_id: string | null; display_name: string; created_at: string }
+    {
+      human_id: string | null;
+      display_name: string;
+      created_at: string;
+      authority: string;
+      transfer_id: string | null;
+    }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
   leases = new Map<string, WriterLease>();
@@ -160,6 +222,8 @@ export class FakeState implements StateClient {
   /** One durable plan per input — key: persona|input_id. Immutable. */
   plans = new Map<string, TurnPlan>();
   schedules = new Map<string, Schedule>();
+  /** Persona-scoped execution records — key: persona|job_id. */
+  jobs = new Map<string, Job>();
   outboxEntries: OutboxEntry[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
@@ -190,6 +254,8 @@ export class FakeState implements StateClient {
       human_id: humanId,
       display_name: displayName,
       created_at: new Date().toISOString(),
+      authority: "active",
+      transfer_id: null,
     });
   }
 
@@ -475,7 +541,10 @@ export class FakeState implements StateClient {
     // boundary (Go dataErr), not a retryable 500. The stored error is
     // diagnostic: Go strips NUL from it, so do the same.
     if (hasNul(req.events) || hasNul(req.output) || hasNul(req.usage)) {
-      throw new StateError(400, "commit contains a NUL byte jsonb cannot store");
+      throw new StateError(
+        400,
+        "commit contains a NUL byte jsonb cannot store",
+      );
     }
     // The Go server rejects bodies over maxBody (1 MiB, "read body")
     // before decode — mirror that boundary so oversized-commit fallback
@@ -483,7 +552,11 @@ export class FakeState implements StateClient {
     if (new TextEncoder().encode(JSON.stringify(req)).length > 1 << 20) {
       throw new StateError(400, "read body");
     }
-    req = { ...req, error: req.error === undefined ? req.error : req.error.replace(/\u0000/g, "") };
+    req = {
+      ...req,
+      error:
+        req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
+    };
     for (const ev of req.events) {
       this.eventLog.push({
         persona_id: persona,
@@ -667,13 +740,28 @@ export class FakeState implements StateClient {
       }
       // A running op claimed by a fenced generation is reclaimed for
       // re-execution (external tools; internal tools can't stay running).
-      if (existing.status === "running" && existing.claimed_generation !== generation) {
+      if (
+        existing.status === "running" &&
+        existing.claimed_generation !== generation
+      ) {
         existing.claimed_generation = generation;
         existing.turn_id = op.turnId;
         return { operation: existing, approval: null, fresh: true };
       }
       if (existing.status === "awaiting_approval") {
         return this.claimGated(persona, turn.input_id, op.callIndex, existing, false);
+      }
+      // A replayed job.* receipt carries the job's state now next to the
+      // original result (Go withCurrentJobTx); the stored receipt stays.
+      if (op.tool.startsWith("job.") && existing.status === "done") {
+        return {
+          operation: {
+            ...existing,
+            response: this.withCurrentJob(persona, existing.response),
+          },
+          approval: null,
+          fresh: false,
+        };
       }
       return {
         operation: existing,
@@ -688,14 +776,20 @@ export class FakeState implements StateClient {
       tool: op.tool,
       idempotency_key: idempotencyKey,
       request: op.request,
-      status: requiredBy ? "awaiting_approval" : "done",
+      // Go inserts 'running' for non-gated calls and 'awaiting_approval'
+      // for gated ones; the claim transaction then finalizes or rolls
+      // the row back entirely.
+      status: requiredBy ? "awaiting_approval" : "running",
       response: null,
       claimed_generation: generation,
       created_at: new Date().toISOString(),
-      completed_at: requiredBy ? null : new Date().toISOString(),
+      completed_at: null,
     };
-    this.ops.set(k, operation);
     if (requiredBy) {
+      // The op row exists before validation on the gated path, exactly
+      // like Go: inserted awaiting_approval, then finalized failed when
+      // the deterministic check rejects it — replay returns the failure.
+      this.ops.set(k, operation);
       // Go F2: a call that can never execute is never asked of the
       // human — validate before the approval row exists so nothing parks
       // and no grant is stranded.
@@ -718,6 +812,10 @@ export class FakeState implements StateClient {
       );
       return { operation, approval: appr, fresh: true };
     }
+    // Below here the claim either stores the finalized op or throws — Go
+    // rolls the insert back on an execution error, so nothing is stored
+    // before the outcome is decided (no phantom receipt, review f42).
+    this.ops.set(k, operation);
     // Go deniedIdenticalCall: a normal-route call identical to one the
     // human denied for this input finalizes failed with that denial.
     const denied = [...this.approvals.values()].find(
@@ -756,7 +854,14 @@ export class FakeState implements StateClient {
       };
       return { operation, approval: null, fresh: true };
     }
-    this.applyInternal(persona, op.turnId, operation);
+    try {
+      this.applyInternal(persona, turn.input_id, op.callIndex, op.turnId, operation);
+    } catch (e) {
+      // Go's claim transaction rolls back on an execution error — the
+      // row must not survive as a replayable receipt (review f42).
+      this.ops.delete(k);
+      throw e;
+    }
     return { operation, approval: null, fresh: true };
   }
 
@@ -834,26 +939,34 @@ export class FakeState implements StateClient {
     // applied in the same step — exactly-once under the granted provenance.
     appr.consumed_at = new Date().toISOString();
     try {
-      this.applyInternal(persona, op.turn_id, op);
+      this.applyInternal(persona, inputId, callIndex, op.turn_id, op);
     } catch (e) {
       // Go F2: a deterministic failure at execution (e.g. a schedule_id
       // taken while the human decided) must not leave the grant
       // approved-unconsumed with the op parked forever — the grant is
-      // spent and the operation records the honest failure. Transient
-      // errors still propagate so the claim retries.
+      // spent and the operation records the honest failure. A transient
+      // (non-400) error rolls the whole claim back in Go — restore the
+      // unconsumed grant so the next claim retries it (review f38).
       if (e instanceof StateError && e.status === 400) {
         op.status = "failed";
         op.completed_at = new Date().toISOString();
         op.response = { error: e.message };
         return { operation: op, approval: appr, fresh: true };
       }
+      appr.consumed_at = null;
       throw e;
     }
     return { operation: op, approval: appr, fresh: true };
   }
 
   /** Apply a state-internal tool's effect and finalize the operation. */
-  private applyInternal(persona: string, turnId: string, operation: Operation) {
+  private applyInternal(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+    turnId: string,
+    operation: Operation,
+  ) {
     const op = operation.request;
     if (operation.tool === "schedule.set") {
       const missPolicy = (op.miss_policy as string) ?? "fire_late";
@@ -863,8 +976,8 @@ export class FakeState implements StateClient {
           "schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed",
         );
       }
-      const wakeAt = new Date(String(op.wake_at));
-      if (Number.isNaN(wakeAt.getTime())) {
+      const wakeAt = parseRFC3339(op.wake_at);
+      if (wakeAt === null) {
         throw new StateError(400, "schedule.set requires RFC3339 wake_at");
       }
       const sid = (op.schedule_id as string) ?? `sch-${Date.now()}`;
@@ -928,17 +1041,62 @@ export class FakeState implements StateClient {
         seq: this.outboxSeq,
         kind: "secretary_message",
       };
-    } else {
+    } else if (operation.tool === "job.start") {
+      // The job row is minted inside this claim transaction with a
+      // server-derived id (plan position), so a replayed claim can never
+      // mint a second job and the model never chooses an id.
+      validateSubprocessRequest(op);
+      const jobId = `op:${inputId}:${callIndex}`;
+      const job = this.insertJob(
+        persona,
+        jobId,
+        "subprocess",
+        op,
+        `tool:${turnId}:${callIndex}`,
+      );
+      // Receipts are snapshots (Go stores jsonb), never the live job row.
+      operation.response = { job: structuredClone(job) };
+    } else if (operation.tool === "job.status") {
+      const jobId = op.job_id;
+      if (typeof jobId !== "string" || jobId === "") {
+        throw new StateError(400, "job.status requires job_id");
+      }
+      // Internal-tool boundary: Go maps ErrJobNotFound to 400 here so a
+      // missing job is a recorded tool error, not a transient retry.
+      operation.response = {
+        job: structuredClone(this.mustJob400(persona, jobId)),
+      };
+    } else if (operation.tool === "job.cancel") {
+      const jobId = op.job_id;
+      if (typeof jobId !== "string" || jobId === "") {
+        throw new StateError(400, "job.cancel requires job_id");
+      }
+      operation.response = {
+        job: structuredClone(this.cancelJobRow(persona, jobId, true)),
+      };
+    } else if (operation.tool === "journal.note") {
+      const text = op.text;
+      if (typeof text !== "string" || text === "") {
+        throw new StateError(400, "journal.note requires text");
+      }
       const ev: Event = {
         persona_id: persona,
         seq: ++this.seq,
         turn_id: turnId,
         kind: "note",
-        payload: { text: op.text },
+        payload: { text },
         created_at: new Date().toISOString(),
       };
       this.eventLog.push(ev);
       operation.response = { seq: ev.seq, kind: "note" };
+    } else {
+      // A registered tool with no effect case fails the claim outright —
+      // Go rolls the insert back (no phantom row), so a later claim
+      // reports the same deterministic error (review f44).
+      throw new StateError(
+        400,
+        `${operation.tool} has no registered effect to run`,
+      );
     }
     operation.status = "done";
     operation.completed_at = new Date().toISOString();
@@ -981,8 +1139,23 @@ export class FakeState implements StateClient {
         "decided_by_kind 'human' and decided_by_id required",
       );
     }
-    const owner = this.personas.get(persona)?.human_id ?? null;
-    if (owner !== null && owner !== decision.decided_by_id) {
+    const rec = this.personas.get(persona);
+    // Go: a persona whose authority moved takes no new decisions here,
+    // and an approval is identity-scoped — no bound human, no decider.
+    if (rec && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona authority is ${rec.authority}; it takes no new approval decisions`,
+      );
+    }
+    const owner = rec?.human_id ?? null;
+    if (owner === null) {
+      throw new StateError(
+        403,
+        "persona is not bound to a human; no one may decide",
+      );
+    }
+    if (owner !== decision.decided_by_id) {
       throw new StateError(403, "only the persona's human may decide");
     }
     const appr = this.approvals.get(approvalId);
@@ -1194,4 +1367,353 @@ export class FakeState implements StateClient {
       ),
     };
   }
+
+  // --- jobs (M09) ---------------------------------------------------------
+  // Same contract as the Go store: runner-claim ownership (not the writer
+  // generation), atomic terminal+notification, identical-replay semantics.
+
+  private mustJob(persona: string, jobId: string): Job {
+    const j = this.jobs.get(`${persona}|${jobId}`);
+    if (!j) throw new StateError(404, "job not found");
+    return j;
+  }
+
+  // Internal-tool boundary: inside a claim the Go store maps "job not
+  // found" to 400 so a missing job_id is recorded as a tool error rather
+  // than retried as transient. The public routes keep 404.
+  private mustJob400(persona: string, jobId: string): Job {
+    const j = this.jobs.get(`${persona}|${jobId}`);
+    if (!j) throw new StateError(400, "job not found");
+    return j;
+  }
+
+  private insertJob(
+    persona: string,
+    jobId: string,
+    kind: string,
+    request: Record<string, unknown>,
+    createdBy: string,
+  ): Job {
+    const existing = this.jobs.get(`${persona}|${jobId}`);
+    if (existing) {
+      if (existing.kind !== kind || !jsonEqual(existing.request, request)) {
+        throw new StateError(409, "job_id replay carries a different request");
+      }
+      return existing;
+    }
+    const job: Job = {
+      persona_id: persona,
+      job_id: jobId,
+      kind,
+      request,
+      status: "queued",
+      claimed_by: null,
+      claim_expires_at: null,
+      created_by: createdBy,
+      created_at: new Date().toISOString(),
+      started_at: null,
+      finished_at: null,
+      cancel_requested_at: null,
+      result: null,
+      error: null,
+      notified_at: null,
+    };
+    this.jobs.set(`${persona}|${jobId}`, job);
+    return job;
+  }
+
+  /** Queue the 'job:<id>' terminal notification input exactly once. */
+  private notifyJobTerminal(job: Job) {
+    const inputId = `job:${job.job_id}`;
+    if (
+      !this.inputs.some(
+        (i) => i.persona_id === job.persona_id && i.input_id === inputId,
+      )
+    ) {
+      const command = this.jobCommandSummary(job);
+      const origin = this.jobOrigin(job);
+      const payload: Record<string, unknown> = {
+        job_id: job.job_id,
+        kind: job.kind,
+        status: job.status,
+        text:
+          `job ${job.job_id} (${job.kind}) ${job.status}` +
+          (job.error ? `: ${job.error}` : "") +
+          (command ? ` — command: ${command}` : "") +
+          (origin
+            ? ` — started by you for request ${origin.inputId}` +
+              (origin.request ? `: ${JSON.stringify(origin.request)}` : "") +
+              (origin.inProgress
+                ? " (that request was not finished yet when this job ended)"
+                : "")
+            : ""),
+      };
+      if (command) payload.command = command;
+      if (origin) {
+        payload.origin_input_id = origin.inputId;
+        payload.origin_request = origin.request;
+        payload.origin_in_progress = origin.inProgress;
+      }
+      if (job.error) payload.error = job.error;
+      const code = job.result?.exit_code;
+      if (code !== undefined) payload.exit_code = code;
+      this.inputs.push({
+        persona_id: job.persona_id,
+        input_id: inputId,
+        kind: "job_completed",
+        payload,
+        actor_kind: "job",
+        actor_id: job.job_id,
+        source_surface: "core_jobs",
+        thread_id: "",
+        occurred_at: null,
+        attention: "reply",
+        status: "queued",
+        claimed_generation: null,
+        turn_id: null,
+        created_at: new Date().toISOString(),
+        done_at: null,
+        not_before: null,
+        waiting_since: null,
+        waited_ms: 0,
+      });
+    }
+    job.notified_at = new Date().toISOString();
+  }
+
+  private jobCommandSummary(job: Job): string {
+    const cmd = job.request.command;
+    if (!Array.isArray(cmd) || cmd.length === 0) return "";
+    return boundCodePoints(cmd.map((c) => String(c)).join(" "), 120);
+  }
+
+  // A tool-minted job (op:<input_id>:<call_index>) resolves to the request
+  // it was started for, as Go jobOriginTx does.
+  private jobOrigin(
+    job: Job,
+  ): { inputId: string; request: string; inProgress: boolean } | null {
+    if (!job.created_by.startsWith("tool:") || !job.job_id.startsWith("op:")) {
+      return null;
+    }
+    const rest = job.job_id.slice(3);
+    const i = rest.lastIndexOf(":");
+    if (i <= 0) return null;
+    const input = this.inputs.find(
+      (x) => x.persona_id === job.persona_id && x.input_id === rest.slice(0, i),
+    );
+    if (!input) return null;
+    const text =
+      typeof input.payload.text === "string" ? input.payload.text : "";
+    return {
+      inputId: input.input_id,
+      request: boundCodePoints(text, 200),
+      inProgress: input.status !== "done",
+    };
+  }
+
+  private withCurrentJob(
+    persona: string,
+    receipt: Operation["response"],
+  ): Operation["response"] {
+    const r = receipt as Record<string, unknown> | null;
+    const jobId = (r?.job as Job | undefined)?.job_id;
+    const j = jobId ? this.jobs.get(`${persona}|${jobId}`) : undefined;
+    if (!r || !j) return receipt;
+    const current: Record<string, unknown> = { status: j.status };
+    if (j.result?.exit_code !== undefined)
+      current.exit_code = j.result.exit_code;
+    if (j.error) current.error = j.error;
+    if (j.finished_at) current.finished_at = j.finished_at;
+    return {
+      ...r,
+      current_job: current,
+      receipt_note:
+        "job is this call's original result; current_job is the job's state when this turn resumed",
+    } as Operation["response"];
+  }
+
+  private cancelJobRow(persona: string, jobId: string, internal = false): Job {
+    const job = internal
+      ? this.mustJob400(persona, jobId)
+      : this.mustJob(persona, jobId);
+    if (job.status === "queued") {
+      job.status = "cancelled";
+      job.cancel_requested_at = new Date().toISOString();
+      job.finished_at = job.cancel_requested_at;
+      this.notifyJobTerminal(job);
+    } else if (job.status === "running") {
+      job.status = "cancel_requested";
+      job.cancel_requested_at = new Date().toISOString();
+    }
+    return job;
+  }
+
+  async submitJob(
+    persona: string,
+    job: { jobId: string; kind: string; request: Record<string, unknown> },
+  ): Promise<{ job: Job; created: boolean }> {
+    if (!job.jobId || job.jobId.length > 256) {
+      throw new StateError(400, "job_id must be 1-256 characters");
+    }
+    if (job.jobId.startsWith("op:") || job.jobId === "claim") {
+      throw new StateError(400, `job_id ${job.jobId} is reserved`);
+    }
+    if (hasNul(job.jobId)) {
+      throw new StateError(400, "job_id contains a NUL byte text cannot store");
+    }
+    if (job.kind !== "subprocess") {
+      throw new StateError(400, `unknown job kind ${job.kind}`);
+    }
+    validateSubprocessRequest(job.request);
+    if (hasNul(job.request)) {
+      throw new StateError(
+        400,
+        "job request contains a NUL byte jsonb cannot store",
+      );
+    }
+    const key = `${persona}|${job.jobId}`;
+    const existed = this.jobs.has(key);
+    const stored = this.insertJob(
+      persona,
+      job.jobId,
+      job.kind,
+      job.request,
+      "api",
+    );
+    return { job: stored, created: !existed };
+  }
+
+  async getJob(persona: string, jobId: string): Promise<Job> {
+    return this.mustJob(persona, jobId);
+  }
+
+  async listJobs(
+    persona: string,
+    opts?: { status?: Job["status"][]; limit?: number },
+  ): Promise<Job[]> {
+    return [...this.jobs.values()]
+      .filter(
+        (j) =>
+          j.persona_id === persona &&
+          (!opts?.status?.length || opts.status.includes(j.status)),
+      )
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, opts?.limit ?? 50);
+  }
+
+  async cancelJob(persona: string, jobId: string): Promise<Job> {
+    return this.cancelJobRow(persona, jobId);
+  }
+
+  async claimJobs(
+    persona: string,
+    req: { runnerId: string; kinds: string[]; leaseMs: number; limit?: number },
+  ): Promise<{ claimed: Job[]; swept: Job[] }> {
+    const now = Date.now();
+    const swept: Job[] = [];
+    for (const j of this.jobs.values()) {
+      if (
+        j.persona_id === persona &&
+        (j.status === "running" || j.status === "cancel_requested") &&
+        j.claim_expires_at !== null &&
+        Date.parse(j.claim_expires_at) < now
+      ) {
+        j.status = "lost";
+        j.finished_at = new Date().toISOString();
+        j.error = "runner claim expired; outcome is indeterminate";
+        j.result = { ...(j.result ?? {}), reason: "claim_expired" };
+        this.notifyJobTerminal(j);
+        swept.push(j);
+      }
+    }
+    const claimed: Job[] = [];
+    const limit = req.limit ?? 1;
+    for (const j of [...this.jobs.values()].sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    )) {
+      if (claimed.length >= limit) break;
+      if (
+        j.persona_id !== persona ||
+        j.status !== "queued" ||
+        !req.kinds.includes(j.kind)
+      ) {
+        continue;
+      }
+      j.status = "running";
+      j.claimed_by = req.runnerId;
+      j.claim_expires_at = new Date(now + req.leaseMs).toISOString();
+      j.started_at ??= new Date().toISOString();
+      claimed.push(j);
+    }
+    return { claimed, swept };
+  }
+
+  async heartbeatJob(
+    persona: string,
+    jobId: string,
+    req: { runnerId: string; leaseMs: number },
+  ): Promise<Job> {
+    const job = this.mustJob(persona, jobId);
+    if (job.claimed_by !== req.runnerId || JOB_TERMINAL.has(job.status)) {
+      throw new StateError(409, "job is not claimed by this runner", job);
+    }
+    job.claim_expires_at = new Date(Date.now() + req.leaseMs).toISOString();
+    return job;
+  }
+
+  async completeJob(
+    persona: string,
+    jobId: string,
+    req: {
+      runnerId: string;
+      status: JobTerminalReport;
+      result: Record<string, unknown>;
+      error?: string;
+    },
+  ): Promise<Job> {
+    if (!["done", "failed", "cancelled"].includes(req.status)) {
+      throw new StateError(
+        400,
+        "complete status must be done, failed, or cancelled",
+      );
+    }
+    if (hasNul(req.result)) {
+      throw new StateError(
+        400,
+        "job result contains a NUL byte jsonb cannot store",
+      );
+    }
+    if (hasNul(req.error ?? "")) {
+      throw new StateError(
+        400,
+        "job error contains a NUL byte text cannot store",
+      );
+    }
+    const job = this.mustJob(persona, jobId);
+    if (JOB_TERMINAL.has(job.status)) {
+      const same =
+        job.status === req.status &&
+        jsonEqual(job.result ?? {}, req.result) &&
+        (job.error ?? "") === (req.error ?? "");
+      if (!same) {
+        throw new StateError(409, `job already finished as ${job.status}`, job);
+      }
+      return job;
+    }
+    if (job.claimed_by !== req.runnerId) {
+      throw new StateError(409, "job is not claimed by this runner", job);
+    }
+    job.status = req.status;
+    job.result = req.result;
+    job.error = req.error || null;
+    job.finished_at = new Date().toISOString();
+    this.notifyJobTerminal(job);
+    return job;
+  }
+}
+
+/** Cut to at most n code points, marking the cut (Go boundRunes). */
+function boundCodePoints(s: string, n: number): string {
+  const cps = [...s];
+  return cps.length > n ? `${cps.slice(0, n).join("")}…` : s;
 }
