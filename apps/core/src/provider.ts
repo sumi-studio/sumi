@@ -61,17 +61,31 @@ export interface ModelProvider {
  * incomplete stream) from rejections no retry can fix (auth, bad
  * request). `retryAfterMs` carries provider-supplied pacing (Retry-After)
  * so the durable retry honors it instead of guessing.
+ *
+ * `refusal` marks a deterministic rejection of the request's content —
+ * "context_length" = the provider refused because the request was too
+ * large. Such a refusal is never transient: retrying the identical request
+ * can never succeed, so it stays non-retryable and does not spend the
+ * transient-retry budget — but the same turn may continue with a smaller
+ * temporary working view. It is classified from the provider's own
+ * status/code/message, never from a configured context window.
  */
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
+  readonly refusal?: "context_length";
   constructor(
     message: string,
-    opts: { retryable: boolean; retryAfterMs?: number },
+    opts: {
+      retryable: boolean;
+      retryAfterMs?: number;
+      refusal?: "context_length";
+    },
   ) {
     super(message);
     this.name = "ModelError";
     this.retryable = opts.retryable;
     this.retryAfterMs = opts.retryAfterMs;
+    this.refusal = opts.refusal;
   }
 }

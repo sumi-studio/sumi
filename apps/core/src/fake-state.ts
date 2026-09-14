@@ -90,6 +90,8 @@ function retryBackoffMs(attempt: number): number {
 
 // Memory thresholds mirrored from the Go store (agentstate/memory.go).
 const L0_CHUNK_MIN_TOKENS = 10_000;
+/** Target bound for one sealed chunk: past it, any safe boundary may cut. */
+const L0_FORCED_SEAL_LIMIT_TOKENS = L0_CHUNK_MIN_TOKENS * 2;
 const L0_LIVE_LIMIT_TOKENS = 40_000;
 /** Recorded preparation failures a chunk may spend. */
 const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
@@ -1187,7 +1189,12 @@ export class FakeState implements StateClient {
     let covered = Math.max(0, ...mine().map((c) => c.last_seq));
     // Seal walk: accumulate the unsealed tail; cut a chunk just before each
     // input_received once the window reaches the minimum and no tool call
-    // in it is still waiting for its result.
+    // in it is still waiting for its result. Past the forced limit, one
+    // further boundary kind opens — before an assistant_message that does
+    // not directly continue a tool flow. A turn's deciding text and the
+    // calls/results it started are one unit: never cut before a tool_call
+    // or tool_result, and a flow with no interior boundary seals whole past
+    // the limit. Same rules as the Go walk.
     const tail = this.eventLog.filter(
       (e) => e.persona_id === persona && e.seq > covered,
     );
@@ -1195,13 +1202,22 @@ export class FakeState implements StateClient {
     let windowEst = 0;
     let windowStart = -1;
     let window: Event[] = [];
+    let prevKind = "";
     for (const e of tail) {
-      if (
-        e.kind === "input_received" &&
-        windowStart >= 0 &&
-        pending.size === 0 &&
-        windowEst >= L0_CHUNK_MIN_TOKENS
-      ) {
+      let cut = false;
+      if (windowStart >= 0 && pending.size === 0) {
+        switch (e.kind) {
+          case "input_received":
+            cut = windowEst >= L0_CHUNK_MIN_TOKENS;
+            break;
+          case "assistant_message":
+            cut =
+              windowEst > L0_FORCED_SEAL_LIMIT_TOKENS &&
+              prevKind !== "tool_result";
+            break;
+        }
+      }
+      if (cut) {
         const nextChunkSeq = (this.chunkSeq.get(persona) ?? 0) + 1;
         this.chunkSeq.set(persona, nextChunkSeq);
         this.memoryChunks.push({
@@ -1237,6 +1253,7 @@ export class FakeState implements StateClient {
       } else if (e.kind === "tool_result" && typeof callId === "string") {
         pending.delete(callId);
       }
+      prevKind = e.kind;
     }
     // Live raw = every not-yet-applied chunk plus the unsealed tail.
     let live =
