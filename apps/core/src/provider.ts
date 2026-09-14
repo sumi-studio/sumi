@@ -27,6 +27,12 @@ export interface ToolSpec {
 export interface ToolCall {
   id: string;
   name: string;
+  /**
+   * The invocation route the model chose for this call (ADR 0013 §1).
+   * Providers must supply it from the wire envelope — a call without a
+   * route is malformed, never silently normal.
+   */
+  route: "normal" | "elevated";
   arguments: Record<string, unknown>;
 }
 

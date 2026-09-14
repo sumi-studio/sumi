@@ -27,15 +27,15 @@ class ScriptedProvider implements ModelProvider {
   requests: ModelRequest[] = [];
   private readonly rounds: {
     text: string;
-    calls?: { tool: string; request: Record<string, unknown> }[];
+    calls?: { tool: string; route?: "normal" | "elevated"; request: Record<string, unknown> }[];
   }[];
   constructor(
     script:
-      | { text: string; calls?: { tool: string; request: Record<string, unknown> }[] }
+      | { text: string; calls?: { tool: string; route?: "normal" | "elevated"; request: Record<string, unknown> }[] }
       | {
           rounds: {
             text: string;
-            calls?: { tool: string; request: Record<string, unknown> }[];
+            calls?: { tool: string; route?: "normal" | "elevated"; request: Record<string, unknown> }[];
           }[];
         },
   ) {
@@ -49,7 +49,7 @@ class ScriptedProvider implements ModelProvider {
     for (const [i, c] of (r.calls ?? []).entries()) {
       yield {
         type: "tool_call",
-        call: { id: `call-${req.round}-${i}`, name: c.tool, arguments: c.request },
+        call: { id: `call-${req.round}-${i}`, name: c.tool, route: c.route ?? "normal", arguments: c.request },
       };
     }
     yield { type: "done", usage: { scripted: true, round: req.round } };
@@ -251,8 +251,8 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
   const planA = new ScriptedProvider({
     text: "reply-A",
     calls: [
-      { tool: "journal.note", request: { text: "note-A0" } },
-      { tool: "journal.note", request: { text: "note-A1" } },
+      { tool: "journal.note", route: "normal" as const, request: { text: "note-A0" } },
+      { tool: "journal.note", route: "normal" as const, request: { text: "note-A1" } },
     ],
   });
   // Attempt 1 commits the position-0 effect, then dies before commitTurn —
@@ -289,7 +289,7 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
     rounds: [
       {
         text: "reply-B",
-        calls: [{ tool: "journal.note", request: { text: "note-B0" } }],
+        calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "note-B0" } }],
       },
       { text: "reply-from-attempt-2" },
     ],
@@ -336,7 +336,7 @@ test("savePlan: identical resend returns the stored plan; conflict is rejected",
     turnId: turn!.turn_id,
     round: 0,
     text: "reply",
-    calls: [{ tool: "journal.note", request: { text: "n" } }],
+    calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "n" } }],
     usage: { in: 1, out: 2 },
   };
   const first = await state.savePlan(PERSONA, gen, req);
@@ -349,7 +349,7 @@ test("savePlan: identical resend returns the stored plan; conflict is rejected",
   // Key order / equivalent JSON must not false-conflict.
   const reordered = {
     ...req,
-    calls: [{ request: { text: "n" }, tool: "journal.note" }],
+    calls: [{ request: { text: "n" }, tool: "journal.note", route: "normal" as const }],
   };
   assert.equal((await state.savePlan(PERSONA, gen, reordered)).created, false);
   // A different decision for the same input is a contract violation.
@@ -385,13 +385,13 @@ test("claims require the recorded plan and must match its positions", async () =
     turnId: turn!.turn_id,
     round: 0,
     text: "reply",
-    calls: [{ tool: "journal.note", request: { text: "n" } }],
+    calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "n" } }],
     usage: {},
   });
   // Off-plan request, off-plan tool, and out-of-range index all conflict.
   for (const bad of [
     { request: { text: "different" } },
-    { tool: "schedule.set", request: { text: "n" } },
+    { tool: "schedule.set", route: "normal" as const, request: { text: "n" } },
     { callIndex: 1 },
   ]) {
     await assert.rejects(
@@ -418,7 +418,7 @@ test("server-derived effect identity: a new operation_id on retry replays the re
     turnId: turn!.turn_id,
     round: 0,
     text: "reply",
-    calls: [{ tool: "journal.note", request: { text: "committed" } }],
+    calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "committed" } }],
     usage: {},
   });
   await state.claimOperation(PERSONA, gen, {
@@ -575,7 +575,7 @@ test("a store replaying a receipt for a different request is still caught client
     turnId: turn!.turn_id,
     round: 0,
     text: "reply",
-    calls: [{ tool: "journal.note", request: { text: "A" } }],
+    calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "A" } }],
     usage: {},
   });
   await inner.claimOperation(PERSONA, gen, {
@@ -637,6 +637,8 @@ test("assemble flattens tool results to assistant text (no orphaned tool role)",
     created_at: new Date().toISOString(),
     done_at: null,
     not_before: null,
+    waiting_since: null,
+    waited_ms: 0,
   };
   const messages = assemble(context, input);
   assert.equal(
@@ -692,6 +694,8 @@ test("assemble shows Messaging provenance a reply can be addressed to", () => {
     created_at: new Date().toISOString(),
     done_at: null,
     not_before: null,
+    waiting_since: null,
+    waited_ms: 0,
   };
   const messages = assemble(earlier, input);
   assert.equal(
@@ -737,7 +741,7 @@ test("tool results feed back into a truthful final reply (multi-round)", async (
     rounds: [
       {
         text: "noting that",
-        calls: [{ tool: "journal.note", request: { text: "has a red bike" } }],
+        calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "has a red bike" } }],
       },
       { text: "Done — I noted your red bike." },
     ],
@@ -794,7 +798,7 @@ test("plan rounds are append-only across attempts (lost save before round 1)", a
     turnId: turn!.turn_id,
     round: 0,
     text: "r0",
-    calls: [{ tool: "journal.note", request: { text: "n0" } }],
+    calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "n0" } }],
     usage: {},
   };
   assert.equal((await state.savePlan(PERSONA, gen, r0)).created, true);
@@ -813,7 +817,7 @@ test("plan rounds are append-only across attempts (lost save before round 1)", a
     (e: unknown) => e instanceof StateError && e.status === 409,
   );
   // Claims address flat positions across rounds.
-  await state.savePlan(PERSONA, gen, { ...r0, round: 2, text: "r2", calls: [{ tool: "journal.note", request: { text: "n2" } }] });
+  await state.savePlan(PERSONA, gen, { ...r0, round: 2, text: "r2", calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "n2" } }] });
   const claim = await state.claimOperation(PERSONA, gen, {
     operationId: "op-1",
     turnId: turn!.turn_id,
@@ -1004,6 +1008,7 @@ test("a decision containing NUL data fails the input non-retryable; the next inp
           call: {
             id: "c0",
             name: "journal.note",
+            route: "normal" as const,
             arguments: { text: "a\u0000b" },
           },
         };
@@ -1054,7 +1059,7 @@ test("schedule.set with an invalid miss_policy is a recorded tool error, not a r
         text: "scheduling",
         calls: [
           {
-            tool: "schedule.set",
+            tool: "schedule.set", route: "normal" as const,
             request: {
               wake_at: "2030-01-01T00:00:00Z",
               miss_policy: "bogus",
@@ -1109,7 +1114,7 @@ test("schedule.set schedule_id reuse: identical pending replays; different conte
       turnId,
       round: 0,
       text: "r",
-      calls: [{ tool: "schedule.set", request }],
+      calls: [{ tool: "schedule.set", route: "normal" as const, request }],
       usage: {},
     });
     try {
@@ -1578,7 +1583,7 @@ test("an unknown recurring in-turn error resolves as an honest failure after 3 s
     cfg(buggy, "h", {
       provider: new ScriptedProvider({
         text: "",
-        calls: [{ tool: "journal.note", request: { text: "x" } }],
+        calls: [{ tool: "journal.note", route: "normal" as const, request: { text: "x" } }],
       }),
     }),
   );
@@ -1610,7 +1615,7 @@ test("a rejected claim still journals its tool_call before the tool_result (F6)"
         rounds: [
           {
             text: "",
-            calls: [{ tool: "no.such.tool", request: { x: 1 } }],
+            calls: [{ tool: "no.such.tool", route: "normal" as const, request: { x: 1 } }],
           },
           { text: "could not do it", calls: [] },
         ],

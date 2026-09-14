@@ -310,6 +310,48 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
 			ErrUnresolvedOperations, strings.Join(inflight, ", "))
 	}
+	// The model selection is human-scoped account state: it binds the
+	// persona's human, and the destination binds a different account whose
+	// connection rows cannot be assumed to exist. Snapshot it onto the
+	// persona as non-secret intent — an explicit 'none', or the selected
+	// connection's kind and metadata without any credential — so the
+	// bundle carries what the user chose. A persona that itself arrived by
+	// transfer may still carry an unresolved intent: when there is no
+	// selection to snapshot, that intent is what the persona owes, so it
+	// is kept rather than silently erased. The value this snapshot
+	// replaces is recorded on the export receipt so Abort can restore the
+	// pre-seal semantics exactly.
+	// At the destination the intent is enforced, not silently substituted:
+	// modelBinding reports needs_rebinding until the destination human
+	// selects a connection of the same kind (or the intent is explicitly
+	// cleared), and the core refuses to run a model rather than falling
+	// back to an environment default. A persona with no selection and no
+	// carried intent snapshots NULL and keeps the destination's ordinary
+	// unset semantics.
+	var priorIntent json.RawMessage
+	if err := tx.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, personaID).Scan(&priorIntent); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_personas p SET model_intent = COALESCE((
+			SELECT jsonb_build_object('kind', m.kind, 'connection', CASE
+				WHEN m.kind = 'api' THEN (
+					SELECT jsonb_build_object(
+						'connection_id', c.connection_id::text, 'name', c.name,
+						'preset', c.preset, 'base_url', c.base_url,
+						'model', c.model, 'version', c.version::text)
+					FROM model_api_connections c
+					WHERE c.human_id = m.human_id AND c.connection_id = m.connection_id)
+				WHEN m.kind = 'chatgpt' THEN (
+					SELECT jsonb_build_object('model', g.model, 'effort', g.effort)
+					FROM chatgpt_connections g WHERE g.human_id = m.human_id)
+				ELSE NULL END)
+			FROM model_connection_selections m
+			WHERE m.human_id = p.human_id), p.model_intent)
+		WHERE p.persona_id = $1`, personaID); err != nil {
+		return Receipt{}, err
+	}
 	var literalNulls int64
 	if err := tx.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM core_turns WHERE persona_id = $1 AND (
@@ -375,6 +417,10 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		Continuity:    cont,
 		NotIncluded:   NotIncluded,
 		UpdatedAt:     sealedAt.UTC(),
+		// The intent this seal's snapshot replaced — Abort restores it so a
+		// cancelled transfer returns the source to exactly its pre-transfer
+		// model semantics.
+		PriorModelIntent: priorIntent,
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -490,8 +536,21 @@ func (s *Service) Abort(ctx context.Context, personaID, transferID, retireProof 
 			"the addressed placement has not retired it (check its import status)",
 			ErrTransferConflict, retireProof, transferID, rec.DestinationID)
 	}
+	// The seal-time intent snapshot is a transfer artifact and dies with the
+	// transfer: restore the intent the seal recorded as replaced. For a
+	// persona that never moved that is NULL — the live selection drives the
+	// binding again, so an ordinary model-kind change after the abort is not
+	// stranded in needs_rebinding. For a persona that itself arrived by
+	// transfer, a still-unresolved incoming intent is restored rather than
+	// silently erased.
+	var intentRestore *string
+	if len(rec.PriorModelIntent) > 0 {
+		s := string(rec.PriorModelIntent)
+		intentRestore = &s
+	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE core_personas SET authority = 'active', transfer_id = NULL WHERE persona_id = $1`, personaID); err != nil {
+		`UPDATE core_personas SET authority = 'active', transfer_id = NULL, model_intent = $2::jsonb WHERE persona_id = $1`,
+		personaID, intentRestore); err != nil {
 		return Receipt{}, err
 	}
 	// Expire the parked lease so the next writer acquires generation+1.
@@ -548,6 +607,29 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	}
 	if authority != "staged" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
+	}
+	// An unbound persona may activate only while nothing parked needs a
+	// human decider: an approval is an identity-scoped act and no one may
+	// decide it while human_id is NULL, so activating with a pending
+	// approval would strand its waiting input forever. Binding stays
+	// reachable — POST /internal/core/personas/{id}/bind works on a staged
+	// persona — and retiring the transfer is always allowed.
+	var humanID *string
+	if err := tx.QueryRow(ctx,
+		`SELECT human_id FROM core_personas WHERE persona_id = $1`, personaID).Scan(&humanID); err != nil {
+		return Receipt{}, err
+	}
+	if humanID == nil {
+		var pending int64
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM core_tool_approvals
+			WHERE persona_id = $1 AND status = 'pending'`, personaID).Scan(&pending); err != nil {
+			return Receipt{}, err
+		}
+		if pending > 0 {
+			return Receipt{}, fmt.Errorf("%w: persona is not bound to a human and %d pending approval(s) require a decision only a bound human can make; bind a human (POST /internal/core/personas/%s/bind) before activating, or retire the transfer",
+				ErrTransferConflict, pending, personaID)
+		}
 	}
 	// The proof names this placement's own id — which is the ledger's
 	// destination_id for every import — so it can only ever verify as the
@@ -766,10 +848,12 @@ func summarize(ctx context.Context, q querier, personaID string) (map[string]int
 			(SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'note'),
 			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'queued'),
 			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'claimed'),
+			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'waiting'),
 			(SELECT count(*) FROM core_turns WHERE persona_id = $1 AND status = 'running'),
 			(SELECT count(*) FROM core_turn_plans p JOIN core_inputs i
 				ON i.persona_id = p.persona_id AND i.input_id = p.input_id
 				WHERE p.persona_id = $1 AND i.status <> 'done'),
+			(SELECT count(*) FROM core_tool_approvals WHERE persona_id = $1 AND status = 'pending'),
 			(SELECT count(*) FROM core_schedules WHERE persona_id = $1 AND status IN ('pending', 'claimed')),
 			(SELECT count(*) FROM core_outbox WHERE persona_id = $1 AND delivered_at IS NULL),
 			(SELECT COALESCE(max(seq), 0) FROM core_events WHERE persona_id = $1),
@@ -780,7 +864,8 @@ func summarize(ctx context.Context, q querier, personaID string) (map[string]int
 			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'kept'),
 			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'failed')`,
 		personaID).Scan(&cont.JournalEvents, &cont.Notes, &cont.QueuedInputs, &cont.ClaimedInputs,
-		&cont.RunningTurns, &cont.UnfinishedPlans, &cont.PendingSchedules, &cont.UndeliveredOut,
+		&cont.WaitingInputs, &cont.RunningTurns, &cont.UnfinishedPlans, &cont.PendingApprovals,
+		&cont.PendingSchedules, &cont.UndeliveredOut,
 		&cut.LatestEventSeq, &cut.LatestOutboxSeq,
 		&cont.MemoryApplied, &cont.MemoryPrepared, &cont.MemorySealed, &cont.MemoryKept, &cont.MemoryFailed)
 	return rows, cont, cut, err
