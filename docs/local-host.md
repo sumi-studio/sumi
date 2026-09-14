@@ -19,16 +19,19 @@ crashes, and reinstalls.
 ## Requirements
 
 - Linux (the supported target; see [ADR 0004](adr/0004-agent-local-platform-support.md)).
-  macOS/other Unix may work as a low-trust fallback — pid safety uses
-  `/proc`, which is Linux-only. Native Windows is unsupported; use WSL.
-- bash ≥ 5, `curl`, `openssl`, `flock`, `tar`, `nohup`
+  Process identity is verified through `/proc` (recorded start-time +
+  absolute-path cmdline match before any signal), so lifecycle commands
+  require Linux and fail clearly elsewhere. Native Windows is unsupported;
+  use WSL.
+- bash ≥ 5, `curl`, `openssl`, `flock`, `tar`, `nohup`, `realpath`
 - Node ≥ 22.18 or ≥ 23.6 (runs `.ts` directly; `sumi-local doctor` checks)
 - PostgreSQL, either:
   - `--db-url postgres://…` to a database you provide, or
   - `--managed-pg` (default when Docker is available): a dedicated
     loopback-only `postgres:17-alpine` container + named volume per
-    `deploy/local-host/compose.pg.yaml`. Not a shared system service —
-    `restart: "no"`, started/stopped by `sumi-local`.
+    `deploy/local-host/compose.pg.yaml`, scoped per install (see below).
+    Not a shared system service — `restart: "no"`, started/stopped by
+    `sumi-local`.
 - Go toolchain only when installing from a source checkout. Packs carry a
   prebuilt binary; installing a pack does not need Go.
 
@@ -55,11 +58,38 @@ Installing drops a `sumi-local` shim in `~/.local/bin`.
 | `~/.local/lib/sumi-local` (`--prefix`) | executables: service binary, `core/` TypeScript sources, CLI | no — removed |
 | `$XDG_STATE_HOME/sumi/local` (`--home`) | `config.env` (0600: identity, secrets, model), `run/` pids, `log/`, `workspace/` | yes — `--purge` to delete |
 | `~/.local/bin/sumi-local` | CLI symlink | no — removed |
-| managed PG volume | canonical database (managed mode) | yes — `--purge` deletes it |
+| managed PG volume | canonical database (managed mode) | yes — `--purge` deletes it, after an ownership check |
 
 Identity lives in `config.env`: `SUMI_PERSONA_ID` is generated once at
 first install and preserved on reinstall — that is what makes the
 reinstalled secretary *the same individual* with the same history.
+
+## Multiple installs / non-default paths
+
+Each install is identified by `SUMI_LOCAL_ID` (recorded in `config.env`,
+derived once from the state-home path). Managed docker resources are named
+after it — container `sumi-local-pg-<id>`, volume `sumi-local-pgdata-<id>`,
+compose project `sumi-local-<id>` — so two installs never share data, and
+a second install's `--purge` cannot delete the first's volume. The managed
+PG host port is docker-assigned (`127.0.0.1:0`), so two managed installs
+can even run simultaneously (each still needs its own
+`SUMI_LOCAL_LISTEN`).
+
+With non-default `--home`/`--prefix`, later commands select the install
+via the environment — `install` prints the exact lines:
+
+```sh
+export SUMI_LOCAL_HOME=/path/to/state-home
+export SUMI_LOCAL_PREFIX=/path/to/prefix
+sumi-local start
+```
+
+If a previous install's config was deleted but its managed volume remains,
+a fresh install at the same home **refuses to adopt it** — restore the old
+`config.env` to keep that secretary's data, or remove the volume yourself
+for a fresh start. `uninstall` likewise refuses to remove a prefix/home
+that lacks this install's payload markers, and refuses to delete a docker
+volume that isn't labeled for this install's compose project.
 
 ## Model connection
 
@@ -102,8 +132,16 @@ from the environment without editing `config.env` — see
 
 - The service binds literal loopback only (`127.x`/`localhost`); the
   browser URL carries the `fm` capability credential.
+- **Credentials in output**: the URL `sumi-local start` prints, and the
+  service's own startup lines in `sumi-local logs` (`log/service.log`),
+  contain the live `fm=`/`core_` capability tokens — that is the only auth
+  the loopback surface has. Treat those outputs like a password.
+  `status`/`doctor` themselves never print secret values.
 - `config.env` is mode 0600 and lives under a 0700 state home.
-- `status`/`doctor` never print secret values.
+- Before signaling a pidfile's process, `stop`/`uninstall` verify both the
+  recorded `/proc` start-time and an absolute-path cmdline match anchored
+  on this install's prefix — a stale or foreign pidfile can't get another
+  install's process killed.
 
 ## Distribution
 

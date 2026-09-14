@@ -1,21 +1,28 @@
 # Managed PostgreSQL for `sumi-local` installs that do not supply their own
-# SUMI_DB_URL. Loopback-only; the named volume holds the secretary's entire
-# authored state and survives `sumi-local uninstall` (removed only by
-# `uninstall --purge`). The container itself is a disposable executable —
-# reinstalling recreates it against the same volume.
+# SUMI_DB_URL. Loopback-only. All names are REQUIRED env vars — the launcher
+# supplies per-install values derived from SUMI_LOCAL_ID, and every compose
+# call runs under `docker compose -p sumi-local-<id>`, so two installs never
+# share a container, volume, or port. The volume holds the secretary's
+# entire authored state; it survives `uninstall` and is deleted only by
+# `uninstall --purge` after a project-label ownership check.
 #
 # Not a shared system service: `restart: "no"`, started and stopped by
 # `sumi-local start` / `stop`.
+#
+# The host port is ephemeral by default (127.0.0.1:0 → docker-assigned) so
+# two managed installs can run simultaneously; `sumi-local` resolves the
+# bound port via `docker compose port postgres 5432` at each start. Pin a
+# fixed port only if you know it is free for this install's lifetime.
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: ${SUMI_LOCAL_PG_CONTAINER:-sumi-local-pg}
+    container_name: ${SUMI_LOCAL_PG_CONTAINER:?set SUMI_LOCAL_PG_CONTAINER}
     environment:
       POSTGRES_USER: sumi
       POSTGRES_PASSWORD: ${SUMI_LOCAL_PG_PASSWORD:?set SUMI_LOCAL_PG_PASSWORD}
       POSTGRES_DB: sumi
     ports:
-      - "${SUMI_LOCAL_PG_LISTEN:-127.0.0.1:55439}:5432"
+      - "${SUMI_LOCAL_PG_LISTEN:-127.0.0.1:0}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -28,4 +35,4 @@ services:
 
 volumes:
   pgdata:
-    name: ${SUMI_LOCAL_PG_VOLUME:-sumi-local-pgdata}
+    name: ${SUMI_LOCAL_PG_VOLUME:?set SUMI_LOCAL_PG_VOLUME}

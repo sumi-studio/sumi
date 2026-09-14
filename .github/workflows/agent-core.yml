@@ -78,9 +78,17 @@ jobs:
         run: |
           bash -n deploy/local-host/sumi-local
           bash -n deploy/local-host/self-test.sh
+          bash -n deploy/local-host/self-test-ownership.sh
 
       - name: Run local-host install/launcher self-test
         run: bash deploy/local-host/self-test.sh
+
+      # Two managed installs side by side on real Docker: distinct volumes/
+      # containers/ports, cross-install purge isolation, orphan refusal,
+      # foreign-pid safety, unowned-path uninstall refusal. Self-skips when
+      # docker compose is unavailable.
+      - name: Run local-host ownership self-test (managed PG)
+        run: bash deploy/local-host/self-test-ownership.sh "${{ runner.temp }}"
 
       # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
       # real model calls or secrets, no Cloudflare deployment, no remote

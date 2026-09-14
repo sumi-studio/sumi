@@ -79,10 +79,27 @@ readonly OVERRIDABLE=(
   SUMI_LOCAL_EXTRA_HOSTS
 )
 
+# Process lifecycle safety requires /proc (Linux): pid identity is verified
+# against /proc/<pid>/stat start-time and cmdline before any signal. Other
+# platforms fail clearly rather than silently doing unreliable lifecycle ops.
+require_proc() {
+  [[ -f /proc/self/stat ]] \
+    || die "$PROG requires Linux /proc for process identity — unsupported platform"
+}
+
+# Canonicalize a path for identity purposes (resolves ~, .., symlinks).
+canon() { realpath -m "$1"; }
+
+# Stable per-installation id: derives from the canonical state-home path at
+# first install and is then recorded in config.env forever. Managed docker
+# resources (project/container/volume) are named after it, which is what
+# keeps two installs' data isolated.
+install_id() { printf 'sl%s' "$(printf '%s' "$1" | sha256sum | cut -c1-10)"; }
+
 HOME_DIR= PREFIX= CONFIG=
 load_config() {
-  HOME_DIR="$(sumi_home)"
-  PREFIX="$(sumi_prefix)"
+  HOME_DIR="$(canon "$(sumi_home)")"
+  PREFIX="$(canon "$(sumi_prefix)")"
   CONFIG="$HOME_DIR/config.env"
   [[ -f $CONFIG ]] || return 1
   local k
@@ -95,6 +112,7 @@ load_config() {
   source "$CONFIG"
   set +a
   for k in "${saved[@]}"; do export "${k?}"; done
+  : "${SUMI_LOCAL_ID:?config missing SUMI_LOCAL_ID}"
   : "${SUMI_LOCAL_LISTEN:?config missing SUMI_LOCAL_LISTEN}"
   : "${SUMI_LOCAL_DB_MODE:?config missing SUMI_LOCAL_DB_MODE}"
   : "${SUMI_CORE_STATE_TOKEN:?config missing SUMI_CORE_STATE_TOKEN}"
@@ -103,10 +121,13 @@ load_config() {
   : "${SUMI_MODEL_PROVIDER:=mock}"
   if [[ $SUMI_LOCAL_DB_MODE == managed ]]; then
     : "${SUMI_LOCAL_PG_CONTAINER:?config missing SUMI_LOCAL_PG_CONTAINER}"
-    : "${SUMI_LOCAL_PG_LISTEN:?config missing SUMI_LOCAL_PG_LISTEN}"
     : "${SUMI_LOCAL_PG_VOLUME:?config missing SUMI_LOCAL_PG_VOLUME}"
     : "${SUMI_LOCAL_PG_PASSWORD:?config missing SUMI_LOCAL_PG_PASSWORD}"
-    SUMI_DB_URL="postgres://sumi:${SUMI_LOCAL_PG_PASSWORD}@${SUMI_LOCAL_PG_LISTEN}/sumi?sslmode=disable"
+    : "${SUMI_LOCAL_PG_LISTEN:=127.0.0.1:0}"
+    SUMI_LOCAL_PG_PROJECT="sumi-local-$SUMI_LOCAL_ID"
+    # SUMI_DB_URL is resolved after the container is up — the host port is
+    # docker-assigned and can change between starts (managed_db_url).
+    SUMI_DB_URL=
   else
     : "${SUMI_DB_URL:?config missing SUMI_DB_URL}"
   fi
@@ -148,12 +169,32 @@ json_get() {
     });' "$1"
 }
 
-pid_alive() { # pidfile cmdline-substring
-  local f=$1 pat=$2 pid
+# --- pid identity -----------------------------------------------------------
+# Pidfiles record "<pid> <starttime>" — starttime is /proc/<pid>/stat field
+# 22, which makes a reused pid detectable instead of merely plausible. The
+# cmdline match is anchored on this install's absolute paths, so another
+# install's process (or a dev run of the same source) never qualifies.
+
+proc_starttime() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+
+write_pid() { # pidfile pid
+  local st
+  st="$(proc_starttime "$2")"
+  [[ -n $st ]] || return 1
+  printf '%s %s\n' "$2" "$st" >"$1"
+}
+
+pid_num() { awk '{print $1}' "$1" 2>/dev/null; }
+
+pid_alive() { # pidfile absolute-cmdline-substring
+  local f=$1 pat=$2 pid st
   [[ -f $f ]] || return 1
-  pid="$(cat "$f")"
+  read -r pid st <"$f" || return 1
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   [[ -d /proc/$pid ]] || return 1
+  # recorded start-time must still match — a stale pidfile left after a
+  # crash points at whatever process later reused the number
+  [[ -n $st && $(proc_starttime "$pid") == "$st" ]] || return 1
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$pat"
 }
 
@@ -199,7 +240,7 @@ persona_state() { # prints persona state JSON or fails
 # already exited (bad provider config, missing payload).
 wait_lease() { # holder_id pidfile seconds
   local deadline=$((SECONDS + $3)) st holder pid
-  pid="$(cat "$2" 2>/dev/null || echo 0)"
+  pid="$(pid_num "$2")"; pid=${pid:-0}
   while ((SECONDS < deadline)); do
     [[ -d /proc/$pid ]] || return 1
     st="$(persona_state 2>/dev/null)" || { sleep 0.5; continue; }
@@ -210,14 +251,15 @@ wait_lease() { # holder_id pidfile seconds
   return 1
 }
 
-kill_pid() { # pidfile grace-seconds cmdline-substring — TERM, then KILL
-  local f=$1 grace=$2 pat=${3:-} pid deadline
+kill_pid() { # pidfile grace-seconds absolute-cmdline-substring — TERM, then KILL
+  local f=$1 grace=$2 pat=$3 pid st deadline
   [[ -f $f ]] || return 0
-  pid="$(cat "$f")"
+  read -r pid st <"$f" || return 0
   rm -f "$f"
   [[ $pid =~ ^[0-9]+$ && -d /proc/$pid ]] || return 0
-  if [[ -n $pat ]] && ! tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$pat"; then
-    info "pid $pid no longer belongs to this install (stale pid file) — leaving it alone"
+  if { [[ -n $st ]] && [[ $(proc_starttime "$pid") != "$st" ]]; } \
+     || ! tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$pat"; then
+    info "pid $pid is not this install's process (stale or foreign pidfile) — leaving it alone"
     return 0
   fi
   kill -TERM "$pid" 2>/dev/null || true
@@ -261,9 +303,9 @@ cmd_install() {
   check_listen || die "invalid --listen"
   [[ -z $mprovider || $mprovider == mock || $mprovider == openai ]] \
     || die "--model-provider must be mock or openai (got '$mprovider')"
-  home="${home:-$(sumi_home)}"
-  prefix="${prefix:-$(sumi_prefix)}"
-  mkdir -p "$prefix/bin" "$home/run" "$home/log" "$home/workspace"
+  home="$(canon "${home:-$(sumi_home)}")"
+  prefix="$(canon "${prefix:-$(sumi_prefix)}")"
+  mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
 
   # --- payloads -------------------------------------------------------------
@@ -272,7 +314,7 @@ cmd_install() {
     rm -rf "$prefix/core"; cp -r "$PACK_ROOT/core" "$prefix/core"
     cp "$PACK_ROOT/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$PACK_ROOT/config.example.env" "$prefix/config.example.env"
-    cp "$PACK_ROOT/docs/local-host.md" "$prefix/local-host.md" 2>/dev/null || true
+    cp "$PACK_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
     [[ -f $PACK_ROOT/VERSION ]] && cp "$PACK_ROOT/VERSION" "$prefix/VERSION"
     info "installed payloads from pack at $PACK_ROOT"
   elif [[ -n $REPO_ROOT ]]; then
@@ -283,18 +325,23 @@ cmd_install() {
     cp -r "$REPO_ROOT/apps/core/src/." "$prefix/core/"
     cp "$SCRIPT_DIR/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$SCRIPT_DIR/config.example.env" "$prefix/config.example.env"
+    cp "$REPO_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
     (cd "$REPO_ROOT" && { git rev-parse HEAD 2>/dev/null || echo source; } | sed 's/^/source /' >"$prefix/VERSION")
     info "built payloads from $REPO_ROOT"
-  elif [[ -n $PREFIX_DIR && $PREFIX_DIR == "$prefix" ]]; then
+  elif [[ -n $PREFIX_DIR && $(canon "$PREFIX_DIR") == "$prefix" ]]; then
     info "payloads already installed in $prefix"
   else
     die "cannot locate payloads — run from a source checkout or an extracted pack"
   fi
   chmod +x "$prefix/bin/sumi-local-service"
 
-  # this script itself is the CLI payload
-  cp "$SCRIPT_PATH" "$prefix/bin/sumi-local"
-  chmod +x "$prefix/bin/sumi-local"
+  # this script itself is the CLI payload (skip when we already are it)
+  local self_dst
+  self_dst="$(canon "$prefix/bin/sumi-local")"
+  if [[ $SCRIPT_PATH != "$self_dst" ]]; then
+    cp "$SCRIPT_PATH" "$prefix/bin/sumi-local"
+    chmod +x "$prefix/bin/sumi-local"
+  fi
   mkdir -p "$HOME/.local/bin"
   ln -sf "$prefix/bin/sumi-local" "$HOME/.local/bin/sumi-local"
 
@@ -306,9 +353,10 @@ cmd_install() {
       info "note: install options affecting identity/database/model were ignored; edit $cfg to change them"
     fi
   else
-    local token persona
+    local token persona iid
     token="$(openssl rand -hex 32)" || die "openssl required to generate the state secret"
     persona="$(uuidv7)" || die "node required to generate the persona id"
+    iid="$(install_id "$home")"
     if [[ -n $db_url ]]; then
       mode=external
     elif command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
@@ -318,18 +366,31 @@ cmd_install() {
     else
       die "no database configured: pass --db-url postgres://… or install Docker for --managed-pg"
     fi
+    if [[ $mode == managed ]]; then
+      # A volume/container named for this install id must never be adopted:
+      # it holds an earlier install's database and POSTGRES_PASSWORD would
+      # not re-initialize it — adopting it would wedge this install, and a
+      # later purge would delete that install's data.
+      if docker volume inspect "sumi-local-pgdata-$iid" >/dev/null 2>&1 \
+         || docker inspect "sumi-local-pg-$iid" >/dev/null 2>&1; then
+        die "docker resources 'sumi-local-pg-$iid' / 'sumi-local-pgdata-$iid' already exist — a previous install at this home left them behind after its config.env was removed. Refusing to adopt: restore the old config.env to keep that secretary's data, or remove the volume yourself (docker volume rm sumi-local-pgdata-$iid) for a fresh install here"
+      fi
+    fi
     {
       printf '# sumi-local configuration — generated %s\n' "$(date -u +%FT%TZ)"
       printf '# Credentials live here: state admin secret, model key, DB password.\n'
       printf '# Kept mode 0600; do not share or commit this file.\n\n'
+      printf '# Installation id — names the managed docker resources; stable for\n'
+      printf '# the lifetime of this install.\n'
+      printf 'SUMI_LOCAL_ID=%s\n\n' "$(shq "$iid")"
       printf 'SUMI_LOCAL_LISTEN=%s\n' "$(shq "${listen:-127.0.0.1:8470}")"
       printf 'SUMI_LOCAL_DB_MODE=%s\n\n' "$(shq "$mode")"
       if [[ $mode == external ]]; then
         printf 'SUMI_DB_URL=%s\n\n' "$(shq "$db_url")"
       else
-        printf 'SUMI_LOCAL_PG_CONTAINER=%s\n' "$(shq "sumi-local-pg")"
-        printf 'SUMI_LOCAL_PG_LISTEN=%s\n' "$(shq "127.0.0.1:55439")"
-        printf 'SUMI_LOCAL_PG_VOLUME=%s\n' "$(shq "sumi-local-pgdata")"
+        printf 'SUMI_LOCAL_PG_CONTAINER=%s\n' "$(shq "sumi-local-pg-$iid")"
+        printf 'SUMI_LOCAL_PG_LISTEN=%s\n' "$(shq "127.0.0.1:0")"
+        printf 'SUMI_LOCAL_PG_VOLUME=%s\n' "$(shq "sumi-local-pgdata-$iid")"
         printf 'SUMI_LOCAL_PG_PASSWORD=%s\n\n' "$(shq "$(openssl rand -hex 24)")"
       fi
       printf 'SUMI_CORE_STATE_TOKEN=%s\n' "$(shq "$token")"
@@ -344,7 +405,7 @@ cmd_install() {
       true
     } >"$cfg"
     chmod 600 "$cfg"
-    info "wrote $cfg (persona $persona)"
+    info "wrote $cfg (persona $persona, install $iid)"
   fi
 
   cat <<EOF
@@ -354,27 +415,98 @@ cmd_install() {
   CLI         : $HOME/.local/bin/sumi-local -> $prefix/bin/sumi-local
 Next: edit $cfg for your model connection, then: $PROG start
 EOF
+  # Non-default paths are not discoverable by later invocations — print the
+  # exact environment needed to drive this install.
+  local def_home def_prefix
+  def_home="$(canon "${XDG_STATE_HOME:-$HOME/.local/state}/sumi/local")"
+  def_prefix="$(canon "$HOME/.local/lib/sumi-local")"
+  if [[ $home != "$def_home" || $prefix != "$def_prefix" ]]; then
+    cat <<EOF
+  non-default paths — every later command for THIS install needs:
+    export SUMI_LOCAL_HOME=$(shq "$home")
+    export SUMI_LOCAL_PREFIX=$(shq "$prefix")
+EOF
+  fi
 }
 
 # --------------------------------------------------------------------------
 # start / stop
 # --------------------------------------------------------------------------
 compose_file() {
-  [[ -f $PREFIX/compose.pg.yaml ]] || die "missing $PREFIX/compose.pg.yaml — reinstall"
-  printf '%s' "$PREFIX/compose.pg.yaml"
+  # The compose file may outlive the prefix: `uninstall --purge` still has
+  # to tear down managed resources after executables were already removed,
+  # so fall back to the file next to the running script.
+  local c
+  for c in "$PREFIX/compose.pg.yaml" "$SCRIPT_DIR/compose.pg.yaml" \
+           "$SCRIPT_DIR/../compose.pg.yaml" "${PACK_ROOT:+$PACK_ROOT/compose.pg.yaml}"; do
+    [[ -n $c && -f $c ]] && { printf '%s' "$c"; return; }
+  done
+  die "compose.pg.yaml not found under $PREFIX or $SCRIPT_DIR — reinstall"
 }
 
+# All compose calls run under this install's own project name — docker
+# objects therefore carry label com.docker.compose.project=sumi-local-<id>
+# and compose never touches another install's resources.
+pg_compose() { docker compose -p "$SUMI_LOCAL_PG_PROJECT" -f "$(compose_file)" "$@"; }
+
 pg_up() {
-  docker compose -f "$(compose_file)" up -d postgres >/dev/null
-  local deadline=$((SECONDS + 60))
+  pg_compose up -d postgres >/dev/null
+  local deadline=$((SECONDS + 90)) addr=""
   while ((SECONDS < deadline)); do
-    docker exec "$SUMI_LOCAL_PG_CONTAINER" pg_isready -U sumi -d sumi >/dev/null 2>&1 && return 0
+    if docker exec "$SUMI_LOCAL_PG_CONTAINER" pg_isready -U sumi -d sumi >/dev/null 2>&1; then
+      # isready inside the container uses the unix socket, which the entry
+      # point's initdb temp server also answers — the published TCP port can
+      # still be refusing. Require a real startup handshake through it.
+      addr="$(pg_compose port postgres 5432 2>/dev/null || true)"
+      [[ -n $addr ]] && pg_tcp_ready "$addr" && return 0
+    fi
     sleep 0.5
   done
   die "managed postgres did not become ready — see: docker logs $SUMI_LOCAL_PG_CONTAINER"
 }
 
-pg_down() { docker compose -f "$(compose_file)" stop >/dev/null 2>&1 || true; }
+# Send a PG StartupMessage to the published addr (host:port) and require an
+# 'R' auth-request byte back — proves the TCP path serves postgres, which a
+# bare connect cannot (docker-proxy accepts then resets).
+pg_tcp_ready() {
+  node -e '
+    const net = require("net");
+    const [h, p] = process.argv[1].split(":");
+    const body = Buffer.from("user\0sumi\0database\0sumi\0\0");
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(8 + body.length); head.writeUInt32BE(196608, 4);
+    const s = net.connect(+p, h);
+    s.setTimeout(2000);
+    s.on("connect", () => s.end(Buffer.concat([head, body])));
+    s.on("data", d => process.exit(d[0] === 0x52 ? 0 : 1));
+    s.on("timeout", () => { s.destroy(); process.exit(1); });
+    s.on("error", () => process.exit(1));
+  ' "$1"
+}
+
+pg_down() { pg_compose stop >/dev/null 2>&1 || true; }
+
+# The managed PG host port is docker-assigned (127.0.0.1:0) so two installs
+# never collide on it — resolve it fresh once the container is up.
+managed_db_url() {
+  local addr
+  addr="$(pg_compose port postgres 5432 2>/dev/null || true)"
+  [[ -n $addr ]] || die "cannot resolve managed postgres port — is the container up?"
+  printf 'postgres://sumi:%s@%s/sumi?sslmode=disable' "$SUMI_LOCAL_PG_PASSWORD" "$addr"
+}
+
+# Ownership checks for managed docker objects: only delete what carries
+# this install's compose-project label.
+owned_volume() {
+  [[ $(docker volume inspect "$1" \
+      --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null) \
+     == "$SUMI_LOCAL_PG_PROJECT" ]]
+}
+owned_container() {
+  [[ $(docker inspect "$1" \
+      --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null) \
+     == "$SUMI_LOCAL_PG_PROJECT" ]]
+}
 
 db_probe() { # external mode: TCP-connect the DB host:port
   local hp
@@ -411,23 +543,37 @@ cmd_start() {
   load_config || die "not installed — run: $PROG install"
   check_listen || die "refusing to start"
   require_installed
+  require_proc
   lock
   mkdir -p "$(RUN_DIR)" "$(LOG_DIR)"
 
-  if [[ $SUMI_LOCAL_DB_MODE == managed ]]; then pg_up; else
+  if [[ $SUMI_LOCAL_DB_MODE == managed ]]; then
+    pg_up
+    SUMI_DB_URL="$(managed_db_url)"
+  else
     db_probe || die "database unreachable — fix SUMI_DB_URL in $CONFIG"
   fi
 
   # --- state service -------------------------------------------------------
-  if pid_alive "$(RUN_DIR)/service.pid" sumi-local-service; then
-    if svc_health; then
-      info "state service already running (pid $(cat "$(RUN_DIR)/service.pid"))"
+  # The service gets its DB URL once at spawn. A managed container publishes
+  # a NEW ephemeral port on every restart, so a service that outlived its
+  # postgres (container bounced outside `stop`, or a pidfile that pointed
+  # elsewhere) holds a dead address forever — compare and restart it.
+  local db_url_file; db_url_file="$(RUN_DIR)/db-url"
+  local live_url=""; [[ -f $db_url_file ]] && live_url="$(cat "$db_url_file")"
+  if pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
+    if [[ $live_url == "$SUMI_DB_URL" ]] && svc_health; then
+      info "state service already running (pid $(pid_num "$(RUN_DIR)/service.pid"))"
     else
-      info "state service pid alive but unhealthy — restarting it"
-      kill_pid "$(RUN_DIR)/service.pid" 10 sumi-local-service
+      if [[ $live_url != "$SUMI_DB_URL" ]]; then
+        info "database endpoint changed — restarting state service"
+      else
+        info "state service pid alive but unhealthy — restarting it"
+      fi
+      kill_pid "$(RUN_DIR)/service.pid" 10 "$(SERVICE_BIN)"
     fi
   fi
-  if ! pid_alive "$(RUN_DIR)/service.pid" sumi-local-service; then
+  if ! pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
     rm -f "$(RUN_DIR)/service.pid"
     if port_busy; then
       die "$(base_url) is occupied by a process this install did not start — refusing to adopt or kill it"
@@ -443,16 +589,25 @@ cmd_start() {
         "SUMI_FM_PERSONA_NAME=$SUMI_PERSONA_NAME" \
         "$(SERVICE_BIN)"
     ) >>"$(LOG_DIR)/service.log" 2>&1 &
-    echo $! >"$(RUN_DIR)/service.pid"
+    write_pid "$(RUN_DIR)/service.pid" "$!" \
+      || die "could not record service pid identity"
     if ! wait_health 30; then
-      rm -f "$(RUN_DIR)/service.pid"
+      kill_pid "$(RUN_DIR)/service.pid" 5 "$(SERVICE_BIN)"
       die "state service failed to become healthy — see $(LOG_DIR)/service.log"
     fi
+    printf '%s' "$SUMI_DB_URL" >"$db_url_file"
   fi
 
   # Verify the derived persona token actually authorizes before trusting it
-  # to the core host.
-  persona_state >/dev/null \
+  # to the core host. Retry briefly: right after a managed-PG restart the
+  # service can answer 5xx while its pool reconnects — that is transient,
+  # not an auth failure.
+  local authed=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    persona_state >/dev/null 2>&1 && { authed=1; break; }
+    sleep 0.5
+  done
+  ((authed)) \
     || die "persona token rejected by the state service — check SUMI_CORE_STATE_TOKEN / SUMI_PERSONA_ID consistency in $CONFIG"
 
   # --- secretary core (plus any extra hosts that have landed on main) ------
@@ -466,18 +621,18 @@ cmd_start() {
     [[ -f $PREFIX/core/host/$h ]] \
       || die "extra host $h not present in $PREFIX/core/host — it lands with a future core update"
     pid_file="$(RUN_DIR)/${h%.ts}.pid"
-    if pid_alive "$pid_file" "core/host/$h"; then
-      info "$h already running (pid $(cat "$pid_file"))"
+    if pid_alive "$pid_file" "$PREFIX/core/host/$h"; then
+      info "$h already running (pid $(pid_num "$pid_file"))"
       continue
     fi
     rm -f "$pid_file"
     info "starting core host $h…"
     (exec 9>&-; exec nohup env "${cenv[@]}" node "$PREFIX/core/host/$h") >>"$(LOG_DIR)/${h%.ts}.log" 2>&1 &
-    echo $! >"$pid_file"
+    write_pid "$pid_file" "$!" || die "could not record core pid identity"
   done
 
   local holder corepid
-  corepid="$(cat "$(RUN_DIR)/local.pid" 2>/dev/null || true)"
+  corepid="$(pid_num "$(RUN_DIR)/local.pid")"
   [[ -n $corepid ]] || die "secretary core was not started — see $(LOG_DIR)/local.log"
   holder="local-$corepid"
   if ! wait_lease "$holder" "$(RUN_DIR)/local.pid" 45; then
@@ -488,24 +643,27 @@ cmd_start() {
 
   cat <<EOF
 [$PROG] running.
-  service   : $(base_url)  (pid $(cat "$(RUN_DIR)/service.pid"))
-  secretary : pid $(cat "$(RUN_DIR)/local.pid"), persona $SUMI_PERSONA_ID, provider $SUMI_MODEL_PROVIDER
+  service   : $(base_url)  (pid $(pid_num "$(RUN_DIR)/service.pid"))
+  secretary : pid $(pid_num "$(RUN_DIR)/local.pid"), persona $SUMI_PERSONA_ID, provider $SUMI_MODEL_PROVIDER
   browser   : $(base_url)/?persona=$SUMI_PERSONA_ID&fm=$(fm_token)
+              (this URL carries the local access credential — treat it like a password)
   chat      : $PROG say --wait 60 "hello"
 EOF
 }
 
-# The cmdline substring a pid file's process must still match before we
-# signal it — protects an unrelated process that reused a stale pid.
-pid_pat() { # pidfile-path → cmdline substring
+# The absolute cmdline substring a pidfile's process must still match before
+# we signal it — anchored on this install's prefix, so a foreign install's
+# or a dev checkout's process never qualifies.
+pid_pat() { # pidfile-path → absolute cmdline substring
   case "$(basename "$1" .pid)" in
-    service) printf 'sumi-local-service';;
-    *) printf 'core/host/%s.ts' "$(basename "$1" .pid)";;
+    service) printf '%s/bin/sumi-local-service' "$PREFIX";;
+    *) printf '%s/core/host/%s.ts' "$PREFIX" "$(basename "$1" .pid)";;
   esac
 }
 
 cmd_stop() {
   load_config || die "not installed — nothing to stop"
+  require_proc
   lock
   local f
   for f in "$(RUN_DIR)"/*.pid; do
@@ -515,7 +673,7 @@ cmd_stop() {
     kill_pid "$f" 15 "$(pid_pat "$f")"
   done
   info "stopping state service…"
-  kill_pid "$(RUN_DIR)/service.pid" 10 sumi-local-service
+  kill_pid "$(RUN_DIR)/service.pid" 10 "$(SERVICE_BIN)"
   [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]] && pg_down
   info "stopped. State remains in $HOME_DIR and the database."
 }
@@ -525,11 +683,12 @@ cmd_status() {
     info "not installed — run: $PROG install"
     exit 1
   fi
+  require_proc
   local rc=0 svc core st="" holder=""
   if svc_health; then
     svc="healthy"
-    pid_alive "$(RUN_DIR)/service.pid" sumi-local-service \
-      && svc+=" (pid $(cat "$(RUN_DIR)/service.pid"))" \
+    pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)" \
+      && svc+=" (pid $(pid_num "$(RUN_DIR)/service.pid"))" \
       || { svc+=" — served by a process this install did not start"; rc=2; }
   else
     svc="down"; rc=1
@@ -538,8 +697,8 @@ cmd_status() {
     st="$(persona_state 2>/dev/null || true)"
     [[ -n $st ]] && holder="$(printf '%s' "$st" | json_get lease.holder_id)"
   fi
-  if pid_alive "$(RUN_DIR)/local.pid" "core/host/local.ts"; then
-    core="running (pid $(cat "$(RUN_DIR)/local.pid"))"
+  if pid_alive "$(RUN_DIR)/local.pid" "$PREFIX/core/host/local.ts"; then
+    core="running (pid $(pid_num "$(RUN_DIR)/local.pid"))"
     if [[ -n $holder ]]; then
       core+=", lease generation $(printf '%s' "$st" | json_get lease.generation)"
     else
@@ -550,7 +709,9 @@ cmd_status() {
   fi
   local dbref
   if [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]]; then
-    dbref="managed container $SUMI_LOCAL_PG_CONTAINER ($SUMI_LOCAL_PG_LISTEN)"
+    local pgaddr
+    pgaddr="$(pg_compose port postgres 5432 2>/dev/null || true)"
+    dbref="managed container $SUMI_LOCAL_PG_CONTAINER${pgaddr:+ ($pgaddr)}"
   else
     dbref="external $(printf '%s' "$SUMI_DB_URL" | sed -E 's#^(postgres[^:]*://)[^@]*@#\1…@#')"
   fi
@@ -655,9 +816,11 @@ cmd_doctor() {
   ok() { printf '  ok    %s\n' "$1"; }
   bad() { printf '  FAIL  %s\n' "$1"; fail=1; }
   local t
-  for t in curl openssl flock node tar; do
+  for t in curl openssl flock node tar realpath; do
     command -v "$t" >/dev/null && ok "$t" || bad "$t missing"
   done
+  [[ -r /proc/self/stat ]] && ok "procfs (process identity checks)" \
+    || bad "no /proc — lifecycle commands require Linux"
   if node -e 'process.exit(process.features.typescript?0:1)' 2>/dev/null; then
     ok "node $(node -v) runs TypeScript directly"
   else
@@ -713,7 +876,8 @@ cmd_pack() {
     cp -r "$from/core/." "$stage/sumi-local/core/"
     cp "$from/compose.pg.yaml" "$stage/sumi-local/" 2>/dev/null || true
     cp "$from/config.example.env" "$stage/sumi-local/" 2>/dev/null || true
-    cp "$from/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null || true
+    cp "$from/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null \
+      || cp "$from/local-host.md" "$stage/sumi-local/docs/local-host.md" 2>/dev/null || true
     [[ -f $from/VERSION ]] && cp "$from/VERSION" "$stage/sumi-local/VERSION"
   fi
   tar -czf "$out" -C "$stage" sumi-local
@@ -732,16 +896,34 @@ cmd_uninstall() {
       *) die "unknown uninstall option: $1";;
     esac
   done
-  HOME_DIR="$(sumi_home)"; PREFIX="$(sumi_prefix)"; CONFIG="$HOME_DIR/config.env"
+  HOME_DIR="$(canon "$(sumi_home)")"; PREFIX="$(canon "$(sumi_prefix)")"
+  CONFIG="$HOME_DIR/config.env"
+  require_proc
   local have_config=0
   load_config && have_config=1 || true
+  if ((purge)) && [[ -d $HOME_DIR ]]; then
+    # verify BEFORE lock() — lock creates $HOME_DIR/run, which would then
+    # satisfy this very check. A mistaken SUMI_LOCAL_HOME must never rm -rf
+    # an unrelated directory.
+    [[ -f $CONFIG || -d $HOME_DIR/run || -d $HOME_DIR/log || -d $HOME_DIR/workspace ]] \
+      || die "refusing to purge $HOME_DIR — it does not look like a $PROG state home (check SUMI_LOCAL_HOME)"
+    [[ $HOME_DIR != / && $HOME_DIR != "$HOME" ]] \
+      || die "refusing to purge $HOME_DIR — not a $PROG state home"
+  fi
   lock
   local f
   for f in "$(RUN_DIR)"/*.pid; do
     [[ -f $f ]] && kill_pid "$f" 10 "$(pid_pat "$f")"
   done
   if ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]]; then
-    docker compose -f "$(compose_file)" rm -sf postgres >/dev/null 2>&1 || true
+    # remove only this install's container; the volume (the data) stays
+    if docker inspect "$SUMI_LOCAL_PG_CONTAINER" >/dev/null 2>&1; then
+      if owned_container "$SUMI_LOCAL_PG_CONTAINER"; then
+        pg_compose rm -sf postgres >/dev/null 2>&1 || true
+      else
+        info "container $SUMI_LOCAL_PG_CONTAINER is not labeled for this install — leaving it"
+      fi
+    fi
   fi
   if ((purge)); then
     local -a doomed=("$HOME_DIR")
@@ -756,15 +938,31 @@ cmd_uninstall() {
       local ans; read -r ans
       [[ $ans == purge ]] || die "aborted"
     fi
-    ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]] \
-      && docker compose -f "$(compose_file)" down -v >/dev/null 2>&1
+    if ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]]; then
+      # the volume holds the secretary's whole authored history — delete it
+      # only when docker itself attributes it to this install's project
+      if docker volume inspect "$SUMI_LOCAL_PG_VOLUME" >/dev/null 2>&1 \
+         && ! owned_volume "$SUMI_LOCAL_PG_VOLUME"; then
+        die "volume $SUMI_LOCAL_PG_VOLUME exists but is not labeled for project $SUMI_LOCAL_PG_PROJECT — refusing to delete another install's data"
+      fi
+      pg_compose down -v >/dev/null 2>&1 \
+        || info "warning: 'compose down -v' failed — docker resources for project $SUMI_LOCAL_PG_PROJECT may remain"
+    fi
     rm -rf "$HOME_DIR"
     info "purged state home and managed data"
   elif [[ -d $HOME_DIR ]]; then
     info "kept state home $HOME_DIR (identity, history, secrets)"
     info "to delete the data too: $PROG uninstall --purge"
   fi
-  rm -rf "$PREFIX"
+  if [[ -e $PREFIX ]]; then
+    # verify this is an actual sumi-local install before rm -rf — a bad
+    # SUMI_LOCAL_PREFIX must not delete an unrelated directory
+    [[ -f $PREFIX/bin/sumi-local-service || -f $PREFIX/bin/sumi-local ]] \
+      || die "refusing to remove $PREFIX — missing bin/sumi-local-service marker (check SUMI_LOCAL_PREFIX)"
+    [[ $PREFIX != / && $PREFIX != "$HOME" ]] \
+      || die "refusing to remove $PREFIX — not a $PROG install root"
+    rm -rf "$PREFIX"
+  fi
   local shim="$HOME/.local/bin/sumi-local"
   [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/sumi-local" ]] && rm -f "$shim"
   info "removed executables at $PREFIX"

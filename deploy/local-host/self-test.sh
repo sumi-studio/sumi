@@ -191,7 +191,7 @@ ok "identity and history persisted across stop/start"
 step "SIGKILL mid-turn → recovery, exactly-once completion"
 "$BIN" say --id fixture-kill '!slow 6000 kill-recovery-check' >/dev/null
 sleep 1.5
-COREPID="$(cat "$T_HOME/run/local.pid")"
+COREPID="$(awk '{print $1}' "$T_HOME/run/local.pid")"
 kill -9 "$COREPID"
 ok "killed core pid $COREPID mid-turn"
 "$BIN" start || fail "start after kill failed"   # waits out the dead holder's lease
