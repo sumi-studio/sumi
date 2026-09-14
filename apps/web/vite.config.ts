@@ -83,6 +83,7 @@ export function createDevServerConfig(
       "/workspace-invites": apiProxy(target.origin),
       "/apps": apiProxy(target.origin),
       "/app-installations": apiProxy(target.origin),
+      "/me/approvals": apiProxy(target.origin),
     },
   };
 }
