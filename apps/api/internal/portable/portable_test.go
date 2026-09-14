@@ -1262,50 +1262,56 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 // check refuses the move. The share-locked persona row makes the two
 // transactions serialize — no job can slip between the check and the commit.
 func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
-	ctx := context.Background()
+	// Each iteration gets its own placement, but as a subtest: a finished
+	// iteration's pool and database are dropped at once instead of twenty-
+	// four of them accumulating against the shared Postgres until the whole
+	// test cleans up.
 	for i := 0; i < 24; i++ {
-		local := newPlacement(t)
-		pid := newID(t)
-		liveSecretary(t, local, pid)
-		jobReq := map[string]any{"command": []any{"echo", "hi"}}
-		jobID := fmt.Sprintf("j-race-%d", i)
-		destination := newID(t)
+		t.Run(fmt.Sprintf("race-%d", i), func(t *testing.T) {
+			ctx := context.Background()
+			local := newPlacement(t)
+			pid := newID(t)
+			liveSecretary(t, local, pid)
+			jobReq := map[string]any{"command": []any{"echo", "hi"}}
+			jobID := fmt.Sprintf("j-race-%d", i)
+			destination := newID(t)
 
-		submitErr := make(chan error, 1)
-		go func() {
-			_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
-			submitErr <- err
-		}()
-		sealErr := make(chan error, 1)
-		go func() {
-			_, err := local.svc.Seal(ctx, pid, "move-race", destination)
-			sealErr <- err
-		}()
-		sErr, jErr := <-sealErr, <-submitErr
+			submitErr := make(chan error, 1)
+			go func() {
+				_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
+				submitErr <- err
+			}()
+			sealErr := make(chan error, 1)
+			go func() {
+				_, err := local.svc.Seal(ctx, pid, "move-race", destination)
+				sealErr <- err
+			}()
+			sErr, jErr := <-sealErr, <-submitErr
 
-		var queued bool
-		if err := local.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
-			pid, jobID).Scan(&queued); err != nil {
-			t.Fatal(err)
-		}
-		switch {
-		case sErr == nil && jErr == nil && queued:
-			t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
-		case sErr == nil:
-			if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
-				t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+			var queued bool
+			if err := local.pool.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
+				pid, jobID).Scan(&queued); err != nil {
+				t.Fatal(err)
 			}
-			if queued {
-				t.Fatalf("race %d: refused submit left a job row", i)
+			switch {
+			case sErr == nil && jErr == nil && queued:
+				t.Fatalf("seal committed yet the job it checked for was queued")
+			case sErr == nil:
+				if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
+					t.Fatalf("submit after seal committed: %v, want persona inactive", jErr)
+				}
+				if queued {
+					t.Fatalf("refused submit left a job row")
+				}
+			case errors.Is(sErr, ErrUnresolvedOperations):
+				if jErr != nil || !queued {
+					t.Fatalf("seal refused for the job but submit err=%v queued=%v", jErr, queued)
+				}
+			default:
+				t.Fatalf("unexpected seal=%v submit=%v queued=%v", sErr, jErr, queued)
 			}
-		case errors.Is(sErr, ErrUnresolvedOperations):
-			if jErr != nil || !queued {
-				t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
-			}
-		default:
-			t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
-		}
+		})
 	}
 }
 
