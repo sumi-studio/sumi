@@ -252,16 +252,50 @@ func (t table) insertSQL() string {
 		t.name, strings.Join(names, ", "), override, strings.Join(exprs, ", "))
 }
 
-// restartIdentities moves each carried identity sequence past the staged
-// maximum, so the destination's next generated value orders after every
-// carried row instead of colliding with the values the bundle brought.
-func restartIdentities(ctx context.Context, tx pgx.Tx, personaID string) error {
+// advanceIdentities moves each carried identity sequence past every value
+// the destination now holds — including this import's staged rows. The
+// sequence is shared by the whole table, so the floor is the table-wide
+// maximum, never a per-persona one.
+//
+// It bumps with nextval rather than setval, deliberately: nextval cannot
+// rewind. A stale floor read only makes us bump further, and a concurrent
+// admission or another import's bump can interleave freely — every call
+// moves the shared sequence forward. A rolled-back import leaves at most a
+// legal gap; a setval could instead land below a value already issued to an
+// in-flight admission on another persona, and its effect would persist past
+// the rollback.
+func advanceIdentities(ctx context.Context, tx pgx.Tx) error {
 	for name, col := range identityCols {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`
-			SELECT setval(pg_get_serial_sequence('%s', '%s'),
-				COALESCE((SELECT max(%s) FROM %s WHERE persona_id = $1), 0) + 1, false)`,
-			name, col, col, name), personaID); err != nil {
-			return fmt.Errorf("restart %s.%s: %w", name, col, err)
+		var seq string
+		if err := tx.QueryRow(ctx,
+			`SELECT pg_get_serial_sequence($1, $2)`, name, col).Scan(&seq); err != nil {
+			return fmt.Errorf("identity sequence %s.%s: %w", name, col, err)
+		}
+		var last int64
+		var called bool
+		// The sequence name comes from pg_get_serial_sequence — the
+		// catalog's own qualified, quoted name for this column's sequence.
+		if err := tx.QueryRow(ctx, fmt.Sprintf(
+			`SELECT last_value, is_called FROM %s`, seq)).Scan(&last, &called); err != nil {
+			return fmt.Errorf("identity position %s: %w", seq, err)
+		}
+		var floor int64
+		if err := tx.QueryRow(ctx, fmt.Sprintf(
+			`SELECT COALESCE(max(%s), 0) FROM %s`, col, name)).Scan(&floor); err != nil {
+			return fmt.Errorf("identity floor %s.%s: %w", name, col, err)
+		}
+		issued := last
+		if !called {
+			issued = last - 1 // nothing handed out yet; first nextval returns last_value
+		}
+		need := floor - issued
+		if need <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`SELECT count(nextval($1::regclass)) FROM generate_series(1, $2::bigint)`,
+			seq, need); err != nil {
+			return fmt.Errorf("advance %s: %w", seq, err)
 		}
 	}
 	return nil
@@ -466,9 +500,6 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		hdr.PersonaID, hdr.Cut.GenerationHighWater, sealHolder(hdr.TransferID)); err != nil {
 		return Receipt{}, false, fmt.Errorf("write lease epoch floor: %w", err)
 	}
-	if err := restartIdentities(ctx, tx, hdr.PersonaID); err != nil {
-		return Receipt{}, false, err
-	}
 	violations, err := verifyCut(ctx, tx, hdr.PersonaID)
 	if err != nil {
 		return Receipt{}, false, err
@@ -515,6 +546,12 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		VALUES ('import', $1, $2, 'staged', $3, $4, $5, $6, $7, $8, $8)`,
 		hdr.TransferID, hdr.PersonaID, hdr.FormatVersion, hdr.DestinationID, digest, hdr.TransferKey, raw, now); err != nil {
 		return Receipt{}, false, fmt.Errorf("record transfer: %w", err)
+	}
+	// Last step before commit: a rejected bundle above must not have touched
+	// the shared sequence at all. nextval bumps are non-transactional, so a
+	// crash after this point can only leave the sequence further ahead.
+	if err := advanceIdentities(ctx, tx); err != nil {
+		return Receipt{}, false, err
 	}
 	return rec, true, tx.Commit(ctx)
 }

@@ -1278,6 +1278,147 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 	}
 }
 
+// admission_seq is backed by one table-global identity sequence: an import
+// must never move it backwards, or the next admission on an *existing*
+// persona can duplicate a queued value and corrupt that persona's claim
+// order. The destination bumps the sequence with nextval against the
+// table-wide maximum — monotone under concurrent admissions and imports —
+// where a setval restart could land below a value already issued to an
+// in-flight admission, and could persist that rewind past a rollback.
+// Regression for the populated-destination finding f-shared-intake-97.
+func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+
+	seqPos := func() (int64, bool) {
+		var last int64
+		var called bool
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT last_value, is_called FROM core_inputs_admission_seq_seq`).Scan(&last, &called); err != nil {
+			t.Fatalf("sequence position: %v", err)
+		}
+		return last, called
+	}
+	globalMax := func() int64 {
+		var m int64
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT COALESCE(max(admission_seq), 0) FROM core_inputs`).Scan(&m); err != nil {
+			t.Fatalf("table max: %v", err)
+		}
+		return m
+	}
+	dupes := func() int {
+		var n int
+		if err := cloud.pool.QueryRow(ctx, `
+			SELECT count(*) FROM (
+				SELECT 1 FROM core_inputs
+				GROUP BY persona_id, admission_seq HAVING count(*) > 1) d`).Scan(&n); err != nil {
+			t.Fatalf("duplicate check: %v", err)
+		}
+		return n
+	}
+
+	// The destination already hosts a persona whose inputs outrank what the
+	// bundle will carry.
+	other := newID(t)
+	must(drop(cloud.state.EnsurePersona(ctx, other, nil, "Staying secretary")))
+	for i := 1; i <= 4; i++ {
+		submit(t, cloud, other, fmt.Sprintf("pre-%d", i), fmt.Sprintf("existing %d", i))
+	}
+
+	// The moved persona carries a smaller history.
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	submit(t, local, pid, "m-1", "first")
+	submit(t, local, pid, "m-2", "second")
+	must(local.svc.Seal(ctx, pid, "move-seq", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-seq")
+
+	// While the import runs, real admissions to the staying persona race it.
+	// The interleaving is deliberately not pinned — every interleaving must
+	// be safe, so the assertions check the outcome, not a schedule.
+	var wg sync.WaitGroup
+	subErr := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := cloud.state.SubmitInput(ctx, &agentstate.Input{
+				PersonaID: other, InputID: fmt.Sprintf("race-%d", i), Kind: "message",
+				Payload: map[string]any{"text": "racing"}, ActorKind: "human", SourceSurface: "test",
+			})
+			subErr <- err
+		}(i)
+	}
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	if err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	wg.Wait()
+	close(subErr)
+	for err := range subErr {
+		if err != nil {
+			t.Fatalf("concurrent admission during import: %v", err)
+		}
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after import", n)
+	}
+	last, _ := seqPos()
+	if last < globalMax() {
+		t.Fatalf("identity sequence at %d below table max %d after import", last, globalMax())
+	}
+
+	// The next admission to the staying persona orders after everything.
+	submit(t, cloud, other, "post-import", "after the move")
+	var seq int64
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 AND input_id = 'post-import'`,
+		other).Scan(&seq); err != nil {
+		t.Fatalf("post-import seq: %v", err)
+	}
+	if seq <= last {
+		t.Fatalf("post-import admission_seq %d did not pass sequence position %d", seq, last)
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after post-import admission", n)
+	}
+
+	// A rejected bundle must not touch the shared sequence at all.
+	before, _ := seqPos()
+	corrupt := bytes.Clone(bundle)
+	corrupt[len(corrupt)-40] ^= 0xFF
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(corrupt), &humanID); err == nil {
+		t.Fatal("corrupted bundle imported")
+	}
+	if after, _ := seqPos(); after != before {
+		t.Fatalf("rejected import moved the sequence %d -> %d", before, after)
+	}
+
+	// An empty carried persona (no inputs at all) must not rewind either.
+	empty := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, empty, nil, "Empty secretary")))
+	must(local.svc.Seal(ctx, empty, "move-empty", placementID(t, cloud)))
+	emptyBundle, _ := exportBytes(t, local, empty, "move-empty")
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(emptyBundle), &humanID); err != nil || !created {
+		t.Fatalf("empty import: created=%v err=%v", created, err)
+	}
+	if after, _ := seqPos(); after < before {
+		t.Fatalf("empty import rewound the sequence %d -> %d", before, after)
+	}
+
+	// The staying persona still passes the cut's own integrity checks — its
+	// admission order was never corrupted.
+	if _, err := cloud.svc.Seal(ctx, other, "move-away", placementID(t, local)); err != nil {
+		t.Fatalf("seal of pre-existing destination persona after import: %v", err)
+	}
+}
+
 // Every table that belongs to a persona must be carried by core.v1 or be
 // declared placement-local, and carried tables must match the contract's
 // columns. A module that adds persona state without a portability decision
