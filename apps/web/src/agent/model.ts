@@ -138,12 +138,69 @@ export type ConversationEntry =
       retryable: false;
     };
 
+/**
+ * One position edit applied to `entryOrder`. `insert`/`move` carry the id's
+ * index after the edit; `remove` needs no index because the consumer knows
+ * where it kept the row.
+ */
+export type ConversationOrderOp =
+  | { op: "insert"; id: string; index: number }
+  | { op: "remove"; id: string }
+  | { op: "move"; id: string; index: number };
+
+/**
+ * Write journal for a span of model transitions. The reducer's model
+ * containers (`entries`, `runs`, `entryOrder`, `runOrder`) are mutated in
+ * place within a session — rebuilding 6,000-key records on every streamed
+ * token dominated the stream hot path — so the wrapper object alone cannot
+ * say what changed. The journal accumulates ids and order edits written
+ * through the model helpers until a projection consumes them, letting
+ * incremental views recompute only the affected rows.
+ */
+export interface ConversationChanges {
+  /** Entries inserted into `entryOrder`. */
+  addedEntryIds: Set<string>;
+  /** Entries removed from the model. */
+  removedEntryIds: Set<string>;
+  /** Entries whose value was replaced in place. */
+  changedEntryIds: Set<string>;
+  /** Runs whose value was replaced in place. */
+  changedRunIds: Set<string>;
+  /** `entryOrder` edits in application order. */
+  orderOps: ConversationOrderOp[];
+  /**
+   * True when the sets above do not describe the transition — a rebuilt
+   * model (history merge, snapshot filter) rather than journaled writes.
+   * Consumers must treat every row as dirty.
+   */
+  structural: boolean;
+}
+
+export function createConversationChanges(
+  structural = false,
+): ConversationChanges {
+  return {
+    addedEntryIds: new Set(),
+    removedEntryIds: new Set(),
+    changedEntryIds: new Set(),
+    changedRunIds: new Set(),
+    orderOps: [],
+    structural,
+  };
+}
+
 /** One normalized projection of the personality agent's canonical life log. */
 export interface ConversationModel {
   entryOrder: string[];
   entries: Record<string, ConversationEntry>;
   runOrder: string[];
   runs: Record<string, AgentRun>;
+  /**
+   * Write journal for the transition that produced this model and every
+   * unconsumed successor. Absent on ad-hoc literals; helpers treat a missing
+   * journal as structural so consumers stay conservative.
+   */
+  changes?: ConversationChanges;
 }
 
 export type ChatItem =
@@ -159,5 +216,15 @@ export type ChatItem =
   | Extract<ConversationEntry, { kind: "card" }>;
 
 export function createEmptyConversation(): ConversationModel {
-  return { entryOrder: [], entries: {}, runOrder: [], runs: {} };
+  return {
+    entryOrder: [],
+    entries: {},
+    runOrder: [],
+    runs: {},
+    // Structural: a model that did not arrive through journaled writes must be
+    // rescanned, not treated as "no changes". This is what lets consumers tell
+    // a wholesale session replacement (resetAuthority, fresh sessions) apart
+    // from an unchanged stream.
+    changes: createConversationChanges(true),
+  };
 }

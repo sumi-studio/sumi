@@ -1729,6 +1729,7 @@ func TestWebSocketReplacementCancelsOldEpochSinkWithoutWaiting(t *testing.T) {
 		fakeEventSink: &fakeEventSink{},
 		entered:       make(chan struct{}),
 		release:       make(chan struct{}),
+		canceled:      make(chan struct{}),
 	}
 	hl := newFakeHydrationLatch()
 	hl.setReady()
@@ -1790,6 +1791,13 @@ func TestWebSocketReplacementCancelsOldEpochSinkWithoutWaiting(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("replacement waited on an old sink that was waiting for context cancellation")
+	}
+	// Observe cancellation before releasing the fixture. Otherwise both select
+	// cases can become ready and the fake sink may record the canceled event.
+	select {
+	case <-events.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not cancel the old epoch sink")
 	}
 	waitForFakeSideEffects(t, events.fakeEventSink, cs, 0, 0)
 	close(events.release)
