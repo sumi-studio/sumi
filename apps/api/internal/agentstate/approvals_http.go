@@ -86,6 +86,10 @@ type ModelConnectionBinding struct {
 	BaseURL string `json:"base_url"`
 	Model   string `json:"model"`
 	Version string `json:"version"`
+	// ExtraHeaders are the connection's sealed per-request headers, sent
+	// only with the credential material (armed store) — never in
+	// metadata-only responses and never persisted into core state.
+	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
 }
 
 // modelBinding resolves the persona's human's explicit model selection.
@@ -194,6 +198,7 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			binding.APIKey = access.APIKey
+			binding.Connection.ExtraHeaders = access.ExtraHeaders
 			binding.CredentialAvailable = true
 		} else {
 			binding.Reason = "credential unavailable: state service has no model-connection key"

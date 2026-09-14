@@ -566,6 +566,11 @@ export interface components {
             model: string;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
+        };
+        /** @description Per-connection request headers sent only to this connection's endpoint (for example a gateway routing header). Sealed encrypted together with the API key and never returned. Header names must be RFC 7230 tokens (max 128 chars) and may not replace the request's own authentication, protocol-version, or transport headers (for example Authorization, x-api-key, Content-Type, Host). Setting or clearing headers requires apiKey in the same request; omit the field to retain the stored headers. */
+        ModelAPIExtraHeaders: {
+            [key: string]: string;
         };
         ModelAPIConnectionUpdate: {
             name: string;
@@ -579,6 +584,7 @@ export interface components {
             model: string;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey?: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
         };
         ModelConnectionSelection: {
             /** @enum {string} */

@@ -7,9 +7,10 @@
  * from the state service for every model call, so a changed selection or a
  * rotated key applies from the next consultation without a restart:
  *
- *   api      → exactly that connection's base_url / model / api_key, when
- *              its preset speaks chat completions (the wire this core
- *              implements). Anything else fails the request.
+ *   api      → exactly that connection's base_url / model / api_key /
+ *              extra_headers, on the wire its preset declares (chat
+ *              completions, OpenAI Responses, or Anthropic Messages).
+ *              Any other preset fails the request.
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
  *   chatgpt  → not implemented by this core: the request fails.
@@ -37,15 +38,16 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
-import { StateError, type StateClient } from "../state-client.ts";
-import type { ModelBinding } from "../types.ts";
+import { AnthropicProvider } from "../providers/anthropic.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
+import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
+import { type StateClient, StateError } from "../state-client.ts";
+import type { ModelBinding } from "../types.ts";
 
 /**
  * Connection presets whose wire protocol is OpenAI chat completions — the
  * same set the Rust agent maps to ApiProtocol::OpenAiChatCompletions.
- * openai-responses and anthropic use other wires this core does not speak.
  */
 export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "openai-chat",
@@ -56,6 +58,14 @@ export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "opencode-go",
   "opencode-zen-go",
 ]);
+
+/** Presets on the OpenAI Responses wire (POST {base}/responses). */
+export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
+  "openai-responses",
+]);
+
+/** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
+export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
 
 /** Non-secret identity of the connection a consultation actually used. */
 export type BindingIdentity =
@@ -127,7 +137,9 @@ export class SelectedModelProvider implements ModelProvider {
       // lookup failure retries like any provider outage.
       const msg = e instanceof Error ? e.message : String(e);
       const definite =
-        e instanceof StateError && e.status >= 400 && e.status < 500 &&
+        e instanceof StateError &&
+        e.status >= 400 &&
+        e.status < 500 &&
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
@@ -169,7 +181,11 @@ export class SelectedModelProvider implements ModelProvider {
         binding.reason ?? "the selected API connection no longer exists",
       );
     }
-    if (!CHAT_COMPLETIONS_PRESETS.has(c.preset)) {
+    if (
+      !CHAT_COMPLETIONS_PRESETS.has(c.preset) &&
+      !RESPONSES_PRESETS.has(c.preset) &&
+      !ANTHROPIC_PRESETS.has(c.preset)
+    ) {
       throw unusable(
         `the selected connection ${c.name} uses preset ${c.preset}, whose protocol this core does not implement`,
       );
@@ -179,6 +195,22 @@ export class SelectedModelProvider implements ModelProvider {
         `the selected connection ${c.name} has no usable credential (${binding.reason ?? "unavailable"}); re-enter its API key`,
       );
     }
+    // Per-connection extra headers travel with the binding (sealed with
+    // the credential on the server) and reach only this connection's
+    // endpoint.
+    const headers = c.extra_headers;
+    const shared = {
+      baseUrl: c.base_url,
+      apiKey: binding.api_key,
+      model: c.model,
+      headers,
+      timeoutMs: this.opts.timeoutMs,
+    };
+    const provider: ModelProvider = RESPONSES_PRESETS.has(c.preset)
+      ? new OpenAIResponsesProvider(shared)
+      : ANTHROPIC_PRESETS.has(c.preset)
+        ? new AnthropicProvider(shared)
+        : new OpenAIProvider(shared);
     const identity: BindingIdentity = {
       selection: "api",
       connection_id: c.id,
@@ -187,15 +219,7 @@ export class SelectedModelProvider implements ModelProvider {
       version: c.version,
     };
     this.opts.log?.("model bound to selected connection", identity);
-    return {
-      provider: new OpenAIProvider({
-        baseUrl: c.base_url,
-        apiKey: binding.api_key,
-        model: c.model,
-        timeoutMs: this.opts.timeoutMs,
-      }),
-      identity,
-    };
+    return { provider, identity };
   }
 }
 

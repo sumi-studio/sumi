@@ -34,7 +34,7 @@ func fixture(t *testing.T) *Store {
 }
 func input() Input {
 	k := "test-secret"
-	return Input{"My API", "openai-chat", "https://provider.example/v1", "model", &k}
+	return Input{Name: "My API", Preset: "openai-chat", BaseURL: "https://provider.example/v1", Model: "model", APIKey: &k}
 }
 func TestIsolationSelectionRotationAndDelete(t *testing.T) {
 	s := fixture(t)
@@ -180,6 +180,116 @@ func TestCanonicalUUIDAndDisplayOnlyChange(t *testing.T) {
 	rotated, err := s.Resolve(ctx, owner, a.ID)
 	if err != nil || rotated.Version == access.Version {
 		t.Fatal("key replacement did not revoke old binding", err)
+	}
+}
+
+func TestExtraHeadersSealedWithCredential(t *testing.T) {
+	s := fixture(t)
+	ctx := context.Background()
+	in := input()
+	in.ExtraHeaders = map[string]string{"X-Gateway-Session": "gw-1", "X-Tenant": "blue"}
+	a, err := s.Save(ctx, owner, "", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Values live inside the ciphertext: nothing readable at rest.
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, "SELECT credential_ciphertext FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", owner, a.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"test-secret", "gw-1", "X-Gateway-Session", "blue"} {
+		if bytes.Contains(raw, []byte(leak)) {
+			t.Fatalf("ciphertext leaks %q", leak)
+		}
+	}
+	access, err := s.Resolve(ctx, owner, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access.APIKey != "test-secret" || access.ExtraHeaders["X-Gateway-Session"] != "gw-1" || access.ExtraHeaders["X-Tenant"] != "blue" {
+		t.Fatalf("resolve %+v", access)
+	}
+	// Headers are credential material: changing them requires the key.
+	in.APIKey = nil
+	in.ExtraHeaders = map[string]string{"X-Tenant": "red"}
+	if _, err = s.Save(ctx, owner, a.ID, in); !errors.Is(err, ErrInvalid) {
+		t.Fatal("headers without key accepted", err)
+	}
+	// Resubmitting the key replaces both key and headers.
+	key := "test-secret-2"
+	in.APIKey = &key
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, err = s.Resolve(ctx, owner, a.ID)
+	if err != nil || access.APIKey != key || len(access.ExtraHeaders) != 1 || access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatalf("rotated resolve %+v", access)
+	}
+	// An update without the headers field keeps them.
+	in.ExtraHeaders = nil
+	in.APIKey = nil
+	in.Name = "renamed"
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatal("keyless edit dropped stored headers")
+	}
+	// Clearing headers explicitly requires the key.
+	in.APIKey = &key
+	in.ExtraHeaders = map[string]string{}
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if len(access.ExtraHeaders) != 0 {
+		t.Fatal("explicit clear did not clear")
+	}
+}
+
+func TestHeaderValidation(t *testing.T) {
+	key := "k"
+	ok := input()
+	ok.ExtraHeaders = map[string]string{"X-Gateway-Session": "gw-1"}
+	if err := Validate(ok); err != nil {
+		t.Fatal(err)
+	}
+	bad := []map[string]string{
+		{"Authorization": "x"},
+		{"x-api-key": "x"},
+		{"Content-Type": "x"},
+		{"Host": "x"},
+		{"Cookie": "x"},
+		{"bad name": "x"},
+		{"": "x"},
+		{"X-Ok": "line\nbreak"},
+		{"X-Ok": strings.Repeat("v", 1025)},
+		{strings.Repeat("n", 129): "x"},
+	}
+	for _, h := range bad {
+		in := input()
+		in.ExtraHeaders = h
+		if err := Validate(in); err == nil {
+			t.Errorf("accepted headers %v", h)
+		}
+	}
+	// Headers without a key cannot be sealed — rejected on create and update.
+	in := input()
+	in.APIKey = nil
+	in.ExtraHeaders = map[string]string{"X-Ok": "v"}
+	if err := Validate(in); err == nil {
+		t.Error("headers without key accepted")
+	}
+	many := map[string]string{}
+	for i := 0; i < 17; i++ {
+		many[string(rune('a'+i))] = "v"
+	}
+	in = input()
+	in.APIKey = &key
+	in.ExtraHeaders = many
+	if err := Validate(in); err == nil {
+		t.Error("17 headers accepted")
 	}
 }
 

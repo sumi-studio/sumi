@@ -208,6 +208,13 @@ export interface ModelBinding {
     base_url: string;
     model: string;
     version: string;
+    /**
+     * Per-connection extra request headers, present only when the
+     * credential store is armed — they are sealed with the credential and
+     * sent only to this connection's endpoint. Never logged or echoed
+     * into state/events.
+     */
+    extra_headers?: Record<string, string>;
   };
   api_key?: string;
   credential_available?: boolean;
@@ -294,13 +301,7 @@ export interface MemoryChunk {
   first_seq: number;
   last_seq: number;
   est_tokens: number;
-  status:
-    | "sealed"
-    | "preparing"
-    | "prepared"
-    | "applied"
-    | "kept"
-    | "failed";
+  status: "sealed" | "preparing" | "prepared" | "applied" | "kept" | "failed";
   replacement: string | null;
   replacement_est_tokens: number | null;
   /** Recorded preparation failures (the only thing that spends the budget). */

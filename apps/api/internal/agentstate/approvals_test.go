@@ -527,7 +527,8 @@ func TestModelBindingFollowsSelection(t *testing.T) {
 	}
 	apiKey := "sk-binding-test"
 	conn, err := conns.Save(ctx, human, "", modelconnections.Input{Name: "Work", Preset: "openai-chat",
-		BaseURL: "https://api.example.com/v1", Model: "model-a", APIKey: &apiKey})
+		BaseURL: "https://api.example.com/v1", Model: "model-a", APIKey: &apiKey,
+		ExtraHeaders: map[string]string{"X-Gateway-Session": "gw-9"}})
 	if err != nil {
 		t.Fatalf("save connection: %v", err)
 	}
@@ -540,11 +541,16 @@ func TestModelBindingFollowsSelection(t *testing.T) {
 		b.Connection.Preset != "openai-chat" || b.Connection.Version == "" || b.APIKey != apiKey || !b.CredentialAvailable {
 		t.Fatalf("api binding = %+v", b)
 	}
+	if b.Connection.ExtraHeaders["X-Gateway-Session"] != "gw-9" {
+		t.Fatalf("binding dropped the connection's extra headers = %+v", b.Connection)
+	}
 
 	// Without the credential key the selection still names the connection
-	// but carries no key — the core must fail rather than pick another.
+	// but carries no key or headers — the core must fail rather than pick
+	// another.
 	srv.SetModelConnections(modelconnections.MetadataOnly(pool))
-	if _, b := get(token); b.Selection != "api" || b.Connection == nil || b.APIKey != "" || b.CredentialAvailable || b.Reason == "" {
+	if _, b := get(token); b.Selection != "api" || b.Connection == nil || b.APIKey != "" ||
+		b.CredentialAvailable || b.Reason == "" || len(b.Connection.ExtraHeaders) != 0 {
 		t.Fatalf("metadata-only binding = %+v", b)
 	}
 	srv.SetModelConnections(conns)

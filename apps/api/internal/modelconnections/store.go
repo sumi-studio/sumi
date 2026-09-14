@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -35,15 +36,22 @@ type Input struct {
 	BaseURL string  `json:"baseUrl"`
 	Model   string  `json:"model"`
 	APIKey  *string `json:"apiKey,omitempty"`
+	// ExtraHeaders are per-connection request headers sent only to this
+	// connection's endpoint (gateway routing, provider betas). They are
+	// sealed with the credential — a value may itself be secret material —
+	// so they are write-only like the key and can only change together
+	// with a resubmitted key.
+	ExtraHeaders map[string]string `json:"extraHeaders,omitempty"`
 }
 type Selection struct {
 	Kind         string `json:"kind"`
 	ConnectionID string `json:"connectionId,omitempty"`
 }
 type Access struct {
-	Connection Connection `json:"-"`
-	APIKey     string     `json:"-"`
-	Version    string     `json:"-"`
+	Connection   Connection        `json:"-"`
+	APIKey       string            `json:"-"`
+	ExtraHeaders map[string]string `json:"-"`
+	Version      string            `json:"-"`
 }
 type Store struct {
 	pool *pgxpool.Pool
@@ -68,7 +76,59 @@ func New(pool *pgxpool.Pool, key []byte) (*Store, error) {
 func bounded(s string, n int) bool {
 	return strings.TrimSpace(s) != "" && len(s) <= n && strings.IndexFunc(s, unicode.IsControl) < 0
 }
-func Validate(in Input) error {
+
+// headerNameRe is the RFC 7230 token grammar — the only shape a header
+// name may take on any of the supported wires.
+var headerNameRe = regexp.MustCompile(`^[!#$%&'*+\-.^_` + "`" + `|~0-9A-Za-z]+$`)
+
+// reservedHeaders may not be overridden per connection: the request's own
+// authentication, protocol-version, and transport framing fields stay
+// adapter-controlled so a custom header can never silently replace the
+// selected credential or corrupt the request.
+var reservedHeaders = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"proxy-authenticate":  true,
+	"www-authenticate":    true,
+	"x-api-key":           true,
+	"anthropic-version":   true,
+	"content-type":        true,
+	"content-length":      true,
+	"host":                true,
+	"connection":          true,
+	"keep-alive":          true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+	"te":                  true,
+	"trailer":             true,
+	"cookie":              true,
+	"set-cookie":          true,
+}
+
+const (
+	maxExtraHeaders     = 16
+	maxExtraHeaderName  = 128
+	maxExtraHeaderValue = 1024
+)
+
+func validateHeaders(headers map[string]string) error {
+	if len(headers) > maxExtraHeaders {
+		return ErrInvalid
+	}
+	for name, value := range headers {
+		if len(name) > maxExtraHeaderName || !headerNameRe.MatchString(name) || reservedHeaders[strings.ToLower(name)] {
+			return ErrInvalid
+		}
+		if len(value) > maxExtraHeaderValue || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return ErrInvalid
+		}
+	}
+	return nil
+}
+
+// validateShape checks everything except the endpoint's transport rules
+// (SaveUnchecked bypasses only the endpoint rules for loopback fixtures).
+func validateShape(in Input) error {
 	if !bounded(in.Name, 120) || !bounded(in.Model, 128) {
 		return ErrInvalid
 	}
@@ -77,8 +137,20 @@ func Validate(in Input) error {
 	default:
 		return ErrInvalid
 	}
-	u, err := url.Parse(in.BaseURL)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(in.BaseURL) > 2048 {
+	if in.APIKey != nil && (!bounded(*in.APIKey, 65536) || strings.TrimSpace(*in.APIKey) != *in.APIKey) {
+		return ErrInvalid
+	}
+	// Extra headers live inside the sealed credential: setting or clearing
+	// them (present field, even an empty map) requires the key alongside.
+	if in.ExtraHeaders != nil && in.APIKey == nil {
+		return ErrInvalid
+	}
+	return validateHeaders(in.ExtraHeaders)
+}
+
+func validateEndpoint(baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(baseURL) > 2048 {
 		return ErrInvalid
 	}
 	// Activation additionally requires transport-level destination enforcement.
@@ -87,30 +159,52 @@ func Validate(in Input) error {
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || (ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast())) {
 		return ErrInvalid
 	}
-	if in.APIKey != nil && (!bounded(*in.APIKey, 65536) || strings.TrimSpace(*in.APIKey) != *in.APIKey) {
-		return ErrInvalid
-	}
 	return nil
 }
-func (s *Store) seal(human, id, key string) ([]byte, error) {
+
+func Validate(in Input) error {
+	if err := validateShape(in); err != nil {
+		return err
+	}
+	return validateEndpoint(in.BaseURL)
+}
+
+// credentialPayload is the sealed form: the API key plus any
+// per-connection extra headers. Header values may themselves be secret
+// (a gateway session token), so they live inside the ciphertext and are
+// never exposed through metadata.
+type credentialPayload struct {
+	APIKey       string            `json:"api_key"`
+	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
+}
+
+func (s *Store) seal(human, id string, p credentialPayload) ([]byte, error) {
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, ErrUnavailable
 	}
+	plaintext, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
 	aad, _ := json.Marshal([]string{"sumi.api.v1", human, id})
-	return s.aead.Seal(nonce, nonce, []byte(key), aad), nil
+	return s.aead.Seal(nonce, nonce, plaintext, aad), nil
 }
-func (s *Store) open(human, id string, b []byte) (string, error) {
+func (s *Store) open(human, id string, b []byte) (credentialPayload, error) {
 	n := s.aead.NonceSize()
 	if len(b) < n {
-		return "", ErrUnavailable
+		return credentialPayload{}, ErrUnavailable
 	}
 	aad, _ := json.Marshal([]string{"sumi.api.v1", human, id})
 	v, err := s.aead.Open(nil, b[:n], b[n:], aad)
 	if err != nil {
-		return "", ErrUnavailable
+		return credentialPayload{}, ErrUnavailable
 	}
-	return string(v), nil
+	var p credentialPayload
+	if err := json.Unmarshal(v, &p); err != nil || p.APIKey == "" {
+		return credentialPayload{}, ErrUnavailable
+	}
+	return p, nil
 }
 func lockHuman(ctx context.Context, tx pgx.Tx, human string) error {
 	var id string
@@ -123,11 +217,15 @@ func (s *Store) Save(ctx context.Context, human, id string, in Input) (Connectio
 	return s.save(ctx, human, id, in)
 }
 
-// SaveUnchecked is Save without transport validation — for dev/test
-// harnesses (state-dev fixture seeding) that must point a connection at a
-// loopback stub. The credential is still sealed through the armed store;
-// an unarmed store refuses.
+// SaveUnchecked is Save without endpoint transport validation — for
+// dev/test harnesses (state-dev fixture seeding) that must point a
+// connection at a loopback stub. Input shape (name/model/preset/key/
+// headers) is still validated and the credential is still sealed through
+// the armed store; an unarmed store refuses.
 func (s *Store) SaveUnchecked(ctx context.Context, human, id string, in Input) (Connection, error) {
+	if err := validateShape(in); err != nil {
+		return Connection{}, err
+	}
 	return s.save(ctx, human, id, in)
 }
 
@@ -168,7 +266,10 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 		return Connection{}, ErrInvalid
 	}
 	if in.APIKey != nil {
-		ciphertext, err = s.seal(human, id, *in.APIKey)
+		ciphertext, err = s.seal(human, id, credentialPayload{
+			APIKey:       *in.APIKey,
+			ExtraHeaders: in.ExtraHeaders,
+		})
 		if err != nil {
 			return Connection{}, err
 		}
@@ -298,8 +399,13 @@ func (s *Store) Resolve(ctx context.Context, human, id string) (Access, error) {
 	if err != nil {
 		return a, err
 	}
-	a.APIKey, err = s.open(human, id, b)
-	return a, err
+	cred, err := s.open(human, id, b)
+	if err != nil {
+		return a, err
+	}
+	a.APIKey = cred.APIKey
+	a.ExtraHeaders = cred.ExtraHeaders
+	return a, nil
 }
 
 // Metadata resolves the selected identity without decrypting its credential.

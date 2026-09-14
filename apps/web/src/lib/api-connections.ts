@@ -45,7 +45,15 @@ export interface ConnectionsState {
   selection: ConnectionSelection | null;
   activation: "next_start";
 }
-export type ConnectionInput = Omit<APIConnection, "id"> & { apiKey?: string };
+export type ConnectionInput = Omit<APIConnection, "id"> & {
+  apiKey?: string;
+  /**
+   * Extra per-connection request headers (e.g. a gateway routing header).
+   * Sealed with the API key and write-only: setting or clearing them
+   * requires resubmitting the key; omit to keep the stored headers.
+   */
+  extraHeaders?: Record<string, string>;
+};
 export interface APIConnectionsClient {
   list(signal: AbortSignal): Promise<ConnectionsState>;
   save(

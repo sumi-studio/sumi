@@ -32,6 +32,7 @@ export function APIConnectionSettings({
   const [editing, setEditing] = useState<string | null | undefined>(undefined);
   const [form, setForm] = useState<ConnectionInput>(blank);
   const [key, setKey] = useState("");
+  const [headersText, setHeadersText] = useState("");
   const [removing, setRemoving] = useState<string | null>(null);
   const lifetime = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -80,6 +81,7 @@ export function APIConnectionSettings({
         : blank,
     );
     setKey("");
+    setHeadersText("");
     setRemoving(null);
     setError("");
   }
@@ -209,13 +211,49 @@ export function APIConnectionSettings({
                 !!key ||
                 previous?.baseUrl !== form.baseUrl ||
                 previous?.preset !== form.preset;
+              // "Name: value" per line. Stored headers are write-only:
+              // an empty field means "keep what is stored".
+              const extraHeaders: Record<string, string> = {};
+              let headersValid = true;
+              for (const line of headersText.split("\n")) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const colon = trimmed.indexOf(":");
+                if (colon < 1) {
+                  headersValid = false;
+                  continue;
+                }
+                const name = trimmed.slice(0, colon).trim();
+                const value = trimmed.slice(colon + 1).trim();
+                if (!name || !value) headersValid = false;
+                else extraHeaders[name] = value;
+              }
+              if (!headersValid) {
+                setError(
+                  "ヘッダーは「名前: 値」の形式で1行ずつ入力してください。",
+                );
+                return;
+              }
+              // Headers are sealed with the credential: changing them
+              // without resubmitting the key is rejected by the server.
+              if (headersText.trim() && !key) {
+                setError(
+                  "ヘッダーを設定・変更するにはAPIキーも入力してください。",
+                );
+                return;
+              }
               await client.save(
-                { ...form, ...(key ? { apiKey: key } : {}) },
+                {
+                  ...form,
+                  ...(key ? { apiKey: key } : {}),
+                  ...(headersText.trim() ? { extraHeaders } : {}),
+                },
                 editing ?? undefined,
                 signal,
               );
               if (!signal.aborted) {
                 setKey("");
+                setHeadersText("");
                 setEditing(undefined);
                 setNotice(
                   state?.selection?.kind === "api" &&
@@ -294,6 +332,7 @@ export function APIConnectionSettings({
               value={key}
               required={
                 !editing ||
+                !!headersText.trim() ||
                 state?.connections.find((c) => c.id === editing)?.baseUrl !==
                   form.baseUrl
               }
@@ -302,8 +341,20 @@ export function APIConnectionSettings({
               placeholder={editing ? "変更しない場合は空欄" : "APIキーを入力"}
             />
           </label>
+          <label className="block text-sm">
+            追加リクエストヘッダー（任意）
+            <textarea
+              className={inputClass}
+              rows={2}
+              value={headersText}
+              disabled={busy}
+              onChange={(e) => setHeadersText(e.target.value)}
+              placeholder={"X-Header-Name: 値"}
+              spellCheck={false}
+            />
+          </label>
           <p className="text-muted-foreground text-xs leading-relaxed">
-            キーはこのSumiサーバーに暗号化して保存します。選んだ接続先へ会話が送られ、APIの利用料はそのアカウントに発生します。保存済みのキーは表示しません。
+            キーはこのSumiサーバーに暗号化して保存します。選んだ接続先へ会話が送られ、APIの利用料はそのアカウントに発生します。保存済みのキーは表示しません。追加ヘッダーもキーと一緒に暗号化して保存され、この接続先にだけ送られます。変更するにはAPIキーと一緒に再入力してください。
           </p>
           <div className="flex gap-3">
             <Button type="submit" disabled={busy}>
