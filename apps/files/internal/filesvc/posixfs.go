@@ -125,6 +125,13 @@ func mountVerdict(visible mountInfoEntry, root string) error {
 		ErrMountPolicy, visible.fstype)
 }
 
+// mountCheckTimeout bounds the per-request mount check. A wedged-but-alive
+// FUSE daemon can block statx/.config reads indefinitely; on timeout the
+// request reports mount_unavailable. The abandoned goroutine holds no
+// locks and exits when the daemon answers or dies — the same bounded-work
+// shape as Store.runBounded.
+const mountCheckTimeout = 5 * time.Second
+
 // checkMount enforces the mount requirements for canonical-namespace mode
 // (requireMount): the root must itself be a live mountpoint AND its
 // filesystem must not serve stale metadata to this client. Freshness is
@@ -151,10 +158,23 @@ func mountVerdict(visible mountInfoEntry, root string) error {
 // this mount and a nonzero attr cache silently re-opens the B1 clobber
 // window.
 func (p *posixRoot) checkMount() error {
+	ch := make(chan error, 1)
+	go func() { ch <- p.checkMountInner() }()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(mountCheckTimeout):
+		return ErrMountUnavailable
+	}
+}
+
+func (p *posixRoot) checkMountInner() error {
 	var stx unix.Statx_t
 	err := unix.Statx(unix.AT_FDCWD, p.root,
 		unix.AT_STATX_DONT_SYNC, unix.STATX_MNT_ID, &stx)
 	if err != nil || stx.Mask&unix.STATX_MNT_ID == 0 {
+		// Includes ENOTCONN — a dead FUSE mount still resolves its root
+		// dentry; the action is remount, so report unavailable.
 		return ErrMountUnavailable
 	}
 	data, err := os.ReadFile("/proc/self/mountinfo")
@@ -177,6 +197,9 @@ func (p *posixRoot) checkMount() error {
 		var cstx unix.Statx_t
 		if err := unix.Statx(unix.AT_FDCWD, cfgPath,
 			unix.AT_STATX_DONT_SYNC, unix.STATX_MNT_ID, &cstx); err != nil {
+			if errors.Is(err, unix.ENOTCONN) {
+				return ErrMountUnavailable
+			}
 			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
 		}
 		if cstx.Mask&unix.STATX_MNT_ID == 0 || cstx.Mnt_id != stx.Mnt_id {
@@ -236,6 +259,8 @@ var (
 	ErrNotFound         = errors.New("not found")
 	ErrIsDir            = errors.New("is a directory")
 	ErrNotDir           = errors.New("not a directory")
+	ErrWrongKind        = errors.New("wrong kind for this operation")
+	ErrAccess           = errors.New("permission denied")
 	ErrReserved         = errors.New("path uses the service staging prefix")
 	ErrMountUnavailable = errors.New("canonical namespace root is not mounted")
 	ErrMountPolicy      = errors.New("canonical mount violates freshness policy")
@@ -266,93 +291,163 @@ func newRoot(root string) (*posixRoot, error) {
 	return &posixRoot{root: abs}, nil
 }
 
-// resolve maps a client (scope, path) to a host path contained beneath
-// root/scope. Each scope is an isolated subtree — a workspace's or
-// secretary's own root. The final element may not exist yet (write/mkdir);
-// its parent must resolve. ".." segments are rejected outright rather than
-// silently clamped — callers get a deterministic error, not a rewrite.
-func (p *posixRoot) resolve(scope, path string) (string, error) {
-	if scope == "" || strings.Contains(scope, "/") || strings.Contains(scope, "..") || strings.HasPrefix(scope, ".") {
-		return "", ErrEscape
+// --- Descriptor-relative resolution ------------------------------------
+//
+// Every file operation resolves beneath a pinned directory file descriptor
+// with openat2(RESOLVE_BENEATH): the kernel re-resolves each path
+// component against the real mount table at use time, so a directory ↔
+// symlink swap racing an operation can never redirect it outside the scope
+// (the earlier stat-then-open-by-path check could be beaten — final-review
+// B F1 reproduced escaped writes and staging files). A swap can still
+// change *which in-scope object* an op targets, but cannot make it escape.
+
+func mapPathErr(err error) error {
+	switch {
+	case errors.Is(err, unix.EXDEV), errors.Is(err, unix.EAGAIN):
+		return ErrEscape
+	case errors.Is(err, unix.ENOENT):
+		return ErrNotFound
+	case errors.Is(err, unix.ENOTDIR):
+		return ErrNotDir
+	case errors.Is(err, unix.ELOOP):
+		return ErrNotFound // unresolvable (symlink loop)
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
+		return ErrAccess
+	default:
+		return err
 	}
+}
+
+// openBeneath resolves rel beneath dfd in-kernel. RESOLVE_BENEATH refuses
+// any resolution that escapes dfd — escaping symlinks, magic links, or
+// ".." past the root all fail with EXDEV/EAGAIN → ErrEscape.
+func openBeneath(dfd *os.File, rel string, flags int, mode uint32) (*os.File, error) {
+	how := unix.OpenHow{
+		Flags:   uint64(flags) | unix.O_CLOEXEC,
+		Mode:    uint64(mode),
+		Resolve: unix.RESOLVE_BENEATH,
+	}
+	fd, err := unix.Openat2(int(dfd.Fd()), rel, &how)
+	if err != nil {
+		return nil, mapPathErr(err)
+	}
+	return os.NewFile(uintptr(fd), rel), nil
+}
+
+// rootFD anchors all scope resolution. O_NOFOLLOW pins it to the real
+// directory — a post-start symlink swap at the root path cannot redirect.
+func (p *posixRoot) rootFD() (*os.File, error) {
+	fd, err := unix.Open(p.root,
+		unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, mapPathErr(err)
+	}
+	return os.NewFile(uintptr(fd), p.root), nil
+}
+
+func validScope(scope string) error {
+	if scope == "" || strings.Contains(scope, "/") || strings.Contains(scope, "..") || strings.HasPrefix(scope, ".") {
+		return ErrEscape
+	}
+	return nil
+}
+
+// scopeDir opens the scope's root directory. With create, a missing scope
+// dir is made first (first mutation of a scope).
+func (p *posixRoot) scopeDir(scope string, create bool) (*os.File, error) {
+	if err := validScope(scope); err != nil {
+		return nil, err
+	}
+	rfd, err := p.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	defer rfd.Close()
+	if create {
+		err := unix.Mkdirat(int(rfd.Fd()), scope, 0o755)
+		if err != nil && !errors.Is(err, unix.EEXIST) {
+			return nil, mapPathErr(err)
+		}
+	}
+	// RESOLVE_BENEATH follows an in-scope symlink at the scope name but
+	// refuses one that escapes the root.
+	return openBeneath(rfd, scope, unix.O_PATH|unix.O_DIRECTORY, 0)
+}
+
+// relPath normalizes a scope-relative path; ".." is rejected outright —
+// callers get a deterministic error, not a clamp.
+func relPath(path string) (string, error) {
 	if path == "" || path == "/" {
-		return filepath.Join(p.root, scope), nil
+		return "", nil
 	}
 	for _, seg := range strings.Split(path, "/") {
 		if seg == ".." {
 			return "", ErrEscape
 		}
 	}
-	clean := filepath.Clean("/" + path) // leading / forces interpretation as scope-relative
-	scopeRoot := filepath.Join(p.root, scope)
-	joined := filepath.Join(scopeRoot, clean)
-	if joined != scopeRoot && !strings.HasPrefix(joined, scopeRoot+string(filepath.Separator)) {
-		return "", ErrEscape
-	}
-	// Resolve the deepest existing ancestor; missing trailing segments are
-	// rejoined verbatim (they contain no ".." and cannot yet be symlinks).
-	// Any real component that escapes scopeRoot is denied.
-	resolved := joined
-	if _, err := os.Lstat(joined); err == nil {
-		resolved, err = filepath.EvalSymlinks(joined)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return "", ErrNotFound // dangling symlink
-			}
-			return "", err
-		}
-	} else if errors.Is(err, fs.ErrNotExist) {
-		// Walk up to the first existing ancestor.
-		var missing []string
-		cur := joined
-		for {
-			parent := filepath.Dir(cur)
-			missing = append([]string{filepath.Base(cur)}, missing...)
-			if parent != scopeRoot && !strings.HasPrefix(parent, scopeRoot+string(filepath.Separator)) {
-				return "", ErrNotFound
-			}
-			if _, lerr := os.Lstat(parent); lerr == nil {
-				anc, aerr := filepath.EvalSymlinks(parent)
-				if aerr != nil {
-					return "", aerr
-				}
-				if anc != scopeRoot && !strings.HasPrefix(anc, scopeRoot+string(filepath.Separator)) {
-					return "", ErrEscape
-				}
-				parts := append([]string{anc}, missing...)
-				resolved = filepath.Join(parts...)
-				break
-			} else if !errors.Is(lerr, fs.ErrNotExist) {
-				return "", lerr
-			}
-			cur = parent
-		}
-	} else {
-		return "", err
-	}
-	if resolved != scopeRoot && !strings.HasPrefix(resolved, scopeRoot+string(filepath.Separator)) {
-		return "", ErrEscape
-	}
-	return resolved, nil
+	return filepath.Clean("/" + path)[1:], nil
 }
 
-// resolveParent resolves the parent directory of (scope, path) and returns
-// the unresolved host path beneath it. Use for ops that must act on the
-// final element literally (remove, rename source): an in-scope symlink that
-// points outside must itself be removable.
-func (p *posixRoot) resolveParent(scope, path string) (string, error) {
-	if path == "" || path == "/" {
-		return "", ErrNotDir
-	}
-	parent, err := p.resolve(scope, filepath.Dir("/"+path))
+// splitRel splits a normalized relative path into parent dir + final name.
+func splitRel(rel string) (dir, name string) {
+	dir, name = filepath.Split(rel)
+	return strings.TrimSuffix(dir, "/"), name
+}
+
+// openDirBeneath resolves rel beneath sfd to a directory fd. With create,
+// missing intermediate directories are made (mkdir -p semantics) — each
+// segment is re-resolved in-kernel, so a racing symlink swap still cannot
+// escape. The caller owns the returned fd; sfd is not consumed.
+func openDirBeneath(sfd *os.File, rel string, create bool) (*os.File, error) {
+	cur, err := openBeneath(sfd, ".", unix.O_PATH|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return filepath.Join(parent, filepath.Base(path)), nil
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "" {
+			continue
+		}
+		next, err := openBeneath(cur, seg, unix.O_PATH|unix.O_DIRECTORY, 0)
+		if err != nil && create && errors.Is(err, ErrNotFound) {
+			merr := unix.Mkdirat(int(cur.Fd()), seg, 0o755)
+			if merr != nil && !errors.Is(merr, unix.EEXIST) {
+				cur.Close()
+				return nil, mapPathErr(merr)
+			}
+			next, err = openBeneath(cur, seg, unix.O_PATH|unix.O_DIRECTORY, 0)
+		}
+		if err != nil {
+			cur.Close()
+			return nil, err
+		}
+		cur.Close()
+		cur = next
+	}
+	return cur, nil
+}
+
+// syncDir fsyncs the directory behind dfd so a published name is durable.
+func syncDir(dfd *os.File) {
+	d, err := openBeneath(dfd, ".", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
+}
+
+// statAt lstats a single name beneath dfd — no traversal, cannot escape.
+func statAt(dfd *os.File, name string) (fs.FileMode, int64, int64, int64, error) {
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(dfd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return 0, 0, 0, 0, mapPathErr(err)
+	}
+	return fs.FileMode(st.Mode), st.Size,
+		st.Mtim.Sec*1e9 + st.Mtim.Nsec, st.Ctim.Sec*1e9 + st.Ctim.Nsec, nil
 }
 
 type FileInfo struct {
-	Kind    string `json:"kind"` // "file" | "dir"
+	Kind    string `json:"kind"` // "file" | "dir" | "symlink" | "special"
 	Size    int64  `json:"size"`
 	MtimeNS int64  `json:"mtime_ns"`
 	// Fingerprint identifies the observed content generation cheaply:
@@ -371,23 +466,46 @@ func fingerprint(st fs.FileInfo) string {
 		s.Mtim.Nsec+s.Mtim.Sec*1e9, s.Ctim.Nsec+s.Ctim.Sec*1e9)
 }
 
+func kindOf(mode fs.FileMode) string {
+	switch {
+	case mode.IsDir():
+		return "dir"
+	case mode&fs.ModeSymlink != 0:
+		return "symlink"
+	case !mode.IsRegular():
+		return "special" // fifo, socket, device — reported, not served as file
+	default:
+		return "file"
+	}
+}
+
 func (p *posixRoot) stat(scope, path string) (FileInfo, error) {
-	host, err := p.resolve(scope, path)
+	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	st, err := os.Stat(host) // follow in-root symlinks
+	defer sfd.Close()
+	rel, err := relPath(path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return FileInfo{}, ErrNotFound
+		return FileInfo{}, err
+	}
+	f := sfd
+	if rel != "" {
+		// O_PATH + RESOLVE_BENEATH: follows in-scope symlinks, refuses
+		// any that escape — and cannot be raced, unlike the old
+		// EvalSymlinks-then-open path.
+		f, err = openBeneath(sfd, rel, unix.O_PATH, 0)
+		if err != nil {
+			return FileInfo{}, err
 		}
-		return FileInfo{}, err
+		defer f.Close()
 	}
-	kind := "file"
-	if st.IsDir() {
-		kind = "dir"
+	st, err := f.Stat()
+	if err != nil {
+		return FileInfo{}, mapPathErr(err)
 	}
-	return FileInfo{Kind: kind, Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, nil
+	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, nil
 }
 
 type ListEntry struct {
@@ -398,58 +516,56 @@ type ListEntry struct {
 }
 
 func (p *posixRoot) list(scope, path string, limit int, cursor string) ([]ListEntry, string, error) {
-	host, err := p.resolve(scope, path)
+	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
 		return nil, "", err
 	}
-	st, err := os.Stat(host)
+	defer sfd.Close()
+	rel, err := relPath(path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, "", ErrNotFound
+		return nil, "", err
+	}
+	d := sfd
+	if rel != "" {
+		d, err = openBeneath(sfd, rel, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, "", err
 		}
-		return nil, "", err
+		defer d.Close()
 	}
-	if !st.IsDir() {
-		return nil, "", ErrNotDir
-	}
-	des, err := os.ReadDir(host)
+	names, err := d.Readdirnames(-1)
 	if err != nil {
-		return nil, "", err
+		return nil, "", mapPathErr(err)
 	}
-	names := make([]string, 0, len(des))
-	for _, de := range des {
-		if strings.HasPrefix(de.Name(), ".filesv-tmp-") {
+	visible := names[:0]
+	for _, n := range names {
+		if strings.HasPrefix(n, stagingPrefix) {
 			continue // hide service staging files
 		}
-		names = append(names, de.Name())
+		visible = append(visible, n)
 	}
-	sort.Strings(names)
+	sort.Strings(visible)
 	start := 0
 	if cursor != "" {
-		start = sort.SearchStrings(names, cursor)
-		for start < len(names) && names[start] <= cursor {
+		start = sort.SearchStrings(visible, cursor)
+		for start < len(visible) && visible[start] <= cursor {
 			start++
 		}
 	}
 	out := make([]ListEntry, 0, limit)
 	next := ""
-	for i := start; i < len(names) && len(out) < limit; i++ {
-		// Lstat: a symlink's target may be outside the scope or even outside
-		// the filesystem — report the link, not its target's metadata.
-		fi, err := os.Lstat(filepath.Join(host, names[i]))
+	for i := start; i < len(visible) && len(out) < limit; i++ {
+		// Lstat via the pinned dir fd: a symlink's target may be outside
+		// the scope — report the link, not its target's metadata.
+		mode, size, mtim, _, err := statAt(d, visible[i])
 		if err != nil {
 			continue // raced delete — listing stays honest for what exists
 		}
-		kind := "file"
-		if fi.IsDir() {
-			kind = "dir"
-		} else if fi.Mode()&os.ModeSymlink != 0 {
-			kind = "symlink"
-		}
-		out = append(out, ListEntry{Name: names[i], Kind: kind, Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano()})
-		next = names[i]
+		out = append(out, ListEntry{Name: visible[i], Kind: kindOf(mode),
+			Size: size, MtimeNS: mtim})
+		next = visible[i]
 	}
-	if start+len(out) >= len(names) {
+	if start+len(out) >= len(visible) {
 		next = ""
 	}
 	return out, next, nil
@@ -457,27 +573,38 @@ func (p *posixRoot) list(scope, path string, limit int, cursor string) ([]ListEn
 
 // open returns the file positioned at off plus its metadata. The caller
 // streams the body — no request-controlled allocation ever happens here.
+// O_NONBLOCK is set for the open itself so a FIFO or device can never
+// wedge the handler goroutine (final-review A F1); it is cleared by the
+// fstat type check — only regular files are served.
 func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, error) {
-	host, err := p.resolve(scope, path)
+	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
 		return nil, FileInfo{}, err
 	}
-	f, err := os.Open(host)
+	defer sfd.Close()
+	rel, err := relPath(path)
+	if err != nil || rel == "" {
+		return nil, FileInfo{}, ErrNotDir
+	}
+	f, err := openBeneath(sfd, rel, unix.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, FileInfo{}, ErrNotFound
-		}
 		return nil, FileInfo{}, err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, FileInfo{}, err
+		return nil, FileInfo{}, mapPathErr(err)
 	}
 	if st.IsDir() {
 		f.Close()
 		return nil, FileInfo{}, ErrIsDir
 	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, FileInfo{}, ErrWrongKind
+	}
+	// Regular file: O_NONBLOCK has no effect on ordinary reads; the flag
+	// only mattered to make the open itself non-wedging.
 	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
@@ -491,132 +618,190 @@ func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, err
 // atomicWrite stages content to a temp sibling, fsyncs, renames over the
 // target, and fsyncs the directory. A name never resolves to torn content.
 // Caller holds the version CAS; this is the durable part of the write.
-// exclusive=true publishes the staged file with link(2), which fails with
-// EEXIST if anything already occupies the name — the create-only check is
-// atomic against executor-side creates, not just advisory.
+// exclusive=true publishes the staged file with linkat(2), which fails
+// with EEXIST if anything already occupies the name — the create-only
+// check is atomic against executor-side creates, not just advisory.
+// Non-exclusive publish uses renameat2(2), which replaces whatever name
+// exists (including a dangling symlink — A F3) atomically and entirely
+// within the pinned parent directory.
 func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool) (FileInfo, error) {
 	if err := checkReserved(path); err != nil {
 		return FileInfo{}, err
 	}
-	if err := p.ensureScope(scope); err != nil {
-		return FileInfo{}, err
-	}
-	host, err := p.resolve(scope, path)
+	rel, err := relPath(path)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	dir := filepath.Dir(host)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if rel == "" {
+		return FileInfo{}, ErrNotDir
+	}
+	sfd, err := p.scopeDir(scope, true)
+	if err != nil {
 		return FileInfo{}, err
 	}
+	defer sfd.Close()
+	dirRel, name := splitRel(rel)
+	pfd, err := openDirBeneath(sfd, dirRel, true)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer pfd.Close()
 	rnd := make([]byte, 8)
 	if _, err := rand.Read(rnd); err != nil {
 		return FileInfo{}, err
 	}
-	tmp := filepath.Join(dir, stagingPrefix+hex.EncodeToString(rnd))
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	tmp := stagingPrefix + hex.EncodeToString(rnd)
+	tf, err := openBeneath(pfd, tmp,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return FileInfo{}, err
+	if _, err := tf.Write(content); err != nil {
+		tf.Close()
+		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		return FileInfo{}, mapPathErr(err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return FileInfo{}, err
+	if err := tf.Sync(); err != nil {
+		tf.Close()
+		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		return FileInfo{}, mapPathErr(err)
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return FileInfo{}, err
+	if err := tf.Close(); err != nil {
+		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		return FileInfo{}, mapPathErr(err)
 	}
 	if exclusive {
-		err = os.Link(tmp, host)
+		err = unix.Linkat(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0)
 	} else {
-		err = os.Rename(tmp, host)
+		err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0)
 	}
 	if err != nil {
-		os.Remove(tmp)
-		if errors.Is(err, fs.ErrExist) {
-			return FileInfo{}, ErrConflict
-		}
-		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTDIR) {
-			return FileInfo{}, ErrNotDir
-		}
-		return FileInfo{}, err
+		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		return FileInfo{}, mapPublishErr(err, exclusive)
 	}
-	os.Remove(tmp) // link() leaves the staging name; drop it
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
-	}
+	unix.Unlinkat(int(pfd.Fd()), tmp, 0) // linkat leaves the staging name
+	syncDir(pfd)
 	return p.stat(scope, path)
 }
 
+// mapPublishErr translates the kernel's rename/link/linkat errors into
+// contract errors. Distinct from mapPathErr: EEXIST and the kind-mismatch
+// errnos carry API-meaningful semantics.
+func mapPublishErr(err error, exclusive bool) error {
+	switch {
+	case errors.Is(err, unix.EEXIST):
+		if exclusive {
+			return ErrConflict
+		}
+		return ErrNotEmpty // rename dir over non-empty dir
+	case errors.Is(err, unix.ENOTEMPTY):
+		return ErrNotEmpty
+	case errors.Is(err, unix.EISDIR), errors.Is(err, unix.ENOTDIR):
+		return ErrWrongKind
+	case errors.Is(err, unix.ENOENT):
+		return ErrNotFound
+	case errors.Is(err, unix.EINVAL):
+		return ErrEscape // e.g. moving a dir beneath itself
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
+		return ErrAccess
+	default:
+		return err
+	}
+}
+
+// rename moves (scope, from) to (scope, to) beneath the pinned scope dir;
+// both parent directories are resolved in-kernel so neither endpoint can
+// be redirected outside the scope mid-op. noReplace uses
+// renameat2(RENAME_NOREPLACE); the plain form passes flags=0, which unlike
+// os.Rename performs no userspace kind pre-check — the kernel handles
+// dir-over-empty-dir, and returns typed errors for real mismatches.
 func (p *posixRoot) rename(scope, from, to string, noReplace bool) (FileInfo, error) {
 	if err := checkReserved(to); err != nil {
 		return FileInfo{}, err
 	}
-	src, err := p.resolveParent(scope, from)
+	if err := checkReserved(from); err != nil {
+		return FileInfo{}, err
+	}
+	relFrom, err := relPath(from)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	dst, err := p.resolveParent(scope, to)
+	relTo, err := relPath(to)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	if _, err := os.Lstat(src); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return FileInfo{}, ErrNotFound
-		}
-		return FileInfo{}, err
+	if relFrom == "" || relTo == "" {
+		return FileInfo{}, ErrNotDir
 	}
-	if strings.HasPrefix(dst, src+string(filepath.Separator)) {
+	if relTo == relFrom || strings.HasPrefix(relTo, relFrom+"/") {
 		return FileInfo{}, ErrEscape // cannot move a dir beneath itself
 	}
-	// Guard: a non-empty directory rename over an existing non-empty dir is not
-	// atomic on POSIX; the contract does not promise it. Files and empty dirs
-	// rename atomically. noReplace uses renameat2(RENAME_NOREPLACE) so a
-	// racing creator cannot be silently overwritten.
-	var rerr error
+	sfd, err := p.scopeDir(scope, false)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer sfd.Close()
+	srcDir, srcName := splitRel(relFrom)
+	dstDir, dstName := splitRel(relTo)
+	srcPfd, err := openDirBeneath(sfd, srcDir, false)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer srcPfd.Close()
+	dstPfd, err := openDirBeneath(sfd, dstDir, false)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer dstPfd.Close()
+	if _, _, _, _, err := statAt(srcPfd, srcName); err != nil {
+		return FileInfo{}, err
+	}
+	var flags uint
 	if noReplace {
-		rerr = unix.Renameat2(unix.AT_FDCWD, src, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE)
-	} else {
-		rerr = os.Rename(src, dst)
+		flags = unix.RENAME_NOREPLACE
 	}
-	if rerr != nil {
-		if errors.Is(rerr, fs.ErrExist) {
-			return FileInfo{}, ErrConflict
-		}
-		return FileInfo{}, rerr
+	err = unix.Renameat2(int(srcPfd.Fd()), srcName, int(dstPfd.Fd()), dstName, flags)
+	if err != nil {
+		return FileInfo{}, mapPublishErr(err, noReplace)
 	}
-	if d, err := os.Open(filepath.Dir(dst)); err == nil {
-		d.Sync()
-		d.Close()
-	}
+	syncDir(dstPfd)
 	return p.stat(scope, to)
 }
 
 func (p *posixRoot) remove(scope, path string) error {
-	host, err := p.resolveParent(scope, path)
+	rel, err := relPath(path)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(host); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return ErrNotFound
-		}
-		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
-			return ErrNotEmpty
-		}
+	if rel == "" {
+		return ErrNotDir // removing the scope root itself is not an op
+	}
+	sfd, err := p.scopeDir(scope, false)
+	if err != nil {
 		return err
 	}
-	if d, err := os.Open(filepath.Dir(host)); err == nil {
-		d.Sync()
-		d.Close()
+	defer sfd.Close()
+	dirRel, name := splitRel(rel)
+	pfd, err := openDirBeneath(sfd, dirRel, false)
+	if err != nil {
+		return err
 	}
+	defer pfd.Close()
+	err = unix.Unlinkat(int(pfd.Fd()), name, 0)
+	if errors.Is(err, unix.EISDIR) {
+		err = unix.Unlinkat(int(pfd.Fd()), name, unix.AT_REMOVEDIR)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			return ErrNotFound
+		case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
+			return ErrNotEmpty
+		default:
+			return mapPathErr(err)
+		}
+	}
+	syncDir(pfd)
 	return nil
 }
 
@@ -624,49 +809,76 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, error) {
 	if err := checkReserved(path); err != nil {
 		return FileInfo{}, err
 	}
-	if err := p.ensureScope(scope); err != nil {
-		return FileInfo{}, err
-	}
-	host, err := p.resolve(scope, path)
+	rel, err := relPath(path)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	if err := os.MkdirAll(host, 0o755); err != nil {
+	sfd, err := p.scopeDir(scope, true)
+	if err != nil {
 		return FileInfo{}, err
 	}
+	defer sfd.Close()
+	pfd, err := openDirBeneath(sfd, rel, true)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	pfd.Close()
+	syncDir(sfd)
 	return p.stat(scope, path)
-}
-
-// ensureScope creates the scope's root directory lazily on first mutation.
-func (p *posixRoot) ensureScope(scope string) error {
-	dir, err := p.resolve(scope, "")
-	if err != nil {
-		return err
-	}
-	return os.MkdirAll(dir, 0o755)
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.
 // left behind by a SIGKILL mid-write. Run at startup and periodically.
 // Safe while the service is live only because the prefix is reserved.
+// The walk stays fd-relative, so even this background cleanup cannot be
+// redirected outside the root by a racing symlink swap.
 func (p *posixRoot) sweepStaging() {
-	scopes, err := os.ReadDir(p.root)
+	rfd, err := p.rootFD()
+	if err != nil {
+		return
+	}
+	defer rfd.Close()
+	d, err := openBeneath(rfd, ".", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return
+	}
+	names, err := d.Readdirnames(-1)
+	d.Close()
 	if err != nil {
 		return
 	}
 	cutoff := time.Now().Add(-10 * time.Minute)
-	for _, sc := range scopes {
-		if !sc.IsDir() {
+	for _, sc := range names {
+		sd, err := openBeneath(rfd, sc, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
 			continue
 		}
-		filepath.WalkDir(filepath.Join(p.root, sc.Name()), func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() || !strings.HasPrefix(d.Name(), stagingPrefix) {
-				return nil
+		sweepDir(sd, cutoff)
+	}
+}
+
+func sweepDir(dfd *os.File, cutoff time.Time) {
+	defer dfd.Close()
+	names, err := dfd.Readdirnames(-1)
+	if err != nil {
+		return
+	}
+	for _, n := range names {
+		mode, _, mtim, _, err := statAt(dfd, n)
+		if err != nil {
+			continue
+		}
+		if mode.IsDir() {
+			sub, err := openBeneath(dfd, n, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+			if err != nil {
+				continue
 			}
-			if fi, err := d.Info(); err == nil && fi.ModTime().Before(cutoff) {
-				os.Remove(path)
-			}
-			return nil
-		})
+			sweepDir(sub, cutoff)
+			continue
+		}
+		if strings.HasPrefix(n, stagingPrefix) &&
+			time.Unix(0, mtim).Before(cutoff) {
+			unix.Unlinkat(int(dfd.Fd()), n, 0)
+		}
 	}
 }

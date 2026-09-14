@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -15,9 +16,10 @@ import (
 // fakeStore is an in-memory VersionStore for handler tests — it exercises the
 // same CAS semantics (monotonic bump, conflict on stale if_version) without PG.
 type fakeStore struct {
-	vers map[string]int64
-	fps  map[string]string
-	evs  []Event
+	vers   map[string]int64
+	fps    map[string]string
+	evs    []Event
+	obsErr error // injected ObservedVersion failure (f33)
 }
 
 func newFakeStore() *fakeStore {
@@ -138,6 +140,9 @@ func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion
 }
 
 func (f *fakeStore) ObservedVersion(ctx context.Context, scope, path string) (int64, string, error) {
+	if f.obsErr != nil {
+		return 0, "", f.obsErr
+	}
 	return f.vers[scope+"/"+path], f.fps[scope+"/"+path], nil
 }
 
@@ -592,6 +597,167 @@ func TestMountInfoEscapes(t *testing.T) {
 		e, ok := findMount(entries, id)
 		if !ok || e.mountpoint != mp {
 			t.Fatalf("id %d: want mountpoint %q, got %+v", id, mp, e)
+		}
+	}
+}
+
+// --- Operation-boundary tests (f-fabric-cloud-39/40/41, A F1/F2/F3) ---
+
+// f33/A F2: an ObservedVersion failure must surface as a clear 503, never
+// as version 0 / external_change:false.
+func TestStatStoreOutageIs503NotZeroVersion(t *testing.T) {
+	dir := t.TempDir()
+	st := newFakeStore()
+	svc, err := NewAt(dir, st, map[string]map[string]bool{"tok-a": {"ws1": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=a.txt", "tok-a", "hi", map[string]string{"If-Version": "any"})
+	st.obsErr = errors.New("pg down")
+	w := req(t, svc, "GET", "/v1/files/ws1/stat?path=a.txt", "tok-a", "", nil)
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "store_unavailable") {
+		t.Fatalf("stat during outage: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=a.txt", "tok-a", "", nil)
+	if w.Code != 503 {
+		t.Fatalf("read during outage: %d %s", w.Code, w.Body)
+	}
+	st.obsErr = nil
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=a.txt", "tok-a", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":1`) {
+		t.Fatalf("stat after recovery: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=a.txt", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "hi" {
+		t.Fatalf("read after recovery: %d %q", w.Code, w.Body)
+	}
+}
+
+// f34/A F1: a FIFO (or any special file) must be refused fast, and a
+// FIFO swapped in between mount check and open must not wedge the handler.
+func TestSpecialFileRefused(t *testing.T) {
+	svc, dir := testSvc(t)
+	fifo := filepath.Join(dir, "ws1", "pipe")
+	if err := os.MkdirAll(filepath.Dir(fifo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- req(t, svc, "GET", "/v1/files/ws1/read?path=pipe", "tok-a", "", nil)
+	}()
+	select {
+	case w := <-done:
+		if w.Code != 400 || !strings.Contains(w.Body.String(), "wrong_kind") {
+			t.Fatalf("fifo read: %d %s", w.Code, w.Body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fifo read wedged the handler")
+	}
+	w := req(t, svc, "GET", "/v1/files/ws1/stat?path=pipe", "tok-a", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"kind":"special"`) {
+		t.Fatalf("fifo stat should report special, got %d %s", w.Code, w.Body)
+	}
+}
+
+// A F3: a dangling symlink is safe to overwrite — the publish rename
+// replaces the link itself; it is not followed.
+func TestWriteOverDanglingSymlink(t *testing.T) {
+	svc, dir := testSvc(t)
+	link := filepath.Join(dir, "ws1", "dangling")
+	os.MkdirAll(filepath.Dir(link), 0o755)
+	if err := os.Symlink("/nonexistent-target", link); err != nil {
+		t.Fatal(err)
+	}
+	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=dangling", "tok-a", "x", map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("write over dangling symlink: %d %s", w.Code, w.Body)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("symlink should be replaced by a regular file: %v %+v", err, fi)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=dangling", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "x" {
+		t.Fatalf("read: %d %q", w.Code, w.Body)
+	}
+}
+
+// f39/B F1: escaping symlinks are refused at use time by the kernel —
+// RESOLVE_BENEATH cannot be raced by a directory/symlink swap.
+func TestEscapingSymlinkRefused(t *testing.T) {
+	svc, dir := testSvc(t)
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(dir, "ws1"), 0o755)
+	os.Symlink(outside, filepath.Join(dir, "ws1", "out"))
+	for _, op := range []string{"stat", "read", "list"} {
+		w := req(t, svc, "GET", "/v1/files/ws1/"+op+"?path=out/secret", "tok-a", "", nil)
+		if w.Code != 403 {
+			t.Fatalf("%s through escaping symlink: %d %s", op, w.Code, w.Body)
+		}
+	}
+	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=out/newfile", "tok-a", "x", map[string]string{"If-Version": "any"})
+	if w.Code != 403 {
+		t.Fatalf("write through escaping symlink: %d %s", w.Code, w.Body)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "newfile")); !os.IsNotExist(err) {
+		t.Fatal("write escaped the scope root")
+	}
+}
+
+// f41/B F3: directory-over-empty-directory rename succeeds (kernel
+// semantics — os.Rename's userspace pre-check refused this).
+func TestRenameDirOverEmptyDir(t *testing.T) {
+	svc, _ := testSvc(t)
+	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"src/inner"}`, nil)
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=src/inner/f", "tok-a", "c", map[string]string{"If-Version": "any"})
+	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"dst"}`, nil)
+	w := req(t, svc, "POST", "/v1/files/ws1/rename", "tok-a",
+		`{"from":"src","to":"dst","if_version":"any"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("dir-over-empty-dir rename: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=dst/inner/f", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "c" {
+		t.Fatalf("moved content: %d %q", w.Code, w.Body)
+	}
+}
+
+// f41/B F4: kind mismatches report wrong_kind, not a generic error.
+func TestRenameKindMismatch(t *testing.T) {
+	svc, _ := testSvc(t)
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=f", "tok-a", "x", map[string]string{"If-Version": "any"})
+	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"d"}`, nil)
+	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"nonempty/inner"}`, nil)
+	for _, tc := range []struct{ from, to string }{
+		{"f", "d"},          // file over dir
+		{"d", "f"},          // dir over file
+		{"d", "nonempty"},   // dir over non-empty dir
+	} {
+		w := req(t, svc, "POST", "/v1/files/ws1/rename", "tok-a",
+			fmt.Sprintf(`{"from":%q,"to":%q,"if_version":"any"}`, tc.from, tc.to), nil)
+		want := 400
+		code := "wrong_kind"
+		if tc.to == "nonempty" {
+			want, code = 409, "dir_not_empty"
+		}
+		if w.Code != want || !strings.Contains(w.Body.String(), code) {
+			t.Fatalf("rename %s -> %s: want %d %s, got %d %s", tc.from, tc.to, want, code, w.Code, w.Body)
+		}
+	}
+}
+
+// Traversal and absolute paths stay refused under the fd-relative boundary.
+func TestTraversalRefused(t *testing.T) {
+	svc, _ := testSvc(t)
+	for _, p := range []string{"../x", "a/../../x", "..", "/etc/passwd"} {
+		w := req(t, svc, "GET", "/v1/files/ws1/stat?path="+p, "tok-a", "", nil)
+		if w.Code == 200 {
+			t.Fatalf("path %q should not resolve", p)
 		}
 	}
 }

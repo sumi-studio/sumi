@@ -239,6 +239,17 @@ func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVers
 // which for create-only modes uses renameat2(RENAME_NOREPLACE)), and moves
 // the source subtree's version rows to the destination in the same
 // transaction. The event records both from and to.
+//
+// Ordering matters: all destination-side row reconciliation happens BEFORE
+// fn (the irreversible fs move), and the source-descendant move happens
+// after it. If fn fails, the tx rollback restores the deleted dst rows.
+// If the stale `to/*` rows were left for the descendant UPDATE to collide
+// with, the fs move had already committed while the tx rolled back —
+// permanent divergence (final-review B F2).
+//
+// Version lineage: the renamed object keeps its identity, so the source
+// row's version carries forward (+1 for this mutation) instead of
+// restarting at the destination's counter (review A F5).
 func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -246,25 +257,56 @@ func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion
 	}
 	defer tx.Rollback(ctx)
 
+	var fromVer int64
+	var fromFP string
+	var haveFrom bool
+	err = tx.QueryRow(ctx,
+		`SELECT version, fp FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, from).Scan(&fromVer, &fromFP)
+	switch {
+	case err == nil:
+		haveFrom = true
+	case errors.Is(err, pgx.ErrNoRows):
+	default:
+		return 0, FileInfo{}, err
+	}
+
 	newVer, err := bumpVersion(ctx, tx, scope, to, iv, probe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
+
+	// The fs rename replaces the destination subtree wholesale. Drop its
+	// stale descendant rows now — inside the tx, so a failed rename rolls
+	// them back — so the source-descendant move below cannot collide with
+	// rows the disk operation will have erased anyway.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM file_version WHERE scope=$1 AND starts_with(path, $2 || '/')`,
+		scope, to); err != nil {
+		return 0, FileInfo{}, err
+	}
+
 	info, ferr := s.runBounded(fn)
 	if ferr != nil {
 		return 0, FileInfo{}, ferr
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE file_version SET fp=$3 WHERE scope=$1 AND path=$2`,
-		scope, to, info.Fingerprint); err != nil {
-		return 0, FileInfo{}, err
-	}
+
 	// Move version rows of descendants of the renamed path so a directory
-	// rename does not strand children's versions at stale paths.
+	// rename does not strand children's versions at stale paths. Safe now:
+	// nothing under `to/` exists in the table.
 	if _, err := tx.Exec(ctx,
 		`UPDATE file_version SET path = $3 || substr(path, length($2)+1)
 		 WHERE scope=$1 AND starts_with(path, $2 || '/')`,
 		scope, from, to); err != nil {
+		return 0, FileInfo{}, err
+	}
+	finalVer := newVer
+	if haveFrom {
+		finalVer = fromVer + 1
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE file_version SET version=$3, fp=$4 WHERE scope=$1 AND path=$2`,
+		scope, to, finalVer, info.Fingerprint); err != nil {
 		return 0, FileInfo{}, err
 	}
 	if _, err := tx.Exec(ctx,
@@ -274,13 +316,13 @@ func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO file_event (scope, path, from_path, op, version) VALUES ($1,$2,$3,'rename',$4)`,
-		scope, to, from, newVer); err != nil {
+		scope, to, from, finalVer); err != nil {
 		return 0, FileInfo{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, FileInfo{}, err
 	}
-	return newVer, info, nil
+	return finalVer, info, nil
 }
 
 // Remove drops the version row for the removed path and any descendants,

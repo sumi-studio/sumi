@@ -88,7 +88,14 @@ export default {
     const path = url.pathname.replace(/^\/+/, "");
     const slash = path.indexOf("/");
     const bucket = slash === -1 ? path : path.slice(0, slash);
-    const key = slash === -1 ? "" : decodeURIComponent(path.slice(slash + 1));
+    let key = "";
+    if (slash !== -1) {
+      try {
+        key = decodeURIComponent(path.slice(slash + 1));
+      } catch {
+        return s3Error("InvalidArgument", "malformed percent-encoding in key", 400);
+      }
+    }
     if (!bucket) {
       // GET / — ListBuckets. The shim cannot enumerate DO names; return the
       // fixed bucket this deployment serves.
@@ -302,6 +309,7 @@ export class BucketObject {
       ? (url.searchParams.get("continuation-token") ?? "")
       : (url.searchParams.get("marker") ?? "");
     // Over-fetch then fold by delimiter so CommonPrefixes count correctly.
+    const fetchLimit = maxKeys * 4 + 100;
     const rows = this.state.storage.sql
       .exec(
         `SELECT key, size, etag, mtime FROM objects
@@ -310,7 +318,7 @@ export class BucketObject {
         marker,
         prefix.length,
         prefix,
-        maxKeys * 4 + 100,
+        fetchLimit,
       )
       .toArray();
     const contents: string[] = [];
@@ -318,6 +326,9 @@ export class BucketObject {
     let count = 0;
     let truncated = false;
     let lastKey = "";
+    // lastKey is the resume token: the last *consumed* key. Folded rows
+    // count as consumed (their prefix is already emitted), so resuming
+    // after them neither re-emits a straddling prefix nor skips rows.
     for (const row of rows) {
       const k = String(row.key);
       let commonPrefix: string | null = null;
@@ -335,6 +346,7 @@ export class BucketObject {
           common.push(commonPrefix);
           count++;
         }
+        lastKey = k;
         continue;
       }
       if (count >= maxKeys) {
@@ -350,7 +362,8 @@ export class BucketObject {
       lastKey = k;
       count++;
     }
-    truncated = truncated || rows.length > 0 && false;
+    // Hit the over-fetch limit without reaching maxKeys: there may be more.
+    if (!truncated && rows.length >= fetchLimit) truncated = true;
     const name = xmlEscape(url.searchParams.get("__bucket") ?? "");
     const cp = common
       .map((p) => `<CommonPrefixes><Prefix>${xmlEscape(p)}</Prefix></CommonPrefixes>`)
@@ -368,6 +381,7 @@ export class BucketObject {
         `<ListBucketResult><Name>${name}</Name><Prefix>${xmlEscape(prefix)}</Prefix>` +
         `<Marker>${xmlEscape(marker)}</Marker><MaxKeys>${maxKeys}</MaxKeys>` +
         `<IsTruncated>${truncated}</IsTruncated>${contents.join("")}${cp}` +
+        (truncated ? `<NextMarker>${xmlEscape(lastKey)}</NextMarker>` : "") +
         `</ListBucketResult>`;
     return new Response(body, {
       headers: { "content-type": "application/xml" },
@@ -376,7 +390,12 @@ export class BucketObject {
 
   private copyObject(copySource: string, destKey: string): Response {
     // x-amz-copy-source: /bucket/key or bucket/key, URL-encoded possibly.
-    let src = decodeURIComponent(copySource).replace(/^\/+/, "");
+    let src: string;
+    try {
+      src = decodeURIComponent(copySource).replace(/^\/+/, "");
+    } catch {
+      return s3Error("InvalidArgument", "malformed percent-encoding in copy source", 400);
+    }
     const slash = src.indexOf("/");
     if (slash !== -1) src = src.slice(slash + 1); // same-bucket copy assumed
     const meta = this.state.storage.sql

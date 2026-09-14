@@ -31,6 +31,17 @@ info:
     kernel-coherent local filesystems (ext4, xfs, tmpfs, ...) passes;
     other FUSE and network filesystems are refused. REQUIRE_MOUNT=0
     disables the gate for simple local operation.
+    Operation boundary: every path operation is resolved in-kernel beneath
+    a pinned scope directory descriptor (openat2 RESOLVE_BENEATH, Linux
+    >= 5.6). A directory<->symlink swap racing a request cannot redirect
+    it outside the scope — the kernel re-resolves every component at use
+    time and fails closed with 403 escape_denied. A swap can still change
+    which in-scope object an op targets (ordinary concurrent-modification
+    semantics), but never escapes the scope root. Paths containing ".."
+    and absolute escapes remain refused; only single-scope namespaces are
+    reachable. Reads serve regular files only: special files (fifo,
+    socket, device) stat as kind=special and read as 400 wrong_kind —
+    the open is non-blocking, so a FIFO can never wedge a handler.
 paths:
   /v1/files/{scope}/stat:
     get:
@@ -43,7 +54,7 @@ paths:
           description: kind, size, mtime_ns, version, fingerprint, external_change
         '403': { description: No grant for scope, or path escapes scope }
         '404': { description: Path not found }
-        '503': { description: Namespace root not mounted (mount_unavailable) }
+        '503': { description: mount_unavailable | store_unavailable }
   /v1/files/{scope}/list:
     get:
       operationId: fileList
@@ -70,8 +81,9 @@ paths:
             File bytes. X-File-Version carries the last service-minted
             version; X-External-Change: true marks content changed outside
             the API since that version.
-        '400': { description: Path is a directory }
+        '400': { description: wrong_kind (directory or special file) }
         '404': { description: Path not found }
+        '503': { description: mount_unavailable | store_unavailable }
   /v1/files/{scope}/write:
     put:
       operationId: fileWrite
@@ -88,11 +100,20 @@ paths:
       operationId: fileRename
       description: >-
         JSON body { "from": "...", "to": "...", "if_version": any|none|n }.
-        Atomic within the same scope.
+        Atomic within the same scope (kernel renameat2 beneath the pinned
+        scope descriptor). A directory may rename over an EMPTY directory;
+        file-over-dir and dir-over-file are 400 wrong_kind; dir over a
+        non-empty dir is 409 dir_not_empty; if_version "none" makes the
+        destination check atomic (RENAME_NOREPLACE -> 409 external_change/
+        version_conflict). The renamed object keeps its version lineage:
+        the destination version is the source version + 1, and descendant
+        version rows move with the subtree. A failed rename leaves both
+        filesystem and version rows untouched.
       responses:
         '200': { description: '{ "version": n }' }
+        '400': { description: wrong_kind on file/dir kind mismatch }
         '404': { description: Source not found }
-        '409': { description: version_conflict }
+        '409': { description: version_conflict | dir_not_empty | external_change }
   /v1/files/{scope}/mkdir:
     post:
       operationId: fileMkdir

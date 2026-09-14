@@ -171,7 +171,14 @@ func (s *Service) handleStat(w http.ResponseWriter, r *http.Request, scope, path
 		s.mapErr(w, err)
 		return
 	}
-	ver, recordedFP, _ := s.store.ObservedVersion(r.Context(), scope, path)
+	// A store error must not degrade to version:0/external_change:false —
+	// that would report "clean" exactly when the record cannot be checked.
+	ver, recordedFP, verr := s.store.ObservedVersion(r.Context(), scope, path)
+	if verr != nil {
+		writeErr(w, 503, "store_unavailable",
+			"version store unavailable; safe to retry")
+		return
+	}
 	changed := ver > 0 && recordedFP != "" && recordedFP != info.Fingerprint
 	writeJSON(w, map[string]any{
 		"kind":            info.Kind,
@@ -234,7 +241,12 @@ func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path
 	if length >= 0 && length < n {
 		n = length
 	}
-	ver, recordedFP, _ := s.store.ObservedVersion(r.Context(), scope, path)
+	ver, recordedFP, verr := s.store.ObservedVersion(r.Context(), scope, path)
+	if verr != nil {
+		writeErr(w, 503, "store_unavailable",
+			"version store unavailable; safe to retry")
+		return
+	}
 	changed := ver > 0 && recordedFP != "" && recordedFP != info.Fingerprint
 	w.Header().Set("X-File-Version", strconv.FormatInt(ver, 10))
 	if changed {
@@ -404,8 +416,10 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "escape_denied", "path escapes scope root")
 	case errors.Is(err, ErrReserved):
 		writeErr(w, 400, "reserved_name", "name is reserved for service staging")
-	case errors.Is(err, ErrIsDir), errors.Is(err, ErrNotDir):
+	case errors.Is(err, ErrIsDir), errors.Is(err, ErrNotDir), errors.Is(err, ErrWrongKind):
 		writeErr(w, 400, "wrong_kind", err.Error())
+	case errors.Is(err, ErrAccess):
+		writeErr(w, 403, "permission_denied", "filesystem denied the operation")
 	case errors.Is(err, ErrNotEmpty):
 		writeErr(w, 409, "dir_not_empty", err.Error())
 	case errors.Is(err, ErrUnavailable):
