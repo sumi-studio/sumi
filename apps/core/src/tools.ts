@@ -5,6 +5,8 @@ import type { ToolSpec } from "./provider.ts";
  * call through the state service operation ledger. For the slice, only
  * state-internal tools are registered: their effects commit atomically
  * inside the claim transaction (no crash window between effect and receipt).
+ * `messaging.send` is state-internal too — its effect is delegated to the
+ * Messaging domain, which applies the append in the same claim transaction.
  *
  * External-side-effect tools (send email, post to Slack, call a paid API)
  * are deliberately NOT in this registry — they need the authorized-tool
@@ -33,6 +35,27 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         },
       },
       required: ["wake_at"],
+    },
+  },
+  {
+    internal: true,
+    name: "messaging.send",
+    description:
+      "Post a message into a shared Messaging place (channel, DM, or group DM) as yourself, so the people and secretaries there see it. Use the place_id shown in the input's marker; pass its message_id as reply_to to answer that message directly. This is for genuinely replying — do not post merely to acknowledge ambient messages.",
+    parameters: {
+      type: "object",
+      properties: {
+        place_id: {
+          type: "string",
+          description: "the Messaging place id to post into",
+        },
+        content: { type: "string", description: "the message text" },
+        reply_to: {
+          type: "string",
+          description: "optional message_id in the same place to reply to",
+        },
+      },
+      required: ["place_id", "content"],
     },
   },
   {

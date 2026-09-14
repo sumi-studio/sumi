@@ -83,6 +83,13 @@ evidence, so no lost response, retry or partition creates two writers:
   `core_schedules`, `core_outbox`, `core_memory_chunks`, with exactly the
   columns in `contract.go`. Unknown or missing columns are refused on both
   sides.
+- `core_inputs.admission_seq` is the one value a bundle carries but the
+  destination does not keep: it backs a table-global identity sequence, so
+  the destination allocates a fresh value per row in bundle order instead.
+  The carried values are the order witness — they must be positive and
+  strictly increasing — and the freshly allocated ones preserve that order
+  while never colliding with or rewinding the destination's other
+  admissions.
 - Memory travels as the secretary's own: `core_memory_chunks` carries the
   sealed journal ranges with their `chunk_seq` locators, accepted replacement
   text (`applied` and shelved `prepared`), the `kept`/`failed` verdicts, and
