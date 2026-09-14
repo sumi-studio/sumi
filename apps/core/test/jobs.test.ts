@@ -62,7 +62,12 @@ class ScriptedProvider implements ModelProvider {
     ).entries()) {
       yield {
         type: "tool_call",
-        call: { id: `call-${round}-${i}`, name: c.tool, arguments: c.request },
+        call: {
+          id: `call-${round}-${i}`,
+          name: c.tool,
+          route: "normal",
+          arguments: c.request,
+        },
       };
     }
     yield { type: "done", usage: {} };
@@ -549,6 +554,7 @@ test("a job ending while its request backs off is explained and resumed with its
           call: {
             id: "call-0-0",
             name: "job.start",
+            route: "normal",
             arguments: { command: ["echo", "hi"] },
           },
         };

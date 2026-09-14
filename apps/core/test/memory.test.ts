@@ -78,7 +78,12 @@ class MemoryProvider implements ModelProvider {
     if (this.branchToolCall) {
       yield {
         type: "tool_call",
-        call: { id: "b-0", name: "journal.note", arguments: { text: "x" } },
+        call: {
+          id: "b-0",
+          name: "journal.note",
+          route: "normal",
+          arguments: { text: "x" },
+        },
       };
       yield { type: "done", usage: {} };
       return;

@@ -130,7 +130,7 @@ func writeRows(ctx context.Context, tx pgx.Tx, personaID string, w io.Writer) (m
 	counts := map[string]int64{}
 	var persona string
 	if err := tx.QueryRow(ctx, `
-		SELECT jsonb_build_object('persona_id', persona_id, 'display_name', display_name, 'created_at', created_at)::text
+		SELECT jsonb_build_object('persona_id', persona_id, 'display_name', display_name, 'created_at', created_at, 'model_intent', model_intent)::text
 		FROM core_personas WHERE persona_id = $1`, personaID).Scan(&persona); err != nil {
 		return nil, err
 	}
@@ -253,10 +253,14 @@ func (t table) insertSQL() string {
 }
 
 // The destination binds the persona to its own authenticated human; the
-// source's human binding is never read from a bundle.
+// source's human binding is never read from a bundle. The carried
+// model_intent is non-secret preference only: the destination enforces it
+// as needs_rebinding until its bound human selects a matching connection
+// (or the intent is explicitly cleared).
 const personaInsertSQL = `
-	INSERT INTO core_personas (persona_id, human_id, display_name, created_at, authority, transfer_id)
-	SELECT (d->>'persona_id')::uuidv7, $2, d->>'display_name', (d->>'created_at')::timestamptz, 'staged', $3
+	INSERT INTO core_personas (persona_id, human_id, display_name, created_at, model_intent, authority, transfer_id)
+	SELECT (d->>'persona_id')::uuidv7, $2, d->>'display_name', (d->>'created_at')::timestamptz,
+		NULLIF(d->>'model_intent', 'null')::jsonb, 'staged', $3
 	FROM (SELECT $1::jsonb AS d) r`
 
 // Import stages a bundle addressed to this placement. Everything happens in
@@ -273,9 +277,20 @@ const personaInsertSQL = `
 // overwritten or duplicated. The same transfer imported again with identical
 // content and the same human_id is answered with the recorded receipt
 // (created=false); a different human_id is a conflict, not a silent rebind.
-func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Receipt, bool, error) {
+// sameHuman is the importing operator's assertion that the bound
+// destination human is the same authority that decided the bundle's
+// approvals at the source. Without it, an approved-but-unconsumed grant —
+// consent recorded under a different account — is re-pended at import:
+// the original decision is preserved in prior_* as provenance, and the
+// destination's bound human must decide again before the effect runs.
+// Decided-and-consumed and denied approvals are receipts/history and keep
+// their state; pending approvals stay pending either way.
+func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, sameHuman bool) (Receipt, bool, error) {
 	if humanID != nil && !uuidv7Re.MatchString(*humanID) {
 		return Receipt{}, false, fmt.Errorf("%w: human_id must be a uuidv7", ErrBadRequest)
+	}
+	if sameHuman && humanID == nil {
+		return Receipt{}, false, fmt.Errorf("%w: same_human requires human_id — the assertion names which human continues the authority", ErrBadRequest)
 	}
 	br := bufio.NewReaderSize(r, 1<<16)
 	h := sha256.New()
@@ -448,6 +463,10 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		if prior.ContentSHA256 != digest {
 			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with different content", ErrTransferConflict, hdr.TransferID)
 		}
+		if prior.SameHuman != sameHuman {
+			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with same_human=%t; the staged authority decision is fixed",
+				ErrTransferConflict, hdr.TransferID, prior.SameHuman)
+		}
 		return prior, false, tx.Commit(ctx)
 	}
 
@@ -464,12 +483,34 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		hdr.PersonaID, hdr.Cut.GenerationHighWater, sealHolder(hdr.TransferID)); err != nil {
 		return Receipt{}, false, fmt.Errorf("write lease epoch floor: %w", err)
 	}
+	// Validate the cut as shipped before any destination-side transform:
+	// the bundle must be coherent in the state the source actually sealed.
 	violations, err := verifyCut(ctx, tx, hdr.PersonaID)
 	if err != nil {
 		return Receipt{}, false, err
 	}
 	if len(violations) > 0 {
 		return Receipt{}, false, fmt.Errorf("%w: %s", ErrIntegrity, describe(violations))
+	}
+	if !sameHuman {
+		// Consent is identity-scoped: a grant decided by the source's human
+		// does not authorize a different destination account. The grant is
+		// re-pended — the original decision moves to prior_* as provenance —
+		// so the destination's bound human decides before the effect runs,
+		// and the operation can neither execute under borrowed authority
+		// nor be silently dropped or denied. The result is a pending
+		// approval on an awaiting operation, already a coherent cut state.
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_tool_approvals
+			SET prior_decision = decision, prior_decided_by_kind = decided_by_kind,
+				prior_decided_by_id = decided_by_id, prior_decided_at = decided_at,
+				status = 'pending', decision = NULL, decision_id = NULL,
+				decided_by_kind = NULL, decided_by_id = NULL, decided_at = NULL,
+				provenance = NULL
+			WHERE persona_id = $1 AND status = 'approved' AND consumed_at IS NULL`,
+			hdr.PersonaID); err != nil {
+			return Receipt{}, false, fmt.Errorf("re-pend cross-authority grants: %w", err)
+		}
 	}
 	rows, cont, cut, err := summarize(ctx, tx, hdr.PersonaID)
 	if err != nil {
@@ -491,6 +532,7 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		FormatVersion: hdr.FormatVersion,
 		DestinationID: hdr.DestinationID,
 		HumanID:       humanID,
+		SameHuman:     sameHuman,
 		ContentSHA256: digest,
 		SealedAt:      hdr.SealedAt.UTC(),
 		Cut:           hdr.Cut,

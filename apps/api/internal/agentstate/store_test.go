@@ -192,10 +192,7 @@ func TestCrashMidTurnRecovery(t *testing.T) {
 	// Writer dies mid-turn (lease expires; no commit).
 	time.Sleep(40 * time.Millisecond)
 
-	l2, err := s.AcquireWriter(ctx, pa, "gen2", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire gen2: %v", err)
-	}
+	l2 := acquireAfterExpiry(t, s, pa, "gen2")
 	rec, err := s.Recover(ctx, pa, l2.Generation)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -656,16 +653,16 @@ func TestOperationIdempotency(t *testing.T) {
 	wake := time.Now().Add(-time.Second).UTC()
 	req := map[string]any{"schedule_id": "s-1", "wake_at": wake.Format(time.RFC3339Nano),
 		"payload": map[string]any{"note": "ping"}}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Request: req})
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal", Request: req})
 
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-1", "schedule.set", 0, req)
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
 	// Replay after lost response: same plan position and the identical
 	// request returns the stored op — even under a new caller operation_id.
-	op2, fresh2, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	op2, _, fresh2, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-2", "schedule.set", 0, req)
 	if err != nil || fresh2 || op2.OperationID != "op-1" || op2.Status != "done" {
 		t.Fatalf("replay claim: %+v fresh=%v err=%v", op2, fresh2, err)
@@ -673,7 +670,7 @@ func TestOperationIdempotency(t *testing.T) {
 	// A replayed position carrying a different request is a contract
 	// violation — the stored receipt must not be returned for an effect
 	// that never ran (and it is off-plan besides).
-	_, _, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	_, _, _, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-3", "schedule.set", 0,
 		map[string]any{"schedule_id": "s-1", "wake_at": wake.Format(time.RFC3339Nano)})
 	if !errors.Is(err, ErrTurnConflict) {
@@ -713,8 +710,8 @@ func TestJournalNoteTool(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "remember this"}})
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "remember this"}})
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-n", "journal.note", 0, map[string]any{"text": "remember this"})
 	if err != nil || !fresh || op.Status != "done" || op.Response["seq"] == nil {
 		t.Fatalf("note claim: %+v fresh=%v err=%v", op, fresh, err)
@@ -962,7 +959,7 @@ func TestClaimOperationTurnBinding(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 	// No turn at all.
-	if _, _, err := s.ClaimOperation(ctx, pa, "ghost", lease.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "ghost", lease.Generation,
 		"op-1", "journal.note", 0, map[string]any{"text": "x"}); !errors.Is(err, ErrTurnNotFound) {
 		t.Fatalf("claim on missing turn err = %v, want ErrTurnNotFound", err)
 	}
@@ -975,17 +972,17 @@ func TestClaimOperationTurnBinding(t *testing.T) {
 	}
 	// Running turn but no recorded plan: claims are not allowed before the
 	// decision is durable.
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-2", "journal.note", 0, map[string]any{"text": "x"}); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("claim without plan err = %v, want ErrTurnConflict", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "x"}})
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "x"}})
 	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{Outcome: "complete"}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	// Finished turn.
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-3", "journal.note", 0, map[string]any{"text": "x"}); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("claim on finished turn err = %v, want ErrTurnConflict", err)
 	}
@@ -1009,8 +1006,8 @@ func TestUnknownToolRejected(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "http.post", Request: map[string]any{"url": "https://x"}})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "http.post", Route: "normal", Request: map[string]any{"url": "https://x"}})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-1", "http.post", 0, map[string]any{"url": "https://x"}); !errors.Is(err, ErrUnknownTool) {
 		t.Fatalf("unknown tool err = %v, want ErrUnknownTool", err)
 	}
@@ -1035,9 +1032,9 @@ func TestDispatchClampsCallerNow(t *testing.T) {
 	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set",
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal",
 		Request: map[string]any{"schedule_id": "far", "wake_at": future.Format(time.RFC3339Nano)}})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "schedule.set", 0,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "schedule.set", 0,
 		map[string]any{"schedule_id": "far", "wake_at": future.Format(time.RFC3339Nano)}); err != nil {
 		t.Fatalf("schedule.set: %v", err)
 	}
@@ -1100,8 +1097,8 @@ func TestPlanSaveReplayConflict(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	dec := Decision{Text: "hi there", Calls: []PlanCall{
-		{Tool: "journal.note", Request: map[string]any{"text": "n1"}},
-		{Tool: "schedule.set", Request: map[string]any{"schedule_id": "s-9",
+		{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "n1"}},
+		{Tool: "schedule.set", Route: "normal", Request: map[string]any{"schedule_id": "s-9",
 			"wake_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}},
 	}, Usage: map[string]any{"input_tokens": 7}}
 	p, created, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec)
@@ -1156,19 +1153,16 @@ func TestPlanContinuesAcrossRecovery(t *testing.T) {
 		t.Fatalf("load gen1: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", l1.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "first"}},
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "second"}})
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "first"}},
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "second"}})
 	// First effect executes, then the writer dies mid-turn.
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
 		"op-a", "journal.note", 0, map[string]any{"text": "first"}); err != nil {
 		t.Fatalf("claim 0 gen1: %v", err)
 	}
 	time.Sleep(40 * time.Millisecond)
 
-	l2, err := s.AcquireWriter(ctx, pa, "gen2", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire gen2: %v", err)
-	}
+	l2 := acquireAfterExpiry(t, s, pa, "gen2")
 	if _, err := s.Recover(ctx, pa, l2.Generation); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
@@ -1182,13 +1176,13 @@ func TestPlanContinuesAcrossRecovery(t *testing.T) {
 	}
 	// Position 0 replays attempt 1's receipt under a fresh caller
 	// operation_id — server-derived identity means no second effect.
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
 		"op-b", "journal.note", 0, map[string]any{"text": "first"})
 	if err != nil || fresh || op.OperationID != "op-a" {
 		t.Fatalf("replay claim gen2: %+v fresh=%v err=%v", op, fresh, err)
 	}
 	// Position 1 executes exactly once.
-	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+	if _, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
 		"op-c", "journal.note", 1, map[string]any{"text": "second"}); err != nil || !fresh {
 		t.Fatalf("claim 1 gen2: fresh=%v err=%v", fresh, err)
 	}
@@ -1227,7 +1221,7 @@ func TestClaimPlanBinding(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "planned"}})
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "planned"}})
 	for _, tc := range []struct {
 		name    string
 		idx     int
@@ -1240,13 +1234,13 @@ func TestClaimPlanBinding(t *testing.T) {
 		{"index out of range", 1, "journal.note", map[string]any{"text": "planned"}, ErrTurnConflict},
 		{"negative index", -1, "journal.note", map[string]any{"text": "planned"}, ErrBadRequest},
 	} {
-		if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 			"op-"+tc.name, tc.tool, tc.idx, tc.req); !errors.Is(err, tc.wantErr) {
 			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.wantErr)
 		}
 	}
 	// On-plan call executes.
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-ok", "journal.note", 0, map[string]any{"text": "planned"})
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("on-plan claim: %+v fresh=%v err=%v", op, fresh, err)
@@ -1272,14 +1266,14 @@ func TestServerDerivedClaimIdentity(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "once"}})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "once"}})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-first", "journal.note", 0, map[string]any{"text": "once"}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	// Same planned call, different caller operation_id: replays the stored
 	// receipt — never a second effect.
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-second", "journal.note", 0, map[string]any{"text": "once"})
 	if err != nil || fresh || op.OperationID != "op-first" {
 		t.Fatalf("identity replay: %+v fresh=%v err=%v", op, fresh, err)
@@ -1319,8 +1313,8 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "keep"}})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "keep"}})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-1", "journal.note", 0, map[string]any{"text": "keep"}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -1341,10 +1335,29 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 		t.Fatalf("plan lost across retryable fail: %+v", load.Plan)
 	}
 	// The already-executed call replays its receipt on the new attempt.
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
 		"op-2", "journal.note", 0, map[string]any{"text": "keep"})
 	if err != nil || fresh || op.OperationID != "op-1" {
 		t.Fatalf("retry replay: %+v fresh=%v err=%v", op, fresh, err)
+	}
+}
+
+// acquireAfterExpiry waits out a short-lived lease and acquires under the
+// new holder. Lease expiry is judged on the database clock — which can step
+// under a loaded host — so a fixed client-side sleep is not proof the lease
+// is dead; poll until the store agrees.
+func acquireAfterExpiry(t *testing.T, s *Store, pa, holder string) WriterLease {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		l, err := s.AcquireWriter(context.Background(), pa, holder, time.Minute)
+		if err == nil {
+			return l
+		}
+		if !errors.Is(err, ErrWriterHeld) || time.Now().After(deadline) {
+			t.Fatalf("acquire after lease expiry: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -1368,18 +1381,15 @@ func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
 		t.Fatalf("load gen1: %v", err)
 	}
 	mustPlan(t, s, pa, "t-1", l1.Generation,
-		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "r0-note"}})
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "r0-note"}})
 	// The round-0 effect commits; the writer dies before consulting round 1.
-	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
+	if _, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
 		"op-a", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || !fresh {
 		t.Fatalf("claim gen1: fresh=%v err=%v", fresh, err)
 	}
 	time.Sleep(40 * time.Millisecond)
 
-	l2, err := s.AcquireWriter(ctx, pa, "gen2", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire gen2: %v", err)
-	}
+	l2 := acquireAfterExpiry(t, s, pa, "gen2")
 	if _, err := s.Recover(ctx, pa, l2.Generation); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
@@ -1388,20 +1398,20 @@ func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
 		t.Fatalf("load gen2: %+v err=%v", load, err)
 	}
 	// Position 0 replays under the new attempt.
-	if op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+	if op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
 		"op-b", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || fresh || op.OperationID != "op-a" {
 		t.Fatalf("replay gen2: fresh=%v err=%v", fresh, err)
 	}
 	// The new attempt appends round 1 to the same durable record.
 	p, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
 		Decision{Text: "final reply", Calls: []PlanCall{
-			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+			{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "r1-note"}},
 		}})
 	if err != nil || !created || len(p.Plan) != 2 {
 		t.Fatalf("append round 1: %+v created=%v err=%v", p, created, err)
 	}
 	// Round 1's call is flat position 1 — it claims and executes once.
-	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+	if _, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
 		"op-c", "journal.note", 1, map[string]any{"text": "r1-note"}); err != nil || !fresh {
 		t.Fatalf("claim flat pos 1: fresh=%v err=%v", fresh, err)
 	}
@@ -1417,7 +1427,7 @@ func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
 	// Identical resend of round 1 replays.
 	if _, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
 		Decision{Text: "final reply", Calls: []PlanCall{
-			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+			{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "r1-note"}},
 		}}); err != nil || created {
 		t.Fatalf("resend round 1: created=%v err=%v", created, err)
 	}
@@ -1451,7 +1461,7 @@ func TestDeterministicToolDataRejected(t *testing.T) {
 	}
 	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0,
 		Decision{Text: "ok", Calls: []PlanCall{
-			{Tool: "journal.note", Request: map[string]any{"text": "a\x00b"}},
+			{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "a\x00b"}},
 		}}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL request savePlan err = %v, want ErrBadRequest", err)
 	}
@@ -1463,17 +1473,17 @@ func TestDeterministicToolDataRejected(t *testing.T) {
 		"miss_policy": "bogus",
 	}
 	mustPlan(t, s, pa, "t-1", lease.Generation,
-		PlanCall{Tool: "schedule.set", Request: badPolicyReq})
+		PlanCall{Tool: "schedule.set", Route: "normal", Request: badPolicyReq})
 
 	// A plan-valid but semantically invalid argument (miss_policy not in
 	// the enum) is rejected as a bad request, not a constraint 500.
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-bad-policy", "schedule.set", 0, badPolicyReq); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("bogus miss_policy claim err = %v, want ErrBadRequest", err)
 	}
 	// A NUL in the claim request is a 400 before plan binding — it can
 	// never match or execute.
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-nul", "journal.note", 0,
 		map[string]any{"text": "a\u0000b"}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL claim err = %v, want ErrBadRequest", err)
@@ -1507,8 +1517,8 @@ func TestScheduleSetIDReuse(t *testing.T) {
 	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
 		t.Fatalf("load t-1: %v", err)
 	}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal", Request: req1})
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
 		"op-1", "schedule.set", 0, req1)
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("initial schedule.set: %+v fresh=%v err=%v", op, fresh, err)
@@ -1532,8 +1542,8 @@ func TestScheduleSetIDReuse(t *testing.T) {
 		"payload":     map[string]any{"text": "hi"},
 		"miss_policy": "coalesce",
 	}
-	mustPlan(t, s, pa, "t-2", lease.Generation, PlanCall{Tool: "schedule.set", Request: req2})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
+	mustPlan(t, s, pa, "t-2", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal", Request: req2})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
 		"op-2", "schedule.set", 0, req2); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("conflicting reuse err = %v, want ErrBadRequest", err)
 	}
@@ -1561,8 +1571,8 @@ func TestScheduleSetIDReuse(t *testing.T) {
 	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-3", 10); err != nil {
 		t.Fatalf("load t-3: %v", err)
 	}
-	mustPlan(t, s, pa, "t-3", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
-	op, fresh, err = s.ClaimOperation(ctx, pa, "t-3", lease.Generation,
+	mustPlan(t, s, pa, "t-3", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal", Request: req1})
+	op, _, fresh, err = s.ClaimOperation(ctx, pa, "t-3", lease.Generation,
 		"op-3", "schedule.set", 0, req1)
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("identical pending reuse: %+v fresh=%v err=%v", op, fresh, err)
@@ -1590,8 +1600,8 @@ func TestScheduleSetIDReuse(t *testing.T) {
 	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-4", 10); err != nil {
 		t.Fatalf("load t-4: %v", err)
 	}
-	mustPlan(t, s, pa, "t-4", lease.Generation, PlanCall{Tool: "schedule.set", Request: req1})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-4", lease.Generation,
+	mustPlan(t, s, pa, "t-4", lease.Generation, PlanCall{Tool: "schedule.set", Route: "normal", Request: req1})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-4", lease.Generation,
 		"op-4", "schedule.set", 0, req1); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("fired schedule reuse err = %v, want ErrBadRequest", err)
 	}

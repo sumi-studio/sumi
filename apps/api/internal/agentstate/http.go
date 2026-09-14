@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 )
 
 // uuidv7Re matches the uuidv7 domain: malformed persona ids in the path are
@@ -37,10 +38,18 @@ type Server struct {
 	store   *Store
 	secret  []byte
 	maxBody int64
+	conns   *modelconnections.Store
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
 	return &Server{store: NewStore(pool), secret: []byte(adminSecret), maxBody: 1 << 20}
+}
+
+// SetModelConnections wires the user model-connection store so
+// GET .../model can resolve the persona's explicit selection. Without it
+// the route reports "unset" rather than guessing at a provider.
+func (s *Server) SetModelConnections(conns *modelconnections.Store) {
+	s.conns = conns
 }
 
 // Store exposes the state store for in-process integrations hosted on the
@@ -106,6 +115,23 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/operations/{operation}/complete", s.completeOperation)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/schedules/dispatch", s.dispatchSchedules)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/outbox", s.outbox)
+	// The executable-tool surface: the model is offered exactly this set, so
+	// a store without a delegated effect registered (e.g. no Messaging) never
+	// advertises a call it could only refuse.
+	mux.HandleFunc("GET /internal/core/personas/{persona}/tools", s.listTools)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals", s.listApprovals)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals/{approval}", s.getApproval)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/approvals/{approval}/decision", s.decideApproval)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/model", s.modelBinding)
+	// Binding a carried persona to a destination human is an account-level
+	// act, not a persona-scoped one — admin-authenticated like persona
+	// creation and approval decisions. Works on staged (unbound import)
+	// and active-unbound personas; a bound persona is never silently
+	// rebound.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/bind", s.bindHuman)
+	// The carried model intent is preference, not a credential: the
+	// admin's explicit "start fresh here" escape from needs_rebinding.
+	mux.HandleFunc("DELETE /internal/core/personas/{persona}/model/intent", s.clearModelIntent)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/memory", s.memoryStatus)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/maintain", s.memoryMaintain)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/claim", s.claimMemoryChunk)
@@ -178,14 +204,18 @@ func storeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
-		errors.Is(err, ErrJobNotFound), errors.Is(err, ErrChunkNotFound):
+		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound),
+		errors.Is(err, ErrChunkNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
-		errors.Is(err, ErrPersonaInactive), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
+		errors.Is(err, ErrApprovalConflict), errors.Is(err, ErrPersonaInactive),
+		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
 		errors.Is(err, ErrMemoryConflict):
 		writeError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool):
+	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool), errors.Is(err, ErrApprovalDecidedBy):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrApprovalForbidden):
+		writeError(w, http.StatusForbidden, err.Error())
 	case isDataError(err):
 		// Deterministic data errors (class 22, 23514) can never succeed on
 		// retry; report them as 400, not a transient-looking 500.
@@ -236,6 +266,58 @@ func (s *Server) createPersona(w http.ResponseWriter, r *http.Request) {
 		"created":       created,
 		"persona_token": s.PersonaToken(p.PersonaID),
 	})
+}
+
+// bindHuman is the reachable finalization for a persona staged or active
+// without a human: the admin binds the destination's authenticated human
+// so pending decisions and model rebinding become decidable.
+func (s *Server) bindHuman(w http.ResponseWriter, r *http.Request) {
+	personaID := r.PathValue("persona")
+	if !uuidv7Re.MatchString(personaID) {
+		writeError(w, http.StatusBadRequest, "persona must be a uuidv7")
+		return
+	}
+	if !s.adminOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		HumanID string `json:"human_id"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !uuidv7Re.MatchString(req.HumanID) {
+		writeError(w, http.StatusBadRequest, "human_id must be a uuidv7")
+		return
+	}
+	p, err := s.store.BindHuman(r.Context(), personaID, req.HumanID)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"persona": p})
+}
+
+// clearModelIntent removes a carried model intent: the destination
+// operator's explicit choice to start fresh instead of rebinding. The
+// persona falls back to ordinary unset semantics — never to a connection
+// no one selected.
+func (s *Server) clearModelIntent(w http.ResponseWriter, r *http.Request) {
+	personaID := r.PathValue("persona")
+	if !uuidv7Re.MatchString(personaID) {
+		writeError(w, http.StatusBadRequest, "persona must be a uuidv7")
+		return
+	}
+	if !s.adminOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.store.ClearModelIntent(r.Context(), personaID); err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
 }
 
 func (s *Server) personaState(w http.ResponseWriter, r *http.Request) {
@@ -547,13 +629,13 @@ func (s *Server) claimOperation(w http.ResponseWriter, r *http.Request) {
 	if !requireGen(w, req.Generation) {
 		return
 	}
-	op, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
+	op, approval, fresh, err := s.store.ClaimOperation(r.Context(), personaID, req.TurnID, req.Generation,
 		req.OperationID, req.Tool, *req.CallIndex, req.Request)
 	if err != nil {
 		storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"operation": op, "fresh": fresh})
+	writeJSON(w, http.StatusOK, map[string]any{"operation": op, "approval": approval, "fresh": fresh})
 }
 
 func (s *Server) completeOperation(w http.ResponseWriter, r *http.Request) {
@@ -762,6 +844,15 @@ func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"outbox": entries})
+}
+
+// listTools reports the tools this store can execute for the persona — the
+// contract the secretary filters its model-visible specs against.
+func (s *Server) listTools(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.scope(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": s.store.ClaimableTools()})
 }
 
 // --- jobs (M09): secretary-independent background executions -------------

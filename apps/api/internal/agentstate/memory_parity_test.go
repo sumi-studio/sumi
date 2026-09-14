@@ -192,8 +192,8 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 		t.Fatalf("load t-1: %v", err)
 	}
 	noteReq := map[string]any{"text": "remember this"}
-	mustPlan(t, s, pa, "t-1", l1.Generation, PlanCall{CallID: "c1", Tool: "journal.note", Request: noteReq})
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation, "op-1", "journal.note", 0, noteReq)
+	mustPlan(t, s, pa, "t-1", l1.Generation, PlanCall{CallID: "c1", Tool: "journal.note", Route: "normal", Request: noteReq})
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation, "op-1", "journal.note", 0, noteReq)
 	if err != nil || !fresh {
 		t.Fatalf("note claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
@@ -222,7 +222,7 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 	if !sawPrior {
 		t.Fatal("prior exchange missing from the retried turn's context")
 	}
-	op2, fresh2, err := s.ClaimOperation(ctx, pa, "t-1b", l2.Generation, "op-2", "journal.note", 0, noteReq)
+	op2, _, fresh2, err := s.ClaimOperation(ctx, pa, "t-1b", l2.Generation, "op-2", "journal.note", 0, noteReq)
 	if err != nil || fresh2 || fmt.Sprint(op2.Response["seq"]) != fmt.Sprint(op.Response["seq"]) {
 		t.Fatalf("note replay: %+v fresh=%v err=%v", op2, fresh2, err)
 	}

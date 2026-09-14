@@ -90,7 +90,12 @@ async function childMain() {
       for (const [i, c] of (decision.calls ?? []).entries()) {
         yield {
           type: "tool_call",
-          call: { id: `call-${round}-${i}`, name: c.tool, arguments: c.request },
+          call: {
+            id: `call-${round}-${i}`,
+            name: c.tool,
+            route: c.route ?? "normal",
+            arguments: c.request,
+          },
         };
       }
       yield { type: "done", usage: { scripted: true, round } };
