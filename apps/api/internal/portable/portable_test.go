@@ -562,8 +562,10 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 // transactions serialize — no job can slip between the check and the commit.
 func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
 	ctx := context.Background()
+	// One placement for all iterations: personas are isolated by id, and a
+	// fresh pool per race would exhaust the shared fixture's max_connections.
+	local := newPlacement(t)
 	for i := 0; i < 24; i++ {
-		local := newPlacement(t)
 		pid := newID(t)
 		liveSecretary(t, local, pid)
 		jobReq := map[string]any{"command": []any{"echo", "hi"}}
@@ -577,7 +579,7 @@ func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
 		}()
 		sealErr := make(chan error, 1)
 		go func() {
-			_, err := local.svc.Seal(ctx, pid, "move-race", destination)
+			_, err := local.svc.Seal(ctx, pid, fmt.Sprintf("move-race-%d", i), destination)
 			sealErr <- err
 		}()
 		sErr, jErr := <-sealErr, <-submitErr

@@ -69,6 +69,31 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE s.persona_id = $1 AND s.status = 'fired' AND NOT EXISTS (
 			SELECT 1 FROM core_inputs i
 			WHERE i.persona_id = s.persona_id AND i.input_id = 'sched:' || s.schedule_id)`},
+	// An approval's identity is the operation it parks plus that
+	// operation's position in the input's recorded plan. A dangling or
+	// mismatched link would let the destination re-execute a decided call
+	// or strand a pending one.
+	{"approval_operation_missing", `
+		SELECT count(*) FROM core_tool_approvals a
+		WHERE a.persona_id = $1 AND NOT EXISTS (
+			SELECT 1 FROM core_operations o
+			WHERE o.persona_id = a.persona_id AND o.operation_id = a.operation_id
+			  AND o.turn_id = a.turn_id AND o.tool = a.tool
+			  AND o.idempotency_key = a.input_id || ':tool:' || a.call_index::text)`},
+	// A waiting input is parked on a human decision; without its pending
+	// approval the destination could never resume it.
+	{"waiting_input_approval_missing", `
+		SELECT count(*) FROM core_inputs i
+		WHERE i.persona_id = $1 AND i.status = 'waiting' AND NOT EXISTS (
+			SELECT 1 FROM core_tool_approvals a
+			WHERE a.persona_id = i.persona_id AND a.input_id = i.input_id AND a.status = 'pending')`},
+	{"waiting_since_without_waiting", `
+		SELECT count(*) FROM core_inputs i
+		WHERE i.persona_id = $1 AND i.waiting_since IS NOT NULL AND i.status <> 'waiting'`},
+	{"pending_approval_operation_resolved", `
+		SELECT count(*) FROM core_tool_approvals a
+		JOIN core_operations o ON o.persona_id = a.persona_id AND o.operation_id = a.operation_id
+		WHERE a.persona_id = $1 AND a.status = 'pending' AND o.status <> 'awaiting_approval'`},
 	{"outbox_reference_missing", `
 		SELECT count(*) FROM core_outbox o
 		WHERE o.persona_id = $1 AND o.kind = 'turn_completed' AND (

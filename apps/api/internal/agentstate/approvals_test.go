@@ -565,3 +565,156 @@ func TestModelBindingFollowsSelection(t *testing.T) {
 		t.Fatalf("cross-persona binding status = %d", code)
 	}
 }
+
+// TestDenialMatchShapes documents the exact re-issue surface a denial covers
+// (f37: the two final reviews disagreed on whether route or call position
+// changes the match). Verified on real PG:
+//   - The durable denial match is (persona, input, tool, request) on the
+//     non-gated claim path — request is jsonb semantic equality, so key order
+//     is irrelevant — with route and call_index not part of the key.
+//   - A same-index replay returns the finalized failed op as-is, on either
+//     route (the op record itself is the receipt).
+//   - A normal-route re-proposal of the identical call at any index is
+//     finalized failed with the stored denial — no second prompt, no bypass.
+//   - An elevated re-proposal at a different index is a NEW decision
+//     instance under deny_once: it parks a fresh pending approval and the
+//     human is asked again. Nothing runs without new consent.
+//   - A new input proposing the identical call is likewise a new instance —
+//     the denial is input-scoped, never a standing policy.
+//   - A different request on the same input is unaffected.
+func TestDenialMatchShapes(t *testing.T) {
+	ctx := context.Background()
+	private := map[string]any{"text": "private detail", "channel": "all"}
+	elevated := PlanCall{Tool: "journal.note", Route: "elevated", Request: private}
+	f := newApprovalFixture(t, elevated)
+	a := f.park(t, elevated)
+	if _, err := f.s.ResolveApproval(ctx, f.pa, a.ApprovalID, f.decision("deny_once", "d-1")); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	f.restart(t)
+
+	// Same input, same index: the finalized failed op replays as-is.
+	if op, got, fresh := f.claim(t, "t-2", 0, elevated); op.Status != "failed" ||
+		op.Response["error"] != "denied" || got == nil || got.ApprovalID != a.ApprovalID || fresh {
+		t.Fatalf("same-index replay: op=%+v approval=%+v fresh=%v", op, got, fresh)
+	}
+
+	// Same input, different index, elevated route: a NEW plan proposal is a
+	// fresh decision instance — deny_once is one-shot, so the call parks a
+	// brand-new pending approval and re-asks the human. It is not a bypass:
+	// nothing executes without fresh consent. The denial record itself is
+	// only consulted on the non-gated path and by same-index op replay.
+	reElevated := PlanCall{Tool: "journal.note", Route: "elevated", Request: private}
+	if _, _, err := f.s.SavePlan(ctx, f.pa, "t-2", f.gen, 1,
+		Decision{Text: "retry elevated", Calls: []PlanCall{reElevated}}); err != nil {
+		t.Fatalf("save elevated retry: %v", err)
+	}
+	op, a2e, fresh := f.claim(t, "t-2", 1, reElevated)
+	if op.Status != "awaiting_approval" || a2e == nil || a2e.Status != "pending" ||
+		a2e.ApprovalID == a.ApprovalID || !fresh {
+		t.Fatalf("elevated different-index: op=%+v approval=%+v fresh=%v", op, a2e, fresh)
+	}
+	// Denying the re-asked call again keeps the normal-route bypass closed.
+	if _, err := f.s.ResolveApproval(ctx, f.pa, a2e.ApprovalID, f.decision("deny_once", "d-2")); err != nil {
+		t.Fatalf("second deny: %v", err)
+	}
+
+	// Same input, normal route: the identical request stays refused — a
+	// denial cannot be bypassed by lowering the route.
+	reNormal := PlanCall{Tool: "journal.note", Route: "normal", Request: private}
+	if _, _, err := f.s.SavePlan(ctx, f.pa, "t-2", f.gen, 2,
+		Decision{Text: "retry normal", Calls: []PlanCall{reNormal}}); err != nil {
+		t.Fatalf("save normal retry: %v", err)
+	}
+	if op, got, _ := f.claim(t, "t-2", 2, reNormal); op.Status != "failed" ||
+		op.Response["error"] != "denied" || got == nil || got.ApprovalID != a.ApprovalID {
+		t.Fatalf("normal same-request: op=%+v approval=%+v", op, got)
+	}
+
+	// Same input, semantically identical request under a different key
+	// order: jsonb equality makes it the same denied call.
+	reordered := PlanCall{Tool: "journal.note", Route: "normal",
+		Request: map[string]any{"channel": "all", "text": "private detail"}}
+	if _, _, err := f.s.SavePlan(ctx, f.pa, "t-2", f.gen, 3,
+		Decision{Text: "retry reordered", Calls: []PlanCall{reordered}}); err != nil {
+		t.Fatalf("save reordered retry: %v", err)
+	}
+	if op, got, _ := f.claim(t, "t-2", 3, reordered); op.Status != "failed" ||
+		op.Response["error"] != "denied" || got == nil || got.ApprovalID != a.ApprovalID {
+		t.Fatalf("reordered same-request: op=%+v approval=%+v", op, got)
+	}
+
+	// Same input, a genuinely different request: not the denied call, so
+	// the agent's own authority runs it.
+	other := PlanCall{Tool: "journal.note", Route: "normal",
+		Request: map[string]any{"text": "different note"}}
+	if _, _, err := f.s.SavePlan(ctx, f.pa, "t-2", f.gen, 4,
+		Decision{Text: "other", Calls: []PlanCall{other}}); err != nil {
+		t.Fatalf("save other: %v", err)
+	}
+	if op, _, _ := f.claim(t, "t-2", 4, other); op.Status != "done" {
+		t.Fatalf("different request: %+v", op)
+	}
+
+	// A new input proposing the identical denied call is not covered: the
+	// denial is scoped to the input the human refused. The elevated call
+	// parks a brand-new pending approval rather than replaying the denial.
+	if _, err := f.s.CommitTurn(ctx, f.pa, "t-2", f.gen,
+		CommitRequest{Outcome: "complete", Output: map[string]any{"text": "done"}}); err != nil {
+		t.Fatalf("complete t-2: %v", err)
+	}
+	if _, _, err := f.s.SubmitInput(ctx, &Input{PersonaID: f.pa, InputID: "in-2",
+		Kind: "message", Payload: map[string]any{"text": "again"},
+		ActorKind: "human", ActorID: f.human}); err != nil {
+		t.Fatalf("submit in-2: %v", err)
+	}
+	if _, err := f.s.LoadTurn(ctx, f.pa, f.gen, "t-3", 10); err != nil {
+		t.Fatalf("load t-3: %v", err)
+	}
+	mustPlan(t, f.s, f.pa, "t-3", f.gen, elevated)
+	op, a2, fresh := f.claim(t, "t-3", 0, elevated)
+	if op.Status != "awaiting_approval" || a2 == nil || a2.Status != "pending" ||
+		a2.ApprovalID == a.ApprovalID || !fresh {
+		t.Fatalf("new input re-issue: op=%+v approval=%+v fresh=%v", op, a2, fresh)
+	}
+	if a2.InputID != "in-2" {
+		t.Fatalf("new approval input = %s, want in-2", a2.InputID)
+	}
+}
+
+// TestApprovedGrantWithoutEffectSettlesFailed covers f44: a gated tool that
+// is registered but has no in-store effect must not consume the grant and
+// leave the operation parked awaiting_approval forever. The grant is spent
+// and the operation settles as an honest deterministic failure instead.
+// toolAuthority is a package-level registry — the phantom tool is added for
+// the test and removed on cleanup.
+func TestApprovedGrantWithoutEffectSettlesFailed(t *testing.T) {
+	toolAuthority["phantom.gated"] = struct {
+		internal         bool
+		requiresApproval bool
+		elevatedOnly     bool
+	}{internal: true, elevatedOnly: true}
+	t.Cleanup(func() { delete(toolAuthority, "phantom.gated") })
+
+	ctx := context.Background()
+	call := PlanCall{Tool: "phantom.gated", Route: "elevated",
+		Request: map[string]any{"text": "anything"}}
+	f := newApprovalFixture(t, call)
+	a := f.park(t, call)
+	if _, err := f.s.ResolveApproval(ctx, f.pa, a.ApprovalID, f.decision("approve_once", "d-1")); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	f.restart(t)
+	op, grant, fresh := f.claim(t, "t-2", 0, call)
+	if op.Status != "failed" || grant == nil || grant.ConsumedAt == nil || !fresh {
+		t.Fatalf("phantom effect claim: op=%+v grant=%+v fresh=%v", op, grant, fresh)
+	}
+	if errStr, _ := op.Response["error"].(string); !strings.Contains(errStr, "no registered effect") {
+		t.Fatalf("response = %+v, want a no-effect deterministic failure", op.Response)
+	}
+	// Replays return the finalized failure; the grant is never re-armed.
+	op2, grant2, fresh2 := f.claim(t, "t-2", 0, call)
+	if op2.Status != "failed" || fresh2 || grant2 == nil || grant2.ConsumedAt == nil {
+		t.Fatalf("replay: op=%+v grant=%+v fresh=%v", op2, grant2, fresh2)
+	}
+}

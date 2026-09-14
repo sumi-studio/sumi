@@ -310,6 +310,31 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
 			ErrUnresolvedOperations, strings.Join(inflight, ", "))
 	}
+	// The model selection is human-scoped account state: it binds the
+	// persona's human, and the destination binds a different account. A
+	// bundle cannot carry it (NotIncluded "connections"), so an explicit
+	// selection at seal would silently become the destination's default —
+	// a different model than the human chose, or a running model where
+	// they chose 'none'. Refuse instead of transferring a broken
+	// selection: clear it (unset) before sealing only if the
+	// destination's default selection is acceptable, and select again
+	// there after the move.
+	var selKind string
+	err = tx.QueryRow(ctx, `
+		SELECT m.kind FROM model_connection_selections m
+		JOIN core_personas p ON p.human_id = m.human_id
+		WHERE p.persona_id = $1`, personaID).Scan(&selKind)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return Receipt{}, err
+	default:
+		return Receipt{}, fmt.Errorf("%w: the persona's human holds an explicit model selection (%s); "+
+			"bundle %s carries no selection section and the destination binds a different account's "+
+			"selection — the transfer would silently substitute the model. Clear the selection before "+
+			"sealing only if the destination's default is acceptable",
+			ErrNotPortable, selKind, CoreContract)
+	}
 	var literalNulls int64
 	if err := tx.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM core_turns WHERE persona_id = $1 AND (
@@ -753,16 +778,19 @@ func summarize(ctx context.Context, q querier, personaID string) (map[string]int
 			(SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'note'),
 			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'queued'),
 			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'claimed'),
+			(SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND status = 'waiting'),
 			(SELECT count(*) FROM core_turns WHERE persona_id = $1 AND status = 'running'),
 			(SELECT count(*) FROM core_turn_plans p JOIN core_inputs i
 				ON i.persona_id = p.persona_id AND i.input_id = p.input_id
 				WHERE p.persona_id = $1 AND i.status <> 'done'),
+			(SELECT count(*) FROM core_tool_approvals WHERE persona_id = $1 AND status = 'pending'),
 			(SELECT count(*) FROM core_schedules WHERE persona_id = $1 AND status IN ('pending', 'claimed')),
 			(SELECT count(*) FROM core_outbox WHERE persona_id = $1 AND delivered_at IS NULL),
 			(SELECT COALESCE(max(seq), 0) FROM core_events WHERE persona_id = $1),
 			(SELECT COALESCE(max(seq), 0) FROM core_outbox WHERE persona_id = $1)`,
 		personaID).Scan(&cont.JournalEvents, &cont.Notes, &cont.QueuedInputs, &cont.ClaimedInputs,
-		&cont.RunningTurns, &cont.UnfinishedPlans, &cont.PendingSchedules, &cont.UndeliveredOut,
+		&cont.WaitingInputs, &cont.RunningTurns, &cont.UnfinishedPlans, &cont.PendingApprovals,
+		&cont.PendingSchedules, &cont.UndeliveredOut,
 		&cut.LatestEventSeq, &cut.LatestOutboxSeq)
 	return rows, cont, cut, err
 }

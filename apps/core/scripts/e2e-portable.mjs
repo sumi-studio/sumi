@@ -45,8 +45,14 @@ const EVIDENCE = process.env.SUMI_PORTABLE_EVIDENCE_DIR;
 const API_DIR = resolve(import.meta.dirname, "../../api");
 const CORE_DIR = resolve(import.meta.dirname, "..");
 const run = randomUUID().replaceAll("-", "").slice(0, 10);
-const LOCAL_DB = withDatabase(DB_URL, `sumi_portable_repair_local_${run}`);
-const CLOUD_DB = withDatabase(DB_URL, `sumi_portable_repair_cloud_${run}`);
+const LOCAL_DB = withDatabase(
+  DB_URL,
+  process.env.SUMI_PORTABLE_LOCAL_DB ?? `sumi_tools_connections_portable_local_${run}`,
+);
+const CLOUD_DB = withDatabase(
+  DB_URL,
+  process.env.SUMI_PORTABLE_CLOUD_DB ?? `sumi_tools_connections_portable_cloud_${run}`,
+);
 const LOCAL_ADMIN = `local-admin-${randomUUID()}`;
 const CLOUD_ADMIN = `cloud-admin-${randomUUID()}`;
 const LOCAL_PORT = Number(process.env.SUMI_PORTABLE_LOCAL_PORT ?? 9430);
@@ -222,8 +228,22 @@ check(true, "local and cloud state services are up on separate databases");
 
 // --- 1. the local secretary lives ------------------------------------------
 const pid = uuidv7();
+// The secretary is bound to a human: approval decisions are identity-scoped,
+// so the persona needs an owner before any approval can be decided. The dev
+// seeding route stands in for the account flow on this fixture.
+const LOCAL_HUMAN = uuidv7();
+const CLOUD_HUMAN = uuidv7();
+check(
+  (await req(LOCAL, "POST", "/internal/dev/humans", LOCAL_ADMIN, { human_id: LOCAL_HUMAN })).status === 201,
+  "local human seeded",
+);
+check(
+  (await req(CLOUD, "POST", "/internal/dev/humans", CLOUD_ADMIN, { human_id: CLOUD_HUMAN })).status === 201,
+  "cloud human seeded",
+);
 const created = await req(LOCAL, "POST", "/internal/core/personas", LOCAL_ADMIN, {
   persona_id: pid,
+  human_id: LOCAL_HUMAN,
   display_name: "Portable e2e secretary",
 });
 check(created.status === 201, "local persona created", created.text);
@@ -246,6 +266,28 @@ const first = spawnSync(process.execPath, ["src/host/local.ts", "--once"], {
 check(first.status === 0, "local core drained its first three messages");
 let st = await req(LOCAL, "GET", `/internal/core/personas/${pid}/state`, localToken);
 check(st.json.queued_inputs === 0 && st.json.pending_schedules === 1, "local reminder is pending", st.json);
+
+// Park a human decision before the move: an elevated message.send waits on
+// consent, the input parks as 'waiting', and the pending approval must travel
+// with the bundle so the destination can resolve and resume it.
+check(
+  (await submit(LOCAL, pid, localToken, "in-send", '!elevated message.send {"text":"tea is served"}')).status === 201,
+  "elevated send input accepted",
+);
+const park = spawnSync(process.execPath, ["src/host/local.ts", "--once"], {
+  cwd: CORE_DIR,
+  env: { ...coreEnv(LOCAL, pid, localToken, "local-core"), SUMI_ONCE_IDLE_MS: "1500" },
+  stdio: "inherit",
+  timeout: 90_000,
+});
+check(park.status === 0, "local core parked on the approval");
+const parkedInput = await inputStatus(LOCAL, pid, localToken, "in-send");
+check(parkedInput?.input?.status === "waiting", "send input parked as waiting", parkedInput);
+const pendingOnLocal = (
+  await req(LOCAL, "GET", `/internal/core/personas/${pid}/approvals`, localToken)
+).json.approvals.filter((a) => a.status === "pending");
+check(pendingOnLocal.length === 1, "one pending approval is parked on local", pendingOnLocal);
+const APPROVAL = pendingOnLocal[0].approval_id;
 
 // --- 2. seal while a slow turn is in flight --------------------------------
 check((await submit(LOCAL, pid, localToken, "in-slow", "!slow 8000 finishing before the move")).status === 201, "slow input accepted");
@@ -274,8 +316,10 @@ check(seal.status === 200 && seal.json.status === "sealed", "local seal bound to
 check(seal.json.destination_id === cloudPlacement.json.placement_id, "seal receipt names the destination", seal.json);
 const cont = seal.json.continuity;
 check(
-  cont.running_turns === 1 && cont.claimed_inputs === 1 && cont.queued_inputs === 1 && cont.notes === 1 && cont.pending_schedules === 1,
-  "seal receipt lists the in-flight turn, queued input, note and reminder",
+  cont.running_turns === 1 && cont.claimed_inputs === 1 && cont.queued_inputs === 1 &&
+    cont.waiting_inputs === 1 && cont.pending_approvals === 1 &&
+    cont.notes === 1 && cont.pending_schedules === 1,
+  "seal receipt lists the in-flight turn, queued and waiting inputs, the pending approval, note and reminder",
   cont,
 );
 const sealReplay = await req(LOCAL, "POST", `/internal/core/personas/${pid}/transfers/${TRANSFER}/seal`, LOCAL_ADMIN, {
@@ -341,7 +385,17 @@ check(r.status === 422 && r.json.error.includes("digest"), "cloud refuses an alt
 r = await req(CLOUD, "GET", `/internal/core/personas/${pid}/state`, CLOUD_ADMIN);
 check(r.status === 404, "refused bundles left no persona on cloud", r.text);
 
-const imported = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, bundle, true);
+// The destination binds the persona to ITS human at import — the source's
+// binding never travels in the bundle. That binding is what makes the
+// carried pending approval decidable here.
+const imported = await req(
+  CLOUD,
+  "POST",
+  `/internal/core/transfers/import?human_id=${CLOUD_HUMAN}`,
+  CLOUD_ADMIN,
+  bundle,
+  true,
+);
 check(imported.status === 201 && imported.json.status === "staged", "cloud staged the bundle", imported.text);
 check(imported.json.content_sha256 === trailer.content_sha256, "cloud verified the same digest");
 const cloudPersona = await req(CLOUD, "POST", "/internal/core/personas", CLOUD_ADMIN, { persona_id: pid });
@@ -352,8 +406,24 @@ r = await req(CLOUD, "POST", `/internal/core/personas/${pid}/writer/acquire`, cl
 check(r.status === 409, "staged persona cannot acquire a writer", r.text);
 r = await submit(CLOUD, pid, cloudToken, "in-early", "sent to cloud before activation");
 check(r.status === 409, "staged persona refuses inputs", r.text);
-r = await req(CLOUD, "POST", "/internal/core/transfers/import", CLOUD_ADMIN, bundle, true);
+r = await req(
+  CLOUD,
+  "POST",
+  `/internal/core/transfers/import?human_id=${CLOUD_HUMAN}`,
+  CLOUD_ADMIN,
+  bundle,
+  true,
+);
 check(r.status === 200 && r.json.content_sha256 === trailer.content_sha256, "re-importing the same bundle replays the receipt", r.text);
+r = await req(
+  CLOUD,
+  "POST",
+  `/internal/core/transfers/import?human_id=${uuidv7()}`,
+  CLOUD_ADMIN,
+  bundle,
+  true,
+);
+check(r.status === 409, "re-importing under a different human is a conflict, not a silent rebind", r.text);
 
 // --- 4. activate cloud, complete local --------------------------------------
 // Without destination evidence the source must not end its authority: a
@@ -401,19 +471,83 @@ check(st.json.persona.authority === "transferred", "local persona is marked tran
 const localEvents = await allPages(LOCAL, `/internal/core/personas/${pid}/events`, localToken);
 const localOutbox = await allPages(LOCAL, `/internal/core/personas/${pid}/outbox`, localToken);
 
+// --- 4b. the carried pending approval resolves on the destination -----------
+// The approval travelled with the bundle still pending; its parked input is
+// waiting. A carried decided_by is provenance — deciding on cloud requires
+// the persona's destination-bound human, so a different asserted id is 403
+// and the bound human's decision is what requeues the input.
+const cloudApprovals = (
+  await req(CLOUD, "GET", `/internal/core/personas/${pid}/approvals`, cloudToken)
+).json.approvals;
+const carried = cloudApprovals.filter((a) => a.approval_id === APPROVAL);
+check(
+  carried.length === 1 && carried[0].status === "pending" && carried[0].input_id === "in-send",
+  "the pending approval crossed the transfer linked to its waiting input",
+  carried,
+);
+const waitingOnCloud = await inputStatus(CLOUD, pid, cloudToken, "in-send");
+check(
+  waitingOnCloud?.input?.status === "waiting" && typeof waitingOnCloud.input.waited_ms === "number",
+  "the waiting input and its wait accounting arrived on cloud",
+  waitingOnCloud,
+);
+r = await req(CLOUD, "POST", `/internal/core/personas/${pid}/approvals/${APPROVAL}/decision`, CLOUD_ADMIN, {
+  decision: "approve_once",
+  decision_id: uuidv7(),
+  decided_by_kind: "human",
+  decided_by_id: uuidv7(),
+});
+check(r.status === 403, "a human other than the bound one cannot decide on the destination", r.text);
+const decide = await req(CLOUD, "POST", `/internal/core/personas/${pid}/approvals/${APPROVAL}/decision`, CLOUD_ADMIN, {
+  decision: "approve_once",
+  decision_id: `d-${run}`,
+  decided_by_kind: "human",
+  decided_by_id: CLOUD_HUMAN,
+});
+check(decide.status === 200 && decide.json.approval.status === "approved", "cloud human approved the carried approval", decide.text);
+const decideReplay = await req(CLOUD, "POST", `/internal/core/personas/${pid}/approvals/${APPROVAL}/decision`, CLOUD_ADMIN, {
+  decision: "approve_once",
+  decision_id: `d-${run}`,
+  decided_by_kind: "human",
+  decided_by_id: CLOUD_HUMAN,
+});
+check(
+  decideReplay.status === 200 && decideReplay.json.approval.status === "approved",
+  "decision replay on the destination is idempotent",
+  decideReplay.text,
+);
+const decideConflict = await req(CLOUD, "POST", `/internal/core/personas/${pid}/approvals/${APPROVAL}/decision`, CLOUD_ADMIN, {
+  decision: "deny_once",
+  decision_id: uuidv7(),
+  decided_by_kind: "human",
+  decided_by_id: CLOUD_HUMAN,
+});
+check(decideConflict.status === 409, "a divergent decision on the resolved approval is a conflict", decideConflict.text);
+const requeued = await inputStatus(CLOUD, pid, cloudToken, "in-send");
+check(requeued?.input?.status === "queued", "the decision requeued the carried waiting input", requeued);
+check(
+  typeof requeued?.input?.waited_ms === "number" && requeued.input.waited_ms >= 0,
+  "wait accounting survived the move",
+  requeued,
+);
+
 // --- 5. the same secretary continues on cloud -------------------------------
 const cloudCore = startCore("cloud-core", coreEnv(CLOUD, pid, cloudToken, "cloud-core"));
 await waitFor("cloud finished the carried work", async () => {
   const s = await req(CLOUD, "GET", `/internal/core/personas/${pid}/state`, cloudToken);
   const slow = await inputStatus(CLOUD, pid, cloudToken, "in-slow");
   const queued = await inputStatus(CLOUD, pid, cloudToken, "in-queued");
+  const send = await inputStatus(CLOUD, pid, cloudToken, "in-send");
   const done =
     s.json?.queued_inputs === 0 &&
     s.json?.running_turn === null &&
     s.json?.pending_schedules === 0 &&
     slow?.input?.status === "done" &&
-    queued?.input?.status === "done";
-  return done ? true : { state: s.json, slow: slow?.input?.status, queued: queued?.input?.status };
+    queued?.input?.status === "done" &&
+    send?.input?.status === "done";
+  return done
+    ? true
+    : { state: s.json, slow: slow?.input?.status, queued: queued?.input?.status, send: send?.input?.status };
 }, 90_000);
 check((await submit(CLOUD, pid, cloudToken, "in-after", "first message in the cloud")).status === 201, "cloud accepts new input after activation");
 await waitFor("cloud answered the first new message", async () => {
@@ -435,6 +569,25 @@ check(
 );
 const teaNotes = cloudEvents.filter((e) => e.kind === "note" && e.payload?.text === "The user takes tea at 15:00");
 check(teaNotes.length === 1, "the memory note exists exactly once after the move", teaNotes);
+// The approved send ran exactly once on the destination: the grant consumed,
+// the message delivered once, and no second effect can replay because the
+// carried operation record is the receipt.
+const sends = cloudOutbox.filter((o) => o.kind === "secretary_message" && o.payload?.text === "tea is served");
+check(sends.length === 1, "the approved send executed exactly once on cloud", sends);
+const consumed = (
+  await req(CLOUD, "GET", `/internal/core/personas/${pid}/approvals`, cloudToken)
+).json.approvals.find((a) => a.approval_id === APPROVAL);
+check(
+  consumed?.status === "approved" && consumed.consumed_at !== null && consumed.decided_by_id === CLOUD_HUMAN,
+  "the carried grant is consumed once and keeps its destination decision provenance",
+  consumed,
+);
+const sendInput = await inputStatus(CLOUD, pid, cloudToken, "in-send");
+check(
+  sendInput?.input?.status === "done" && (sendInput.input.waited_ms ?? 0) > 0,
+  "the resumed input is done with wait accounting intact",
+  sendInput,
+);
 const slow = await inputStatus(CLOUD, pid, cloudToken, "in-slow");
 check(slow.turn?.attempt === 2 && slow.turn?.status === "done", "interrupted input completed on cloud as attempt 2", slow);
 const wakes = cloudEvents.filter((e) => e.kind === "input_received" && e.payload?.kind === "wake");
@@ -471,5 +624,5 @@ if (EVIDENCE) {
   );
   log("evidence written to", EVIDENCE);
 }
-log(`PASS: ${passed} checks. databases left for inspection: sumi_portable_repair_local_${run}, sumi_portable_repair_cloud_${run}`);
+log(`PASS: ${passed} checks. databases left for inspection: ${LOCAL_DB.split("/").pop()}, ${CLOUD_DB.split("/").pop()}`);
 process.exit(0);

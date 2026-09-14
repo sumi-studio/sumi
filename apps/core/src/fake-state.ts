@@ -92,7 +92,9 @@ function retryBackoffMs(attempt: number): number {
  * human prompt (ADR 0013 §2). `requiresApproval` mirrors Go's reserved
  * intrinsic-gating seam; no foundation tool uses it.
  */
-const TOOL_AUTHORITY: Record<
+// Exported for tests that register a phantom tool to probe edge paths
+// (e.g. a granted call whose tool has no effect — Go toolAuthority parity).
+export const TOOL_AUTHORITY: Record<
   string,
   { requiresApproval: boolean; elevatedOnly: boolean }
 > = {

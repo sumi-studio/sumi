@@ -86,6 +86,11 @@ var toolAuthority = map[string]struct {
 }{
 	"schedule.set": {internal: true},
 	"journal.note": {internal: true},
+	// Jobs (merged slice): ordinary internal effects under the secretary's
+	// own authority — no human decision on either route.
+	"job.start":  {internal: true},
+	"job.status": {internal: true},
+	"job.cancel": {internal: true},
 	// Speaking into the shared channel on the human's behalf is an
 	// outward-facing act requiring consent. Per ADR 0013 §2 the Normal
 	// route does not ask the human, so a normal call is recorded as a
@@ -276,12 +281,25 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 	}
 	// The decision route is admin-authenticated, but the named human is
 	// still checked against the persona's owner: a host that relays some
-	// other human's click cannot consent on this secretary's behalf.
+	// other human's click cannot consent on this secretary's behalf. A
+	// persona whose authority moved (sealed/staged/transferred) takes no
+	// new decisions here — the destination placement holds any carried
+	// pending approvals now. And a persona with no bound human has no
+	// decider: an approval is an identity-scoped act, so it blocks until
+	// the persona is actually bound rather than accepting any asserted id.
 	p, err := s.persona(ctx, personaID)
 	if err != nil {
 		return nil, err
 	}
-	if p.HumanID != nil && *p.HumanID != req.DecidedByID {
+	if p.Authority != "active" {
+		return nil, fmt.Errorf("%w: persona authority is %s; it takes no new approval decisions",
+			ErrPersonaInactive, p.Authority)
+	}
+	if p.HumanID == nil {
+		return nil, fmt.Errorf("%w: persona is not bound to a human; no one may decide",
+			ErrApprovalForbidden)
+	}
+	if *p.HumanID != req.DecidedByID {
 		return nil, fmt.Errorf("%w: only the persona's human may decide", ErrApprovalForbidden)
 	}
 	tx, err := s.pool.Begin(ctx)

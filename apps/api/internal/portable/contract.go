@@ -140,8 +140,10 @@ type Continuity struct {
 	Notes            int64 `json:"notes"`
 	QueuedInputs     int64 `json:"queued_inputs"`
 	ClaimedInputs    int64 `json:"claimed_inputs"`
+	WaitingInputs    int64 `json:"waiting_inputs"`
 	RunningTurns     int64 `json:"running_turns"`
 	UnfinishedPlans  int64 `json:"unfinished_plans"`
+	PendingApprovals int64 `json:"pending_approvals"`
 	PendingSchedules int64 `json:"pending_schedules"`
 	UndeliveredOut   int64 `json:"undelivered_outbox"`
 }
@@ -183,10 +185,8 @@ var NotIncluded = []Exclusion{
 		Reason: "file contents, versions and object bytes live in the file service, not core state"},
 	{Name: "jobs", Owner: "jobs-results (M09)",
 		Reason: "background job records and their completion authority are not core state"},
-	{Name: "approvals", Owner: "unassigned (M08)",
-		Reason: "pending human approvals do not exist in core state; recorded turn plans are carried but are the model's decisions, not human approvals"},
 	{Name: "connections", Owner: "unassigned (M08, D9)",
-		Reason: "model and tool connections are not core state; credentials are never written into a bundle"},
+		Reason: "model connections and the human-scoped model selection are account state, not core state; credentials are never written into a bundle. Sealing refuses while the persona's human holds an explicit selection — the destination binds a different account's selection, so carrying the intent would silently substitute the model"},
 	{Name: "memory_projection", Owner: "unassigned (M06)",
 		Reason: "search projections and encrypted originals are not core state; the journal, including notes, is carried verbatim"},
 	{Name: "account_and_workspace", Owner: "koseki / workspace (M21)",
@@ -238,6 +238,7 @@ var coreTables = []table{
 		{"occurred_at", colTime}, {"attention", colText}, {"status", colText},
 		{"claimed_generation", colBigint}, {"turn_id", colText}, {"created_at", colTime},
 		{"done_at", colTime}, {"not_before", colTime},
+		{"waiting_since", colTime}, {"waited_ms", colBigint},
 	}},
 	{name: "core_turns", orderBy: `turn_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"turn_id", colText}, {"input_id", colText}, {"generation", colBigint},
@@ -256,6 +257,21 @@ var coreTables = []table{
 		{"persona_id", colUUID}, {"operation_id", colText}, {"turn_id", colText}, {"tool", colText},
 		{"idempotency_key", colText}, {"request", colJSON}, {"status", colText}, {"response", colJSONNull},
 		{"claimed_generation", colBigint}, {"created_at", colTime}, {"completed_at", colTime},
+	}},
+	// Approvals travel with the operation they park: a pending one stays
+	// pending and resolvable at the destination, a decided one keeps its
+	// decision provenance, and a consumed grant keeps its receipt — none
+	// can be silently dropped, re-decided, or replayed into a second
+	// effect. decided_by_* is provenance, not destination authority: a
+	// decision at the destination requires the destination-bound human.
+	{name: "core_tool_approvals", orderBy: `approval_id COLLATE "C"`, cols: []column{
+		{"persona_id", colUUID}, {"approval_id", colText}, {"input_id", colText},
+		{"call_index", colInt}, {"operation_id", colText}, {"turn_id", colText},
+		{"tool", colText}, {"route", colText}, {"required_by", colText},
+		{"request", colJSON}, {"action_digest", colText}, {"status", colText},
+		{"decision", colText}, {"decision_id", colText},
+		{"decided_by_kind", colText}, {"decided_by_id", colText}, {"provenance", colText},
+		{"decided_at", colTime}, {"consumed_at", colTime}, {"created_at", colTime},
 	}},
 	{name: "core_schedules", orderBy: `schedule_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"schedule_id", colText}, {"wake_at", colTime}, {"payload", colJSON},

@@ -98,8 +98,14 @@ for (let up = false, deadline = Date.now() + 15_000; !up; ) {
   }
 }
 
+// Decisions are identity-scoped: the persona must be bound to the deciding
+// human, and the human row must exist. state-dev exposes a dev-only seeding
+// route (humans are provisioned by the account flow on a real deployment).
+const seeded = await req("POST", "/internal/dev/humans", ADMIN, { human_id: DECIDER });
+assert(seeded.status === 201 || seeded.status === 200, `seed human ${seeded.status}: ${seeded.text}`);
 const created = await req("POST", "/internal/core/personas", ADMIN, {
   persona_id: personaId,
+  human_id: DECIDER,
   display_name: "e2e approvals",
 });
 assert(created.status === 201, `createPersona ${created.status}: ${created.text}`);

@@ -397,3 +397,33 @@ test("a long human wait does not consume the provider retry window", async () =>
   );
   await s2.stop();
 });
+
+test("an approved grant on a tool with no effect settles failed, not parked forever", async () => {
+  // f44 parity: a gated tool registered without an in-store effect would
+  // otherwise consume the grant and leave the op awaiting_approval on every
+  // re-claim. The grant is spent and the op settles as an honest failure.
+  const { TOOL_AUTHORITY } = await import("../src/fake-state.ts");
+  TOOL_AUTHORITY["phantom.gated"] = { requiresApproval: false, elevatedOnly: true };
+  try {
+    const state = new FakeState();
+    state.addPersona(PERSONA, "secretary", HUMAN);
+    state.addInput(PERSONA, "in-1", '!elevated phantom.gated {"text":"x"}');
+    const s = new Secretary(cfg(state, "h-1"));
+    await s.start();
+    assert.equal(await s.step(), "turn");
+    const [appr] = await pending(state);
+    assert.ok(appr);
+    await state.resolveApproval(PERSONA, appr.approval_id, decide("approve_once", "d-1"));
+    const s2 = await restart(s, state);
+    assert.equal(await s2.step(), "turn");
+    const op = [...state.ops.values()].find((o) => o.tool === "phantom.gated")!;
+    assert.equal(op.status, "failed");
+    assert.match(String(op.response?.error), /no registered effect/);
+    const got = (await state.listApprovals(PERSONA))[0]!;
+    assert.equal(got.status, "approved");
+    assert.notEqual(got.consumed_at, null, "the grant was spent once");
+    await s2.stop();
+  } finally {
+    delete TOOL_AUTHORITY["phantom.gated"];
+  }
+});
