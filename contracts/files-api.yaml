@@ -33,14 +33,46 @@ info:
     lock — at most one live writer per database. A second instance waits
     briefly for a rolling-restart handoff, then refuses to start; a
     different root on an occupied database is rejected outright. If the
-    lock session dies the store is deposed (mutations fail fast with 503);
-    it resumes only if it re-acquires while still the recorded owner, and
-    exits if another instance took over. Dead-owner intents are settled by
-    the live reconciler after a settle grace covering in-kernel/FUSE
-    completions; settlement claims the intent atomically and write intents
-    verify the landed bytes' hash, so externally modified content is
-    recorded as diverged (external_change=true), never laundered into the
-    service's version.
+    lock session dies the store is deposed (mutations fail fast with 503,
+    and /healthz reports 503 so supervision sees the fenced state); it
+    resumes only if it re-acquires while still the recorded owner. The
+    re-acquire loop reads store_meta.owner directly, so a live successor
+    displacing it is detected without waiting for the lock — the
+    displaced process exits rather than lingering as a zombie. A dead
+    recorded owner can be taken over; a temporary DB loss with no
+    successor recovers in place.
+    Settlement honesty: while any intent overlapping the target paths is
+    still pending, a conflicting mutation is refused with 503
+    pending_settlement — the outcome of the earlier filesystem work is
+    uncertain, and new rows minted inside its subtree could be stranded
+    by a late-landing rename. Intents are only settled by the instance
+    that declared them (its fs goroutine) or — after the settle grace —
+    by the live owner. The grace is measured from intent declare time
+    and covers in-kernel/daemon-accepted completion after owner death;
+    it is a best-effort bound, not proof that a partitioned-but-alive
+    owner's syscall can never land late — such a landing leaves a
+    detectable unversioned/divergent file, never a falsely clean record.
+    Every settlement path (apply AND intent/row drops) verifies the
+    recorded store owner inside its transaction, so a displaced process
+    cannot delete rows a live successor would roll forward.
+    The reconciler trusts "absent" only when the filesystem root is
+    verified: under REQUIRE_MOUNT a failed mount check skips the whole
+    pass (a clean unmount leaves a bare directory where everything reads
+    missing), so mount interruptions never erase pending intents or
+    acknowledged rows. Rename settlement additionally proves destination
+    identity by inode continuity from the declare-time fingerprint — a
+    destination that merely exists is never claimed as the moved source;
+    a proven destination whose content changed post-move records a
+    diverged fingerprint. Dead-owner intents are settled by
+    the live reconciler after the settle grace; settlement claims the
+    intent atomically and write intents verify the landed bytes' hash, so
+    externally modified content is recorded as diverged
+    (external_change=true), never laundered into the service's version.
+    external_change is a comparison against a recorded version: a path
+    never written through the API reports version 0, not
+    external_change — the service cannot detect edits it never recorded.
+    mkdir is deliberately idempotent create-parents: mkdir over an
+    existing directory succeeds and mints a version.
     Scope names must be real directories under the root — a scope name
     that is a symlink is refused (400 wrong_kind), because a scope-root
     alias would grant one scope's tokens access to another scope's files.
@@ -91,7 +123,7 @@ paths:
           description: kind, size, mtime_ns, version, fingerprint, external_change
         '403': { description: No grant for scope, or path escapes scope }
         '404': { description: Path not found }
-        '503': { description: mount_unavailable | store_unavailable }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/list:
     get:
       operationId: fileList
@@ -120,7 +152,7 @@ paths:
             the API since that version.
         '400': { description: wrong_kind (directory or special file) }
         '404': { description: Path not found }
-        '503': { description: mount_unavailable | store_unavailable }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/write:
     put:
       operationId: fileWrite
@@ -131,7 +163,7 @@ paths:
         '200': { description: '{ "version": n }' }
         '409': { description: version_conflict }
         '413': { description: Body exceeds the 256 MiB service ceiling }
-        '503': { description: mount_unavailable | store_unavailable }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/rename:
     post:
       operationId: fileRename
@@ -152,7 +184,7 @@ paths:
         '400': { description: wrong_kind on file/dir kind mismatch }
         '404': { description: Source not found }
         '409': { description: version_conflict | dir_not_empty | external_change }
-        '503': { description: mount_unavailable | store_unavailable }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/mkdir:
     post:
       operationId: fileMkdir
@@ -169,7 +201,7 @@ paths:
         '200': { description: '{ "removed": true }' }
         '404': { description: Path not found }
         '409': { description: version_conflict }
-        '503': { description: mount_unavailable | store_unavailable }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/changes:
     get:
       operationId: fileChanges

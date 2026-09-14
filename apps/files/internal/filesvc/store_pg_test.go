@@ -10,7 +10,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,26 +72,63 @@ func newPGStore(t *testing.T, dsn, root string) *Store {
 	return s
 }
 
-// fakeDisk is an in-memory filesystem view for reconcile tests.
+// fakeDisk is an in-memory filesystem view for reconcile tests. Each
+// entry carries an inode + mtime so fingerprints use the real
+// "ino:size:mtime:ctime" format — rename identity proof in the reconciler
+// exercises the same checks production runs.
 type fakeDisk struct {
-	files map[string]string // scope/path -> content ("dir:" prefix = dir)
-	fps   map[string]string // scope/path -> fingerprint
+	files map[string]string // scope/path -> content ("dir" = dir)
+	inos  map[string]uint64
+	mts   map[string]int64
+	next  uint64
+	clock int64
 }
 
 func newFakeDisk() *fakeDisk {
-	return &fakeDisk{files: map[string]string{}, fps: map[string]string{}}
+	return &fakeDisk{files: map[string]string{},
+		inos: map[string]uint64{}, mts: map[string]int64{}}
 }
 
 func (d *fakeDisk) put(scope, path, content string) {
 	k := scope + "/" + path
+	d.next++
+	d.clock++
 	d.files[k] = content
-	d.fps[k] = "fp-" + hex.EncodeToString([]byte(k + content))[:8]
+	d.inos[k] = d.next
+	d.mts[k] = d.clock
+}
+
+// edit rewrites content in place — same inode, new mtime — like a
+// non-atomic executor-side rewrite after a rename.
+func (d *fakeDisk) edit(scope, path, content string) {
+	k := scope + "/" + path
+	d.clock++
+	d.files[k] = content
+	d.mts[k] = d.clock
+}
+
+// mv moves src and its subtree to dst preserving inode and mtime — the
+// identity a real rename keeps.
+func (d *fakeDisk) mv(scope, src, dst string) {
+	pref := scope + "/" + src
+	for k, c := range d.files {
+		if k == pref || strings.HasPrefix(k, pref+"/") {
+			nk := scope + "/" + dst + k[len(pref):]
+			d.files[nk] = c
+			d.inos[nk] = d.inos[k]
+			d.mts[nk] = d.mts[k]
+			delete(d.files, k)
+			delete(d.inos, k)
+			delete(d.mts, k)
+		}
+	}
 }
 
 func (d *fakeDisk) del(scope, path string) {
 	k := scope + "/" + path
 	delete(d.files, k)
-	delete(d.fps, k)
+	delete(d.inos, k)
+	delete(d.mts, k)
 }
 
 func (d *fakeDisk) stat(scope, path string) (FileInfo, error) {
@@ -98,10 +137,11 @@ func (d *fakeDisk) stat(scope, path string) (FileInfo, error) {
 	if !ok {
 		return FileInfo{}, ErrNotFound
 	}
+	fp := fmt.Sprintf("%d:%d:%d:%d", d.inos[k], int64(len(c)), d.mts[k], d.mts[k])
 	if c == "dir" {
-		return FileInfo{Kind: "dir", Fingerprint: d.fps[k]}, nil
+		return FileInfo{Kind: "dir", Fingerprint: fp}, nil
 	}
-	return FileInfo{Kind: "file", Size: int64(len(c)), Fingerprint: d.fps[k]}, nil
+	return FileInfo{Kind: "file", Size: int64(len(c)), Fingerprint: fp}, nil
 }
 
 func (d *fakeDisk) hash(scope, path string) (string, error) {
@@ -195,7 +235,7 @@ func TestPGWriteSettlesIntent(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 
 	probeAbsent := func() (string, bool, error) { return "", false, nil }
 	ver, _, err := s.WithWrite(context.Background(), "ws", "a.txt", "write",
@@ -226,7 +266,7 @@ func TestPGReconcileDeadOwnerWrite(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 	disk.put("ws", "b.txt", "landed")
 
 	insertIntent(t, s, intent{
@@ -254,7 +294,7 @@ func TestPGReconcileDivergedWrite(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 	disk.put("ws", "c.txt", "executor-bytes")
 
 	insertIntent(t, s, intent{
@@ -269,7 +309,8 @@ func TestPGReconcileDivergedWrite(t *testing.T) {
 	if v != 43 {
 		t.Fatalf("version = %d, want 43", v)
 	}
-	if fp == "" || fp == disk.fps["ws/c.txt"] {
+	live, _ := disk.stat("ws", "c.txt")
+	if fp == "" || fp == live.Fingerprint {
 		t.Fatalf("diverged content recorded with clean fp %q", fp)
 	}
 	if !hasPrefix(fp, "diverged:") {
@@ -286,7 +327,7 @@ func TestPGReconcileSkipsLiveInflight(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 	disk.put("ws", "d.txt", "pending")
 
 	id := insertIntent(t, s, intent{
@@ -314,7 +355,7 @@ func TestPGReconcileDeadGrace(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 	disk.put("ws", "e.txt", "x")
 
 	insertIntent(t, s, intent{
@@ -334,7 +375,7 @@ func TestPGStaleRenameKeepsNewerRows(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 
 	ctx := context.Background()
 	// Declare-time state: d1/old.txt (v2). The intent minted v4.
@@ -345,14 +386,17 @@ func TestPGStaleRenameKeepsNewerRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed rows: %v", err)
 	}
-	// Disk after: rename ran (d2 exists), source dir recreated.
+	// Disk after: rename ran (d2 is the moved d1 — same inode), and the
+	// source path was recreated with a new dir (new inode).
 	disk.put("ws", "d1", "dir")
-	disk.fps["ws/d1"] = "fp-d1-new" // recreated — differs from preFP
-	disk.put("ws", "d2", "dir")
+	d1Info, _ := disk.stat("ws", "d1")
+	preFP := d1Info.Fingerprint
+	disk.mv("ws", "d1", "d2")
+	disk.put("ws", "d1", "dir") // recreated — new inode, differs from preFP
 
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "d1", toPath: "d2",
-		version: 4, preFP: "fp-d1-old", at: time.Now().Add(-time.Minute),
+		version: 4, preFP: preFP, at: time.Now().Add(-time.Minute),
 	})
 	if got := s.Reconcile(context.Background()); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
@@ -377,7 +421,7 @@ func TestPGApplyIsIdempotent(t *testing.T) {
 	resetTables(t, dsn)
 	s := newPGStore(t, dsn, t.TempDir())
 	disk := newFakeDisk()
-	s.SetReconcile(disk.stat, disk.hash)
+	s.SetReconcile(disk.stat, disk.hash, nil)
 	disk.put("ws", "f.txt", "data")
 
 	id := insertIntent(t, s, intent{
@@ -425,5 +469,260 @@ func TestPGSequenceNeverRewinds(t *testing.T) {
 	}
 	if next <= 90 {
 		t.Fatalf("sequence rewound to %d below pending version 90", next)
+	}
+}
+
+// f102: while the filesystem root cannot be verified (canonical mount
+// down — a clean unmount leaves a bare directory where every stat reads
+// absent), the reconciler must not judge anything. Pending intents and
+// the acknowledged rows they cover survive until a pass where absence is
+// provable.
+func TestPGReconcileMountGate(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	ctx := context.Background()
+
+	// Acknowledged row + pending intent; disk has nothing (as a bare
+	// unmounted mountpoint would report).
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','pend.txt',7,'fp-p')`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "pend.txt",
+		version: 8, expectSHA: sha("landed"), at: time.Now().Add(-time.Minute),
+	})
+
+	unhealthy := true
+	s.SetReconcile(disk.stat, disk.hash, func() error {
+		if unhealthy {
+			return ErrMountUnavailable
+		}
+		return nil
+	})
+	if got := s.Reconcile(ctx); got != 0 {
+		t.Fatalf("reconcile judged intents while mount unverifiable: settled %d", got)
+	}
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("intent lost during unverifiable pass: %d", n)
+	}
+	if v, _ := versionOf(t, s, "ws", "pend.txt"); v != 7 {
+		t.Fatalf("acknowledged row erased during unverifiable pass: %d", v)
+	}
+	// Gate clears: the same intent is judged on a trustworthy absence —
+	// dropped with its ghost row (proves the gate is not a stall).
+	unhealthy = false
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d after gate cleared", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "pend.txt"); v != 0 {
+		t.Fatalf("ghost row survived trustworthy absence: %d", v)
+	}
+}
+
+// f103: the destructive half of settlement is owner-fenced. A process
+// whose recorded owner changed (watchdog lag or a mid-pass flip) must not
+// delete intents or version rows — the live successor rolls them forward.
+func TestPGDropFencedForeignOwner(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	ctx := context.Background()
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','keep.txt',5,'fp-k')`); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "keep.txt",
+		version: 6, at: time.Now().Add(-time.Minute),
+	})
+	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
+		path: "keep.txt", version: 6}
+
+	// A successor took ownership — this process is displaced.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE store_meta SET owner='other-inst' WHERE id`); err != nil {
+		t.Fatalf("flip owner: %v", err)
+	}
+	if s.dropIntent(ctx, it) {
+		t.Fatal("dropIntent deleted under a foreign owner")
+	}
+	if s.dropIntentGhosts(ctx, it, true) {
+		t.Fatal("dropIntentGhosts deleted under a foreign owner")
+	}
+	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}); err == nil {
+		t.Fatal("apply ran under a foreign owner")
+	}
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("intent deleted under foreign owner: %d", n)
+	}
+	if v, _ := versionOf(t, s, "ws", "keep.txt"); v != 5 {
+		t.Fatalf("acknowledged row deleted under foreign owner: %d", v)
+	}
+}
+
+// f104: while any intent overlapping the target paths is still pending,
+// the outcome of earlier filesystem work is uncertain — declare refuses
+// the conflicting op instead of minting rows a delayed settle would
+// strand. Non-overlapping paths proceed normally.
+func TestPGDeclareBlockedByPendingIntent(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	// A rename intent a→b whose fs outcome is not yet settled.
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "a", toPath: "b",
+		version: 30, at: time.Now(),
+	})
+	probeAbsent := func() (string, bool, error) { return "", false, nil }
+	noop := func() (FileInfo, error) { return FileInfo{Kind: "file"}, nil }
+
+	for _, p := range []string{"a", "a/new.txt", "b", "b/x.txt"} {
+		_, _, err := s.WithWrite(ctx, "ws", p, "write",
+			IfVersion{Mode: "any"}, "", probeAbsent, noop)
+		if !errors.Is(err, ErrUnsettled) {
+			t.Fatalf("write %s under pending rename: %v, want ErrUnsettled", p, err)
+		}
+	}
+	// An unrelated path is unaffected.
+	ver, _, err := s.WithWrite(ctx, "ws", "c.txt", "write",
+		IfVersion{Mode: "none"}, sha("c"), probeAbsent,
+		func() (FileInfo, error) {
+			disk.put("ws", "c.txt", "c")
+			return FileInfo{Kind: "file", Fingerprint: "fp-c"}, nil
+		})
+	if err != nil || ver < 1 {
+		t.Fatalf("unrelated write blocked: ver=%d err=%v", ver, err)
+	}
+	// A rename INTO the pending area is refused too.
+	_, _, err = s.Rename(ctx, "ws", "c.txt", "b/moved.txt",
+		IfVersion{Mode: "none"}, probeAbsent, probeAbsent, noop)
+	if !errors.Is(err, ErrUnsettled) {
+		t.Fatalf("rename into pending area: %v, want ErrUnsettled", err)
+	}
+}
+
+// f106: a pending rename whose destination is not the moved source (an
+// external create took the name) must not be applied — no clean version,
+// no rename event, and the source's rows are preserved rather than moved
+// onto foreign paths.
+func TestPGRenameReconcileForeignDest(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	// Declare-time source e1 with a recorded row; the rename never ran —
+	// e1 was deleted externally and e2 created by someone else.
+	disk.put("ws", "e1", "orig")
+	srcInfo, _ := disk.stat("ws", "e1")
+	preFP := srcInfo.Fingerprint
+	disk.del("ws", "e1")
+	disk.put("ws", "e2", "foreign-bytes") // different inode
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','e1',10,$1)`,
+		preFP); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "e1", toPath: "e2",
+		version: 20, preFP: preFP, at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "e2"); v != 0 {
+		t.Fatalf("foreign destination minted clean version %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "e1"); v != 10 {
+		t.Fatalf("source row lost: version %d", v)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op='rename' AND path='e2'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("rename event journaled for a rename that never ran (%d)", n)
+	}
+}
+
+// f106 positive leg: the destination IS the moved source (inode
+// continuity) — the intent applies, moving the subtree rows.
+func TestPGRenameReconcileIdentityMatch(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "f1.txt", "payload")
+	srcInfo, _ := disk.stat("ws", "f1.txt")
+	preFP := srcInfo.Fingerprint
+	disk.mv("ws", "f1.txt", "f2.txt") // the rename landed
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','f1.txt',10,$1)`,
+		preFP); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "f1.txt", toPath: "f2.txt",
+		version: 21, preFP: preFP, at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	v, fp := versionOf(t, s, "ws", "f2.txt")
+	if v != 21 {
+		t.Fatalf("destination version = %d, want 21", v)
+	}
+	live, _ := disk.stat("ws", "f2.txt")
+	if fp != live.Fingerprint {
+		t.Fatalf("clean rename recorded fp %q, want live %q", fp, live.Fingerprint)
+	}
+	if v, _ := versionOf(t, s, "ws", "f1.txt"); v != 0 {
+		t.Fatalf("source row left behind: %d", v)
+	}
+}
+
+// f106 content leg: the destination is the moved source by inode, but its
+// content was rewritten in place after the move — the version is recorded
+// with a diverged fingerprint so the foreign bytes stay external.
+func TestPGRenameReconcileDivergedFile(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "g1.txt", "payload")
+	srcInfo, _ := disk.stat("ws", "g1.txt")
+	preFP := srcInfo.Fingerprint
+	disk.mv("ws", "g1.txt", "g2.txt")    // rename landed
+	disk.edit("ws", "g2.txt", "edited!") // then rewritten in place (same inode)
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "g1.txt", toPath: "g2.txt",
+		version: 22, preFP: preFP, at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	v, fp := versionOf(t, s, "ws", "g2.txt")
+	if v != 22 {
+		t.Fatalf("destination version = %d, want 22", v)
+	}
+	if !hasPrefix(fp, "diverged:") {
+		t.Fatalf("post-move rewrite recorded clean fp %q", fp)
 	}
 }

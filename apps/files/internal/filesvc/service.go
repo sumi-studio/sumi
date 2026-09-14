@@ -100,6 +100,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
+		// A deposed store (writer lock lost) can serve nothing mutable;
+		// report it so supervision/routing sees the fenced state instead
+		// of a healthy-looking zombie that 503s every write (f107).
+		if d, ok := s.store.(interface{ Deposed() bool }); ok && d.Deposed() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("deposed"))
+			return
+		}
 		w.Write([]byte("ok"))
 		return
 	}
@@ -449,13 +457,22 @@ func isStoreErr(err error) bool {
 // diverging. No-op for stores without a journal (test fakes).
 func (s *Service) StartReconciler(ctx context.Context) {
 	st, ok := s.store.(interface {
-		SetReconcile(StatFn, HashFn)
+		SetReconcile(StatFn, HashFn, func() error)
 		ReconcileLoop(context.Context)
 	})
 	if !ok {
 		return
 	}
-	st.SetReconcile(s.root.stat, s.root.hash)
+	// Under require_mount the reconciler must not trust an "absent" stat
+	// while the canonical mount is down — a clean unmount leaves a bare
+	// directory where everything reads missing (f102). Without
+	// require_mount the root is an ordinary directory and absence is
+	// already trustworthy, so no gate is wired.
+	var check func() error
+	if s.root.requireMount {
+		check = s.root.checkMount
+	}
+	st.SetReconcile(s.root.stat, s.root.hash, check)
 	go st.ReconcileLoop(ctx)
 }
 
@@ -478,6 +495,9 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "permission_denied", "filesystem denied the operation")
 	case errors.Is(err, ErrNotEmpty):
 		writeErr(w, 409, "dir_not_empty", err.Error())
+	case errors.Is(err, ErrUnsettled):
+		writeErr(w, 503, "pending_settlement",
+			"a mutation touching this path is still settling; safe to retry")
 	case errors.Is(err, ErrUnavailable):
 		writeErr(w, 503, "unavailable", "operation timed out; safe to retry")
 	case isStoreErr(err):

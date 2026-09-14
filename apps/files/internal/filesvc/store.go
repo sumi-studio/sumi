@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,10 +70,11 @@ type Store struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	scopeMu   sync.Map // scope string -> *sync.Mutex
-	inflight  sync.Map // intent id -> struct{} — fs goroutines executing in this process
-	statFn    StatFn   // set by the service once the fs root exists
-	hashFn    HashFn   // content probe for expected-outcome verification
+	scopeMu   sync.Map     // scope string -> *sync.Mutex
+	inflight  sync.Map     // intent id -> struct{} — fs goroutines executing in this process
+	statFn    StatFn       // set by the service once the fs root exists
+	hashFn    HashFn       // content probe for expected-outcome verification
+	fsCheck   func() error // when set, verdict that the fs root is trustworthy (canonical mount live)
 	reconcile chan struct{}
 }
 
@@ -141,11 +143,21 @@ func (s *Store) SetOpTimeout(d time.Duration) { s.opTimeout = d }
 func (s *Store) SetDBTimeout(d time.Duration) { s.dbTimeout = d }
 
 // SetReconcile wires the filesystem probes the reconciler uses: stat for
-// the disk verdict, hash for expected-content verification.
-func (s *Store) SetReconcile(fn StatFn, hash HashFn) {
+// the disk verdict, hash for expected-content verification, and check —
+// when non-nil — a verdict that the filesystem root itself is trustworthy
+// right now (canonical mount live and fresh). A failed check means an
+// "absent" stat answer proves nothing (a clean unmount leaves a bare,
+// empty directory), so no intent is judged while it fails (f102).
+func (s *Store) SetReconcile(fn StatFn, hash HashFn, check func() error) {
 	s.statFn = fn
 	s.hashFn = hash
+	s.fsCheck = check
 }
+
+// Deposed reports whether the writer lock was lost — the service maps it
+// onto /healthz so supervision sees the fenced state instead of a
+// healthy-looking zombie (f107).
+func (s *Store) Deposed() bool { return s.deposed.Load() }
 
 func (s *Store) Close() {
 	s.closeOnce.Do(func() {
@@ -279,7 +291,21 @@ func (s *Store) watchWriter() {
 				time.Sleep(2 * time.Second)
 				continue
 			}
+			// Check the recorded owner BEFORE the lock attempt: a live
+			// successor holds the lock, so waiting for pg_try_advisory_lock
+			// alone can never discover the takeover — the displaced
+			// process would linger deposed forever (f107/A-F2). A foreign
+			// recorded owner means the failover already happened; exit.
 			cctx, ccancel := context.WithTimeout(context.Background(), s.dbTimeout)
+			var owner string
+			oerr := conn.QueryRow(cctx,
+				`SELECT owner FROM store_meta WHERE id`).Scan(&owner)
+			ccancel()
+			if oerr == nil && owner != s.owner {
+				log.Printf("store: another instance (%s) owns this database — exiting", owner)
+				os.Exit(1)
+			}
+			cctx, ccancel = context.WithTimeout(context.Background(), s.dbTimeout)
 			var got bool
 			cerr = conn.QueryRow(cctx,
 				`SELECT pg_try_advisory_lock($1)`, writerLockKey).Scan(&got)
@@ -298,9 +324,10 @@ func (s *Store) watchWriter() {
 			s.lockMu.Lock()
 			s.lockConn = conn
 			s.lockMu.Unlock()
-			var owner string
+			// Re-verify after acquiring: a successor may have bound while
+			// we waited on the lock.
 			cctx, ccancel = context.WithTimeout(context.Background(), s.dbTimeout)
-			oerr := conn.QueryRow(cctx,
+			oerr = conn.QueryRow(cctx,
 				`SELECT owner FROM store_meta WHERE id`).Scan(&owner)
 			ccancel()
 			if oerr != nil {
@@ -384,6 +411,11 @@ var (
 	ErrExternalChange = errors.New("path changed outside the service")
 	ErrUnavailable    = errors.New("operation timed out")
 	ErrNotEmpty       = errors.New("directory not empty")
+	// ErrUnsettled: a still-pending intent overlaps this op's paths, so
+	// the outcome of earlier filesystem work is not yet known — starting
+	// a conflicting mutation now could produce rows the pending
+	// settlement would strand (f104). Retry once the intent settles.
+	ErrUnsettled = errors.New("a mutation touching this path is still settling")
 )
 
 // IfVersion is the caller's declared expectation for the target path.
@@ -580,6 +612,32 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 	if err := checkVersion(ctx, tx, scope, casPath, iv, casProbe, op == "remove"); err != nil {
 		return intent{}, err
 	}
+	// Refuse work whose paths overlap a still-pending intent (f104): a
+	// mutation that outlived its request may land on the filesystem at
+	// any time, and a new op inside its source/destination subtree could
+	// mint rows that settlement then strands — a rename moving the file
+	// while its row stays at the old path. Because declares serialize on
+	// the scope mutex, a pending row here always means an earlier op's
+	// settle is outstanding (timed-out fs call, failed apply, or a dead
+	// owner's intent awaiting reconcile). The pending intent owns the
+	// affected area until it settles; the caller retries. Path pairs are
+	// subtree-overlapping in either direction; an empty leg can never
+	// match a real relative path (''||'/' is '/', and '' = only '').
+	var pendingID int64
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM file_op WHERE scope=$1 AND (
+		     path=$2 OR starts_with(path, $2||'/') OR starts_with($2, path||'/')
+		  OR to_path=$2 OR starts_with(to_path, $2||'/') OR starts_with($2, to_path||'/')
+		  OR path=$3 OR starts_with(path, $3||'/') OR starts_with($3, path||'/')
+		  OR to_path=$3 OR starts_with(to_path, $3||'/') OR starts_with($3, to_path||'/'))
+		 LIMIT 1`,
+		scope, path, toPath).Scan(&pendingID)
+	if err == nil {
+		return intent{}, ErrUnsettled
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return intent{}, err
+	}
 	it := intent{owner: s.owner, scope: scope, op: op, path: path, toPath: toPath, expectSHA: expectSHA}
 	if preProbe != nil {
 		fp, exists, perr := preProbe()
@@ -656,9 +714,13 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
 
 	switch it.op {
 	case "remove":
+		// Version-guarded like rename: a row committed after this intent
+		// declared (e.g. a recreate that raced a delayed settle) is not
+		// dead state and must not be erased (f104).
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM file_version WHERE scope=$1 AND (path=$2 OR starts_with(path, $2 || '/'))`,
-			it.scope, it.path); err != nil {
+			`DELETE FROM file_version WHERE scope=$1 AND (path=$2 OR starts_with(path, $2 || '/'))
+			 AND version < $3`,
+			it.scope, it.path, it.version); err != nil {
 			return err
 		}
 	case "rename":
@@ -725,38 +787,80 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo) error {
 	return tx.Commit(ctx)
 }
 
+// errForeignOwner: the recorded store owner is another instance — this
+// process is fenced and must not settle anything (f103).
+var errForeignOwner = errors.New("store owned by another instance")
+
+// checkOwnerTx verifies inside the tx that store_meta still names this
+// instance. Every destructive settlement path is fenced by it — a deposed
+// process must never delete intents or version rows a live successor
+// would roll forward (f103/B-F-B).
+func (s *Store) checkOwnerTx(ctx context.Context, tx pgx.Tx) error {
+	var owner string
+	if err := tx.QueryRow(ctx,
+		`SELECT owner FROM store_meta WHERE id`).Scan(&owner); err != nil {
+		return err
+	}
+	if owner != s.owner {
+		return errForeignOwner
+	}
+	return nil
+}
+
 // dropIntent clears an intent that provably never reached the filesystem.
-func (s *Store) dropIntent(ctx context.Context, it intent) {
+// Returns true when the intent row is actually gone; a foreign owner or a
+// DB failure leaves it for the owning writer's next pass.
+func (s *Store) dropIntent(ctx context.Context, it intent) bool {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
-	s.pool.Exec(ctx, `DELETE FROM file_op WHERE id=$1`, it.id) // best-effort
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return false
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM file_op WHERE id=$1`, it.id); err != nil {
+		return false
+	}
+	return tx.Commit(ctx) == nil
 }
 
 // dropIntentGhosts clears an intent plus version rows the disk proves are
 // dead state: rows under path (subtree when subtree=true) minted before
 // this intent's declare-time version. The version guard preserves rows
 // committed by later ops for recreated paths — a stale settlement can
-// never steal them (f81).
-func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) {
+// never steal them (f81). Owner-fenced like dropIntent (f103).
+func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) bool {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return
+		return false
 	}
 	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return false
+	}
+	var derr error
 	if subtree {
-		tx.Exec(ctx,
+		_, derr = tx.Exec(ctx,
 			`DELETE FROM file_version WHERE scope=$1 AND (path=$2 OR starts_with(path, $2 || '/'))
 			 AND version < $3`,
 			it.scope, it.path, it.version)
 	} else {
-		tx.Exec(ctx,
+		_, derr = tx.Exec(ctx,
 			`DELETE FROM file_version WHERE scope=$1 AND path=$2 AND version < $3`,
 			it.scope, it.path, it.version)
 	}
-	tx.Exec(ctx, `DELETE FROM file_op WHERE id=$1`, it.id)
-	tx.Commit(ctx)
+	if derr != nil {
+		return false
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM file_op WHERE id=$1`, it.id); err != nil {
+		return false
+	}
+	return tx.Commit(ctx) == nil
 }
 
 func (s *Store) kickReconcile() {
@@ -922,6 +1026,18 @@ func (s *Store) Reconcile(ctx context.Context) int {
 	if s.statFn == nil || s.deposed.Load() {
 		return 0
 	}
+	// An "absent" answer is only trustworthy when the filesystem root is
+	// verified present: a clean unmount leaves a bare directory where
+	// every stat returns ErrNotFound, which would otherwise erase pending
+	// intents and the acknowledged rows they cover (f102/B-F-A). While
+	// the check fails, no intent is judged — records wait for a pass
+	// where absence can actually be proven.
+	if s.fsCheck != nil {
+		if err := s.fsCheck(); err != nil {
+			log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", err)
+			return 0
+		}
+	}
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	rows, err := s.pool.Query(dctx,
@@ -944,11 +1060,49 @@ func (s *Store) Reconcile(ctx context.Context) int {
 	rows.Close()
 	settled := 0
 	for _, it := range its {
+		if s.deposed.Load() {
+			break // fenced mid-pass: the writer lock was lost (f103)
+		}
 		if s.reconcileOne(ctx, it) {
 			settled++
 		}
 	}
 	return settled
+}
+
+// fpParts splits a live fingerprint "ino:size:mtime_ns:ctime_ns". The
+// inode is the object's identity across a same-mount rename; size+mtime
+// extend the identity to content for regular files (a rename updates
+// ctime, and a dir's mtime moves with its '..' entry, so those legs are
+// not compared for identity). Returns ok=false for the 2-field fallback
+// fingerprint emitted when Stat_t is unavailable — without an inode the
+// destination cannot be proven to be the moved source (f106).
+func fpParts(fp string) (ino, size, mtime string, ok bool) {
+	a := strings.Split(fp, ":")
+	if len(a) != 4 {
+		return "", "", "", false
+	}
+	return a[0], a[1], a[2], true
+}
+
+// renameOutcome adjusts the FileInfo applied for a proven rename. Inode
+// continuity proves the object at the destination IS the moved source;
+// for a regular file, a size/mtime difference from the declare-time
+// fingerprint then means the content was rewritten in place after the
+// move — the version is recorded with a diverged fingerprint so the
+// foreign bytes surface as external_change instead of being attributed
+// to the rename (f106). Directory renames stay clean: child rows keep
+// their own fingerprints, which flag per-file external edits.
+func renameOutcome(it intent, info FileInfo) FileInfo {
+	if info.Kind != "file" {
+		return info
+	}
+	_, srcSize, srcMt, sok := fpParts(it.preFP)
+	_, toSize, toMt, tok := fpParts(info.Fingerprint)
+	if sok && tok && (srcSize != toSize || srcMt != toMt) {
+		info.Fingerprint = divergedFP(it.preFP)
+	}
+	return info
 }
 
 func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
@@ -974,36 +1128,58 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 	case "rename":
 		toInfo, terr := s.statFn(it.scope, it.toPath)
 		frInfo, ferr := s.statFn(it.scope, it.path)
+		// The destination counts as the moved source only when the inode
+		// recorded at declare time survived the move (f106/A-F1). A
+		// destination that merely EXISTS could be an unrelated external
+		// create — applying then would mint a clean version + rename
+		// event for foreign bytes and move the source's rows onto paths
+		// that never held them. Unproven destinations are never claimed:
+		// the intent is dropped and all version rows are kept, so nothing
+		// is laundered and acknowledged history is preserved.
+		srcIno, _, _, haveSrc := fpParts(it.preFP)
+		toIno, _, _, haveTo := fpParts(toInfo.Fingerprint)
+		proven := haveSrc && haveTo && srcIno == toIno
 		switch {
-		case errors.Is(ferr, ErrNotFound):
-			// Source gone. If the destination exists the rename ran;
-			// if neither exists, the moved subtree was deleted after —
-			// either way the source's stale rows are dead state.
-			if terr == nil {
-				if err := s.apply(ctx, it, toInfo); err != nil {
+		case ferr == nil && frInfo.Fingerprint == it.preFP:
+			// Source byte-identical to declare (same inode+times) — the
+			// rename provably never ran, whatever sits at the
+			// destination. Drop only the intent; rows stay.
+			return s.dropIntent(ctx, it)
+		case ferr == nil:
+			// Source exists but changed — recreated or edited. The
+			// rename can only have run if the destination is the moved
+			// original; apply moves subtree rows (version-guarded so the
+			// recreation's newer rows keep their paths). Anything else —
+			// foreign or absent destination — means no provable rename:
+			// drop the intent, keep every row.
+			if terr == nil && proven {
+				if err := s.apply(ctx, it, renameOutcome(it, toInfo)); err != nil {
 					return false
 				}
-			} else {
-				s.dropIntentGhosts(ctx, it, true)
-			}
-			return true
-		case ferr == nil:
-			if frInfo.Fingerprint == it.preFP {
-				// Source unchanged since declare — the rename never ran.
-				s.dropIntent(ctx, it)
 				return true
 			}
-			// Source was recreated: the rename ran iff the destination
-			// exists. If it does not, drop — disk wins. The version
-			// guards in apply keep the recreated source's newer rows.
-			if terr == nil {
-				if err := s.apply(ctx, it, toInfo); err != nil {
+			return s.dropIntent(ctx, it)
+		case errors.Is(ferr, ErrNotFound):
+			// Source gone: either the rename ran (destination present)
+			// or the source was removed without it.
+			if terr == nil && proven {
+				if err := s.apply(ctx, it, renameOutcome(it, toInfo)); err != nil {
 					return false
 				}
-			} else {
-				s.dropIntent(ctx, it)
+				return true
 			}
-			return true
+			if errors.Is(terr, ErrNotFound) {
+				// Both legs absent — the subtree is gone either way;
+				// its pre-intent rows are dead state.
+				return s.dropIntentGhosts(ctx, it, true)
+			}
+			if terr == nil {
+				// Destination exists but is not the moved source:
+				// uncertain outcome — drop the intent, keep all rows.
+				log.Printf("reconcile: rename %s/%s -> %s destination not the moved source; dropping intent, keeping rows",
+					it.scope, it.path, it.toPath)
+			}
+			return s.dropIntent(ctx, it)
 		default:
 			return false // fs unreachable — retry next pass
 		}
@@ -1019,34 +1195,31 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 					log.Printf("reconcile: apply remove %s/%s: %v", it.scope, it.path, err)
 					return false
 				}
-			} else {
-				// Absent + settled owner: the write/mkdir never landed
-				// (its fs goroutine is gone or already failed). Any row
-				// for the path is a ghost — clean it too.
-				s.dropIntentGhosts(ctx, it, false)
+				return true
 			}
-			return true
+			// Absent + settled owner: the write/mkdir never landed
+			// (its fs goroutine is gone or already failed). Any row
+			// for the path is a ghost — clean it too. Absence is only
+			// trusted because the pass was mount-gated (f102).
+			return s.dropIntentGhosts(ctx, it, false)
 		}
 		if err != nil {
 			return false // fs unreachable — retry next pass
 		}
 		if it.op == "remove" {
 			// Path still exists — removal never committed.
-			s.dropIntent(ctx, it)
-			return true
+			return s.dropIntent(ctx, it)
 		}
 		if it.preFP != "" && info.Fingerprint == it.preFP {
 			// Byte-identical fingerprint since declare — our mutation
 			// never ran (a landed write always mints a new inode/fp).
-			s.dropIntent(ctx, it)
-			return true
+			return s.dropIntent(ctx, it)
 		}
 		if it.op == "mkdir" {
 			if info.Kind != "dir" {
 				// A non-dir at the path means the mkdir never ran —
 				// whatever is there is not ours.
-				s.dropIntent(ctx, it)
-				return true
+				return s.dropIntent(ctx, it)
 			}
 		} else if it.expectSHA != "" && s.hashFn != nil {
 			// Write: verify the landed bytes are the intended ones.
