@@ -147,18 +147,18 @@ evidence, so no lost response, retry or partition creates two writers:
   every journaled `input_received` must be the one its input points at —
   otherwise the destination would drop the real event or journal it twice.
   The store enforces this invariant at the write boundary rather than
-  discovering it at the cut. A receipt's identity is the journal's own
-  `payload->>'input_id'` text form — numeric `5` and string `"5"` name one
-  input, because that is what the marker lookup and the verifier compare.
-  A commit that presents a second copy of an already-journaled identity —
-  same batch, an earlier commit, or a receipt whose input row does not
-  exist yet — drops it as the same fact twice. Creating an input adopts
-  the earliest receipt already naming its id as `received_seq` (the same
-  for `SubmitInput`, scheduled wakes and job notifications), so a ghost
-  receipt becomes that input's receipt instead of a second, unlinked copy;
-  the input's own later turn dedups against the marker. A receipt with a
-  missing or null `input_id` names no input: it stays journaled ghost
-  content, is never deduplicated, and can never join a row.
+  discovering it at the cut: a commit carrying an `input_received` is
+  refused — transactionally, before any event lands — unless every receipt
+  carries a non-empty string `input_id` naming an input row the persona
+  already holds. A receipt for an absent input is malformed journal
+  content, not history; the refusal rolls back cleanly and the commit can
+  be retried once the input exists, so a concurrent `SubmitInput` and a
+  receipt commit can never produce a journaled receipt beside an unlinked
+  marker. For valid ids, a copy naming an already-journaled input is
+  dropped, and so is a second copy inside the request itself — a duplicate
+  receipt is the same fact twice, not new history. `input_id` is a string
+  by contract; the boundary does not emulate `payload->>'input_id'` text
+  forms for other JSON shapes.
 
 ## Secrets
 

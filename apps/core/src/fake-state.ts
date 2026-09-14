@@ -103,29 +103,6 @@ const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
 const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
 
-/**
- * An input_received event's identity — the journal's own
- * payload->>'input_id' text form, matching the Go store's dedup/back-fill
- * and the cut verifier. String ids are themselves; other JSON scalars use
- * their text form so numeric 5 and string "5" name one input. A missing or
- * null input_id yields null: the receipt names no input, is journaled as
- * ghost content and is never deduplicated or linked.
- */
-function receiptKey(
-  persona: string,
-  payload: Record<string, unknown>,
-): string | null {
-  const v = payload?.input_id;
-  if (v === null || v === undefined) return null;
-  const id =
-    typeof v === "string"
-      ? v
-      : typeof v === "number" || typeof v === "boolean"
-        ? String(v)
-        : JSON.stringify(v);
-  return `${persona}|${id}`;
-}
-
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
 function estEventTokens(kind: string, payload: Record<string, unknown>): number {
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
@@ -653,20 +630,39 @@ export class FakeState implements StateClient {
       error:
         req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
     };
-    // Exactly one input_received per input ever lands in the journal (Go
-    // withoutJournaledInput + received_seq): copies naming an already-
-    // journaled input are dropped, and so is a second copy inside this
-    // batch — a duplicate receipt is the same fact twice, not new history.
+    // Exactly one input_received per input ever lands in the journal, and
+    // every receipt names a real input (Go withoutJournaledInput +
+    // received_seq): a receipt must carry a non-empty string input_id
+    // naming an input row this persona holds — anything else refuses the
+    // commit before any event lands. Validation covers every copy so a
+    // dropped duplicate cannot mask an invalid element; a valid copy
+    // naming an already-journaled input is dropped, as is a second copy
+    // inside this batch — a duplicate receipt is the same fact twice.
+    for (const ev of req.events) {
+      if (ev.kind !== "input_received") continue;
+      const id = ev.payload?.input_id;
+      if (typeof id !== "string" || id === "") {
+        throw new StateError(
+          400,
+          "input_received payload.input_id must be a non-empty string",
+        );
+      }
+      if (
+        !this.inputs.some(
+          (i) => i.persona_id === persona && i.input_id === id,
+        )
+      ) {
+        throw new StateError(400, `input_received names absent input ${id}`);
+      }
+    }
     const emitted = new Set<string>();
     for (const ev of req.events) {
       if (ev.kind === "input_received") {
-        const key = receiptKey(persona, ev.payload);
-        if (key !== null) {
-          if (this.receivedSeq.has(key) || emitted.has(key)) {
-            continue;
-          }
-          emitted.add(key);
+        const key = `${persona}|${ev.payload.input_id as string}`;
+        if (this.receivedSeq.has(key) || emitted.has(key)) {
+          continue;
         }
+        emitted.add(key);
       }
       const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
@@ -678,8 +674,10 @@ export class FakeState implements StateClient {
         created_at: new Date().toISOString(),
       });
       if (ev.kind === "input_received") {
-        const key = receiptKey(persona, ev.payload);
-        if (key !== null) this.receivedSeq.set(key, seq);
+        this.receivedSeq.set(
+          `${persona}|${ev.payload.input_id as string}`,
+          seq,
+        );
       }
     }
     const input = this.inputs.find(

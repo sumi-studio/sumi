@@ -538,18 +538,10 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 	var stored Input
 	err = pgx.ErrNoRows
 	if authority == "active" {
-		// A receipt for this input_id may already be in the journal — a
-		// commit can journal input_received ahead of the input's creation.
-		// The new row adopts the earliest such receipt as its marker so
-		// materializing the id claims existing history instead of letting
-		// a second receipt land unlinked.
 		err = tx.QueryRow(ctx, `
 		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id,
-			source_surface, thread_id, occurred_at, attention, status, received_seq)
-		SELECT $1::uuidv7, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued',
-			(SELECT MIN(seq) FROM core_events
-			 WHERE persona_id = $1::uuidv7 AND kind = 'input_received'
-				AND payload->>'input_id' = $2)
+			source_surface, thread_id, occurred_at, attention, status)
+		SELECT $1::uuidv7, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued'
 		FROM core_personas WHERE persona_id = $1::uuidv7
 		ON CONFLICT (persona_id, input_id) DO NOTHING
 		RETURNING `+inputCols,
@@ -1005,13 +997,15 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	// Exactly one input_received per input identity ever lands in the
-	// journal: a copy whose identity is already journaled — the input's
-	// marker is set, or a receipt carrying that payload->>'input_id' exists
-	// (see withoutJournaledInput) — is dropped, and so is a second copy
-	// inside the request itself. A duplicate receipt is the same fact
-	// twice, not new history. commit_request keeps the request as sent, so
-	// replays still compare.
+	// Exactly one input_received per input ever lands in the journal, and
+	// every receipt names a real input: withoutJournaledInput refuses the
+	// commit when a receipt carries a non-string id or names an input row
+	// that does not exist (the refusal rolls back — nothing is journaled
+	// and the turn can be retried once the input exists). A receipt for an
+	// already-journaled input is dropped, and so is a second copy inside
+	// the request itself — a duplicate receipt is the same fact twice, not
+	// new history. commit_request keeps the request as sent, so replays
+	// still compare.
 	events, err := withoutJournaledInput(ctx, tx, personaID, req.Events)
 	if err != nil {
 		return nil, err
@@ -1341,22 +1335,6 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	if received != nil {
 		return nil
 	}
-	// The journal may already carry a receipt naming this input (journaled
-	// before the row's marker was visible to this write). Adopt it rather
-	// than journaling a second, unlinked copy.
-	var journaled *int64
-	if err := tx.QueryRow(ctx,
-		`SELECT MIN(seq) FROM core_events
-		 WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = $2`,
-		personaID, inputID).Scan(&journaled); err != nil {
-		return fmt.Errorf("input for journal: %w", err)
-	}
-	if journaled != nil {
-		_, err := tx.Exec(ctx,
-			`UPDATE core_inputs SET received_seq = $3 WHERE persona_id = $1 AND input_id = $2`,
-			personaID, inputID, *journaled)
-		return err
-	}
 	in, err := scanInput(tx.QueryRow(ctx,
 		`SELECT `+inputCols+` FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
 		personaID, inputID))
@@ -1395,117 +1373,91 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	return err
 }
 
-// withoutJournaledInput enforces one input_received per input identity in
-// the journal. A receipt's identity is the journal's own key —
-// payload->>'input_id' — resolved in PostgreSQL so dedup, the marker
-// back-fill and the cut's link checks share one namespace: numeric 5 and
-// string "5" name one input, not two. A copy whose identity is already
-// journaled (the input's marker is set, or a receipt carrying that key
-// exists — including a ghost receipt for an input not yet created) is
-// dropped, and so is a second copy inside the request itself: a duplicate
-// receipt is the same fact twice, not new history. A receipt with a
-// missing or null input_id names no input — it is journaled ghost content
-// that can never join a row, so it is neither deduplicated nor linked.
-// The marker check runs FOR UPDATE so a commit cannot dedup against a
-// marker another in-flight write has not recorded yet.
+// withoutJournaledInput validates and dedups the request's input_received
+// events. A receipt is only meaningful as the record of an input this
+// persona holds: its payload.input_id must be a non-empty string naming an
+// existing input row. Anything else — a non-string id or an id with no row —
+// is malformed journal content, so the commit is refused before any
+// mutation rather than journaled as a ghost the cut would later refuse.
+// Validation runs on every copy before dedup, so a dropped duplicate
+// cannot mask an invalid element. For valid ids, one receipt per input
+// ever lands in the journal: a copy naming an input whose marker is
+// already set is dropped (the receipt exists), and a second copy inside
+// the request itself is dropped (the first is the receipt). The marker
+// check runs FOR UPDATE so a commit cannot dedup against a marker another
+// in-flight write has not recorded yet.
 func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, events []EventInput) ([]EventInput, error) {
-	var payloads []string
-	var idx []int
-	for i, e := range events {
+	var named []string
+	seen := map[string]bool{}
+	for _, e := range events {
 		if e.Kind != "input_received" {
 			continue
 		}
-		raw, err := json.Marshal(e.Payload)
-		if err != nil {
-			return nil, err
+		id, ok := e.Payload["input_id"].(string)
+		if !ok || id == "" {
+			return nil, fmt.Errorf("%w: input_received payload.input_id must be a non-empty string", ErrBadRequest)
 		}
-		payloads = append(payloads, string(raw))
-		idx = append(idx, i)
+		if !seen[id] {
+			seen[id] = true
+			named = append(named, id)
+		}
 	}
-	if len(payloads) == 0 {
+	if len(named) == 0 {
 		return events, nil
 	}
-	keys := make(map[int]string, len(idx))
-	var named []string
-	seen := map[string]bool{}
-	rows, err := tx.Query(ctx, `
-		SELECT (p::jsonb)->>'input_id'
-		FROM unnest($1::text[]) WITH ORDINALITY AS t(p, i)
-		ORDER BY t.i`, payloads)
+	// Every named id must resolve to an input row. A receipt for an absent
+	// input is refused here — before any event or marker lands — so the
+	// commit can be retried once the input exists.
+	existing := map[string]bool{}
+	rows, err := tx.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 AND input_id = ANY($2)`,
+		personaID, named)
 	if err != nil {
 		return nil, err
 	}
-	k := 0
 	for rows.Next() {
-		var id *string
+		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		if id != nil {
-			keys[idx[k]] = *id
-			if !seen[*id] {
-				seen[*id] = true
-				named = append(named, *id)
-			}
-		}
-		k++
+		existing[id] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	rows.Close()
-	journaled := map[string]bool{}
-	if len(named) > 0 {
-		rows, err = tx.Query(ctx,
-			`SELECT input_id FROM core_inputs
-			 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
-			 FOR UPDATE`,
-			personaID, named)
-		if err != nil {
-			return nil, err
+	for _, id := range named {
+		if !existing[id] {
+			return nil, fmt.Errorf("%w: input_received names absent input %q", ErrBadRequest, id)
 		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			journaled[id] = true
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		rows.Close()
-		// A receipt already in the journal names its input forever —
-		// including a ghost whose input row does not exist yet. Dropping
-		// the second copy is what keeps a later SubmitInput adoption from
-		// joining an unlinked receipt.
-		rows, err = tx.Query(ctx, `
-			SELECT DISTINCT payload->>'input_id' FROM core_events
-			WHERE persona_id = $1 AND kind = 'input_received'
-				AND payload->>'input_id' = ANY($2)`,
-			personaID, named)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			journaled[id] = true
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		rows.Close()
 	}
+	journaled := map[string]bool{}
+	rows, err = tx.Query(ctx,
+		`SELECT input_id FROM core_inputs
+		 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
+		 FOR UPDATE`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		journaled[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
 	out := make([]EventInput, 0, len(events))
 	emitted := map[string]bool{}
-	for i, e := range events {
-		if id, ok := keys[i]; ok {
+	for _, e := range events {
+		if e.Kind == "input_received" {
+			id := e.Payload["input_id"].(string)
 			if journaled[id] || emitted[id] {
 				continue
 			}
@@ -1879,11 +1831,8 @@ func (s *Store) DispatchDueSchedules(ctx context.Context, personaID string, gene
 	out := []Schedule{}
 	for _, id := range ids {
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status, received_seq)
-			SELECT persona_id, 'sched:' || schedule_id, 'wake', payload, 'schedule', schedule_id, 'core_schedules', 'reply', 'queued',
-				(SELECT MIN(seq) FROM core_events
-				 WHERE persona_id = core_schedules.persona_id AND kind = 'input_received'
-					AND payload->>'input_id' = 'sched:' || core_schedules.schedule_id)
+			INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status)
+			SELECT persona_id, 'sched:' || schedule_id, 'wake', payload, 'schedule', schedule_id, 'core_schedules', 'reply', 'queued'
 			FROM core_schedules
 			WHERE persona_id = $1 AND schedule_id = $2
 			ON CONFLICT (persona_id, input_id) DO NOTHING`,

@@ -405,11 +405,8 @@ func (s *Store) notifyJobTerminalTx(ctx context.Context, tx pgx.Tx, j *Job) erro
 		}
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status, received_seq)
-		SELECT $1::uuidv7, $2, 'job_completed', $3, 'job', $4, 'core_jobs', 'reply', 'queued',
-			(SELECT MIN(seq) FROM core_events
-			 WHERE persona_id = $1::uuidv7 AND kind = 'input_received'
-				AND payload->>'input_id' = $2)
+		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id, source_surface, attention, status)
+		VALUES ($1::uuidv7, $2, 'job_completed', $3, 'job', $4, 'core_jobs', 'reply', 'queued')
 		ON CONFLICT (persona_id, input_id) DO NOTHING`,
 		j.PersonaID, jobInputPrefix+j.JobID, payload, j.JobID); err != nil {
 		return fmt.Errorf("notify job: %w", dataErr(err))
