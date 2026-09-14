@@ -81,6 +81,13 @@ const (
 	// not spend attempts; they are paced by backoff and bounded separately
 	// so a host that dies on every claim cannot loop model calls forever.
 	memoryChunkMaxInterruptions = 8
+	// memoryReshelvePacing delays a chunk returned to the shelf when the
+	// model layer could not produce a request — an unusable binding or a
+	// budget-denied admission. The claim reached no model, so nothing is
+	// counted; the delay keeps a persistent block from spinning the
+	// claim/reshelve pair inside one host tick. Callers pass a longer pace
+	// for a budget wait, which clears on the next funding change.
+	memoryReshelvePacing = 200 * time.Millisecond
 )
 
 // ErrMemoryConflict marks a memory-state contract violation (HTTP 409).
@@ -903,6 +910,53 @@ func (s *Store) FailMemoryChunk(ctx context.Context, personaID string, generatio
 			personaID, chunkSeq, errText, attempts); err != nil {
 			return nil, err
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.chunk(ctx, s.pool, personaID, chunkSeq)
+}
+
+// ReshelveMemoryChunk returns a claimed chunk to the shelf when no model
+// request could be made — the binding was unusable or budget admission
+// denied the call. No verdict was evaluated, so the claim spends neither
+// an attempt nor an interruption; the chunk waits on the shelf for a
+// usable funding/binding state. delayMs paces the next claim beyond the
+// default tick — a budget wait uses a slower cadence because only a
+// funding change can unblock it.
+func (s *Store) ReshelveMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, reason string, delayMs int64) (*MemoryChunk, error) {
+	reason = strings.ReplaceAll(reason, "\x00", "")
+	delay := time.Duration(delayMs) * time.Millisecond
+	if delay <= 0 {
+		delay = memoryReshelvePacing
+	}
+	if delay > 10*time.Minute {
+		delay = 10 * time.Minute
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
+		return nil, err
+	}
+	c, err := scanChunk(tx.QueryRow(ctx,
+		`SELECT `+chunkCols+` FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2 FOR UPDATE`,
+		personaID, chunkSeq))
+	if err != nil {
+		return nil, err
+	}
+	if c.Status != "preparing" || c.ClaimedGeneration == nil || *c.ClaimedGeneration != generation {
+		return nil, fmt.Errorf("%w: chunk %d is not preparing under this generation", ErrMemoryConflict, chunkSeq)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_memory_chunks SET status = 'sealed',
+			claimed_generation = NULL, claimed_at = NULL,
+			last_error = $3, not_before = now() + $4 * interval '1 millisecond'
+		WHERE persona_id = $1 AND chunk_seq = $2`,
+		personaID, chunkSeq, reason, delay.Milliseconds()); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

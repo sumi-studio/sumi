@@ -6,6 +6,7 @@ import type {
   ClaimedMemoryChunk,
   CommitRequest,
   Event,
+  FundingRef,
   Input,
   Job,
   JobTerminalReport,
@@ -25,6 +26,9 @@ import type {
   Schedule,
   Turn,
   TurnPlan,
+  UsageAdmitResult,
+  UsageEstimate,
+  UsageFact,
   WriterLease,
 } from "./types.ts";
 
@@ -107,6 +111,8 @@ const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
 const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
+/** Pacing for a chunk reshelved without a verdict (Go memoryReshelvePacing). */
+const MEMORY_RESHELVE_PACING_MS = 200;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
 function estEventTokens(kind: string, payload: Record<string, unknown>): number {
@@ -326,6 +332,50 @@ export class FakeState implements StateClient {
   approvals = new Map<string, Approval>();
   /** Test fixture: the model binding each persona resolves to. */
   modelBindings = new Map<string, ModelBinding>();
+  /** Configured budgets — key: funding_kind|funding_id (usage_budgets). */
+  usageBudgets = new Map<
+    string,
+    {
+      limit_minor: number;
+      currency: string;
+      rate_input_per_mtok: number;
+      rate_output_per_mtok: number;
+      rate_cached_per_mtok: number | null;
+      pricing_revision: string;
+    }
+  >();
+  /** Admission holds — key: persona|fact_id (usage_reservations). */
+  usageReservations = new Map<
+    string,
+    {
+      fact_id: string;
+      funding_kind: string;
+      funding_id: string;
+      reserved_minor: number;
+      currency: string | null;
+      bounded: boolean;
+      generation: number;
+      turn_id: string | null;
+      phase: string;
+      status: "held" | "settled" | "released";
+    }
+  >();
+  /** The usage ledger — key: persona|fact_id (usage_facts). */
+  usageFacts = new Map<string, UsageFact>();
+  /** Parked budget waits — key: persona|input_id (core_budget_waits). */
+  budgetWaits = new Map<
+    string,
+    {
+      persona_id: string;
+      input_id: string;
+      turn_id: string;
+      funding_kind: string;
+      funding_id: string;
+      needed_minor: number;
+      currency: string;
+      created_at: string;
+    }
+  >();
   /** Seq of each input's one input_received event (core_inputs.received_seq). */
   private receivedSeq = new Map<string, number>();
   /** Per-persona seqs — Go allocates MAX(seq)+1 per persona for both
@@ -553,11 +603,387 @@ export class FakeState implements StateClient {
     }
     // Memory chunks a fenced generation was preparing count an interruption.
     this.interruptPreparing(persona, generation);
+    // Held reservations from dead generations reconcile the same way Go
+    // Recover does: the fact landed → settled; it never did → released.
+    for (const [k, r] of this.usageReservations) {
+      if (
+        k.startsWith(`${persona}|`) &&
+        r.generation < generation &&
+        r.status === "held"
+      ) {
+        r.status = this.usageFacts.has(k) ? "settled" : "released";
+      }
+    }
     return {
       interrupted_turns: interrupted,
       requeued_inputs: requeued,
       released_schedule_claims: [],
     };
+  }
+
+  /**
+   * Test fixture: install or replace a budget on a funding source, then
+   * resume waits the new cap can now admit (Go SetBudget parity — a cap
+   * without a rate card refuses, since it cannot bound spend).
+   */
+  setUsageBudget(
+    kind: string,
+    id: string,
+    budget: {
+      limit_minor: number;
+      currency: string;
+      rate_input_per_mtok: number;
+      rate_output_per_mtok: number;
+      rate_cached_per_mtok?: number | null;
+      pricing_revision?: string;
+    },
+  ) {
+    this.usageBudgets.set(`${kind}|${id}`, {
+      limit_minor: budget.limit_minor,
+      currency: budget.currency,
+      rate_input_per_mtok: budget.rate_input_per_mtok,
+      rate_output_per_mtok: budget.rate_output_per_mtok,
+      rate_cached_per_mtok: budget.rate_cached_per_mtok ?? null,
+      pricing_revision: budget.pricing_revision ?? "",
+    });
+    this.resumeBudgetWaits(kind, id);
+  }
+
+  /** Test fixture: remove the cap — uncapped is explicit — and resume
+   * every input waiting on that funding (Go ClearBudget parity). */
+  clearUsageBudget(kind: string, id: string) {
+    this.usageBudgets.delete(`${kind}|${id}`);
+    this.resumeBudgetWaits(kind, id);
+  }
+
+  /** Test fixture: a selection/connection change re-resolves funding, so
+   * every budget-parked input of the human's personas resumes
+   * (Go ResumeWaitsForHuman parity). */
+  resumeBudgetWaitsForHuman(humanId: string) {
+    for (const [key, w] of [...this.budgetWaits]) {
+      const p = this.personas.get(w.persona_id);
+      if (p?.human_id !== humanId) continue;
+      this.budgetWaits.delete(key);
+      this.requeueWaitingInput(w.persona_id, w.input_id);
+    }
+    for (const c of this.memoryChunks) {
+      const p = this.personas.get(c.persona_id);
+      if (
+        p?.human_id === humanId &&
+        c.status === "sealed" &&
+        c.not_before !== null &&
+        (c.last_error ?? "").startsWith("budget-wait:")
+      ) {
+        c.not_before = null;
+      }
+    }
+  }
+
+  /**
+   * Go resumeWaits: delete the matching wait rows whose needed amount now
+   * fits (or all of them when the cap is gone), requeue still-waiting
+   * inputs — unless a pending approval is a second, independent wait —
+   * and unpark memory chunks reshelved on a budget wait.
+   */
+  private resumeBudgetWaits(kind: string, id: string) {
+    const budget = this.usageBudgets.get(`${kind}|${id}`);
+    let fitsNeeded = -1;
+    if (budget) {
+      const { spent, held } = this.fundingSpend(kind, id);
+      fitsNeeded = budget.limit_minor - spent - held;
+    }
+    for (const [key, w] of [...this.budgetWaits]) {
+      if (w.funding_kind !== kind || w.funding_id !== id) continue;
+      if (fitsNeeded >= 0 && w.needed_minor > fitsNeeded) continue;
+      this.budgetWaits.delete(key);
+      this.requeueWaitingInput(w.persona_id, w.input_id);
+    }
+    // Chunks reshelved on a budget wait for this funding belong to its
+    // owner's personas; the fake has no funding→owner table, so unpark
+    // every budget-wait-paced chunk whose persona could reach it — a
+    // wider wake than Go's owner-scoped one, harmless in tests.
+    for (const c of this.memoryChunks) {
+      if (
+        c.status === "sealed" &&
+        c.not_before !== null &&
+        (c.last_error ?? "").startsWith("budget-wait:")
+      ) {
+        c.not_before = null;
+      }
+    }
+  }
+
+  /**
+   * Requeue a still-waiting input, accumulating its parked time into
+   * waited_ms like the Go resume path — but never one a pending approval
+   * still holds (a second, independent wait).
+   */
+  private requeueWaitingInput(persona: string, inputId: string) {
+    const input = this.inputs.find(
+      (i) =>
+        i.persona_id === persona &&
+        i.input_id === inputId &&
+        i.status === "waiting",
+    );
+    if (!input) return;
+    const pendingApproval = [...this.approvals.values()].some(
+      (a) =>
+        a.persona_id === persona &&
+        a.input_id === inputId &&
+        a.status === "pending",
+    );
+    if (pendingApproval) return;
+    if (input.waiting_since) {
+      input.waited_ms += Date.now() - Date.parse(input.waiting_since);
+      input.waiting_since = null;
+    }
+    input.status = "queued";
+    input.claimed_generation = null;
+    input.turn_id = null;
+    input.not_before = null;
+  }
+
+  private fundingSpend(kind: string, id: string) {
+    let spent = 0;
+    let held = 0;
+    for (const f of this.usageFacts.values()) {
+      if (f.funding.kind === kind && f.funding.id === id && f.cost_minor) {
+        spent += f.cost_minor;
+      }
+    }
+    for (const r of this.usageReservations.values()) {
+      if (
+        r.funding_kind === kind &&
+        r.funding_id === id &&
+        r.status === "held"
+      ) {
+        held += r.reserved_minor;
+      }
+    }
+    return { spent, held };
+  }
+
+  async admitUsage(
+    persona: string,
+    generation: number,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      round?: number;
+      funding: FundingRef;
+      estimate: UsageEstimate;
+    },
+  ): Promise<UsageAdmitResult> {
+    // Admission is writer-fenced (Go requireGeneration): a dead writer
+    // cannot reserve new spend.
+    this.mustHold(persona, generation);
+    if (!req.factId || !req.kind || !req.phase) {
+      throw new StateError(400, "fact_id, kind and phase are required");
+    }
+    if (
+      req.funding.kind !== "connection" &&
+      req.funding.kind !== "operator" &&
+      req.funding.kind !== "sumi"
+    ) {
+      throw new StateError(400, `unknown funding kind ${req.funding.kind}`);
+    }
+    const key = `${persona}|${req.factId}`;
+    const existing = this.usageReservations.get(key);
+    if (existing) {
+      if (
+        existing.funding_kind !== req.funding.kind ||
+        existing.funding_id !== req.funding.id
+      ) {
+        throw new StateError(
+          409,
+          `fact_id ${req.factId} already admitted under different funding`,
+        );
+      }
+      if (existing.status !== "held") {
+        throw new StateError(
+          409,
+          `fact_id ${req.factId} already ${existing.status}`,
+        );
+      }
+      return {
+        admitted: true,
+        reservation: {
+          fact_id: existing.fact_id,
+          reserved_minor: existing.reserved_minor,
+          currency: existing.currency ?? undefined,
+          bounded: existing.bounded,
+          status: existing.status,
+        },
+      };
+    }
+    const budget = this.usageBudgets.get(
+      `${req.funding.kind}|${req.funding.id}`,
+    );
+    let needed = 0;
+    let bounded = req.estimate.output_tokens_bound !== undefined;
+    let currency = "";
+    if (budget) {
+      const price = (tok: number, rate: number) =>
+        tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
+      needed =
+        price(req.estimate.input_tokens, budget.rate_input_per_mtok) +
+        (req.estimate.output_tokens_bound !== undefined
+          ? price(
+              req.estimate.output_tokens_bound,
+              budget.rate_output_per_mtok,
+            )
+          : 0);
+      currency = budget.currency;
+      const { spent, held } = this.fundingSpend(
+        req.funding.kind,
+        req.funding.id,
+      );
+      if (spent + held + needed > budget.limit_minor) {
+        return {
+          admitted: false,
+          wait: {
+            funding: req.funding,
+            needed_minor: needed,
+            limit_minor: budget.limit_minor,
+            spent_minor: spent,
+            held_minor: held,
+            remaining_minor: budget.limit_minor - spent - held,
+            currency: budget.currency,
+            pricing_revision: budget.pricing_revision,
+            bounded,
+          },
+        };
+      }
+    }
+    this.usageReservations.set(key, {
+      fact_id: req.factId,
+      funding_kind: req.funding.kind,
+      funding_id: req.funding.id,
+      reserved_minor: needed,
+      currency: currency || null,
+      bounded,
+      generation,
+      turn_id: req.turnId ?? null,
+      phase: req.phase,
+      status: "held",
+    });
+    return {
+      admitted: true,
+      reservation: {
+        fact_id: req.factId,
+        reserved_minor: needed,
+        currency: currency || undefined,
+        bounded,
+        status: "held",
+      },
+    };
+  }
+
+  async recordUsage(
+    persona: string,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      status: "reported" | "unknown";
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cachedTokens?: number | null;
+      quantities?: Record<string, unknown>;
+    },
+  ): Promise<{ fact: UsageFact; created: boolean }> {
+    // Not writer-fenced — the spend already happened (Go parity).
+    if (!req.factId || !req.kind || !req.phase) {
+      throw new StateError(400, "fact_id, kind and phase are required");
+    }
+    if (req.status !== "reported" && req.status !== "unknown") {
+      throw new StateError(400, "status must be reported or unknown");
+    }
+    const key = `${persona}|${req.factId}`;
+    const existing = this.usageFacts.get(key);
+    if (existing) {
+      const same =
+        existing.kind === req.kind &&
+        existing.phase === req.phase &&
+        (existing.turn_id ?? "") === (req.turnId ?? "") &&
+        (existing.input_id ?? "") === (req.inputId ?? "") &&
+        (existing.round ?? 0) === (req.round ?? 0) &&
+        existing.funding.kind === req.funding.kind &&
+        existing.funding.id === req.funding.id &&
+        existing.status === req.status &&
+        (existing.input_tokens ?? 0) === (req.inputTokens ?? 0) &&
+        (existing.output_tokens ?? 0) === (req.outputTokens ?? 0) &&
+        (existing.cached_tokens ?? 0) === (req.cachedTokens ?? 0);
+      if (!same) {
+        throw new StateError(
+          409,
+          `fact_id ${req.factId} recorded with different content`,
+        );
+      }
+      return { fact: existing, created: false };
+    }
+    const budget = this.usageBudgets.get(
+      `${req.funding.kind}|${req.funding.id}`,
+    );
+    let costMinor: number | null = null;
+    let currency: string | undefined;
+    let costBasis: string | undefined;
+    let revision: string | undefined;
+    if (
+      budget &&
+      req.status === "reported" &&
+      req.inputTokens != null &&
+      req.outputTokens != null
+    ) {
+      const price = (tok: number, rate: number) =>
+        tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
+      const cached = Math.min(req.cachedTokens ?? 0, req.inputTokens);
+      const cachedRate = budget.rate_cached_per_mtok ?? budget.rate_input_per_mtok;
+      costMinor =
+        price(req.inputTokens - cached, budget.rate_input_per_mtok) +
+        price(cached, cachedRate) +
+        price(req.outputTokens, budget.rate_output_per_mtok);
+      currency = budget.currency;
+      costBasis = "configured_rates";
+      revision = budget.pricing_revision;
+    }
+    const fact: UsageFact = {
+      persona_id: persona,
+      fact_id: req.factId,
+      kind: req.kind,
+      phase: req.phase,
+      turn_id: req.turnId,
+      input_id: req.inputId,
+      round: req.round,
+      funding: req.funding,
+      status: req.status,
+      input_tokens: req.inputTokens ?? null,
+      output_tokens: req.outputTokens ?? null,
+      cached_tokens: req.cachedTokens ?? null,
+      quantities: req.quantities ?? {},
+      cost_minor: costMinor,
+      currency,
+      cost_basis: costBasis,
+      pricing_revision: revision,
+      recorded_at: new Date().toISOString(),
+    };
+    this.usageFacts.set(key, fact);
+    const res = this.usageReservations.get(key);
+    if (res && res.status === "held") res.status = "settled";
+    return { fact, created: true };
+  }
+
+  async listUsageFacts(persona: string, limit = 100): Promise<UsageFact[]> {
+    return [...this.usageFacts.values()]
+      .filter((f) => f.persona_id === persona)
+      .sort((a, b) => a.recorded_at.localeCompare(b.recorded_at))
+      .slice(0, limit);
   }
 
   async loadTurn(
@@ -909,10 +1335,69 @@ export class FakeState implements StateClient {
         delivered_at: null,
       });
     } else if (req.outcome === "await") {
+      turn.status = "awaiting";
+      if (req.wait) {
+        // Mirror of the Go budget-wait commit: 'budget' is the only kind.
+        // The denied admission sent no request; if the cap changed between
+        // denial and commit the input requeues immediately instead of
+        // waiting on a blocker that no longer exists.
+        const w = req.wait;
+        if (
+          w.kind !== "budget" || !w.funding.kind || !w.funding.id ||
+          w.needed_minor < 0 || w.currency.length !== 3
+        ) {
+          throw new StateError(
+            400,
+            "wait must be a budget wait with funding, needed_minor and currency",
+          );
+        }
+        const budget = this.usageBudgets.get(
+          `${w.funding.kind}|${w.funding.id}`,
+        );
+        const { spent, held } = this.fundingSpend(
+          w.funding.kind,
+          w.funding.id,
+        );
+        const fits = !budget ||
+          spent + held + w.needed_minor <= budget.limit_minor;
+        if (fits) {
+          input.status = "queued";
+          input.claimed_generation = null;
+          input.turn_id = null;
+          input.not_before = null;
+        } else {
+          input.status = "waiting";
+          input.waiting_since = new Date().toISOString();
+          this.budgetWaits.set(`${persona}|${input.input_id}`, {
+            persona_id: persona,
+            input_id: input.input_id,
+            turn_id: turnId,
+            funding_kind: w.funding.kind,
+            funding_id: w.funding.id,
+            needed_minor: w.needed_minor,
+            currency: w.currency,
+            created_at: new Date().toISOString(),
+          });
+          this.outboxEntries.push({
+            persona_id: persona,
+            seq: this.nextSeq(this.outboxSeq, persona),
+            kind: "budget_wait",
+            payload: {
+              turn_id: turnId,
+              input_id: input.input_id,
+              funding_kind: w.funding.kind,
+              funding_id: w.funding.id,
+              needed_minor: w.needed_minor,
+              currency: w.currency,
+            },
+            created_at: new Date().toISOString(),
+            delivered_at: null,
+          });
+        }
+      } else {
       // Mirror of the Go await commit: the input waits only while an
       // approval is still pending; a decision that already landed requeues
       // it directly.
-      turn.status = "awaiting";
       const pending = [...this.approvals.values()].filter(
         (a) => a.persona_id === persona && a.input_id === input.input_id &&
           a.status === "pending",
@@ -944,6 +1429,7 @@ export class FakeState implements StateClient {
           created_at: new Date().toISOString(),
           delivered_at: null,
         });
+      }
       }
     } else {
       turn.status = "failed";
@@ -980,6 +1466,18 @@ export class FakeState implements StateClient {
     }
     turn.finished_at = new Date().toISOString();
     this.commits.set(turnId, req);
+    // Go releaseOrphanedReservations at turn commit: this turn's held
+    // reservations settle when their fact landed and release when it
+    // never did, so a lost provider call cannot hold budget forever.
+    for (const [k, r] of this.usageReservations) {
+      if (
+        k.startsWith(`${persona}|`) &&
+        r.turn_id === turnId &&
+        r.status === "held"
+      ) {
+        r.status = this.usageFacts.has(k) ? "settled" : "released";
+      }
+    }
     return turn;
   }
 
@@ -2101,6 +2599,40 @@ export class FakeState implements StateClient {
       c.status = "failed";
       c.not_before = null;
     }
+    return c;
+  }
+
+  /**
+   * Go ReshelveMemoryChunk: no model request could be made — the binding
+   * was unavailable or budget admission denied the call — so the claim
+   * records no verdict and spends neither attempts nor interruptions; a
+   * short pacing keeps a persistent condition from claiming every tick,
+   * and a 'budget-wait:' reason is cleared early by a funding change.
+   */
+  async reshelveMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    pause: { reason: string; delayMs?: number },
+  ): Promise<MemoryChunk> {
+    this.mustHold(persona, generation);
+    const c = this.memoryChunks.find(
+      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+    );
+    if (!c) throw new StateError(404, "memory chunk not found");
+    if (c.status !== "preparing" || c.claimed_generation !== generation) {
+      throw new StateError(
+        409,
+        `chunk ${chunkSeq} is not preparing under this generation`,
+      );
+    }
+    c.status = "sealed";
+    c.claimed_generation = null;
+    c.claimed_at = null;
+    c.last_error = pause.reason;
+    c.not_before = new Date(
+      Date.now() + (pause.delayMs ?? MEMORY_RESHELVE_PACING_MS),
+    ).toISOString();
     return c;
   }
 

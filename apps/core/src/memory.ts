@@ -39,6 +39,7 @@ import type {
   OmittedRange,
 } from "./types.ts";
 import { FencedError, StateError, type StateClient } from "./state-client.ts";
+import { BudgetWaitError } from "./usage.ts";
 
 /** A sealed L0 chunk cuts at a safe boundary once it reaches this estimate. */
 export const L0_CHUNK_MIN_TOKENS = 10_000;
@@ -50,6 +51,13 @@ export const L0_LIVE_LIMIT_TOKENS = 40_000;
  * that never ends, and it is recorded as a retryable failure.
  */
 export const DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Re-admission pacing for a chunk reshelved on a budget denial — a slow
+ * heartbeat, not a poll loop: a budget or funding change clears
+ * not_before early, so this only bounds the self-healing fallback.
+ */
+const BUDGET_WAIT_RESHELVE_MS = 30_000;
 
 /**
  * The L1 preparation instruction — carried over from the previous runtime's
@@ -272,6 +280,12 @@ export function estEventTokens(
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
 }
 
+/** Estimated tokens of a stored or rendered text — same ~4-bytes-per-token
+ * family as estEventTokens. */
+export function estTextTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
 /**
  * Eviction units over the journal view — the port of the reference's
  * replay_units onto journal kinds. The deciding assistant_message and the
@@ -478,6 +492,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 type PreparationOutcome =
   | { kind: "prepared"; replacement: string }
   | { kind: "kept" }
+  | { kind: "unavailable"; reason: string; delayMs?: number }
   | { kind: "failed"; error: string; retryable: boolean };
 
 /**
@@ -506,6 +521,15 @@ async function recordMemoryOutcome(
           keepUnchanged: true,
         });
         log("memory preparation kept originals", { chunk_seq: chunkSeq });
+      } else if (outcome.kind === "unavailable") {
+        await state.reshelveMemoryChunk(personaId, generation, chunkSeq, {
+          reason: outcome.reason,
+          delayMs: outcome.delayMs,
+        });
+        log("memory preparation paused: no model request could be made", {
+          chunk_seq: chunkSeq,
+          reason: outcome.reason,
+        });
       } else {
         await state.failMemoryChunk(personaId, generation, chunkSeq, {
           error: outcome.error,
@@ -606,6 +630,24 @@ export async function runMemoryPreparation(
   const log = deps.log ?? (() => {});
   // A stopped or fenced writer claims nothing and spends no model call.
   if (deps.signal?.aborted) return;
+  // Binding preflight: an unusable selection (post-transfer
+  // needs_rebinding, "none", a missing credential, a selection lookup
+  // outage) pauses the work instead of letting a claim reach the model
+  // layer's refusal. Anything not marked unavailable falls through and
+  // the real call classifies it — the binding can die between this check
+  // and the stream.
+  if (provider.probe) {
+    try {
+      await provider.probe();
+    } catch (e) {
+      if (e instanceof ModelError && e.unavailable) {
+        log("memory preparation paused: model unavailable", {
+          reason: e.message.slice(0, 4 * 1024),
+        });
+        return;
+      }
+    }
+  }
   const claimed = await state.claimMemoryChunk(
     personaId,
     generation,
@@ -631,7 +673,9 @@ export async function runMemoryPreparation(
   try {
     const stream = provider.stream({
       personaId,
-      turnId: `memory-l1-${chunk.chunk_seq}`,
+      turnId: `memory-l${chunk.layer}-${chunk.chunk_seq}`,
+      generation,
+      phase: "memory",
       round: 0,
       messages: branchMessages(claimed, deps.system),
       tools: deps.tools,
@@ -667,6 +711,31 @@ export async function runMemoryPreparation(
   }
   if (streamError !== null) {
     const e = streamError;
+    // Budget admission denied the call before any request was sent — a
+    // placement condition, not a verdict on the chunk. The 'budget-wait:'
+    // reason marks it so a later budget or funding change clears the
+    // pacing early; between changes a slow re-admit heartbeat keeps the
+    // wait self-healing.
+    if (e instanceof BudgetWaitError) {
+      await recordMemoryOutcome(deps, chunk.chunk_seq, {
+        kind: "unavailable",
+        reason: `budget-wait: ${e.message.slice(0, 4 * 1024)}`,
+        delayMs: BUDGET_WAIT_RESHELVE_MS,
+      });
+      return;
+    }
+    // An unusable binding refused before any request was evaluated — a
+    // placement condition, not a verdict on the chunk (a transferred
+    // secretary is needs_rebinding until its human binds a connection).
+    // The claim returns to the shelf with its attempt budget intact so
+    // the same work proceeds once a usable binding exists.
+    if (e instanceof ModelError && e.unavailable) {
+      await recordMemoryOutcome(deps, chunk.chunk_seq, {
+        kind: "unavailable",
+        reason: `model: ${e.message.slice(0, 4 * 1024)}`,
+      });
+      return;
+    }
     const retryable = !(e instanceof ModelError) || e.retryable;
     await fail(
       `model: ${(e instanceof Error ? e.message : String(e)).slice(0, 4 * 1024)}`,

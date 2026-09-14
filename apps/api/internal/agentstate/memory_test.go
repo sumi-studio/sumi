@@ -109,7 +109,7 @@ func TestMemoryForcedSealBeforeLeadingAssistant(t *testing.T) {
 	commitEvents(t, s, pa, "t1", []EventInput{
 		{Kind: "input_received", Payload: map[string]any{
 			"input_id": "in-a", "kind": "message",
-			"payload": map[string]any{"text": strings.Repeat("z", 85_000)},
+			"payload":    map[string]any{"text": strings.Repeat("z", 85_000)},
 			"actor_kind": "human"}},
 		{Kind: "assistant_message", Payload: map[string]any{"text": bigText()}},
 		{Kind: "tool_call", Payload: map[string]any{

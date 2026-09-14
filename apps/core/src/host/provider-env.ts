@@ -38,7 +38,13 @@ import {
   type ModelRequest,
 } from "../provider.ts";
 import { StateError, type StateClient } from "../state-client.ts";
-import type { ModelBinding } from "../types.ts";
+import type { FundingRef, ModelBinding } from "../types.ts";
+import {
+  BudgetWaitError,
+  newFactId,
+  reportedTokens,
+  requestEstimate,
+} from "../usage.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
 
@@ -102,14 +108,130 @@ export class SelectedModelProvider implements ModelProvider {
     this.opts = opts;
   }
 
+  /**
+   * Preflight for callers that hold durable work before consulting the
+   * model (memory preparation claims a chunk): resolves the binding
+   * without sending a request so an unusable selection is a pause, not a
+   * spent attempt. The stream still re-resolves — the binding can change
+   * between this check and the call.
+   */
+  async probe(): Promise<void> {
+    await this.resolve();
+  }
+
+  /**
+   * The metered call path: resolve the selected funding, admit the
+   * priced estimate under the writer generation BEFORE any provider
+   * bytes leave, stream, then record one usage fact. A denial throws
+   * BudgetWaitError — no request was sent. The fact id is unique to this
+   * invocation: a retried or resent call is genuinely additional spend
+   * and records its own fact; only the record's own redelivery is
+   * idempotent.
+   */
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const { provider, identity } = await this.resolve();
-    for await (const ev of provider.stream(request)) {
-      // The recorded plan's usage names the connection that produced the
-      // decision, so "which model answered" is durable evidence.
-      yield ev.type === "done"
-        ? { type: "done", usage: { ...ev.usage, model_binding: identity } }
-        : ev;
+    const { state, persona } = this.opts;
+    if (request.generation === undefined) {
+      throw new Error("a metered call requires the writer generation");
+    }
+    const factId = newFactId(request);
+    const funding = fundingRef(identity);
+    const admission = await state.admitUsage(persona, request.generation, {
+      factId,
+      kind: "model_call",
+      phase: request.phase ?? "turn",
+      turnId: request.turnId,
+      round: request.round,
+      funding,
+      estimate: requestEstimate(request),
+    });
+    if (!admission.admitted) {
+      throw new BudgetWaitError(
+        admission.wait ?? {
+          funding,
+          needed_minor: 0,
+          limit_minor: 0,
+          spent_minor: 0,
+          held_minor: 0,
+          remaining_minor: 0,
+          currency: "",
+          pricing_revision: "",
+          bounded: false,
+        },
+      );
+    }
+    let usage: Record<string, unknown> | null = null;
+    let streamError: unknown = null;
+    try {
+      for await (const ev of provider.stream(request)) {
+        if (ev.type !== "done") {
+          yield ev;
+          continue;
+        }
+        usage = ev.usage;
+        // The recorded plan's usage names the connection that produced the
+        // decision, so "which model answered" is durable evidence.
+        yield { type: "done", usage: { ...ev.usage, model_binding: identity } };
+      }
+    } catch (e) {
+      streamError = e;
+    }
+    await this.record(factId, request, funding, usage);
+    if (streamError !== null) throw streamError;
+  }
+
+  /**
+   * Persist the call's usage fact. Recording is not writer-fenced — the
+   * spend already happened — so this still lands after a fence loss or an
+   * aborted stream. A call whose usage never resolved records 'unknown',
+   * never silently zero. A recording failure must not fail the turn:
+   * retrying the turn would spend again, so after bounded retries the gap
+   * is logged and the held reservation reconciles at turn commit or
+   * generation recovery instead.
+   */
+  private async record(
+    factId: string,
+    request: ModelRequest,
+    funding: FundingRef,
+    usage: Record<string, unknown> | null,
+  ): Promise<void> {
+    const { state, persona, log } = this.opts;
+    const tokens = usage === null
+      ? { input: null, output: null, cached: null }
+      : reportedTokens(usage);
+    // 'reported' only when the provider's report carried at least one
+    // token category; a done event without recognizable usage — or a call
+    // that ended before its report — is 'unknown', not a zero bill.
+    const reported =
+      tokens.input !== null || tokens.output !== null || tokens.cached !== null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await state.recordUsage(persona, {
+          factId,
+          kind: "model_call",
+          phase: request.phase ?? "turn",
+          turnId: request.turnId,
+          inputId: request.inputId,
+          round: request.round,
+          funding,
+          status: reported ? "reported" : "unknown",
+          inputTokens: tokens.input,
+          outputTokens: tokens.output,
+          cachedTokens: tokens.cached,
+          quantities: usage ?? {},
+        });
+        return;
+      } catch (e) {
+        if (attempt === 2) {
+          log?.("usage fact could not be recorded", {
+            fact_id: factId,
+            turn_id: request.turnId,
+            error: String(e),
+          });
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      }
     }
   }
 
@@ -131,6 +253,7 @@ export class SelectedModelProvider implements ModelProvider {
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
+        unavailable: true,
       });
     }
     switch (binding.selection) {
@@ -200,7 +323,27 @@ export class SelectedModelProvider implements ModelProvider {
 }
 
 function unusable(message: string): ModelError {
-  return new ModelError(message, { retryable: false });
+  return new ModelError(message, { retryable: false, unavailable: true });
+}
+
+/**
+ * The funding principal for the resolved binding — the identity recorded
+ * on the usage fact and charged at admission. 'unset' (no selection)
+ * spends the operator's environment default as kind 'operator'/'env'; a
+ * selected API connection is kind 'connection' under its own id, with the
+ * version/model/preset snapshot preserved at call time.
+ */
+function fundingRef(identity: BindingIdentity): FundingRef {
+  if (identity.selection === "unset") {
+    return { kind: "operator", id: "env", provider: identity.provider };
+  }
+  return {
+    kind: "connection",
+    id: identity.connection_id,
+    version: identity.version,
+    model: identity.model,
+    provider: identity.preset,
+  };
 }
 
 export function providerFromEnv(

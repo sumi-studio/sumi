@@ -21,6 +21,7 @@ import {
   StateError,
   UnauthorizedError,
 } from "./state-client.ts";
+import { BudgetWaitError } from "./usage.ts";
 import { toolSpecs } from "./tools.ts";
 import type {
   CommitRequest,
@@ -1022,6 +1023,9 @@ export class Secretary {
         for await (const ev of this.cfg.provider.stream({
           personaId,
           turnId: turn.turn_id,
+          generation: gen,
+          phase: "turn",
+          inputId: input.input_id,
           round,
           messages: sendMessages,
           tools: await this.advertisedSpecs(),
@@ -1034,6 +1038,32 @@ export class Secretary {
         break;
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
+        if (e instanceof BudgetWaitError) {
+          // Budget admission denied the call: no provider request was
+          // sent and nothing this round produced is journaled — the
+          // resuming attempt re-plans the round and journals once. The
+          // turn commits 'await' carrying the denied funding; the input
+          // parks until a budget or funding change requeues it, exactly
+          // like an approval wait, and spends no attempt.
+          await this.commitTurnFinal(turn, {
+            outcome: "await",
+            events: [],
+            wait: {
+              kind: "budget",
+              funding: e.wait.funding,
+              needed_minor: e.wait.needed_minor,
+              currency: e.wait.currency,
+            },
+          });
+          this.log("turn awaiting budget", {
+            turn_id: turn.turn_id,
+            input_id: input.input_id,
+            funding: e.wait.funding,
+            needed_minor: e.wait.needed_minor,
+            currency: e.wait.currency,
+          });
+          return { failed: true, retryable: false };
+        }
         // Provider error text is untrusted bytes: a poisoned message (e.g.
         // one containing NUL) must not make the failure itself unpersistable.
         const msg = stripNul(e instanceof Error ? e.message : String(e));

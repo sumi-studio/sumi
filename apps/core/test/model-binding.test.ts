@@ -22,6 +22,7 @@ const PERSONA = "01930e00-0000-7000-8000-0000000000c1";
 const REQ = {
   personaId: PERSONA,
   turnId: "t",
+  generation: 1,
   round: 0,
   messages: [{ role: "user" as const, content: "hi" }],
   tools: [],
@@ -106,11 +107,19 @@ function selected(state: StateClient, fallback: ModelProvider) {
   });
 }
 
+// A metered call needs a live writer generation — hold one on the fake.
+async function metered(state: FakeState, fallback: ModelProvider) {
+  state.addPersona(PERSONA);
+  const lease = await state.acquireWriter(PERSONA, "test-writer", 60_000);
+  REQ.generation = lease.generation;
+  return selected(state, fallback);
+}
+
 test("an API selection streams from exactly that connection and is re-read on every call", async () => {
   await withModelServer(async (baseUrl, seen) => {
     const state = new FakeState();
     const fallback = new Fallback();
-    const p = selected(state, fallback);
+    const p = await metered(state, fallback);
 
     state.setModelBinding(PERSONA, api(baseUrl));
     const first = await collect(p);
@@ -172,7 +181,7 @@ test("a selection the core cannot honor fails the request without using another 
 test("no selection uses the operator default; a lookup outage retries rather than guessing", async () => {
   const state = new FakeState();
   const fallback = new Fallback();
-  const evs = await collect(selected(state, fallback));
+  const evs = await collect(await metered(state, fallback));
   assert.equal(fallback.calls, 1);
   assert.deepEqual((evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage.model_binding, {
     selection: "unset",
@@ -218,7 +227,7 @@ test("a carried model intent blocks model calls until the destination binds", as
     // test's explicit binding stands in for that selection — and the
     // carried intent no longer blocks.
     state.setModelBinding(PERSONA, api(baseUrl));
-    const evs = await collect(selected(state, fallback));
+    const evs = await collect(await metered(state, fallback));
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.model, "model-a");
     assert.deepEqual(
@@ -232,7 +241,7 @@ test("a carried model intent blocks model calls until the destination binds", as
     cleared.addPersona(PERSONA);
     cleared.setModelIntent(PERSONA, null);
     const fb2 = new Fallback();
-    await collect(selected(cleared, fb2));
+    await collect(await metered(cleared, fb2));
     assert.equal(fb2.calls, 1);
   });
 });

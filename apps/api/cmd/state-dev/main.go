@@ -168,6 +168,99 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
+	// Dev-only fixture seeding for usage budgets and Sumi funding grants.
+	// The product surface configures budgets through the authenticated
+	// /api/usage routes; tests need the same rows without a browser
+	// session, so these are admin-token guarded like every internal route.
+	mux.HandleFunc("PUT /internal/dev/usage-budgets", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var b struct {
+			FundingKind       string `json:"funding_kind"`
+			FundingID         string `json:"funding_id"`
+			LimitMinor        int64  `json:"limit_minor"`
+			Currency          string `json:"currency"`
+			RateInputPerMTok  int64  `json:"rate_input_per_mtok"`
+			RateOutputPerMTok int64  `json:"rate_output_per_mtok"`
+			PricingRevision   string `json:"pricing_revision"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&b); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		budget, err := coreState.Store().SetBudgetAdmin(r.Context(), b.FundingKind, b.FundingID, agentstate.UsageBudget{
+			LimitMinor:        b.LimitMinor,
+			Currency:          b.Currency,
+			RateInputPerMTok:  b.RateInputPerMTok,
+			RateOutputPerMTok: b.RateOutputPerMTok,
+			PricingRevision:   b.PricingRevision,
+		})
+		if err != nil {
+			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"budget": budget})
+	})
+	mux.HandleFunc("DELETE /internal/dev/usage-budgets", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var b struct {
+			FundingKind string `json:"funding_kind"`
+			FundingID   string `json:"funding_id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&b); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		if err := coreState.Store().ClearBudgetAdmin(r.Context(), b.FundingKind, b.FundingID); err != nil {
+			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /internal/dev/usage-grants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var b struct {
+			FundingID string `json:"funding_id"`
+			HumanID   string `json:"human_id"`
+			Label     string `json:"label"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&b); err != nil || !uuidv7Re.MatchString(b.HumanID) {
+			http.Error(w, `{"error":"human_id must be a uuidv7"}`, http.StatusBadRequest)
+			return
+		}
+		if _, err := pool.Exec(r.Context(), `
+			INSERT INTO usage_funding_grants (funding_id, human_id, label)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (funding_id) DO UPDATE SET human_id = $2, label = $3, revoked_at = NULL`,
+			b.FundingID, b.HumanID, b.Label); err != nil {
+			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"funding_id": b.FundingID})
+	})
+	mux.HandleFunc("DELETE /internal/dev/usage-grants/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if _, err := pool.Exec(r.Context(),
+			`UPDATE usage_funding_grants SET revoked_at = now() WHERE funding_id = $1 AND revoked_at IS NULL`,
+			r.PathValue("id")); err != nil {
+			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { APIConnectionsClient } from "../lib/api-connections";
+import type { UsageAPI } from "../lib/usage";
 import {
   CHATGPT_EFFORTS,
   CHATGPT_MODEL,
@@ -25,6 +26,7 @@ import {
   type ModelConnectionsAPI,
 } from "../lib/model-connections";
 import { APIConnectionSettings } from "./api-connection-settings";
+import { UsageSettings } from "./usage-settings";
 
 const defaultAPI = createModelConnectionsAPI();
 const EFFORT_LABELS: Record<ChatGPTEffort, string> = {
@@ -40,11 +42,13 @@ export function ModelProviderSettings({
   onOpenChange,
   api = defaultAPI,
   connectionsAPI,
+  usageAPI,
 }: {
   open: boolean;
   onOpenChange(open: boolean): void;
   api?: ModelConnectionsAPI;
   connectionsAPI?: APIConnectionsClient;
+  usageAPI?: UsageAPI;
 }) {
   const [connection, setConnection] = useState<ChatGPTConnection | null>(null);
   const [login, setLogin] = useState<ChatGPTLogin | null>(null);
@@ -482,6 +486,7 @@ export function ModelProviderSettings({
               client={connectionsAPI}
             />
           )}
+          {open && <UsageSettings client={usageAPI} />}
         </div>
       </SheetContent>
     </Sheet>
