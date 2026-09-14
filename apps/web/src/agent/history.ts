@@ -50,8 +50,10 @@ export function projectHistory(page: DirectChatHistoryPage): ProjectedHistory {
       }
       if (visible.has(event.seq))
         for (const id of changes.changedEntryIds) visibleIds.add(id);
-      session.conversation.changes = createConversationChanges();
     }
+    // Re-arm after either branch: a fresh replay session starts structural,
+    // and leaving it armed would scan (and mark) the whole order per event.
+    session.conversation.changes = createConversationChanges();
   }
   const pending = page.pendingApprovals.at(-1)?.event;
   session = {
