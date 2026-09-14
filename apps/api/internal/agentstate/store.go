@@ -1038,10 +1038,13 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	// Exactly one input_received per input ever lands in the journal: if a
-	// mid-turn effect already journaled the input (see ensureInputReceived)
-	// the commit's copy is skipped, and a second copy inside the request
-	// itself is dropped — a duplicate receipt is the same fact twice, not
+	// Exactly one input_received per input ever lands in the journal, and
+	// every receipt names a real input: withoutJournaledInput refuses the
+	// commit when a receipt carries a non-string id or names an input row
+	// that does not exist (the refusal rolls back — nothing is journaled
+	// and the turn can be retried once the input exists). A receipt for an
+	// already-journaled input is dropped, and so is a second copy inside
+	// the request itself — a duplicate receipt is the same fact twice, not
 	// new history. commit_request keeps the request as sent, so replays
 	// still compare.
 	events, err := withoutJournaledInput(ctx, tx, personaID, req.Events)
@@ -1437,12 +1440,19 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	return err
 }
 
-// withoutJournaledInput enforces one input_received per input in the
-// journal: a copy naming an input whose marker is already set is dropped
-// (the receipt exists), and a second copy inside the request itself is
-// dropped (the first is the receipt). The marker check runs FOR UPDATE so
-// a commit cannot dedup against a marker another in-flight commit has not
-// recorded yet.
+// withoutJournaledInput validates and dedups the request's input_received
+// events. A receipt is only meaningful as the record of an input this
+// persona holds: its payload.input_id must be a non-empty string naming an
+// existing input row. Anything else — a non-string id or an id with no row —
+// is malformed journal content, so the commit is refused before any
+// mutation rather than journaled as a ghost the cut would later refuse.
+// Validation runs on every copy before dedup, so a dropped duplicate
+// cannot mask an invalid element. For valid ids, one receipt per input
+// ever lands in the journal: a copy naming an input whose marker is
+// already set is dropped (the receipt exists), and a second copy inside
+// the request itself is dropped (the first is the receipt). The marker
+// check runs FOR UPDATE so a commit cannot dedup against a marker another
+// in-flight write has not recorded yet.
 func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, events []EventInput) ([]EventInput, error) {
 	var named []string
 	seen := map[string]bool{}
@@ -1450,7 +1460,11 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 		if e.Kind != "input_received" {
 			continue
 		}
-		if id, _ := e.Payload["input_id"].(string); !seen[id] {
+		id, ok := e.Payload["input_id"].(string)
+		if !ok || id == "" {
+			return nil, fmt.Errorf("%w: input_received payload.input_id must be a non-empty string", ErrBadRequest)
+		}
+		if !seen[id] {
 			seen[id] = true
 			named = append(named, id)
 		}
@@ -1458,8 +1472,35 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 	if len(named) == 0 {
 		return events, nil
 	}
-	journaled := map[string]bool{}
+	// Every named id must resolve to an input row. A receipt for an absent
+	// input is refused here — before any event or marker lands — so the
+	// commit can be retried once the input exists.
+	existing := map[string]bool{}
 	rows, err := tx.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 AND input_id = ANY($2)`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		existing[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for _, id := range named {
+		if !existing[id] {
+			return nil, fmt.Errorf("%w: input_received names absent input %q", ErrBadRequest, id)
+		}
+	}
+	journaled := map[string]bool{}
+	rows, err = tx.Query(ctx,
 		`SELECT input_id FROM core_inputs
 		 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
 		 FOR UPDATE`,
@@ -1483,7 +1524,7 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 	emitted := map[string]bool{}
 	for _, e := range events {
 		if e.Kind == "input_received" {
-			id, _ := e.Payload["input_id"].(string)
+			id := e.Payload["input_id"].(string)
 			if journaled[id] || emitted[id] {
 				continue
 			}
