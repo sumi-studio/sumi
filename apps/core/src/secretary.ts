@@ -1,5 +1,11 @@
 import { jsonEqual } from "./json.ts";
 import {
+  DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+  inputMarker,
+  renderJournalContext,
+  runMemoryPreparation,
+} from "./memory.ts";
+import {
   ModelError,
   type ChatMessage,
   type ModelProvider,
@@ -19,6 +25,10 @@ import type {
   EventInput,
   Input,
   Json,
+  MemoryBlock,
+  MemoryStatus,
+  OmittedMemory,
+  OmittedRange,
   Turn,
   TurnPlan,
   WriterLease,
@@ -68,11 +78,27 @@ export interface SecretaryConfig {
    * non-retryable. Default 6.
    */
   maxToolRounds?: number;
+  /**
+   * Wall-clock bound on one memory preparation branch's model call. A
+   * branch past it records a retryable failure (it spends one of the
+   * chunk's attempts); a host must keep the branch alive at least this long
+   * once it starts one. Default 10 minutes.
+   */
+  memoryPreparationTimeoutMs?: number;
   idgen: () => string;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
 
 export type StepResult = "turn" | "idle" | "stopped";
+
+export interface StepOptions {
+  /**
+   * Whether this step may start a memory preparation branch. A host whose
+   * remaining lifetime cannot cover memoryPreparationTimeoutMs passes false
+   * so a preparation it would have to cut short never starts. Default true.
+   */
+  startMemory?: boolean;
+}
 
 /** Default wall-clock budget for transient provider retries (F1). */
 const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
@@ -102,6 +128,15 @@ export class Secretary {
   private inFlight: AbortController | null = null;
   private lastDispatch = 0;
   private poison: { turnId: string; count: number } | null = null;
+  /**
+   * The one in-flight memory preparation branch. Preparation is
+   * asynchronous: it runs alongside turns, never blocks them, and only one
+   * branch exists at a time (the state service also enforces this).
+   */
+  private memoryTask: Promise<void> | null = null;
+  private memoryAbort: AbortController | null = null;
+  /** The memory shape seen by the latest maintenance step. */
+  private memoryShape: MemoryStatus | null = null;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -133,8 +168,7 @@ export class Secretary {
         return;
       } catch (e) {
         if (!(e instanceof FencedError)) throw e;
-        this.running = false;
-        this.lease = null;
+        this.loseFence();
       }
     }
     this.lease = await state.acquireWriter(personaId, holderId, leaseTtlMs);
@@ -149,7 +183,7 @@ export class Secretary {
   }
 
   /** One unit of work: fire due schedules, then take one turn if an input waits. */
-  async step(): Promise<StepResult> {
+  async step(opts: StepOptions = {}): Promise<StepResult> {
     if (!this.running || !this.lease) return "stopped";
     const gen = this.lease.generation;
     const { state, personaId } = this.cfg;
@@ -160,13 +194,35 @@ export class Secretary {
         const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
+      // Memory housekeeping between turns, while the conversation is idle
+      // enough for the sent context to change: seal newly safe journal
+      // ranges, then apply shelved L1 replacements while the live raw
+      // estimate exceeds the limit. Preparation itself is asynchronous —
+      // a claimed chunk's originals stay in the context while the branch
+      // runs, so corrections and new experiences during preparation are
+      // never overwritten.
+      // A 'preparing' chunk while this process runs no branch is orphaned
+      // (lost claim response, stopped branch); the claim counts it as an
+      // interruption and prepares it again once its short pacing passes.
+      const mem = await state.memoryMaintain(personaId, gen);
+      this.memoryShape = mem;
+      if (
+        opts.startMemory !== false &&
+        !this.memoryTask &&
+        mem.claimable > 0
+      ) {
+        this.memoryAbort = new AbortController();
+        this.memoryTask = this.prepareMemory(
+          gen,
+          this.memoryAbort.signal,
+        ).finally(() => {
+          this.memoryTask = null;
+          this.memoryAbort = null;
+        });
+      }
       const turnId = this.cfg.idgen();
-      const { turn, input, context, plan } = await state.loadTurn(
-        personaId,
-        gen,
-        turnId,
-        this.cfg.contextLimit,
-      );
+      const { turn, input, context, memory, omitted, memory_omitted, plan } =
+        await state.loadTurn(personaId, gen, turnId, this.cfg.contextLimit);
       if (!turn || !input) return "idle";
       const maxAttempts = this.cfg.maxAttempts ?? 5;
       const budgetMs =
@@ -196,7 +252,15 @@ export class Secretary {
         return "turn";
       }
       try {
-        await this.runTurn(turn, input, context, plan);
+        await this.runTurn(
+          turn,
+          input,
+          context,
+          memory ?? [],
+          omitted ?? null,
+          plan,
+          memory_omitted ?? null,
+        );
         this.poison = null;
       } catch (e) {
         if (
@@ -233,12 +297,23 @@ export class Secretary {
     } catch (e) {
       if (e instanceof FencedError) {
         this.log("lost writer fence; stopping", { generation: gen });
-        this.running = false;
-        this.lease = null;
+        this.loseFence();
         return "stopped";
       }
       throw e;
     }
+  }
+
+  /**
+   * The writer no longer owns this life: stop everything it was doing on
+   * the old generation — the in-flight turn and the memory branch — so no
+   * further model call is spent without ownership.
+   */
+  private loseFence(): void {
+    this.running = false;
+    this.lease = null;
+    this.inFlight?.abort();
+    this.memoryAbort?.abort();
   }
 
   /**
@@ -362,7 +437,10 @@ export class Secretary {
             this.cfg.leaseTtlMs,
           );
         } catch (e) {
-          if (e instanceof FencedError) break;
+          if (e instanceof FencedError) {
+            this.loseFence();
+            break;
+          }
           this.log("lease renewal failed", { error: String(e) });
         }
       }
@@ -386,13 +464,66 @@ export class Secretary {
         await backoff();
       }
     }
+    // Leaving the loop ends this life's ownership of its branch too: the
+    // lease is about to be released, so the branch must not keep running.
+    this.memoryAbort?.abort();
+    await this.memoryTask;
     await this.shutdown();
   }
 
-  /** Drain in-flight work opportunity and release the lease. */
+  /** True while a memory preparation branch is in flight. */
+  get memoryBusy(): boolean {
+    return this.memoryTask !== null;
+  }
+
+  /** The wall-clock bound this secretary puts on one preparation branch. */
+  get memoryTimeoutMs(): number {
+    return (
+      this.cfg.memoryPreparationTimeoutMs ??
+      DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * When memory preparation could next start, as epoch ms: now if a chunk
+   * is claimable, the end of its backoff if one waits, null when nothing
+   * waits or a branch is already running. Hosts that cannot start
+   * preparation themselves schedule a wake from this.
+   */
+  memoryWakeAt(): number | null {
+    if (this.memoryTask || !this.memoryShape) return null;
+    if (this.memoryShape.claimable > 0) return Date.now();
+    const next = this.memoryShape.next_claimable_at;
+    return next ? Date.parse(next) : null;
+  }
+
+  /**
+   * Wait for the running preparation branch to end on its own — by
+   * recording its result or a failure within its timeout — without starting
+   * another. Bounded by that timeout plus a margin for recording the
+   * outcome; resolves true when the branch settled.
+   */
+  async settleMemory(maxWaitMs = this.memoryTimeoutMs + 30_000): Promise<boolean> {
+    const task = this.memoryTask;
+    if (!task) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      task.then(() => true),
+      new Promise<boolean>((res) => {
+        timer = setTimeout(() => res(false), maxWaitMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    return settled;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.inFlight?.abort();
+    this.memoryAbort?.abort();
+    // Let the aborted branch settle before the lease is released; it never
+    // rejects (prepareMemory records or logs every outcome).
+    await this.memoryTask;
     await this.shutdown();
   }
 
@@ -418,7 +549,8 @@ export class Secretary {
    * stream lets the lease expire mid-turn and the next writer's acquire
    * fences the in-flight work. Renewal failures other than fencing are
    * logged and retried on the next tick; losing the fence aborts the
-   * in-flight provider call so the turn cannot outlive its ownership.
+   * in-flight provider call and the memory branch so neither outlives its
+   * ownership.
    */
   private renewDuringTurn(generation: number): () => void {
     const every = Math.max(50, this.cfg.renewEveryMs);
@@ -436,9 +568,7 @@ export class Secretary {
         .catch((e: unknown) => {
           if (e instanceof FencedError) {
             this.log("lost writer fence mid-turn", { generation });
-            this.running = false;
-            this.lease = null;
-            this.inFlight?.abort();
+            this.loseFence();
           } else {
             this.log("lease renewal failed mid-turn", { error: String(e) });
           }
@@ -446,6 +576,46 @@ export class Secretary {
     }, every);
     (t as { unref?: () => void }).unref?.();
     return () => clearInterval(t);
+  }
+
+  /**
+   * One asynchronous L1 preparation branch. The state service seals the
+   * chunk and hands back the parent's rendered context at claim time; the
+   * branch consults the same provider with the parent's tools offered (never
+   * executed) and records its verdict (prepared / kept / failed). The claim
+   * is generation-fenced: losing the writer fence mid-preparation aborts the
+   * branch with no further model call, and the next generation counts the
+   * claim as an interruption.
+   */
+  private async prepareMemory(
+    gen: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const stopRenewal = this.renewDuringTurn(gen);
+    try {
+      await runMemoryPreparation({
+        personaId: this.cfg.personaId,
+        generation: gen,
+        state: this.cfg.state,
+        provider: this.cfg.provider,
+        contextLimit: this.cfg.contextLimit,
+        system: SYSTEM,
+        tools: toolSpecs(),
+        signal,
+        timeoutMs: this.memoryTimeoutMs,
+        log: (msg, fields) => this.log(msg, fields),
+      });
+    } catch (e) {
+      // A fenced branch stops silently — the next generation's recovery
+      // reseals its chunk. Other errors inside preparation are already
+      // recorded on the chunk by runMemoryPreparation; anything that
+      // escaped that is a defect worth surfacing, not a loop-killer.
+      if (!(e instanceof FencedError)) {
+        this.log("memory preparation error", { error: String(e) });
+      }
+    } finally {
+      stopRenewal();
+    }
   }
 
   /**
@@ -461,7 +631,10 @@ export class Secretary {
     turn: Turn,
     input: Input,
     context: Event[],
+    memory: MemoryBlock[],
+    omitted: OmittedRange | null,
     plan: TurnPlan | null,
+    memoryOmitted: OmittedMemory | null = null,
   ): Promise<void> {
     const gen = turn.generation;
     const maxRounds = this.cfg.maxToolRounds ?? 6;
@@ -469,7 +642,7 @@ export class Secretary {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       const events: EventInput[] = [inputReceivedEvent(input, turn)];
-      const messages = assemble(context, input);
+      const messages = assemble(context, input, memory, omitted, memoryOmitted);
       // The stored plan is the authority — re-sync on every savePlan so a
       // plan that grew further in a lost prior attempt is executed as
       // recorded, never as this attempt would have decided it.
@@ -945,6 +1118,7 @@ const SYSTEM =
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
   "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
+  "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
@@ -977,101 +1151,22 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
   };
 }
 
-type InputProvenance = {
-  actorKind: string;
-  actorName: unknown;
-  surface: string;
-  placeId: unknown;
-  placeName: unknown;
-  placeKind: unknown;
-  messageId: unknown;
-  attention: string;
-};
-
-const str = (v: unknown): string => (typeof v === "string" ? v : "");
-
 /**
- * Render the "[who in where]" marker prefixing an input's text in model
- * context and in the current input. Provenance stays inside one bracket pair
- * (names are stripped of brackets) so directive-style content still parses
- * first. A Messaging input names the place_id and message_id the secretary
- * needs to answer there through messaging.send — without them a real model
- * could see who spoke but not address a reply. The attention hint is part of
- * the marker — it informs, never mandates.
+ * Assemble model messages from the journal tail plus the current input.
+ * Applied L1 memory blocks interleave at the positions where their covered
+ * events were — a replacement never migrates to the top of the context.
  */
-function inputMarker(p: InputProvenance): string {
-  const clean = (s: string) => s.replace(/[[\]]/g, "");
-  const name = clean(str(p.actorName));
-  const who = name ? `${name} (${p.actorKind})` : p.actorKind;
-  const placeLabel = clean(str(p.placeName)) || str(p.placeKind);
-  const where = placeLabel ? ` in ${placeLabel}` : "";
-  const refs =
-    p.surface === "messaging"
-      ? [
-          str(p.placeId) && ` place_id=${str(p.placeId)}`,
-          str(p.messageId) && ` message_id=${str(p.messageId)}`,
-        ].join("")
-      : "";
-  const hint =
-    p.attention === "observe"
-      ? " — fyi, no reply needed"
-      : p.attention === "defer"
-        ? " — deferred"
-        : "";
-  return `[${who}${where}${refs}${hint}]`;
-}
-
-/** Assemble model messages from the journal tail plus the current input. */
-export function assemble(context: Event[], input: Input): ChatMessage[] {
-  const messages: ChatMessage[] = [{ role: "system", content: SYSTEM }];
-  for (const ev of context) {
-    const p = ev.payload;
-    switch (ev.kind) {
-      case "input_received": {
-        const who =
-          p.actor_kind === "schedule"
-            ? "[scheduled wake]"
-            : inputMarker({
-                actorKind: String(p.actor_kind),
-                actorName: p.actor_display,
-                surface: str(p.source_surface),
-                placeId: p.thread_id,
-                placeName: p.place_name,
-                placeKind: p.place_kind,
-                messageId: p.message_id,
-                attention: str(p.attention),
-              });
-        messages.push({
-          role: "user",
-          content: `${who} ${String(p.text ?? "")}`,
-        });
-        break;
-      }
-      case "assistant_message":
-        messages.push({ role: "assistant", content: String(p.text ?? "") });
-        break;
-      case "note":
-        messages.push({
-          role: "assistant",
-          content: `[note] ${String(p.text ?? "")}`,
-        });
-        break;
-      case "tool_result":
-        // Flattened to assistant text: a bare role:"tool" message with no
-        // preceding assistant tool_calls is rejected by chat-completions
-        // providers. The journal keeps the structured record; the model gets
-        // the result inline.
-        messages.push({
-          role: "assistant",
-          content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
-            p.response ?? (p.error ? { error: p.error } : {}),
-          )}`,
-        });
-        break;
-      default:
-        break;
-    }
-  }
+export function assemble(
+  context: Event[],
+  input: Input,
+  memory: MemoryBlock[] = [],
+  omitted: OmittedRange | null = null,
+  memoryOmitted: OmittedMemory | null = null,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [
+    { role: "system", content: SYSTEM },
+    ...renderJournalContext(context, memory, omitted, memoryOmitted),
+  ];
   const p = input.payload as Record<string, unknown>;
   const text =
     typeof p.text === "string" && p.text !== ""

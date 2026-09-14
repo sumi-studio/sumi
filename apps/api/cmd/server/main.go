@@ -35,6 +35,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
+	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
@@ -658,7 +659,8 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		coreServer = agentstate.NewServer(database.Pool, coreToken)
 		coreServer.RegisterRoutes(mux)
-		log.Print("core state routes ready (/internal/core, scoped tokens)")
+		portable.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
+		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")
 	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())

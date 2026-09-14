@@ -104,6 +104,10 @@ export interface PersonaState {
     human_id: string | null;
     display_name: string;
     created_at: string;
+    /** Placement authority: active | sealed | staged | transferred. */
+    authority: string;
+    /** The transfer that last changed authority, when one is in flight. */
+    transfer_id: string | null;
   };
   lease: WriterLease | null;
   queued_inputs: number;
@@ -154,8 +158,130 @@ export interface LoadResult {
   turn: Turn | null;
   input: Input | null;
   context: Event[];
+  /**
+   * Applied L1 replacement blocks. Each renders at the journal position
+   * where its events were — the core interleaves them with the raw tail
+   * by sequence position.
+   */
+  memory: MemoryBlock[];
+  /**
+   * Older raw records outside the send cap — still stored and readable
+   * through conversation_history; null when nothing was left out.
+   */
+  omitted: OmittedRange | null;
+  /**
+   * Older applied memory blocks outside the memory cap — stored, their
+   * originals readable; null when every applied block was admitted.
+   */
+  memory_omitted?: OmittedMemory | null;
   /** The input's recorded decision — null when none has been saved yet. */
   plan: TurnPlan | null;
+}
+
+/** The extent of applied memory blocks left outside the sent context. */
+export interface OmittedMemory {
+  count: number;
+  first_chunk_seq: number;
+  last_chunk_seq: number;
+  first_seq: number;
+  last_seq: number;
+  first_time: string;
+  last_time: string;
+  est_tokens: number;
+}
+
+/** The extent of raw records left outside the sent context. */
+export interface OmittedRange {
+  count: number;
+  first_seq: number;
+  last_seq: number;
+  first_time: string;
+  last_time: string;
+}
+
+/** One sealed journal range and its L1 replacement lifecycle. */
+export interface MemoryChunk {
+  persona_id: string;
+  chunk_seq: number;
+  layer: number;
+  first_seq: number;
+  last_seq: number;
+  est_tokens: number;
+  status:
+    | "sealed"
+    | "preparing"
+    | "prepared"
+    | "applied"
+    | "kept"
+    | "failed";
+  replacement: string | null;
+  replacement_est_tokens: number | null;
+  /** Recorded preparation failures (the only thing that spends the budget). */
+  attempts: number;
+  /** Claims that ended without any recorded outcome (host lifecycle). */
+  interruptions: number;
+  last_error: string | null;
+  claimed_generation: number | null;
+  claimed_at: string | null;
+  not_before: string | null;
+  created_at: string;
+  prepared_at: string | null;
+  applied_at: string | null;
+}
+
+/** An applied chunk as it appears in the sent context. */
+export interface MemoryBlock {
+  chunk_seq: number;
+  layer: number;
+  first_seq: number;
+  last_seq: number;
+  /** When the first and last covered events were recorded. */
+  first_time: string;
+  last_time: string;
+  text: string;
+  est_tokens: number;
+}
+
+/** The journal as the model sees it: raw window plus applied blocks. */
+export interface RenderedContext {
+  events: Event[];
+  memory: MemoryBlock[];
+  omitted: OmittedRange | null;
+  memory_omitted?: OmittedMemory | null;
+}
+
+/** The memory layer's current shape (read-only observability). */
+export interface MemoryStatus {
+  live_raw_tokens: number;
+  applied_tokens: number;
+  sealed: number;
+  preparing: number;
+  prepared: number;
+  applied: number;
+  kept: number;
+  failed: number;
+  /** Chunks a claim could take now (sealed past backoff, or orphaned). */
+  claimable: number;
+  /** Earliest time a chunk becomes claimable; null when none waits. */
+  next_claimable_at: string | null;
+  /** Applied blocks left outside the memory cap. */
+  applied_omitted: number;
+  covered_seq: number;
+  latest_seq: number;
+  chunk_min_tokens: number;
+  live_limit_tokens: number;
+  memory_send_cap_tokens: number;
+}
+
+/**
+ * A chunk claimed for asynchronous L1 preparation, with everything the
+ * branch needs: the covered events verbatim and the rendered parent
+ * context at claim time.
+ */
+export interface ClaimedMemoryChunk {
+  chunk: MemoryChunk | null;
+  target_events: Event[];
+  context: RenderedContext;
 }
 
 export interface RecoverResult {
@@ -178,3 +304,54 @@ export interface CommitRequest {
    */
   retry_after_ms?: number;
 }
+
+/**
+ * Secretary-independent background execution (M09). A job belongs to the
+ * persona but NOT to the writer generation: its lifecycle is owned by a
+ * runner claim (claimed_by + claim_expires_at), so a job started under one
+ * secretary generation can complete after that process stopped and resumed.
+ *
+ * Lifecycle: queued → running → done|failed|cancelled. cancel_requested is
+ * the running→cancelled transit state; 'lost' marks an expired runner claim
+ * whose outcome is indeterminate — it is never silently re-executed. Every
+ * terminal transition enqueues exactly one 'job:<job_id>' notification input
+ * into the secretary's ordinary input stream.
+ */
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "cancel_requested"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "lost";
+
+export interface Job {
+  persona_id: string;
+  job_id: string;
+  /** Executor family; 'subprocess' is the implemented local kind. */
+  kind: string;
+  request: Json;
+  status: JobStatus;
+  claimed_by: string | null;
+  claim_expires_at: string | null;
+  created_by: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  cancel_requested_at: string | null;
+  result: Json | null;
+  error: string | null;
+  notified_at: string | null;
+}
+
+/** Request shape for kind 'subprocess': an executable + argv, no shell. */
+export interface SubprocessJobRequest {
+  command: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  timeout_ms?: number;
+}
+
+/** Terminal statuses a runner may report to completeJob. */
+export type JobTerminalReport = "done" | "failed" | "cancelled";
