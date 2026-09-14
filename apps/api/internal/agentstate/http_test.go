@@ -240,11 +240,11 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 
 	// Missing calls array → 400.
 	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
-		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"hi"}`); rec.Code != 400 {
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"hi"}`); rec.Code != 400 {
 		t.Fatalf("plan without calls: %d, want 400", rec.Code)
 	}
 	// Save the decision.
-	planBody := `{"generation":` + gen + `,"turn_id":"` + turnID + `","text":"noted",
+	planBody := `{"generation":` + gen + `,"turn_id":"` + turnID + `","round":0,"text":"noted",
 		"calls":[{"tool":"journal.note","request":{"text":"keep me"}}]}`
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok, planBody)
 	if rec.Code != 200 {
@@ -255,7 +255,7 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 		Created bool     `json:"created"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &saved)
-	if !saved.Created || saved.Plan.InputID != "i1" || saved.Plan.Plan.Text != "noted" {
+	if !saved.Created || saved.Plan.InputID != "i1" || len(saved.Plan.Plan) != 1 || saved.Plan.Plan[0].Text != "noted" {
 		t.Fatalf("saved plan: %+v", saved)
 	}
 	// Identical resave replays.
@@ -269,13 +269,13 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 	}
 	// Divergent resave conflicts.
 	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
-		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"other","calls":[]}`); rec.Code != 409 {
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"other","calls":[]}`); rec.Code != 409 {
 		t.Fatalf("divergent plan: %d, want 409", rec.Code)
 	}
 	// Load replay surfaces the plan.
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok, `{"generation":`+gen+`}`)
 	_ = json.Unmarshal(rec.Body.Bytes(), &load)
-	if load.Plan == nil || len(load.Plan.Plan.Calls) != 1 {
+	if load.Plan == nil || len(load.Plan.Plan) != 1 || len(load.Plan.Plan[0].Calls) != 1 {
 		t.Fatalf("load replay plan: %+v", load.Plan)
 	}
 
@@ -345,12 +345,12 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 
 	// A NUL-bearing decision → 400 at savePlan, the first boundary.
 	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
-		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"a\u0000b","calls":[]}`); rec.Code != 400 {
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"a\u0000b","calls":[]}`); rec.Code != 400 {
 		t.Fatalf("NUL plan: %d, want 400", rec.Code)
 	}
 	// A clean plan still saves after the rejection.
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
-		`{"generation":`+gen+`,"turn_id":"`+turnID+`","text":"scheduling",
+		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"scheduling",
 		"calls":[{"tool":"schedule.set","request":{"wake_at":"2030-01-01T00:00:00Z","miss_policy":"bogus"}}]}`)
 	if rec.Code != 200 {
 		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
@@ -364,5 +364,50 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/operations/claim", tok,
 		`{"generation":`+gen+`,"operation_id":"o2","turn_id":"`+turnID+`","tool":"journal.note","call_index":0,"request":{"text":"x\u0000y"}}`); rec.Code != 400 {
 		t.Fatalf("NUL claim: %d, want 400", rec.Code)
+	}
+}
+
+// TestHTTPCommitOverBodyLimit pins the boundary the commit fallback
+// relies on: a commit body over maxBody is rejected 400 ("read body"),
+// deterministically — a giant error text can never be persisted
+// verbatim and must be bounded client-side.
+func TestHTTPCommitOverBodyLimit(t *testing.T) {
+	_, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	tok := created.PersonaToken
+
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
+		`{"holder_id":"h1","ttl_ms":60000}`)
+	var lease WriterLease
+	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
+	gen := itoa(lease.Generation)
+	do(t, mux, "POST", "/internal/core/personas/"+pa+"/inputs", tok,
+		`{"input_id":"i1","kind":"message","payload":{"text":"hi"}}`)
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/load", tok,
+		`{"generation":`+gen+`}`)
+	var load LoadResult
+	_ = json.Unmarshal(rec.Body.Bytes(), &load)
+
+	// ~1.2 MB of error text — over the 1 MiB body limit.
+	huge := strings.Repeat("x", 1_200_000)
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/"+load.Turn.TurnID+"/commit", tok,
+		`{"generation":`+gen+`,"outcome":"fail","retryable":true,"error":"`+huge+`"}`)
+	if rec.Code != 400 {
+		t.Fatalf("oversized commit: %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "read body") {
+		t.Fatalf("oversized commit body: %s", rec.Body)
+	}
+	// The turn is untouched — the rejection leaves it running so a
+	// bounded retry can still finalize it.
+	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/"+load.Turn.TurnID+"/commit", tok,
+		`{"generation":`+gen+`,"outcome":"fail","retryable":false,"error":"bounded: too large to store"}`)
+	if rec.Code != 200 {
+		t.Fatalf("bounded commit after rejection: %d %s", rec.Code, rec.Body)
 	}
 }

@@ -1,7 +1,12 @@
 import type {
+  ClaimedMemoryChunk,
   CommitRequest,
   Event,
+  Job,
+  JobTerminalReport,
   LoadResult,
+  MemoryChunk,
+  MemoryStatus,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -31,10 +36,18 @@ export class UnauthorizedError extends Error {
 
 export class StateError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /**
+   * Present when a 409 job response carries the stored row — e.g. a
+   * heartbeat answered after the job went terminal or the claim expired.
+   * The runner reads job.status to decide what to do with the execution
+   * it still holds.
+   */
+  readonly job?: Job;
+  constructor(status: number, message: string, job?: Job) {
     super(message);
     this.name = "StateError";
     this.status = status;
+    this.job = job;
   }
 }
 
@@ -68,15 +81,18 @@ export interface StateClient {
     contextLimit: number,
   ): Promise<LoadResult>;
   /**
-   * Persist the model's decision for the claimed input before any of its
-   * effects run. Idempotent: an identical resend returns the stored plan
-   * with `created: false`; a conflicting plan is rejected 409.
+   * Persist one round of the model's decisions for the claimed input before
+   * any of that round's effects run. The plan is an append-only list of
+   * rounds: an identical resend of a recorded round returns the stored plan
+   * with `created: false`; a different decision at a recorded position or a
+   * skipped round is rejected 409.
    */
   savePlan(
     persona: string,
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -92,8 +108,8 @@ export interface StateClient {
   /**
    * Claim one position of the recorded plan. The service derives the durable
    * effect identity server-side (input_id + call_index) and verifies the
-   * claimed (tool, request) equals plan.calls[call_index] — a caller never
-   * supplies an idempotency key.
+   * claimed (tool, request) equals the recorded call at that flat position
+   * across all plan rounds — a caller never supplies an idempotency key.
    */
   claimOperation(
     persona: string,
@@ -119,12 +135,114 @@ export interface StateClient {
     now?: Date,
     limit?: number,
   ): Promise<Schedule[]>;
+  /**
+   * Memory housekeeping between turns: seal newly safe journal ranges,
+   * then apply shelved L1 replacements while the live raw estimate
+   * exceeds the limit. Runs under the writer generation so application
+   * never interleaves with an in-flight model call.
+   */
+  memoryMaintain(persona: string, generation: number): Promise<MemoryStatus>;
+  memoryStatus(persona: string): Promise<MemoryStatus>;
+  /**
+   * Claim the oldest sealable chunk for asynchronous L1 preparation — one
+   * branch at a time. `chunk` is null when nothing is claimable right now
+   * (nothing sealed, another branch preparing, or backoff pending). The
+   * returned context is the rendered parent context at claim time.
+   */
+  claimMemoryChunk(
+    persona: string,
+    generation: number,
+    contextLimit: number,
+  ): Promise<ClaimedMemoryChunk>;
+  /**
+   * Shelve the finished replacement candidate. Completion alone never
+   * changes the sent context — application is a separate threshold-gated
+   * step in memoryMaintain. keepUnchanged is the model's KEEP_UNCHANGED
+   * decision: the originals stay and the chunk is never reprepared.
+   */
+  completeMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    result: { replacement?: string; keepUnchanged?: boolean },
+  ): Promise<MemoryChunk>;
+  /**
+   * Record a failed preparation attempt. Retryable failures return the
+   * chunk to the shelf with backoff while attempts remain; an exhausted
+   * or non-retryable failure is terminal ('failed') — visible, originals
+   * kept, never silently skipped.
+   */
+  failMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    failure: { error: string; retryable: boolean },
+  ): Promise<MemoryChunk>;
   outbox(
     persona: string,
     afterSeq: number,
     limit?: number,
   ): Promise<OutboxEntry[]>;
   personaState(persona: string): Promise<PersonaState>;
+  /**
+   * Record a background job for later runner claiming. Idempotent on
+   * job_id: an identical resend returns `created: false` with the stored
+   * row; a divergent one is rejected 409.
+   */
+  submitJob(
+    persona: string,
+    job: { jobId: string; kind: string; request: Record<string, unknown> },
+  ): Promise<{ job: Job; created: boolean }>;
+  getJob(persona: string, jobId: string): Promise<Job>;
+  listJobs(
+    persona: string,
+    opts?: { status?: Job["status"][]; limit?: number },
+  ): Promise<Job[]>;
+  /**
+   * queued → cancelled (notification queued); running → cancel_requested
+   * for the owning runner to observe via heartbeat. Not writer-gated:
+   * callable while the secretary is down.
+   */
+  cancelJob(persona: string, jobId: string): Promise<Job>;
+  /**
+   * The runner's periodic call: sweeps expired claims to 'lost' (with
+   * notification — indeterminate, never re-run) and claims up to `limit`
+   * queued jobs of the requested kinds for this runner.
+   */
+  claimJobs(
+    persona: string,
+    req: {
+      runnerId: string;
+      kinds: string[];
+      leaseMs: number;
+      limit?: number;
+    },
+  ): Promise<{ claimed: Job[]; swept: Job[] }>;
+  /**
+   * Extend the runner's claim and learn the current status (incl.
+   * cancel_requested). Throws StateError(409) with `job` set when the job
+   * is no longer this runner's — terminal, lost, or claimed away.
+   */
+  heartbeatJob(
+    persona: string,
+    jobId: string,
+    req: { runnerId: string; leaseMs: number },
+  ): Promise<Job>;
+  /**
+   * Record the runner-observed terminal outcome and queue the secretary's
+   * notification atomically. An identical resend returns the stored row
+   * (lost response); a divergent one throws StateError(409).
+   */
+  completeJob(
+    persona: string,
+    jobId: string,
+    req: {
+      runnerId: string;
+      status: JobTerminalReport;
+      result: Record<string, unknown>;
+      error?: string;
+    },
+  ): Promise<Job>;
 }
 
 type FetchLike = (
@@ -174,18 +292,34 @@ export class HttpStateClient implements StateClient {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      try {
+        return (await res.json()) as T;
+      } catch (e) {
+        // A 200 with an unreadable body is an infrastructure blip — a
+        // truncated proxy/middlebox response or a service bug — not a
+        // code defect. Surface it as a transient 5xx so callers back
+        // off instead of exiting (final-review NF2). The real status
+        // stays in the message.
+        throw new StateError(
+          503,
+          `state service returned an unreadable ${res.status} body: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
     let message = `state service ${res.status}`;
+    let job: Job | undefined;
     try {
-      const parsed = (await res.json()) as { error?: string };
+      const parsed = (await res.json()) as { error?: string; job?: Job };
       if (parsed.error) message = parsed.error;
+      if (parsed.job) job = parsed.job;
     } catch {
       /* non-JSON error body */
     }
     if (res.status === 401) throw new UnauthorizedError(message);
     if (res.status === 409 && message.includes("fenced"))
       throw new FencedError(message);
-    throw new StateError(res.status, message);
+    throw new StateError(res.status, message, job);
   }
 
   acquireWriter(persona: string, holder: string, ttlMs: number) {
@@ -254,6 +388,7 @@ export class HttpStateClient implements StateClient {
     generation: number,
     req: {
       turnId: string;
+      round: number;
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
@@ -265,6 +400,7 @@ export class HttpStateClient implements StateClient {
       {
         generation,
         turn_id: req.turnId,
+        round: req.round,
         text: req.text,
         calls: req.calls,
         usage: req.usage,
@@ -345,6 +481,56 @@ export class HttpStateClient implements StateClient {
     );
     return res.fired;
   }
+  memoryMaintain(persona: string, generation: number) {
+    return this.call<MemoryStatus>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/maintain`,
+      { generation },
+    );
+  }
+  memoryStatus(persona: string) {
+    return this.call<MemoryStatus>(
+      "GET",
+      `/internal/core/personas/${persona}/memory`,
+    );
+  }
+  claimMemoryChunk(persona: string, generation: number, contextLimit: number) {
+    return this.call<ClaimedMemoryChunk>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/claim`,
+      { generation, context_limit: contextLimit },
+    );
+  }
+  async completeMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    result: { replacement?: string; keepUnchanged?: boolean },
+  ) {
+    const res = await this.call<{ chunk: MemoryChunk }>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/complete`,
+      {
+        generation,
+        replacement: result.replacement ?? "",
+        keep_unchanged: result.keepUnchanged ?? false,
+      },
+    );
+    return res.chunk;
+  }
+  async failMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    failure: { error: string; retryable: boolean },
+  ) {
+    const res = await this.call<{ chunk: MemoryChunk }>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/fail`,
+      { generation, error: failure.error, retryable: failure.retryable },
+    );
+    return res.chunk;
+  }
   async outbox(persona: string, afterSeq: number, limit = 200) {
     const res = await this.call<{ outbox: OutboxEntry[] }>(
       "GET",
@@ -357,5 +543,93 @@ export class HttpStateClient implements StateClient {
       "GET",
       `/internal/core/personas/${persona}/state`,
     );
+  }
+  async submitJob(
+    persona: string,
+    job: { jobId: string; kind: string; request: Record<string, unknown> },
+  ) {
+    return this.call<{ job: Job; created: boolean }>(
+      "POST",
+      `/internal/core/personas/${persona}/jobs`,
+      { job_id: job.jobId, kind: job.kind, request: job.request },
+    );
+  }
+  async getJob(persona: string, jobId: string) {
+    const res = await this.call<{ job: Job }>(
+      "GET",
+      `/internal/core/personas/${persona}/jobs/${encodeURIComponent(jobId)}`,
+    );
+    return res.job;
+  }
+  async listJobs(
+    persona: string,
+    opts?: { status?: Job["status"][]; limit?: number },
+  ) {
+    const params = new URLSearchParams();
+    if (opts?.status?.length) params.set("status", opts.status.join(","));
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    const res = await this.call<{ jobs: Job[] }>(
+      "GET",
+      `/internal/core/personas/${persona}/jobs${qs ? `?${qs}` : ""}`,
+    );
+    return res.jobs;
+  }
+  async cancelJob(persona: string, jobId: string) {
+    const res = await this.call<{ job: Job }>(
+      "POST",
+      `/internal/core/personas/${persona}/jobs/${encodeURIComponent(jobId)}/cancel`,
+      {},
+    );
+    return res.job;
+  }
+  async claimJobs(
+    persona: string,
+    req: { runnerId: string; kinds: string[]; leaseMs: number; limit?: number },
+  ) {
+    return this.call<{ claimed: Job[]; swept: Job[] }>(
+      "POST",
+      `/internal/core/personas/${persona}/jobs/claim`,
+      {
+        runner_id: req.runnerId,
+        kinds: req.kinds,
+        lease_ms: req.leaseMs,
+        limit: req.limit,
+      },
+    );
+  }
+  async heartbeatJob(
+    persona: string,
+    jobId: string,
+    req: { runnerId: string; leaseMs: number },
+  ) {
+    const res = await this.call<{ job: Job }>(
+      "POST",
+      `/internal/core/personas/${persona}/jobs/${encodeURIComponent(jobId)}/heartbeat`,
+      { runner_id: req.runnerId, lease_ms: req.leaseMs },
+    );
+    return res.job;
+  }
+  async completeJob(
+    persona: string,
+    jobId: string,
+    req: {
+      runnerId: string;
+      status: JobTerminalReport;
+      result: Record<string, unknown>;
+      error?: string;
+    },
+  ) {
+    const res = await this.call<{ job: Job }>(
+      "POST",
+      `/internal/core/personas/${persona}/jobs/${encodeURIComponent(jobId)}/complete`,
+      {
+        runner_id: req.runnerId,
+        status: req.status,
+        result: req.result,
+        error: req.error,
+      },
+    );
+    return res.job;
   }
 }

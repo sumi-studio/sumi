@@ -4,9 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanupPendingEmailFlowStorage,
   consumePendingCredentialRecovery,
+  hasPendingRedirectFlowRecord,
   loadPendingEmailFlow,
+  loadPendingRedirectFlow,
   type PendingEmailAuthFlow,
+  type PendingRedirectAuthFlow,
   savePendingEmailFlow,
+  savePendingRedirectFlow,
+  takePendingRedirectFlow,
 } from "./auth-flow-state";
 
 const state = "A".repeat(24);
@@ -127,6 +132,97 @@ describe("pending credential recovery state", () => {
     expect(localStorage.getItem(`sumi.auth.email-flow.v1.${state}`)).toBeNull();
   });
 });
+
+describe("pending redirect flow", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("round-trips a saved redirect receipt inside the same tab", () => {
+    const flow = pendingRedirect();
+    expect(savePendingRedirectFlow(flow)).toBe(true);
+    expect(loadPendingRedirectFlow()).toEqual(flow);
+  });
+
+  it("claims the receipt exactly once for the exchange", () => {
+    const flow = pendingRedirect();
+    savePendingRedirectFlow(flow);
+
+    expect(takePendingRedirectFlow()).toEqual(flow);
+    expect(takePendingRedirectFlow()).toBeNull();
+    expect(loadPendingRedirectFlow()).toBeNull();
+  });
+
+  it("keeps an expired receipt so the exchange reaches a real outcome", () => {
+    // The server owns flow expiry: a fast clock must not silently strand a
+    // return that could still exchange, and a stale flow gets the server's
+    // answer rather than a quiet deletion.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T10:00:00Z"));
+    const flow = pendingRedirect();
+    savePendingRedirectFlow(flow);
+
+    vi.advanceTimersByTime(11 * 60_000);
+
+    expect(loadPendingRedirectFlow()).toEqual(flow);
+    expect(takePendingRedirectFlow()).toEqual(flow);
+    expect(takePendingRedirectFlow()).toBeNull();
+  });
+
+  it("reports a raw record as pending even when it fails validation", () => {
+    sessionStorage.setItem("sumi.auth.redirect-flow.v1", "{corrupt");
+
+    expect(hasPendingRedirectFlowRecord()).toBe(true);
+    expect(loadPendingRedirectFlow()).toBeNull();
+    expect(takePendingRedirectFlow()).toBeNull();
+    expect(hasPendingRedirectFlowRecord()).toBe(false);
+  });
+
+  it("rejects and clears a receipt that fails structural validation", () => {
+    sessionStorage.setItem(
+      "sumi.auth.redirect-flow.v1",
+      JSON.stringify({ ...pendingRedirect(), provider: "email_link" }),
+    );
+
+    expect(loadPendingRedirectFlow()).toBeNull();
+    expect(sessionStorage.getItem("sumi.auth.redirect-flow.v1")).toBeNull();
+  });
+
+  it("rejects and clears a receipt that is not valid JSON", () => {
+    sessionStorage.setItem("sumi.auth.redirect-flow.v1", "{corrupt");
+
+    expect(loadPendingRedirectFlow()).toBeNull();
+    expect(takePendingRedirectFlow()).toBeNull();
+    expect(sessionStorage.getItem("sumi.auth.redirect-flow.v1")).toBeNull();
+  });
+
+  it("fails closed when the tab cannot persist the receipt", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("storage denied", "SecurityError");
+    });
+
+    expect(savePendingRedirectFlow(pendingRedirect())).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it("fails closed when the stored receipt cannot be read back", () => {
+    vi.spyOn(Storage.prototype, "getItem").mockReturnValue(null);
+
+    expect(savePendingRedirectFlow(pendingRedirect())).toBe(false);
+    vi.restoreAllMocks();
+  });
+});
+
+function pendingRedirect(): PendingRedirectAuthFlow {
+  return {
+    flowId: "redirect-flow",
+    nonce: "n".repeat(43),
+    intent: "sign_in",
+    provider: "google.com",
+    expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    stage: "redirect_sent",
+  };
+}
 
 function pendingFlow(): PendingEmailAuthFlow {
   const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();

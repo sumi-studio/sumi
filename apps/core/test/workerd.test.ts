@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
-import { SecretaryObject } from "../src/host/workerd.ts";
-import type { ModelProvider } from "../src/provider.ts";
+import {
+  MissingPersonaTokenError,
+  SecretaryObject,
+} from "../src/host/workerd.ts";
+import type {
+  ModelEvent,
+  ModelProvider,
+  ModelRequest,
+} from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { Secretary } from "../src/secretary.ts";
 import type { StateClient } from "../src/state-client.ts";
@@ -56,6 +63,7 @@ class TestObject extends SecretaryObject {
       contextLimit: 50,
       pollIntervalMs: 0,
       scheduleEveryMs: 1,
+      memoryPreparationTimeoutMs: this.memoryPreparationTimeoutMs(),
       idgen: () => crypto.randomUUID(),
     });
   }
@@ -160,4 +168,166 @@ test("alarm on a never-activated DO is a no-op", async () => {
   const obj = new TestObject(ctx as never, fakeEnv as never, new FakeState());
   await obj.alarm(); // must not throw
   assert.equal(ctx.alarmAt(), null);
+});
+
+class MissingTokenObject extends TestObject {
+  protected override newSecretary(personaId: string): Secretary {
+    throw new MissingPersonaTokenError(personaId);
+  }
+}
+
+test("missing persona token re-arms on the dormant cadence and recovers (F5)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = {
+    ...fakeEnv,
+    SUMI_HEARTBEAT_MS: "60000",
+    SUMI_DORMANT_REARM_MS: "5000",
+  };
+  // Activation succeeds while the token binding exists.
+  const active = new TestObject(ctx as never, env as never, state);
+  await active.fetch(wakeReq());
+  await settle(ctx);
+  assert.ok(ctx.alarmAt() !== null, "heartbeat armed");
+
+  // Eviction with the binding now gone: the alarm must not die silently —
+  // it re-arms on the long dormant cadence instead of the heartbeat.
+  const dormant = new MissingTokenObject(ctx as never, env as never, state);
+  const t0 = Date.now();
+  await dormant.alarm();
+  const dormantIn = ctx.alarmAt()! - t0;
+  assert.ok(
+    dormantIn > 1_000 && dormantIn <= 5_500,
+    `dormant re-arm (~5s), not heartbeat/disarm: ${dormantIn}ms`,
+  );
+  // A second dormant alarm re-arms again — eventual recovery is durable,
+  // not a one-shot.
+  await dormant.alarm();
+  assert.ok(ctx.alarmAt()! > Date.now());
+
+  // The binding returns: the dormant alarm drains normally again.
+  const healed = new TestObject(ctx as never, env as never, state);
+  state.addInput(PERSONA, "in-healed", "hello after provisioning");
+  await healed.alarm();
+  await settle(ctx);
+  const out = await state.outbox(PERSONA, 0);
+  assert.ok(
+    out.some((o) => o.payload.input_id === "in-healed"),
+    "provisioned persona drains on the dormant alarm",
+  );
+  const hb = ctx.alarmAt()! - Date.now();
+  assert.ok(hb > 30_000, "back on the heartbeat cadence after recovery");
+});
+
+/** ~11k estimated tokens per message: each exchange clears the 10k seal. */
+const PAD = "x".repeat(44 * 1024);
+
+/**
+ * Turns answer at once. A memory branch answers after `branchDelayMs`, or
+ * never (ignoring cancellation) when `branchHangs` is set.
+ */
+class BranchProvider implements ModelProvider {
+  readonly name = "branch-scripted";
+  branchRequests = 0;
+  branchDelayMs = 0;
+  branchHangs = false;
+  async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+    if (!req.turnId.startsWith("memory-l1-")) {
+      yield { type: "text", delta: "ok" };
+      yield { type: "done", usage: { finish_reason: "stop" } };
+      return;
+    }
+    this.branchRequests++;
+    if (this.branchHangs) await new Promise(() => {});
+    await sleep(this.branchDelayMs);
+    yield { type: "text", delta: "organized memory of the first exchange" };
+    yield { type: "done", usage: { finish_reason: "stop" } };
+  }
+}
+
+/** Two padded exchanges through fetch wakes: chunk 1 is sealable after. */
+async function twoExchanges(
+  state: FakeState,
+  obj: TestObject,
+  ctx: ReturnType<typeof fakeCtx>,
+) {
+  state.addInput(PERSONA, "pad-1", `first ${PAD}`);
+  state.addInput(PERSONA, "pad-2", `second ${PAD}`);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  assert.equal((await state.outbox(PERSONA, 0)).length, 2);
+}
+
+test("fetch drain never starts memory preparation and arms the alarm to start it", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const provider = new BranchProvider();
+  const ctx = fakeCtx();
+  const obj = new TestObject(ctx as never, fakeEnv as never, state, provider);
+  await twoExchanges(state, obj, ctx);
+  // A second fetch drain seals chunk 1 but must not claim it.
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  const c = state.memoryChunks[0];
+  assert.ok(c, "chunk 1 sealed");
+  assert.equal(c.status, "sealed");
+  assert.equal(c.interruptions, 0);
+  assert.equal(provider.branchRequests, 0, "no model call from a fetch drain");
+  const armedIn = ctx.alarmAt()! - Date.now();
+  assert.ok(armedIn <= 1_500, `alarm armed soon for preparation: ${armedIn}ms`);
+});
+
+test("alarm drain keeps a branch alive past the turn budget and shelves its result", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const provider = new BranchProvider();
+  provider.branchDelayMs = 1_500;
+  const ctx = fakeCtx();
+  const env = {
+    ...fakeEnv,
+    SUMI_DRAIN_TURN_BUDGET_MS: "300",
+    SUMI_ALARM_DRAIN_LIFETIME_MS: "20000",
+    SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "5000",
+  };
+  const obj = new TestObject(ctx as never, env as never, state, provider);
+  await twoExchanges(state, obj, ctx);
+
+  const t0 = Date.now();
+  await obj.alarm();
+  const took = Date.now() - t0;
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "prepared", JSON.stringify(c));
+  assert.equal(c.attempts, 0);
+  assert.equal(c.interruptions, 0);
+  assert.equal(provider.branchRequests, 1);
+  assert.ok(took >= 1_500, `the alarm held the branch to completion: ${took}ms`);
+  assert.equal(state.leases.get(PERSONA)!.expires_at < new Date().toISOString(), true, "lease released after the drain");
+});
+
+test("alarm drain records a hanging branch as a retryable timeout and re-arms for the retry", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const provider = new BranchProvider();
+  provider.branchHangs = true;
+  const ctx = fakeCtx();
+  const env = {
+    ...fakeEnv,
+    SUMI_ALARM_DRAIN_LIFETIME_MS: "3000",
+    SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "1000",
+  };
+  const obj = new TestObject(ctx as never, env as never, state, provider);
+  await twoExchanges(state, obj, ctx);
+
+  await obj.alarm();
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "sealed", JSON.stringify(c));
+  assert.equal(c.attempts, 1, "a timeout is a recorded failure");
+  assert.equal(c.interruptions, 0);
+  assert.match(c.last_error ?? "", /did not finish within 1000ms/);
+  const armedIn = ctx.alarmAt()! - Date.now();
+  assert.ok(
+    armedIn > 0 && armedIn <= 1_500,
+    `re-armed for the retry, not the 30s heartbeat: ${armedIn}ms`,
+  );
 });

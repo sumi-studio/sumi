@@ -39,6 +39,10 @@ var (
 	ErrOpNotFound      = errors.New("operation not found")
 	ErrUnknownTool     = errors.New("unknown tool")
 	ErrBadRequest      = errors.New("bad request")
+	// ErrPersonaInactive: the persona is sealed for, staged by, or already
+	// moved by a transfer (internal/portable), so this placement may not run
+	// it or accept new inputs for it.
+	ErrPersonaInactive = errors.New("persona is not active in this placement")
 )
 
 // dataErr maps deterministic PostgreSQL data errors — class 22 data
@@ -85,6 +89,9 @@ type Persona struct {
 	HumanID     *string   `json:"human_id"`
 	DisplayName string    `json:"display_name"`
 	CreatedAt   time.Time `json:"created_at"`
+	// Authority is active, sealed, staged or transferred (migration 0049).
+	Authority  string  `json:"authority"`
+	TransferID *string `json:"transfer_id"`
 }
 
 type WriterLease struct {
@@ -114,6 +121,10 @@ type Input struct {
 	TurnID            *string        `json:"turn_id"`
 	CreatedAt         time.Time      `json:"created_at"`
 	DoneAt            *time.Time     `json:"done_at"`
+	// NotBefore delays a retryable-failed input's next claim — the
+	// durable bound that keeps one failing input from hot-looping and
+	// starving every later queued input.
+	NotBefore *time.Time `json:"not_before"`
 }
 
 type Turn struct {
@@ -209,25 +220,29 @@ type PlanCall struct {
 	Request map[string]any `json:"request"`
 }
 
-// Decision is what the model decided for an input: reply text, the ordered
-// tool calls to execute, and reported usage. It is persisted before any
-// effect runs; recovery continues it instead of re-planning.
+// Decision is what the model decided in one round of a turn: the text it
+// produced, the ordered tool calls to execute, and reported usage. Each
+// round is persisted before any of its effects run; recovery continues it
+// instead of re-planning.
 type Decision struct {
 	Text  string         `json:"text"`
 	Calls []PlanCall     `json:"calls"`
 	Usage map[string]any `json:"usage"`
 }
 
-// TurnPlan is the durable record of one input's decision. One row per input,
-// immutable once written: a replayed identical save returns the stored row,
-// a conflicting save is rejected.
+// TurnPlan is the durable record of one input's decisions. One row per
+// input; Plan is the append-only list of rounds — a recorded round never
+// changes, a new round may only be appended by the live turn. A replayed
+// identical save returns the stored row; a conflicting save is rejected.
+// A round with zero calls is the turn's final decision — its text is the
+// reply, informed by the committed tool results of earlier rounds.
 type TurnPlan struct {
-	PersonaID  string    `json:"persona_id"`
-	InputID    string    `json:"input_id"`
-	TurnID     string    `json:"turn_id"`
-	Generation int64     `json:"generation"`
-	Plan       Decision  `json:"plan"`
-	CreatedAt  time.Time `json:"created_at"`
+	PersonaID  string     `json:"persona_id"`
+	InputID    string     `json:"input_id"`
+	TurnID     string     `json:"turn_id"`
+	Generation int64      `json:"generation"`
+	Plan       []Decision `json:"plan"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 // LoadResult is one coarse read: the running or freshly begun turn, its
@@ -236,6 +251,16 @@ type LoadResult struct {
 	Turn    *Turn   `json:"turn"`
 	Input   *Input  `json:"input"`
 	Context []Event `json:"context"`
+	// Memory holds the applied L1 replacement blocks. Each renders at the
+	// journal position where its events were — the core interleaves them
+	// with the raw tail by sequence position.
+	Memory []MemoryBlock `json:"memory"`
+	// Omitted is the extent of older raw records outside the send cap —
+	// still stored and readable through conversation_history; nil if none.
+	Omitted *OmittedRange `json:"omitted"`
+	// MemoryOmitted is the extent of older applied memory blocks outside
+	// the memory cap — stored, originals readable; nil if none.
+	MemoryOmitted *OmittedMemory `json:"memory_omitted"`
 	// Plan is the input's recorded decision, if one exists — returned on
 	// both the fresh-claim and running-turn replay paths so a retried
 	// attempt continues the recorded plan rather than re-planning.
@@ -252,6 +277,11 @@ type CommitRequest struct {
 	Usage     map[string]any `json:"usage"`
 	Error     string         `json:"error"`
 	Retryable bool           `json:"retryable"`
+	// RetryAfterMs is provider-supplied pacing (HTTP Retry-After) for a
+	// retryable failure: the requeue's not_before is at least
+	// now()+RetryAfterMs on top of the per-attempt backoff. Clamped to
+	// [0, 2min] — a hint can slow the next retry, never silence it.
+	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
 }
 
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
@@ -267,11 +297,18 @@ func NewStore(pool *pgxpool.Pool) *Store {
 // requireGeneration locks the writer lease row and verifies the presented
 // generation. Holding the row lock for the rest of the transaction also
 // serializes mutations from callers sharing one generation.
+//
+// The persona's placement authority is part of the fence: a sealed, staged or
+// transferred persona admits no mutation even under a matching generation, so
+// a staged import can never be driven by a caller that guesses its epoch.
 func requireGeneration(ctx context.Context, tx pgx.Tx, personaID string, generation int64) error {
 	var current int64
+	var authority string
 	err := tx.QueryRow(ctx,
-		`SELECT generation FROM core_writer_leases WHERE persona_id = $1 FOR UPDATE`,
-		personaID).Scan(&current)
+		`SELECT l.generation, p.authority
+		 FROM core_writer_leases l JOIN core_personas p ON p.persona_id = l.persona_id
+		 WHERE l.persona_id = $1 FOR UPDATE OF l`,
+		personaID).Scan(&current, &authority)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrGenerationFence
 	}
@@ -280,6 +317,9 @@ func requireGeneration(ctx context.Context, tx pgx.Tx, personaID string, generat
 	}
 	if current != generation {
 		return ErrGenerationFence
+	}
+	if authority != "active" {
+		return fmt.Errorf("%w: persona authority is %s", ErrGenerationFence, authority)
 	}
 	return nil
 }
@@ -290,13 +330,13 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 		INSERT INTO core_personas (persona_id, human_id, display_name)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (persona_id) DO NOTHING
-		RETURNING persona_id, human_id, display_name, created_at`,
+		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id`,
 		personaID, humanID, displayName).
-		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt)
+		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = s.pool.QueryRow(ctx,
-			`SELECT persona_id, human_id, display_name, created_at FROM core_personas WHERE persona_id = $1`,
-			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt)
+			`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return p, false, ErrPersonaNotFound
 		}
@@ -311,8 +351,9 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaState, error) {
 	var st PersonaState
 	err := s.pool.QueryRow(ctx,
-		`SELECT persona_id, human_id, display_name, created_at FROM core_personas WHERE persona_id = $1`,
-		personaID).Scan(&st.Persona.PersonaID, &st.Persona.HumanID, &st.Persona.DisplayName, &st.Persona.CreatedAt)
+		`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
+		personaID).Scan(&st.Persona.PersonaID, &st.Persona.HumanID, &st.Persona.DisplayName, &st.Persona.CreatedAt,
+		&st.Persona.Authority, &st.Persona.TransferID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, ErrPersonaNotFound
 	}
@@ -355,12 +396,15 @@ func (s *Store) PersonaState(ctx context.Context, personaID string) (PersonaStat
 }
 
 // AcquireWriter takes the persona writer lease when free, expired, or already
-// held by the same holder, returning the new fencing generation.
+// held by the same holder, returning the new fencing generation. Only an
+// active persona can be acquired; a transfer seal also parks the lease on a
+// far-future expiry, so a concurrent acquire cannot slip past the seal.
 func (s *Store) AcquireWriter(ctx context.Context, personaID, holderID string, ttl time.Duration) (WriterLease, error) {
 	var lease WriterLease
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO core_writer_leases (persona_id, generation, holder_id, expires_at)
-		SELECT $1::uuidv7, 1, $2, now() + $3::interval FROM core_personas WHERE persona_id = $1::uuidv7
+		SELECT $1::uuidv7, 1, $2, now() + $3::interval FROM core_personas
+		WHERE persona_id = $1::uuidv7 AND authority = 'active'
 		ON CONFLICT (persona_id) DO UPDATE SET
 			generation  = core_writer_leases.generation + 1,
 			holder_id   = EXCLUDED.holder_id,
@@ -372,14 +416,18 @@ func (s *Store) AcquireWriter(ctx context.Context, personaID, holderID string, t
 		personaID, holderID, ttl).
 		Scan(&lease.PersonaID, &lease.Generation, &lease.HolderID, &lease.AcquiredAt, &lease.ExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if err := s.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_personas WHERE persona_id = $1)`,
-			personaID).Scan(&exists); err != nil {
+		var authority string
+		err := s.pool.QueryRow(ctx,
+			`SELECT authority FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&authority)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return lease, ErrPersonaNotFound
+		}
+		if err != nil {
 			return lease, err
 		}
-		if !exists {
-			return lease, ErrPersonaNotFound
+		if authority != "active" {
+			return lease, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
 		}
 		return lease, ErrWriterHeld
 	}
@@ -410,10 +458,12 @@ func (s *Store) RenewWriter(ctx context.Context, personaID, holderID string, gen
 // the generation must be monotonic per persona, so the next acquire goes
 // through the ON CONFLICT path and returns generation+1. A deleted row
 // would restart generation at 1 and admit a stale holder's in-flight
-// mutation under the recycled fencing token.
+// mutation under the recycled fencing token. The expiry is a fixed past
+// instant, not now(): a now()-written "dead" marker can look live to a
+// later transaction after the host clock steps backward.
 func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, generation int64) error {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE core_writer_leases SET expires_at = now()
+		`UPDATE core_writer_leases SET expires_at = 'epoch'::timestamptz
 		 WHERE persona_id = $1 AND generation = $2 AND holder_id = $3`,
 		personaID, generation, holderID)
 	if err != nil {
@@ -427,7 +477,7 @@ func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, g
 
 const inputCols = `persona_id, input_id, kind, payload, actor_kind, actor_id,
 	source_surface, thread_id, occurred_at, attention, status,
-	claimed_generation, turn_id, created_at, done_at`
+	claimed_generation, turn_id, created_at, done_at, not_before`
 
 type inputScanner interface {
 	Scan(dest ...any) error
@@ -438,7 +488,7 @@ func scanInput(row inputScanner) (Input, error) {
 	err := row.Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 		&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 		&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-		&in.TurnID, &in.CreatedAt, &in.DoneAt)
+		&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return in, ErrInputNotFound
 	}
@@ -456,8 +506,8 @@ const schedInputPrefix = "sched:"
 // violation, not idempotency: it is rejected rather than answered with a
 // receipt for a different request.
 func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error) {
-	if strings.HasPrefix(in.InputID, schedInputPrefix) {
-		return Input{}, false, fmt.Errorf("%w: input_id prefix %q is reserved", ErrBadRequest, schedInputPrefix)
+	if strings.HasPrefix(in.InputID, schedInputPrefix) || strings.HasPrefix(in.InputID, jobInputPrefix) {
+		return Input{}, false, fmt.Errorf("%w: input_id prefix %q is reserved", ErrBadRequest, strings.SplitN(in.InputID, ":", 2)[0]+":")
 	}
 	if in.Attention == "" {
 		in.Attention = "reply"
@@ -470,30 +520,39 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		return Input{}, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Share-lock the persona row: a transfer seal updates it, so a new input
+	// either commits before the seal (and is inside the export cut) or sees
+	// the new authority and is refused. Refusal is explicit — the ingress
+	// still holds the input — never a silent drop. Replays of an accepted
+	// input stay answerable in every authority.
+	var authority string
+	err = tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1 FOR SHARE`,
+		in.PersonaID).Scan(&authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Input{}, false, ErrPersonaNotFound
+	}
+	if err != nil {
+		return Input{}, false, dataErr(err)
+	}
 	var stored Input
-	err = tx.QueryRow(ctx, `
+	err = pgx.ErrNoRows
+	if authority == "active" {
+		err = tx.QueryRow(ctx, `
 		INSERT INTO core_inputs (persona_id, input_id, kind, payload, actor_kind, actor_id,
 			source_surface, thread_id, occurred_at, attention, status)
 		SELECT $1::uuidv7, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued'
 		FROM core_personas WHERE persona_id = $1::uuidv7
 		ON CONFLICT (persona_id, input_id) DO NOTHING
 		RETURNING `+inputCols,
-		in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
-		in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).
-		Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
-			&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
-			&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
-			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt)
+			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
+			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).
+			Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
+				&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
+				&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
+				&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		err = tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_personas WHERE persona_id = $1)`, in.PersonaID).Scan(&exists)
-		if err != nil {
-			return Input{}, false, err
-		}
-		if !exists {
-			return Input{}, false, ErrPersonaNotFound
-		}
 		// Replay of an existing input_id is only valid when every caller-
 		// supplied field matches what was stored — an idempotent retry, not
 		// a different input claiming the same id.
@@ -505,6 +564,9 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 			FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
 			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
 			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).Scan(&same)
+		if errors.Is(err, pgx.ErrNoRows) && authority != "active" {
+			return Input{}, false, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
+		}
 		if err != nil {
 			return Input{}, false, err
 		}
@@ -568,12 +630,23 @@ func (s *Store) GetInput(ctx context.Context, personaID, inputID string) (Input,
 	return in, turn, err
 }
 
-// SavePlan durably records the model's decision for the input a running
-// turn is resolving — the "decision before effects" boundary (F1). The
-// caller names the turn; the input is derived server-side from the turn row
-// so it cannot be mis-asserted. One plan per input, immutable: replaying an
-// identical save returns the stored row; a conflicting save conflicts.
-func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generation int64, decision Decision) (TurnPlan, bool, error) {
+// SavePlan durably records one round of the model's decisions for the input
+// a running turn is resolving — the "decision before effects" boundary (F1),
+// extended so tool results can be fed back for a truthful final reply: the
+// model may be consulted again after a round's effects commit, and each new
+// round is appended to the same durable record before its own effects run.
+//
+// The caller names the turn and the round index; the input is derived
+// server-side from the turn row so it cannot be mis-asserted. The stored
+// plan is append-only: re-saving an existing round is idempotent only when
+// identical (a lost-response resend), a different decision at a recorded
+// position or a gap in the round sequence is a contract violation (409).
+// Rounds may be appended by a later attempt of the same input — the plan
+// belongs to the input's resolution lineage, not to one attempt.
+func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generation int64, round int64, decision Decision) (TurnPlan, bool, error) {
+	if round < 0 {
+		return TurnPlan{}, false, fmt.Errorf("%w: round must be >= 0", ErrBadRequest)
+	}
 	if decision.Calls == nil {
 		decision.Calls = []PlanCall{}
 	}
@@ -588,7 +661,7 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 			decision.Calls[i].Request = map[string]any{}
 		}
 	}
-	planJSON, err := json.Marshal(decision)
+	decJSON, err := json.Marshal(decision)
 	if err != nil {
 		return TurnPlan{}, false, err
 	}
@@ -596,11 +669,11 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	// anywhere in it cannot be stored as jsonb, and retrying the save can
 	// never succeed. Reject it as a deterministic decision error here —
 	// before any effect boundary is reached.
-	var genericPlan any
-	if err := json.Unmarshal(planJSON, &genericPlan); err != nil {
+	var genericDecision any
+	if err := json.Unmarshal(decJSON, &genericDecision); err != nil {
 		return TurnPlan{}, false, err
 	}
-	if hasNUL(genericPlan) {
+	if hasNUL(genericDecision) {
 		return TurnPlan{}, false, fmt.Errorf("%w: decision contains a NUL byte jsonb cannot store", ErrBadRequest)
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -628,48 +701,82 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	if turnGen != generation || turnStatus != "running" {
 		return TurnPlan{}, false, ErrTurnConflict
 	}
-	var p TurnPlan
+	// Serialize appends against other writers on this row.
+	var storedRounds int64
+	var haveRow bool
 	err = tx.QueryRow(ctx, `
-		INSERT INTO core_turn_plans (persona_id, input_id, turn_id, generation, plan)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (persona_id, input_id) DO NOTHING
-		RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
-		personaID, inputID, turnID, generation, planJSON).
-		Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// A plan already exists for this input. Idempotent only when the
-		// decision is identical — a different plan under the same input is
-		// a contract violation, never a supersession.
-		var same bool
-		if err := tx.QueryRow(ctx, `
-			SELECT plan = $3::jsonb FROM core_turn_plans
-			WHERE persona_id = $1 AND input_id = $2`,
-			personaID, inputID, planJSON).Scan(&same); err != nil {
-			return TurnPlan{}, false, err
+		SELECT COALESCE(jsonb_array_length(plan), 0) FROM core_turn_plans
+		WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&storedRounds)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if round != 0 {
+			return TurnPlan{}, false, fmt.Errorf("%w: first plan round must be round 0", ErrTurnConflict)
 		}
-		if !same {
-			return TurnPlan{}, false, fmt.Errorf("%w: input already has a different recorded plan", ErrTurnConflict)
-		}
-		stored, err := s.planForInput(ctx, tx, personaID, inputID)
+	case err != nil:
+		return TurnPlan{}, false, err
+	default:
+		haveRow = true
+	}
+	var p TurnPlan
+	if !haveRow {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO core_turn_plans (persona_id, input_id, turn_id, generation, plan)
+			VALUES ($1, $2, $3, $4, jsonb_build_array($5::jsonb))
+			RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
+			personaID, inputID, turnID, generation, decJSON).
+			Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
 		if err != nil {
-			return TurnPlan{}, false, err
+			return TurnPlan{}, false, fmt.Errorf("save plan: %w", dataErr(err))
 		}
-		if stored == nil {
-			return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
-		}
-		p = *stored
 		if err := tx.Commit(ctx); err != nil {
 			return TurnPlan{}, false, err
 		}
-		return p, false, nil
+		return p, true, nil
 	}
+	switch {
+	case round < storedRounds:
+		// Re-saving a recorded round is idempotent only when identical —
+		// a different decision at a recorded position is a contract
+		// violation, never a supersession.
+		var same bool
+		if err := tx.QueryRow(ctx, `
+			SELECT plan->($3::int) = $4::jsonb FROM core_turn_plans
+			WHERE persona_id = $1 AND input_id = $2`,
+			personaID, inputID, round, decJSON).Scan(&same); err != nil {
+			return TurnPlan{}, false, err
+		}
+		if !same {
+			return TurnPlan{}, false, fmt.Errorf("%w: round %d already recorded with a different decision", ErrTurnConflict, round)
+		}
+	case round == storedRounds:
+		err = tx.QueryRow(ctx, `
+			UPDATE core_turn_plans SET plan = plan || $3::jsonb
+			WHERE persona_id = $1 AND input_id = $2
+			RETURNING persona_id, input_id, turn_id, generation, plan, created_at`,
+			personaID, inputID, json.RawMessage("["+string(decJSON)+"]")).
+			Scan(&p.PersonaID, &p.InputID, &p.TurnID, &p.Generation, &p.Plan, &p.CreatedAt)
+		if err != nil {
+			return TurnPlan{}, false, fmt.Errorf("append plan round: %w", dataErr(err))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return TurnPlan{}, false, err
+		}
+		return p, true, nil
+	default:
+		return TurnPlan{}, false, fmt.Errorf("%w: plan round %d skips recorded rounds (have %d)", ErrTurnConflict, round, storedRounds)
+	}
+	stored, err := s.planForInput(ctx, tx, personaID, inputID)
 	if err != nil {
 		return TurnPlan{}, false, fmt.Errorf("save plan: %w", dataErr(err))
+	}
+	if stored == nil {
+		return TurnPlan{}, false, fmt.Errorf("plan vanished mid-transaction")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TurnPlan{}, false, err
 	}
-	return p, true, nil
+	return *stored, false, nil
 }
 
 // planForInput returns the recorded decision for an input, or nil.
@@ -699,29 +806,6 @@ func clampLimit(v, def, max int) int {
 		return max
 	}
 	return v
-}
-
-func (s *Store) journalTail(ctx context.Context, db interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, personaID string, limit int) ([]Event, error) {
-	limit = clampLimit(limit, 50, 500)
-	rows, err := db.Query(ctx, `
-		SELECT persona_id, seq, turn_id, kind, payload, created_at
-		FROM (SELECT * FROM core_events WHERE persona_id = $1 ORDER BY seq DESC LIMIT $2) recent
-		ORDER BY seq`, personaID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
 }
 
 // LoadTurn is the coarse turn-start read under the writer's generation. If a
@@ -755,10 +839,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 	case errors.Is(err, pgx.ErrNoRows):
 		var in Input
 		err = tx.QueryRow(ctx, `
-			UPDATE core_inputs SET status = 'claimed', claimed_generation = $2
+			UPDATE core_inputs SET status = 'claimed', claimed_generation = $2, not_before = NULL
 			WHERE (persona_id, input_id) = (
 				SELECT persona_id, input_id FROM core_inputs
 				WHERE persona_id = $1 AND status = 'queued'
+					AND (not_before IS NULL OR not_before <= now())
 				ORDER BY created_at, input_id LIMIT 1 FOR UPDATE SKIP LOCKED
 			)
 			RETURNING `+inputCols,
@@ -766,12 +851,13 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 				&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-				&in.TurnID, &in.CreatedAt, &in.DoneAt)
+				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 		if errors.Is(err, pgx.ErrNoRows) {
-			res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
 			if err != nil {
 				return res, err
 			}
+			res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 			if err := tx.Commit(ctx); err != nil {
 				return res, err
 			}
@@ -829,10 +915,18 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			return res, err
 		}
 	}
-	res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+	// The turn presents its own input (and its recorded plan re-presents any
+	// mid-turn effects), so records an earlier attempt already journaled for
+	// this input are left out of the rendered history.
+	exclude := ""
+	if res.Input != nil {
+		exclude = res.Input.InputID
+	}
+	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, exclude)
 	if err != nil {
 		return res, err
 	}
+	res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -847,6 +941,11 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if req.Outcome != "complete" && req.Outcome != "fail" {
 		return nil, fmt.Errorf("%w: outcome must be complete or fail", ErrBadRequest)
 	}
+	// Error text is diagnostic, not authoritative content: strip bytes PG
+	// text/jsonb cannot hold so a poisoned provider message cannot make the
+	// failure itself unpersistable and loop attempts forever. Normalized
+	// before the commit_request marshals so replays compare identically.
+	req.Error = strings.ReplaceAll(req.Error, "\x00", "")
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -898,7 +997,43 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	if err := s.appendEventsTx(ctx, tx, personaID, turnID, req.Events); err != nil {
+	// Exactly one input_received per input ever lands in the journal, and
+	// every receipt names a real input: withoutJournaledInput refuses the
+	// commit when a receipt carries a non-string id or names an input row
+	// that does not exist (the refusal rolls back — nothing is journaled
+	// and the turn can be retried once the input exists). A receipt for an
+	// already-journaled input is dropped, and so is a second copy inside
+	// the request itself — a duplicate receipt is the same fact twice, not
+	// new history. commit_request keeps the request as sent, so replays
+	// still compare.
+	events, err := withoutJournaledInput(ctx, tx, personaID, req.Events)
+	if err != nil {
+		return nil, err
+	}
+	var base int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM core_events WHERE persona_id = $1`,
+		personaID).Scan(&base); err != nil {
+		return nil, err
+	}
+	if err := s.appendEventsTx(ctx, tx, personaID, turnID, events); err != nil {
+		return nil, dataErr(err)
+	}
+	// Link every input_received this commit journaled to its input's
+	// marker — not only this turn's input: a receipt for another input is
+	// unusual but journaled history, and leaving it unlinked would make the
+	// persona permanently unsealable under the cut's reverse-link check.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_inputs i SET received_seq = s.seq
+		FROM (
+			SELECT payload->>'input_id' AS input_id, MIN(seq) AS seq
+			FROM core_events
+			WHERE persona_id = $1 AND seq > $2 AND kind = 'input_received'
+			GROUP BY 1
+		) s
+		WHERE i.persona_id = $1 AND i.input_id = s.input_id
+			AND i.received_seq IS NULL`,
+		personaID, base); err != nil {
 		return nil, err
 	}
 	switch req.Outcome {
@@ -909,12 +1044,12 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			RETURNING status, finished_at, output, usage`,
 			personaID, turnID, req.Output, req.Usage, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Output, &t.Usage); err != nil {
-			return nil, fmt.Errorf("complete turn: %w", err)
+			return nil, fmt.Errorf("complete turn: %w", dataErr(err))
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE core_inputs SET status = 'done', done_at = now() WHERE persona_id = $1 AND input_id = $2`,
 			personaID, t.InputID); err != nil {
-			return nil, err
+			return nil, dataErr(err)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO core_outbox (persona_id, seq, kind, payload)
@@ -925,7 +1060,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				"input_id": t.InputID,
 				"output":   req.Output,
 			}); err != nil {
-			return nil, fmt.Errorf("append outbox: %w", err)
+			return nil, fmt.Errorf("append outbox: %w", dataErr(err))
 		}
 	case "fail":
 		if err := tx.QueryRow(ctx, `
@@ -933,12 +1068,29 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			WHERE persona_id = $1 AND turn_id = $2 RETURNING status, finished_at, error`,
 			personaID, turnID, req.Error, reqJSON).
 			Scan(&t.Status, &t.FinishedAt, &t.Error); err != nil {
-			return nil, err
+			return nil, dataErr(err)
 		}
 		if req.Retryable {
+			// The requeue carries a per-attempt backoff: without it a
+			// deterministically failing input reclaims instantly every
+			// pass (its original created_at wins the ordering), grows
+			// the journal and turns table without bound, and starves
+			// every later queued input. not_before keeps the retry
+			// honest and lets other work proceed. Provider-supplied
+			// pacing (Retry-After) is honored on top, clamped to 2min —
+			// a hint can slow a retry, never silence it.
+			delay := retryBackoff(t.Attempt)
+			if after := time.Duration(req.RetryAfterMs) * time.Millisecond; after > delay {
+				if after > 2*time.Minute {
+					after = 2 * time.Minute
+				}
+				delay = after
+			}
 			if _, err := tx.Exec(ctx, `
-				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL, turn_id = NULL
-				WHERE persona_id = $1 AND input_id = $2`, personaID, t.InputID); err != nil {
+				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
+					turn_id = NULL, not_before = now() + $3 * interval '1 millisecond'
+				WHERE persona_id = $1 AND input_id = $2`,
+				personaID, t.InputID, delay.Milliseconds()); err != nil {
 				return nil, err
 			}
 		} else {
@@ -947,12 +1099,45 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				WHERE persona_id = $1 AND input_id = $2`, personaID, t.InputID); err != nil {
 				return nil, err
 			}
+			// A terminal failure resolves the input — the requester must see
+			// the request ended, not wait silently. The failure is the reply.
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO core_outbox (persona_id, seq, kind, payload)
+				SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'turn_failed', $2
+				FROM core_outbox WHERE persona_id = $1::uuidv7`,
+				personaID, map[string]any{
+					"turn_id":  turnID,
+					"input_id": t.InputID,
+					"error":    req.Error,
+				}); err != nil {
+				return nil, fmt.Errorf("append outbox: %w", err)
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return t, nil
+}
+
+// retryBackoff bounds how soon a retryable-failed input may be claimed
+// again: 200ms doubling per attempt, capped at 30s. The attempt number
+// of the turn that just failed drives it, so a permanently failing
+// input decays to a slow poll instead of a hot loop — while later queued
+// inputs remain claimable during the delay.
+func retryBackoff(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 8 {
+		shift = 8
+	}
+	d := 200 * time.Millisecond << shift
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }
 
 // jsonbEqual compares two JSON payloads semantically: both sides pass
@@ -1088,6 +1273,13 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	if err := sRows.Err(); err != nil {
 		return res, err
 	}
+	// Return memory chunks a fenced generation was preparing to the shelf
+	// so the live generation can reprepare them — the originals never left
+	// the context while preparation ran. The lost claim counts as an
+	// interruption, not a failed attempt.
+	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
+		return res, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -1119,13 +1311,173 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 // atomically inside the claim transaction. Anything else has no execution
 // path yet and must not be claimable.
 func isInternalTool(tool string) bool {
-	return tool == "schedule.set" || tool == "journal.note"
+	switch tool {
+	case "schedule.set", "journal.note", "conversation_history",
+		"job.start", "job.status", "job.cancel":
+		return true
+	}
+	return false
+}
+
+// ensureInputReceived journals the input a turn is serving before a
+// mid-turn effect lands in the journal, so the effect follows its cause in
+// seq order (and in the memory chunk the seal walk cuts at that input). The
+// payload is the one the core commits for the same input. received_seq makes
+// it happen once per input: later effects, retried attempts and the turn's
+// own commit all see the input as already journaled.
+func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, turnID string) error {
+	var received *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&received); err != nil {
+		return fmt.Errorf("input for journal: %w", err)
+	}
+	if received != nil {
+		return nil
+	}
+	in, err := scanInput(tx.QueryRow(ctx,
+		`SELECT `+inputCols+` FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID))
+	if err != nil {
+		return err
+	}
+	var attempt int
+	if err := tx.QueryRow(ctx,
+		`SELECT attempt FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&attempt); err != nil {
+		return err
+	}
+	var text any
+	if t, ok := in.Payload["text"].(string); ok {
+		text = t
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
+		SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, $2, 'input_received', $3
+		FROM core_events WHERE persona_id = $1::uuidv7
+		RETURNING seq`,
+		personaID, turnID, map[string]any{
+			"input_id":       in.InputID,
+			"kind":           in.Kind,
+			"text":           text,
+			"actor_kind":     in.ActorKind,
+			"source_surface": in.SourceSurface,
+			"attempt":        attempt,
+		}).Scan(&seq); err != nil {
+		return fmt.Errorf("journal input: %w", dataErr(err))
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE core_inputs SET received_seq = $3 WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID, seq)
+	return err
+}
+
+// withoutJournaledInput validates and dedups the request's input_received
+// events. A receipt is only meaningful as the record of an input this
+// persona holds: its payload.input_id must be a non-empty string naming an
+// existing input row. Anything else — a non-string id or an id with no row —
+// is malformed journal content, so the commit is refused before any
+// mutation rather than journaled as a ghost the cut would later refuse.
+// Validation runs on every copy before dedup, so a dropped duplicate
+// cannot mask an invalid element. For valid ids, one receipt per input
+// ever lands in the journal: a copy naming an input whose marker is
+// already set is dropped (the receipt exists), and a second copy inside
+// the request itself is dropped (the first is the receipt). The marker
+// check runs FOR UPDATE so a commit cannot dedup against a marker another
+// in-flight write has not recorded yet.
+func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, events []EventInput) ([]EventInput, error) {
+	var named []string
+	seen := map[string]bool{}
+	for _, e := range events {
+		if e.Kind != "input_received" {
+			continue
+		}
+		id, ok := e.Payload["input_id"].(string)
+		if !ok || id == "" {
+			return nil, fmt.Errorf("%w: input_received payload.input_id must be a non-empty string", ErrBadRequest)
+		}
+		if !seen[id] {
+			seen[id] = true
+			named = append(named, id)
+		}
+	}
+	if len(named) == 0 {
+		return events, nil
+	}
+	// Every named id must resolve to an input row. A receipt for an absent
+	// input is refused here — before any event or marker lands — so the
+	// commit can be retried once the input exists.
+	existing := map[string]bool{}
+	rows, err := tx.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 AND input_id = ANY($2)`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		existing[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for _, id := range named {
+		if !existing[id] {
+			return nil, fmt.Errorf("%w: input_received names absent input %q", ErrBadRequest, id)
+		}
+	}
+	journaled := map[string]bool{}
+	rows, err = tx.Query(ctx,
+		`SELECT input_id FROM core_inputs
+		 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
+		 FOR UPDATE`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		journaled[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	out := make([]EventInput, 0, len(events))
+	emitted := map[string]bool{}
+	for _, e := range events {
+		if e.Kind == "input_received" {
+			id := e.Payload["input_id"].(string)
+			if journaled[id] || emitted[id] {
+				continue
+			}
+			emitted[id] = true
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // internalToolResponse applies a state-internal tool's effect inside the
 // claim transaction: the operation record and its effect are atomic, so a
-// crash cannot leave an unrecorded effect or a dangling record.
-func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, tool string, request map[string]any) (map[string]any, bool, error) {
+// crash cannot leave an unrecorded effect or a dangling record. inputID and
+// callIndex are the claim's plan position — job.start derives its job_id
+// from them so a replayed claim can never mint a second job.
+func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, request map[string]any) (map[string]any, bool, error) {
+	if strings.HasPrefix(tool, "job.") {
+		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
+		return resp, resp != nil, err
+	}
 	switch tool {
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
@@ -1193,6 +1545,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		if text == "" {
 			return nil, false, fmt.Errorf("%w: journal.note requires text", ErrBadRequest)
 		}
+		if err := ensureInputReceived(ctx, tx, personaID, inputID, turnID); err != nil {
+			return nil, false, err
+		}
 		var seq int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
@@ -1204,6 +1559,12 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
+	case "conversation_history":
+		resp, err := s.conversationHistory(ctx, tx, personaID, request)
+		if err != nil {
+			return nil, false, err
+		}
+		return resp, true, nil
 	default:
 		return nil, false, nil
 	}
@@ -1264,23 +1625,23 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	// The claim must be an entry of the input's recorded plan: the decision
 	// is durable before effects, so an off-plan call — absent plan, index
 	// out of range, or a different tool/request at that position — is a
-	// contract violation, never a fresh effect.
+	// contract violation, never a fresh effect. call_index addresses a flat
+	// position across every recorded round's calls in order.
 	if callIndex < 0 {
 		return Operation{}, false, fmt.Errorf("%w: call_index must be >= 0", ErrBadRequest)
 	}
-	var planned bool
-	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(
-			((plan->'calls'->($3::int))->>'tool') = $4
-			AND ((plan->'calls'->($3::int))->'request') = $5::jsonb,
-			false)
-		FROM core_turn_plans WHERE persona_id = $1 AND input_id = $2`,
-		personaID, inputID, callIndex, tool, request).Scan(&planned)
-	if errors.Is(err, pgx.ErrNoRows) {
-		planned = false
-	} else if err != nil {
+	plan, err := s.planForInput(ctx, tx, personaID, inputID)
+	if err != nil {
 		return Operation{}, false, dataErr(err)
 	}
+	var flat []PlanCall
+	if plan != nil {
+		for _, round := range plan.Plan {
+			flat = append(flat, round.Calls...)
+		}
+	}
+	planned := callIndex < len(flat) && flat[callIndex].Tool == tool &&
+		jsonbEqual(flat[callIndex].Request, request)
 	if !planned {
 		return Operation{}, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
 	}
@@ -1327,6 +1688,11 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			}
 			return op, true, nil
 		}
+		if strings.HasPrefix(tool, "job.") && op.Status == "done" {
+			if op.Response, err = withCurrentJobTx(ctx, tx, personaID, op.Response); err != nil {
+				return Operation{}, false, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, false, err
 		}
@@ -1337,7 +1703,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
-	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
+	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
 	if err != nil {
 		return Operation{}, false, err
 	}
@@ -1348,7 +1714,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			RETURNING status, response, completed_at`,
 			personaID, operationID, generation, response).
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
-			return Operation{}, false, fmt.Errorf("finish internal operation: %w", err)
+			return Operation{}, false, fmt.Errorf("finish internal operation: %w", dataErr(err))
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

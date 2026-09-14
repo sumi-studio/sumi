@@ -3,6 +3,9 @@ package agentstate
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,10 +229,405 @@ func TestCrashMidTurnRecovery(t *testing.T) {
 	}
 }
 
-// mustPlan records a durable decision for the turn's input.
+// f74: the store API accepted a commit carrying the same input_received
+// twice, journaled both, and linked the marker to the first — the second
+// copy was then unlinked and the cut's reverse-link check refused every
+// later Seal, permanently. The write boundary now dedups: one receipt per
+// input, per journal. A receipt naming a still-queued input is journaled
+// history and gets its marker linked, so that input's own commit does not
+// repeat it.
+func TestCommitDeduplicatesInputReceived(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for _, id := range []string{"in-1", "in-2"} {
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": id}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "note", Payload: map[string]any{"text": "between"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}}, // duplicate copy
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-2"}}, // other input's receipt
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var receipts, seq1, seq2 int64
+	var marker1, marker2 *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("journaled receipts = %d err=%v, want exactly 2", receipts, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT min(seq) FILTER (WHERE payload->>'input_id' = 'in-1'),
+				min(seq) FILTER (WHERE payload->>'input_id' = 'in-2')
+		 FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&seq1, &seq2); err != nil || seq1 != 1 || seq2 != 3 {
+		t.Fatalf("receipt seqs = %d,%d err=%v, want 1,3", seq1, seq2, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT max(received_seq) FILTER (WHERE input_id = 'in-1'),
+				max(received_seq) FILTER (WHERE input_id = 'in-2')
+		 FROM core_inputs WHERE persona_id = $1`,
+		pa).Scan(&marker1, &marker2); err != nil {
+		t.Fatalf("markers: %v", err)
+	}
+	if marker1 == nil || *marker1 != seq1 || marker2 == nil || *marker2 != seq2 {
+		t.Fatalf("markers = %v,%v want %d,%d", marker1, marker2, seq1, seq2)
+	}
+	// in-2's own commit must not re-journal its receipt.
+	load2, err := s.LoadTurn(ctx, pa, l.Generation, "t-2", 10)
+	if err != nil || load2.Input == nil || load2.Input.InputID != "in-2" {
+		t.Fatalf("load in-2: %+v err=%v", load2, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-2"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "done"}},
+		},
+		Output: map[string]any{"text": "done"},
+	}); err != nil {
+		t.Fatalf("in-2 commit: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("receipts after in-2 commit = %d err=%v, want 2", receipts, err)
+	}
+}
+
+// unlinkedReceipts is the cut verifier's reverse link: every journaled
+// input_received that names an existing input must be the one its marker
+// points at.
+func unlinkedReceipts(t *testing.T, pool *pgxpool.Pool, pa string) int64 {
+	t.Helper()
+	var n int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`,
+		pa).Scan(&n); err != nil {
+		t.Fatalf("unlinked receipts: %v", err)
+	}
+	return n
+}
+
+// f-memory-86/87: a receipt must carry a non-empty string input_id naming
+// an existing input — the commit is refused before anything lands, so a
+// retry once the input exists journals exactly one receipt and the persona
+// stays sealable.
+func TestCommitRejectsReceiptForAbsentInput(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	ghostCommit := CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, ghostCommit); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("ghost-receipt commit err = %v, want ErrBadRequest", err)
+	}
+	// The refusal rolled back: nothing journaled, the turn still runs, and
+	// no input or marker state was touched.
+	var events int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1`, pa).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("events after refused commit = %d err=%v, want 0", events, err)
+	}
+	tm, err := s.turn(ctx, pool, pa, "t-1")
+	if err != nil || tm.Status != "running" {
+		t.Fatalf("turn after refused commit = %+v err=%v, want running", tm, err)
+	}
+	// Once the input exists the same commit succeeds.
+	if _, created, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "ghost-1",
+		Kind: "message", Payload: map[string]any{"text": "arrived late"}}); err != nil || !created {
+		t.Fatalf("submit ghost-1: created=%v err=%v", created, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, ghostCommit); err != nil {
+		t.Fatalf("retry after input creation: %v", err)
+	}
+	var receipts int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("receipts = %d err=%v, want 2", receipts, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
+// A receipt's input_id is a string — the documented input-ID type. Any
+// other JSON shape refuses the commit before mutation; the same commit is
+// legal once corrected.
+func TestCommitRejectsMalformedReceiptIDs(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "5", Kind: "message",
+		Payload: map[string]any{"text": "five"}}); err != nil {
+		t.Fatalf("submit 5: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	// Every malformed identity shape refuses — including inside a commit
+	// whose other receipts are valid, and a copy dedup would have dropped.
+	for i, bad := range []any{float64(5), nil, map[string]any{"a": 1}, true, ""} {
+		_, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+			Outcome: "complete",
+			Events: []EventInput{
+				{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+				{Kind: "input_received", Payload: map[string]any{"input_id": bad}},
+			},
+			Output: map[string]any{"text": "hi"},
+		})
+		if !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("malformed input_id %v (%d): err = %v, want ErrBadRequest", bad, i, err)
+		}
+	}
+	var events int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1`, pa).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("events after refused commits = %d err=%v, want 0", events, err)
+	}
+	// A valid commit still works: one receipt for "5", marker linked.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}); err != nil {
+		t.Fatalf("valid commit after refusals: %v", err)
+	}
+	var receipts int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = '5'`,
+		pa).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("receipts = %d err=%v, want 1", receipts, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
+// The lost-adoption race from the reviews is closed by refusal, not by
+// locking: a commit carrying a receipt for an input being submitted
+// concurrently either sees the committed row (journals and links it) or is
+// refused cleanly — it can never produce a journaled receipt beside a
+// NULL-marker input.
+func TestConcurrentSubmitVsReceiptCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	for i := 0; i < 12; i++ {
+		turn := fmt.Sprintf("t-race-%d", i)
+		input := fmt.Sprintf("race-%d", i)
+		load, err := s.LoadTurn(ctx, pa, l.Generation, turn, 10)
+		if err != nil {
+			t.Fatalf("load %s: %v", turn, err)
+		}
+		var wg sync.WaitGroup
+		var commitErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, commitErr = s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i%4) * time.Millisecond)
+			if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa,
+				InputID: input, Kind: "message",
+				Payload: map[string]any{"text": "late"}}); err != nil {
+				t.Errorf("submit %s: %v", input, err)
+			}
+		}()
+		wg.Wait()
+		if commitErr != nil {
+			// Refused while the input was still absent: the turn stays
+			// running and a retry once the input exists succeeds.
+			if !errors.Is(commitErr, ErrBadRequest) {
+				t.Fatalf("commit %s: %v, want ErrBadRequest", turn, commitErr)
+			}
+			if _, err := s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			}); err != nil {
+				t.Fatalf("retry commit %s after input landed: %v", turn, err)
+			}
+		}
+	}
+	// Whatever the interleaving, every journaled receipt is linked.
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+	var dangling int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_inputs
+		WHERE persona_id = $1 AND received_seq IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM core_events e
+			WHERE e.persona_id = core_inputs.persona_id AND e.seq = core_inputs.received_seq
+				AND e.kind = 'input_received'
+				AND e.payload->>'input_id' = core_inputs.input_id)`,
+		pa).Scan(&dangling); err != nil || dangling != 0 {
+		t.Fatalf("mismatched markers = %d err=%v, want 0", dangling, err)
+	}
+}
+
+// The same race against a job-terminal notification: the notification
+// inserts the 'job:<id>' input inside the job's terminal transition, and a
+// concurrent commit carrying a receipt for that id either sees the
+// committed row or is refused — never a journaled receipt beside a
+// NULL-marker input.
+func TestConcurrentJobNotifyVsReceiptCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		jobID := fmt.Sprintf("j-race-%d", i)
+		input := "job:" + jobID
+		turn := fmt.Sprintf("t-job-%d", i)
+		if _, _, err := s.SubmitJob(ctx, pa, jobID, "subprocess",
+			map[string]any{"command": []any{"echo", "hi"}}, "api"); err != nil {
+			t.Fatalf("submit %s: %v", jobID, err)
+		}
+		claimed, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 1)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim %s: claimed=%+v err=%v", jobID, claimed, err)
+		}
+		load, err := s.LoadTurn(ctx, pa, l.Generation, turn, 10)
+		if err != nil {
+			t.Fatalf("load %s: %v", turn, err)
+		}
+		commit := func() error {
+			_, err := s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			})
+			return err
+		}
+		var wg sync.WaitGroup
+		var commitErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			commitErr = commit()
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i%4) * time.Millisecond)
+			if _, err := s.CompleteJob(ctx, pa, jobID, "runner-1", "done",
+				map[string]any{"exit_code": 0.0}, ""); err != nil {
+				t.Errorf("complete %s: %v", jobID, err)
+			}
+		}()
+		wg.Wait()
+		if commitErr != nil {
+			if !errors.Is(commitErr, ErrBadRequest) {
+				t.Fatalf("commit %s: %v, want ErrBadRequest", turn, commitErr)
+			}
+			if err := commit(); err != nil {
+				t.Fatalf("retry commit %s after notification landed: %v", turn, err)
+			}
+		}
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+	var dangling int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_inputs
+		WHERE persona_id = $1 AND received_seq IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM core_events e
+			WHERE e.persona_id = core_inputs.persona_id AND e.seq = core_inputs.received_seq
+				AND e.kind = 'input_received'
+				AND e.payload->>'input_id' = core_inputs.input_id)`,
+		pa).Scan(&dangling); err != nil || dangling != 0 {
+		t.Fatalf("mismatched markers = %d err=%v, want 0", dangling, err)
+	}
+}
+
+// mustPlan records a durable round-0 decision for the turn's input.
 func mustPlan(t *testing.T, s *Store, pa, turnID string, gen int64, calls ...PlanCall) TurnPlan {
 	t.Helper()
-	p, created, err := s.SavePlan(context.Background(), pa, turnID, gen,
+	p, created, err := s.SavePlan(context.Background(), pa, turnID, gen, 0,
 		Decision{Text: "reply", Calls: calls})
 	if err != nil || !created {
 		t.Fatalf("save plan: %+v created=%v err=%v", p, created, err)
@@ -321,14 +719,17 @@ func TestJournalNoteTool(t *testing.T) {
 	if err != nil || !fresh || op.Status != "done" || op.Response["seq"] == nil {
 		t.Fatalf("note claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
+	// The note follows the input that caused it: the effect journals its
+	// input first, so seq order is causal.
 	evs, err := s.Events(ctx, pa, 0, 10)
-	if err != nil || len(evs) != 1 || evs[0].Kind != "note" {
+	if err != nil || len(evs) != 2 || evs[0].Kind != "input_received" ||
+		evs[0].Payload["input_id"] != "in-1" || evs[1].Kind != "note" {
 		t.Fatalf("events: %+v err=%v", evs, err)
 	}
 }
 
 func TestFailTurnRequeues(t *testing.T) {
-	s, _ := newStore(t)
+	s, pool := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
@@ -352,6 +753,12 @@ func TestFailTurnRequeues(t *testing.T) {
 	in, _, err := s.GetInput(ctx, pa, "in-1")
 	if err != nil || in.Status != "queued" {
 		t.Fatalf("requeued input: %+v err=%v", in, err)
+	}
+	// The retryable requeue parks the input behind its backoff; expire it
+	// to reach the retry immediately.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("expire backoff: %v", err)
 	}
 	load2, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
 	if err != nil || load2.Turn == nil || load2.Turn.Attempt != 2 {
@@ -685,7 +1092,7 @@ func TestPlanSaveReplayConflict(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 	// No turn → no plan authorship.
-	if _, _, err := s.SavePlan(ctx, pa, "ghost", lease.Generation,
+	if _, _, err := s.SavePlan(ctx, pa, "ghost", lease.Generation, 0,
 		Decision{Text: "x", Calls: []PlanCall{}}); !errors.Is(err, ErrTurnNotFound) {
 		t.Fatalf("plan on missing turn err = %v, want ErrTurnNotFound", err)
 	}
@@ -697,34 +1104,34 @@ func TestPlanSaveReplayConflict(t *testing.T) {
 		{Tool: "schedule.set", Request: map[string]any{"schedule_id": "s-9",
 			"wake_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)}},
 	}, Usage: map[string]any{"input_tokens": 7}}
-	p, created, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec)
+	p, created, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec)
 	if err != nil || !created || p.InputID != "in-1" || p.TurnID != "t-1" {
 		t.Fatalf("save: %+v created=%v err=%v", p, created, err)
 	}
-	if len(p.Plan.Calls) != 2 || p.Plan.Text != "hi there" {
+	if len(p.Plan) != 1 || len(p.Plan[0].Calls) != 2 || p.Plan[0].Text != "hi there" {
 		t.Fatalf("stored plan: %+v", p.Plan)
 	}
 	// Identical resave replays the stored row (lost-response retry).
-	p2, created2, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec)
+	p2, created2, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec)
 	if err != nil || created2 || p2.TurnID != "t-1" {
 		t.Fatalf("identical resave: %+v created=%v err=%v", p2, created2, err)
 	}
 	// Conflicting decision under the same input is rejected.
 	diverged := dec
 	diverged.Text = "changed"
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, diverged); !errors.Is(err, ErrTurnConflict) {
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, diverged); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("divergent plan err = %v, want ErrTurnConflict", err)
 	}
 	// loadTurn surfaces the recorded plan.
 	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10)
-	if err != nil || load.Plan == nil || load.Plan.Plan.Text != "hi there" {
+	if err != nil || load.Plan == nil || load.Plan.Plan[0].Text != "hi there" {
 		t.Fatalf("load plan: %+v err=%v", load.Plan, err)
 	}
 	// A finished turn cannot author a plan.
 	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{Outcome: "complete"}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, dec); !errors.Is(err, ErrTurnConflict) {
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0, dec); !errors.Is(err, ErrTurnConflict) {
 		t.Fatalf("plan on finished turn err = %v, want ErrTurnConflict", err)
 	}
 }
@@ -770,7 +1177,7 @@ func TestPlanContinuesAcrossRecovery(t *testing.T) {
 		t.Fatalf("load gen2: %+v err=%v", load, err)
 	}
 	// Attempt 2 sees the recorded plan — not asked to re-plan.
-	if load.Plan == nil || len(load.Plan.Plan.Calls) != 2 || load.Plan.TurnID != "t-1" {
+	if load.Plan == nil || len(load.Plan.Plan) != 1 || len(load.Plan.Plan[0].Calls) != 2 || load.Plan.TurnID != "t-1" {
 		t.Fatalf("plan on attempt 2: %+v", load.Plan)
 	}
 	// Position 0 replays attempt 1's receipt under a fresh caller
@@ -896,7 +1303,7 @@ func TestServerDerivedClaimIdentity(t *testing.T) {
 // A retryable-failed turn does not discard the recorded plan: the requeued
 // input's next attempt continues the same decision.
 func TestPlanSurvivesRetryableFail(t *testing.T) {
-	s, _ := newStore(t)
+	s, pool := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
@@ -921,11 +1328,16 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 		Outcome: "fail", Error: "transient", Retryable: true}); err != nil {
 		t.Fatalf("fail commit: %v", err)
 	}
+	// Expire the retry backoff so the next attempt can claim immediately.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("expire backoff: %v", err)
+	}
 	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
 	if err != nil || load.Turn == nil || load.Turn.Attempt != 2 {
 		t.Fatalf("retry load: %+v err=%v", load, err)
 	}
-	if load.Plan == nil || load.Plan.Plan.Calls[0].Tool != "journal.note" {
+	if load.Plan == nil || load.Plan.Plan[0].Calls[0].Tool != "journal.note" {
 		t.Fatalf("plan lost across retryable fail: %+v", load.Plan)
 	}
 	// The already-executed call replays its receipt on the new attempt.
@@ -933,6 +1345,81 @@ func TestPlanSurvivesRetryableFail(t *testing.T) {
 		"op-2", "journal.note", 0, map[string]any{"text": "keep"})
 	if err != nil || fresh || op.OperationID != "op-1" {
 		t.Fatalf("retry replay: %+v fresh=%v err=%v", op, fresh, err)
+	}
+}
+
+// Multi-round plan: a later round is appended after earlier rounds' effects
+// committed — including by a new attempt after recovery — and claims address
+// flat positions across all rounds.
+func TestPlanRoundsAppendAcrossAttempts(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l1, err := s.AcquireWriter(ctx, pa, "gen1", 30*time.Millisecond)
+	if err != nil {
+		t.Fatalf("acquire gen1: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l1.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load gen1: %v", err)
+	}
+	mustPlan(t, s, pa, "t-1", l1.Generation,
+		PlanCall{Tool: "journal.note", Request: map[string]any{"text": "r0-note"}})
+	// The round-0 effect commits; the writer dies before consulting round 1.
+	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", l1.Generation,
+		"op-a", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || !fresh {
+		t.Fatalf("claim gen1: fresh=%v err=%v", fresh, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	l2, err := s.AcquireWriter(ctx, pa, "gen2", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire gen2: %v", err)
+	}
+	if _, err := s.Recover(ctx, pa, l2.Generation); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	load, err := s.LoadTurn(ctx, pa, l2.Generation, "t-2", 10)
+	if err != nil || load.Plan == nil || len(load.Plan.Plan) != 1 {
+		t.Fatalf("load gen2: %+v err=%v", load, err)
+	}
+	// Position 0 replays under the new attempt.
+	if op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+		"op-b", "journal.note", 0, map[string]any{"text": "r0-note"}); err != nil || fresh || op.OperationID != "op-a" {
+		t.Fatalf("replay gen2: fresh=%v err=%v", fresh, err)
+	}
+	// The new attempt appends round 1 to the same durable record.
+	p, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
+		Decision{Text: "final reply", Calls: []PlanCall{
+			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+		}})
+	if err != nil || !created || len(p.Plan) != 2 {
+		t.Fatalf("append round 1: %+v created=%v err=%v", p, created, err)
+	}
+	// Round 1's call is flat position 1 — it claims and executes once.
+	if _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", l2.Generation,
+		"op-c", "journal.note", 1, map[string]any{"text": "r1-note"}); err != nil || !fresh {
+		t.Fatalf("claim flat pos 1: fresh=%v err=%v", fresh, err)
+	}
+	// Skipping a round and rewriting a recorded round both conflict.
+	if _, _, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 3,
+		Decision{Text: "gap"}); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("gap round err = %v, want ErrTurnConflict", err)
+	}
+	if _, _, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 0,
+		Decision{Text: "rewrite", Calls: []PlanCall{}}); !errors.Is(err, ErrTurnConflict) {
+		t.Fatalf("rewrite round err = %v, want ErrTurnConflict", err)
+	}
+	// Identical resend of round 1 replays.
+	if _, created, err := s.SavePlan(ctx, pa, "t-2", l2.Generation, 1,
+		Decision{Text: "final reply", Calls: []PlanCall{
+			{Tool: "journal.note", Request: map[string]any{"text": "r1-note"}},
+		}}); err != nil || created {
+		t.Fatalf("resend round 1: created=%v err=%v", created, err)
 	}
 }
 
@@ -958,13 +1445,13 @@ func TestDeterministicToolDataRejected(t *testing.T) {
 
 	// A decision containing NUL cannot be persisted — rejected at SavePlan,
 	// the first persistence boundary, before any effect is reached.
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation,
-		Decision{Text: "reply\u0000stop"}); !errors.Is(err, ErrBadRequest) {
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0,
+		Decision{Text: "reply\x00stop"}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL text savePlan err = %v, want ErrBadRequest", err)
 	}
-	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation,
+	if _, _, err := s.SavePlan(ctx, pa, "t-1", lease.Generation, 0,
 		Decision{Text: "ok", Calls: []PlanCall{
-			{Tool: "journal.note", Request: map[string]any{"text": "a\u0000b"}},
+			{Tool: "journal.note", Request: map[string]any{"text": "a\x00b"}},
 		}}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL request savePlan err = %v, want ErrBadRequest", err)
 	}
@@ -1107,5 +1594,212 @@ func TestScheduleSetIDReuse(t *testing.T) {
 	if _, _, err := s.ClaimOperation(ctx, pa, "t-4", lease.Generation,
 		"op-4", "schedule.set", 0, req1); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("fired schedule reuse err = %v, want ErrBadRequest", err)
+	}
+}
+
+// Fresh-review F1: a commit whose payload PostgreSQL can never store is
+// a deterministic 400 at the store boundary — so the core records an
+// honest failure instead of leaving the input claimed forever.
+// (Adapted from foundation repair b4cdc722: on this branch the stored
+// error text is diagnostic and NUL-stripped before marshalling, so a
+// NUL-bearing error commits successfully rather than 400ing — the 400 is
+// reserved for record content: events, output, usage.)
+func TestCommitUnstorablePayloadRejected(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// NUL in committed record content — an event payload or the output —
+	// cannot persist; each variant is a deterministic 400.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "complete", Events: []EventInput{
+			{Kind: "assistant_message", Payload: map[string]any{"text": "a\u0000b"}},
+		}, Output: map[string]any{"text": "a\u0000b"},
+	}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL output commit err = %v, want ErrBadRequest", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Events: []EventInput{
+			{Kind: "assistant_message", Payload: map[string]any{"text": "a\u0000b"}},
+		},
+	}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("NUL event commit err = %v, want ErrBadRequest", err)
+	}
+	// A NUL-bearing error string is diagnostic, not record content: it is
+	// stripped and the retryable failure commits — the input requeues
+	// with backoff rather than dying at the boundary.
+	tr, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "model: \u0000 exploded",
+	})
+	if err != nil || tr.Status != "failed" {
+		t.Fatalf("NUL error commit should succeed stripped: %+v err=%v", tr, err)
+	}
+	if tr.Error == nil || strings.Contains(*tr.Error, "\u0000") {
+		t.Fatalf("error not stripped: %v", tr.Error)
+	}
+	// Nothing from the rejected commits landed: the turn requeued
+	// retryably, parked behind not_before.
+	in, _, err := s.GetInput(ctx, pa, "in-1")
+	if err != nil || in.Status != "queued" || in.NotBefore == nil {
+		t.Fatalf("input after NUL-error commit: %+v err=%v", in, err)
+	}
+}
+
+// Fresh-review F2: a retryable failure requeues with backoff (not_before)
+// instead of instantly reclaiming — the queue stays fair and the retry
+// rate is bounded.
+func TestRetryableFailureRequeuesWithBackoff(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	submit := func(id string) {
+		t.Helper()
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": "x"}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	submit("in-bad")
+	submit("in-good")
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "provider down",
+	}); err != nil {
+		t.Fatalf("retryable commit: %v", err)
+	}
+	// The failed input is queued but parked behind its backoff — and a
+	// later queued input claims first instead of starving behind it.
+	var nb time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-bad'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if !nb.After(time.Now()) {
+		t.Fatalf("not_before = %v, want a future backoff", nb)
+	}
+	res, err := s.LoadTurn(ctx, pa, lease.Generation, "t-2", 10)
+	if err != nil {
+		t.Fatalf("load t-2: %v", err)
+	}
+	if res.Input == nil || res.Input.InputID != "in-good" {
+		t.Fatalf("claim during backoff took %+v, want in-good", res.Input)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", lease.Generation, CommitRequest{
+		Outcome: "complete",
+	}); err != nil {
+		t.Fatalf("complete in-good: %v", err)
+	}
+	// Backoff grows with the input's attempt count: failing in-bad a
+	// second time parks it for longer than the first.
+	expire := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`UPDATE core_inputs SET not_before = now() - interval '1 second'
+			 WHERE persona_id = $1 AND status = 'queued'`, pa); err != nil {
+			t.Fatalf("expire not_before: %v", err)
+		}
+	}
+	expire()
+	res, err = s.LoadTurn(ctx, pa, lease.Generation, "t-3", 10)
+	if err != nil {
+		t.Fatalf("load t-3: %v", err)
+	}
+	if res.Input == nil || res.Input.InputID != "in-bad" || res.Turn.Attempt != 2 {
+		t.Fatalf("post-backoff claim took %+v, want in-bad attempt 2", res.Input)
+	}
+	before := time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-3", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "provider down",
+	}); err != nil {
+		t.Fatalf("second retryable commit: %v", err)
+	}
+	var nb2 time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-bad'`,
+		pa).Scan(&nb2); err != nil {
+		t.Fatalf("read not_before 2: %v", err)
+	}
+	if nb2.Sub(before) <= nb.Sub(before) {
+		t.Fatalf("backoff did not grow: attempt1=%v attempt2=%v", nb, nb2)
+	}
+}
+
+// Fresh-review F1: provider-supplied pacing (Retry-After) flows through
+// CommitRequest.retry_after_ms into the requeue's not_before — honored on
+// top of the per-attempt backoff, and clamped so a hint can never silence
+// a request.
+func TestRetryAfterMsPacesRequeue(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-ra", Kind: "message",
+		Payload: map[string]any{"text": "x"}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-ra", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	before := time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-ra", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "rate limited", RetryAfterMs: 5_000,
+	}); err != nil {
+		t.Fatalf("retryable commit: %v", err)
+	}
+	var nb time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-ra'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if d := nb.Sub(before); d < 4*time.Second || d > 6*time.Second {
+		t.Fatalf("retry_after_ms must dominate the backoff (~5s), got %v", d)
+	}
+	// An absurd hint is clamped — it can slow a retry, never silence it.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_inputs SET not_before = now() - interval '1 second'
+		 WHERE persona_id = $1 AND input_id = 'in-ra'`, pa); err != nil {
+		t.Fatalf("expire not_before: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, lease.Generation, "t-ra2", 10); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	before = time.Now()
+	if _, err := s.CommitTurn(ctx, pa, "t-ra2", lease.Generation, CommitRequest{
+		Outcome: "fail", Retryable: true, Error: "rate limited",
+		RetryAfterMs: 3_600_000, // provider asks for an hour
+	}); err != nil {
+		t.Fatalf("second retryable commit: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-ra'`,
+		pa).Scan(&nb); err != nil {
+		t.Fatalf("read not_before: %v", err)
+	}
+	if d := nb.Sub(before); d > 3*time.Minute {
+		t.Fatalf("an absurd Retry-After must be clamped to 2min, got %v", d)
 	}
 }

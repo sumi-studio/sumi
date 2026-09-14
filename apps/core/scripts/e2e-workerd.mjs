@@ -29,8 +29,14 @@ if (!DB_URL) {
 }
 const API_DIR = resolve(import.meta.dirname, "../../api");
 const CORE_DIR = resolve(import.meta.dirname, "..");
-const STATE_PORT = 8760 + (process.pid % 200);
-const WORKER_PORT = 8760 + ((process.pid + 137) % 200);
+// SUMI_E2E_PORT_BASE pins state/worker/inspector ports (base..+2) when
+// parallel worktrees own port ranges.
+const PORT_BASE = process.env.SUMI_E2E_PORT_BASE
+  ? Number(process.env.SUMI_E2E_PORT_BASE)
+  : null;
+const STATE_PORT = PORT_BASE ?? 8760 + (process.pid % 200);
+const WORKER_PORT =
+  PORT_BASE !== null ? PORT_BASE + 1 : 8760 + ((process.pid + 137) % 200);
 const STATE = `http://127.0.0.1:${STATE_PORT}`;
 const WORKER = `http://127.0.0.1:${WORKER_PORT}`;
 const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
@@ -57,8 +63,10 @@ function cleanup() {
   try {
     svc?.kill("SIGKILL");
   } catch {}
+  // wrangler runs in its own process group: killing only the pnpm wrapper
+  // would orphan wrangler and its workerd children.
   try {
-    worker?.kill("SIGKILL");
+    if (worker) process.kill(-worker.pid, "SIGKILL");
   } catch {}
 }
 process.on("exit", cleanup);
@@ -139,6 +147,7 @@ worker = spawn(
     String(WORKER_PORT),
     "--ip",
     "127.0.0.1",
+    ...(PORT_BASE !== null ? ["--inspector-port", String(PORT_BASE + 2)] : []),
     "--var",
     `SUMI_STATE_URL:${STATE}`,
     "--var",
@@ -153,6 +162,7 @@ worker = spawn(
     cwd: CORE_DIR,
     env: { ...process.env, CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
   },
 );
 worker.stdout.on("data", (d) => process.stdout.write(`[workerd] ${d}`));
