@@ -25,9 +25,9 @@ type VersionStore interface {
 	// reached — an error with committed=true means "landed but
 	// unobserved" and the intent must be kept for reconciliation, not
 	// dropped as a rejection (F-RA-5/f120).
-	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error)
-	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error)
-	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error
+	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
+	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
+	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
 }
@@ -62,10 +62,12 @@ func NewAt(root string, store VersionStore, tokens map[string]map[string]bool) (
 // probe returns a filesystem probe the store calls under the row lock.
 // It reports the live FileInfo (kind + fingerprint) so the store can
 // record source-kind evidence for later settlement; ErrNotFound means
-// "absent", any other error is unverifiable.
+// "absent", any other error is unverifiable. The fingerprint is of the
+// object AT the path (lstat — a symlink itself, not its target) because
+// it records what an effect may displace.
 func (s *Service) probe(scope, path string) FPProbe {
 	return func() (FileInfo, bool, error) {
-		info, err := s.root.stat(scope, path)
+		info, err := s.root.lstat(scope, path)
 		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
 			return FileInfo{}, false, nil
 		}
@@ -316,8 +318,9 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 	ver, _, err := s.store.WithWrite(r.Context(), scope, path, "write", iv,
 		hex.EncodeToString(sum[:]),
 		s.probe(scope, path),
-		func() (FileInfo, bool, error) {
-			return s.root.atomicWrite(scope, path, body, exclusive)
+		func(it intent) (FileInfo, bool, error) {
+			return s.root.atomicWrite(scope, path, body, exclusive,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -376,8 +379,9 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 	noReplace := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
 	ver, _, err := s.store.Rename(r.Context(), scope, from, to, iv,
 		s.probe(scope, to), s.probe(scope, from),
-		func() (FileInfo, bool, error) {
-			return s.root.rename(scope, from, to, noReplace)
+		func(it intent) (FileInfo, bool, error) {
+			return s.root.rename(scope, from, to, noReplace,
+				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -402,7 +406,7 @@ func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope stri
 	ver, _, err := s.store.WithWrite(r.Context(), scope, mpath, "mkdir",
 		IfVersion{Mode: "any"}, "dir",
 		s.probe(scope, mpath),
-		func() (FileInfo, bool, error) {
+		func(it intent) (FileInfo, bool, error) {
 			return s.root.mkdir(scope, mpath)
 		})
 	if err != nil {
@@ -419,8 +423,9 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, pa
 		return
 	}
 	err = s.store.Remove(r.Context(), scope, path, iv, s.probe(scope, path),
-		func() (bool, error) {
-			return s.root.remove(scope, path)
+		func(it intent) (bool, error) {
+			return s.root.remove(scope, path, it.dstFP,
+				opStagePrefix+strconv.FormatInt(it.id, 10))
 		})
 	if err != nil {
 		s.mapErr(w, err)

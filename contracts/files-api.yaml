@@ -110,19 +110,42 @@ info:
     store outage after a known fs commit still records the true event
     instead of leaving inference to the reconciler.
     Late landings: a resolved intent keeps its evidence (pre-state
-    fingerprint, expected hash, source kind) as a tombstone for as long
-    as its effect remains unproven — tombstone evidence is never erased
-    by a timer, because a filesystem effect may arrive after any
-    horizon. Tombstones are re-judged on a two-tier cadence (recently
-    resolved intents every 30s; older ones hourly) — a cost bound and a
-    worst-case detection latency, not a quiescence claim. A late landing
-    that matches the declared effect is still applied or relocated on
-    the same evidence as a prompt landing. Residual: an effect that
-    lands differently than declared cannot be distinguished from an
-    external change — a delayed unlink removing a file that was
-    recreated after the tombstone, or a late rename overwriting newer
-    destination content, is reported as external_change, never as the
-    intent's outcome.
+    fingerprint, expected hash, source kind, destination fingerprint)
+    as a tombstone for as long as its effect remains unproven —
+    tombstone evidence is never erased by a timer, because a filesystem
+    effect may arrive after any horizon. Tombstones are re-judged on a
+    two-tier cadence (recently resolved intents every 30s; older ones
+    hourly) — a cost bound and a worst-case detection latency, not a
+    quiescence claim.
+    Verified effects: a destructive filesystem operation never unlinks a
+    public name. An overwrite or rename-over-occupied-destination moves
+    the displaced object into the intent's private .filesv-op-<id> slot
+    by exchange; a remove moves it there by rename. The object is
+    discarded only when its identity still matches the fingerprint the
+    intent declared — and the delete itself happens under a quarantine
+    name the effect's actor cannot write, so a retired operation that
+    resumes mid-cleanup cannot destroy bytes it did not create. When the
+    displaced object is not the declared one (the intent is stale: a
+    successor already acknowledged a newer save, or the file changed
+    since declaration) the effect is undone non-destructively: the
+    displaced object is restored to its name, or — when a racing writer
+    holds the name — stays parked at the slot, hidden from listings,
+    excluded from the staging sweep, and retrievable. The caller gets
+    409 external_change: honest rejection plus preserved bytes.
+    A parked object is restored by the reconciler to an empty name when
+    it is the recorded content for that name (fingerprint match against
+    file_version.fp — the acknowledged ordering, never ctime), or
+    swapped back over a squatter that does not match the row. The
+    version row is version-guarded, so a stale intent can never roll a
+    newer acknowledged row back.
+    Explicit if_version:any from the current authorized writer still
+    overwrites unconditionally — the declare-time fingerprint captures
+    exactly which object that writer was allowed to displace, and only
+    that object is discarded; anything else is preserved. Residual: an
+    effect that lands differently than declared cannot be distinguished
+    from an external change — it is reported as external_change, the
+    foreign bytes survive parked, never laundered into the service's
+    version.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so

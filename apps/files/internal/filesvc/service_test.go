@@ -71,14 +71,20 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 	return f.seq, nil
 }
 
-func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	k := scope + "/" + path
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, path, iv, probe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
-	info, _, err := fn()
+	var it intent
+	if probe != nil {
+		if live, exists, perr := probe(); perr == nil && exists {
+			it.dstFP = live.Fingerprint
+		}
+	}
+	info, _, err := fn(it)
 	if err != nil {
 		if had {
 			f.vers[k] = prev // roll back the row on FS failure (seq is consumed)
@@ -92,14 +98,25 @@ func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv If
 	return ver, info, nil
 }
 
-func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	k := scope + "/" + to
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, to, iv, casProbe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
-	info, _, err := fn()
+	var it intent
+	if casProbe != nil {
+		if live, exists, perr := casProbe(); perr == nil && exists {
+			it.dstFP = live.Fingerprint
+		}
+	}
+	if fromProbe != nil {
+		if live, exists, perr := fromProbe(); perr == nil && exists {
+			it.preFP = live.Fingerprint
+		}
+	}
+	info, _, err := fn(it)
 	if err != nil {
 		if had {
 			f.vers[k] = prev
@@ -125,7 +142,7 @@ func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVer
 	return ver, info, nil
 }
 
-func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error {
+func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error {
 	k := scope + "/" + path
 	cur := f.vers[k]
 	if cur == 0 && (iv.Mode == "eq" || iv.Mode == "none") {
@@ -143,7 +160,13 @@ func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion
 			return ErrExternalChange
 		}
 	}
-	if _, err := fn(); err != nil {
+	var it intent
+	if probe != nil {
+		if live, exists, perr := probe(); perr == nil && exists {
+			it.dstFP = live.Fingerprint
+		}
+	}
+	if _, err := fn(it); err != nil {
 		return err
 	}
 	for kk := range f.vers {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,32 @@ type HashFn func(scope, path string) (string, error)
 type ReconView interface {
 	Stat(scope, path string) (FileInfo, error)
 	Hash(scope, path string) (string, error)
+	// MoveStaged restores a recovery object to an empty name beneath the
+	// same pinned root (renameat2 NOREPLACE — never overwrites).
+	MoveStaged(scope, from, to string) error
+	// SwapStaged exchanges a recovery object with whatever the name holds
+	// (renameat2 RENAME_EXCHANGE) — the second half of a dead op's undo:
+	// it puts the displaced object back and parks whatever it evicts at
+	// the staging slot for inspection, never unlinking it.
+	SwapStaged(scope, staged, name string) error
+	// RemoveStaged deletes a recovery object only after re-proving its
+	// identity at a name no retired actor can write: it first moves path
+	// to a unique quarantine name (path + "-q-" + nonce), re-verifies
+	// the captured object against wantFP3 (ino:size:mtime triple) or
+	// wantSHA (content hash), and unlinks only on a match. A verified
+	// object at path may still be exchanged out by a live retired actor
+	// between the caller's check and this call — the move captures
+	// whatever is actually there, and a mismatch stays parked at the
+	// quarantine name (preserved bytes, re-judged each pass). A path
+	// already carrying "-q-" is itself unforgeable, so it is verified
+	// in place without another hop. wantFP3 takes precedence; pass "" to
+	// use content hash. ENOENT at path reports nil — already gone is the
+	// desired end state.
+	RemoveStaged(scope, path, wantFP3, wantSHA string) error
+	// ListStaged returns base names in dir (a path beneath the scope root)
+	// beginning with prefix — used to find crash-orphaned quarantine
+	// objects left by a reconciler that died mid-delete.
+	ListStaged(scope, dir, prefix string) ([]string, error)
 	Close() error
 }
 
@@ -437,6 +464,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS stalled_at timestamptz;
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS last_error text NOT NULL DEFAULT '';
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS dst_fp text NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS file_op_scope ON file_op(scope, path);
 		SELECT setval('file_version_seq',
 			GREATEST(COALESCE((SELECT MAX(version) FROM file_version), 0),
@@ -480,6 +508,7 @@ type intent struct {
 	toPath    string // rename destination
 	version   int64  // pre-minted version this op will record
 	preFP     string // fingerprint of path (rename: of source) at declare time
+	dstFP     string // fingerprint of the object the effect may displace (write/remove: path; rename: destination) — the verified effect undoes rather than destroy anything else
 	expectSHA string // write: sha256 hex of intended bytes; rename of file: sha256 of source; mkdir: "dir"; "": unverified
 	srcKind   string // rename: kind of the source at declare ("" = unknown → unprovable)
 	at        time.Time
@@ -522,6 +551,7 @@ func fsErrDefinitive(err error) bool {
 		errors.Is(err, ErrIsDir), errors.Is(err, ErrWrongKind),
 		errors.Is(err, ErrAccess), errors.Is(err, ErrReserved),
 		errors.Is(err, ErrEscape), errors.Is(err, ErrConflict),
+		errors.Is(err, ErrExternalChange),
 		errors.Is(err, ErrNotEmpty), errors.Is(err, ErrMountPolicy):
 		return true
 	default:
@@ -529,11 +559,11 @@ func fsErrDefinitive(err error) bool {
 	}
 }
 
-func (s *Store) runFs(it intent, fn func() (FileInfo, bool, error)) <-chan fsResult {
+func (s *Store) runFs(it intent, fn func(intent) (FileInfo, bool, error)) <-chan fsResult {
 	ch := make(chan fsResult, 1)
 	go func() {
 		defer s.inflight.Delete(it.id)
-		info, committed, ferr := fn()
+		info, committed, ferr := fn(it)
 		var settleErr error
 		switch {
 		case ferr == nil:
@@ -543,6 +573,11 @@ func (s *Store) runFs(it intent, fn func() (FileInfo, bool, error)) <-chan fsRes
 			// Clean them WITHOUT an event: we observed absence, we did
 			// not cause it (observed-absence vs performed-removal).
 			s.dropIntentGhosts(context.Background(), it, true)
+		case !committed && errors.Is(ferr, errUndoParked):
+			// A verified effect displaced foreign bytes and could not
+			// fully restore the pre-effect shape — the parked object is
+			// live evidence; retain the intent for the reconciler.
+			s.tombstoneIntent(context.Background(), it)
 		case !committed && fsErrDefinitive(ferr):
 			// Rejected before commit — provably no fs effect.
 			s.dropIntent(context.Background(), it)
@@ -773,6 +808,23 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 			it.srcKind = pre.Kind
 		}
 	}
+	// dstFP is the object a committed effect is allowed to displace —
+	// recorded at declare so a verified effect that lands late (after
+	// ownership moved and a successor wrote newer content) undoes itself
+	// rather than destroy what it never agreed to replace.
+	if op == "rename" {
+		if casProbe != nil {
+			dst, exists, derr := casProbe()
+			if derr != nil {
+				return intent{}, derr
+			}
+			if exists {
+				it.dstFP = dst.Fingerprint
+			}
+		}
+	} else {
+		it.dstFP = it.preFP
+	}
 	// Rename of a file: capture content evidence so settlement can tell
 	// "the moved source" from "foreign bytes with recycled metadata"
 	// (f106/B-4). Prefer the version row's recorded content hash — valid
@@ -801,9 +853,9 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 		return intent{}, err
 	}
 	err = tx.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-		s.rootID, s.owner, scope, op, path, toPath, it.version, it.preFP, it.expectSHA, it.srcKind).Scan(&it.id)
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+		s.rootID, s.owner, scope, op, path, toPath, it.version, it.preFP, it.dstFP, it.expectSHA, it.srcKind).Scan(&it.id)
 	if err != nil {
 		return intent{}, err
 	}
@@ -1115,6 +1167,175 @@ func (s *Store) markStalled(ctx context.Context, it intent, cause error) {
 	}
 }
 
+// stageRel is the deterministic recovery object slot for an intent —
+// where a verified effect's staged content or a parked displaced object
+// can be found. It lives in the op's parent directory (rename: the
+// source's parent, where a parked displaced destination lands).
+func stageRel(it intent) string {
+	parent := it.path
+	if i := strings.LastIndex(parent, "/"); i >= 0 {
+		parent = parent[:i]
+	} else {
+		parent = ""
+	}
+	name := opStagePrefix + strconv.FormatInt(it.id, 10)
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + name
+}
+
+// settleStaged finishes what an interrupted verified effect left behind
+// at the intent's staging slot, then re-judges any crash-orphaned
+// quarantine objects from a prior pass. Every branch is non-destructive
+// toward foreign content: the only objects ever deleted are the op's
+// own staged bytes (hash-proven) and the exact object the effect was
+// allowed to displace (fingerprint-proven) — and even those deletions
+// happen under a quarantine name a retired actor cannot write.
+// Foreign objects are restored to their home name or left parked.
+func (s *Store) settleStaged(ctx context.Context, it intent, view ReconView, tombstoned bool) {
+	rel := stageRel(it)
+	s.settleStagedOne(ctx, it, view, rel, tombstoned)
+	// Crash-orphaned quarantine objects carry the same identity
+	// evidence; re-judge them each pass.
+	dir, base := splitRel(rel)
+	if names, err := view.ListStaged(it.scope, dir, base+"-q-"); err == nil {
+		for _, n := range names {
+			qrel := n
+			if dir != "" {
+				qrel = dir + "/" + n
+			}
+			s.settleStagedOne(ctx, it, view, qrel, tombstoned)
+		}
+	}
+}
+
+func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, rel string, tombstoned bool) {
+	st, err := view.Stat(it.scope, rel)
+	if err != nil {
+		return // absent or unobservable — nothing to finish
+	}
+	st3 := fp3(st.Fingerprint)
+	switch it.op {
+	case "write", "mkdir":
+		if it.expectSHA != "" && it.expectSHA != "dir" && st.Kind == "file" {
+			if h, herr := view.Hash(it.scope, rel); herr == nil && h == it.expectSHA {
+				// Our own unpublished bytes — safe to discard.
+				_ = view.RemoveStaged(it.scope, rel, "", it.expectSHA)
+				return
+			}
+		}
+		if it.dstFP != "" && st3 == fp3(it.dstFP) {
+			// Exactly the object the write was allowed to displace —
+			// the exchange committed; finish the intended discard.
+			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			return
+		}
+		// The staged slot holds a foreign object the effect displaced.
+		// If the path still carries THIS op's staged bytes, finish the
+		// undo the dead process could not: exchange restores the
+		// displaced object to its name; whatever comes back is inspected
+		// before any discard.
+		if it.expectSHA != "" && it.expectSHA != "dir" {
+			if h, herr := view.Hash(it.scope, it.path); herr == nil && h == it.expectSHA {
+				if view.SwapStaged(it.scope, rel, it.path) == nil {
+					if h2, herr2 := view.Hash(it.scope, rel); herr2 == nil && h2 == it.expectSHA {
+						// Our stale bytes came back — discard them.
+						_ = view.RemoveStaged(it.scope, rel, "", it.expectSHA)
+					}
+					// Otherwise the slot now holds a racing writer's
+					// object — leave it parked; the name correctly holds
+					// the restored displaced content.
+				}
+				return
+			}
+		}
+		s.restoreStaged(ctx, it, view, rel, it.path, st, tombstoned)
+	case "remove":
+		if it.dstFP != "" && st3 == fp3(it.dstFP) {
+			// The captured object is the one the remove was allowed to
+			// delete — the removal committed; complete it.
+			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			return
+		}
+		s.restoreStaged(ctx, it, view, rel, it.path, st, tombstoned)
+	case "rename":
+		if it.dstFP != "" && st3 == fp3(it.dstFP) {
+			// The displaced destination object — deleting it was part of
+			// the committed rename; finish it.
+			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			return
+		}
+		// A foreign object parked at the slot came from either the
+		// destination name (a raced undo) or the source name (a racer's
+		// content captured during commit). Restore it to whichever name
+		// the version rows say it belongs to.
+		s.restoreStaged(ctx, it, view, rel,
+			s.stagedHome(ctx, it, st), st, tombstoned)
+	}
+}
+
+// stagedHome picks the name a parked rename-residual belongs to: the
+// destination when it matches the destination's recorded fingerprint,
+// the source when it matches the source row, else the source name —
+// the object was captured there, so restoring the source name recovers
+// the pre-effect shape.
+func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
+	st3 := fp3(st.Fingerprint)
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var rowFP string
+	if it.toPath != "" && s.pool.QueryRow(dctx,
+		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
+		it.scope, it.toPath).Scan(&rowFP) == nil && fp3(rowFP) == st3 {
+		return it.toPath
+	}
+	return it.path
+}
+
+// restoreStaged returns a parked recovery object to a name it belongs
+// to, without ever overwriting: an empty name gets a NOREPLACE move
+// when the object is the recorded content for that name (or the intent
+// is still unresolved — its outcome never judged); an occupied name
+// holding non-recorded content gets the recorded object swapped back
+// onto it (the squatter parks at the slot for the next pass). Anything
+// else — unverifiable name, recorded content already in place, resolved
+// intent with a foreign object — stays parked.
+func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, rel, destPath string, st FileInfo, tombstoned bool) {
+	if destPath == "" {
+		return
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	var rowFP string
+	rerr := s.pool.QueryRow(dctx,
+		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
+		it.scope, destPath).Scan(&rowFP)
+	cancel()
+	rowMatch := rerr == nil && fp3(rowFP) == fp3(st.Fingerprint)
+	dst, derr := view.Stat(it.scope, destPath)
+	switch {
+	case derr == nil:
+		// Occupied: only a proven recorded object swaps back — never
+		// overwrite a name merely because something sits parked.
+		if rowMatch && fp3(dst.Fingerprint) != fp3(rowFP) {
+			_ = view.SwapStaged(it.scope, rel, destPath)
+		}
+	case absentVerdict(derr):
+		switch {
+		case rowMatch:
+			// The parked object IS the recorded content for the empty
+			// name — restore it.
+			_ = view.MoveStaged(it.scope, rel, destPath)
+		case errors.Is(rerr, pgx.ErrNoRows) && !tombstoned:
+			// Unresolved intent, empty name, no recorded row — restoring
+			// recovers the pre-effect shape.
+			_ = view.MoveStaged(it.scope, rel, destPath)
+		}
+	default:
+		// unverifiable — leave parked
+	}
+}
+
 func (s *Store) kickReconcile() {
 	select {
 	case s.reconcile <- struct{}{}:
@@ -1126,7 +1347,7 @@ func (s *Store) kickReconcile() {
 // settling goroutine apply the version row + event. Serialized per scope.
 // expectSHA is the sha256 hex of the intended content (or "dir" for
 // mkdir); the reconciler uses it to detect external bytes.
-func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1150,7 +1371,7 @@ func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVers
 
 // rename — renameat2(RENAME_NOREPLACE) for create-only modes), then moves
 // the source subtree's rows to the destination in the apply tx.
-func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1171,7 +1392,7 @@ func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion
 
 // Remove drops the version rows for the removed path and any descendants
 // after the fs removal, under the same intent journal.
-func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() (bool, error)) error {
+func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
@@ -1180,7 +1401,7 @@ func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, pr
 	if err != nil {
 		return err
 	}
-	r := s.waitFs(s.runFs(it, func() (FileInfo, bool, error) { _, ferr := fn(); return FileInfo{}, ferr == nil, ferr }))
+	r := s.waitFs(s.runFs(it, func(it intent) (FileInfo, bool, error) { _, ferr := fn(it); return FileInfo{}, ferr == nil, ferr }))
 	if r.err != nil {
 		return r.err
 	}
@@ -1282,7 +1503,17 @@ type funcView struct {
 
 func (v funcView) Stat(scope, path string) (FileInfo, error) { return v.stat(scope, path) }
 func (v funcView) Hash(scope, path string) (string, error)   { return v.hash(scope, path) }
-func (v funcView) Close() error                              { return nil }
+func (v funcView) MoveStaged(scope, from, to string) error   { return ErrUnavailable }
+func (v funcView) SwapStaged(scope, staged, name string) error {
+	return ErrUnavailable
+}
+func (v funcView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
+	return ErrUnavailable
+}
+func (v funcView) ListStaged(scope, dir, prefix string) ([]string, error) {
+	return nil, nil
+}
+func (v funcView) Close() error { return nil }
 
 // Reconcile processes all pending intents once, then re-judges retained
 // tombstones. Returns how many it settled. The pass judges only beneath a
@@ -1319,7 +1550,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
-	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind, at`
+	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, at`
 	load := func(where string, args ...any) []intent {
 		rows, err := s.pool.Query(dctx,
 			`SELECT `+cols+` FROM file_op WHERE root=$1 AND `+where+` ORDER BY id`, args...)
@@ -1331,7 +1562,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 		for rows.Next() {
 			var it intent
 			if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
-				&it.version, &it.preFP, &it.expectSHA, &it.srcKind, &it.at); err != nil {
+				&it.version, &it.preFP, &it.dstFP, &it.expectSHA, &it.srcKind, &it.at); err != nil {
 				return out
 			}
 			out = append(out, it)
@@ -1446,6 +1677,13 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 	mu := s.lockScope(it.scope)
 	mu.Lock()
 	defer mu.Unlock()
+
+	// Settle any recovery object the intent's verified effect left at its
+	// deterministic staging name before judging the path itself — a
+	// process that died between the exchange and the verdict leaves the
+	// displaced object there, and the judgment must see the restored
+	// shape, not the transient one.
+	s.settleStaged(ctx, it, view, tombstoned)
 
 	switch it.op {
 	case "rename":

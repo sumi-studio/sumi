@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -212,10 +213,10 @@ func insertIntent(t *testing.T, s *Store, it intent) int64 {
 	defer cancel()
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, expect_sha, src_kind, at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
 		s.rootID, it.owner, it.scope, it.op, it.path, it.toPath,
-		it.version, it.preFP, it.expectSHA, it.srcKind, it.at).Scan(&id)
+		it.version, it.preFP, it.dstFP, it.expectSHA, it.srcKind, it.at).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert intent: %v", err)
 	}
@@ -278,7 +279,7 @@ func TestPGWriteSettlesIntent(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	ver, _, err := s.WithWrite(context.Background(), "ws", "a.txt", "write",
 		IfVersion{Mode: "none"}, sha("hello"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "a.txt", "hello")
 			return FileInfo{Kind: "file", Fingerprint: "fp-a"}, true, nil
 		})
@@ -633,7 +634,7 @@ func TestPGDeclareBlockedByPendingIntent(t *testing.T) {
 		version: 30, srcKind: "dir", at: time.Now(),
 	})
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
-	noop := func() (FileInfo, bool, error) { return FileInfo{Kind: "file"}, true, nil }
+	noop := func(intent) (FileInfo, bool, error) { return FileInfo{Kind: "file"}, true, nil }
 
 	for _, p := range []string{"a", "a/new.txt", "b", "b/x.txt"} {
 		_, _, err := s.WithWrite(ctx, "ws", p, "write",
@@ -645,7 +646,7 @@ func TestPGDeclareBlockedByPendingIntent(t *testing.T) {
 	// An unrelated path is unaffected.
 	ver, _, err := s.WithWrite(ctx, "ws", "c.txt", "write",
 		IfVersion{Mode: "none"}, sha("c"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "c.txt", "c")
 			return FileInfo{Kind: "file", Fingerprint: "fp-c"}, true, nil
 		})
@@ -855,14 +856,14 @@ func TestPGEmptyLegDoesNotBlockDisjoint(t *testing.T) {
 	// The pending path itself is excluded.
 	_, _, err := s.WithWrite(ctx, "ws", "w1.txt", "write",
 		IfVersion{Mode: "any"}, "", probeAbsent,
-		func() (FileInfo, bool, error) { return FileInfo{}, true, nil })
+		func(intent) (FileInfo, bool, error) { return FileInfo{}, true, nil })
 	if !errors.Is(err, ErrUnsettled) {
 		t.Fatalf("write over pending path: %v, want ErrUnsettled", err)
 	}
 	// Disjoint write, mkdir and rename all proceed.
 	if _, _, err := s.WithWrite(ctx, "ws", "w2.txt", "write",
 		IfVersion{Mode: "none"}, sha("w2"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "w2.txt", "w2")
 			return FileInfo{Kind: "file", Fingerprint: "fp-w2"}, true, nil
 		}); err != nil {
@@ -870,7 +871,7 @@ func TestPGEmptyLegDoesNotBlockDisjoint(t *testing.T) {
 	}
 	if _, _, err := s.WithWrite(ctx, "ws", "d1", "mkdir",
 		IfVersion{Mode: "any"}, "dir", probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "d1", "dir")
 			return FileInfo{Kind: "dir", Fingerprint: "fp-d1"}, true, nil
 		}); err != nil {
@@ -878,7 +879,7 @@ func TestPGEmptyLegDoesNotBlockDisjoint(t *testing.T) {
 	}
 	if _, _, err := s.Rename(ctx, "ws", "w2.txt", "w3.txt",
 		IfVersion{Mode: "any"}, probeAbsent, probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.mv("ws", "w2.txt", "w3.txt")
 			return FileInfo{Kind: "file", Fingerprint: "fp-w3"}, true, nil
 		}); err != nil {
@@ -900,7 +901,7 @@ func TestPGCommittedButUnobservedKeepsIntent(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	_, _, err := s.WithWrite(ctx, "ws", "cx.txt", "write",
 		IfVersion{Mode: "none"}, sha("cx"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "cx.txt", "cx")
 			// Publish committed; the trailing stat failed.
 			return FileInfo{}, true, ErrUnavailable
@@ -932,7 +933,7 @@ func TestPGDefinitivePreCommitDropsIntent(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	_, _, err := s.WithWrite(ctx, "ws", "deny.txt", "write",
 		IfVersion{Mode: "none"}, sha("x"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			return FileInfo{}, false, ErrAccess // rejected before publish
 		})
 	if !errors.Is(err, ErrAccess) {
@@ -959,7 +960,7 @@ func TestPGAmbiguousErrorKeepsIntent(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	_, _, err := s.WithWrite(ctx, "ws", "amb.txt", "write",
 		IfVersion{Mode: "none"}, sha("amb"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			return FileInfo{}, false, ErrUnavailable // reply may be lost
 		})
 	if err == nil {
@@ -1010,13 +1011,13 @@ func TestPGUnverifiableStallsDurably(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	_, _, err := s.WithWrite(ctx, "ws", "jam.txt", "write",
 		IfVersion{Mode: "any"}, "", probeAbsent,
-		func() (FileInfo, bool, error) { return FileInfo{}, true, nil })
+		func(intent) (FileInfo, bool, error) { return FileInfo{}, true, nil })
 	if !errors.Is(err, ErrUnsettled) || !strings.Contains(err.Error(), "permission") {
 		t.Fatalf("blocked op lacks cause: %v", err)
 	}
 	if _, _, err := s.WithWrite(ctx, "ws", "free.txt", "write",
 		IfVersion{Mode: "none"}, sha("f"), probeAbsent,
-		func() (FileInfo, bool, error) {
+		func(intent) (FileInfo, bool, error) {
 			disk.put("ws", "free.txt", "f")
 			return FileInfo{Kind: "file", Fingerprint: "fp-f"}, true, nil
 		}); err != nil {
@@ -1113,7 +1114,7 @@ func TestPGInflightMarkedBeforeVisible(t *testing.T) {
 	go func() {
 		_, _, err := s.WithWrite(ctx, "ws", "race.txt", "write",
 			IfVersion{Mode: "none"}, sha("r"), probeAbsent,
-			func() (FileInfo, bool, error) {
+			func(intent) (FileInfo, bool, error) {
 				close(started)
 				<-release
 				disk.put("ws", "race.txt", "r")
@@ -1487,5 +1488,209 @@ func TestPGApplyUntilSettledForeignOwner(t *testing.T) {
 	}
 	if n := intentCount(t, s); n != 1 {
 		t.Fatalf("foreign-owned intent consumed: %d", n)
+	}
+}
+
+// --- Verified effects: the stale-op durability repair ------------------
+//
+// The sequence these tests model: an op declares an intent while the old
+// owner lives; ownership moves; the intent settles as never-landed; a
+// successor acknowledges newer content at the path; THEN the retired
+// op's queued filesystem effect lands. The verified effect must undo
+// itself — never destroy the successor's acknowledged bytes.
+
+// staleWriteEffect runs the retired op's real fs effect with its
+// declare-time evidence — exactly what its paused goroutine does on
+// resume.
+func staleWriteEffect(p *posixRoot, it intent, body string) (bool, error) {
+	_, committed, err := p.atomicWrite(it.scope, it.path, []byte(body), false,
+		it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+	return committed, err
+}
+
+// Full ownership-loss sequence on real fs + real PG: the successor's
+// acknowledged write survives the late-landing stale effect byte-exact,
+// at its normal path, and the stale intent cannot regress the row.
+func TestPGStaleWritePreservesSuccessor(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	probeOf := func(p *posixRoot, scope, path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := p.stat(scope, path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	write := func(s *Store, content string) {
+		t.Helper()
+		sum := sha256.Sum256([]byte(content))
+		_, _, err := s.WithWrite(ctx, "ws", "a.txt", "write",
+			IfVersion{Mode: "any"}, hex.EncodeToString(sum[:]),
+			probeOf(root, "ws", "a.txt"),
+			func(it intent) (FileInfo, bool, error) {
+				return root.atomicWrite("ws", "a.txt", []byte(content), false,
+					it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			})
+		if err != nil {
+			t.Fatalf("write %q: %v", content, err)
+		}
+	}
+
+	s1 := newPGStore(t, dsn, dir)
+	write(s1, "old")
+	fpOld := durFP(t, root, "ws", "a.txt")
+
+	// The stale op declares while "old" is current — then its actor is
+	// paused (its fs effect stays queued).
+	stale, err := s1.declare(ctx, "ws", "write", "a.txt", "",
+		IfVersion{Mode: "any"}, sha("stale"), probeOf(root, "ws", "a.txt"),
+		probeOf(root, "ws", "a.txt"))
+	if err != nil {
+		t.Fatalf("stale declare: %v", err)
+	}
+	if stale.dstFP != fpOld {
+		t.Fatalf("stale dst_fp = %q, want declare-time %q", stale.dstFP, fpOld)
+	}
+	// Ownership is lost; a successor takes the store.
+	s1.Close()
+	s2 := newPGStore(t, dsn, dir)
+	s2.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	// The dead owner's intent ages past the grace window and settles as
+	// never-landed (the path still holds the declare-time object).
+	if _, err := s2.pool.Exec(ctx,
+		`UPDATE file_op SET at = now() - interval '60 seconds' WHERE id=$1`, stale.id); err != nil {
+		t.Fatal(err)
+	}
+	s2.Reconcile(ctx)
+	// Age past the tombstone hot window so the successor is admitted.
+	if _, err := s2.pool.Exec(ctx,
+		`UPDATE file_op SET resolved_at = now() - interval '60 seconds' WHERE id=$1`, stale.id); err != nil {
+		t.Fatal(err)
+	}
+	// The successor acknowledges newer content.
+	write(s2, "new")
+	v2, fpV2 := versionOf(t, s2, "ws", "a.txt")
+	// THE STALE EFFECT LANDS.
+	committed, ferr := staleWriteEffect(root, stale, "stale")
+	if !errors.Is(ferr, ErrExternalChange) || committed {
+		t.Fatalf("stale effect = (committed=%v, %v), want (false, external_change)", committed, ferr)
+	}
+	// The successor's acknowledged bytes survive, at the normal path.
+	if got := durRead(t, dir, "ws/a.txt"); got != "new" {
+		t.Fatalf("a.txt = %q — stale effect destroyed the acknowledged save", got)
+	}
+	if durExists(t, dir, "ws/"+opStagePrefix+strconv.FormatInt(stale.id, 10)) {
+		t.Fatal("stale staged slot left behind")
+	}
+	// The version row still describes the successor's save.
+	if v, fp := versionOf(t, s2, "ws", "a.txt"); v != v2 || fp != fpV2 {
+		t.Fatalf("row regressed to (%d,%q), want (%d,%q)", v, fp, v2, fpV2)
+	}
+}
+
+// The same sequence, but the retired process dies BETWEEN the exchange
+// and the verdict: the name holds its stale bytes and the displaced
+// acknowledged object sits parked at the intent's staging slot. The
+// reconciler must finish the undo — restore the acknowledged object to
+// its name and discard only the stale op's own bytes.
+func TestPGReconcileCompletesDeadUndo(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Acknowledged successor content at the path; the stale effect
+	// already exchanged: name = stale bytes, staged = displaced object.
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 70, preFP: "0:0:0:0", dstFP: "9:3:1:1",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	staged := dir + "/ws/" + opStagePrefix + strconv.FormatInt(id, 10)
+	if err := os.WriteFile(staged, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "new" {
+		t.Fatalf("a.txt = %q — dead op's undo not completed", got)
+	}
+	if durExists(t, dir, "ws/"+opStagePrefix+strconv.FormatInt(id, 10)) {
+		t.Fatal("stale staged bytes not discarded")
+	}
+}
+
+// A parked recovery object that IS the recorded content for an occupied
+// name is swapped back onto it — the squatter is preserved at the slot,
+// never unlinked. This is the row-fp rule: file_version.fp is the
+// acknowledged fingerprint; ctime ordering is not consulted.
+func TestPGReconcileRestoresRecordedOverSquatter(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	// Acknowledged content at the path — row v1, fp F1.
+	_, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		})
+	if err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	// The acknowledged object is parked at a stale intent's slot (a dead
+	// op's undo captured it); a squatter occupies the name.
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 70, preFP: "0:0:0:0", dstFP: "9:9:9",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	staged := dir + "/ws/" + opStagePrefix + strconv.FormatInt(id, 10)
+	if err := os.Rename(dir+"/ws/a.txt", staged); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("squatter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q — recorded content not restored over squatter", got)
+	}
+	if got := durRead(t, dir, "ws/"+opStagePrefix+strconv.FormatInt(id, 10)); got != "squatter" {
+		t.Fatalf("squatter = %q — foreign object must be preserved parked", got)
 	}
 }
