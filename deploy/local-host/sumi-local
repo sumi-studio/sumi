@@ -411,12 +411,17 @@ kill_pid() {
 # element (service binary argv[0], or the node host's .ts argument). Exact
 # matching: a path substring in some unrelated command line never qualifies.
 proc_pids_for() {
-  local want=$1 p pid arg
+  local want=$1 p pid arg ppid
   for p in /proc/[0-9]*/cmdline; do
     pid=${p#/proc/}; pid=${pid%/cmdline}
     # $$ excludes the launcher shell; $BASHPID excludes the $(...) subshell
-    # running this scan — its argv still shows our own prefix-anchored path
+    # running this scan — its argv still shows our own prefix-anchored path.
+    # Process-substitution forks ({ tr … || :; } below) are children of
+    # that subshell and briefly carry the same argv before exec — exclude
+    # anything we just forked by parent pid too.
     [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
+    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+    [[ $ppid == "$$" || $ppid == "$BASHPID" ]] && continue
     while IFS= read -r arg; do
       [[ $arg == "$want" ]] && { printf '%s\n' "$pid"; break; }
     done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
@@ -483,16 +488,48 @@ anchored_pids() {
 
 # proc_pids_under DIR — pids with any argv element beneath DIR. Used for
 # truthful survivors reporting after payload removal (exact paths may no
-# longer exist on disk by then).
+# longer exist on disk by then) and to refuse install over live processes
+# the exact-path glob can no longer see (deleted payload, lost pidfile).
 proc_pids_under() {
-  local root=$1 p pid arg
+  local root=$1 p pid arg ppid
   for p in /proc/[0-9]*/cmdline; do
     pid=${p#/proc/}; pid=${pid%/cmdline}
     [[ $pid == "$$" || $pid == "$BASHPID" || ! -r $p ]] && continue
+    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+    [[ $ppid == "$$" || $ppid == "$BASHPID" ]] && continue
     while IFS= read -r arg; do
       case $arg in "$root"/*) printf '%s\n' "$pid"; break;; esac
     done < <({ tr '\0' '\n' <"$p" || :; } 2>/dev/null)
   done
+  return 0
+}
+
+# anchored_any ROOT — every live process anchored on ROOT by exact payload
+# path OR by any argv element beneath it. Refusal/reporting only — never a
+# signal list (a foreign argv can reference paths under the root).
+anchored_any() { anchored_pids "$1"; proc_pids_under "$1"; return 0; }
+
+# config_missing FILE — required keys absent from FILE (one per line);
+# empty output = complete. Data-only, same contract as load_config.
+config_missing() {
+  local f=$1 k v
+  local -A pairs=()
+  while IFS=$'\t' read -r k v; do
+    case $k in SUMI_*) pairs[$k]=$v;; esac
+  done < <(config_pairs "$f")
+  ((${#pairs[@]})) || { echo '<unreadable>'; return 0; }
+  for v in SUMI_LOCAL_ID SUMI_LOCAL_LISTEN SUMI_LOCAL_DB_MODE \
+           SUMI_CORE_STATE_TOKEN SUMI_PERSONA_ID; do
+    [[ -n ${pairs[$v]:-} ]] || echo "$v"
+  done
+  case ${pairs[SUMI_LOCAL_DB_MODE]:-} in
+    managed) for v in SUMI_LOCAL_PG_CONTAINER SUMI_LOCAL_PG_VOLUME \
+                      SUMI_LOCAL_PG_PASSWORD; do
+               [[ -n ${pairs[$v]:-} ]] || echo "$v"
+             done;;
+    "") : ;;
+    *) [[ -n ${pairs[SUMI_DB_URL]:-} ]] || echo SUMI_DB_URL;;
+  esac
   return 0
 }
 
@@ -534,6 +571,23 @@ cmd_install() {
     || die "--home $home exists but is not a directory"
   [[ ! -e $prefix || -d $prefix ]] \
     || die "--prefix $prefix exists but is not a directory"
+  # Path/identity inputs are written verbatim into config.env and the
+  # markers — a control character (newline, CR, …) would inject extra
+  # KEY= lines into the flat data files and wedge the install. Reject
+  # them before anything is persisted.
+  local v_
+  for v_ in "$home" "$prefix" "$listen" "$db_url" "$pname" \
+            "$mbase" "$mkey" "$mname"; do
+    [[ $v_ != *[[:cntrl:]]* ]] \
+      || die "install paths/options must not contain control characters (a newline in a path would corrupt config.env and the markers)"
+  done
+  # Nested home/prefix cannot satisfy the payload-only deletion contract
+  # in either direction: purge removes the whole home tree (deleting a
+  # nested prefix's foreign files) and removes known prefix payload
+  # entries (deleting a nested home inside them). Refuse the overlap at
+  # install rather than discover it at deletion.
+  [[ $prefix != "$home" && $prefix != "$home"/* && $home != "$prefix"/* ]] \
+    || die "--home and --prefix must not nest inside each other — purge removes the entire state home while promising unrelated prefix files survive; keep them in separate trees"
   # The install id is decided BEFORE anything is created: an existing
   # config's id is authoritative (moved home, config-only recovery), else
   # the path-derived id for a fresh install.
@@ -560,20 +614,33 @@ cmd_install() {
     [[ -n $pextra ]] \
       && info "note: $prefix contains pre-existing entries; uninstall will remove only the $PROG payload and keep the rest"
   fi
+  # A kept config must actually be usable — otherwise install would
+  # report success into an unstartable wedge and "run install" loops.
+  # Refuse with the repair path: fix the listed keys (keeping
+  # SUMI_LOCAL_ID/SUMI_PERSONA_ID preserves this secretary), or move the
+  # file aside and re-run install for a fresh identity.
+  if [[ -f $home/config.env ]]; then
+    local missing; missing="$(config_missing "$home/config.env")"
+    [[ -z $missing ]] \
+      || die "$home/config.env is incomplete (missing/unreadable: $(printf '%s' "$missing" | tr '\n' ' ')) — refusing to keep it as-is; repair the listed keys (SUMI_LOCAL_ID + SUMI_PERSONA_ID carry this secretary's identity) or move config.env aside and re-run install for a fresh identity"
+  fi
   # Refuse to install over live processes: a payload copy onto running
   # binaries fails half-way (text file busy), and a prefix move would
   # strand orphans anchored on the old prefix. The previously recorded
-  # prefix counts too — its processes are still this install's.
+  # prefix counts too — its processes are still this install's — whether
+  # recorded in config.env or, config-less, in the home marker.
   local oldpref=""
   if [[ -f $home/config.env ]]; then
     oldpref="$(config_val "$home/config.env" SUMI_LOCAL_INSTALLED_PREFIX || true)"
-    [[ -n $oldpref ]] && oldpref="$(canon "$oldpref")"
+  elif [[ -f $home/.sumi-local-home ]]; then
+    oldpref="$(marker_prefix "$home/.sumi-local-home")"
   fi
+  [[ -n $oldpref ]] && oldpref="$(canon "$oldpref")"
   local live=""
-  live="$(anchored_pids "$prefix")"
+  live="$(anchored_any "$prefix" | sort -un | tr '\n' ' ')"
   [[ -n $oldpref && $oldpref != "$prefix" ]] \
-    && live="${live:+$live }$(anchored_pids "$oldpref")"
-  live="$(printf '%s' "$live" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')"
+    && live="$(printf '%s\n' "$live" $(anchored_any "$oldpref") | tr -s ' \n' '\n' | sort -un | tr '\n' ' ')"
+  live="${live% }"
   [[ -z $live ]] \
     || die "this install has processes still running anchored on ${oldpref:-$prefix} (pids: $live) — stop it first: $PROG stop"
   # A regular file at the shim path is authored content — never overwrite
@@ -583,6 +650,23 @@ cmd_install() {
     || die "$shim_dst exists and is not a symlink — refusing to overwrite it; move it aside and re-run install"
   mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
+  # Serialize the claim/payload/config writes with start/stop/uninstall of
+  # THIS install via the per-home operation lock (unrelated installs use
+  # their own home and are unaffected). The lock itself lives under the
+  # home — at this point the directory is ours to write (fresh target, or
+  # the existing install's own home).
+  HOME_DIR=$home; PREFIX=$prefix
+  lock
+  mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
+  # Re-check liveness under the lock: a concurrent start could have
+  # spawned our processes between the preflight above and now.
+  local live2=""
+  live2="$(anchored_any "$prefix" | sort -un | tr '\n' ' ')"
+  [[ -n $oldpref && $oldpref != "$prefix" ]] \
+    && live2="$(printf '%s\n' "$live2" $(anchored_any "$oldpref") | tr -s ' \n' '\n' | sort -un | tr '\n' ' ')"
+  live2="${live2% }"
+  [[ -z $live2 ]] \
+    || die "this install has processes still running anchored on ${oldpref:-$prefix} (pids: $live2) — stop it first: $PROG stop"
   # Claim the home and prefix before any payload/config work. The markers
   # make even a failed install recognizable (and cleanable) as ours, and
   # record the install id so uninstall/purge can recover managed resource
@@ -915,12 +999,32 @@ cmd_start() {
   else info "note: $PREFIX has no marker naming this install — skipping prefix-anchored orphan sweeps"; fi
   if ! pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
     rm -f "$(RUN_DIR)/service.pid"
-    # a lost pidfile can leave our own service orphaned on the port —
-    # it is provably ours (argv[0] anchors on this prefix), so stop it
-    ((sweep_ok)) && kill_anchored "$(SERVICE_BIN)" 5
-    if port_busy; then
-      die "$(base_url) is occupied by a process this install did not start — refusing to adopt or kill it"
+    # A copied/moved state home has no valid pidfile, but the install's
+    # service may already be running under the other home — same prefix,
+    # same persona, same derived tokens. If the configured port already
+    # serves THIS install (persona_state authenticates with our token and
+    # answers our persona), adopt the anchored process and rebuild the
+    # pidfile instead of sweeping it (a silent takeover) or refusing.
+    local adopted=""
+    if port_busy && persona_state >/dev/null 2>&1; then
+      adopted="$(proc_pids_for "$(SERVICE_BIN)" | head -1)"
+      if [[ -n $adopted ]] && write_pid "$(RUN_DIR)/service.pid" "$adopted"; then
+        info "state service already running (pid $adopted) — adopted via anchored process; this home shares the install"
+        printf '%s' "$SUMI_DB_URL" >"$db_url_file"
+      else
+        adopted=""
+      fi
     fi
+    if [[ -z $adopted ]]; then
+      # a lost pidfile can leave our own service orphaned on the port —
+      # it is provably ours (argv[0] anchors on this prefix), so stop it
+      ((sweep_ok)) && kill_anchored "$(SERVICE_BIN)" 5
+      if port_busy; then
+        die "$(base_url) is occupied by a process this install did not start — refusing to adopt or kill it"
+      fi
+    fi
+  fi
+  if ! pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
     info "starting state service on $(base_url)…"
     (
       exec 9>&-  # daemons must not inherit the operation lock
@@ -969,6 +1073,25 @@ cmd_start() {
       continue
     fi
     rm -f "$pid_file"
+    # Copied/moved home, same install: if the secretary core is already
+    # running under the other home AND still holds its writer lease, it is
+    # functional — adopt it (rebuild the pidfile) rather than sweeping a
+    # healthy peer. An anchored process with no matching lease is a
+    # genuine orphan and still gets swept below.
+    if [[ $h == local.ts ]] && ((sweep_ok)); then
+      local cp cholder="" cst=""
+      cst="$(persona_state 2>/dev/null || true)"
+      if [[ -n $cst ]]; then
+        for cp in $(proc_pids_for "$PREFIX/core/host/$h"); do
+          [[ $(printf '%s' "$cst" | json_get lease.holder_id) == "local-$cp" ]] \
+            && { cholder=$cp; break; }
+        done
+      fi
+      if [[ -n $cholder ]] && write_pid "$pid_file" "$cholder"; then
+        info "$h already running (pid $cholder, holds the writer lease) — adopted; this home shares the install"
+        continue
+      fi
+    fi
     # a lost pidfile leaves an orphan that would double-run this persona —
     # kill it (verified ours by its absolute path) before spawning
     ((sweep_ok)) && kill_anchored "$PREFIX/core/host/$h" 5
@@ -1048,6 +1171,11 @@ cmd_stop() {
     if ((proven)); then
       if prefix_proven "$mid"; then
         stop_own_procs 5
+        # a deleted payload makes an orphan invisible to the exact-path
+        # sweep — report whatever still anchors under the prefix
+        local left; left="$(proc_pids_under "$PREFIX")"
+        [[ -n $left ]] \
+          && info "warning: processes still running with paths under $PREFIX (pids: $(printf '%s' "$left" | tr '\n' ' ')) — the exact-path sweep could not verify them (payload files may be deleted); inspect: tr '\\0' ' ' </proc/<pid>/cmdline"
       else
         local left; left="$(proc_pids_under "$PREFIX")"
         [[ -n $left ]] \
@@ -1081,6 +1209,12 @@ cmd_stop() {
   # (a stale home's recorded path may have been re-claimed)
   if prefix_proven "$SUMI_LOCAL_ID"; then
     stop_own_procs 5
+    # a deleted payload makes an orphan invisible to the exact-path
+    # sweep — report whatever still anchors under the prefix rather than
+    # claim a clean stop
+    local left; left="$(proc_pids_under "$PREFIX")"
+    [[ -n $left ]] \
+      && info "warning: processes still running with paths under $PREFIX (pids: $(printf '%s' "$left" | tr '\n' ' ')) — the exact-path sweep could not verify them (payload files may be deleted); inspect: tr '\\0' ' ' </proc/<pid>/cmdline"
   else
     local left; left="$(proc_pids_under "$PREFIX")"
     [[ -n $left ]] \
@@ -1389,6 +1523,14 @@ cmd_uninstall() {
   ((purge)) && [[ -d $HOME_DIR ]] \
     && { [[ $HOME_DIR != / && $HOME_DIR != "$HOME" ]] \
          || die "refusing to purge $HOME_DIR — not a $PROG state home"; }
+  # A volume-ownership refusal must land at preflight — a purge that dies
+  # after removing its own container/network leaves a needlessly
+  # half-torn-down install. Check before any docker mutation.
+  if ((purge)) && [[ -n $pg_vol ]] \
+     && docker volume inspect "$pg_vol" >/dev/null 2>&1; then
+    owned_volume "$pg_vol" \
+      || die "volume $pg_vol exists but is not labeled for project $pg_proj — refusing to delete another install's data"
+  fi
 
   # The prefix must prove it is THIS install: a .sumi-local-prefix marker
   # carrying the same install id. A bare payload, or an unproven home
@@ -1489,10 +1631,9 @@ cmd_uninstall() {
   fi
   if ((purge)); then
     if [[ -n $pg_vol ]] && docker volume inspect "$pg_vol" >/dev/null 2>&1; then
-      # the volume holds the secretary's whole authored history — delete it
-      # only when docker itself attributes it to this install's project
-      owned_volume "$pg_vol" \
-        || die "volume $pg_vol exists but is not labeled for project $pg_proj — refusing to delete another install's data"
+      # ownership was verified at preflight (above) — the volume holds the
+      # secretary's whole authored history, and only docker's own project
+      # label ever authorizes its deletion
       docker volume rm "$pg_vol" >/dev/null 2>&1 \
         && info "removed volume $pg_vol" \
         || info "warning: could not remove volume $pg_vol"

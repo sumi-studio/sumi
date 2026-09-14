@@ -88,13 +88,13 @@ F2_HOME="$FIX/home-f2"; F2_PREFIX="$FIX/prefix-f2"
 K_HOME="$FIX/home-k"; K_PREFIX="$FIX/prefix-k"
 f2() { env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" "$@"; }
 k() { env HOME="$OSH" SUMI_LOCAL_HOME="$K_HOME" SUMI_LOCAL_PREFIX="$K_PREFIX" "$SRC" "$@"; }
-for x in m n p q r v w; do
+for x in m n p q r s t v w x y z; do
   eval "${x}() { env HOME=\"\$OSH\" SUMI_LOCAL_HOME=\"$FIX/home-$x\" SUMI_LOCAL_PREFIX=\"$FIX/prefix-$x\" \"\$SRC\" \"\$@\"; }"
 done
 
 cleanup() {
   local x
-  for x in a b c d e f f2 h i j k m n p q r v w; do
+  for x in a b c d e f f2 h i j k m n p q r s t v w x y z; do
     "$x" stop >/dev/null 2>&1 || true
     "$x" uninstall --purge --yes >/dev/null 2>&1 || true
   done
@@ -628,6 +628,190 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" "$SRC" install \
   || bad "special-char prefix payload/marker missing"
 env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" SUMI_LOCAL_PREFIX="$FIX/prefix-v&amp;x" \
   "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-B F1 / f89: config-less reinstall must check the marker's
+# recorded prefix for live processes BEFORE rewriting evidence ----------
+echo "== config-less reinstall/move refuses while recorded prefix is live"
+t install --managed-pg --listen 127.0.0.1:9552 >/dev/null
+t start >/dev/null
+rm -f "$FIX/home-t/config.env"
+T_MARK_BEFORE="$(cat "$FIX/home-t/.sumi-local-home")"
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" "$SRC" install \
+  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:9552 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 && $out == *"still running"* && $out == *"stop it first"* ]] \
+  && ok "config-less move refused while marker prefix is live" \
+  || bad "config-less move over live processes not refused: rc=$rc $(echo "$out" | tail -2)"
+[[ $(cat "$FIX/home-t/.sumi-local-home") == "$T_MARK_BEFORE" && ! -e $FIX/prefix-t2 ]] \
+  && ok "refusal preserved the marker and created nothing" \
+  || bad "refused config-less move rewrote evidence!"
+pgrep -f "$FIX/prefix-t/bin/sumi-local-service" >/dev/null \
+  && ok "original service still running after refused move" \
+  || bad "refused move still harmed the running service"
+# stopped config-less move stays supported — but a managed install's
+# leftover container/volume is never adopted without its config, so
+# remove them explicitly first (the documented recovery step)
+env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" "$SRC" stop >/dev/null 2>&1 || true
+T_ID="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$FIX/home-t/.sumi-local-home")"
+docker rm -f "sumi-local-pg-$T_ID" >/dev/null 2>&1 || true
+docker volume rm "sumi-local-pgdata-$T_ID" >/dev/null 2>&1 || true
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" "$SRC" install \
+  --managed-pg --prefix "$FIX/prefix-t2" --listen 127.0.0.1:9552 2>&1)" && rc=0 || rc=$?
+[[ $rc == 0 ]] \
+  && ok "config-less move proceeds once stopped" \
+  || bad "stopped config-less move refused: $(echo "$out" | tail -2)"
+env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" SUMI_LOCAL_PREFIX="$FIX/prefix-t2" \
+  "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F1 / f109: install joins the per-home operation lock -----
+echo "== install serializes with other lifecycle ops on the same home"
+x install --managed-pg --listen 127.0.0.1:9551 >/dev/null
+mkdir -p "$FIX/home-x/run"
+t0=$SECONDS
+flock "$FIX/home-x/run/lock" -c 'sleep 4' &
+LOCK_HOLDER=$!
+sleep 0.3   # let the holder take the lock
+out="$(x install --managed-pg --listen 127.0.0.1:9551 2>&1)" && rc=0 || rc=$?
+wait "$LOCK_HOLDER" 2>/dev/null || true
+[[ $rc == 0 && $((SECONDS - t0)) -ge 3 ]] \
+  && ok "install waited on the per-home lock, then succeeded" \
+  || bad "install did not serialize on the home lock (rc=$rc, ${SECONDS}s): $(echo "$out" | tail -2)"
+x uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F2 / f110: nested home/prefix refused before mutation ----
+echo "== nested home/prefix pairs refused before anything is created"
+expect_die "prefix nested inside home refused" "must not nest" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-nest" SUMI_LOCAL_PREFIX="$FIX/home-nest/payload" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+[[ ! -e $FIX/home-nest ]] \
+  && ok "nested-prefix refusal created nothing" \
+  || bad "nested-prefix refusal still created the home"
+expect_die "home nested inside prefix refused" "must not nest" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/prefix-nest/state" SUMI_LOCAL_PREFIX="$FIX/prefix-nest" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+[[ ! -e $FIX/prefix-nest ]] \
+  && ok "nested-home refusal created nothing" \
+  || bad "nested-home refusal still created the prefix"
+expect_die "equal home/prefix refused" "must not nest" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/same" SUMI_LOCAL_PREFIX="$FIX/same" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9552
+
+# --- review-B F3 / f112: control-char paths + incomplete config --------
+echo "== control characters in paths and incomplete configs are refused"
+expect_die "newline in --prefix refused" "control characters" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-ctl" SUMI_LOCAL_PREFIX="$(printf '%s\nEVIL=x' "$FIX/prefix-ctl")" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553
+[[ ! -e $FIX/home-ctl && ! -e $FIX/prefix-ctl ]] \
+  && ok "control-char refusal created nothing" \
+  || bad "control-char install partially created dirs"
+expect_die "CR in --home refused" "control characters" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$(printf '%s\r' "$FIX/home-cr")" SUMI_LOCAL_PREFIX="$FIX/prefix-cr" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553
+s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553 >/dev/null
+S_CFG_BEFORE="$(cat "$FIX/home-s/config.env")"
+# strip required keys -> incomplete config must be refused, kept verbatim
+grep -v '^SUMI_CORE_STATE_TOKEN=' "$FIX/home-s/config.env" > "$FIX/home-s/config.tmp"
+mv "$FIX/home-s/config.tmp" "$FIX/home-s/config.env"
+out="$(s install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9553 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 && $out == *"incomplete"* && $out == *"SUMI_CORE_STATE_TOKEN"* && $out == *"move config.env aside"* ]] \
+  && ok "incomplete config refused with a repair path" \
+  || bad "incomplete config mishandled: rc=$rc $(echo "$out" | tail -2)"
+[[ $(cat "$FIX/home-s/config.env") == "$(grep -v '^SUMI_CORE_STATE_TOKEN=' <<<"$S_CFG_BEFORE")" ]] \
+  && ok "incomplete config preserved verbatim (identity keys kept)" \
+  || bad "refused install rewrote the incomplete config"
+# repairing the listed key makes the SAME install usable again
+printf 'SUMI_CORE_STATE_TOKEN='"'"'repaired-secret'"'"'\n' >> "$FIX/home-s/config.env"
+s url >/dev/null 2>&1 \
+  && ok "repaired config is usable (same install, same identity)" \
+  || bad "repaired config still unusable"
+s uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F4 / f111: volume-ownership refusal precedes teardown ----
+echo "== foreign-labelled volume refuses purge BEFORE own resources are removed"
+# marker-only home names install slffff1111ff; the container/network carry
+# this install's project label (removable), but the volume is labelled for
+# a DIFFERENT project — the refusal must fire before either is torn down.
+Y_ID=slffff1111ff; Y_HOME="$FIX/home-y"
+mkdir -p "$Y_HOME"
+printf "SUMI_LOCAL_ID='%s'\nSUMI_LOCAL_PREFIX='%s'\n" "$Y_ID" "$FIX/prefix-y" > "$Y_HOME/.sumi-local-home"
+docker create --name "sumi-local-pg-$Y_ID" \
+  --label "com.docker.compose.project=sumi-local-$Y_ID" \
+  postgres:17-alpine >/dev/null
+docker network create --label "com.docker.compose.project=sumi-local-$Y_ID" \
+  "sumi-local-$Y_ID-default" >/dev/null
+docker volume create --label com.docker.compose.project=other-proj \
+  "sumi-local-pgdata-$Y_ID" >/dev/null
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$Y_HOME" SUMI_LOCAL_PREFIX="$FIX/prefix-y" \
+  "$SRC" uninstall --purge --yes 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 && $out == *"not labeled for project"* ]] \
+  && ok "purge refused foreign-labelled volume" \
+  || bad "foreign-labelled volume not refused: rc=$rc $(echo "$out" | tail -2)"
+docker inspect "sumi-local-pg-$Y_ID" >/dev/null 2>&1 \
+  && ok "own container NOT removed before the refused volume check" \
+  || bad "container removed before volume ownership check!"
+docker network inspect "sumi-local-$Y_ID-default" >/dev/null 2>&1 \
+  && ok "own network NOT removed before the refused volume check" \
+  || bad "network removed before volume ownership check!"
+[[ -d $Y_HOME ]] \
+  && ok "home preserved by refused purge" || bad "refused purge removed the home"
+docker rm -f "sumi-local-pg-$Y_ID" >/dev/null 2>&1
+docker network rm "sumi-local-$Y_ID-default" >/dev/null 2>&1
+docker volume rm "sumi-local-pgdata-$Y_ID" >/dev/null 2>&1
+
+# --- review-B F2 / f114: copied home adopts, never takes over ----------
+echo "== copied state home joins the running install, no takeover"
+z install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+z start >/dev/null
+z say "z ping" >/dev/null
+Z_SPID="$(cut -d' ' -f1 "$FIX/home-z/run/service.pid")"
+Z_CPID="$(cut -d' ' -f1 "$FIX/home-z/run/local.pid")"
+cp -a "$FIX/home-z" "$FIX/home-z2"
+rm -rf "$FIX/home-z2/run"   # a plain copy/mount lacks live run records
+z2() { env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-z2" SUMI_LOCAL_PREFIX="$FIX/prefix-z" "$SRC" "$@"; }
+out="$(z2 start 2>&1)" && rc=0 || rc=$?
+[[ $rc == 0 && $out == *"adopted"* ]] \
+  && ok "copied-home start adopted the running install" \
+  || bad "copied-home start did not adopt: rc=$rc $(echo "$out" | tail -3)"
+Z2_SPID="$(cut -d' ' -f1 "$FIX/home-z2/run/service.pid" 2>/dev/null || true)"
+[[ $Z2_SPID == "$Z_SPID" && -d /proc/$Z_SPID ]] \
+  && ok "adopted pidfile records the ORIGINAL service pid (no takeover)" \
+  || bad "service was replaced: orig=$Z_SPID copy=${Z2_SPID:-none}"
+[[ $(pgrep -f "$FIX/prefix-z/bin/sumi-local-service" | wc -l) == 1 \
+   && $(pgrep -f "$FIX/prefix-z/core/host/local.ts" | wc -l) == 1 ]] \
+  && ok "exactly one service + one core after copied-home start" \
+  || bad "duplicate processes after copied-home start"
+z2 say "shared secretary" >/dev/null \
+  && ok "copied home drives the same running secretary" \
+  || bad "copied home could not reach the shared install"
+# and the copy can stop the shared install it adopted
+z2 stop >/dev/null
+! pgrep -f "$FIX/prefix-z/" >/dev/null 2>&1 \
+  && ok "copied home stopped the shared install" \
+  || bad "copied-home stop left processes"
+z uninstall --purge --yes >/dev/null 2>&1 || true
+rm -rf "$FIX/home-z2"
+
+# --- review-A F3 / f113: deleted-payload survivors are reported --------
+echo "== stop reports survivors invisible to the exact-path sweep"
+w install --managed-pg --listen 127.0.0.1:9556 >/dev/null
+w start >/dev/null
+cp "$FIX/prefix-w/core/host/local.ts" "$FIX/local.ts.saved"
+# F3's orphan: the payload file is gone AND the pidfile is lost — the
+# exact-path glob no longer matches, so only the argv-anchored report sees it
+rm -f "$FIX/prefix-w/core/host/local.ts" "$FIX/home-w/run/local.pid"
+out="$(w stop 2>&1)" && rc=0 || rc=$?
+[[ $out == *"processes still running with paths under"* ]] \
+  && ok "stop reported the deleted-payload orphan" \
+  || bad "stop silent about deleted-payload orphan: $(echo "$out" | tail -3)"
+[[ -n $(pgrep -f "$FIX/prefix-w/core/host/local.ts" | head -1) ]] \
+  && ok "reported orphan was NOT signaled (reporting != killing)" \
+  || bad "deleted-payload orphan was signaled anyway"
+# restoring the payload file makes the exact-path sweep work again
+cp "$FIX/local.ts.saved" "$FIX/prefix-w/core/host/local.ts"
+w stop >/dev/null 2>&1
+[[ -z $(pgrep -f "$FIX/prefix-w/" | head -1) ]] \
+  && ok "restored payload lets the sweep finish the orphan" \
+  || bad "orphan survived a second stop after restore"
+w uninstall --purge --yes >/dev/null 2>&1 || true
 
 echo "== real user shim untouched across the whole run"
 [[ $(readlink "$REAL_HOME/.local/bin/sumi-local" 2>/dev/null || echo __absent__) == "$REAL_SHIM_BEFORE" ]] \

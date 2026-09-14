@@ -117,9 +117,23 @@ same way, with an env prefix that disagrees refused as a mismatched pair.
 
 `install` refuses to run while the install's service or core processes
 are still alive under the target prefix — or under the previously
-recorded prefix when you are moving. `sumi-local stop` first, then
+recorded prefix when you are moving (`config.env`, or the home marker
+when `config.env` is gone). `sumi-local stop` first, then
 reinstall/move: copying payloads onto running binaries fails half-way
 and would strand orphans on a path the install no longer records.
+`install` also refuses `--home`/`--prefix` pairs that nest inside each
+other — purge removes the entire state home while promising unrelated
+prefix files survive, and an overlap makes that contract unsatisfiable —
+and any path containing control characters, which would corrupt the
+flat `KEY=value` markers it writes. If `config.env` exists but is
+incomplete or unreadable, `install` refuses rather than keep an
+unstartable config: it prints the missing keys so you can repair them
+in place (keeping `SUMI_LOCAL_ID`/`SUMI_PERSONA_ID` preserves the
+secretary), or move the file aside and reinstall for a fresh identity.
+Lifecycle commands serialize through a per-home `run/lock`, so an
+`install` cannot interleave with a `stop`/`start`/`uninstall` of the
+same install; unrelated installs use their own lock and run in
+parallel.
 
 If a previous install's config was deleted but its managed volume remains,
 a fresh install at the same home **refuses to adopt it** — restore the old
@@ -138,9 +152,18 @@ resources.
 
 Copying or moving the state home copies/moves the install itself: the
 recorded `SUMI_LOCAL_ID` follows the config, so the copy aliases the same
-docker resources and listen address (two copies cannot run at once — the
-second is refused by the foreign-listener check). To relocate, *move* the
-home and update `SUMI_LOCAL_HOME`.
+docker resources and listen address — it is the same install, not a
+second one. Two copies therefore cannot *both own* a running install:
+when `start` finds the configured port already serving this persona with
+this install's service binary anchored on the shared prefix, it *adopts*
+the running service (rebuilding the pidfile in this home), and adopts
+the secretary core the same way when the writer lease names that exact
+process (`local-<pid>`). A lease-free anchored core is a genuine orphan
+and is swept as usual; a port held by anything not provably this install
+is refused as before. So `start` from a copy while the original runs
+joins the running install instead of taking it over — the copy and the
+original then share one service and one secretary. To relocate, *move*
+the home and update `SUMI_LOCAL_HOME` (stopped relocation is unaffected).
 
 If the state home was deleted while the install is still present (or
 still running), the CLI can no longer prove ownership: `stop` reports
@@ -185,11 +208,16 @@ from the environment without editing `config.env` — see
   anchored on this install's prefix — a lost record cannot strand them,
   and `restart` cannot spawn a duplicate core. That sweep only runs when
   the prefix marker still names this install, so a stale home cannot
-  kill a newer install that re-claimed the same directory. If after
-  that the listen port stays occupied by a process this install cannot
-  verify, `stop` says so instead of claiming success — identify the
-  holder with `ss -tlnp`, inspect its `/proc/<pid>/cmdline`, and only
-  then terminate it if it is a leftover of this install.
+  kill a newer install that re-claimed the same directory. If payload
+  files were deleted while its processes still run (the F3 orphan
+  case), the exact-path sweep can no longer see them — `stop` then
+  *reports* every process with an argv element under the proven prefix
+  instead of claiming a clean stop; reported paths alone never authorize
+  a signal. If after that the listen port stays occupied by a process
+  this install cannot verify, `stop` says so instead of claiming
+  success — identify the holder with `ss -tlnp`, inspect its
+  `/proc/<pid>/cmdline`, and only then terminate it if it is a leftover
+  of this install.
 - `uninstall --purge` asks for confirmation *before* anything is stopped
   or removed: it prints the full doomed list, and cancelling leaves
   processes, containers, and files untouched. It exits 0 even when the
