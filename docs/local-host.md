@@ -57,7 +57,7 @@ Installing drops a `sumi-local` shim in `~/.local/bin`.
 | --- | --- | --- |
 | `~/.local/lib/sumi-local` (`--prefix`) | executables: service binary, `core/` TypeScript sources, CLI, `.sumi-local-prefix` ownership marker | no — payload entries removed; foreign files kept |
 | `$XDG_STATE_HOME/sumi/local` (`--home`) | `config.env` (0600: identity, secrets, model), `.sumi-local-home` ownership marker, `run/` pids, `log/`, `workspace/` | yes — `--purge` to delete |
-| `~/.local/bin/sumi-local` | CLI symlink | no — removed |
+| `~/.local/bin/sumi-local` | CLI symlink — a regular file there is never overwritten (`install` refuses) | no — removed |
 | managed PG volume | canonical database (managed mode) | yes — `--purge` deletes it, after an ownership check |
 
 Identity lives in `config.env`: `SUMI_PERSONA_ID` is generated once at
@@ -73,7 +73,19 @@ prefix marked for a different install is refused, and a config whose id
 disagrees with the home marker refuses destructive action rather than
 picking a side. Generic directories (`run/`, `log/`, `workspace/`) are
 *not* ownership evidence, and `config.env` itself is parsed as data —
-its contents are never executed as shell.
+its contents are never executed as shell. The config is a flat
+`KEY=value` file (LF or CRLF endings; if a key appears twice the later
+line wins); anything that doesn't match is ignored, so a foreign or
+corrupt file is inert rather than half-loaded.
+
+`config.env` parsed as data also means the process-anchored safety nets
+need one more proof: a reused *path* is not ownership. Because a state
+home survives `uninstall` and a later install may claim the same prefix
+directory, every prefix-anchored `/proc` sweep (`stop`, `start`,
+`restart`, `uninstall`) first checks that `$PREFIX/.sumi-local-prefix`
+still names *this* install's id. A prefix whose marker is absent,
+unparseable, or names another install is left alone — its processes are
+reported, never signaled, and its payload entries are never deleted.
 
 ## Multiple installs / non-default paths
 
@@ -99,7 +111,15 @@ The two must name the *same* install: `config.env` records
 `SUMI_LOCAL_INSTALLED_PREFIX`, and lifecycle commands refuse a
 `SUMI_LOCAL_HOME`/`SUMI_LOCAL_PREFIX` pair that points at two different
 installs before touching either side. When only `SUMI_LOCAL_HOME` is set,
-the recorded prefix is used, so a moved install stays self-locating.
+the recorded prefix is used, so a moved install stays self-locating —
+and when `config.env` is gone, the marker's recorded prefix is used the
+same way, with an env prefix that disagrees refused as a mismatched pair.
+
+`install` refuses to run while the install's service or core processes
+are still alive under the target prefix — or under the previously
+recorded prefix when you are moving. `sumi-local stop` first, then
+reinstall/move: copying payloads onto running binaries fails half-way
+and would strand orphans on a path the install no longer records.
 
 If a previous install's config was deleted but its managed volume remains,
 a fresh install at the same home **refuses to adopt it** — restore the old
@@ -121,6 +141,13 @@ recorded `SUMI_LOCAL_ID` follows the config, so the copy aliases the same
 docker resources and listen address (two copies cannot run at once — the
 second is refused by the foreign-listener check). To relocate, *move* the
 home and update `SUMI_LOCAL_HOME`.
+
+If the state home was deleted while the install is still present (or
+still running), the CLI can no longer prove ownership: `stop` reports
+"not installed", `uninstall` refuses the unverifiable pair, and nothing
+is guessed. Recovery is manual but small — find the processes with
+`pgrep -af <prefix>/` (their argv anchors on the payload root), terminate
+them yourself, then delete the prefix directory by hand.
 
 ## Model connection
 
@@ -150,16 +177,19 @@ from the environment without editing `config.env` — see
   port held by a foreign process is refused, never adopted or killed.
 - `stop` terminates the secretary first (SIGTERM → graceful lease
   release), then the service, then managed Postgres. Stale pid files are
-  checked against `/proc/<pid>/cmdline` before any signal, and pidfiles
+  checked against `/proc/<pid>/cmdline` before any signal; a live process
+  that fails verification keeps its pidfile as evidence, and pidfiles
   inside a home that isn't proven to be an install are never deleted.
   If a pid file was *lost*, `stop`/`restart`/`uninstall` still find the
   orphaned service and core hosts by scanning `/proc` for processes
   anchored on this install's prefix — a lost record cannot strand them,
-  and `restart` cannot spawn a duplicate core. If after that the listen
-  port stays occupied by a process this install cannot verify, `stop`
-  warns instead of claiming success — identify the holder with
-  `ss -tlnp`, verify its path is this install's prefix, and only then
-  terminate it.
+  and `restart` cannot spawn a duplicate core. That sweep only runs when
+  the prefix marker still names this install, so a stale home cannot
+  kill a newer install that re-claimed the same directory. If after
+  that the listen port stays occupied by a process this install cannot
+  verify, `stop` says so instead of claiming success — identify the
+  holder with `ss -tlnp`, inspect its `/proc/<pid>/cmdline`, and only
+  then terminate it if it is a leftover of this install.
 - `uninstall --purge` asks for confirmation *before* anything is stopped
   or removed: it prints the full doomed list, and cancelling leaves
   processes, containers, and files untouched. It exits 0 even when the

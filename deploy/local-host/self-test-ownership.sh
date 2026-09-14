@@ -88,13 +88,19 @@ F2_HOME="$FIX/home-f2"; F2_PREFIX="$FIX/prefix-f2"
 K_HOME="$FIX/home-k"; K_PREFIX="$FIX/prefix-k"
 f2() { env HOME="$OSH" SUMI_LOCAL_HOME="$F2_HOME" SUMI_LOCAL_PREFIX="$F2_PREFIX" "$SRC" "$@"; }
 k() { env HOME="$OSH" SUMI_LOCAL_HOME="$K_HOME" SUMI_LOCAL_PREFIX="$K_PREFIX" "$SRC" "$@"; }
+for x in m n p q r v w; do
+  eval "${x}() { env HOME=\"\$OSH\" SUMI_LOCAL_HOME=\"$FIX/home-$x\" SUMI_LOCAL_PREFIX=\"$FIX/prefix-$x\" \"\$SRC\" \"\$@\"; }"
+done
 
 cleanup() {
   local x
-  for x in a b c d e f f2 h i j k; do
+  for x in a b c d e f f2 h i j k m n p q r v w; do
     "$x" stop >/dev/null 2>&1 || true
     "$x" uninstall --purge --yes >/dev/null 2>&1 || true
   done
+  # r may have been moved to prefix-r2 mid-test
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" SUMI_LOCAL_PREFIX="$FIX/prefix-r2" \
+    "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
   rm -rf "$FIX" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -138,7 +144,7 @@ echo "== pidfile pointing at ANOTHER INSTALL's process is never signaled"
 cp "$B_HOME/run/service.pid" "$FIX/b-service.pid.saved"
 cp "$A_HOME/run/service.pid" "$B_HOME/run/service.pid"
 out="$(b stop 2>&1)"
-[[ $out == *"leaving it alone"* ]] \
+[[ $out == *"leaving it"* ]] \
   && ok "cross-install pidfile detected, not signaled" \
   || bad "cross-install warning missing: $(echo "$out" | tail -3)"
 a say "alpha survives" >/dev/null 2>&1 \
@@ -172,8 +178,8 @@ sleep 600 & SLEEP_PID=$!
 SLEEP_ST="$(awk '{print $22}' "/proc/$SLEEP_PID/stat")"
 printf '%s %s\n' "$SLEEP_PID" "$SLEEP_ST" > "$B_HOME/run/foreign.pid"
 out="$(b stop 2>&1)"
-[[ $out == *"leaving it alone"* && ! -f $B_HOME/run/foreign.pid ]] \
-  && ok "foreign pidfile in OWNED home: warned, not signaled, stale record removed" \
+[[ $out == *"leaving it"* && -f $B_HOME/run/foreign.pid ]] \
+  && ok "foreign pidfile in OWNED home: warned, not signaled, record kept as evidence" \
   || bad "owned-home foreign pidfile mishandled: $(echo "$out" | tail -3)"
 kill -0 "$SLEEP_PID" 2>/dev/null && ok "foreign process still alive" \
   || bad "foreign process was signaled!"
@@ -266,8 +272,14 @@ rc=0; out="$(h uninstall --purge --yes 2>&1)" || rc=$?
   || bad "post-uninstall purge wrong (rc=$rc): $(echo "$out" | tail -3)"
 
 echo "== install via the installed prefix binary (self-copy)"
+out="$(a_prefix="$A_PREFIX/bin/sumi-local"; env HOME="$OSH" SUMI_LOCAL_HOME="$A_HOME" SUMI_LOCAL_PREFIX="$A_PREFIX" "$a_prefix" install 2>&1)" && rc=0 || rc=$?
+[[ $rc -ne 0 && "$out" == *"still running"* && "$out" == *"stop it first"* ]] \
+  && ok "self-copy install refused while A is running (stop first)" \
+  || bad "self-copy while running: rc=$rc $(echo "$out"|tail -2)"
+a stop >/dev/null
 out="$(a_prefix="$A_PREFIX/bin/sumi-local"; env HOME="$OSH" SUMI_LOCAL_HOME="$A_HOME" SUMI_LOCAL_PREFIX="$A_PREFIX" "$a_prefix" install 2>&1)" \
   && ok "install from installed prefix succeeded" || bad "self-copy install failed: $(echo "$out"|tail -2)"
+a start >/dev/null
 
 echo "== B purge cannot harm A"
 b uninstall --purge --yes >/dev/null
@@ -470,6 +482,152 @@ K_PMARK="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$K_PREFIX/.sumi-local-pr
   && ok "external->managed reinstall: config/marker/prefix all agree ($K_ID)" \
   || bad "identity disagree after external->managed reinstall (cfg=$K_ID2 home=$K_MARK prefix=$K_PMARK)"
 env HOME="$OSH" SUMI_LOCAL_HOME="$K_HOME" SUMI_LOCAL_PREFIX="$K_PREFIX" "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F-A1: a retained state home must never steer signals at a
+# different install that re-claimed the recorded prefix path -----------
+echo "== stale home + reused prefix path: old stop/start cannot touch the new install"
+M_HOME="$FIX/home-m"; N_HOME="$FIX/home-n"; MN_PREFIX="$FIX/prefix-m"
+m() { env HOME="$OSH" SUMI_LOCAL_HOME="$M_HOME" SUMI_LOCAL_PREFIX="$MN_PREFIX" "$SRC" "$@"; }
+n() { env HOME="$OSH" SUMI_LOCAL_HOME="$N_HOME" SUMI_LOCAL_PREFIX="$MN_PREFIX" "$SRC" "$@"; }
+m install --managed-pg --listen 127.0.0.1:9551 >/dev/null
+m start >/dev/null
+m uninstall >/dev/null    # keeps home-m; removes the prefix payload+marker
+n install --managed-pg --listen 127.0.0.1:9552 >/dev/null   # same prefix path, new home/id
+n start >/dev/null
+n say "n lives" >/dev/null && ok "new install on reused prefix is serving" \
+  || bad "new install failed to start"
+out="$(m stop 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 && $out == *"different install"* ]] \
+  && ok "stale-home stop refuses: prefix now owned by another install" \
+  || bad "stale-home stop mishandled rc=$rc: $(echo "$out" | tail -3)"
+n say "n still lives" >/dev/null \
+  && ok "stale-home stop did not touch the new install's processes" \
+  || bad "new install's processes were killed by the stale home's stop!"
+out="$(m start 2>&1)" && rc=0 || rc=$?
+[[ $rc != 0 ]] \
+  && ok "stale-home start refused (prefix foreign-owned)" \
+  || bad "stale-home start adopted another install's prefix/port"
+n say "n endures" >/dev/null \
+  && ok "new install still healthy after stale-home start attempt" \
+  || bad "new install harmed by stale-home start"
+n stop >/dev/null; n uninstall --purge --yes >/dev/null
+env HOME="$OSH" SUMI_LOCAL_HOME="$M_HOME" "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
+# m's own purge runs after n removed the shared prefix's marker — it may
+# succeed or refuse depending on ordering; either way make sure no fixture
+# volume leaks by removing m's exact resource names.
+M_ID="$(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$M_HOME/config.env" 2>/dev/null || true)"
+[[ -n $M_ID ]] && { docker rm -f "sumi-local-pg-$M_ID" >/dev/null 2>&1; docker volume rm "sumi-local-pgdata-$M_ID" >/dev/null 2>&1; } || true
+
+# --- review-B F1: config-less stop must not honor a foreign env prefix --
+echo "== config-less stop with another install's env prefix is refused"
+p install --managed-pg --listen 127.0.0.1:9553 >/dev/null
+q install --managed-pg --listen 127.0.0.1:9554 >/dev/null
+p start >/dev/null; q start >/dev/null
+rm -f "$FIX/home-q/config.env"
+expect_die "config-less stop refuses env prefix of another install" \
+  "does not match the prefix recorded" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-q" SUMI_LOCAL_PREFIX="$FIX/prefix-p" "$SRC" stop
+# q's config is gone (that is the point of this probe) — verify its
+# service process survived by its recorded pid rather than `say`
+Q_SPID="$(cut -d' ' -f1 "$FIX/home-q/run/service.pid" 2>/dev/null || true)"
+p say "p lives" >/dev/null && [[ -n $Q_SPID && -d /proc/$Q_SPID ]] \
+  && ok "both installs alive after refused mismatched stop" \
+  || bad "a refused config-less stop still signaled processes!"
+[[ -f $FIX/home-q/run/service.pid ]] \
+  && ok "refused stop kept the target's pidfiles (no lost-pidfile state)" \
+  || bad "refused stop still deleted pidfiles"
+# the correct degraded path still works: marker prefix locates the install
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-q" "$SRC" stop 2>&1)" && rc=0 || rc=$?
+[[ $rc == 0 && ( $out == *"stopping unrecorded process"* || $out == *"stopped managed container"* ) ]] \
+  && ok "config-less stop sweeps the install's own proven-prefix processes" \
+  || bad "correct degraded stop failed: $(echo "$out" | tail -3)"
+q uninstall --purge --yes >/dev/null 2>&1 || true
+p stop >/dev/null; p uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F-A2 / B F2: install over live processes is refused -------
+echo "== install refuses while the install's processes are running"
+r install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+r start >/dev/null
+expect_die "reinstall to a new prefix while running refused" "stop it first" \
+  env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" "$SRC" install \
+    --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:9555
+expect_die "same-prefix reinstall while running refused" "stop it first" \
+  r install --managed-pg --listen 127.0.0.1:9555
+r say "r lives" >/dev/null \
+  && ok "running install unharmed by refused reinstall" \
+  || bad "refused reinstall still touched the live install"
+r stop >/dev/null
+env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" "$SRC" install \
+  --managed-pg --prefix "$FIX/prefix-r2" --listen 127.0.0.1:9555 >/dev/null \
+  && ok "prefix move allowed once stopped" \
+  || bad "stopped install could not move prefix"
+r2() { env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-r" SUMI_LOCAL_PREFIX="$FIX/prefix-r2" "$SRC" "$@"; }
+r2 start >/dev/null && r2 say "r moved" >/dev/null \
+  && ok "moved install serves from the new prefix" \
+  || bad "moved install failed to start"
+r2 stop >/dev/null; r2 uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F-A3 / B O5: unparseable prefix marker is not ownership ---
+echo "== corrupt/unparseable prefix marker never authorizes deletion"
+U_HOME="$FIX/home-u"; U_PREFIX="$FIX/prefix-u"
+mkdir -p "$U_HOME" "$U_PREFIX/bin" "$U_PREFIX/core"
+printf "SUMI_LOCAL_ID='sl0123456789'\nSUMI_LOCAL_PREFIX='%s'\n" "$U_PREFIX" \
+  > "$U_HOME/.sumi-local-home"
+echo "userfile" > "$U_PREFIX/bin/userfile"
+echo "userfile2" > "$U_PREFIX/core/userfile2"
+echo "TOTAL GARBAGE no equals" > "$U_PREFIX/.sumi-local-prefix"
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$U_HOME" SUMI_LOCAL_PREFIX="$U_PREFIX" \
+  "$SRC" uninstall --yes 2>&1)" && rc=0 || rc=$?
+[[ $out == *"does not positively identify"* || $out == *"leaving $U_PREFIX untouched"* ]] \
+  && ok "unparseable prefix marker: payload left untouched" \
+  || bad "corrupt marker authorized deletion: $(echo "$out" | tail -3)"
+[[ -f $U_PREFIX/bin/userfile && -f $U_PREFIX/core/userfile2 ]] \
+  && ok "foreign bin/core entries preserved under corrupt marker" \
+  || bad "payload entries were deleted despite corrupt marker!"
+out="$(env HOME="$OSH" SUMI_LOCAL_HOME="$U_HOME" SUMI_LOCAL_PREFIX="$U_PREFIX" \
+  "$SRC" uninstall --purge --yes 2>&1)" && rc=0 || rc=$?
+[[ $rc == 0 && ! -d $U_HOME && -f $U_PREFIX/bin/userfile ]] \
+  && ok "purge removed proven home; corrupt-marked prefix still preserved" \
+  || bad "purge mishandled corrupt-marker prefix"
+
+# --- review-B O6: a regular-file shim is authored content --------------
+echo "== regular-file ~/.local/bin/sumi-local is never overwritten"
+OSH3="$FIX/os-home3"; mkdir -p "$OSH3/.local/bin"
+echo "my own tool" > "$OSH3/.local/bin/sumi-local"; chmod +x "$OSH3/.local/bin/sumi-local"
+expect_die "install refuses to overwrite a regular-file shim" "not a symlink" \
+  env HOME="$OSH3" SUMI_LOCAL_HOME="$FIX/home-shim" SUMI_LOCAL_PREFIX="$FIX/prefix-shim" \
+    "$SRC" install --db-url 'postgres://x@127.0.0.1:1/n' --listen 127.0.0.1:9556
+[[ $(cat "$OSH3/.local/bin/sumi-local") == "my own tool" && ! -e $FIX/home-shim ]] \
+  && ok "regular-file shim preserved; nothing was created" \
+  || bad "regular-file shim was overwritten or install half-created dirs"
+
+# --- review-B F3/O2: CRLF config parses; duplicate keys last-wins -------
+echo "== CRLF config is readable; duplicate keys resolve last-wins"
+w install --managed-pg --listen 127.0.0.1:9557 >/dev/null
+sed -i 's/$/\r/' "$FIX/home-w/config.env"
+[[ $(w url 2>/dev/null) == *9557* ]] \
+  && ok "CRLF config.env still parses" \
+  || bad "CRLF config treated as corrupt"
+printf "SUMI_LOCAL_LISTEN='127.0.0.1:9558'\n" >> "$FIX/home-w/config.env"
+[[ $(w url 2>/dev/null) == *9558* ]] \
+  && ok "duplicate key resolves last-wins" \
+  || bad "duplicate-key policy inconsistent: $(w url 2>/dev/null | head -1)"
+w uninstall --purge --yes >/dev/null 2>&1 || true
+
+# --- review-A F-A4: & | \ in a moved prefix must stay literal -----------
+echo "== moved prefix with shell-special chars is recorded literally"
+v install --managed-pg --listen 127.0.0.1:9559 >/dev/null
+env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" "$SRC" install \
+  --managed-pg --prefix "$FIX/prefix-v&amp;x" --listen 127.0.0.1:9559 >/dev/null
+[[ $(grep -cF "SUMI_LOCAL_INSTALLED_PREFIX='$FIX/prefix-v&amp;x'" "$FIX/home-v/config.env") == 1 ]] \
+  && ok "recorded prefix with & is literal (no sed expansion)" \
+  || bad "recorded prefix corrupted: $(grep SUMI_LOCAL_INSTALLED_PREFIX "$FIX/home-v/config.env")"
+[[ -d "$FIX/prefix-v&amp;x/bin" \
+  && $(sed -n "s/^SUMI_LOCAL_ID='\\(.*\\)'$/\\1/p" "$FIX/prefix-v&amp;x/.sumi-local-prefix") == "$(id_of "$FIX/home-v")" ]] \
+  && ok "special-char prefix installed + marked" \
+  || bad "special-char prefix payload/marker missing"
+env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-v" SUMI_LOCAL_PREFIX="$FIX/prefix-v&amp;x" \
+  "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
 
 echo "== real user shim untouched across the whole run"
 [[ $(readlink "$REAL_HOME/.local/bin/sumi-local" 2>/dev/null || echo __absent__) == "$REAL_SHIM_BEFORE" ]] \
