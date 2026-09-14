@@ -56,6 +56,18 @@ representation. Simply removing the filter while leaving all incoming messages
 styled as messages from the Human would preserve the original misunderstanding.
 Actual replies should use the destination's normal Messaging path.
 
+Edits and deletions of an already-delivered message are new attributed
+experiences, not retroactive rewrites: the durable intake path issues a fresh
+attention event carrying the message's new revision (with `message_change`
+`edited`, or `deleted` with empty content for the tombstone), so the
+secretary's journal keeps the original experience intact and the change marker
+shows what the conversation looks like now. An edit is re-evaluated against
+current notification decisions — a mention added by an edit reaches the newly
+named secretary — while a deletion goes only to the secretaries the original
+selection already recorded. A pending event whose source was superseded (edited
+then deleted before delivery) is suppressed as `source_unavailable`; the
+tombstone still delivers.
+
 This document records product direction and a correction. It does not claim
 that the revised integration or UI has been implemented or accepted.
 

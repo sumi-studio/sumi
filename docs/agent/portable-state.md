@@ -35,6 +35,18 @@ admin/service secret. A persona token cannot seal, export, import or activate.
 not a label. A staged or transferred persona admits no mutation even from a
 caller that presents a matching generation.
 
+Pending Messaging attention deliveries honor the same fence. A `sealed` or
+`staged` persona's queued delivery rows stay pending and retryable — an abort
+can still return the persona to `active`, at which point the delivery lands.
+Once the source completes a transfer the persona is `transferred` here
+permanently, so the drain suppresses the row once with the inspectable reason
+`recipient_transferred` instead of retrying forever or claiming a delivery that
+can never happen; the frozen event payload stays in the row as the record of
+what was sent. The same terminal treatment applies when the durable input under
+an event's id already carries different content (`input_conflict`): a receipt
+only counts when the stored input's fields and payload match the event exactly —
+a matching replay deduplicates, a mismatched one can never become this event.
+
 The destination's first writer acquires `generation_high_water + 1` and runs
 ordinary recovery: carried running turns are interrupted, their inputs are
 requeued, and the recorded plan continues. Operations already done before the

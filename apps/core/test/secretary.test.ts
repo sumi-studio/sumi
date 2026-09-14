@@ -714,6 +714,87 @@ test("assemble shows Messaging provenance a reply can be addressed to", () => {
   assert.equal(plain.at(-1)?.content, "[human] hi");
 });
 
+test("assemble and journal render message change updates, not rewrites", () => {
+  const place = "0190a8a0-0000-7000-8000-000000000001";
+  // A delivered edit renders the change cue on the marker; the original
+  // journaled input_received keeps its own frozen rendering.
+  const journaled: Event[] = [
+    {
+      persona_id: PERSONA,
+      seq: 1,
+      turn_id: "t1",
+      kind: "input_received",
+      payload: {
+        text: "元の相談",
+        actor_kind: "human",
+        actor_display: "Haru",
+        source_surface: "messaging",
+        thread_id: place,
+        place_name: "general",
+        place_kind: "channel",
+        message_id: "m-1",
+        attention: "reply",
+      },
+      created_at: new Date().toISOString(),
+    },
+    {
+      persona_id: PERSONA,
+      seq: 2,
+      turn_id: "t2",
+      kind: "input_received",
+      payload: {
+        text: "訂正後です",
+        actor_kind: "human",
+        actor_display: "Haru",
+        source_surface: "messaging",
+        thread_id: place,
+        place_name: "general",
+        place_kind: "channel",
+        message_id: "m-1",
+        message_change: "edited",
+        attention: "reply",
+      },
+      created_at: new Date().toISOString(),
+    },
+  ];
+  const tombstone = {
+    persona_id: PERSONA,
+    input_id: "messaging:e-3",
+    kind: "message",
+    payload: {
+      actor: { kind: "human", display_name: "Haru" },
+      place: { id: place, kind: "channel", name: "general" },
+      message_id: "m-1",
+      message_change: "deleted",
+    },
+    actor_kind: "human",
+    actor_id: "h-1",
+    source_surface: "messaging",
+    thread_id: place,
+    occurred_at: new Date().toISOString(),
+    attention: "observe" as const,
+    status: "queued" as const,
+    claimed_generation: null,
+    turn_id: null,
+    created_at: new Date().toISOString(),
+    done_at: null,
+    not_before: null,
+  };
+  const messages = assemble(journaled, tombstone);
+  assert.equal(
+    messages.at(-3)?.content,
+    `[Haru (human) in general place_id=${place} message_id=m-1] 元の相談`,
+  );
+  assert.equal(
+    messages.at(-2)?.content,
+    `[Haru (human) in general place_id=${place} message_id=m-1 — edited] 訂正後です`,
+  );
+  // A tombstone input carries no text — the marker itself reports it.
+  const last = messages.at(-1)?.content ?? "";
+  assert.ok(last.includes("— deleted"), `tombstone marker: ${last}`);
+  assert.ok(last.includes("message_id=m-1"), `tombstone marker: ${last}`);
+});
+
 test("same-holder acquire bumps generation; release keeps monotonic fencing", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);

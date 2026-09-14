@@ -18,6 +18,16 @@ const (
 	AgentAttentionPollVote = "messaging_poll_vote"
 )
 
+const (
+	// AttentionChangeEdited marks an update to an already-posted message:
+	// the event carries the new current content at the bumped revision.
+	AttentionChangeEdited = "edited"
+	// AttentionChangeDeleted marks the tombstone event: the original
+	// message stays the secretary's experienced past; this event reports
+	// that the current view no longer contains it.
+	AttentionChangeDeleted = "deleted"
+)
+
 // AgentAttentionEvent is frozen when the source is issued. It is private input
 // to the recipient PA, not a browser command or an instruction from its employer.
 // The delivery adapter adds its configured runtime tenant, not a guessed Human.
@@ -35,6 +45,12 @@ type AgentAttentionEvent struct {
 	// delivery does not depend on the continued existence of the parent.
 	ReplyRequired    bool   `json:"reply_required,omitempty"`
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	// Change marks a mutation of an already-posted message (edited/deleted);
+	// empty is the original delivery. The deliveries row keeps source_kind
+	// 'messaging_message' — the source entity is still the message, and the
+	// bumped source_revision already makes each change a distinct deduplicated
+	// version without a new source_kind (which the column's CHECK forbids).
+	Change string `json:"change,omitempty"`
 	// Reason is the notification rule that selected this recipient
 	// (dm/mention/keyword/all). It rides along so the delivery adapter can
 	// carry the same attention hint into the core input — it is a hint about
@@ -144,6 +160,98 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 	}
 	return s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
 		access.WorkspaceMemberID, access.PlaceMemberID, message.CreatedAt)
+}
+
+// issueAgentMessageChange records an edit or a deletion of an already-posted
+// message as a new attention event — a current-view update, never a rewrite
+// of the event that delivered the original. Every PA the original selection
+// recorded keeps hearing about the change (their view of this message would
+// otherwise stay stale), and an edit additionally reaches members its new
+// content selects for the first time: a mention added by an edit is a real
+// call for attention, and the new reason refines a recorded recipient's
+// stale one. A deletion has no new content to select on, so only the
+// recorded recipients see the tombstone.
+func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, place Place, message Message, change string, changedAt time.Time) error {
+	recipients := map[string]NotificationDecision{}
+	rows, err := tx.Query(ctx, `
+		SELECT recipient_kind, recipient_id, reason
+		FROM message_notification_intents
+		WHERE message_id = $1 AND recipient_kind = 'personality_agent'`, message.MessageID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var decision NotificationDecision
+		if err := rows.Scan(&decision.Participant.Kind, &decision.Participant.ID, &decision.Reason); err != nil {
+			rows.Close()
+			return err
+		}
+		recipients[decision.Participant.Key()] = decision
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	members, err := s.activeMembersScoped(ctx, tx, place)
+	if err != nil {
+		return err
+	}
+	if place.Kind == PlaceThread {
+		members, err = s.threadNotificationMembers(ctx, tx, place.PlaceID, members)
+		if err != nil {
+			return err
+		}
+	}
+	actorName := ""
+	for _, member := range members {
+		if member.Participant == s.Scope.Actor {
+			actorName = member.DisplayName
+			break
+		}
+	}
+	if change == AttentionChangeEdited {
+		decisions, err := s.notificationDecisionsForMembersScoped(ctx, tx, place, message, members)
+		if err != nil {
+			return err
+		}
+		for _, decision := range decisions {
+			if decision.Participant.Kind == KindPersonalityAgent {
+				recipients[decision.Participant.Key()] = decision
+			}
+		}
+	}
+	for _, decision := range recipients {
+		// Tenure is re-authorized, not replayed from the intent record: a
+		// recipient who has since left the place has no view to update.
+		access, err := s.placeAccessAfterAuthorization(ctx, tx, place, decision.Participant)
+		if errors.Is(err, ErrPlaceNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		event := s.attentionEvent(place, message, s.Scope.Actor, actorName)
+		event.Kind, event.PersonalityAgentID = AgentAttentionMessage, decision.Participant.ID
+		event.Change, event.Reason = change, decision.Reason
+		event.OccurredAt = changedAt
+		event.ReplyToMessageID = message.ReplyTo
+		if change == AttentionChangeDeleted {
+			event.Content = ""
+		} else {
+			for _, ref := range message.Mentions {
+				if ref == decision.Participant && decision.Reason != NotifyReasonDM {
+					event.Kind = AgentAttentionMention
+					break
+				}
+			}
+		}
+		if err := s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
+			access.WorkspaceMemberID, access.PlaceMemberID, changedAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // A reply names its recipient through the persisted message author, never text
@@ -391,6 +499,9 @@ func (s *Store) deliverAgentAttention(ctx context.Context, delivery AgentAttenti
 	}
 	release, err := delivery.Prepare(ctx, item.event.PersonalityAgentID)
 	if err != nil {
+		if reason, terminal := terminalDeliveryReason(err); terminal {
+			return s.suppressAttentionNow(ctx, item.event.EventID, reason)
+		}
 		return "", err
 	}
 	if release == nil {
@@ -400,6 +511,48 @@ func (s *Store) deliverAgentAttention(ctx context.Context, delivery AgentAttenti
 	// Startup took place outside source locks. Recheck the source and receipt
 	// under those locks before emitting a new command.
 	return s.attemptAgentAttention(ctx, delivery, item, true)
+}
+
+// terminalDeliveryReason names the inspectable suppression reason for a
+// delivery failure that can never resolve on this placement. A persona that
+// permanently transferred away can never accept the input again, and an
+// input id already bound to different content can never become this event —
+// retrying either forever would only hide the truth. Everything else stays
+// retryable: sealed or staged personas can still return to active when a
+// transfer aborts, and storage failures are transient.
+func terminalDeliveryReason(err error) (string, bool) {
+	switch {
+	case errors.Is(err, errRecipientTransferred):
+		return "recipient_transferred", true
+	case errors.Is(err, errAttentionInputConflict):
+		return "input_conflict", true
+	}
+	return "", false
+}
+
+// suppressAttention marks the pending row terminally undeliverable with the
+// truthful reason. The frozen event stays in the row — suppression answers
+// the delivery question, it does not erase what was sent.
+func suppressAttention(ctx context.Context, tx pgx.Tx, eventID, reason string) (string, error) {
+	if _, err := tx.Exec(ctx, `UPDATE agent_attention_deliveries
+        SET suppressed_at=now(), suppression_reason=$2
+        WHERE event_id=$1 AND admitted_at IS NULL AND suppressed_at IS NULL`,
+		eventID, reason); err != nil {
+		return "", err
+	}
+	return "suppressed", tx.Commit(ctx)
+}
+
+// suppressAttentionNow suppresses outside an open delivery transaction —
+// the path taken when a terminal failure surfaces in Prepare, before the
+// second source-locked attempt begins.
+func (s *Store) suppressAttentionNow(ctx context.Context, eventID, reason string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	return suppressAttention(ctx, tx, eventID, reason)
 }
 
 func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttentionDelivery, item attentionCandidate, mayAdmit bool) (string, error) {
@@ -435,6 +588,9 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	key := "attention:" + item.event.PersonalityAgentID + ":" + item.event.EventID
 	receipt, found, err := delivery.Lookup(ctx, key, item.event)
 	if err != nil {
+		if reason, terminal := terminalDeliveryReason(err); terminal {
+			return suppressAttention(ctx, tx, item.event.EventID, reason)
+		}
 		return "", err
 	}
 	// A prior authorized append remains a fact even if its DB acknowledgement
@@ -443,17 +599,16 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
 	}
 	if sourceErr != nil {
-		_, err = tx.Exec(ctx, `UPDATE agent_attention_deliveries SET suppressed_at=now(), suppression_reason='source_unavailable' WHERE event_id=$1`, item.event.EventID)
-		if err != nil {
-			return "", err
-		}
-		return "suppressed", tx.Commit(ctx)
+		return suppressAttention(ctx, tx, item.event.EventID, "source_unavailable")
 	}
 	if !mayAdmit {
 		return "ready", tx.Commit(ctx)
 	}
 	receipt, err = delivery.Admit(ctx, key, item.event)
 	if err != nil {
+		if reason, terminal := terminalDeliveryReason(err); terminal {
+			return suppressAttention(ctx, tx, item.event.EventID, reason)
+		}
 		return "", err
 	}
 	return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
@@ -491,7 +646,20 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 	if err != nil {
 		return err
 	}
-	if message.Deleted || message.Seq < access.VisibleFromSeq {
+	if item.event.Change == AttentionChangeDeleted {
+		// The tombstone is the durable fact this event reports; it committed
+		// atomically with the event. A live message would mean the stored
+		// payload no longer describes the source — retry rather than
+		// permanently suppress on the anomaly.
+		if !message.Deleted {
+			return errors.New("deletion event found a live message")
+		}
+	} else if message.Deleted {
+		// A later deletion supersedes a pending delivery or edit event; the
+		// recipient's tombstone event reports the current state.
+		return ErrMessageNotFound
+	}
+	if message.Seq < access.VisibleFromSeq {
 		return ErrMessageNotFound
 	}
 	if item.event.ReplyRequired {
