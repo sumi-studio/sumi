@@ -3,7 +3,9 @@ package agentstate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -307,6 +309,318 @@ func TestCommitDeduplicatesInputReceived(t *testing.T) {
 		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
 		pa).Scan(&receipts); err != nil || receipts != 2 {
 		t.Fatalf("receipts after in-2 commit = %d err=%v, want 2", receipts, err)
+	}
+}
+
+// unlinkedReceipts is the cut verifier's reverse link: every journaled
+// input_received that names an existing input must be the one its marker
+// points at.
+func unlinkedReceipts(t *testing.T, pool *pgxpool.Pool, pa string) int64 {
+	t.Helper()
+	var n int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`,
+		pa).Scan(&n); err != nil {
+		t.Fatalf("unlinked receipts: %v", err)
+	}
+	return n
+}
+
+// f-memory-86/87: a receipt must carry a non-empty string input_id naming
+// an existing input — the commit is refused before anything lands, so a
+// retry once the input exists journals exactly one receipt and the persona
+// stays sealable.
+func TestCommitRejectsReceiptForAbsentInput(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	ghostCommit := CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "ghost-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, ghostCommit); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("ghost-receipt commit err = %v, want ErrBadRequest", err)
+	}
+	// The refusal rolled back: nothing journaled, the turn still runs, and
+	// no input or marker state was touched.
+	var events int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1`, pa).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("events after refused commit = %d err=%v, want 0", events, err)
+	}
+	tm, err := s.turn(ctx, pool, pa, "t-1")
+	if err != nil || tm.Status != "running" {
+		t.Fatalf("turn after refused commit = %+v err=%v, want running", tm, err)
+	}
+	// Once the input exists the same commit succeeds.
+	if _, created, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "ghost-1",
+		Kind: "message", Payload: map[string]any{"text": "arrived late"}}); err != nil || !created {
+		t.Fatalf("submit ghost-1: created=%v err=%v", created, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, ghostCommit); err != nil {
+		t.Fatalf("retry after input creation: %v", err)
+	}
+	var receipts int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("receipts = %d err=%v, want 2", receipts, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
+// A receipt's input_id is a string — the documented input-ID type. Any
+// other JSON shape refuses the commit before mutation; the same commit is
+// legal once corrected.
+func TestCommitRejectsMalformedReceiptIDs(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "5", Kind: "message",
+		Payload: map[string]any{"text": "five"}}); err != nil {
+		t.Fatalf("submit 5: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load t-1: %v", err)
+	}
+	// Every malformed identity shape refuses — including inside a commit
+	// whose other receipts are valid, and a copy dedup would have dropped.
+	for i, bad := range []any{float64(5), nil, map[string]any{"a": 1}, true, ""} {
+		_, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+			Outcome: "complete",
+			Events: []EventInput{
+				{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+				{Kind: "input_received", Payload: map[string]any{"input_id": bad}},
+			},
+			Output: map[string]any{"text": "hi"},
+		})
+		if !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("malformed input_id %v (%d): err = %v, want ErrBadRequest", bad, i, err)
+		}
+	}
+	var events int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1`, pa).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("events after refused commits = %d err=%v, want 0", events, err)
+	}
+	// A valid commit still works: one receipt for "5", marker linked.
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "5"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}); err != nil {
+		t.Fatalf("valid commit after refusals: %v", err)
+	}
+	var receipts int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_events
+		WHERE persona_id = $1 AND kind = 'input_received' AND payload->>'input_id' = '5'`,
+		pa).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("receipts = %d err=%v, want 1", receipts, err)
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+}
+
+// The lost-adoption race from the reviews is closed by refusal, not by
+// locking: a commit carrying a receipt for an input being submitted
+// concurrently either sees the committed row (journals and links it) or is
+// refused cleanly — it can never produce a journaled receipt beside a
+// NULL-marker input.
+func TestConcurrentSubmitVsReceiptCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	for i := 0; i < 12; i++ {
+		turn := fmt.Sprintf("t-race-%d", i)
+		input := fmt.Sprintf("race-%d", i)
+		load, err := s.LoadTurn(ctx, pa, l.Generation, turn, 10)
+		if err != nil {
+			t.Fatalf("load %s: %v", turn, err)
+		}
+		var wg sync.WaitGroup
+		var commitErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, commitErr = s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i%4) * time.Millisecond)
+			if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa,
+				InputID: input, Kind: "message",
+				Payload: map[string]any{"text": "late"}}); err != nil {
+				t.Errorf("submit %s: %v", input, err)
+			}
+		}()
+		wg.Wait()
+		if commitErr != nil {
+			// Refused while the input was still absent: the turn stays
+			// running and a retry once the input exists succeeds.
+			if !errors.Is(commitErr, ErrBadRequest) {
+				t.Fatalf("commit %s: %v, want ErrBadRequest", turn, commitErr)
+			}
+			if _, err := s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			}); err != nil {
+				t.Fatalf("retry commit %s after input landed: %v", turn, err)
+			}
+		}
+	}
+	// Whatever the interleaving, every journaled receipt is linked.
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+	var dangling int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_inputs
+		WHERE persona_id = $1 AND received_seq IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM core_events e
+			WHERE e.persona_id = core_inputs.persona_id AND e.seq = core_inputs.received_seq
+				AND e.kind = 'input_received'
+				AND e.payload->>'input_id' = core_inputs.input_id)`,
+		pa).Scan(&dangling); err != nil || dangling != 0 {
+		t.Fatalf("mismatched markers = %d err=%v, want 0", dangling, err)
+	}
+}
+
+// The same race against a job-terminal notification: the notification
+// inserts the 'job:<id>' input inside the job's terminal transition, and a
+// concurrent commit carrying a receipt for that id either sees the
+// committed row or is refused — never a journaled receipt beside a
+// NULL-marker input.
+func TestConcurrentJobNotifyVsReceiptCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "one"}}); err != nil {
+		t.Fatalf("submit in-1: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		jobID := fmt.Sprintf("j-race-%d", i)
+		input := "job:" + jobID
+		turn := fmt.Sprintf("t-job-%d", i)
+		if _, _, err := s.SubmitJob(ctx, pa, jobID, "subprocess",
+			map[string]any{"command": []any{"echo", "hi"}}, "api"); err != nil {
+			t.Fatalf("submit %s: %v", jobID, err)
+		}
+		claimed, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 1)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claim %s: claimed=%+v err=%v", jobID, claimed, err)
+		}
+		load, err := s.LoadTurn(ctx, pa, l.Generation, turn, 10)
+		if err != nil {
+			t.Fatalf("load %s: %v", turn, err)
+		}
+		commit := func() error {
+			_, err := s.CommitTurn(ctx, pa, turn, l.Generation, CommitRequest{
+				Outcome: "complete",
+				Events: []EventInput{
+					{Kind: "input_received", Payload: map[string]any{"input_id": load.Input.InputID}},
+					{Kind: "input_received", Payload: map[string]any{"input_id": input}},
+				},
+				Output: map[string]any{"text": "ok"},
+			})
+			return err
+		}
+		var wg sync.WaitGroup
+		var commitErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			commitErr = commit()
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i%4) * time.Millisecond)
+			if _, err := s.CompleteJob(ctx, pa, jobID, "runner-1", "done",
+				map[string]any{"exit_code": 0.0}, ""); err != nil {
+				t.Errorf("complete %s: %v", jobID, err)
+			}
+		}()
+		wg.Wait()
+		if commitErr != nil {
+			if !errors.Is(commitErr, ErrBadRequest) {
+				t.Fatalf("commit %s: %v, want ErrBadRequest", turn, commitErr)
+			}
+			if err := commit(); err != nil {
+				t.Fatalf("retry commit %s after notification landed: %v", turn, err)
+			}
+		}
+	}
+	if n := unlinkedReceipts(t, pool, pa); n != 0 {
+		t.Fatalf("unlinked input_received rows = %d, want 0", n)
+	}
+	var dangling int64
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM core_inputs
+		WHERE persona_id = $1 AND received_seq IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM core_events e
+			WHERE e.persona_id = core_inputs.persona_id AND e.seq = core_inputs.received_seq
+				AND e.kind = 'input_received'
+				AND e.payload->>'input_id' = core_inputs.input_id)`,
+		pa).Scan(&dangling); err != nil || dangling != 0 {
+		t.Fatalf("mismatched markers = %d err=%v, want 0", dangling, err)
 	}
 }
 
