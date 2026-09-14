@@ -215,6 +215,9 @@ const (
 	// source holding the jsonb literal null there cannot be represented and
 	// is refused at seal.
 	colJSONNull
+	// colBigintList is a nullable bigint[] column: a JSON null is SQL NULL,
+	// a JSON array of integers becomes the Postgres array.
+	colBigintList
 )
 
 type column struct {
@@ -282,6 +285,7 @@ var coreTables = []table{
 	// fenced source writer (verifyCut refuses a bundle that claims one).
 	{name: "core_memory_chunks", orderBy: `chunk_seq`, cols: []column{
 		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"layer", colInt},
+		{"sources", colBigintList},
 		{"first_seq", colBigint}, {"last_seq", colBigint}, {"est_tokens", colBigint},
 		{"status", colText}, {"replacement", colText}, {"replacement_est_tokens", colBigint},
 		{"attempts", colInt}, {"interruptions", colInt}, {"last_error", colText},

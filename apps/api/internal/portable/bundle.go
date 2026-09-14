@@ -235,6 +235,11 @@ func (t table) insertSQL() string {
 			exprs[i] = fmt.Sprintf("d->'%s'", c.name)
 		case colJSONNull:
 			exprs[i] = fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name)
+		case colBigintList:
+			// A JSON null is SQL NULL; a JSON array aggregates into bigint[].
+			exprs[i] = fmt.Sprintf(
+				"(SELECT array_agg(e::bigint) FROM jsonb_array_elements_text(NULLIF(d->'%s','null'::jsonb)) e)",
+				c.name)
 		}
 	}
 	return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM (SELECT $1::jsonb AS d) r",
@@ -559,6 +564,18 @@ func insertErr(table string, err error) error {
 	if errors.As(err, &pgErr) && (strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23")) {
 		if pgErr.Code == "23505" {
 			return fmt.Errorf("%w: %s row duplicates a key already in this bundle", ErrBadBundle, table)
+		}
+		// A row-shape CHECK on a carried table is the same integrity rule
+		// the cut-time checks name — report it in that vocabulary so a
+		// violation reads identically whether the schema or the verifier
+		// catches it first.
+		if pgErr.Code == "23514" {
+			if check, ok := map[string]string{
+				"core_memory_chunks_sources_check": "memory_chunk_sources_invalid",
+				"core_memory_chunks_layer_check":   "memory_chunk_negative_values",
+			}[pgErr.ConstraintName]; ok {
+				return fmt.Errorf("%w: %s", ErrIntegrity, describe([]Violation{{Check: check, Rows: 1}}))
+			}
 		}
 		return fmt.Errorf("%w: %s row: %v", ErrBadBundle, table, err)
 	}

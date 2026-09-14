@@ -84,6 +84,30 @@ var cutChecks = []struct{ name, sql string }{
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (
 			c.status = 'preparing' OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
+	// Upper-layer targets carry their provenance: every source must resolve
+	// to a carried same-persona chunk, all in one layer, and the target's
+	// journal range must be exactly its sources' span. A crafted bundle that
+	// dangles a source reference, mixes layers, or claims a range beyond its
+	// sources would activate a fragment that cannot be read back or checked.
+	{"memory_chunk_sources_invalid", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			(c.layer = 1 AND c.sources IS NOT NULL)
+			OR (c.layer >= 2 AND (
+				c.sources IS NULL OR cardinality(c.sources) = 0
+				OR EXISTS (SELECT 1 FROM unnest(c.sources) AS s(seq)
+					WHERE NOT EXISTS (SELECT 1 FROM core_memory_chunks s2
+						WHERE s2.persona_id = c.persona_id AND s2.chunk_seq = s.seq))
+				OR (SELECT count(DISTINCT s2.layer) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> 1
+				OR (SELECT min(s2.first_seq) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> c.first_seq
+				OR (SELECT max(s2.last_seq) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> c.last_seq
+			)))`},
 	// Chunk ranges are locators into the carried journal; a range that
 	// reaches past it would render a fragment for records that do not
 	// exist.
@@ -109,7 +133,8 @@ var cutChecks = []struct{ name, sql string }{
 	// store only ever produces positive or zero: chunk_seq/layer start at 1,
 	// estimates and attempt/interruption counts are >= 0. A negative value is
 	// a crafted row that corrupts ordering and the live-raw accounting; a
-	// layer above 1 is *not* invalid — consolidation layers are future work.
+	// layer above 1 is a consolidation/reintegration target whose sources'
+	// provenance is checked separately above.
 	{"memory_chunk_negative_values", `
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (

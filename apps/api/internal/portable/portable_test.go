@@ -416,12 +416,12 @@ func chunkRow(t *testing.T, p placement, personaID string, chunkSeq int64) agent
 	t.Helper()
 	var c agentstate.MemoryChunk
 	err := p.pool.QueryRow(context.Background(), `
-		SELECT persona_id, chunk_seq, layer, first_seq, last_seq, est_tokens,
+		SELECT persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
 			status, replacement, replacement_est_tokens, attempts, interruptions, last_error,
 			claimed_generation, claimed_at, not_before, created_at, prepared_at, applied_at
 		FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2`,
-		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.FirstSeq, &c.LastSeq,
-		&c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
+		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.Sources, &c.FirstSeq,
+		&c.LastSeq, &c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
 		&c.Interruptions, &c.LastError, &c.ClaimedGeneration, &c.ClaimedAt,
 		&c.NotBefore, &c.CreatedAt, &c.PreparedAt, &c.AppliedAt)
 	if err != nil {
@@ -634,6 +634,106 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	}
 }
 
+// Upper-layer memory carries its full provenance: the superseded source
+// rows (accepted decisions, texts and ranges durable), the applied L2 block
+// at its sources' position, and an unfinished upper-layer preparation whose
+// live claim cannot cross — the cut returns it to 'sealed' so the
+// destination's own writer reclaims it.
+func TestTransferCarriesUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+
+	// Four small exchanges = seqs 1..8, then chunk rows in the shapes the
+	// upper pipeline writes: two L1 sources superseded by an applied L2
+	// block, two applied L1 fragments, and one L2 reintegration target
+	// still claimed when the cut lands.
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("u-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ut-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ut-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens,
+			 claimed_generation, claimed_at)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, NULL, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, NULL, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60, NULL, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, NULL, NULL),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50, NULL, NULL),
+			($1, 6, 2, '{3,4}', 5, 8, 120, 'preparing', NULL, NULL, $2, now())`,
+		pid, gen); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-upper", cloudID))
+	// The preparing L2 target's claim was dead placement-local execution:
+	// the cut returned it to 'sealed' for the destination to reclaim.
+	if c := chunkRow(t, local, pid, 6); c.Status != "sealed" || c.ClaimedGeneration != nil {
+		t.Fatalf("preparing L2 target after seal: %+v", c)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-upper")
+
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	// Rows — including sources, superseded verdicts and the normalized
+	// sealed target — arrive byte for byte.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-upper"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+
+	// The destination renders the applied L2 block at its earliest source's
+	// journal position and never the superseded coverage raw.
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-1", 50))
+	if len(load.Memory) != 3 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Layer != 2 ||
+		load.Memory[0].Text != "L2: days one and two" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		if e.Seq <= 4 {
+			t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+		}
+	}
+
+	// The carried sealed L2 target is ordinary work for the destination's
+	// writer: claiming it resolves the carried sources to their fragments.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 6 || claimed.Chunk.Layer != 2 {
+		t.Fatalf("destination upper claim: %+v", claimed.Chunk)
+	}
+	if len(claimed.TargetFragments) != 2 || len(claimed.TargetEvents) != 0 ||
+		claimed.TargetFragments[0].Text != "L1 of days three" {
+		t.Fatalf("carried sources unresolved: %+v", claimed.TargetFragments)
+	}
+}
+
 // A carried chunk can never hold a live claim, and its range must resolve
 // inside the carried journal. Both are integrity violations a valid digest
 // cannot launder.
@@ -768,6 +868,21 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 			set("est_tokens", -900000)), "memory_chunk_negative_values"},
 		"layer zero": {mutRow("core_memory_chunks", chunkRow,
 			set("layer", 0)), "memory_chunk_negative_values"},
+		// Upper-layer provenance: a layer-1 row never carries sources; a
+		// layer-2 target's sources must all resolve to carried chunks whose
+		// span is exactly the target's range.
+		"layer-1 row carrying sources": {mutRow("core_memory_chunks", chunkRow,
+			set("sources", []any{1})), "memory_chunk_sources_invalid"},
+		"upper target with a dangling source": {mutRow("core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{999}
+			}), "memory_chunk_sources_invalid"},
+		"upper target with an empty source set": {mutRow("core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{}
+			}), "memory_chunk_sources_invalid"},
 		// F-B2: received_seq that dangles, names the wrong kind, or names
 		// another input's event would make the destination skip journaling
 		// this input's input_received — its original record silently lost.
@@ -800,17 +915,21 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
 	}
-	// Bounds are floors, not a layer policy: a future consolidation layer and
-	// the queued input's NULL marker must still cross. Re-address the mutated
-	// bundle to a second placement since the first already holds this
-	// transfer under the clean digest.
+	// Bounds are floors, not a layer policy: the queued input's NULL marker
+	// must still cross (the clean import above proves it). But an upper-layer
+	// row now has a contract — consolidation is real: a layer-2 chunk
+	// without resolvable sources is malformed, not "future work". Re-address
+	// the mutated bundle to a second placement since the first already holds
+	// this transfer under the clean digest.
 	cloud2 := newPlacement(t)
-	higherLayer := rebundle(t, bundle, func(line string) string {
+	sourceless := rebundle(t, bundle, func(line string) string {
 		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
 		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
 	})
-	if _, created, err := cloud2.svc.Import(ctx, bytes.NewReader(higherLayer), nil); err != nil || !created {
-		t.Fatalf("layer-2 chunk refused: created=%v err=%v", created, err)
+	if _, _, err := cloud2.svc.Import(ctx, bytes.NewReader(sourceless), nil); err == nil ||
+		!errors.Is(err, ErrIntegrity) ||
+		!strings.Contains(err.Error(), "memory_chunk_sources_invalid") {
+		t.Fatalf("sourceless layer-2 chunk: %v, want memory_chunk_sources_invalid", err)
 	}
 }
 
@@ -1148,48 +1267,50 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < 24; i++ {
-		local := newPlacement(t)
-		pid := newID(t)
-		liveSecretary(t, local, pid)
-		jobReq := map[string]any{"command": []any{"echo", "hi"}}
-		jobID := fmt.Sprintf("j-race-%d", i)
-		destination := newID(t)
+		t.Run(fmt.Sprintf("race-%d", i), func(t *testing.T) {
+			local := newPlacement(t)
+			pid := newID(t)
+			liveSecretary(t, local, pid)
+			jobReq := map[string]any{"command": []any{"echo", "hi"}}
+			jobID := fmt.Sprintf("j-race-%d", i)
+			destination := newID(t)
 
-		submitErr := make(chan error, 1)
-		go func() {
-			_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
-			submitErr <- err
-		}()
-		sealErr := make(chan error, 1)
-		go func() {
-			_, err := local.svc.Seal(ctx, pid, "move-race", destination)
-			sealErr <- err
-		}()
-		sErr, jErr := <-sealErr, <-submitErr
+			submitErr := make(chan error, 1)
+			go func() {
+				_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
+				submitErr <- err
+			}()
+			sealErr := make(chan error, 1)
+			go func() {
+				_, err := local.svc.Seal(ctx, pid, "move-race", destination)
+				sealErr <- err
+			}()
+			sErr, jErr := <-sealErr, <-submitErr
 
-		var queued bool
-		if err := local.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
-			pid, jobID).Scan(&queued); err != nil {
-			t.Fatal(err)
-		}
-		switch {
-		case sErr == nil && jErr == nil && queued:
-			t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
-		case sErr == nil:
-			if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
-				t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+			var queued bool
+			if err := local.pool.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
+				pid, jobID).Scan(&queued); err != nil {
+				t.Fatal(err)
 			}
-			if queued {
-				t.Fatalf("race %d: refused submit left a job row", i)
+			switch {
+			case sErr == nil && jErr == nil && queued:
+				t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
+			case sErr == nil:
+				if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
+					t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+				}
+				if queued {
+					t.Fatalf("race %d: refused submit left a job row", i)
+				}
+			case errors.Is(sErr, ErrUnresolvedOperations):
+				if jErr != nil || !queued {
+					t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
+				}
+			default:
+				t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
 			}
-		case errors.Is(sErr, ErrUnresolvedOperations):
-			if jErr != nil || !queued {
-				t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
-			}
-		default:
-			t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
-		}
+		})
 	}
 }
 

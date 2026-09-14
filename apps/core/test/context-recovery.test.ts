@@ -74,7 +74,14 @@ async function turn(s: Secretary, state: FakeState, id: string, text: string) {
 }
 
 const noticeOf = (req: ModelRequest) =>
-  req.messages.find((m) => m.content.includes("Working-context capacity notice"));
+  req.messages.find((m) =>
+    m.content.includes("Working-context capacity notice"),
+  );
+
+// Old exchanges carry real bulk so that halving the working view saves more
+// than the capacity notice costs — below that margin a resend is correctly
+// not attempted (the notice itself would make the send larger).
+const BULK = "y".repeat(2_000);
 
 test("recovery: a refused request retries on a reduced working view and completes", async () => {
   const state = new FakeState();
@@ -84,9 +91,10 @@ test("recovery: a refused request retries on a reduced working view and complete
   await s.start();
   // Four completed exchanges = eight older journal records.
   for (let i = 0; i < 4; i++) {
-    await turn(s, state, `old-${i}`, `old-${i}`);
+    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
   }
-  provider.script = (call) => (call === 5 ? refuseContext() : answer("still here"));
+  provider.script = (call) =>
+    call === 5 ? refuseContext() : answer("still here");
   await turn(s, state, "live", "the live request");
   assert.equal(provider.requests.length, 6);
 
@@ -102,7 +110,10 @@ test("recovery: a refused request retries on a reduced working view and complete
   // current input are not.
   const bodies = recovered.messages.map((m) => m.content);
   assert.ok(!bodies.some((c) => c.includes("old-0")), "evicted records absent");
-  assert.ok(bodies.some((c) => c.includes("old-2")), "retained tail present");
+  assert.ok(
+    bodies.some((c) => c.includes("old-2")),
+    "retained tail present",
+  );
   assert.equal(recovered.messages.at(-1)!.content, "[human] the live request");
   assert.equal(recovered.messages.at(-1)!.role, "user");
 
@@ -122,7 +133,7 @@ test("recovery: the in-turn assistant/tool suffix rides along; effects are not r
   const s = new Secretary(cfg(state, provider));
   await s.start();
   for (let i = 0; i < 4; i++) {
-    await turn(s, state, `old-${i}`, `old-${i}`);
+    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
   }
   provider.script = (call) => {
     if (call === 5) {
@@ -177,7 +188,7 @@ test("recovery: persistent refusals end in a bounded, honest failure", async () 
   await s.start();
   for (let i = 0; i < 4; i++) {
     provider.script = () => answer("ok");
-    await turn(s, state, `old-${i}`, `old-${i}`);
+    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
   }
   provider.script = () => refuseContext();
   await turn(s, state, "live", "too big");
@@ -188,9 +199,16 @@ test("recovery: persistent refusals end in a bounded, honest failure", async () 
   assert.match(noticeOf(provider.requests[6]!)!.content, /seq 1 through 6/);
 
   const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(input.status, "done", "a capacity failure is terminal, not requeued");
+  assert.equal(
+    input.status,
+    "done",
+    "a capacity failure is terminal, not requeued",
+  );
   const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
-  assert.match(String(failed.payload.error), /refused the request for context size/);
+  assert.match(
+    String(failed.payload.error),
+    /refused the request for context size/,
+  );
   assert.match(String(failed.payload.error), /2 reduced working-view attempt/);
   await s.stop();
 });
@@ -203,7 +221,7 @@ test("recovery: a refusal framed as retryable is still terminal", async () => {
   await s.start();
   for (let i = 0; i < 4; i++) {
     provider.script = () => answer("ok");
-    await turn(s, state, `old-${i}`, `old-${i}`);
+    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
   }
   // A provider can report a capacity refusal inside an otherwise
   // transient-looking error (e.g. an in-band stream error with a 5xx code).
@@ -212,17 +230,20 @@ test("recovery: a refusal framed as retryable is still terminal", async () => {
   provider.script = () =>
     (async function* () {
       yield { type: "text" as const, delta: "partial " };
-      throw new ModelError(
-        "provider stream error: context_length_exceeded",
-        { retryable: true, refusal: "context_length" },
-      );
+      throw new ModelError("provider stream error: context_length_exceeded", {
+        retryable: true,
+        refusal: "context_length",
+      });
     })();
   await turn(s, state, "live", "too big");
   assert.equal(provider.requests.length, 7); // 1 + 2 recoveries
   const input = state.inputs.find((i) => i.input_id === "live")!;
   assert.equal(input.status, "done", "capacity failure stays terminal");
   const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
-  assert.match(String(failed.payload.error), /refused the request for context size/);
+  assert.match(
+    String(failed.payload.error),
+    /refused the request for context size/,
+  );
   await s.stop();
 });
 
@@ -241,6 +262,32 @@ test("recovery: nothing reducible fails at once, without burning recoveries", as
   await s.stop();
 });
 
+test("recovery: a resend that the notice would not make smaller is not attempted", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const provider = new ScriptedProvider();
+  const s = new Secretary(cfg(state, provider));
+  await s.start();
+  // One small exchange: evicting it saves less than the notice costs, so
+  // the reduced view would be larger than the one just refused.
+  provider.script = () => answer("ok");
+  await turn(s, state, "old-0", "old-0");
+  provider.script = () => refuseContext();
+  await turn(s, state, "live", "too big");
+  // No second send: dropping the one reducible unit and paying the notice
+  // would not shrink the view.
+  assert.equal(provider.requests.length, 2);
+  const input = state.inputs.find((i) => i.input_id === "live")!;
+  assert.equal(input.status, "done", "terminal — not requeued");
+  const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
+  assert.match(
+    String(failed.payload.error),
+    /refused the request for context size/,
+  );
+  assert.match(String(failed.payload.error), /would not have been smaller/);
+  await s.stop();
+});
+
 test("recovery: a transient provider failure keeps its own retry semantics", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
@@ -250,7 +297,7 @@ test("recovery: a transient provider failure keeps its own retry semantics", asy
   await s.start();
   for (let i = 0; i < 4; i++) {
     provider.script = () => answer("ok");
-    await turn(s, state, `old-${i}`, `old-${i}`);
+    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
   }
   provider.script = () => failTransient();
   await turn(s, state, "live", "later");
@@ -310,7 +357,8 @@ test("recovery: eviction drops whole decision/call/result units and shrinks the 
   for (const e of evs) {
     if (e.kind === "tool_result") {
       const call = evs.find(
-        (x) => x.kind === "tool_call" && x.payload.call_id === e.payload.call_id,
+        (x) =>
+          x.kind === "tool_call" && x.payload.call_id === e.payload.call_id,
       );
       assert.ok(call, "result has a call");
       assert.equal(
@@ -352,10 +400,16 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
     },
     { kind: "assistant_message", payload: { text: big } },
     { kind: "tool_call", payload: { call_id: "c1", tool: "t", request: {} } },
-    { kind: "tool_result", payload: { call_id: "c1", tool: "t", response: {} } },
+    {
+      kind: "tool_result",
+      payload: { call_id: "c1", tool: "t", response: {} },
+    },
     { kind: "assistant_message", payload: { text: big } },
     { kind: "tool_call", payload: { call_id: "c2", tool: "t", request: {} } },
-    { kind: "tool_result", payload: { call_id: "c2", tool: "t", response: {} } },
+    {
+      kind: "tool_result",
+      payload: { call_id: "c2", tool: "t", response: {} },
+    },
     { kind: "assistant_message", payload: { text: "done" } },
     {
       kind: "input_received",
@@ -368,7 +422,7 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
     },
     { kind: "assistant_message", payload: { text: "hi" } },
   ];
-  evs.forEach((e, i) =>
+  evs.forEach((e, i) => {
     state.eventLog.push({
       persona_id: PERSONA,
       seq: i + 1,
@@ -376,8 +430,8 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
       kind: e.kind,
       payload: e.payload,
       created_at: "2026-09-15T00:00:00.000Z",
-    }),
-  );
+    });
+  });
   await state.memoryMaintain(PERSONA, lease.generation);
   // Same as the Go walk: no interior boundary exists inside the ~31k turn —
   // every continuation assistant follows a tool_result and a cut before a
@@ -405,7 +459,10 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
     },
     { kind: "assistant_message", payload: { text: big } },
     { kind: "tool_call", payload: { call_id: "c1", tool: "t", request: {} } },
-    { kind: "tool_result", payload: { call_id: "c1", tool: "t", response: {} } },
+    {
+      kind: "tool_result",
+      payload: { call_id: "c1", tool: "t", response: {} },
+    },
     { kind: "assistant_message", payload: { text: big } },
     {
       kind: "input_received",
@@ -418,7 +475,7 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
     },
     { kind: "assistant_message", payload: { text: "hi" } },
   ];
-  flow.forEach((e, i) =>
+  flow.forEach((e, i) => {
     state.eventLog.push({
       persona_id: persona2,
       seq: i + 1,
@@ -426,8 +483,8 @@ test("memory: the fake seal walk keeps an oversized committed turn whole", async
       kind: e.kind,
       payload: e.payload,
       created_at: "2026-09-15T00:00:00.000Z",
-    }),
-  );
+    });
+  });
   await state.memoryMaintain(persona2, lease2.generation);
   const c2 = state.memoryChunks.find((x) => x.persona_id === persona2)!;
   assert.equal(c2.last_seq, 5);

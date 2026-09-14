@@ -18,10 +18,17 @@
 // seal at >=10k estimated tokens, replace when live raw exceeds 40k. The
 // estimate is an internal capacity heuristic, not provider billing.
 //
-// Not in this layer yet: L1→L2 consolidation, L2 reintegration and the ~20k
-// in-turn evacuation boundary. Until they exist, applied fragments beyond
-// MemorySendCapTokens leave the sent context behind an explicit notice
-// (their originals stay readable), rather than growing every consultation.
+// Upper layers share the same pipeline (docs/agent/memory.md steps 4–5,
+// memory-boundaries-2026-09-08). When applied L1 replacements exceed
+// L1LimitTokens, the writer creates a sealed layer-2 target over the oldest
+// contiguous applied L1 fragments; a branch replaces their combined text
+// with one smaller L2 fragment, and the sources become 'superseded' — the
+// accepted decisions and their texts stay durable, their ranges are
+// represented by the applied target. Applied L2 beyond L2LimitTokens is
+// reintegrated the same way: a target whose sources are L2 fragments may
+// rearrange material within them, importing nothing from other layers.
+// Selected sources alone supply a replacement — later corrections and
+// fragments outside the selection are never folded in.
 package agentstate
 
 import (
@@ -67,6 +74,16 @@ const (
 	// memory range — stored, not summarized, originals readable — instead
 	// of silently growing (or one huge replacement poisoning) every turn.
 	MemorySendCapTokens int64 = 25_000
+	// L1LimitTokens: applied L1 replacement text beyond this triggers an
+	// L1→L2 consolidation target (docs/agent/memory.md: L1 holds ~15k).
+	L1LimitTokens int64 = 15_000
+	// L1DropToTokens: one L1→L2 target consumes the oldest contiguous
+	// applied L1 fragments until at most this much applied L1 remains
+	// unselected — the design's drop-to hysteresis.
+	L1DropToTokens int64 = 11_000
+	// L2LimitTokens: applied L2 beyond this triggers L2-internal
+	// reintegration over the whole contiguous applied L2 run.
+	L2LimitTokens int64 = 10_000
 	// contextMaxEvents is a defensive row bound on the rendered raw window;
 	// the token cap is the normal bound.
 	contextMaxEvents = 5_000
@@ -107,11 +124,17 @@ func estTextTokens(text string) int64 {
 	return (int64(len(text)) + 3) / 4
 }
 
-// MemoryChunk is one sealed journal range and its L1 replacement lifecycle.
+// MemoryChunk is one sealed journal range and its replacement lifecycle.
+// Layer 1 chunks seal raw journal events; layer 2 chunks are consolidation
+// targets whose Sources name the accepted fragments they consume.
 type MemoryChunk struct {
-	PersonaID            string     `json:"persona_id"`
-	ChunkSeq             int64      `json:"chunk_seq"`
-	Layer                int        `json:"layer"`
+	PersonaID string `json:"persona_id"`
+	ChunkSeq  int64  `json:"chunk_seq"`
+	Layer     int    `json:"layer"`
+	// Sources is the ordered chunk_seqs an upper-layer target consumes —
+	// the replacement's provenance. NULL for ordinary L0→L1 chunks. A
+	// 'kept' target's source tuple is what later selection dedups against.
+	Sources              []int64    `json:"sources"`
 	FirstSeq             int64      `json:"first_seq"`
 	LastSeq              int64      `json:"last_seq"`
 	EstTokens            int64      `json:"est_tokens"`
@@ -195,6 +218,9 @@ type MemoryStatus struct {
 	Applied       int   `json:"applied"`
 	Kept          int   `json:"kept"`
 	Failed        int   `json:"failed"`
+	// Superseded counts sources replaced by an applied upper-layer block —
+	// their accepted rows stay durable but no longer render raw.
+	Superseded int `json:"superseded"`
 	// Claimable counts chunks a claim could take now: sealed past their
 	// backoff, or 'preparing' rows the live writer is not running.
 	Claimable int `json:"claimable"`
@@ -211,20 +237,27 @@ type MemoryStatus struct {
 }
 
 // ClaimedMemoryChunk is a chunk plus everything the preparation branch needs:
-// the covered events verbatim and the rendered parent context at claim time.
+// the covered events verbatim (layer-1 target) or the selected source
+// fragments verbatim (upper-layer target), and the rendered parent context
+// at claim time.
 type ClaimedMemoryChunk struct {
-	Chunk        *MemoryChunk    `json:"chunk"`
-	TargetEvents []Event         `json:"target_events"`
-	Context      RenderedContext `json:"context"`
+	Chunk *MemoryChunk `json:"chunk"`
+	// TargetEvents is the sealed journal range's stored events — set for a
+	// layer-1 target, empty for an upper-layer one.
+	TargetEvents []Event `json:"target_events"`
+	// TargetFragments is the selected source fragments' accepted texts with
+	// their locators — set for an upper-layer target, empty for layer 1.
+	TargetFragments []MemoryBlock   `json:"target_fragments"`
+	Context         RenderedContext `json:"context"`
 }
 
-var chunkCols = `persona_id, chunk_seq, layer, first_seq, last_seq, est_tokens,
+var chunkCols = `persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
 	status, replacement, replacement_est_tokens, attempts, interruptions, last_error,
 	claimed_generation, claimed_at, not_before, created_at, prepared_at, applied_at`
 
 func scanChunk(row interface{ Scan(...any) error }) (MemoryChunk, error) {
 	var c MemoryChunk
-	err := row.Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.FirstSeq, &c.LastSeq,
+	err := row.Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.Sources, &c.FirstSeq, &c.LastSeq,
 		&c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens,
 		&c.Attempts, &c.Interruptions, &c.LastError, &c.ClaimedGeneration, &c.ClaimedAt,
 		&c.NotBefore, &c.CreatedAt, &c.PreparedAt, &c.AppliedAt)
@@ -274,12 +307,13 @@ func (s *Store) eventsInRange(ctx context.Context, db interface {
 }
 
 // renderedContext returns the journal as the model sees it: the newest raw
-// events not covered by an applied chunk, up to L0SendCapTokens (and the
-// caller's row bound), plus the newest applied blocks up to
-// MemorySendCapTokens. Applied blocks are admitted regardless of the raw
-// window — compacted memory stays in the context even when its original
-// range is older than the raw window. The newest record is always included,
-// even alone over the cap.
+// events not covered by an applied chunk (or by a superseded source — its
+// records are represented by the applied upper-layer block that consumed
+// it), up to L0SendCapTokens (and the caller's row bound), plus the newest
+// applied blocks up to MemorySendCapTokens. Applied blocks are admitted
+// regardless of the raw window — compacted memory stays in the context
+// even when its original range is older than the raw window. The newest
+// record is always included, even alone over the cap.
 //
 // excludeInputID names the input a turn is about to present itself: records
 // its earlier attempts already journaled mid-turn (its input_received and a
@@ -294,7 +328,7 @@ func (s *Store) renderedContext(ctx context.Context, db contextQuerier, personaI
 		WHERE e.persona_id = $1
 			AND NOT EXISTS (
 				SELECT 1 FROM core_memory_chunks c
-				WHERE c.persona_id = e.persona_id AND c.status = 'applied'
+				WHERE c.persona_id = e.persona_id AND c.status IN ('applied','superseded')
 					AND e.seq BETWEEN c.first_seq AND c.last_seq)
 			AND NOT EXISTS (
 				SELECT 1 FROM core_turns t
@@ -337,7 +371,7 @@ func (s *Store) renderedContext(ctx context.Context, db contextQuerier, personaI
 			WHERE e.persona_id = $1 AND e.seq < $2
 				AND NOT EXISTS (
 					SELECT 1 FROM core_memory_chunks c
-					WHERE c.persona_id = e.persona_id AND c.status = 'applied'
+					WHERE c.persona_id = e.persona_id AND c.status IN ('applied','superseded')
 						AND e.seq BETWEEN c.first_seq AND c.last_seq)
 				AND NOT EXISTS (
 					SELECT 1 FROM core_turns t
@@ -357,8 +391,10 @@ func (s *Store) renderedContext(ctx context.Context, db contextQuerier, personaI
 	return rc, nil
 }
 
-// appliedBlocks returns every applied chunk in journal order, with the
-// recorded time of its first and last covered event.
+// appliedBlocks returns every applied chunk in journal position order —
+// first_seq, not chunk_seq, so an upper-layer block renders at its
+// earliest source's position — with the recorded time of its first and
+// last covered event.
 func (s *Store) appliedBlocks(ctx context.Context, db interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }, personaID string) ([]MemoryBlock, error) {
@@ -369,7 +405,7 @@ func (s *Store) appliedBlocks(ctx context.Context, db interface {
 		JOIN core_events f ON f.persona_id = c.persona_id AND f.seq = c.first_seq
 		JOIN core_events l ON l.persona_id = c.persona_id AND l.seq = c.last_seq
 		WHERE c.persona_id = $1 AND c.status = 'applied'
-		ORDER BY c.chunk_seq`, personaID)
+		ORDER BY c.first_seq`, personaID)
 	if err != nil {
 		return nil, err
 	}
@@ -584,13 +620,17 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	// boundary follows it, and it contributes to the raw estimate.
 	tailEst := windowEst
 
-	// Live raw = every not-yet-applied chunk (its originals still render)
-	// plus the unsealed tail. Applied chunks contribute their replacement
-	// estimate to the compacted portion instead.
+	// Live raw = every not-yet-applied layer-1 chunk (its originals still
+	// render) plus the unsealed tail. An upper-layer row never counts: its
+	// range is already represented by its sources' layer-1 accounting while
+	// they live, and by its applied replacement afterwards. 'superseded'
+	// sources leave the count because their events no longer render raw —
+	// the applied upper block represents them.
 	var chunkRaw int64
 	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE(SUM(est_tokens), 0) FROM core_memory_chunks
-		WHERE persona_id = $1 AND status <> 'applied'`, personaID).Scan(&chunkRaw); err != nil {
+		WHERE persona_id = $1 AND layer = 1 AND status NOT IN ('applied','superseded')`,
+		personaID).Scan(&chunkRaw); err != nil {
 		return st, err
 	}
 	live := chunkRaw + tailEst
@@ -603,7 +643,7 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 		prows, err := tx.Query(ctx, `
 			SELECT chunk_seq, est_tokens, COALESCE(replacement_est_tokens, 0)
 			FROM core_memory_chunks
-			WHERE persona_id = $1 AND status = 'prepared'
+			WHERE persona_id = $1 AND layer = 1 AND status = 'prepared'
 			ORDER BY chunk_seq FOR UPDATE`, personaID)
 		if err != nil {
 			return st, err
@@ -637,10 +677,254 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 			live -= c.est
 		}
 	}
+
+	// Upper layer: apply a prepared layer-2 target once the layer it
+	// consumes is still over its own limit — the same gate that created it,
+	// so a shelved candidate never lands on a layer that has since fallen
+	// under the threshold. Sources and target swap in this transaction:
+	// sources become 'superseded' (their accepted rows stay, their events
+	// stop rendering raw because the applied target now represents them)
+	// and the target becomes 'applied'.
+	urows, err := tx.Query(ctx, `
+		SELECT `+chunkCols+` FROM core_memory_chunks
+		WHERE persona_id = $1 AND layer >= 2 AND status = 'prepared'
+		ORDER BY chunk_seq FOR UPDATE`, personaID)
+	if err != nil {
+		return st, err
+	}
+	var preparedUpper []MemoryChunk
+	for urows.Next() {
+		c, err := scanChunk(urows)
+		if err != nil {
+			urows.Close()
+			return st, err
+		}
+		preparedUpper = append(preparedUpper, c)
+	}
+	urows.Close()
+	if err := urows.Err(); err != nil {
+		return st, err
+	}
+	for _, target := range preparedUpper {
+		if err := applyUpperTarget(ctx, tx, personaID, target); err != nil {
+			return st, err
+		}
+	}
+
+	// Then create the next upper-layer target when a layer is over its
+	// limit. One target at a time: a sealed/preparing/prepared upper row
+	// owns its source group until it is applied or kept.
+	if err := prepareUpperTarget(ctx, tx, personaID, &chunkSeq); err != nil {
+		return st, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return st, err
 	}
 	return s.MemoryStatus(ctx, personaID)
+}
+
+// appliedLayerTokens is the replacement-text estimate of one layer's
+// applied fragments — the layer's load as the send context carries it.
+func appliedLayerTokens(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, personaID string, layer int) (int64, error) {
+	var n int64
+	err := db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(replacement_est_tokens), 0) FROM core_memory_chunks
+		WHERE persona_id = $1 AND layer = $2 AND status = 'applied'`,
+		personaID, layer).Scan(&n)
+	return n, err
+}
+
+// applyUpperTarget applies one prepared layer-2 target if its layer gate
+// still holds. A target whose sources are no longer all applied cannot be
+// reconstructed (unreachable while the one-in-flight rule holds, but the
+// check is the honest answer if a bundle or another path produced one):
+// it is marked failed, its sources untouched, without spending attempts.
+func applyUpperTarget(ctx context.Context, tx pgx.Tx, personaID string, target MemoryChunk) error {
+	type src struct {
+		seq, layer int64
+		status     string
+	}
+	srows, err := tx.Query(ctx, `
+		SELECT chunk_seq, layer, status FROM core_memory_chunks
+		WHERE persona_id = $1 AND chunk_seq = ANY($2) FOR UPDATE`,
+		personaID, target.Sources)
+	if err != nil {
+		return err
+	}
+	var srcs []src
+	for srows.Next() {
+		var s src
+		if err := srows.Scan(&s.seq, &s.layer, &s.status); err != nil {
+			srows.Close()
+			return err
+		}
+		srcs = append(srcs, s)
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		return err
+	}
+	srcLayer := int64(0)
+	stale := len(srcs) != len(target.Sources)
+	for _, s := range srcs {
+		if s.status != "applied" {
+			stale = true
+		}
+		if srcLayer == 0 {
+			srcLayer = s.layer
+		} else if s.layer != srcLayer {
+			stale = true
+		}
+	}
+	if srcLayer != 1 && srcLayer != 2 {
+		stale = true
+	}
+	if stale {
+		_, err := tx.Exec(ctx, `
+			UPDATE core_memory_chunks SET status = 'failed',
+				last_error = 'upper-layer target is stale: its selected sources are no longer applied'
+			WHERE persona_id = $1 AND chunk_seq = $2 AND status = 'prepared'`,
+			personaID, target.ChunkSeq)
+		return err
+	}
+	var limit int64
+	if srcLayer == 1 {
+		limit = L1LimitTokens
+	} else {
+		limit = L2LimitTokens
+	}
+	total, err := appliedLayerTokens(ctx, tx, personaID, int(srcLayer))
+	if err != nil {
+		return err
+	}
+	if total <= limit {
+		return nil // the layer settled under its limit; the target stays shelved
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE core_memory_chunks SET status = 'superseded'
+		WHERE persona_id = $1 AND chunk_seq = ANY($2) AND status = 'applied'`,
+		personaID, target.Sources)
+	if err != nil {
+		return err
+	}
+	if int(tag.RowsAffected()) != len(target.Sources) {
+		return fmt.Errorf("%w: upper target %d lost sources mid-apply", ErrMemoryConflict, target.ChunkSeq)
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE core_memory_chunks SET status = 'applied', applied_at = now()
+		WHERE persona_id = $1 AND chunk_seq = $2 AND status = 'prepared'`,
+		personaID, target.ChunkSeq)
+	return err
+}
+
+// prepareUpperTarget creates at most one sealed layer-2 target per pass,
+// from the oldest contiguous run of applied fragments in the layer that is
+// over its limit. L1→L2 consumes oldest-first until the unselected applied
+// remainder drops to L1DropToTokens; L2 reintegration takes the whole
+// contiguous applied L2 run. Contiguity is tile-adjacency in the journal:
+// chunks seal contiguous ranges, so source b follows source a only when
+// b.first_seq = a.last_seq + 1 — a kept chunk, a still-raw range or an
+// unrelated fragment between them ends the run, and a later correction
+// outside the span is never folded into an earlier replacement.
+// A selection identical to a settled ('kept' or 'failed') target's source
+// tuple is skipped: the verdict already holds for exactly those sources.
+func prepareUpperTarget(ctx context.Context, tx pgx.Tx, personaID string, chunkSeq *int64) error {
+	var busy bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM core_memory_chunks
+			WHERE persona_id = $1 AND layer >= 2
+				AND status IN ('sealed','preparing','prepared'))`,
+		personaID).Scan(&busy); err != nil {
+		return err
+	}
+	if busy {
+		return nil
+	}
+	for _, sel := range []struct {
+		srcLayer int
+		limit    int64
+		dropTo   int64
+		// whole consumes the entire contiguous run (L2 reintegration);
+		// otherwise the run stops once the applied remainder fits dropTo.
+		whole bool
+	}{
+		{srcLayer: 1, limit: L1LimitTokens, dropTo: L1DropToTokens},
+		{srcLayer: 2, limit: L2LimitTokens, dropTo: L2LimitTokens, whole: true},
+	} {
+		total, err := appliedLayerTokens(ctx, tx, personaID, sel.srcLayer)
+		if err != nil {
+			return err
+		}
+		if total <= sel.limit {
+			continue
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT chunk_seq, first_seq, last_seq, replacement_est_tokens
+			FROM core_memory_chunks
+			WHERE persona_id = $1 AND layer = $2 AND status = 'applied'
+			ORDER BY first_seq`, personaID, sel.srcLayer)
+		if err != nil {
+			return err
+		}
+		type frag struct {
+			seq, first, last, rest int64
+		}
+		var frags []frag
+		for rows.Next() {
+			var f frag
+			if err := rows.Scan(&f.seq, &f.first, &f.last, &f.rest); err != nil {
+				rows.Close()
+				return err
+			}
+			frags = append(frags, f)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for i := 0; i < len(frags); {
+			group := []frag{frags[i]}
+			consumed := frags[i].rest
+			i++
+			for i < len(frags) && frags[i].first == group[len(group)-1].last+1 &&
+				(sel.whole || consumed < total-sel.dropTo) {
+				group = append(group, frags[i])
+				consumed += frags[i].rest
+				i++
+			}
+			var srcSeqs []int64
+			for _, f := range group {
+				srcSeqs = append(srcSeqs, f.seq)
+			}
+			// A prior verdict applies only to this exact source tuple: a
+			// 'kept' row is the model's KEEP_UNCHANGED for those sources,
+			// and a 'failed' row exhausted its attempts — resealing the
+			// identical set would either relitigate the answer or burn a
+			// fresh attempt budget forever. A different grouping of the same
+			// shelf may still run.
+			var settled bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS(SELECT 1 FROM core_memory_chunks
+					WHERE persona_id = $1 AND layer >= 2 AND status IN ('kept','failed')
+						AND sources = $2::bigint[])`,
+				personaID, srcSeqs).Scan(&settled); err != nil {
+				return err
+			}
+			if settled {
+				continue
+			}
+			*chunkSeq++
+			_, err := tx.Exec(ctx, `
+				INSERT INTO core_memory_chunks
+					(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens, status)
+				VALUES ($1, $2, 2, $3, $4, $5, $6, 'sealed')`,
+				personaID, *chunkSeq, srcSeqs, group[0].first, group[len(group)-1].last, consumed)
+			return err
+		}
+	}
+	return nil
 }
 
 // MemoryStatus reads the current memory shape without mutating it.
@@ -652,7 +936,8 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 	}
 	err := s.pool.QueryRow(ctx, `
 		SELECT
-			COALESCE(SUM(est_tokens) FILTER (WHERE status <> 'applied'), 0),
+			COALESCE(SUM(est_tokens) FILTER (WHERE layer = 1
+				AND status NOT IN ('applied','superseded')), 0),
 			COALESCE(SUM(replacement_est_tokens) FILTER (WHERE status = 'applied'), 0),
 			COUNT(*) FILTER (WHERE status = 'sealed'),
 			COUNT(*) FILTER (WHERE status = 'preparing'),
@@ -660,6 +945,7 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			COUNT(*) FILTER (WHERE status = 'applied'),
 			COUNT(*) FILTER (WHERE status = 'kept'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'superseded'),
 			COUNT(*) FILTER (WHERE status = 'preparing'
 				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= now()))),
 			MIN(CASE WHEN status = 'preparing' THEN now()
@@ -667,15 +953,15 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			COALESCE(MAX(last_seq), 0)
 		FROM core_memory_chunks WHERE persona_id = $1`, personaID).
 		Scan(&st.LiveRawTokens, &st.AppliedTokens, &st.Sealed, &st.Preparing,
-			&st.Prepared, &st.Applied, &st.Kept, &st.Failed, &st.Claimable,
-			&st.NextClaimableAt, &st.CoveredSeq)
+			&st.Prepared, &st.Applied, &st.Kept, &st.Failed, &st.Superseded,
+			&st.Claimable, &st.NextClaimableAt, &st.CoveredSeq)
 	if err != nil {
 		return st, err
 	}
 	if st.Applied > 0 {
 		rows, err := s.pool.Query(ctx, `
 			SELECT COALESCE(replacement_est_tokens, 0) FROM core_memory_chunks
-			WHERE persona_id = $1 AND status = 'applied' ORDER BY chunk_seq`, personaID)
+			WHERE persona_id = $1 AND status = 'applied' ORDER BY first_seq`, personaID)
 		if err != nil {
 			return st, err
 		}
@@ -765,18 +1051,75 @@ func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generati
 	if err != nil {
 		return nil, fmt.Errorf("claim memory chunk: %w", dataErr(err))
 	}
-	events, err := s.eventsInRange(ctx, tx, personaID, c.FirstSeq, c.LastSeq)
-	if err != nil {
-		return nil, err
+	claimed := &ClaimedMemoryChunk{Chunk: &c}
+	if c.Layer >= 2 {
+		// An upper-layer target's input is its selected sources' accepted
+		// texts with their locators — not raw events. The sources must all
+		// still be applied: a stale target (unreachable while the
+		// one-in-flight rule holds; possible only through a crafted or
+		// carried row) is marked failed without spending attempts rather
+		// than prepared from a different source set.
+		frows, err := tx.Query(ctx, `
+			SELECT s.chunk_seq, s.layer, s.first_seq, s.last_seq,
+				f.created_at, l.created_at, s.replacement, s.replacement_est_tokens, s.status
+			FROM core_memory_chunks s
+			JOIN core_events f ON f.persona_id = s.persona_id AND f.seq = s.first_seq
+			JOIN core_events l ON l.persona_id = s.persona_id AND l.seq = s.last_seq
+			WHERE s.persona_id = $1 AND s.chunk_seq = ANY($2)
+			ORDER BY s.first_seq`, personaID, c.Sources)
+		if err != nil {
+			return nil, err
+		}
+		stale := false
+		var frags []MemoryBlock
+		for frows.Next() {
+			var b MemoryBlock
+			var status string
+			if err := frows.Scan(&b.ChunkSeq, &b.Layer, &b.FirstSeq, &b.LastSeq,
+				&b.FirstTime, &b.LastTime, &b.Text, &b.EstTokens, &status); err != nil {
+				frows.Close()
+				return nil, err
+			}
+			if status != "applied" {
+				stale = true
+			}
+			frags = append(frags, b)
+		}
+		frows.Close()
+		if err := frows.Err(); err != nil {
+			return nil, err
+		}
+		if stale || len(frags) != len(c.Sources) {
+			if _, err := tx.Exec(ctx, `
+				UPDATE core_memory_chunks SET status = 'failed', claimed_generation = NULL,
+					claimed_at = NULL,
+					last_error = 'upper-layer target is stale: its selected sources are no longer applied'
+				WHERE persona_id = $1 AND chunk_seq = $2`,
+				personaID, c.ChunkSeq); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return &ClaimedMemoryChunk{}, nil
+		}
+		claimed.TargetFragments = frags
+	} else {
+		events, err := s.eventsInRange(ctx, tx, personaID, c.FirstSeq, c.LastSeq)
+		if err != nil {
+			return nil, err
+		}
+		claimed.TargetEvents = events
 	}
 	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
 	if err != nil {
 		return nil, err
 	}
+	claimed.Context = rc
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &ClaimedMemoryChunk{Chunk: &c, TargetEvents: events, Context: rc}, nil
+	return claimed, nil
 }
 
 // CompleteMemoryChunk shelves the finished replacement candidate. The result

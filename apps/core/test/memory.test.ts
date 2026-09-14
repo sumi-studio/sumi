@@ -3,17 +3,22 @@ import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
 import {
   COMPACT_L1_PROMPT,
+  COMPACT_L1_TO_L2_PROMPT,
+  COMPACT_L2_REINTEGRATION_PROMPT,
   memoryBlockMessage,
   renderJournalContext,
+  runMemoryPreparation,
 } from "../src/memory.ts";
-import { MockProvider } from "../src/providers/mock.ts";
-import type {
-  ModelEvent,
-  ModelProvider,
-  ModelRequest,
+import {
+  ModelError,
+  type ModelEvent,
+  type ModelProvider,
+  type ModelRequest,
 } from "../src/provider.ts";
+import { MockProvider } from "../src/providers/mock.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
 import { toolSpecs } from "../src/tools.ts";
+import type { MemoryChunk } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-0000000000a1";
 /** ~11k estimated tokens per message: each exchange clears the 10k seal. */
@@ -463,6 +468,7 @@ test("memory: the fake admits applied fragments newest-first under the cap", asy
       persona_id: PERSONA,
       chunk_seq: k + 1,
       layer: 1,
+      sources: null,
       first_seq: 2 * k + 1,
       last_seq: 2 * k + 2,
       est_tokens: 20_000,
@@ -497,6 +503,317 @@ test("memory: the fake admits applied fragments newest-first under the cap", asy
     { count: 2, first: 1, last: 4, est: 20_000 },
   );
   assert.equal((await state.memoryStatus(PERSONA)).applied_omitted, 2);
+});
+
+// ---- Upper-layer memory: L1→L2 consolidation and L2 reintegration ----
+
+/** Push a chunk row in the shape the store itself maintains. */
+function pushChunk(
+  state: FakeState,
+  fields: Partial<MemoryChunk> & {
+    chunk_seq: number;
+    layer: number;
+    first_seq: number;
+    last_seq: number;
+  },
+): void {
+  state.memoryChunks.push({
+    persona_id: PERSONA,
+    sources: null,
+    est_tokens: 10_000,
+    status: "applied",
+    replacement: null,
+    replacement_est_tokens: null,
+    attempts: 0,
+    interruptions: 0,
+    last_error: null,
+    claimed_generation: null,
+    claimed_at: null,
+    not_before: null,
+    created_at: "2026-09-14T00:00:00.000Z",
+    prepared_at: null,
+    applied_at: null,
+    ...fields,
+  });
+}
+
+/** Small journal records so every chunk read returns complete messages. */
+function seedJournal(state: FakeState, count: number): void {
+  for (let i = 1; i <= count; i++) {
+    state.eventLog.push({
+      persona_id: PERSONA,
+      seq: i,
+      turn_id: "t",
+      kind: i % 2 === 1 ? "input_received" : "assistant_message",
+      payload:
+        i % 2 === 1
+          ? {
+              input_id: `u${i}`,
+              kind: "message",
+              payload: { text: `said ${i}` },
+              actor_kind: "human",
+            }
+          : { text: `answer ${i}` },
+      created_at: `2026-09-14T00:0${i}:00.000Z`,
+    });
+  }
+}
+
+/** A provider that captures its request and answers with fixed text. */
+class CaptureProvider implements ModelProvider {
+  readonly name = "capture";
+  req: ModelRequest | null = null;
+  private reply: string;
+  constructor(reply: string) {
+    this.reply = reply;
+  }
+  async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+    this.req = req;
+    yield { type: "text", delta: this.reply };
+    yield { type: "done", usage: {} };
+  }
+}
+
+const upperDeps = (state: FakeState, gen: number, provider: ModelProvider) => ({
+  personaId: PERSONA,
+  generation: gen,
+  state,
+  provider,
+  contextLimit: 5_000,
+  system: "SYS",
+  tools: [],
+});
+
+test("memory: applied L1 over its limit consolidates into an L2 target that supersedes its sources", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  seedJournal(state, 8);
+  // Four applied L1 fragments, ~4k each — 16k sits over the 15k limit.
+  for (let k = 0; k < 4; k++) {
+    pushChunk(state, {
+      chunk_seq: k + 1,
+      layer: 1,
+      first_seq: 2 * k + 1,
+      last_seq: 2 * k + 2,
+      replacement: `L1 fragment ${k + 1}`,
+      replacement_est_tokens: 4_000,
+    });
+  }
+  const gen = (await state.acquireWriter(PERSONA, "h", 30_000)).generation;
+
+  // Overflow → a sealed L2 target over the oldest contiguous applied run:
+  // consuming [1,2] (8k) leaves 8k applied, under the 11k drop-to.
+  await state.memoryMaintain(PERSONA, gen);
+  const target = state.memoryChunks.find((c) => c.layer === 2)!;
+  assert.equal(target.chunk_seq, 5);
+  assert.equal(target.status, "sealed");
+  assert.deepEqual(target.sources, [1, 2]);
+  assert.equal(target.first_seq, 1);
+  assert.equal(target.last_seq, 4);
+  assert.equal(target.est_tokens, 8_000);
+
+  // The preparation branch gets the L1→L2 instruction and the selected
+  // fragments' accepted texts — never raw events.
+  const provider = new CaptureProvider("L2: the first two days");
+  await runMemoryPreparation(upperDeps(state, gen, provider));
+  assert.equal(provider.req?.turnId, "memory-l2-5");
+  const tail = provider.req?.messages.at(-1)?.content ?? "";
+  assert.ok(tail.startsWith(COMPACT_L1_TO_L2_PROMPT), tail.slice(0, 200));
+  assert.ok(tail.includes('"kind":"compact_l1"'));
+  assert.ok(tail.includes("L1 fragment 1") && tail.includes("L1 fragment 2"));
+  assert.ok(!tail.includes("L1 fragment 3"), "unselected fragment not sent");
+  assert.equal(state.memoryChunks[4]!.status, "prepared");
+
+  // The layer is still over its limit: apply supersedes the sources in the
+  // same step, and the L2 block renders at their position.
+  await state.memoryMaintain(PERSONA, gen);
+  assert.equal(state.memoryChunks[0]!.status, "superseded");
+  assert.equal(state.memoryChunks[1]!.status, "superseded");
+  assert.equal(state.memoryChunks[4]!.status, "applied");
+  const res = await state.loadTurn(PERSONA, gen, "t-view", 100);
+  assert.deepEqual(
+    res.memory.map((b) => b.chunk_seq),
+    [5, 3, 4],
+    "the L2 block takes its earliest source's journal position",
+  );
+  assert.equal(res.memory[0]!.text, "L2: the first two days");
+  assert.equal(
+    res.context.filter((e) => e.seq <= 8).length,
+    0,
+    "no covered record renders raw",
+  );
+  const st = await state.memoryStatus(PERSONA);
+  assert.equal(st.superseded, 2);
+  assert.equal(st.applied, 3);
+});
+
+test("memory: applied L2 over its limit reintegrates the whole contiguous L2 run", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  seedJournal(state, 8);
+  // Two applied L2 blocks (~6k each → 12k > 10k), each over a superseded
+  // L1 pair — the shape consolidation leaves behind.
+  pushChunk(state, {
+    chunk_seq: 1,
+    layer: 1,
+    first_seq: 1,
+    last_seq: 2,
+    status: "superseded",
+    replacement: "L1 one",
+    replacement_est_tokens: 4_000,
+  });
+  pushChunk(state, {
+    chunk_seq: 2,
+    layer: 1,
+    first_seq: 3,
+    last_seq: 4,
+    status: "superseded",
+    replacement: "L1 two",
+    replacement_est_tokens: 4_000,
+  });
+  pushChunk(state, {
+    chunk_seq: 3,
+    layer: 2,
+    sources: [1, 2],
+    first_seq: 1,
+    last_seq: 4,
+    replacement: "L2 early days",
+    replacement_est_tokens: 6_000,
+  });
+  pushChunk(state, {
+    chunk_seq: 4,
+    layer: 1,
+    first_seq: 5,
+    last_seq: 6,
+    status: "superseded",
+    replacement: "L1 three",
+    replacement_est_tokens: 4_000,
+  });
+  pushChunk(state, {
+    chunk_seq: 5,
+    layer: 1,
+    first_seq: 7,
+    last_seq: 8,
+    status: "superseded",
+    replacement: "L1 four",
+    replacement_est_tokens: 4_000,
+  });
+  pushChunk(state, {
+    chunk_seq: 6,
+    layer: 2,
+    sources: [4, 5],
+    first_seq: 5,
+    last_seq: 8,
+    replacement: "L2 later days",
+    replacement_est_tokens: 6_000,
+  });
+  const gen = (await state.acquireWriter(PERSONA, "h", 30_000)).generation;
+
+  await state.memoryMaintain(PERSONA, gen);
+  const target = state.memoryChunks.find((c) => c.chunk_seq === 7)!;
+  assert.equal(target.layer, 2);
+  assert.equal(target.status, "sealed");
+  assert.deepEqual(target.sources, [3, 6]);
+  assert.equal(target.first_seq, 1);
+  assert.equal(target.last_seq, 8);
+
+  // The branch gets the reintegration instruction and the L2 fragments'
+  // texts — rearrangement stays inside the selection.
+  const provider = new CaptureProvider("L2: integrated week");
+  await runMemoryPreparation(upperDeps(state, gen, provider));
+  assert.equal(provider.req?.turnId, "memory-l2-7");
+  const tail = provider.req?.messages.at(-1)?.content ?? "";
+  assert.ok(
+    tail.startsWith(COMPACT_L2_REINTEGRATION_PROMPT),
+    tail.slice(0, 200),
+  );
+  assert.ok(tail.includes('"kind":"consolidate_l2"'));
+  assert.ok(tail.includes("L2 early days") && tail.includes("L2 later days"));
+  assert.ok(!tail.includes("L1 one"), "L1 coverage is not re-imported");
+  assert.equal(target.status, "prepared");
+
+  await state.memoryMaintain(PERSONA, gen);
+  assert.equal(state.memoryChunks[2]!.status, "superseded");
+  assert.equal(state.memoryChunks[5]!.status, "superseded");
+  assert.equal(target.status, "applied");
+  const res = await state.loadTurn(PERSONA, gen, "t-view", 100);
+  assert.deepEqual(
+    res.memory.map((b) => b.chunk_seq),
+    [7],
+    "one reintegrated block represents the whole span",
+  );
+  assert.equal(res.context.length, 0);
+});
+
+test("memory: a capacity refusal inside preparation fails terminally — the identical target can never succeed", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  seedJournal(state, 2);
+  pushChunk(state, {
+    chunk_seq: 1,
+    layer: 1,
+    first_seq: 1,
+    last_seq: 2,
+    status: "sealed",
+    est_tokens: 12_000,
+  });
+  const gen = (await state.acquireWriter(PERSONA, "h", 30_000)).generation;
+  // An in-band refusal may carry retryable:true; the identical send would
+  // fail again, so the verdict is terminal — not a paced retry.
+  const provider: ModelProvider = {
+    name: "refusing",
+    async *stream() {
+      yield { type: "text", delta: "partial" };
+      throw new ModelError("provider stream error: context_length_exceeded", {
+        retryable: true,
+        refusal: "context_length",
+      });
+    },
+  };
+  await runMemoryPreparation(upperDeps(state, gen, provider));
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "failed");
+  assert.equal(c.attempts, 1);
+  assert.equal(c.not_before, null, "no retry is scheduled");
+  assert.match(c.last_error ?? "", /context_length/);
+  // Originals stay: the sealed range still renders raw.
+  const res = await state.loadTurn(PERSONA, gen, "t-view", 100);
+  assert.equal(res.context.length, 2);
+});
+
+test("memory: a transient preparation error still returns to the shelf paced", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  seedJournal(state, 2);
+  pushChunk(state, {
+    chunk_seq: 1,
+    layer: 1,
+    first_seq: 1,
+    last_seq: 2,
+    status: "sealed",
+    est_tokens: 12_000,
+  });
+  const gen = (await state.acquireWriter(PERSONA, "h", 30_000)).generation;
+  const provider: ModelProvider = {
+    name: "flaky",
+    stream() {
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () =>
+            Promise.reject(
+              new ModelError("model request failed: 429 rate limited", {
+                retryable: true,
+              }),
+            ),
+        }),
+      };
+    },
+  };
+  await runMemoryPreparation(upperDeps(state, gen, provider));
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "sealed", "a transient failure re-shelves");
+  assert.equal(c.attempts, 1);
+  assert.ok(c.not_before, "retry is paced by backoff");
 });
 
 test("memory: a note follows its input, and the input is journaled exactly once", async () => {

@@ -14,11 +14,11 @@ import type {
   MemoryStatus,
   OmittedMemory,
   Operation,
-  RenderedContext,
   OutboxEntry,
   PersonaState,
   PlanCall,
   RecoverResult,
+  RenderedContext,
   Schedule,
   Turn,
   TurnPlan,
@@ -99,6 +99,12 @@ const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
 /** Estimated tokens of applied memory blocks admitted into one context. */
 const MEMORY_SEND_CAP_TOKENS = 25_000;
+/** Applied L1 beyond this triggers an L1→L2 consolidation target. */
+const L1_LIMIT_TOKENS = 15_000;
+/** One L1→L2 target consumes until at most this much applied L1 remains. */
+const L1_DROP_TO_TOKENS = 11_000;
+/** Applied L2 beyond this triggers L2-internal reintegration. */
+const L2_LIMIT_TOKENS = 10_000;
 /** Journal records one conversation_history search call scans. */
 const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
@@ -106,7 +112,10 @@ const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
-function estEventTokens(kind: string, payload: Record<string, unknown>): number {
+function estEventTokens(
+  kind: string,
+  payload: Record<string, unknown>,
+): number {
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
 }
 function estTextTokens(text: string): number {
@@ -211,8 +220,6 @@ export class FakeState implements StateClient {
    *  core_events and core_outbox, so a second persona starts at 1. */
   private seq = new Map<string, number>();
   private outboxSeq = new Map<string, number>();
-  /** Next chunk_seq per persona — matches MAX(chunk_seq) WHERE persona_id. */
-  private chunkSeq = new Map<string, number>();
 
   private key(persona: string, tool: string, idem: string) {
     return `${persona}|${tool}|${idem}`;
@@ -222,6 +229,19 @@ export class FakeState implements StateClient {
     const next = (map.get(persona) ?? 0) + 1;
     map.set(persona, next);
     return next;
+  }
+
+  /** Go allocates MAX(chunk_seq)+1 per persona, so rows seeded directly —
+   *  or carried in a future transfer — still get the next free seq. */
+  private nextChunkSeq(persona: string) {
+    return (
+      Math.max(
+        0,
+        ...this.memoryChunks
+          .filter((c) => c.persona_id === persona)
+          .map((c) => c.chunk_seq),
+      ) + 1
+    );
   }
 
   private mustHold(persona: string, generation: number) {
@@ -458,13 +478,19 @@ export class FakeState implements StateClient {
     limit: number,
     excludeInputId = "",
   ): RenderedContext {
-    const applied = this.memoryChunks.filter(
-      (c) => c.persona_id === persona && c.status === "applied",
+    // Applied and superseded chunks both cover their ranges: a superseded
+    // source's records are represented by the applied upper-layer block
+    // that consumed it, so they no longer render raw.
+    const covering = this.memoryChunks.filter(
+      (c) =>
+        c.persona_id === persona &&
+        (c.status === "applied" || c.status === "superseded"),
     );
+    const applied = covering.filter((c) => c.status === "applied");
     const uncovered = this.eventLog.filter(
       (e) =>
         e.persona_id === persona &&
-        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
+        !covering.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
         !(
           excludeInputId !== "" &&
           this.turns.get(e.turn_id)?.input_id === excludeInputId
@@ -506,7 +532,7 @@ export class FakeState implements StateClient {
       this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
         ?.created_at ?? "";
     const blocks = applied
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .sort((a, b) => a.first_seq - b.first_seq)
       .map((c) => ({
         chunk_seq: c.chunk_seq,
         layer: c.layer,
@@ -650,9 +676,7 @@ export class FakeState implements StateClient {
         );
       }
       if (
-        !this.inputs.some(
-          (i) => i.persona_id === persona && i.input_id === id,
-        )
+        !this.inputs.some((i) => i.persona_id === persona && i.input_id === id)
       ) {
         throw new StateError(400, `input_received names absent input ${id}`);
       }
@@ -993,7 +1017,7 @@ export class FakeState implements StateClient {
     if (operation !== "search" && operation !== "read") {
       throw bad("operation must be search or read");
     }
-    if (operation === "search" !== (query !== undefined)) {
+    if ((operation === "search") !== (query !== undefined)) {
       throw bad("search requires query and read must not carry one");
     }
     if (query === "") throw bad("search query must not be empty");
@@ -1004,13 +1028,18 @@ export class FakeState implements StateClient {
       throw bad("content_offset is only valid with read + seq");
     }
     const locators = [seq, chunkSeq, fromSeq].filter((v) => v !== null).length;
-    if (locators > 1) throw bad("seq, chunk_seq and from_seq are alternative locators");
+    if (locators > 1)
+      throw bad("seq, chunk_seq and from_seq are alternative locators");
     // chunk_seq + after_seq continues a page within that chunk's range.
     if (seq !== null && afterSeq !== null) {
       throw bad("seq cannot combine with after_seq");
     }
     const all = this.eventLog.filter((e) => e.persona_id === persona);
-    const details = (messages: Json[], nextAfterSeq: number | null, nextRead: Json | null): Json => ({
+    const details = (
+      messages: Json[],
+      nextAfterSeq: number | null,
+      nextRead: Json | null,
+    ): Json => ({
       operation,
       scope: "your_conversation_history",
       messages,
@@ -1123,7 +1152,9 @@ export class FakeState implements StateClient {
       const totalChars = runes.length;
       const offset = contentOffset ?? 0;
       if (offset > totalChars) {
-        throw bad(`content_offset ${offset} beyond record length ${totalChars}`);
+        throw bad(
+          `content_offset ${offset} beyond record length ${totalChars}`,
+        );
       }
       if (
         i >= limit ||
@@ -1186,7 +1217,7 @@ export class FakeState implements StateClient {
     this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
-    let covered = Math.max(0, ...mine().map((c) => c.last_seq));
+    const covered = Math.max(0, ...mine().map((c) => c.last_seq));
     // Seal walk: accumulate the unsealed tail; cut a chunk just before each
     // input_received once the window reaches the minimum and no tool call
     // in it is still waiting for its result. Past the forced limit, one
@@ -1218,12 +1249,12 @@ export class FakeState implements StateClient {
         }
       }
       if (cut) {
-        const nextChunkSeq = (this.chunkSeq.get(persona) ?? 0) + 1;
-        this.chunkSeq.set(persona, nextChunkSeq);
+        const nextChunkSeq = this.nextChunkSeq(persona);
         this.memoryChunks.push({
           persona_id: persona,
           chunk_seq: nextChunkSeq,
           layer: 1,
+          sources: null,
           first_seq: windowStart,
           last_seq: window[window.length - 1]?.seq ?? windowStart,
           est_tokens: windowEst,
@@ -1255,20 +1286,145 @@ export class FakeState implements StateClient {
       }
       prevKind = e.kind;
     }
-    // Live raw = every not-yet-applied chunk plus the unsealed tail.
+    // Live raw = every not-yet-applied layer-1 chunk plus the unsealed
+    // tail. Upper-layer rows and superseded sources never count: their
+    // ranges are represented by applied replacements, not raw events.
     let live =
       windowEst +
       mine()
-        .filter((c) => c.status !== "applied")
+        .filter(
+          (c) =>
+            c.layer === 1 &&
+            c.status !== "applied" &&
+            c.status !== "superseded",
+        )
         .reduce((s, c) => s + c.est_tokens, 0);
     if (live > L0_LIVE_LIMIT_TOKENS) {
       for (const c of mine()
-        .filter((c) => c.status === "prepared")
+        .filter((c) => c.layer === 1 && c.status === "prepared")
         .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
         if (live <= L0_LIVE_LIMIT_TOKENS) break;
         c.status = "applied";
         c.applied_at = new Date().toISOString();
         live -= c.est_tokens;
+      }
+    }
+    // A prepared upper-layer target applies once the layer it consumes is
+    // still over its own limit; its sources become 'superseded' in the same
+    // step so their ranges are represented by the target, not dropped.
+    const appliedTokens = (layer: number) =>
+      mine()
+        .filter((c) => c.layer === layer && c.status === "applied")
+        .reduce((s, c) => s + (c.replacement_est_tokens ?? 0), 0);
+    for (const target of mine()
+      .filter((c) => c.layer >= 2 && c.status === "prepared")
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
+      const srcs = (target.sources ?? []).map((seq) =>
+        mine().find((s) => s.chunk_seq === seq),
+      );
+      const srcLayer = srcs[0]?.layer ?? 0;
+      const stale =
+        srcs.length !== (target.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied" || s.layer !== srcLayer) ||
+        (srcLayer !== 1 && srcLayer !== 2);
+      if (stale) {
+        target.status = "failed";
+        target.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        continue;
+      }
+      const limit = srcLayer === 1 ? L1_LIMIT_TOKENS : L2_LIMIT_TOKENS;
+      if (appliedTokens(srcLayer) <= limit) continue;
+      for (const s of srcs) {
+        if (s) s.status = "superseded";
+      }
+      target.status = "applied";
+      target.applied_at = new Date().toISOString();
+    }
+    // Create the next upper-layer target: one in flight at a time. L1→L2
+    // consumes the oldest contiguous applied L1 run until the remainder
+    // drops to L1_DROP_TO; L2 reintegration takes the whole contiguous
+    // applied L2 run. A 'kept' target's exact source tuple is never
+    // re-selected.
+    const busy = mine().some(
+      (c) =>
+        c.layer >= 2 &&
+        (c.status === "sealed" ||
+          c.status === "preparing" ||
+          c.status === "prepared"),
+    );
+    if (!busy) {
+      for (const sel of [
+        {
+          srcLayer: 1,
+          limit: L1_LIMIT_TOKENS,
+          dropTo: L1_DROP_TO_TOKENS,
+          whole: false,
+        },
+        {
+          srcLayer: 2,
+          limit: L2_LIMIT_TOKENS,
+          dropTo: L2_LIMIT_TOKENS,
+          whole: true,
+        },
+      ]) {
+        const total = appliedTokens(sel.srcLayer);
+        if (total <= sel.limit) continue;
+        const frags = mine()
+          .filter((c) => c.layer === sel.srcLayer && c.status === "applied")
+          .sort((a, b) => a.first_seq - b.first_seq);
+        for (let i = 0; i < frags.length; ) {
+          const group = [frags[i] as MemoryChunk];
+          let consumed = group[0]?.replacement_est_tokens ?? 0;
+          i++;
+          while (
+            i < frags.length &&
+            (frags[i] as MemoryChunk).first_seq ===
+              (group[group.length - 1] as MemoryChunk).last_seq + 1 &&
+            (sel.whole || consumed < total - sel.dropTo)
+          ) {
+            const f = frags[i] as MemoryChunk;
+            group.push(f);
+            consumed += f.replacement_est_tokens ?? 0;
+            i++;
+          }
+          const srcSeqs = group.map((f) => f.chunk_seq);
+          // A 'kept' or 'failed' verdict settles its exact source tuple —
+          // resealing it would relitigate the answer or burn a fresh
+          // attempt budget forever. A different grouping may still run.
+          const dup = mine().some(
+            (c) =>
+              c.layer >= 2 &&
+              (c.status === "kept" || c.status === "failed") &&
+              c.sources !== null &&
+              c.sources.length === srcSeqs.length &&
+              c.sources.every((s, j) => s === srcSeqs[j]),
+          );
+          if (dup) continue;
+          const nextChunkSeq = this.nextChunkSeq(persona);
+          this.memoryChunks.push({
+            persona_id: persona,
+            chunk_seq: nextChunkSeq,
+            layer: 2,
+            sources: srcSeqs,
+            first_seq: (group[0] as MemoryChunk).first_seq,
+            last_seq: (group[group.length - 1] as MemoryChunk).last_seq,
+            est_tokens: consumed,
+            status: "sealed",
+            replacement: null,
+            replacement_est_tokens: null,
+            attempts: 0,
+            interruptions: 0,
+            last_error: null,
+            claimed_generation: null,
+            claimed_at: null,
+            not_before: null,
+            created_at: new Date().toISOString(),
+            prepared_at: null,
+            applied_at: null,
+          });
+          return this.memoryStatus(persona);
+        }
       }
     }
     return this.memoryStatus(persona);
@@ -1290,17 +1446,22 @@ export class FakeState implements StateClient {
         : c.status === "sealed"
           ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
           : null;
-    const ready = mine
-      .map(readyAt)
-      .filter((t): t is number => t !== null);
+    const ready = mine.map(readyAt).filter((t): t is number => t !== null);
     const appliedBlocks = mine
       .filter((c) => c.status === "applied")
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
-      .map((c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock);
+      .sort((a, b) => a.first_seq - b.first_seq)
+      .map(
+        (c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock,
+      );
     return {
       live_raw_tokens:
         mine
-          .filter((c) => c.status !== "applied")
+          .filter(
+            (c) =>
+              c.layer === 1 &&
+              c.status !== "applied" &&
+              c.status !== "superseded",
+          )
           .reduce((s, c) => s + c.est_tokens, 0) + tail,
       applied_tokens: mine
         .filter((c) => c.status === "applied")
@@ -1311,6 +1472,7 @@ export class FakeState implements StateClient {
       applied: count("applied"),
       kept: count("kept"),
       failed: count("failed"),
+      superseded: count("superseded"),
       claimable: ready.filter((t) => t <= now).length,
       next_claimable_at: ready.length
         ? new Date(Math.min(...ready)).toISOString()
@@ -1334,6 +1496,7 @@ export class FakeState implements StateClient {
     const empty = () => ({
       chunk: null,
       target_events: [],
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     });
     // Every 'preparing' chunk is an orphan from the caller's view (one branch
@@ -1352,6 +1515,47 @@ export class FakeState implements StateClient {
     c.claimed_generation = generation;
     c.claimed_at = new Date().toISOString();
     c.not_before = null;
+    if (c.layer >= 2) {
+      // An upper-layer target prepares from its selected sources' accepted
+      // texts, not raw events. A stale target (a source no longer applied)
+      // is marked failed without spending attempts — unreachable while the
+      // one-in-flight rule holds, but the honest answer for a carried row.
+      const at = (seq: number) =>
+        this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
+          ?.created_at ?? "";
+      const srcs = (c.sources ?? []).map((seq) =>
+        this.memoryChunks.find(
+          (s) => s.persona_id === persona && s.chunk_seq === seq,
+        ),
+      );
+      const stale =
+        srcs.length !== (c.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied");
+      if (stale) {
+        c.status = "failed";
+        c.claimed_generation = null;
+        c.claimed_at = null;
+        c.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        return empty();
+      }
+      const fragments = (srcs as MemoryChunk[]).map((s) => ({
+        chunk_seq: s.chunk_seq,
+        layer: s.layer,
+        first_seq: s.first_seq,
+        last_seq: s.last_seq,
+        first_time: at(s.first_seq),
+        last_time: at(s.last_seq),
+        text: s.replacement ?? "",
+        est_tokens: s.replacement_est_tokens ?? 0,
+      }));
+      return {
+        chunk: c,
+        target_events: [],
+        target_fragments: fragments,
+        context: this.renderedContext(persona, contextLimit),
+      };
+    }
     return {
       chunk: c,
       target_events: this.eventLog.filter(
@@ -1360,6 +1564,7 @@ export class FakeState implements StateClient {
           e.seq >= c.first_seq &&
           e.seq <= c.last_seq,
       ),
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     };
   }
@@ -1518,7 +1723,8 @@ export class FakeState implements StateClient {
       payload: {
         input_id: input.input_id,
         kind: input.kind,
-        text: typeof input.payload.text === "string" ? input.payload.text : null,
+        text:
+          typeof input.payload.text === "string" ? input.payload.text : null,
         actor_kind: input.actor_kind,
         source_surface: input.source_surface,
         attempt: turn.attempt,
