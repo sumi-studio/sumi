@@ -141,7 +141,7 @@ var cutChecks = []struct{ name, sql string }{
 	// destination claims inputs in the order the source accepted them. The
 	// identity sequence only ever assigns unique positive values; a
 	// non-positive or duplicated one is a crafted row that corrupts or
-	// ambiguates that order.
+	// makes that order ambiguous.
 	{"input_admission_seq_invalid", `
 		SELECT count(*) FROM core_inputs i
 		WHERE i.persona_id = $1 AND i.admission_seq < 1`},

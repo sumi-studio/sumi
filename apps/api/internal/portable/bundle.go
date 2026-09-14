@@ -240,10 +240,12 @@ func (t table) insertSQL() string {
 	// A carried identity column keeps the value the source assigned; without
 	// OVERRIDING SYSTEM VALUE a GENERATED ALWAYS column rejects the insert.
 	override := ""
-	for _, c := range t.cols {
-		if c.identity {
-			override = " OVERRIDING SYSTEM VALUE"
-			break
+	if col, ok := identityCols[t.name]; ok {
+		for _, c := range t.cols {
+			if c.name == col {
+				override = " OVERRIDING SYSTEM VALUE"
+				break
+			}
 		}
 	}
 	return fmt.Sprintf("INSERT INTO %s (%s)%s SELECT %s FROM (SELECT $1::jsonb AS d) r",
@@ -254,17 +256,12 @@ func (t table) insertSQL() string {
 // maximum, so the destination's next generated value orders after every
 // carried row instead of colliding with the values the bundle brought.
 func restartIdentities(ctx context.Context, tx pgx.Tx, personaID string) error {
-	for _, t := range coreTables {
-		for _, c := range t.cols {
-			if !c.identity {
-				continue
-			}
-			if _, err := tx.Exec(ctx, fmt.Sprintf(`
-				SELECT setval(pg_get_serial_sequence('%s', '%s'),
-					COALESCE((SELECT max(%s) FROM %s WHERE persona_id = $1), 0) + 1, false)`,
-				t.name, c.name, c.name, t.name), personaID); err != nil {
-				return fmt.Errorf("restart %s.%s: %w", t.name, c.name, err)
-			}
+	for name, col := range identityCols {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`
+			SELECT setval(pg_get_serial_sequence('%s', '%s'),
+				COALESCE((SELECT max(%s) FROM %s WHERE persona_id = $1), 0) + 1, false)`,
+			name, col, col, name), personaID); err != nil {
+			return fmt.Errorf("restart %s.%s: %w", name, col, err)
 		}
 	}
 	return nil

@@ -220,11 +220,14 @@ const (
 type column struct {
 	name string
 	kind colKind
-	// identity marks a GENERATED ALWAYS AS IDENTITY column whose values are
-	// carried verbatim: the import inserts with OVERRIDING SYSTEM VALUE and
-	// restarts the destination sequence past the staged maximum, so the
-	// order it encodes (e.g. input admission order) survives the move.
-	identity bool
+}
+
+// identityCols are GENERATED ALWAYS AS IDENTITY columns whose values are
+// carried verbatim: the import inserts them with OVERRIDING SYSTEM VALUE and
+// restarts the destination sequence past the staged maximum, so the order
+// they encode (e.g. input admission order) survives the move.
+var identityCols = map[string]string{
+	"core_inputs": "admission_seq",
 }
 
 type table struct {
@@ -251,7 +254,7 @@ var coreTables = []table{
 		{"done_at", colTime}, {"not_before", colTime}, {"received_seq", colBigint},
 		// admission_seq is the claim queue's order: carried verbatim so the
 		// destination claims inputs in the order the source accepted them.
-		{"admission_seq", colBigint, true},
+		{"admission_seq", colBigint},
 	}},
 	{name: "core_turns", orderBy: `turn_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"turn_id", colText}, {"input_id", colText}, {"generation", colBigint},
