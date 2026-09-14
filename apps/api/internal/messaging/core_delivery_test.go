@@ -24,10 +24,10 @@ import (
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
 
-// createSharedIntakeDB mirrors testdb.Create but names the database under
-// this slice's owned prefix (sumi_shared_intake_) so its databases can never
-// be confused with — or reused by — another reviewer's fixtures.
-func createSharedIntakeDB(t *testing.T) *pgxpool.Pool {
+// createOwnedTestDB mirrors testdb.Create but names the database under the
+// caller's owned prefix so its databases can never be confused with — or
+// reused by — another worker's fixtures.
+func createOwnedTestDB(t *testing.T, prefix string) *pgxpool.Pool {
 	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("SUMI_TEST_DB_URL"))
 	if databaseURL == "" {
@@ -41,7 +41,7 @@ func createSharedIntakeDB(t *testing.T) *pgxpool.Pool {
 	if _, err := rand.Read(suffix); err != nil {
 		t.Fatalf("generate db suffix: %v", err)
 	}
-	testDBName := "sumi_shared_intake_" + hex.EncodeToString(suffix)
+	testDBName := prefix + hex.EncodeToString(suffix)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -96,11 +96,19 @@ func swapSharedIntakePath(prefix string) string {
 	return prefix + "/"
 }
 
+func createSharedIntakeDB(t *testing.T) *pgxpool.Pool {
+	return createOwnedTestDB(t, "sumi_shared_intake_")
+}
+
 // newSharedIntakeWorld mirrors newWorld on the owned database: two humans
 // (Yohaku, Haru) and one secretary (Kuro), synthetic and disposable.
 func newSharedIntakeWorld(t *testing.T, ctx context.Context) world {
 	t.Helper()
-	pool := createSharedIntakeDB(t)
+	return newWorldOnPool(t, ctx, createSharedIntakeDB(t))
+}
+
+func newWorldOnPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) world {
+	t.Helper()
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -769,6 +777,10 @@ func newSharedIntakeIsolatedPlace(t *testing.T, ctx context.Context, w world) st
 // startSharedIntakeCoreServer mounts the real agentstate HTTP contract on an
 // owned port so the real Node core can run against it.
 func startSharedIntakeCoreServer(t *testing.T, w world, delivery *CoreAttentionDelivery) (*agentstate.Server, string) {
+	return startOwnedCoreServer(t, w, delivery, 9530, 9539)
+}
+
+func startOwnedCoreServer(t *testing.T, w world, delivery *CoreAttentionDelivery, portLo, portHi int) (*agentstate.Server, string) {
 	t.Helper()
 	const token = "shared-intake-test-token-0123456789"
 	srv := agentstate.NewServer(w.store.core.pool, token)
@@ -779,14 +791,14 @@ func startSharedIntakeCoreServer(t *testing.T, w world, delivery *CoreAttentionD
 	srv.RegisterRoutes(mux)
 	var ln net.Listener
 	var err error
-	for port := 9530; port <= 9539; port++ {
+	for port := portLo; port <= portHi; port++ {
 		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			break
 		}
 	}
 	if err != nil {
-		t.Fatalf("no free port in 9530-9539: %v", err)
+		t.Fatalf("no free port in %d-%d: %v", portLo, portHi, err)
 	}
 	httpSrv := &http.Server{Handler: mux}
 	go func() { _ = httpSrv.Serve(ln) }()

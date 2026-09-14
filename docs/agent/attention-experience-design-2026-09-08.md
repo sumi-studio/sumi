@@ -56,6 +56,27 @@ representation. Simply removing the filter while leaving all incoming messages
 styled as messages from the Human would preserve the original misunderstanding.
 Actual replies should use the destination's normal Messaging path.
 
+Edits and deletions of an already-delivered message are new attributed
+experiences, not retroactive rewrites: the durable intake path issues a fresh
+attention event carrying the message's new revision (with `message_change`
+`edited`, or `deleted` with empty content for the tombstone), so the
+secretary's journal keeps the original experience intact and the change marker
+shows what the conversation looks like now. Change recipients are the
+secretaries the message actually reached — recorded notification intents plus
+every live delivery row for the message (reply attention, poll-vote reports,
+reminders, earlier edit-added mentions) — and, when someone else makes the
+change, the message's own secretary author. An edit additionally re-evaluates
+current notification decisions so a mention added by an edit reaches the newly
+named secretary; a deletion selects nothing fresh. `reply_to` on a change
+event stays bound to the parent author it actually answers — observing that
+a message is a reply does not make it reply attention for an ambient
+recipient. A pending event whose source was superseded (edited then deleted
+before delivery) is suppressed as `source_unavailable`; the tombstone still
+delivers. The supported intake route is the core-state service selected by
+`SUMI_CORE_STATE_TOKEN` (`CoreAttentionDelivery`); the legacy agentevents
+adapter cannot represent change events and suppresses them terminally as
+`unsupported_route` rather than admitting an unmarked empty event.
+
 This document records product direction and a correction. It does not claim
 that the revised integration or UI has been implemented or accepted.
 
