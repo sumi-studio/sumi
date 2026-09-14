@@ -80,8 +80,25 @@ evidence, so no lost response, retry or partition creates two writers:
   (including `received_seq`, so an input already journaled mid-turn is never
   journaled a second time on the destination), `core_turns` (including
   `commit_request`), `core_turn_plans`, `core_events`, `core_operations`,
-  `core_schedules`, `core_outbox`, with exactly the columns in
-  `contract.go`. Unknown or missing columns are refused on both sides.
+  `core_schedules`, `core_outbox`, `core_memory_chunks`, with exactly the
+  columns in `contract.go`. Unknown or missing columns are refused on both
+  sides.
+- Memory travels as the secretary's own: `core_memory_chunks` carries the
+  sealed journal ranges with their `chunk_seq` locators, accepted replacement
+  text (`applied` and shelved `prepared`), the `kept`/`failed` verdicts, and
+  the attempts/interruptions history behind each — so a moved secretary keeps
+  its fragments instead of re-deriving them, and settled decisions are not
+  silently regenerated or retried on the destination. What never crosses is a
+  live execution claim: a `preparing` chunk belongs to the writer generation
+  the seal fenced, so the seal returns it to `sealed` and clears
+  `claimed_generation`/`claimed_at`/`not_before` before the cut. A bundle
+  carrying a claim, a chunk range outside the carried journal, or an
+  impossible range is refused at import. On the destination the memory
+  lifecycle continues ordinarily: `sealed` ranges (including a normalized
+  one) wait for their pacing and are claimed by the destination's writer, a
+  `prepared` candidate applies when live raw exceeds the limit, and the
+  first destination turn already sees `applied` fragments at their journal
+  positions.
 - `destination_id` is the destination's placement id (`GET /placement`); an
   import anywhere else is refused. `transfer_key` is a per-transfer random key
   the source mints at the seal; the destination stores it at import and uses it
@@ -92,12 +109,9 @@ evidence, so no lost response, retry or partition creates two writers:
   runner-owned execution bound to the placement that queued it; carrying a
   claim could run the same work twice, so job rows stay behind. A job's
   terminal notification is an ordinary `job:<job_id>` input and does cross
-  in `core_inputs` — the result still reaches the moved secretary. Also not
-  carried: `core_memory_chunks`, the memory layer's sealed ranges and L1
-  replacements. They are a derived projection over the journal; the journal
-  travels verbatim and the destination re-seals and re-prepares it through
-  ordinary memory maintenance. Carrying the projection itself is the
-  `memory_projection` section below.
+  in `core_inputs` — the result still reaches the moved secretary. Live
+  memory claims stay behind the same way (the seal normalizes them, above);
+  the durable memory itself is carried.
 - A reader refuses a format version, section or contract it does not implement.
   There is no compatibility layer; version 1 is the only version.
 - The digest detects truncation and corruption. It is not authentication: the
@@ -121,8 +135,9 @@ evidence, so no lost response, retry or partition creates two writers:
 - **Broken references.** Seal and import check references foreign keys do not
   enforce: input↔turn, event/operation↔turn, operation↔recorded plan position,
   running turn↔claimed input, wake input↔schedule, outbox↔turn/input,
-  contiguous journal and outbox sequences, and no generation at or above the
-  cut epoch.
+  contiguous journal and outbox sequences, no generation at or above the
+  cut epoch, no carried memory chunk holding a live claim, and every chunk
+  range inside the carried journal.
 
 ## Secrets
 
@@ -142,7 +157,6 @@ before a transfer may claim to preserve it:
 |---|---|---|
 | `files` | fabric-cloud (M11) | Scope↔persona/workspace binding; manifest of path, version and content SHA-256; bytes transferred separately and verified against the manifest before staging completes; version floor so destination CAS versions never go backwards; relative paths and links contained in the declared root. **At the seal, executor writes must actually stop** (unmount or stop the executor): CAS fences API writers only, and a direct POSIX write after the cut would be lost. Large content may pre-copy before the seal and send only the final delta at the cut. |
 | `jobs` | jobs-results (M09) | Today `core_jobs` is placement-local and the seal refuses while any job is non-terminal, so in-flight work can neither be lost nor duplicated; a finished job's `job:<job_id>` notification input does travel with the cut. The section still owed: carrying terminal job *records* for history, and a path that lets a move proceed with in-flight jobs — drained or recorded source-bound with result reconciliation — rather than blocking. Completion authority after the move would belong to the destination; a late source result is reconciled, not executed again. |
-| `memory_projection` | M06 | `core_memory_chunks` is placement-local today: the destination re-derives sealed ranges and replacements from the carried journal, so a moved secretary forms its memory again rather than keeping the source's fragments. Carrying the projection — chunk ranges, replacement texts and their lifecycle state — is the owed section. Encrypted originals may be re-encrypted for the destination. Search projections may be rebuilt there instead of carried. The journal and notes already travel in `core`. |
 | `approvals` | M08 | Pending human approvals carried as evidence, re-validated at the destination against the same operation, target and current permissions before use. |
 | `connections` | M08 / D9 | Connection metadata and provider context references only. Secrets never travel in a bundle; the receipt lists each connection needing reauthorization. |
 | `account_and_workspace` | koseki / workspace (M21) | Not imported. The destination's authenticated account decides human, employer and membership; local roles never become Cloud permissions. |

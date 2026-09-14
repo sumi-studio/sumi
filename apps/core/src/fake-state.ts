@@ -207,7 +207,8 @@ export class FakeState implements StateClient {
   private receivedSeq = new Map<string, number>();
   private seq = 0;
   private outboxSeq = 0;
-  private chunkSeq = 0;
+  /** Next chunk_seq per persona — matches MAX(chunk_seq) WHERE persona_id. */
+  private chunkSeq = new Map<string, number>();
 
   private key(persona: string, tool: string, idem: string) {
     return `${persona}|${tool}|${idem}`;
@@ -1168,9 +1169,11 @@ export class FakeState implements StateClient {
         pending.size === 0 &&
         windowEst >= L0_CHUNK_MIN_TOKENS
       ) {
+        const nextChunkSeq = (this.chunkSeq.get(persona) ?? 0) + 1;
+        this.chunkSeq.set(persona, nextChunkSeq);
         this.memoryChunks.push({
           persona_id: persona,
-          chunk_seq: ++this.chunkSeq,
+          chunk_seq: nextChunkSeq,
           layer: 1,
           first_seq: windowStart,
           last_seq: window[window.length - 1]?.seq ?? windowStart,

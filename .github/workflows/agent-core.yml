@@ -88,6 +88,9 @@ jobs:
       - name: Run Local→Cloud transfer e2e (two state services, two PostgreSQL databases)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:portable
 
+      - name: Run Local→Cloud memory-continuity e2e (carried chunks, fenced claims resume)
+        run: corepack pnpm --filter @sumi/agent-core test:e2e:portable:memory
+
       # Coverage note: every e2e path runs with SUMI_MODEL_PROVIDER=mock — no
       # real model calls or secrets, no Cloudflare deployment, no remote
       # database. The workerd smoke exercises the Durable Object wake path via

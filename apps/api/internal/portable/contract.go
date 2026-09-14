@@ -134,7 +134,10 @@ type Trailer struct {
 // the verified rows. Claimed inputs and running turns are interrupted work of
 // a source writer that no longer exists: the destination's first writer
 // recovers them through the ordinary recovery path, continuing any recorded
-// plan without repeating its completed operations.
+// plan without repeating its completed operations. The memory counts describe
+// the carried semantic memory: accepted fragments in context, shelved
+// candidates, verdicts, and the still-unprepared ranges the destination will
+// prepare itself.
 type Continuity struct {
 	JournalEvents    int64 `json:"journal_events"`
 	Notes            int64 `json:"notes"`
@@ -144,6 +147,11 @@ type Continuity struct {
 	UnfinishedPlans  int64 `json:"unfinished_plans"`
 	PendingSchedules int64 `json:"pending_schedules"`
 	UndeliveredOut   int64 `json:"undelivered_outbox"`
+	MemoryApplied    int64 `json:"memory_applied"`
+	MemoryPrepared   int64 `json:"memory_prepared"`
+	MemorySealed     int64 `json:"memory_sealed"`
+	MemoryKept       int64 `json:"memory_kept"`
+	MemoryFailed     int64 `json:"memory_failed"`
 }
 
 // Receipt is the verified result of a transfer step, stored in the ledger
@@ -187,8 +195,6 @@ var NotIncluded = []Exclusion{
 		Reason: "pending human approvals do not exist in core state; recorded turn plans are carried but are the model's decisions, not human approvals"},
 	{Name: "connections", Owner: "unassigned (M08, D9)",
 		Reason: "model and tool connections are not core state; credentials are never written into a bundle"},
-	{Name: "memory_projection", Owner: "unassigned (M06)",
-		Reason: "memory chunk rows are a derived projection over the journal and are rebuilt on the destination; the journal itself, including notes, is carried verbatim"},
 	{Name: "account_and_workspace", Owner: "koseki / workspace (M21)",
 		Reason: "human account, employer and workspace membership are resolved by the destination's authentication, never imported"},
 	{Name: "usage", Owner: "unassigned (M14)",
@@ -266,6 +272,22 @@ var coreTables = []table{
 		{"persona_id", colUUID}, {"seq", colBigint}, {"kind", colText}, {"payload", colJSON},
 		{"created_at", colTime}, {"delivered_at", colTime},
 	}},
+	// The memory layer's durable semantic memory carries verbatim: accepted
+	// replacement text, kept/failed verdicts, prepared candidates, the
+	// seq-anchored ranges and chunk_seq locators that carried notes and
+	// fragment headers reference, and the attempts/interruptions history
+	// behind each judgment. What does not cross is a live execution claim:
+	// the seal normalizes a 'preparing' row back to 'sealed' and clears its
+	// claim fields first, so no bundle can carry work still bound to a
+	// fenced source writer (verifyCut refuses a bundle that claims one).
+	{name: "core_memory_chunks", orderBy: `chunk_seq`, cols: []column{
+		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"layer", colInt},
+		{"first_seq", colBigint}, {"last_seq", colBigint}, {"est_tokens", colBigint},
+		{"status", colText}, {"replacement", colText}, {"replacement_est_tokens", colBigint},
+		{"attempts", colInt}, {"interruptions", colInt}, {"last_error", colText},
+		{"claimed_generation", colBigint}, {"claimed_at", colTime}, {"not_before", colTime},
+		{"created_at", colTime}, {"prepared_at", colTime}, {"applied_at", colTime},
+	}},
 }
 
 // placementLocalTables reference core_personas but are never carried: the
@@ -276,8 +298,4 @@ var coreTables = []table{
 var placementLocalTables = map[string]string{
 	"core_writer_leases": "live execution authority; the generation travels as cut.generation_high_water",
 	"core_jobs":          "runner-owned execution authority; seal refuses while a job is non-terminal, so job records stay with the placement that ran them",
-	// The journal the chunks summarize is carried verbatim; the destination
-	// re-seals and re-prepares from it as ordinary memory maintenance.
-	// Carrying the projection itself is a separate product slice.
-	"core_memory_chunks": "derived projection over the carried journal; rebuilt on the destination by ordinary memory maintenance",
 }

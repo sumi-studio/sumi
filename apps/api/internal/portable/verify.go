@@ -76,6 +76,22 @@ var cutChecks = []struct{ name, sql string }{
 				WHERE t.persona_id = o.persona_id AND t.turn_id = o.payload->>'turn_id')
 			OR NOT EXISTS (SELECT 1 FROM core_inputs i
 				WHERE i.persona_id = o.persona_id AND i.input_id = o.payload->>'input_id'))`},
+	// A memory chunk's claim is execution authority of a placement-bound
+	// writer; the seal normalizes live 'preparing' rows back to 'sealed'
+	// before the cut, so a bundle carrying a claim is malformed, not a
+	// transfer of in-flight work.
+	{"memory_chunk_claim_carried", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			c.status = 'preparing' OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
+	// Chunk ranges are locators into the carried journal; a range that
+	// reaches past it would render a fragment for records that do not
+	// exist.
+	{"memory_chunk_range_outside_journal", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			c.first_seq < 1
+			OR c.last_seq > (SELECT COALESCE(max(seq), 0) FROM core_events WHERE persona_id = $1))`},
 	{"journal_seq_not_contiguous", `
 		SELECT CASE WHEN count(*) = COALESCE(max(seq), 0) AND COALESCE(min(seq), 1) >= 1 THEN 0 ELSE 1 END
 		FROM core_events WHERE persona_id = $1`},

@@ -329,6 +329,19 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
+	// A 'preparing' chunk is a claim by the writer generation the seal just
+	// fenced: the branch can never record an outcome, so its claim is dead
+	// placement-local execution state. The cut carries the durable memory
+	// — verdicts, replacement text, ranges, attempt history — but never a
+	// live claim: the row returns to 'sealed' so the destination can claim
+	// it under its own writer. Attempts and interruptions are judgments and
+	// history, not claims; they carry unchanged.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_memory_chunks
+		SET status = 'sealed', claimed_generation = NULL, claimed_at = NULL, not_before = NULL
+		WHERE persona_id = $1 AND status = 'preparing'`, personaID); err != nil {
+		return Receipt{}, err
+	}
 	violations, err := verifyCut(ctx, tx, personaID)
 	if err != nil {
 		return Receipt{}, err
@@ -760,10 +773,16 @@ func summarize(ctx context.Context, q querier, personaID string) (map[string]int
 			(SELECT count(*) FROM core_schedules WHERE persona_id = $1 AND status IN ('pending', 'claimed')),
 			(SELECT count(*) FROM core_outbox WHERE persona_id = $1 AND delivered_at IS NULL),
 			(SELECT COALESCE(max(seq), 0) FROM core_events WHERE persona_id = $1),
-			(SELECT COALESCE(max(seq), 0) FROM core_outbox WHERE persona_id = $1)`,
+			(SELECT COALESCE(max(seq), 0) FROM core_outbox WHERE persona_id = $1),
+			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'applied'),
+			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'prepared'),
+			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'sealed'),
+			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'kept'),
+			(SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'failed')`,
 		personaID).Scan(&cont.JournalEvents, &cont.Notes, &cont.QueuedInputs, &cont.ClaimedInputs,
 		&cont.RunningTurns, &cont.UnfinishedPlans, &cont.PendingSchedules, &cont.UndeliveredOut,
-		&cut.LatestEventSeq, &cut.LatestOutboxSeq)
+		&cut.LatestEventSeq, &cut.LatestOutboxSeq,
+		&cont.MemoryApplied, &cont.MemoryPrepared, &cont.MemorySealed, &cont.MemoryKept, &cont.MemoryFailed)
 	return rows, cont, cut, err
 }
 
