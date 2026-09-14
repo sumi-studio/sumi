@@ -44,6 +44,7 @@ func main() {
 	if os.Getenv("FILESV_REQUIRE_MOUNT") == "1" {
 		svc.RequireMount()
 	}
+	svc.StartReconciler(ctx)
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           svc,

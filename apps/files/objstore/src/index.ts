@@ -306,7 +306,9 @@ export class BucketObject {
       1000,
     );
     const marker = v2
-      ? (url.searchParams.get("continuation-token") ?? "")
+      ? (url.searchParams.get("continuation-token") ??
+        url.searchParams.get("start-after") ??
+        "")
       : (url.searchParams.get("marker") ?? "");
     // Over-fetch then fold by delimiter so CommonPrefixes count correctly.
     const fetchLimit = maxKeys * 4 + 100;
@@ -326,6 +328,17 @@ export class BucketObject {
     let count = 0;
     let truncated = false;
     let lastKey = "";
+    // If the resume marker sits inside a folded prefix group, that prefix
+    // was already emitted on the previous page — seed `lastPrefix` so the
+    // group's remaining rows fold without re-emitting a duplicate
+    // CommonPrefix (operation-review B F8). The seed is only a dedup
+    // marker: it must NOT appear in this page's CommonPrefixes.
+    let lastPrefix = "";
+    if (delimiter && marker.startsWith(prefix)) {
+      const rest = marker.slice(prefix.length);
+      const d = rest.indexOf(delimiter);
+      if (d !== -1) lastPrefix = prefix + rest.slice(0, d) + delimiter;
+    }
     // lastKey is the resume token: the last *consumed* key. Folded rows
     // count as consumed (their prefix is already emitted), so resuming
     // after them neither re-emits a straddling prefix nor skips rows.
@@ -338,12 +351,13 @@ export class BucketObject {
         if (d !== -1) commonPrefix = prefix + rest.slice(0, d) + delimiter;
       }
       if (commonPrefix !== null) {
-        if (common[common.length - 1] !== commonPrefix) {
+        if (commonPrefix !== lastPrefix) {
           if (count >= maxKeys) {
             truncated = true;
             break;
           }
           common.push(commonPrefix);
+          lastPrefix = commonPrefix;
           count++;
         }
         lastKey = k;

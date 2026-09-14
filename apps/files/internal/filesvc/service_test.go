@@ -2,6 +2,7 @@ package filesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ type fakeStore struct {
 	vers   map[string]int64
 	fps    map[string]string
 	evs    []Event
+	seq    int64 // global monotonic version mint — mirrors file_version_seq
 	obsErr error // injected ObservedVersion failure (f33)
 }
 
@@ -62,18 +64,27 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 	default:
 		return 0, fmt.Errorf("bad mode")
 	}
-	f.vers[k] = cur + 1
-	return cur + 1, nil
+	// Global monotonic mint: versions never repeat at a path, so a stale
+	// token can never collide with a later incarnation (f48).
+	f.seq++
+	f.vers[k] = f.seq
+	return f.seq, nil
 }
 
 func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+	k := scope + "/" + path
+	prev, had := f.vers[k]
 	ver, err := f.bump(scope, path, iv, probe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
 	info, err := fn()
 	if err != nil {
-		f.vers[scope+"/"+path]-- // roll back the bump on FS failure
+		if had {
+			f.vers[k] = prev // roll back the row on FS failure (seq is consumed)
+		} else {
+			delete(f.vers, k)
+		}
 		return 0, FileInfo{}, err
 	}
 	f.fps[scope+"/"+path] = info.Fingerprint
@@ -81,14 +92,20 @@ func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv If
 	return ver, info, nil
 }
 
-func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
-	ver, err := f.bump(scope, to, iv, probe)
+func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+	k := scope + "/" + to
+	prev, had := f.vers[k]
+	ver, err := f.bump(scope, to, iv, casProbe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
 	info, err := fn()
 	if err != nil {
-		f.vers[scope+"/"+to]--
+		if had {
+			f.vers[k] = prev
+		} else {
+			delete(f.vers, k)
+		}
 		return 0, FileInfo{}, err
 	}
 	f.fps[scope+"/"+to] = info.Fingerprint
@@ -135,7 +152,8 @@ func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion
 			delete(f.fps, kk)
 		}
 	}
-	f.evs = append(f.evs, Event{Seq: int64(len(f.evs) + 1), Path: path, Op: "remove", Version: cur + 1})
+	f.seq++
+	f.evs = append(f.evs, Event{Seq: int64(len(f.evs) + 1), Path: path, Op: "remove", Version: f.seq})
 	return nil
 }
 
@@ -734,9 +752,9 @@ func TestRenameKindMismatch(t *testing.T) {
 	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"d"}`, nil)
 	req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"nonempty/inner"}`, nil)
 	for _, tc := range []struct{ from, to string }{
-		{"f", "d"},          // file over dir
-		{"d", "f"},          // dir over file
-		{"d", "nonempty"},   // dir over non-empty dir
+		{"f", "d"},        // file over dir
+		{"d", "f"},        // dir over file
+		{"d", "nonempty"}, // dir over non-empty dir
 	} {
 		w := req(t, svc, "POST", "/v1/files/ws1/rename", "tok-a",
 			fmt.Sprintf(`{"from":%q,"to":%q,"if_version":"any"}`, tc.from, tc.to), nil)
@@ -759,5 +777,144 @@ func TestTraversalRefused(t *testing.T) {
 		if w.Code == 200 {
 			t.Fatalf("path %q should not resolve", p)
 		}
+	}
+}
+
+// f48: a stale version token must never match a different object
+// incarnation. Versions mint from one global sequence — a rename-overwrite
+// or delete/recreate can never land on a value a client already holds.
+func TestVersionABAOnRenameOverwrite(t *testing.T) {
+	svc, _ := testSvc(t)
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=doc", "tok-a", "A", map[string]string{"If-Version": "none"})
+	w := req(t, svc, "PUT", "/v1/files/ws1/write?path=doc", "tok-a", "A2", map[string]string{"If-Version": "1"})
+	if w.Code != 200 {
+		t.Fatalf("second write: %d %s", w.Code, w.Body)
+	}
+	// doc is incarnation A at version 2. Object B (tmp) gets version 3.
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=tmp", "tok-a", "B", map[string]string{"If-Version": "none"})
+	w = req(t, svc, "POST", "/v1/files/ws1/rename", "tok-a", `{"from":"tmp","to":"doc","if_version":"any"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("rename-overwrite: %d %s", w.Code, w.Body)
+	}
+	// doc is now incarnation B at a fresh version (4). A's token (2) must
+	// not apply — under path-local versioning the rename minted exactly 2.
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=doc", "tok-a", "stale", map[string]string{"If-Version": "2"})
+	if w.Code != 409 {
+		t.Fatalf("stale token against new incarnation must 409, got %d", w.Code)
+	}
+}
+
+// f48: delete/recreate must not resurrect old tokens either.
+func TestVersionABAOnDeleteRecreate(t *testing.T) {
+	svc, _ := testSvc(t)
+	req(t, svc, "PUT", "/v1/files/ws1/write?path=f", "tok-a", "one", map[string]string{"If-Version": "none"})
+	w := req(t, svc, "DELETE", "/v1/files/ws1/remove?path=f", "tok-a", "", map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("remove: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=f", "tok-a", "two", map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("recreate: %d %s", w.Code, w.Body)
+	}
+	// A client holding version 1 of the deleted file must not CAS the new one.
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=f", "tok-a", "stale", map[string]string{"If-Version": "1"})
+	if w.Code != 409 {
+		t.Fatalf("stale token after delete/recreate must 409, got %d", w.Code)
+	}
+}
+
+// f54: a scope name that is a symlink to another scope must be refused —
+// token separation survives; ordinary in-scope symlinks still resolve.
+func TestScopeNameSymlinkRefused(t *testing.T) {
+	svc, dir := testSvc(t)
+	os.MkdirAll(filepath.Join(dir, "ws1"), 0o755)
+	os.WriteFile(filepath.Join(dir, "ws1", "secret.txt"), []byte("s"), 0o644)
+	if err := os.Symlink("ws1", filepath.Join(dir, "ws2")); err != nil {
+		t.Fatal(err)
+	}
+	// tok-b legitimately grants ws2 — the alias must not expose ws1 files.
+	w := req(t, svc, "GET", "/v1/files/ws2/read?path=secret.txt", "tok-b", "", nil)
+	if w.Code == 200 {
+		t.Fatal("scope-name symlink granted cross-scope access")
+	}
+	// Ordinary in-scope symlinks still work.
+	os.Symlink("secret.txt", filepath.Join(dir, "ws1", "link.txt"))
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=link.txt", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "s" {
+		t.Fatalf("in-scope symlink must resolve: %d %q", w.Code, w.Body)
+	}
+}
+
+// f49: list must report true kinds (dir/file/symlink/special) — the raw
+// Stat_t.Mode cast used to misclassify everything.
+func TestListKinds(t *testing.T) {
+	svc, dir := testSvc(t)
+	os.MkdirAll(filepath.Join(dir, "ws1", "d"), 0o755)
+	os.WriteFile(filepath.Join(dir, "ws1", "f"), []byte("x"), 0o644)
+	if err := syscall.Mkfifo(filepath.Join(dir, "ws1", "p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("f", filepath.Join(dir, "ws1", "l")); err != nil {
+		t.Fatal(err)
+	}
+	w := req(t, svc, "GET", "/v1/files/ws1/list?path=", "tok-a", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("list: %d %s", w.Code, w.Body)
+	}
+	var body struct {
+		Entries []ListEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]string{}
+	for _, e := range body.Entries {
+		kinds[e.Name] = e.Kind
+	}
+	want := map[string]string{"d": "dir", "f": "file", "p": "special", "l": "symlink"}
+	for n, k := range want {
+		if kinds[n] != k {
+			t.Fatalf("kind of %s: want %q got %q (all: %v)", n, k, kinds[n], kinds)
+		}
+	}
+}
+
+// f53: reading a socket must be 400 wrong_kind, not a generic 500.
+func TestSocketReadWrongKind(t *testing.T) {
+	svc, dir := testSvc(t)
+	os.MkdirAll(filepath.Join(dir, "ws1"), 0o755)
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: filepath.Join(dir, "ws1", "sock")}); err != nil {
+		t.Fatal(err)
+	}
+	syscall.Close(fd)
+	w := req(t, svc, "GET", "/v1/files/ws1/read?path=sock", "tok-a", "", nil)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "wrong_kind") {
+		t.Fatalf("socket read: want 400 wrong_kind, got %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "GET", "/v1/files/ws1/stat?path=sock", "tok-a", "", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"kind":"special"`) {
+		t.Fatalf("socket stat: want kind=special, got %d %s", w.Code, w.Body)
+	}
+}
+
+// f49: staging sweep must descend into subdirectories — the mode bug left
+// nested leftover staging files behind.
+func TestSweepNestedStaging(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "ws1", "sub")
+	os.MkdirAll(sub, 0o755)
+	stale := filepath.Join(sub, stagingPrefix+"abc")
+	os.WriteFile(stale, []byte("x"), 0o644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(stale, old, old)
+	if _, err := NewAt(dir, newFakeStore(), map[string]map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("nested staging file not swept: %v", err)
 	}
 }

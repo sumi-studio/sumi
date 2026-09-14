@@ -8,8 +8,29 @@ info:
     an isolated subtree root/<scope>/. Mutations take an If-Version header:
     "any" (unconditional), "none" (create-only; 409 if the path exists or has
     a service version), or an integer (CAS against the last service-minted
-    version). Service versions are cooperative among API writers; direct
-    executor/POSIX writes bypass them and are reported via external_change.
+    version). Versions are minted from one global monotonic sequence — a
+    version value is unique across paths and time, so a stale CAS token can
+    never match a different object that later occupies the same path (no
+    ABA across rename-overwrite or delete/recreate). Service versions are
+    cooperative among API writers; direct executor/POSIX writes bypass them
+    and are reported via external_change.
+    Durability: every mutation declares an intent row (with a pre-minted
+    version) before touching the filesystem, then applies version rows and
+    the journal event after the fs commit. A DB failure between fs commit
+    and apply leaves a recoverable intent, never silent divergence: the
+    reconciler re-checks the disk and rolls the DB forward or drops the
+    intent, including after a restart. Errors after a possibly-committed
+    fs mutation are surfaced, never reported as success. All mutations in
+    one scope serialize, so a directory rename cannot interleave with a
+    concurrent write's row bookkeeping. Store faults (deadline, dropped
+    connection, network error) are 503 store_unavailable on every op —
+    never version:0 or external_change:false.
+    Scope names must be real directories under the root — a scope name
+    that is a symlink is refused (400 wrong_kind), because a scope-root
+    alias would grant one scope's tokens access to another scope's files.
+    Ordinary
+    symlinks inside a scope remain supported (in-scope links resolve;
+    escaping ones are 403 escape_denied).
     Deployment requirement: the canonical mount the service roots on MUST
     run with zero client-side metadata caching (JuiceFS:
     --attr-cache=0 --entry-cache=0 --dir-entry-cache=0). A nonzero attr
@@ -94,7 +115,7 @@ paths:
         '200': { description: '{ "version": n }' }
         '409': { description: version_conflict }
         '413': { description: Body exceeds the 256 MiB service ceiling }
-        '503': { description: mount_unavailable }
+        '503': { description: mount_unavailable | store_unavailable }
   /v1/files/{scope}/rename:
     post:
       operationId: fileRename
@@ -105,15 +126,17 @@ paths:
         file-over-dir and dir-over-file are 400 wrong_kind; dir over a
         non-empty dir is 409 dir_not_empty; if_version "none" makes the
         destination check atomic (RENAME_NOREPLACE -> 409 external_change/
-        version_conflict). The renamed object keeps its version lineage:
-        the destination version is the source version + 1, and descendant
-        version rows move with the subtree. A failed rename leaves both
-        filesystem and version rows untouched.
+        version_conflict). The destination is minted a fresh global-sequence
+        version (never a reused value) and descendant version rows move
+        with the subtree. A rename refused before the fs commit leaves
+        both sides untouched; one that fails after the fs commit is
+        reconciled from disk state (see Durability).
       responses:
         '200': { description: '{ "version": n }' }
         '400': { description: wrong_kind on file/dir kind mismatch }
         '404': { description: Source not found }
         '409': { description: version_conflict | dir_not_empty | external_change }
+        '503': { description: mount_unavailable | store_unavailable }
   /v1/files/{scope}/mkdir:
     post:
       operationId: fileMkdir
@@ -130,6 +153,7 @@ paths:
         '200': { description: '{ "removed": true }' }
         '404': { description: Path not found }
         '409': { description: version_conflict }
+        '503': { description: mount_unavailable | store_unavailable }
   /v1/files/{scope}/changes:
     get:
       operationId: fileChanges

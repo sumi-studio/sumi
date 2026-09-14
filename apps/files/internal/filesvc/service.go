@@ -2,21 +2,25 @@ package filesvc
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // VersionStore is the persistence surface the service needs — *Store satisfies
 // it against real PG; tests substitute a fake.
 type VersionStore interface {
 	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
-	Rename(ctx context.Context, scope, from, to string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
+	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
 	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
@@ -335,7 +339,7 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 	// renameat2(RENAME_NOREPLACE), not just by the version row.
 	noReplace := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
 	ver, _, err := s.store.Rename(r.Context(), scope, rr.From, rr.To, iv,
-		s.probe(scope, rr.To),
+		s.probe(scope, rr.To), s.probe(scope, rr.From),
 		func() (FileInfo, error) {
 			return s.root.rename(scope, rr.From, rr.To, noReplace)
 		})
@@ -403,6 +407,54 @@ func (s *Service) handleChanges(w http.ResponseWriter, r *http.Request, scope st
 	writeJSON(w, map[string]any{"events": evs})
 }
 
+// isStoreErr classifies database faults: deadlines, connection errors,
+// severed pooled connections, and network errors all mean "the version
+// store could not answer" — 503 store_unavailable, not a 500 (f58).
+func isStoreErr(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	var ce *pgconn.ConnectError
+	if errors.As(err, &ce) {
+		return true
+	}
+	// pgx v5.7.5 reports a severed pooled conn as an unexported
+	// connLockError("conn closed") — no sentinel exists, so match text.
+	if strings.Contains(err.Error(), "conn closed") {
+		return true
+	}
+	var pge *pgconn.PgError
+	if errors.As(err, &pge) {
+		// SQLSTATE class 08 = connection exception; 57P* = server-side
+		// shutdown/drop/idle-timeout operator intervention.
+		return strings.HasPrefix(pge.Code, "08") ||
+			strings.HasPrefix(pge.Code, "57P")
+	}
+	return false
+}
+
+// StartReconciler runs the intent-journal reconciler against the real
+// filesystem: at startup, after any apply-failure, and periodically. A
+// mutation whose fs commit outlived its DB apply converges instead of
+// diverging. No-op for stores without a journal (test fakes).
+func (s *Service) StartReconciler(ctx context.Context) {
+	st, ok := s.store.(interface {
+		SetReconcile(StatFn, string)
+		ReconcileLoop(context.Context)
+	})
+	if !ok {
+		return
+	}
+	st.SetReconcile(s.root.stat, s.root.root)
+	go st.ReconcileLoop(ctx)
+}
+
 func (s *Service) mapErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrExternalChange):
@@ -424,6 +476,11 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 		writeErr(w, 409, "dir_not_empty", err.Error())
 	case errors.Is(err, ErrUnavailable):
 		writeErr(w, 503, "unavailable", "operation timed out; safe to retry")
+	case isStoreErr(err):
+		// All store faults share one retryable class — a PG outage must not
+		// look like an internal bug (f58).
+		writeErr(w, 503, "store_unavailable",
+			"version store unavailable; safe to retry")
 	default:
 		// Never leak host paths or syscall details in error bodies.
 		writeErr(w, 500, "internal", "internal error")

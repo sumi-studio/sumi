@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,16 @@ type posixRoot struct {
 	root         string
 	requireMount bool // refuse file ops when root is not a verified mount
 
+	mcMu       sync.Mutex
+	mcInflight *inflightMountCheck // single-flight: one checker serves all requests
+}
+
+// inflightMountCheck broadcasts one checkMountInner result to every caller
+// waiting on it — a wedged FUSE mount parks exactly one goroutine no matter
+// how many requests arrive (operation-review B F5).
+type inflightMountCheck struct {
+	done chan struct{}
+	err  error
 }
 
 // mountInfoEntry is one parsed /proc/self/mountinfo line.
@@ -158,11 +169,23 @@ const mountCheckTimeout = 5 * time.Second
 // this mount and a nonzero attr cache silently re-opens the B1 clobber
 // window.
 func (p *posixRoot) checkMount() error {
-	ch := make(chan error, 1)
-	go func() { ch <- p.checkMountInner() }()
+	p.mcMu.Lock()
+	ic := p.mcInflight
+	if ic == nil {
+		ic = &inflightMountCheck{done: make(chan struct{})}
+		p.mcInflight = ic
+		go func() {
+			ic.err = p.checkMountInner()
+			close(ic.done)
+			p.mcMu.Lock()
+			p.mcInflight = nil
+			p.mcMu.Unlock()
+		}()
+	}
+	p.mcMu.Unlock()
 	select {
-	case err := <-ch:
-		return err
+	case <-ic.done:
+		return ic.err
 	case <-time.After(mountCheckTimeout):
 		return ErrMountUnavailable
 	}
@@ -311,6 +334,12 @@ func mapPathErr(err error) error {
 		return ErrNotDir
 	case errors.Is(err, unix.ELOOP):
 		return ErrNotFound // unresolvable (symlink loop)
+	case errors.Is(err, unix.ENXIO):
+		return ErrWrongKind // open of a socket or unopenable device
+	case errors.Is(err, unix.ENOTCONN):
+		return ErrMountUnavailable // dead FUSE mount
+	case errors.Is(err, unix.EIO), errors.Is(err, unix.ECONNRESET), errors.Is(err, unix.ECONNABORTED):
+		return ErrUnavailable // transient backend/FUSE hiccup — retryable
 	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
 		return ErrAccess
 	default:
@@ -353,7 +382,10 @@ func validScope(scope string) error {
 }
 
 // scopeDir opens the scope's root directory. With create, a missing scope
-// dir is made first (first mutation of a scope).
+// dir is made first (first mutation of a scope). O_NOFOLLOW pins the scope
+// name to a real directory: a scope-name symlink would alias one scope's
+// tokens onto another scope's files (operation-review P2b/F7) — refused,
+// while ordinary symlinks INSIDE the scope remain supported.
 func (p *posixRoot) scopeDir(scope string, create bool) (*os.File, error) {
 	if err := validScope(scope); err != nil {
 		return nil, err
@@ -369,9 +401,10 @@ func (p *posixRoot) scopeDir(scope string, create bool) (*os.File, error) {
 			return nil, mapPathErr(err)
 		}
 	}
-	// RESOLVE_BENEATH follows an in-scope symlink at the scope name but
-	// refuses one that escapes the root.
-	return openBeneath(rfd, scope, unix.O_PATH|unix.O_DIRECTORY, 0)
+	// O_RDONLY (not O_PATH): the scope fd is also used for readdir of the
+	// scope root itself.
+	return openBeneath(rfd, scope,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 }
 
 // relPath normalizes a scope-relative path; ".." is rejected outright —
@@ -436,13 +469,45 @@ func syncDir(dfd *os.File) {
 	d.Close()
 }
 
+// unixToFileMode converts a raw unix mode word (S_IFMT type bits in the low
+// range) to fs.FileMode (type bits in the high range). A raw cast leaves
+// IsDir/IsRegular wrong — which misclassified every list entry and stopped
+// sweepDir from recursing (operation-review B F2).
+func unixToFileMode(m uint32) fs.FileMode {
+	fm := fs.FileMode(m & 0o7777)
+	switch m & unix.S_IFMT {
+	case unix.S_IFDIR:
+		fm |= fs.ModeDir
+	case unix.S_IFLNK:
+		fm |= fs.ModeSymlink
+	case unix.S_IFIFO:
+		fm |= fs.ModeNamedPipe
+	case unix.S_IFSOCK:
+		fm |= fs.ModeSocket
+	case unix.S_IFBLK:
+		fm |= fs.ModeDevice
+	case unix.S_IFCHR:
+		fm |= fs.ModeDevice | fs.ModeCharDevice
+	}
+	if m&unix.S_ISUID != 0 {
+		fm |= fs.ModeSetuid
+	}
+	if m&unix.S_ISGID != 0 {
+		fm |= fs.ModeSetgid
+	}
+	if m&unix.S_ISVTX != 0 {
+		fm |= fs.ModeSticky
+	}
+	return fm
+}
+
 // statAt lstats a single name beneath dfd — no traversal, cannot escape.
 func statAt(dfd *os.File, name string) (fs.FileMode, int64, int64, int64, error) {
 	var st unix.Stat_t
 	if err := unix.Fstatat(int(dfd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return 0, 0, 0, 0, mapPathErr(err)
 	}
-	return fs.FileMode(st.Mode), st.Size,
+	return unixToFileMode(st.Mode), st.Size,
 		st.Mtim.Sec*1e9 + st.Mtim.Nsec, st.Ctim.Sec*1e9 + st.Ctim.Nsec, nil
 }
 
