@@ -997,11 +997,13 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	// Exactly one input_received per input: if a mid-turn effect already
-	// journaled this input (see ensureInputReceived), the turn's own copy is
-	// skipped; otherwise the committed one is remembered as the input's.
-	// commit_request keeps the request as sent, so replays still compare.
-	events, err := withoutJournaledInput(ctx, tx, personaID, t.InputID, req.Events)
+	// Exactly one input_received per input ever lands in the journal: if a
+	// mid-turn effect already journaled the input (see ensureInputReceived)
+	// the commit's copy is skipped, and a second copy inside the request
+	// itself is dropped — a duplicate receipt is the same fact twice, not
+	// new history. commit_request keeps the request as sent, so replays
+	// still compare.
+	events, err := withoutJournaledInput(ctx, tx, personaID, req.Events)
 	if err != nil {
 		return nil, err
 	}
@@ -1014,13 +1016,21 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err := s.appendEventsTx(ctx, tx, personaID, turnID, events); err != nil {
 		return nil, dataErr(err)
 	}
+	// Link every input_received this commit journaled to its input's
+	// marker — not only this turn's input: a receipt for another input is
+	// unusual but journaled history, and leaving it unlinked would make the
+	// persona permanently unsealable under the cut's reverse-link check.
 	if _, err := tx.Exec(ctx, `
-		UPDATE core_inputs SET received_seq = (
-			SELECT MIN(seq) FROM core_events
-			WHERE persona_id = $1 AND seq > $3 AND kind = 'input_received'
-				AND payload->>'input_id' = $2)
-		WHERE persona_id = $1 AND input_id = $2 AND received_seq IS NULL`,
-		personaID, t.InputID, base); err != nil {
+		UPDATE core_inputs i SET received_seq = s.seq
+		FROM (
+			SELECT payload->>'input_id' AS input_id, MIN(seq) AS seq
+			FROM core_events
+			WHERE persona_id = $1 AND seq > $2 AND kind = 'input_received'
+			GROUP BY 1
+		) s
+		WHERE i.persona_id = $1 AND i.input_id = s.input_id
+			AND i.received_seq IS NULL`,
+		personaID, base); err != nil {
 		return nil, err
 	}
 	switch req.Outcome {
@@ -1360,22 +1370,57 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	return err
 }
 
-// withoutJournaledInput drops the turn's own input_received event when the
-// input is already in the journal.
-func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID, inputID string, events []EventInput) ([]EventInput, error) {
-	var received *int64
-	if err := tx.QueryRow(ctx,
-		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
-		personaID, inputID).Scan(&received); err != nil {
-		return nil, err
+// withoutJournaledInput enforces one input_received per input in the
+// journal: a copy naming an input whose marker is already set is dropped
+// (the receipt exists), and a second copy inside the request itself is
+// dropped (the first is the receipt). The marker check runs FOR UPDATE so
+// a commit cannot dedup against a marker another in-flight commit has not
+// recorded yet.
+func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, events []EventInput) ([]EventInput, error) {
+	var named []string
+	seen := map[string]bool{}
+	for _, e := range events {
+		if e.Kind != "input_received" {
+			continue
+		}
+		if id, _ := e.Payload["input_id"].(string); !seen[id] {
+			seen[id] = true
+			named = append(named, id)
+		}
 	}
-	if received == nil {
+	if len(named) == 0 {
 		return events, nil
 	}
+	journaled := map[string]bool{}
+	rows, err := tx.Query(ctx,
+		`SELECT input_id FROM core_inputs
+		 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
+		 FOR UPDATE`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		journaled[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
 	out := make([]EventInput, 0, len(events))
+	emitted := map[string]bool{}
 	for _, e := range events {
-		if id, _ := e.Payload["input_id"].(string); e.Kind == "input_received" && id == inputID {
-			continue
+		if e.Kind == "input_received" {
+			id, _ := e.Payload["input_id"].(string)
+			if journaled[id] || emitted[id] {
+				continue
+			}
+			emitted[id] = true
 		}
 		out = append(out, e)
 	}

@@ -146,6 +146,10 @@ evidence, so no lost response, retry or partition creates two writers:
   name that input's own `input_received` event in the carried journal, and
   every journaled `input_received` must be the one its input points at —
   otherwise the destination would drop the real event or journal it twice.
+  The store enforces the same invariant at the write boundary: a commit's
+  second copy of an input's receipt is dropped rather than journaled, and
+  every receipt a commit journals is linked to its input's marker — so a
+  commit the store accepted can never make the secretary unsealable.
 
 ## Secrets
 

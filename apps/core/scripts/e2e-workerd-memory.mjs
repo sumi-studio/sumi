@@ -411,8 +411,21 @@ if (personas.delayed) {
     `chunk 1 must be prepared from its single branch call, got ${c1.length}`,
     branchCalls,
   );
+  // The semantic requirement is that the call outlived the fetch-drain
+  // turn budget (SUMI_DRAIN_TURN_BUDGET_MS default 25s, not overridden
+  // here): that is what makes this answer "the delayed one" — the drain
+  // yielded mid-call and the branch completed on a later alarm. The
+  // scripted sleep itself may land a few ms short of DELAY_MS (observed
+  // 29999.75ms in CI), so the assertion is the drain boundary, not the
+  // nominal sleep length.
+  const DRAIN_TURN_BUDGET_MS = 25_000;
   assert(
-    first.outcome === "answered" && first.endedAt - first.at >= DELAY_MS,
+    DELAY_MS > DRAIN_TURN_BUDGET_MS,
+    `SUMI_E2E_BRANCH_DELAY_MS=${DELAY_MS} must exceed the ${DRAIN_TURN_BUDGET_MS}ms drain budget to be meaningful`,
+  );
+  assert(
+    first.outcome === "answered" &&
+      first.endedAt - first.at >= DRAIN_TURN_BUDGET_MS,
     "the branch response was not the delayed one",
     first,
   );

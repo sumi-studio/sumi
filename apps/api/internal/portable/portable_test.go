@@ -814,6 +814,41 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	}
 }
 
+// f74: the Go CommitTurn API accepts a request carrying the same
+// input_received twice — the store dedups at the write boundary, so an
+// accepted commit can never produce the unlinked second receipt that
+// input_received_seq_not_linked would refuse at every later Seal.
+func TestSealAfterStoreProducedDuplicateReceipt(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Dupe receipt")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	submit(t, local, pid, "d-1", "hello")
+	must(local.state.LoadTurn(ctx, pid, gen, "t-1", 50))
+	must(local.state.CommitTurn(ctx, pid, "t-1", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "d-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "d-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}))
+	var receipts int64
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pid).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("journaled receipts = %d err=%v, want 1", receipts, err)
+	}
+	// The accepted state must be movable: seal, export, import all succeed.
+	must(local.svc.Seal(ctx, pid, "move-dupe", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-dupe")
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+		t.Fatalf("import after duplicate-receipt commit: created=%v err=%v", created, err)
+	}
+}
+
 func mutateLines(bundle []byte, fn func(lines []string) []string) []byte {
 	lines := strings.SplitAfter(string(bundle), "\n")
 	if lines[len(lines)-1] == "" {

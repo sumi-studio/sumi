@@ -374,7 +374,9 @@ export class FakeState implements StateClient {
       if (running.generation !== generation) {
         throw new StateError(409, "conflicting turn state");
       }
-      const input = this.inputs.find((i) => i.input_id === running.input_id);
+      const input = this.inputs.find(
+        (i) => i.persona_id === persona && i.input_id === running.input_id,
+      );
       if (!input) throw new Error("running turn input missing");
       const rc = this.renderedContext(persona, contextLimit, input.input_id);
       return {
@@ -417,8 +419,9 @@ export class FakeState implements StateClient {
       input_id: input.input_id,
       generation,
       attempt:
-        [...this.turns.values()].filter((t) => t.input_id === input.input_id)
-          .length + 1,
+        [...this.turns.values()].filter(
+          (t) => t.persona_id === persona && t.input_id === input.input_id,
+        ).length + 1,
       status: "running",
       started_at: new Date().toISOString(),
       finished_at: null,
@@ -627,18 +630,18 @@ export class FakeState implements StateClient {
       error:
         req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
     };
-    // Exactly one input_received per input: a note claimed earlier already
-    // journaled it in causal order, so the commit's copy is dropped (Go
-    // withoutJournaledInput + received_seq).
-    const receivedKey = `${persona}|${turn.input_id}`;
-    const journaled = this.receivedSeq.has(receivedKey);
+    // Exactly one input_received per input ever lands in the journal (Go
+    // withoutJournaledInput + received_seq): copies naming an already-
+    // journaled input are dropped, and so is a second copy inside this
+    // batch — a duplicate receipt is the same fact twice, not new history.
+    const emitted = new Set<string>();
     for (const ev of req.events) {
-      if (
-        journaled &&
-        ev.kind === "input_received" &&
-        ev.payload.input_id === turn.input_id
-      ) {
-        continue;
+      if (ev.kind === "input_received") {
+        const key = `${persona}|${ev.payload.input_id}`;
+        if (this.receivedSeq.has(key) || emitted.has(key)) {
+          continue;
+        }
+        emitted.add(key);
       }
       const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
@@ -649,15 +652,13 @@ export class FakeState implements StateClient {
         payload: ev.payload,
         created_at: new Date().toISOString(),
       });
-      if (
-        ev.kind === "input_received" &&
-        ev.payload.input_id === turn.input_id &&
-        !this.receivedSeq.has(receivedKey)
-      ) {
-        this.receivedSeq.set(receivedKey, seq);
+      if (ev.kind === "input_received") {
+        this.receivedSeq.set(`${persona}|${ev.payload.input_id}`, seq);
       }
     }
-    const input = this.inputs.find((i) => i.input_id === turn.input_id);
+    const input = this.inputs.find(
+      (i) => i.persona_id === persona && i.input_id === turn.input_id,
+    );
     if (!input) throw new Error("turn input missing");
     if (req.outcome === "complete") {
       turn.status = "done";
