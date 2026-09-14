@@ -159,13 +159,15 @@ export function memoryOmittedNoticeMessage(om: OmittedMemory): ChatMessage {
  * were. Raw records left outside the send cap and applied blocks left
  * outside the memory cap are each marked by one notice at their position.
  * Every item is ordered by the first journal seq it stands for, so the
- * original ordering holds.
+ * original ordering holds. `extras` are synthetic items (e.g. a capacity
+ * notice) rendered at their given journal position.
  */
 export function renderJournalContext(
   events: Event[],
   memory: MemoryBlock[] = [],
   omitted: OmittedRange | null = null,
   memoryOmitted: OmittedMemory | null = null,
+  extras: { seq: number; message: ChatMessage }[] = [],
 ): ChatMessage[] {
   const items: { seq: number; message: ChatMessage }[] = [];
   if (memoryOmitted) {
@@ -183,12 +185,78 @@ export function renderJournalContext(
   for (const b of memory) {
     items.push({ seq: b.first_seq, message: memoryBlockMessage(b) });
   }
+  for (const x of extras) {
+    items.push(x);
+  }
   for (const ev of events) {
     const m = eventMessage(ev);
     if (m) items.push({ seq: ev.seq, message: m });
   }
   // Array sort is stable: ties keep the order pushed above.
   return items.sort((a, b) => a.seq - b.seq).map((i) => i.message);
+}
+
+/**
+ * Estimated tokens of one journal record — the same ~4-bytes-per-token
+ * accounting the state service uses (estPayloadTokens). Used here only to
+ * size the temporary working view after a provider capacity refusal; it is
+ * not provider billing and never writes durable state.
+ */
+export function estEventTokens(
+  kind: string,
+  payload: Record<string, unknown>,
+): number {
+  return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
+}
+
+/**
+ * Drop the oldest raw journal records from a working view until the retained
+ * raw estimate fits `budget`. Records are indivisible: an oversized record
+ * drops whole or stays whole — nothing is split or truncated to satisfy the
+ * number. Newest records are always kept.
+ */
+export function evictToBudget(
+  events: Event[],
+  budget: number,
+): { kept: Event[]; evicted: Event[] } {
+  const costs = events.map((e) => estEventTokens(e.kind, e.payload));
+  let total = 0;
+  for (const c of costs) total += c;
+  let cut = 0;
+  while (cut < events.length && total > budget) {
+    total -= costs[cut] ?? 0;
+    cut += 1;
+  }
+  return { kept: events.slice(cut), evicted: events.slice(0, cut) };
+}
+
+/**
+ * The provider-capacity notice carried in a recovered working view: it names
+ * exactly which journal records are out of this send — count, seq range and
+ * recorded times — and how to reread them. It is not a summary, and it is
+ * never written to the journal: the records stay in the canonical history.
+ */
+export function capacityNoticeMessage(evicted: Event[]): ChatMessage {
+  const first = evicted[0];
+  const last = evicted[evicted.length - 1];
+  if (!first || !last) {
+    throw new Error("capacity notice requires evicted records");
+  }
+  const source = JSON.stringify({
+    operation: "read",
+    from_seq: first.seq,
+    limit: 5,
+  });
+  return {
+    role: "user",
+    content:
+      "[Working-context capacity notice; not a new user message]\n" +
+      `${evicted.length} earlier raw records from your private history — journal seq ${first.seq} through ${last.seq}, recorded ${first.created_at} through ${last.created_at} — ` +
+      "are outside this working view because the provider rejected its size. They have not been summarized or deleted. " +
+      "Their contents and any uncertainty about them remain in your original private history. " +
+      `Reread with conversation_history(${source}), following next_after_seq while needed through sequence ${last.seq}. ` +
+      "Do not treat this omission as evidence that those experiences were unimportant.",
+  };
 }
 
 /** The compact_target user message: the sealed range's stored events,

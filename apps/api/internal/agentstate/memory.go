@@ -39,6 +39,15 @@ const (
 	// L0ChunkMinTokens: a normal L0 chunk seals once the open accumulation
 	// reaches this internal estimate at a safe boundary.
 	L0ChunkMinTokens int64 = 10_000
+	// L0ForcedSealLimitTokens bounds one sealed chunk's target size: while
+	// the open window exceeds it, the walk may cut at any safe boundary, not
+	// only before a new input, so a single oversized committed turn still
+	// becomes bounded preparation targets. It is a target, not a promise —
+	// a single huge record or a tool group with no safe interior boundary
+	// pushes a chunk past it, and no record is ever split to satisfy it.
+	// The 2× ratio over the minimum keeps the accepted design's relation
+	// between ordinary and evacuation boundaries.
+	L0ForcedSealLimitTokens int64 = L0ChunkMinTokens * 2
 	// L0LiveLimitTokens: prepared replacements apply only while the live raw
 	// estimate (unapplied chunks + unsealed tail) exceeds this.
 	L0LiveLimitTokens int64 = 40_000
@@ -477,9 +486,14 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 
 	// Seal walk: accumulate the unsealed tail; cut a chunk just before each
 	// input_received once the accumulation reaches the minimum and no tool
-	// call in the window is still waiting for its result. Tool calls and
-	// results commit inside one turn transaction, so a dangling call can
-	// never sit at a turn boundary — the pending set is defensive depth.
+	// call in the window is still waiting for its result. While the window
+	// exceeds L0ForcedSealLimitTokens, additional safe boundaries open —
+	// before an assistant_message that does not directly continue a tool
+	// flow, and before a new tool_call once every earlier call resolved —
+	// so one oversized committed turn still becomes bounded preparation
+	// targets. Tool calls and results commit inside one turn transaction,
+	// so a dangling call can never sit at a turn boundary — the pending set
+	// is defensive depth.
 	rows, err := tx.Query(ctx, `
 		SELECT seq, kind, payload FROM core_events
 		WHERE persona_id = $1 AND seq > $2 ORDER BY seq`, personaID, covered)
@@ -517,18 +531,37 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	}
 	var windowEst int64
 	var windowStart int64 = -1
+	prevKind := ""
 	for _, e := range tail {
 		// Boundary check happens BEFORE the event joins the window: the
-		// input itself opens the next chunk.
-		if e.kind == "input_received" && windowStart >= 0 && len(pending) == 0 &&
-			windowEst >= L0ChunkMinTokens {
-			last := window[len(window)-1].seq
-			if err := seal(windowStart, last, windowEst); err != nil {
-				return st, err
+		// boundary event itself opens the next chunk. Every boundary
+		// requires a started window and no tool call still waiting for its
+		// result. Never cut before a tool_result — its call would be left
+		// in the previous chunk — and never before an assistant_message
+		// directly continuing a tool flow (it follows a tool_result):
+		// the flow's results and its continuation stay together. A forced
+		// boundary before a new tool_call can split the decided text from
+		// the effects it started, but each call→results group stays whole.
+		if windowStart >= 0 && len(pending) == 0 {
+			cut := false
+			switch e.kind {
+			case "input_received":
+				cut = windowEst >= L0ChunkMinTokens
+			case "assistant_message":
+				cut = windowEst > L0ForcedSealLimitTokens &&
+					prevKind != "tool_result"
+			case "tool_call":
+				cut = windowEst > L0ForcedSealLimitTokens
 			}
-			window = window[:0]
-			windowEst = 0
-			windowStart = -1
+			if cut {
+				last := window[len(window)-1].seq
+				if err := seal(windowStart, last, windowEst); err != nil {
+					return st, err
+				}
+				window = window[:0]
+				windowEst = 0
+				windowStart = -1
+			}
 		}
 		if windowStart < 0 {
 			windowStart = e.seq
@@ -545,9 +578,10 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 				delete(pending, id)
 			}
 		}
+		prevKind = e.kind
 	}
-	// The unsealed remainder is the live tail: it is never sealed without a
-	// following input boundary, and it contributes to the raw estimate.
+	// The unsealed remainder is the live tail: it is never sealed while no
+	// boundary follows it, and it contributes to the raw estimate.
 	tailEst := windowEst
 
 	// Live raw = every not-yet-applied chunk (its originals still render)
