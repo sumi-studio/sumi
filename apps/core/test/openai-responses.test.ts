@@ -277,10 +277,11 @@ test("tool results feed back as function_call_output keyed by call_id", async ()
           content: [{ type: "input_text", text: "note this" }],
         },
         {
+          // Easy input-message form: assistant replay needs no item id
+          // (the output-message form requires one the journal never kept).
           type: "message",
           role: "assistant",
-          status: "completed",
-          content: [{ type: "output_text", text: "saving", annotations: [] }],
+          content: "saving",
         },
         {
           type: "function_call",
@@ -386,7 +387,7 @@ test("http errors: 401 permanent, 429 keeps Retry-After, 5xx retryable", async (
   }
 });
 
-test("response.incomplete max_output_tokens is a context-length refusal", async () => {
+test("response.incomplete max_output_tokens completes truncated like finish_reason=length", async () => {
   await withServer(
     (_req, res) =>
       sse([
@@ -396,16 +397,46 @@ test("response.incomplete max_output_tokens is a context-length refusal", async 
           response: {
             status: "incomplete",
             incomplete_details: { reason: "max_output_tokens" },
+            usage: { input_tokens: 9, output_tokens: 4 },
+          },
+        }),
+      ])(res),
+    async (base) => {
+      // The output cap is not an input-context refusal: the turn gets the
+      // truncated text, recorded in usage like the other wires' length
+      // finish — never a halved-context retry.
+      const evs = await collect(provider(base));
+      assert.deepEqual(evs[0], { type: "text", delta: "partial" });
+      const done = evs.at(-1);
+      assert.equal(done?.type, "done");
+      assert.equal(
+        (done as { usage: { finish_reason?: string } }).usage.finish_reason,
+        "max_output_tokens",
+      );
+      assert.equal(
+        (done as { usage: { output_tokens?: number } }).usage.output_tokens,
+        4,
+      );
+    },
+  );
+});
+
+test("response.incomplete content_filter is a deterministic refusal", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([
+        ev({
+          type: "response.incomplete",
+          response: {
+            status: "incomplete",
+            incomplete_details: { reason: "content_filter" },
           },
         }),
       ])(res),
     async (base) => {
       await assert.rejects(
         collect(provider(base)),
-        (e: unknown) =>
-          e instanceof ModelError &&
-          !e.retryable &&
-          e.refusal === "context_length",
+        (e: unknown) => e instanceof ModelError && !e.retryable,
       );
     },
   );
@@ -419,7 +450,7 @@ test("response.incomplete for other reasons retries", async () => {
           type: "response.incomplete",
           response: {
             status: "incomplete",
-            incomplete_details: { reason: "content_filter" },
+            incomplete_details: { reason: "server_error" },
           },
         }),
       ])(res),
@@ -565,5 +596,17 @@ test("unparseable tool arguments fail the call", async () => {
           /unparseable tool arguments/.test(e.message),
       );
     },
+  );
+});
+
+test("a reserved extra header fails the call, never the credential", async () => {
+  await assert.rejects(
+    collect(
+      provider("http://127.0.0.1:1", {
+        headers: { "Content-Type": "text/plain" },
+      }),
+    ),
+    (e: unknown) =>
+      e instanceof ModelError && !e.retryable && /reserved/.test(e.message),
   );
 });

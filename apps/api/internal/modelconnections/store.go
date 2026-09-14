@@ -266,9 +266,21 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 		return Connection{}, ErrInvalid
 	}
 	if in.APIKey != nil {
+		headers := in.ExtraHeaders
+		if headers == nil && !create {
+			// "Omit the field to retain the stored headers" applies to a
+			// key resubmission too: an explicit empty map clears, a nil
+			// field carries the sealed set forward. A previous ciphertext
+			// that cannot be opened fails honestly rather than guessing.
+			prev, err := s.open(human, id, ciphertext)
+			if err != nil {
+				return Connection{}, err
+			}
+			headers = prev.ExtraHeaders
+		}
 		ciphertext, err = s.seal(human, id, credentialPayload{
 			APIKey:       *in.APIKey,
-			ExtraHeaders: in.ExtraHeaders,
+			ExtraHeaders: headers,
 		})
 		if err != nil {
 			return Connection{}, err

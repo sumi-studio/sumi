@@ -371,6 +371,49 @@ export function errorBodyFields(
   return null;
 }
 
+/**
+ * Header names an extra-headers set may never carry: the request's own
+ * authentication, protocol-version, and transport framing stay
+ * adapter-controlled, so a stored or operator-supplied value can never
+ * silently replace the selected credential or corrupt the request.
+ * Mirrors the Go store's reservedHeaders — the store validates on write,
+ * this guards every other path headers can take (env JSON, future
+ * callers) at the point they go on the wire.
+ */
+const RESERVED_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "proxy-authenticate",
+  "www-authenticate",
+  "x-api-key",
+  "anthropic-version",
+  "content-type",
+  "content-length",
+  "host",
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "te",
+  "trailer",
+  "cookie",
+  "set-cookie",
+]);
+
+/** Fail a call whose extra headers would replace adapter-owned fields. */
+export function assertExtraHeaders(
+  headers: Record<string, string> | undefined,
+): void {
+  for (const name of Object.keys(headers ?? {})) {
+    if (RESERVED_HEADERS.has(name.toLowerCase())) {
+      throw new ModelError(
+        `extra request header ${name} is reserved and cannot be set on a connection`,
+        { retryable: false },
+      );
+    }
+  }
+}
+
 /** Parse a Retry-After header (delay-seconds or HTTP-date) into ms. */
 export function parseRetryAfter(v: string | null): number | undefined {
   if (!v) return undefined;

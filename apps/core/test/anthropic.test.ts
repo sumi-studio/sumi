@@ -388,6 +388,66 @@ test("mid-stream error events classify by type", async () => {
       );
     },
   );
+  // api_error is Anthropic's generic 500-class condition — transient.
+  await withServer(
+    (_req, res) =>
+      sse([
+        textDelta("partial"),
+        ev({
+          type: "error",
+          error: { type: "api_error", message: "internal error" },
+        }),
+      ])(res),
+    async (base) => {
+      await assert.rejects(
+        collect(provider(base)),
+        (e: unknown) => e instanceof ModelError && e.retryable,
+      );
+    },
+  );
+});
+
+test("an empty user message emits no text block (Anthropic rejects them)", async () => {
+  await withServer(
+    (_req, res) => sse([messageStop])(res),
+    async (base, seen) => {
+      await collect(
+        provider(base),
+        req([
+          { role: "user", content: "hi" },
+          { role: "user", content: "" },
+          { role: "tool", toolCallId: "t1", content: "result" },
+        ]),
+      );
+      const body = JSON.parse(seen[0]!.body) as {
+        messages: {
+          role: string;
+          content: { type: string; text?: string }[];
+        }[];
+      };
+      // The empty user message contributes no block; the tool_result still
+      // coalesces into the surviving user turn.
+      assert.equal(body.messages.length, 1);
+      assert.equal(body.messages[0]!.role, "user");
+      assert.deepEqual(
+        body.messages[0]!.content.map((b) => b.type),
+        ["text", "tool_result"],
+      );
+      assert.equal(body.messages[0]!.content[0]!.text, "hi");
+    },
+  );
+});
+
+test("a reserved extra header fails the call, never the credential", async () => {
+  await assert.rejects(
+    collect(
+      provider("http://127.0.0.1:1", {
+        headers: { "X-Api-Key": "spoof" },
+      }),
+    ),
+    (e: unknown) =>
+      e instanceof ModelError && !e.retryable && /reserved/.test(e.message),
+  );
 });
 
 test("a stream that ends without message_stop is not a reply", async () => {

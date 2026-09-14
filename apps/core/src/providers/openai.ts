@@ -6,6 +6,7 @@ import {
   type ToolCall,
 } from "../provider.ts";
 import {
+  assertExtraHeaders,
   encodeCallArguments,
   httpError,
   isContextLengthRefusal,
@@ -54,6 +55,7 @@ export class OpenAIProvider implements ModelProvider {
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
+    assertExtraHeaders(this.cfg.headers);
     // Chat-completions function names must match ^[a-zA-Z][a-zA-Z0-9_-]*$ —
     // canonical tool names like "journal.note" are rejected outright by some
     // providers (OpenCode Go returns 400). Translate per request: send the

@@ -7,6 +7,7 @@ import {
   type ToolCall,
 } from "../provider.ts";
 import {
+  assertExtraHeaders,
   httpError,
   isContextLengthRefusal,
   networkError,
@@ -64,6 +65,7 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
+    assertExtraHeaders(this.cfg.headers);
     const tools = wireTools(request.tools);
     const toWire = new Map(tools.map((t) => [t.spec.name, t.wire]));
     const fromWire = new Map(tools.map((t) => [t.wire, t.spec.name]));
@@ -190,11 +192,11 @@ export class AnthropicProvider implements ModelProvider {
             const err = json.error;
             const message = err?.message ?? "stream error";
             const code = err?.type ?? "";
-            // Overload / transient server errors retry; auth and request
-            // rejections never do.
-            const transient = /overloaded|rate_limit|timeout|internal/i.test(
-              code,
-            );
+            // Overload / transient server errors retry — api_error is the
+            // generic 500-class condition the docs recommend retrying with
+            // backoff; auth and request rejections never do.
+            const transient =
+              /overloaded|rate_limit|timeout|internal|api_error/i.test(code);
             throw new ModelError(`provider stream error: ${message}`, {
               retryable: transient,
               refusal:
@@ -292,7 +294,10 @@ function toMessages(
         system.push(m.content);
         break;
       case "user":
-        push("user", { type: "text", text: m.content });
+        // Anthropic rejects empty text blocks — an empty user message
+        // contributes no block (any adjacent tool_result blocks still
+        // coalesce into a user turn).
+        if (m.content) push("user", { type: "text", text: m.content });
         break;
       case "assistant":
         if (m.content) push("assistant", { type: "text", text: m.content });

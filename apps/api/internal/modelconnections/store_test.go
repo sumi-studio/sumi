@@ -236,6 +236,17 @@ func TestExtraHeadersSealedWithCredential(t *testing.T) {
 	if access.ExtraHeaders["X-Tenant"] != "red" {
 		t.Fatal("keyless edit dropped stored headers")
 	}
+	// Rotating the key alone — the UI's default rotation flow sends no
+	// headers field — must also keep the stored set (F1).
+	key3 := "test-secret-3"
+	in.APIKey = &key3
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if access.APIKey != key3 || access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatalf("key rotation dropped stored headers: %+v", access)
+	}
 	// Clearing headers explicitly requires the key.
 	in.APIKey = &key
 	in.ExtraHeaders = map[string]string{}
