@@ -779,15 +779,54 @@ env HOME="$OSH" SUMI_LOCAL_HOME="$FIX/home-t" SUMI_LOCAL_PREFIX="$FIX/prefix-t2"
 echo "== install serializes with other lifecycle ops on the same home"
 x install --managed-pg --listen 127.0.0.1:$P1 >/dev/null
 mkdir -p "$FIX/home-x/run"
-t0=$SECONDS
-flock "$FIX/home-x/run/lock" -c 'sleep 4' &
+# Ordering evidence, not elapsed time: elapsed time measured around a
+# 4 s holder passes whether or not install waited, and bash $SECONDS
+# follows the wall clock, which steps on some hosts. The holder takes the
+# lock first, waits (bounded) until install is seen blocked in its own
+# `flock -w 30 9`, keeps holding 1 s more, and records whether install's
+# first under-lock write (the prefix marker) happened while it held the
+# lock. The marker path reaches the holder via the environment: an argv
+# element under the prefix is, correctly, a live process of this install
+# to install's own pre-lock refusal.
+XS="$FIX/lock-x"; mkdir -p "$XS"
+XM="$FIX/prefix-x/.sumi-local-prefix" flock "$FIX/home-x/run/lock" bash -c '
+  echo held >"$1/held"; st=gone
+  for _ in $(seq 1 600); do
+    ip=$(cat "$1/install.pid" 2>/dev/null)
+    if [[ -n $ip ]]; then
+      kill -0 "$ip" 2>/dev/null || { st=gone; break; }
+      st=running
+      for p in $(pgrep -x flock); do
+        [[ $(tr "\0" " " <"/proc/$p/cmdline" 2>/dev/null) == "flock -w 30 9 " ]] || continue
+        q=$p
+        while q=$(awk "{print \$4}" "/proc/$q/stat" 2>/dev/null) && ((q > 1)); do
+          [[ $q == "$ip" ]] && { st=blocked-in-lock; break 2; }
+        done
+      done
+      [[ $st == blocked-in-lock ]] && break
+    fi
+    sleep 0.1
+  done
+  [[ $st == blocked-in-lock ]] && sleep 1
+  printf "%s\n%s\n" "$(stat -c %y "$XM")" "$st" >"$1/release"' _ "$XS" &
 LOCK_HOLDER=$!
-sleep 0.3   # let the holder take the lock
-out="$(x install --managed-pg --listen 127.0.0.1:$P1 2>&1)" && rc=0 || rc=$?
+XM="$FIX/prefix-x/.sumi-local-prefix"
+for _ in $(seq 1 100); do [[ -s $XS/held ]] && break; sleep 0.1; done
+m0="$(stat -c %y "$XM")"
+x install --managed-pg --listen 127.0.0.1:$P1 >"$XS/install.out" 2>&1 &
+echo "$!" >"$XS/install.pid"
+wait "$!" && rc=0 || rc=$?
 wait "$LOCK_HOLDER" 2>/dev/null || true
-[[ $rc == 0 && $((SECONDS - t0)) -ge 3 ]] \
-  && ok "install waited on the per-home lock, then succeeded" \
-  || bad "install did not serialize on the home lock (rc=$rc, ${SECONDS}s): $(echo "$out" | tail -2)"
+m1="$(stat -c %y "$XM")"
+m_held="" st_held=""
+{ read -r m_held; read -r st_held; } <"$XS/release" 2>/dev/null || true
+if [[ ! -s $XS/held ]]; then
+  bad "lock fixture never took the home lock — serialization not tested"
+elif [[ $st_held == blocked-in-lock && $m_held == "$m0" && $rc == 0 && $m1 != "$m0" ]]; then
+  ok "install blocked on the per-home lock, wrote nothing while it was held, then succeeded"
+else
+  bad "install did not serialize on the home lock (rc=$rc, install while held: ${st_held:-?}, marker written while held: $([[ $m_held == "$m0" ]] && echo no || echo yes), written after: $([[ $m1 != "$m0" ]] && echo yes || echo no)): $(tail -2 "$XS/install.out")"
+fi
 x uninstall --purge --yes >/dev/null 2>&1 || true
 
 # --- review-A F2 / f110: nested home/prefix refused before mutation ----
