@@ -632,14 +632,35 @@ export class FakeState implements StateClient {
       error:
         req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
     };
-    // Exactly one input_received per input ever lands in the journal (Go
-    // withoutJournaledInput + received_seq): copies naming an already-
-    // journaled input are dropped, and so is a second copy inside this
-    // batch — a duplicate receipt is the same fact twice, not new history.
+    // Exactly one input_received per input ever lands in the journal, and
+    // every receipt names a real input (Go withoutJournaledInput +
+    // received_seq): a receipt must carry a non-empty string input_id
+    // naming an input row this persona holds — anything else refuses the
+    // commit before any event lands. Validation covers every copy so a
+    // dropped duplicate cannot mask an invalid element; a valid copy
+    // naming an already-journaled input is dropped, as is a second copy
+    // inside this batch — a duplicate receipt is the same fact twice.
+    for (const ev of req.events) {
+      if (ev.kind !== "input_received") continue;
+      const id = ev.payload?.input_id;
+      if (typeof id !== "string" || id === "") {
+        throw new StateError(
+          400,
+          "input_received payload.input_id must be a non-empty string",
+        );
+      }
+      if (
+        !this.inputs.some(
+          (i) => i.persona_id === persona && i.input_id === id,
+        )
+      ) {
+        throw new StateError(400, `input_received names absent input ${id}`);
+      }
+    }
     const emitted = new Set<string>();
     for (const ev of req.events) {
       if (ev.kind === "input_received") {
-        const key = `${persona}|${ev.payload.input_id}`;
+        const key = `${persona}|${ev.payload.input_id as string}`;
         if (this.receivedSeq.has(key) || emitted.has(key)) {
           continue;
         }
@@ -655,7 +676,10 @@ export class FakeState implements StateClient {
         created_at: new Date().toISOString(),
       });
       if (ev.kind === "input_received") {
-        this.receivedSeq.set(`${persona}|${ev.payload.input_id}`, seq);
+        this.receivedSeq.set(
+          `${persona}|${ev.payload.input_id as string}`,
+          seq,
+        );
       }
     }
     const input = this.inputs.find(
