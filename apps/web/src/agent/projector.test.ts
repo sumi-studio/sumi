@@ -531,3 +531,131 @@ test("ignored envelopes leave the projected rows untouched", () => {
   projector.update(session.conversation);
   assert.equal(projector.items, items);
 });
+
+test("message_end dropping adjacent streamed blocks leaves no ghost rows", () => {
+  let session = createAgentSession();
+  const projector = new ConversationProjector();
+  const step = (envelope: BrowserEventEnvelope, label: string) => {
+    session = apply(session, envelope);
+    projector.update(session.conversation);
+    assertMatchesCanonical(projector, session.conversation, label);
+  };
+
+  step(seq(1, { type: "agent_start" }), "agent_start");
+  step(
+    seq(2, {
+      type: "message_start",
+      message_id: AssistantMessageId,
+      message: assistantMessage(""),
+    }),
+    "message_start",
+  );
+  // Two adjacent streamed prose blocks that the durable copy drops entirely.
+  step(
+    live({
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 0, delta: "first" },
+    }),
+    "delta 0",
+  );
+  step(
+    live({
+      type: "message_update",
+      message_id: AssistantMessageId,
+      event: { type: "text_delta", content_index: 1, delta: "second" },
+    }),
+    "delta 1",
+  );
+  // The durable copy merges to a single block at a new index; both streamed
+  // blocks are stale and adjacent in entryOrder. In-place removal must not
+  // skip the second one — the regression was a live-iterator splice dropping
+  // every other adjacent stale entry.
+  step(
+    seq(3, {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: {
+        ...assistantMessage(""),
+        content: [{ type: "text", text: "merged", wire_item_index: 2 }],
+      },
+    }),
+    "message_end dropping both blocks",
+  );
+  assert.equal(
+    session.conversation.entryOrder.includes(`message:${AssistantMessageId}:1`),
+    false,
+    "adjacent stale streamed block survives in entryOrder",
+  );
+  assert.equal(
+    session.conversation.entries[`message:${AssistantMessageId}:1`],
+    undefined,
+    "adjacent stale streamed block survives in entries",
+  );
+  step(seq(4, { type: "agent_end" }), "agent_end");
+});
+
+test("a wholesale session replacement clears a mounted projector", () => {
+  let session = createAgentSession();
+  const projector = new ConversationProjector();
+  session = apply(session, seq(1, { type: "agent_start" }));
+  session = apply(
+    session,
+    seq(2, {
+      type: "message_start",
+      message_id: UserMessageId,
+      message: userMessage("previous authority transcript"),
+    }),
+  );
+  session = apply(
+    session,
+    seq(3, {
+      type: "message_end",
+      message_id: UserMessageId,
+      message: userMessage("previous authority transcript"),
+    }),
+  );
+  projector.update(session.conversation);
+  assert.equal(projector.items.length > 0, true);
+
+  // resetAuthority installs createAgentSession()'s fresh model; its journal is
+  // structural, so the projector rescans instead of keeping stale rows.
+  projector.update(createAgentSession().conversation);
+  assert.equal(
+    projector.items.length,
+    0,
+    "stale transcript rows survive a session reset",
+  );
+
+  // A run-only write on the new session must not extend the old rows.
+  let next = createAgentSession();
+  next = apply(next, seq(1, { type: "agent_start" }));
+  projector.update(next.conversation);
+  assertMatchesCanonical(
+    projector,
+    next.conversation,
+    "post-reset agent_start",
+  );
+});
+
+test("a projector first mounted mid-stream takes a canonical snapshot", () => {
+  let session = createAgentSession();
+  session = apply(session, seq(1, { type: "agent_start" }));
+  session = apply(
+    session,
+    seq(2, {
+      type: "message_start",
+      message_id: UserMessageId,
+      message: userMessage("hi"),
+    }),
+  );
+  const owner = new ConversationProjector();
+  owner.update(session.conversation);
+
+  // A second consumer arrives after the owner drained the journal; its first
+  // update must still produce the full transcript, not an empty one.
+  const late = new ConversationProjector();
+  late.update(session.conversation);
+  assertMatchesCanonical(late, session.conversation, "late-mounted projector");
+  assert.deepEqual(late.items, owner.items);
+});

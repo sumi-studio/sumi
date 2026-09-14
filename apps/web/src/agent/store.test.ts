@@ -14,6 +14,8 @@ import type {
   DirectChatServerFrame,
 } from "../lib/direct-chat-socket";
 import { PrivateOutbox, type PrivateOutboxStorage } from "./private-outbox";
+import { projectConversation } from "./projection";
+import { ConversationProjector } from "./projector";
 import { createConversationStore, type DirectChatTransport } from "./store";
 import { userMessageIdFromCommandId } from "./user-message-id";
 
@@ -1696,4 +1698,62 @@ test("snapshot recovers rejected and superseded admitted text outside the body w
     assert.equal(transport.sent.length, 0);
     release();
   }
+});
+
+test("resetAuthority clears a mounted projector and stays canonical after", () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({ transport });
+  // The projector mirrors ChatScreen: one instance driven by every publish.
+  const projector = new ConversationProjector();
+  const render = () => {
+    projector.update(store.getState().conversation);
+    assert.deepEqual(
+      projector.items,
+      projectConversation(store.getState().conversation),
+    );
+  };
+  store.getState().connect();
+  render();
+
+  const emitEvent = (envelope: BrowserEventEnvelope) =>
+    transport.emit({
+      type: "event",
+      envelope,
+    } as unknown as DirectChatServerFrame);
+  emitEvent({
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  emitEvent({
+    audience: "direct_chat",
+    seq: 2,
+    event: {
+      type: "message_end",
+      message_id: "user-reset-1",
+      message: userMessage("before reset"),
+    },
+  });
+  render();
+  assert.equal(projector.items.length > 0, true);
+
+  assert.equal(store.getState().resetAuthority(), true);
+  render();
+  assert.equal(
+    projector.items.length,
+    0,
+    "reset leaves the previous authority's transcript mounted",
+  );
+
+  // The new authority's first frames must not append under stale rows.
+  emitEvent({
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  render();
+  assert.deepEqual(
+    projector.items.map((item) => item.id),
+    ["run:1"],
+  );
 });

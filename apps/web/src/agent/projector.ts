@@ -46,8 +46,14 @@ interface EntryMeta {
  * infrequent events (history merges, replayed-content inserts, deletions)
  * keep canonical cost.
  *
- * A single projector must own each model's journal stream; two projectors
- * consuming one model would each disarm the journal the other needed.
+ * Lifecycle: the first `update` always takes a canonical snapshot, so a
+ * projector mounted against a model mid-stream (a second consumer, a remount
+ * after the journal was already consumed) renders correctly. From then on a
+ * single projector must own the model's journal stream — two live projectors
+ * consuming one model each disarm the journal the other needs, and the
+ * non-owner misses every journaled write until a structural event resyncs it.
+ * `ChatScreen` is the sole consumer; the model has no multi-consumer journal
+ * fan-out because none is needed.
  */
 export class ConversationProjector {
   items: ChatItem[] = [];
@@ -84,18 +90,9 @@ export class ConversationProjector {
 
   update(model: ConversationModel): void {
     const journal = model.changes;
-    if (
-      journal &&
-      !journal.structural &&
-      (journal === this.lastConsumed ||
-        (journal.addedEntryIds.size === 0 &&
-          journal.removedEntryIds.size === 0 &&
-          journal.changedEntryIds.size === 0 &&
-          journal.changedRunIds.size === 0 &&
-          journal.orderOps.length === 0))
-    )
-      return;
-
+    // Initialization precedes the empty-journal fast path: a projector that
+    // has never taken a snapshot cannot treat an empty (already-consumed)
+    // journal as "no writes".
     if (!this.initialized || !journal || journal.structural) {
       model.changes = createConversationChanges();
       this.lastConsumed = journal ?? null;
@@ -103,6 +100,16 @@ export class ConversationProjector {
       this.initialized = true;
       return;
     }
+
+    if (
+      journal === this.lastConsumed ||
+      (journal.addedEntryIds.size === 0 &&
+        journal.removedEntryIds.size === 0 &&
+        journal.changedEntryIds.size === 0 &&
+        journal.changedRunIds.size === 0 &&
+        journal.orderOps.length === 0)
+    )
+      return;
 
     // The incremental path only applies tail appends and in-place writes.
     // Anything else (removals, replayed mid-order inserts) rebuilds.

@@ -326,6 +326,9 @@ const streamApi = {
       event: { type: "agent_end" },
     });
   },
+  resetAuthority() {
+    return store.getState().resetAuthority();
+  },
   resetPerf() {
     perf.commits.length = 0;
     perf.frames.length = 0;

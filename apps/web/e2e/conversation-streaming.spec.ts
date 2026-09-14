@@ -192,6 +192,61 @@ for (const scenario of scenarios) {
   });
 }
 
+// Regression: resetAuthority (session revalidation/authority rebind) replaces
+// the session wholesale while ChatScreen stays mounted. The mounted projector
+// must rescan the fresh model, not keep the previous transcript.
+test("mounted chat screen clears on authority reset and renders the new transcript", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const vite = startVite(PORT);
+  const url = `http://127.0.0.1:${PORT}/harness/conversation-streaming.html?turns=24`;
+  try {
+    await waitFor(url);
+    await page.goto(url);
+    await page.waitForFunction(() => "__stream" in window);
+    const composer = page.getByRole("textbox", { name: "メッセージ" });
+    await composer.waitFor({ state: "visible", timeout: 60_000 });
+    // The virtualized view anchors at the tail; the last turn's rows are mounted.
+    await expect(
+      page.getByText("記録の質問 23", { exact: false }).first(),
+    ).toBeVisible({ timeout: 60_000 });
+
+    const cleared = await page.evaluate(() =>
+      (
+        window as unknown as { __stream: { resetAuthority(): boolean } }
+      ).__stream.resetAuthority(),
+    );
+    expect(cleared).toBe(true);
+
+    // The previous authority's transcript is gone; the empty state returns.
+    await expect(page.getByText("記録の質問", { exact: false })).toHaveCount(0);
+    await expect(page.getByText("Sumiの活動記録")).toBeVisible();
+
+    // New authority events render without appending under stale rows.
+    await page.evaluate(() => {
+      const stream = (
+        window as unknown as {
+          __stream: {
+            beginReply(): void;
+            delta(chunk: string): number;
+            endReply(): void;
+          };
+        }
+      ).__stream;
+      stream.beginReply();
+      stream.delta("新しい権限の応答");
+      stream.endReply();
+    });
+    await expect(
+      page.getByText("新しい権限の応答", { exact: false }),
+    ).toBeVisible();
+    await expect(page.getByText("記録の質問", { exact: false })).toHaveCount(0);
+  } finally {
+    await stop(vite);
+  }
+});
+
 function startVite(port: number) {
   return spawn(
     process.execPath,

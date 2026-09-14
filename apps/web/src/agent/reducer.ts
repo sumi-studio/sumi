@@ -369,7 +369,9 @@ function applyMessage(
         .filter((item) => item.type === "text" && item.text.length > 0)
         .map((item) => `message:${messageId}:${item.wire_item_index}`),
     );
-    for (const id of conversation.entryOrder) {
+    // entryOrder mutates in place under removeEntry; iterate a snapshot so
+    // adjacent stale blocks cannot slip past the live iterator.
+    for (const id of [...conversation.entryOrder]) {
       const entry = conversation.entries[id];
       if (
         entry?.kind === "prose" &&

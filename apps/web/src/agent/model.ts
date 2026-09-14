@@ -221,6 +221,10 @@ export function createEmptyConversation(): ConversationModel {
     entries: {},
     runOrder: [],
     runs: {},
-    changes: createConversationChanges(),
+    // Structural: a model that did not arrive through journaled writes must be
+    // rescanned, not treated as "no changes". This is what lets consumers tell
+    // a wholesale session replacement (resetAuthority, fresh sessions) apart
+    // from an unchanged stream.
+    changes: createConversationChanges(true),
   };
 }
