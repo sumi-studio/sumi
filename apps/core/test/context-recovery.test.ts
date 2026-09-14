@@ -133,6 +133,7 @@ test("recovery: the in-turn assistant/tool suffix rides along; effects are not r
           call: {
             id: "c1",
             name: "journal.note",
+            route: "normal",
             arguments: { text: "remembered" },
           },
         };

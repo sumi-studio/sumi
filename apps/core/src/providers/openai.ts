@@ -92,7 +92,12 @@ export class OpenAIProvider implements ModelProvider {
                       type: "function",
                       function: {
                         name: toWire.get(c.name) ?? c.name,
-                        arguments: JSON.stringify(c.arguments),
+                        // The wire envelope is {route, input} — replay the
+                        // decided call in the same shape the model emitted.
+                        arguments: JSON.stringify({
+                          route: c.route,
+                          input: c.arguments,
+                        }),
                       },
                     })),
                   }
@@ -105,7 +110,24 @@ export class OpenAIProvider implements ModelProvider {
                     function: {
                       name: toWire.get(t.name) ?? t.name,
                       description: t.description,
-                      parameters: t.parameters,
+                      // Invocation-route envelope (ADR 0013 §1): the model
+                      // must declare the call's route explicitly. A missing
+                      // or unknown route is rejected at parse — never
+                      // silently treated as "normal".
+                      parameters: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["route", "input"],
+                        properties: {
+                          route: {
+                            type: "string",
+                            enum: ["normal", "elevated"],
+                            description:
+                              "Invocation route: 'normal' runs under your own authority; 'elevated' asks the human for a one-shot approval before the effect runs. A tool that needs consent can only run elevated — on 'normal' it is blocked without asking anyone.",
+                          },
+                          input: t.parameters,
+                        },
+                      },
                     },
                   })),
                 }
@@ -280,12 +302,14 @@ export class OpenAIProvider implements ModelProvider {
             { retryable: true },
           );
         }
+        const envelope = parseCallEnvelope(c.name, args);
         const call: ToolCall = {
           id: c.id || `call-${c.name}`,
           // Unknown wire names (model hallucination) pass through unchanged;
           // the state service then records a definite tool error for them.
           name: fromWire.get(c.name) ?? c.name,
-          arguments: args,
+          route: envelope.route,
+          arguments: envelope.input,
         };
         yield { type: "tool_call", call };
       }
@@ -296,6 +320,34 @@ export class OpenAIProvider implements ModelProvider {
       await readerRef?.cancel().catch(() => {});
     }
   }
+}
+
+/**
+ * Strictly validate the invocation-route envelope (ADR 0013 §1): exactly
+ * {route, input}, route ∈ {normal, elevated}, input an object. A missing
+ * route, unknown route, unknown field, or non-object input is a malformed
+ * call — rejected, never defaulted to "normal".
+ */
+function parseCallEnvelope(
+  name: string,
+  args: Record<string, unknown>,
+): { route: "normal" | "elevated"; input: Record<string, unknown> } {
+  const keys = Object.keys(args);
+  const route = args.route;
+  const input = args.input;
+  if (
+    keys.every((k) => k === "route" || k === "input") &&
+    (route === "normal" || route === "elevated") &&
+    input !== null &&
+    typeof input === "object" &&
+    !Array.isArray(input)
+  ) {
+    return { route, input: input as Record<string, unknown> };
+  }
+  throw new ModelError(
+    `model emitted a malformed call envelope for ${name} — expected {route, input}`,
+    { retryable: true },
+  );
 }
 
 /**

@@ -124,6 +124,7 @@ async function childMain() {
           call: {
             id: "history-0",
             name: "conversation_history",
+            route: "normal",
             arguments: {
               operation: "read",
               chunk_seq: Number(history[1]),

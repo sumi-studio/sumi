@@ -440,3 +440,91 @@ test('an "error": null chunk is not an error — stream completes (NF1)', async 
     },
   );
 });
+
+const NOTE_TOOL = {
+  name: "journal.note",
+  description: "note",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string" } },
+    required: ["text"],
+  },
+};
+
+const toolCallChunk = (args: string) =>
+  chunk({
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            { index: 0, id: "c1", function: { name: "journal_note", arguments: args } },
+          ],
+        },
+      },
+    ],
+  });
+
+test("tools are offered inside the {route, input} envelope and the chosen route is kept (ADR 0013)", async () => {
+  let offered: unknown;
+  await withServer(
+    (req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        offered = (JSON.parse(body) as { tools: { function: { parameters: unknown } }[] })
+          .tools[0]?.function.parameters;
+        sse([
+          toolCallChunk(JSON.stringify({ route: "elevated", input: { text: "x" } })),
+          fin("tool_calls"),
+          "[DONE]",
+        ])(res);
+      });
+    },
+    async (base) => {
+      const out: ModelEvent[] = [];
+      for await (const ev of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+        out.push(ev);
+      }
+      assert.deepEqual(offered, {
+        type: "object",
+        additionalProperties: false,
+        required: ["route", "input"],
+        properties: {
+          route: (offered as { properties: { route: unknown } }).properties.route,
+          input: NOTE_TOOL.parameters,
+        },
+      });
+      const call = out.find((e) => e.type === "tool_call");
+      assert.deepEqual(call, {
+        type: "tool_call",
+        call: { id: "c1", name: "journal.note", route: "elevated", arguments: { text: "x" } },
+      });
+    },
+  );
+});
+
+test("a call without a valid route is malformed, never treated as normal", async () => {
+  for (const args of [
+    { text: "x" },
+    { route: "sideways", input: { text: "x" } },
+    { route: "normal", input: { text: "x" }, extra: 1 },
+    { route: "normal", input: ["x"] },
+  ]) {
+    await withServer(
+      (_req, res) =>
+        sse([toolCallChunk(JSON.stringify(args)), fin("tool_calls"), "[DONE]"])(res),
+      async (base) => {
+        await assert.rejects(
+          (async () => {
+            for await (const _ of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+              /* drain */
+            }
+          })(),
+          (e: unknown) =>
+            e instanceof ModelError && e.retryable && /malformed call envelope/.test(e.message),
+          JSON.stringify(args),
+        );
+      },
+    );
+  }
+});

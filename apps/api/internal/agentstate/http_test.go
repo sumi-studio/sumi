@@ -9,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -245,7 +247,7 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 	}
 	// Save the decision.
 	planBody := `{"generation":` + gen + `,"turn_id":"` + turnID + `","round":0,"text":"noted",
-		"calls":[{"tool":"journal.note","request":{"text":"keep me"}}]}`
+		"calls":[{"tool":"journal.note","route":"normal","request":{"text":"keep me"}}]}`
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok, planBody)
 	if rec.Code != 200 {
 		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
@@ -351,7 +353,7 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 	// A clean plan still saves after the rejection.
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/plan", tok,
 		`{"generation":`+gen+`,"turn_id":"`+turnID+`","round":0,"text":"scheduling",
-		"calls":[{"tool":"schedule.set","request":{"wake_at":"2030-01-01T00:00:00Z","miss_policy":"bogus"}}]}`)
+		"calls":[{"tool":"schedule.set","route":"normal","request":{"wake_at":"2030-01-01T00:00:00Z","miss_policy":"bogus"}}]}`)
 	if rec.Code != 200 {
 		t.Fatalf("save plan: %d %s", rec.Code, rec.Body)
 	}
@@ -409,5 +411,197 @@ func TestHTTPCommitOverBodyLimit(t *testing.T) {
 		`{"generation":`+gen+`,"outcome":"fail","retryable":false,"error":"bounded: too large to store"}`)
 	if rec.Code != 200 {
 		t.Fatalf("bounded commit after rejection: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A persona that arrived by transfer carries model intent: its binding
+// reports needs_rebinding until the destination's bound human selects a
+// connection of the same kind, and the admin's bind route is the reachable
+// finalization for an unbound one.
+func TestModelIntentRebindingAndBindRoute(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	srv.SetModelConnections(modelconnections.MetadataOnly(srv.store.pool))
+	ctx := context.Background()
+
+	pa := pid(t)
+	human := pid(t)
+	if _, err := srv.store.pool.Exec(ctx,
+		`INSERT INTO humans (human_id) VALUES ($1)`, human); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret,
+		`{"persona_id":"`+pa+`"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create unbound persona: %d %s", rec.Code, rec.Body)
+	}
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	tok := created.PersonaToken
+	// Carried intent, no bound human: needs_rebinding, never unset.
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_personas SET model_intent = '{"kind":"api","connection":{"preset":"openai-chat","model":"model-9","base_url":"https://api.example.test"}}'::jsonb WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	getBinding := func() (int, ModelBinding) {
+		r := do(t, mux, "GET", "/internal/core/personas/"+pa+"/model", tok, "")
+		var b ModelBinding
+		if r.Code == 200 {
+			_ = json.Unmarshal(r.Body.Bytes(), &b)
+		}
+		return r.Code, b
+	}
+	code, b := getBinding()
+	if code != 200 || b.Selection != "needs_rebinding" || len(b.Intent) == 0 {
+		t.Fatalf("unbound+intent binding: %d %+v", code, b)
+	}
+	// Binding is admin-only and reachable.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/bind", tok,
+		`{"human_id":"`+human+`"}`); rec.Code != 401 {
+		t.Fatalf("bind with a persona token: %d", rec.Code)
+	}
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/bind", testAdminSecret,
+		`{"human_id":"`+human+`"}`); rec.Code != 200 {
+		t.Fatalf("bind: %d %s", rec.Code, rec.Body)
+	}
+	// Still needs_rebinding: bound but no selection yet.
+	if code, b := getBinding(); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("bound+unselected binding: %d %+v", code, b)
+	}
+	// A mismatched selection kind does not satisfy the intent.
+	if _, err := srv.store.pool.Exec(ctx,
+		`INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human); err != nil {
+		t.Fatal(err)
+	}
+	if code, b := getBinding(); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("mismatched selection: %d %+v", code, b)
+	}
+	// A matching api connection satisfies it — and reports the missing
+	// credential honestly (metadata-only store, no key armed).
+	connID := "00000000-0000-4000-8000-0000000000aa"
+	if _, err := srv.store.pool.Exec(ctx, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		human, connID, "00000000-0000-4000-8000-0000000000bb"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE model_connection_selections SET kind='api', connection_id=$2::uuid WHERE human_id=$1`,
+		human, connID); err != nil {
+		t.Fatal(err)
+	}
+	code, b = getBinding()
+	if code != 200 || b.Selection != "api" || b.Connection == nil ||
+		b.Connection.Model != "model-9" || b.CredentialAvailable || b.Reason == "" {
+		t.Fatalf("satisfied intent binding: %d %+v", code, b)
+	}
+	// Rebind attempts: same human is idempotent, another conflicts.
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/bind", testAdminSecret,
+		`{"human_id":"`+human+`"}`); rec.Code != 200 {
+		t.Fatalf("idempotent bind: %d", rec.Code)
+	}
+	other := pid(t)
+	if _, err := srv.store.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, other); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/bind", testAdminSecret,
+		`{"human_id":"`+other+`"}`); rec.Code != 409 {
+		t.Fatalf("rebind to another human: %d", rec.Code)
+	}
+	// A sealed persona's intent is part of the transfer cut: clearing it
+	// between seal and export would strip what the bundle ships, so the
+	// write is fenced to staged/active personas.
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_personas SET authority='sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, mux, "DELETE", "/internal/core/personas/"+pa+"/model/intent", testAdminSecret, ""); rec.Code != 409 {
+		t.Fatalf("clear intent under seal: %d %s", rec.Code, rec.Body)
+	}
+	var intent json.RawMessage
+	if err := srv.store.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pa).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(intent) == 0 {
+		t.Fatal("sealed clear mutated the persona's model_intent")
+	}
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_personas SET authority='active' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	// The operator's explicit fresh start: clearing the intent restores
+	// ordinary selection semantics — api resolves, none of it silently.
+	rec = do(t, mux, "DELETE", "/internal/core/personas/"+pa+"/model/intent", tok, "")
+	if rec.Code != 401 {
+		t.Fatalf("clear intent with a persona token: %d", rec.Code)
+	}
+	if rec := do(t, mux, "DELETE", "/internal/core/personas/"+pa+"/model/intent", testAdminSecret, ""); rec.Code != 200 {
+		t.Fatalf("clear intent: %d", rec.Code)
+	}
+	if code, b := getBinding(); code != 200 || b.Selection != "api" {
+		t.Fatalf("post-clear binding: %d %+v", code, b)
+	}
+}
+
+func TestListToolsRoute(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`","display_name":"T"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	toolsURL := "/internal/core/personas/" + pa + "/tools"
+	if rec := do(t, mux, "GET", toolsURL, "", ""); rec.Code != 401 {
+		t.Fatalf("no-auth tools: %d", rec.Code)
+	}
+	get := func() map[string]bool {
+		rec := do(t, mux, "GET", toolsURL, created.PersonaToken, "")
+		if rec.Code != 200 {
+			t.Fatalf("tools: %d %s", rec.Code, rec.Body)
+		}
+		var body struct {
+			Tools []string `json:"tools"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, name := range body.Tools {
+			out[name] = true
+		}
+		return out
+	}
+	base := get()
+	for _, want := range []string{"schedule.set", "journal.note", "conversation_history", "job.start", "job.status", "job.cancel", "message.send"} {
+		if !base[want] {
+			t.Fatalf("missing built-in tool %s in %v", want, base)
+		}
+	}
+	// No delegated effect is registered on a bare state service, so
+	// messaging.send must not be advertised — a claim could only fail.
+	if base["messaging.send"] {
+		t.Fatalf("unregistered messaging.send advertised: %v", base)
+	}
+	// Registering the delegated effect makes it claimable and advertised.
+	if err := srv.RegisterToolEffect("messaging.send", ToolEffect{
+		Apply: func(context.Context, pgx.Tx, string, string, map[string]any) (map[string]any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	withEffect := get()
+	if !withEffect["messaging.send"] {
+		t.Fatalf("registered messaging.send not advertised: %v", withEffect)
 	}
 }
