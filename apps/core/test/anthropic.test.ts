@@ -569,3 +569,72 @@ test("unparseable tool arguments fail the call", async () => {
     },
   );
 });
+
+test("a replayed call keeps a valid wire name after the tool leaves the advertised set", async () => {
+  await withServer(
+    (_req, res) => sse([messageStop])(res),
+    async (base, seen) => {
+      // journal.note ran in an earlier generation; this consultation no
+      // longer advertises it (tools: []). The replayed canonical name
+      // must still become a wire-legal name — Anthropic rejects dotted
+      // names outright (400) — and the tool_use_id linkage survives.
+      await collect(
+        provider(base),
+        req(
+          [
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "toolu_01X",
+                  name: "journal.note",
+                  route: "normal",
+                  arguments: { text: "x" },
+                },
+              ],
+            },
+            { role: "tool", toolCallId: "toolu_01X", content: "saved x" },
+          ],
+          [],
+        ),
+      );
+      const messages = (JSON.parse(seen[0]!.body) as { messages: unknown[] })
+        .messages as { role: string; content: Record<string, unknown>[] }[];
+      const toolUse = messages
+        .find((m) => m.role === "assistant")!
+        .content.find((b) => b.type === "tool_use")!;
+      assert.equal(toolUse.name, "journal_note");
+      assert.equal(toolUse.id, "toolu_01X");
+      const toolResult = messages
+        .find((m) => m.role === "user")!
+        .content.find((b) => b.type === "tool_result")!;
+      assert.equal(toolResult.tool_use_id, "toolu_01X");
+    },
+  );
+});
+
+test("model_context_window_exceeded completes truncated with faithful finish metadata", async () => {
+  await withServer(
+    (_req, res) =>
+      sse([
+        textDelta("cut by window"),
+        stop("model_context_window_exceeded"),
+        messageStop,
+      ])(res),
+    async (base) => {
+      // Anthropic documents this stop_reason as a filled context window —
+      // "treat the response as truncated". It is not an input-capacity
+      // refusal and does not engage the smaller-view retry: the reply is
+      // the truncated text with the true reason recorded in usage.
+      const evs = await collect(provider(base));
+      assert.deepEqual(evs[0], { type: "text", delta: "cut by window" });
+      const done = evs.at(-1)!;
+      assert.equal(done.type, "done");
+      assert.equal(
+        (done as { usage: { finish_reason?: string } }).usage.finish_reason,
+        "model_context_window_exceeded",
+      );
+    },
+  );
+});

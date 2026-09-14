@@ -14,6 +14,7 @@ import {
   networkError,
   parseCallEnvelope,
   requestDeadline,
+  sanitizeToolName,
   sseEvents,
   wireTools,
 } from "./shared.ts";
@@ -36,13 +37,13 @@ export interface ResponsesConfig {
    */
   timeoutMs?: number;
   /**
-   * Bound on generated tokens (max_output_tokens). Default 16_384 — the
-   * legacy agent's default output budget for this protocol.
+   * Bound on generated tokens (max_output_tokens), per connection. When
+   * unset the field is omitted entirely — the parameter is optional in
+   * the API and the model's own output cap applies, so no fixed default
+   * can make a lower-cap model fail every request.
    */
   maxOutputTokens?: number;
 }
-
-const DEFAULT_MAX_OUTPUT_TOKENS = 16_384;
 
 /**
  * OpenAI Responses API provider (POST {base}/responses, streaming SSE).
@@ -93,8 +94,13 @@ export class OpenAIResponsesProvider implements ModelProvider {
               model: this.cfg.model,
               stream: true,
               store: false,
-              max_output_tokens:
-                this.cfg.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+              // Stable per-persona identity for provider prefix-cache
+              // routing — the same identity the legacy agent supplied as
+              // `session_id` (session IDs are the documented common value).
+              prompt_cache_key: request.personaId,
+              ...(this.cfg.maxOutputTokens
+                ? { max_output_tokens: this.cfg.maxOutputTokens }
+                : {}),
               ...toInput(request.messages, toWire),
               ...(tools.length
                 ? {
@@ -384,9 +390,11 @@ function toInput(
           input.push({
             type: "function_call",
             call_id: c.id,
-            // The recorded name is canonical; the model emitted the
-            // wire-safe name, so replay must translate back.
-            name: toWire.get(c.name) ?? c.name,
+            // The recorded name is canonical; replay must still produce a
+            // valid wire name when the tool is no longer advertised in
+            // this request, so the deterministic transform is the
+            // fallback.
+            name: toWire.get(c.name) ?? sanitizeToolName(c.name),
             arguments: encodeCallArguments(c),
             status: "completed",
           });

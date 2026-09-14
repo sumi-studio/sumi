@@ -7,6 +7,7 @@ const connectionSchema = z.object({
   preset: z.string(),
   baseUrl: z.string(),
   model: z.string(),
+  maxOutputTokens: z.number().int().positive().optional(),
 });
 const stateSchema = z.object({
   available: z.boolean(),
@@ -34,6 +35,13 @@ export interface APIConnection {
   preset: string;
   baseUrl: string;
   model: string;
+  /**
+   * Requested bound on generated tokens for this connection. Set it when
+   * the model's output cap is below the core default (a bound above the
+   * cap makes every request fail with a provider 400). Undefined means
+   * the protocol default.
+   */
+  maxOutputTokens?: number;
 }
 export type ConnectionSelection =
   | { kind: "none" | "chatgpt" }
@@ -87,12 +95,27 @@ export function createAPIConnectionsClient(
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
-    if (!response.ok)
+    if (!response.ok) {
+      // The API returns {error:{message, detail?}} — surface the detail
+      // (e.g. which header is reserved) so the user can act on it.
+      let detail = "";
+      try {
+        const body = (await response.json()) as {
+          error?: { message?: string; detail?: string } | string;
+        };
+        const err = body?.error;
+        if (err && typeof err === "object" && err.detail) {
+          detail = ` ${err.detail}`;
+        }
+      } catch {
+        // Non-JSON failure body — fall through to the generic message.
+      }
       throw new Error(
         response.status === 404
           ? "接続が見つかりません。状態を更新してください。"
-          : "接続を変更できませんでした。入力と接続状態を確認してください。",
+          : `接続を変更できませんでした。入力と接続状態を確認してください。${detail}`,
       );
+    }
     return response.status === 204 ? undefined : response.json();
   }
   return {

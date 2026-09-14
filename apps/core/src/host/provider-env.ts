@@ -67,6 +67,15 @@ export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
 /** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
 export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
 
+/**
+ * Presets served by the OpenCode Go endpoint — the legacy agent sent
+ * `x-opencode-session` with the PA's stable session id on this wire.
+ */
+export const OPENCODE_PRESETS: ReadonlySet<string> = new Set([
+  "opencode-go",
+  "opencode-zen-go",
+]);
+
 /** Non-secret identity of the connection a consultation actually used. */
 export type BindingIdentity =
   | { selection: "unset"; provider: string }
@@ -112,6 +121,16 @@ export class SelectedModelProvider implements ModelProvider {
     this.opts = opts;
   }
 
+  /**
+   * Binding preflight: resolves the selection exactly as the next call
+   * would, without sending a request. Throws the same `ModelError` the
+   * call would raise — callers that gate work on a usable model (memory
+   * preparation) can pause instead of spending it.
+   */
+  async probe(): Promise<void> {
+    await this.resolve();
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const { provider, identity } = await this.resolve();
     for await (const ev of provider.stream(request)) {
@@ -143,6 +162,9 @@ export class SelectedModelProvider implements ModelProvider {
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
+        // The model was never consulted — this is an availability gap,
+        // not an evaluated-model failure.
+        unavailable: true,
       });
     }
     switch (binding.selection) {
@@ -205,12 +227,20 @@ export class SelectedModelProvider implements ModelProvider {
       model: c.model,
       headers,
       timeoutMs: this.opts.timeoutMs,
+      maxOutputTokens: c.max_output_tokens,
     };
     const provider: ModelProvider = RESPONSES_PRESETS.has(c.preset)
       ? new OpenAIResponsesProvider(shared)
       : ANTHROPIC_PRESETS.has(c.preset)
-        ? new AnthropicProvider(shared)
-        : new OpenAIProvider(shared);
+        ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
+        : new OpenAIProvider({
+            ...shared,
+            // OpenCode Go routes on a per-session header; the legacy agent
+            // supplied the PA's stable id — personaId is that identity here.
+            sessionHeader: OPENCODE_PRESETS.has(c.preset)
+              ? "x-opencode-session"
+              : undefined,
+          });
     const identity: BindingIdentity = {
       selection: "api",
       connection_id: c.id,
@@ -224,7 +254,7 @@ export class SelectedModelProvider implements ModelProvider {
 }
 
 function unusable(message: string): ModelError {
-  return new ModelError(message, { retryable: false });
+  return new ModelError(message, { retryable: false, unavailable: true });
 }
 
 export function providerFromEnv(

@@ -13,6 +13,7 @@ import {
   networkError,
   parseCallEnvelope,
   requestDeadline,
+  sanitizeToolName,
   sseEvents,
   wireTools,
 } from "./shared.ts";
@@ -302,12 +303,13 @@ function toMessages(
       case "assistant":
         if (m.content) push("assistant", { type: "text", text: m.content });
         for (const c of m.toolCalls ?? []) {
-          // The recorded name is canonical; the model emitted the
-          // wire-safe name, so replay must translate back.
+          // The recorded name is canonical; replay must still produce a
+          // valid wire name when the tool is no longer advertised in this
+          // request, so the deterministic transform is the fallback.
           push("assistant", {
             type: "tool_use",
             id: c.id,
-            name: toWire.get(c.name) ?? c.name,
+            name: toWire.get(c.name) ?? sanitizeToolName(c.name),
             input: { route: c.route, input: c.arguments },
           });
         }

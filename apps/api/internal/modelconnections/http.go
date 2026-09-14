@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 )
@@ -34,15 +35,22 @@ func respond(w http.ResponseWriter, status int, v any) {
 func failure(w http.ResponseWriter, err error) {
 	status := 503
 	message := "AI接続を更新できませんでした。"
+	payload := map[string]string{"message": message}
 	if errors.Is(err, ErrInvalid) {
 		status = 400
 		message = "接続の入力内容を確認してください。"
+		// ErrInvalid may wrap a public-safe reason (field name, header
+		// name) the user can act on — never stored secret material.
+		payload["message"] = message
+		if detail := strings.TrimPrefix(err.Error(), ErrInvalid.Error()+": "); detail != err.Error() {
+			payload["detail"] = detail
+		}
 	}
 	if errors.Is(err, ErrNotFound) {
 		status = 404
-		message = "接続が見つかりません。"
+		payload["message"] = "接続が見つかりません。"
 	}
-	respond(w, status, map[string]any{"error": map[string]string{"message": message}})
+	respond(w, status, map[string]any{"error": payload})
 }
 func (s *Service) identity(w http.ResponseWriter, r *http.Request) (chatgpt.LoginIdentity, bool) {
 	if s.Authenticate == nil {

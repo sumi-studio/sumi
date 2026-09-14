@@ -118,3 +118,42 @@ func TestHTTPExtraHeadersWriteOnly(t *testing.T) {
 		t.Fatalf("keyless header change accepted: %d", w.Code)
 	}
 }
+
+func TestHTTPMaxOutputTokensAndErrorDetail(t *testing.T) {
+	store := fixture(t)
+	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
+		return chatgpt.LoginIdentity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+			return effect(ctx)
+		}}, nil
+	}}
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+		return w
+	}
+	// The bound is non-secret metadata: it round-trips through save and list.
+	w := request("POST", "/api/model-connections/api", `{"name":"cap","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","maxOutputTokens":4096}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"maxOutputTokens":4096`) {
+		t.Fatalf("save %d %s", w.Code, w.Body.String())
+	}
+	var c Connection
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	w = request("GET", "/api/model-connections", "")
+	if !strings.Contains(w.Body.String(), `"maxOutputTokens":4096`) {
+		t.Fatalf("list omitted the bound: %s", w.Body.String())
+	}
+	// Out-of-range values are refused with the reason surfaced.
+	w = request("PUT", "/api/model-connections/api/"+c.ID, `{"name":"cap","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","maxOutputTokens":0}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "maxOutputTokens") {
+		t.Fatalf("bound 0 accepted or reason lost: %d %s", w.Code, w.Body.String())
+	}
+	// A reserved header rejection names the offending header, not the value.
+	w = request("POST", "/api/model-connections/api", `{"name":"gw2","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","extraHeaders":{"Authorization":"Bearer evil-value"}}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "Authorization") || strings.Contains(w.Body.String(), "evil-value") {
+		t.Fatalf("detail missing or value leaked: %d %s", w.Code, w.Body.String())
+	}
+}

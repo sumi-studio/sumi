@@ -151,12 +151,23 @@ export function parseCallEnvelope(
 }
 
 /**
- * Per-request translation between canonical tool names and the names a
- * function-calling wire accepts (OpenAI requires
+ * The deterministic canonical→wire tool-name transform (OpenAI requires
  * ^[a-zA-Z][a-zA-Z0-9_-]*$, Anthropic ^[a-zA-Z0-9_-]{1,128}$ — the
- * stricter shape satisfies both). Sanitization is lossy, so a collision
- * between two tools in one request fails loudly at request-build time
- * rather than misrouting a call.
+ * stricter shape satisfies both). Exported for replay: a recorded call
+ * must still map to a valid wire name when its tool is no longer
+ * advertised in the current request, so the fallback cannot depend on
+ * the request's tool list.
+ */
+export function sanitizeToolName(name: string): string {
+  let wire = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!/^[a-zA-Z]/.test(wire)) wire = `t_${wire}`;
+  return wire;
+}
+
+/**
+ * Per-request translation between canonical tool names and wire names.
+ * Sanitization is lossy, so a collision between two tools in one request
+ * fails loudly at request-build time rather than misrouting a call.
  */
 export function toolNameMaps(tools: { name: string }[]): {
   toWire: Map<string, string>;
@@ -165,8 +176,7 @@ export function toolNameMaps(tools: { name: string }[]): {
   const toWire = new Map<string, string>();
   const fromWire = new Map<string, string>();
   for (const t of tools) {
-    let wire = t.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    if (!/^[a-zA-Z]/.test(wire)) wire = `t_${wire}`;
+    const wire = sanitizeToolName(t.name);
     const taken = fromWire.get(wire);
     if (taken !== undefined && taken !== t.name) {
       throw new ModelError(
@@ -219,13 +229,19 @@ export async function httpError(res: Response): Promise<ModelError> {
 /**
  * Classify a fetch() rejection: caller cancellation propagates
  * untouched; our wall deadline and network failures are transient
- * provider errors worth retrying.
+ * provider errors worth retrying. A bare TypeError with no underlying
+ * cause is different: undici uses it for deterministic request defects
+ * (an unrepresentable header value, an unparsable URL) that can never
+ * succeed on retry — those fail honestly instead of spending the
+ * transient-retry window. Transport failures always arrive as
+ * `TypeError: fetch failed` carrying the socket error as `cause`.
  */
 export function networkError(e: unknown, signal?: AbortSignal): ModelError {
   if (signal?.aborted) throw e;
   const reason = e instanceof Error ? e.message : String(e);
+  const deterministic = e instanceof TypeError && !(e.cause instanceof Error);
   return new ModelError(`model request failed: ${reason}`, {
-    retryable: true,
+    retryable: !deterministic,
   });
 }
 
@@ -400,14 +416,27 @@ const RESERVED_HEADERS = new Set([
   "set-cookie",
 ]);
 
-/** Fail a call whose extra headers would replace adapter-owned fields. */
+/**
+ * Fail a call whose extra headers would replace adapter-owned fields or
+ * cannot go on the wire at all. fetch only accepts ByteString values
+ * (each code point ≤ U+00FF); a wider value would die as a TypeError
+ * inside Headers construction — caught here as an honest non-retryable
+ * config error instead. The header name may appear in the message; the
+ * value never does.
+ */
 export function assertExtraHeaders(
   headers: Record<string, string> | undefined,
 ): void {
-  for (const name of Object.keys(headers ?? {})) {
+  for (const [name, value] of Object.entries(headers ?? {})) {
     if (RESERVED_HEADERS.has(name.toLowerCase())) {
       throw new ModelError(
         `extra request header ${name} is reserved and cannot be set on a connection`,
+        { retryable: false },
+      );
+    }
+    if ([...value].some((ch) => (ch.codePointAt(0) ?? 0) > 0xff)) {
+      throw new ModelError(
+        `extra request header ${name} has a value HTTP cannot represent (characters must be Latin-1)`,
         { retryable: false },
       );
     }

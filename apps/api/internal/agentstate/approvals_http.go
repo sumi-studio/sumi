@@ -86,6 +86,9 @@ type ModelConnectionBinding struct {
 	BaseURL string `json:"base_url"`
 	Model   string `json:"model"`
 	Version string `json:"version"`
+	// MaxOutputTokens is the connection's requested output bound
+	// (non-secret metadata). Nil means the adapter's protocol default.
+	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
 	// ExtraHeaders are the connection's sealed per-request headers, sent
 	// only with the credential material (armed store) — never in
 	// metadata-only responses and never persisted into core state.
@@ -183,12 +186,13 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 		binding := ModelBinding{
 			Selection: "api",
 			Connection: &ModelConnectionBinding{
-				ID:      meta.Connection.ID,
-				Name:    meta.Connection.Name,
-				Preset:  meta.Connection.Preset,
-				BaseURL: meta.Connection.BaseURL,
-				Model:   meta.Connection.Model,
-				Version: meta.Version,
+				ID:              meta.Connection.ID,
+				Name:            meta.Connection.Name,
+				Preset:          meta.Connection.Preset,
+				BaseURL:         meta.Connection.BaseURL,
+				Model:           meta.Connection.Model,
+				Version:         meta.Version,
+				MaxOutputTokens: meta.Connection.MaxOutputTokens,
 			},
 		}
 		if s.conns.CredentialsAvailable() {

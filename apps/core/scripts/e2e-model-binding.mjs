@@ -42,6 +42,8 @@ const EXTRA_HEADERS = {
   "X-E2E-Gateway": "fixture",
   "X-E2E-Route": "model-binding",
 };
+// A configured output bound must ride store → binding → provider wire.
+const MAX_OUTPUT_TOKENS = 512;
 
 function uuidv7() {
   const now = Date.now().toString(16).padStart(12, "0");
@@ -259,6 +261,7 @@ r = await req("POST", "/internal/dev/model-connections", ADMIN, {
   model: "e2e-model",
   api_key: API_KEY,
   extra_headers: EXTRA_HEADERS,
+  max_output_tokens: MAX_OUTPUT_TOKENS,
 });
 assert(
   r.status === 201 || r.status === 200,
@@ -312,7 +315,11 @@ assert(
   binding.connection?.extra_headers?.["X-E2E-Gateway"] === "fixture",
   "binding extra_headers missing X-E2E-Gateway",
 );
-log("  binding resolves with credential + extra headers");
+assert(
+  binding.connection?.max_output_tokens === MAX_OUTPUT_TOKENS,
+  "binding max_output_tokens missing",
+);
+log("  binding resolves with credential + extra headers + output bound");
 
 // --- run the core turn -----------------------------------------------------
 r = await req("POST", `/internal/core/personas/${personaId}/inputs`, ptoken, {
@@ -381,6 +388,12 @@ for (const [i, q] of requests.entries()) {
       `request ${i + 1} missing extra header ${name}`,
     );
   }
+}
+for (const [i, q] of requests.entries()) {
+  assert(
+    q.body.max_output_tokens === MAX_OUTPUT_TOKENS,
+    `request ${i + 1} max_output_tokens ${q.body.max_output_tokens} != ${MAX_OUTPUT_TOKENS}`,
+  );
 }
 const second = requests[1].body;
 const toolOut = second.input.find((i) => i.type === "function_call_output");

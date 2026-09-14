@@ -1173,6 +1173,17 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Model
+            IDs are free text and providers reject a bound above the model's cap
+            with a 400 — set this when the selected model's output cap is below
+            the core's default. Absent means the protocol default (Anthropic
+            sends the core's default budget; Responses omits the field so the
+            model's own cap applies).
     ModelAPIConnectionCreate:
       type: object
       additionalProperties: false
@@ -1209,6 +1220,15 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Set it
+            when the selected model's output cap is below the core's default.
+            Non-secret metadata returned in list responses; omitting it stores
+            the protocol default (unbounded field), like other plain fields.
         apiKey:
           type: string
           minLength: 1
@@ -1268,6 +1288,15 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Set it
+            when the selected model's output cap is below the core's default.
+            Non-secret metadata returned in list responses; omitting it stores
+            the protocol default (unbounded field), like other plain fields.
         apiKey:
           type: string
           minLength: 1

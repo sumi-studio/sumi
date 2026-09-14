@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"regexp"
@@ -29,6 +30,12 @@ type Connection struct {
 	Preset  string `json:"preset"`
 	BaseURL string `json:"baseUrl"`
 	Model   string `json:"model"`
+	// MaxOutputTokens is the connection's requested bound on generated
+	// tokens (Anthropic max_tokens / Responses max_output_tokens). Nil
+	// means "use the protocol default": Anthropic sends the core's
+	// default budget; Responses omits the field so the model's own cap
+	// applies. Non-secret metadata — returned in list/read responses.
+	MaxOutputTokens *int `json:"maxOutputTokens,omitempty"`
 }
 type Input struct {
 	Name    string  `json:"name"`
@@ -36,6 +43,11 @@ type Input struct {
 	BaseURL string  `json:"baseUrl"`
 	Model   string  `json:"model"`
 	APIKey  *string `json:"apiKey,omitempty"`
+	// MaxOutputTokens overrides the default output bound for models whose
+	// cap differs from it. A model field is free text; without this knob a
+	// connection pointed at a model whose output cap is below the default
+	// would fail every request with a provider 400. Nil keeps the default.
+	MaxOutputTokens *int `json:"maxOutputTokens,omitempty"`
 	// ExtraHeaders are per-connection request headers sent only to this
 	// connection's endpoint (gateway routing, provider betas). They are
 	// sealed with the credential — a value may itself be secret material —
@@ -109,18 +121,44 @@ const (
 	maxExtraHeaders     = 16
 	maxExtraHeaderName  = 128
 	maxExtraHeaderValue = 1024
+	// maxOutputTokensBound is a sanity ceiling, not a model capability
+	// claim: above every documented provider cap, it only rejects obvious
+	// garbage. The endpoint remains the authority on what a model allows.
+	maxOutputTokensBound = 1_000_000
 )
+
+// invalid is ErrInvalid with a public-safe reason: it may name the field
+// or header the user supplied, never a stored credential or header value.
+func invalid(reason string) error {
+	return fmt.Errorf("%w: %s", ErrInvalid, reason)
+}
 
 func validateHeaders(headers map[string]string) error {
 	if len(headers) > maxExtraHeaders {
-		return ErrInvalid
+		return invalid(fmt.Sprintf("at most %d extra headers per connection", maxExtraHeaders))
 	}
 	for name, value := range headers {
-		if len(name) > maxExtraHeaderName || !headerNameRe.MatchString(name) || reservedHeaders[strings.ToLower(name)] {
-			return ErrInvalid
+		if len(name) > maxExtraHeaderName {
+			return invalid("extra header name exceeds 128 characters")
 		}
-		if len(value) > maxExtraHeaderValue || strings.IndexFunc(value, unicode.IsControl) >= 0 {
-			return ErrInvalid
+		if !headerNameRe.MatchString(name) {
+			return invalid(fmt.Sprintf("extra header name %q is not an RFC 7230 token", name))
+		}
+		if reservedHeaders[strings.ToLower(name)] {
+			return invalid(fmt.Sprintf("extra header %q is reserved by the request itself", name))
+		}
+		if len(value) > maxExtraHeaderValue {
+			return invalid(fmt.Sprintf("extra header %q value exceeds %d characters", name, maxExtraHeaderValue))
+		}
+		if strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return invalid(fmt.Sprintf("extra header %q value contains a control character", name))
+		}
+		// The fetch/undici Headers contract accepts only ByteString
+		// values (each code point ≤ U+00FF): a wider character would
+		// otherwise pass this check and then deterministically fail every
+		// request inside fetch, misclassified as a transient outage.
+		if strings.IndexFunc(value, func(r rune) bool { return r > 0xFF }) >= 0 {
+			return invalid(fmt.Sprintf("extra header %q value contains a character outside Latin-1", name))
 		}
 	}
 	return nil
@@ -129,21 +167,28 @@ func validateHeaders(headers map[string]string) error {
 // validateShape checks everything except the endpoint's transport rules
 // (SaveUnchecked bypasses only the endpoint rules for loopback fixtures).
 func validateShape(in Input) error {
-	if !bounded(in.Name, 120) || !bounded(in.Model, 128) {
-		return ErrInvalid
+	if !bounded(in.Name, 120) {
+		return invalid("name is required (max 120 characters)")
+	}
+	if !bounded(in.Model, 128) {
+		return invalid("model is required (max 128 characters)")
 	}
 	switch in.Preset {
 	case "openai-chat", "openai-responses", "anthropic", "kimi-k3", "glm-5.2", "umans", "umans-kimi-k2.7", "opencode-go", "opencode-zen-go":
 	default:
-		return ErrInvalid
+		return invalid(fmt.Sprintf("unsupported preset %q", in.Preset))
 	}
 	if in.APIKey != nil && (!bounded(*in.APIKey, 65536) || strings.TrimSpace(*in.APIKey) != *in.APIKey) {
-		return ErrInvalid
+		return invalid("API key is empty, too long, or has surrounding whitespace")
+	}
+	if in.MaxOutputTokens != nil &&
+		(*in.MaxOutputTokens < 1 || *in.MaxOutputTokens > maxOutputTokensBound) {
+		return invalid(fmt.Sprintf("maxOutputTokens must be between 1 and %d", maxOutputTokensBound))
 	}
 	// Extra headers live inside the sealed credential: setting or clearing
 	// them (present field, even an empty map) requires the key alongside.
 	if in.ExtraHeaders != nil && in.APIKey == nil {
-		return ErrInvalid
+		return invalid("changing extra headers requires resubmitting the API key")
 	}
 	return validateHeaders(in.ExtraHeaders)
 }
@@ -151,13 +196,13 @@ func validateShape(in Input) error {
 func validateEndpoint(baseURL string) error {
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(baseURL) > 2048 {
-		return ErrInvalid
+		return invalid("base URL must be a public https URL without credentials, query, or fragment")
 	}
 	// Activation additionally requires transport-level destination enforcement.
 	host := strings.ToLower(u.Hostname())
 	ip := net.ParseIP(host)
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || (ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast())) {
-		return ErrInvalid
+		return invalid("base URL must resolve to a public host")
 	}
 	return nil
 }
@@ -263,7 +308,7 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 		}
 	}
 	if !create && in.APIKey == nil && previousURL != in.BaseURL {
-		return Connection{}, ErrInvalid
+		return Connection{}, invalid("changing the base URL requires resubmitting the API key")
 	}
 	if in.APIKey != nil {
 		headers := in.ExtraHeaders
@@ -286,7 +331,7 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 			return Connection{}, err
 		}
 	} else if create {
-		return Connection{}, ErrInvalid
+		return Connection{}, invalid("a new connection requires an API key")
 	}
 	// The binding identifies credential authority, not the display name or model.
 	// Model-only edits can finish the current run with its existing model safely;
@@ -294,17 +339,17 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 	if create || in.APIKey != nil || previousURL != in.BaseURL || previousPreset != in.Preset {
 		version = uuid.NewString()
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO model_api_connections(human_id,connection_id,name,preset,base_url,model,credential_ciphertext,version) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(human_id,connection_id) DO UPDATE SET name=EXCLUDED.name,preset=EXCLUDED.preset,base_url=EXCLUDED.base_url,model=EXCLUDED.model,credential_ciphertext=EXCLUDED.credential_ciphertext,version=EXCLUDED.version`, human, id, in.Name, in.Preset, in.BaseURL, in.Model, ciphertext, version)
+	_, err = tx.Exec(ctx, `INSERT INTO model_api_connections(human_id,connection_id,name,preset,base_url,model,max_output_tokens,credential_ciphertext,version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(human_id,connection_id) DO UPDATE SET name=EXCLUDED.name,preset=EXCLUDED.preset,base_url=EXCLUDED.base_url,model=EXCLUDED.model,max_output_tokens=EXCLUDED.max_output_tokens,credential_ciphertext=EXCLUDED.credential_ciphertext,version=EXCLUDED.version`, human, id, in.Name, in.Preset, in.BaseURL, in.Model, in.MaxOutputTokens, ciphertext, version)
 	if err != nil {
 		return Connection{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return Connection{}, err
 	}
-	return Connection{id, in.Name, in.Preset, in.BaseURL, in.Model}, nil
+	return Connection{id, in.Name, in.Preset, in.BaseURL, in.Model, in.MaxOutputTokens}, nil
 }
 func (s *Store) List(ctx context.Context, human string) ([]Connection, error) {
-	rows, err := s.pool.Query(ctx, "SELECT connection_id::text,name,preset,base_url,model FROM model_api_connections WHERE human_id=$1 ORDER BY name,connection_id", human)
+	rows, err := s.pool.Query(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens FROM model_api_connections WHERE human_id=$1 ORDER BY name,connection_id", human)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +357,7 @@ func (s *Store) List(ctx context.Context, human string) ([]Connection, error) {
 	out := []Connection{}
 	for rows.Next() {
 		var c Connection
-		if err = rows.Scan(&c.ID, &c.Name, &c.Preset, &c.BaseURL, &c.Model); err != nil {
+		if err = rows.Scan(&c.ID, &c.Name, &c.Preset, &c.BaseURL, &c.Model, &c.MaxOutputTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -404,7 +449,7 @@ func (s *Store) Resolve(ctx context.Context, human, id string) (Access, error) {
 
 	var a Access
 	var b []byte
-	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,credential_ciphertext,version::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, id).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &b, &a.Version)
+	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens,credential_ciphertext,version::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, id).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &a.Connection.MaxOutputTokens, &b, &a.Version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -437,7 +482,7 @@ func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) 
 		return Access{}, ErrNotFound
 	}
 	var a Access
-	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,version::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, parsed.String()).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &a.Version)
+	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens,version::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, parsed.String()).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &a.Connection.MaxOutputTokens, &a.Version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -447,7 +492,7 @@ func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) 
 // RuntimeFingerprint excludes display-only fields and inactive connections.
 func (s *Store) RuntimeFingerprint(ctx context.Context, human string) (string, error) {
 	var value string
-	err := s.pool.QueryRow(ctx, `SELECT s.kind || ':' || COALESCE(s.connection_id::text,'') || ':' || COALESCE(c.version::text,'') || ':' || COALESCE(c.model,'') FROM model_connection_selections s LEFT JOIN model_api_connections c ON c.human_id=s.human_id AND c.connection_id=s.connection_id WHERE s.human_id=$1`, human).Scan(&value)
+	err := s.pool.QueryRow(ctx, `SELECT s.kind || ':' || COALESCE(s.connection_id::text,'') || ':' || COALESCE(c.version::text,'') || ':' || COALESCE(c.model,'') || ':' || COALESCE(c.max_output_tokens::text,'') FROM model_connection_selections s LEFT JOIN model_api_connections c ON c.human_id=s.human_id AND c.connection_id=s.connection_id WHERE s.human_id=$1`, human).Scan(&value)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}

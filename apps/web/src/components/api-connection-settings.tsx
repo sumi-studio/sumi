@@ -33,6 +33,7 @@ export function APIConnectionSettings({
   const [form, setForm] = useState<ConnectionInput>(blank);
   const [key, setKey] = useState("");
   const [headersText, setHeadersText] = useState("");
+  const [clearHeaders, setClearHeaders] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   const lifetime = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -59,10 +60,12 @@ export function APIConnectionSettings({
       await action(controller.signal);
       const next = await client.list(controller.signal);
       if (!controller.signal.aborted) setState(next);
-    } catch {
+    } catch (e) {
       if (!controller.signal.aborted)
         setError(
-          "接続を更新できませんでした。入力と接続状態を確認して、もう一度お試しください。",
+          e instanceof Error && e.message
+            ? e.message
+            : "接続を更新できませんでした。入力と接続状態を確認して、もう一度お試しください。",
         );
     } finally {
       if (!controller.signal.aborted) setBusy(false);
@@ -77,11 +80,13 @@ export function APIConnectionSettings({
             preset: connection.preset,
             baseUrl: connection.baseUrl,
             model: connection.model,
+            maxOutputTokens: connection.maxOutputTokens,
           }
         : blank,
     );
     setKey("");
     setHeadersText("");
+    setClearHeaders(false);
     setRemoving(null);
     setError("");
   }
@@ -234,11 +239,12 @@ export function APIConnectionSettings({
                 );
                 return;
               }
-              // Headers are sealed with the credential: changing them
-              // without resubmitting the key is rejected by the server.
-              if (headersText.trim() && !key) {
+              // Headers are sealed with the credential: setting,
+              // changing, or clearing them without resubmitting the key
+              // is rejected by the server.
+              if ((headersText.trim() || clearHeaders) && !key) {
                 setError(
-                  "ヘッダーを設定・変更するにはAPIキーも入力してください。",
+                  "ヘッダーを設定・変更・削除するにはAPIキーも入力してください。",
                 );
                 return;
               }
@@ -246,7 +252,11 @@ export function APIConnectionSettings({
                 {
                   ...form,
                   ...(key ? { apiKey: key } : {}),
-                  ...(headersText.trim() ? { extraHeaders } : {}),
+                  ...(clearHeaders
+                    ? { extraHeaders: {} }
+                    : headersText.trim()
+                      ? { extraHeaders }
+                      : {}),
                 },
                 editing ?? undefined,
                 signal,
@@ -254,6 +264,7 @@ export function APIConnectionSettings({
               if (!signal.aborted) {
                 setKey("");
                 setHeadersText("");
+                setClearHeaders(false);
                 setEditing(undefined);
                 setNotice(
                   state?.selection?.kind === "api" &&
@@ -324,6 +335,33 @@ export function APIConnectionSettings({
             />
           </label>
           <label className="block text-sm">
+            最大出力トークン（任意）
+            <input
+              className={inputClass}
+              type="number"
+              min={1}
+              max={1000000}
+              step={1}
+              value={form.maxOutputTokens ?? ""}
+              disabled={busy}
+              onChange={(e) => {
+                const raw = e.target.value;
+                const n = raw === "" ? undefined : Number.parseInt(raw, 10);
+                setForm({
+                  ...form,
+                  maxOutputTokens:
+                    n !== undefined && Number.isInteger(n) && n > 0
+                      ? n
+                      : undefined,
+                });
+              }}
+              placeholder="プロバイダー既定"
+            />
+            <span className="mt-1 block text-muted-foreground text-xs">
+              モデルの出力上限が既定より小さい場合に設定します。上限を超える値はプロバイダーが拒否します。
+            </span>
+          </label>
+          <label className="block text-sm">
             APIキー
             <input
               className={inputClass}
@@ -333,6 +371,7 @@ export function APIConnectionSettings({
               required={
                 !editing ||
                 !!headersText.trim() ||
+                clearHeaders ||
                 state?.connections.find((c) => c.id === editing)?.baseUrl !==
                   form.baseUrl
               }
@@ -347,12 +386,23 @@ export function APIConnectionSettings({
               className={inputClass}
               rows={2}
               value={headersText}
-              disabled={busy}
+              disabled={busy || clearHeaders}
               onChange={(e) => setHeadersText(e.target.value)}
               placeholder={"X-Header-Name: 値"}
               spellCheck={false}
             />
           </label>
+          {editing && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={clearHeaders}
+                disabled={busy}
+                onChange={(e) => setClearHeaders(e.target.checked)}
+              />
+              保存済みの追加ヘッダーをすべて削除する
+            </label>
+          )}
           <p className="text-muted-foreground text-xs leading-relaxed">
             キーはこのSumiサーバーに暗号化して保存します。選んだ接続先へ会話が送られ、APIの利用料はそのアカウントに発生します。保存済みのキーは表示しません。追加ヘッダーもキーと一緒に暗号化して保存され、この接続先にだけ送られます。変更するにはAPIキーと一緒に再入力してください。
           </p>
@@ -367,6 +417,8 @@ export function APIConnectionSettings({
               onClick={() => {
                 setEditing(undefined);
                 setKey("");
+                setHeadersText("");
+                setClearHeaders(false);
               }}
             >
               戻る

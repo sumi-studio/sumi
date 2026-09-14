@@ -215,6 +215,12 @@ export interface ModelBinding {
      * into state/events.
      */
     extra_headers?: Record<string, string>;
+    /**
+     * The connection's requested bound on generated tokens (Anthropic
+     * max_tokens / Responses max_output_tokens). Absent = protocol
+     * default.
+     */
+    max_output_tokens?: number;
   };
   api_key?: string;
   credential_available?: boolean;

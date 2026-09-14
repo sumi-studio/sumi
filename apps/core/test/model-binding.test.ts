@@ -43,7 +43,10 @@ type Seen = {
   apiKeyHeader: string | undefined;
   versionHeader: string | undefined;
   extra: string | undefined;
+  sessionHeader: string | undefined;
   model: string;
+  outputBound: unknown;
+  cacheKey: unknown;
 };
 
 async function withModelServer(
@@ -54,14 +57,18 @@ async function withModelServer(
     let body = "";
     req.on("data", (d) => (body += d));
     req.on("end", () => {
-      const model = String((JSON.parse(body) as { model: unknown }).model);
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const model = String(parsed.model);
       seen.push({
         url: req.url,
         auth: req.headers.authorization,
         apiKeyHeader: req.headers["x-api-key"] as string | undefined,
         versionHeader: req.headers["anthropic-version"] as string | undefined,
         extra: req.headers["x-fixture-tag"] as string | undefined,
-        model,
+        sessionHeader: req.headers["x-opencode-session"] as string | undefined,
+        model: String(parsed.model),
+        outputBound: parsed.max_tokens ?? parsed.max_output_tokens,
+        cacheKey: parsed.prompt_cache_key,
       });
       res.writeHead(200, { "content-type": "text/event-stream" });
       const url = req.url ?? "";
@@ -179,7 +186,10 @@ test("an API selection streams from exactly that connection and is re-read on ev
         apiKeyHeader: undefined,
         versionHeader: undefined,
         extra: undefined,
+        sessionHeader: undefined,
         model: "model-a",
+        outputBound: undefined,
+        cacheKey: undefined,
       },
       {
         url: "/chat/completions",
@@ -187,7 +197,10 @@ test("an API selection streams from exactly that connection and is re-read on ev
         apiKeyHeader: undefined,
         versionHeader: undefined,
         extra: undefined,
+        sessionHeader: undefined,
         model: "model-b",
+        outputBound: undefined,
+        cacheKey: undefined,
       },
     ]);
     assert.equal(fallback.calls, 0);
@@ -263,12 +276,60 @@ test("a selection the core cannot honor fails the request without using another 
       state.setModelBinding(PERSONA, binding);
       await assert.rejects(
         collect(selected(state, fallback)),
-        (e: unknown) => e instanceof ModelError && !e.retryable,
+        (e: unknown) =>
+          e instanceof ModelError &&
+          !e.retryable &&
+          // An unusable selection is an availability gap — distinguishable
+          // from a genuine evaluated-model failure so callers that spend
+          // model budget (memory attempts) can pause instead.
+          e.unavailable === true,
         label,
       );
       assert.equal(fallback.calls, 0, `${label}: operator model not used`);
     }
     assert.equal(seen.length, 0, "no request reached any model");
+  });
+});
+
+test("the connection's output bound reaches its wire; OpenCode carries the session header", async () => {
+  await withModelServer(async (baseUrl, seen) => {
+    const state = new FakeState();
+    const p = selected(state, new Fallback());
+
+    // Anthropic requires the field — the configured bound overrides the
+    // default budget.
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "anthropic", max_output_tokens: 512 }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, 512);
+
+    // Responses: unconfigured omits the field; configured sends it; the
+    // persona id feeds prompt_cache_key either way.
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "openai-responses" }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, undefined);
+    assert.equal(seen.at(-1)!.cacheKey, PERSONA);
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "openai-responses", max_output_tokens: 900 }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, 900);
+
+    // The chat wire sends no output bound; OpenCode presets carry the
+    // persona's stable identity as the session header.
+    state.setModelBinding(PERSONA, api(baseUrl, { preset: "opencode-go" }));
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, undefined);
+    assert.equal(seen.at(-1)!.sessionHeader, PERSONA);
+    state.setModelBinding(PERSONA, api(baseUrl, { preset: "openai-chat" }));
+    await collect(p);
+    assert.equal(seen.at(-1)!.sessionHeader, undefined);
   });
 });
 
@@ -292,11 +353,13 @@ test("no selection uses the operator default; a lookup outage retries rather tha
     }) as unknown as StateClient;
   await assert.rejects(
     collect(selected(failing(503), fallback)),
-    (e: unknown) => e instanceof ModelError && e.retryable,
+    (e: unknown) =>
+      e instanceof ModelError && e.retryable && e.unavailable === true,
   );
   await assert.rejects(
     collect(selected(failing(404), fallback)),
-    (e: unknown) => e instanceof ModelError && !e.retryable,
+    (e: unknown) =>
+      e instanceof ModelError && !e.retryable && e.unavailable === true,
   );
   assert.equal(
     fallback.calls,

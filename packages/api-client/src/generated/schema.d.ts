@@ -553,6 +553,8 @@ export interface components {
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Model IDs are free text and providers reject a bound above the model's cap with a 400 — set this when the selected model's output cap is below the core's default. Absent means the protocol default (Anthropic sends the core's default budget; Responses omits the field so the model's own cap applies). */
+            maxOutputTokens?: number;
         };
         ModelAPIConnectionCreate: {
             name: string;
@@ -564,6 +566,8 @@ export interface components {
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores the protocol default (unbounded field), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey: string;
             extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
@@ -582,6 +586,8 @@ export interface components {
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores the protocol default (unbounded field), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey?: string;
             extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];

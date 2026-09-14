@@ -277,6 +277,10 @@ func TestHeaderValidation(t *testing.T) {
 		{"X-Ok": "line\nbreak"},
 		{"X-Ok": strings.Repeat("v", 1025)},
 		{strings.Repeat("n", 129): "x"},
+		// Beyond Latin-1 fetch cannot put the value on the wire: reject at
+		// write instead of deterministically failing every request.
+		{"X-Ok": "値"},
+		{"X-Ok": "emoji🎉"},
 	}
 	for _, h := range bad {
 		in := input()
@@ -335,5 +339,55 @@ func TestMissingEncryptionKeyPreservesSelectionsAndRejectsCredentials(t *testing
 	}
 	if _, err := store.Resolve(ctx, owner, connection.ID); err != nil {
 		t.Fatal("restored original key no longer decrypts", err)
+	}
+}
+
+func TestMaxOutputTokensPersistsAsConnectionMetadata(t *testing.T) {
+	s := fixture(t)
+	ctx := context.Background()
+	in := input()
+	bound := 8192
+	in.MaxOutputTokens = &bound
+	c, err := s.Save(ctx, owner, "", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxOutputTokens == nil || *c.MaxOutputTokens != 8192 {
+		t.Fatalf("saved connection %+v", c)
+	}
+	list, err := s.List(ctx, owner)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list %v %+v", err, list)
+	}
+	if list[0].MaxOutputTokens == nil || *list[0].MaxOutputTokens != 8192 {
+		t.Fatalf("list omitted the bound: %+v", list[0])
+	}
+	meta, err := s.Describe(ctx, owner, c.ID)
+	if err != nil || meta.Connection.MaxOutputTokens == nil || *meta.Connection.MaxOutputTokens != 8192 {
+		t.Fatalf("describe %+v %v", meta, err)
+	}
+	// Non-secret metadata: present on the readable row, not inside the
+	// sealed credential payload.
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, "SELECT credential_ciphertext FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", owner, c.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("8192")) {
+		t.Fatal("output bound leaked into the credential payload")
+	}
+	// A plain metadata update replaces the bound (unset clears to default).
+	in.MaxOutputTokens = nil
+	if _, err = s.Save(ctx, owner, c.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, err := s.Resolve(ctx, owner, c.ID)
+	if err != nil || access.Connection.MaxOutputTokens != nil {
+		t.Fatalf("cleared bound still present: %+v", access.Connection)
+	}
+	for _, v := range []int{0, -5, 1_000_001} {
+		in.MaxOutputTokens = &v
+		if _, err = s.Save(ctx, owner, c.ID, in); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("accepted bound %d: %v", v, err)
+		}
 	}
 }

@@ -565,3 +565,72 @@ test("a reserved extra header fails the call, never the credential", async () =>
       e instanceof ModelError && !e.retryable && /reserved/.test(e.message),
   );
 });
+
+test("a replayed call keeps a valid wire name after the tool leaves the advertised set", async () => {
+  let parsed: {
+    messages?: {
+      role: string;
+      tool_calls?: { id: string; function: { name: string } }[];
+    }[];
+  } = {};
+  await withServer(
+    (req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        parsed = JSON.parse(body) as typeof parsed;
+        sse([fin("stop"), "[DONE]"])(res);
+      });
+    },
+    async (base) => {
+      // journal.note ran in an earlier generation; this consultation no
+      // longer advertises it. The replayed canonical name must still
+      // become the wire-legal form, not the raw dotted name.
+      for await (const _ of provider(base).stream({
+        ...REQ,
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              {
+                id: "c1",
+                name: "journal.note",
+                route: "normal",
+                arguments: { text: "x" },
+              },
+            ],
+          },
+          { role: "tool", toolCallId: "c1", content: '{"ok":true}' },
+        ],
+      })) {
+        /* drain */
+      }
+    },
+  );
+  const replayed = parsed.messages?.[0]?.tool_calls?.[0];
+  assert.equal(replayed?.id, "c1");
+  assert.equal(replayed?.function.name, "journal_note");
+});
+
+test("a configured session header carries the persona's stable identity", async () => {
+  let sessionHeader: string | undefined;
+  await withServer(
+    (req, res) => {
+      sessionHeader = req.headers["x-opencode-session"] as string | undefined;
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => sse([fin("stop"), "[DONE]"])(res));
+    },
+    async (base) => {
+      const p = new OpenAIProvider({
+        baseUrl: base,
+        apiKey: "test-key",
+        model: "test-model",
+        sessionHeader: "x-opencode-session",
+      });
+      await collect(p);
+    },
+  );
+  assert.equal(sessionHeader, "p");
+});

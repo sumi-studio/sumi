@@ -14,6 +14,7 @@ import {
   parseCallEnvelope,
   requestDeadline,
   routeEnvelope,
+  sanitizeToolName,
   toolNameMaps,
 } from "./shared.ts";
 
@@ -25,9 +26,17 @@ export interface OpenAIConfig {
   extra?: Record<string, unknown>;
   /**
    * Static extra request headers — provider routing requirements such as
-   * OpenCode Go's x-opencode-session belong here, not in the request body.
+   * a gateway header belong here, not in the request body.
    */
   headers?: Record<string, string>;
+  /**
+   * When set, the request carries this header with the persona's stable
+   * identity (request.personaId) — the new-core equivalent of the legacy
+   * agent's per-PA session id (e.g. x-opencode-session for OpenCode Go,
+   * which routes/affinity-keys on it). Applied after `headers` so the
+   * live identity always wins over a static configured value.
+   */
+  sessionHeader?: string;
   /**
    * Per-request wall-clock timeout covering the whole streamed response —
    * connect through final event. A stalled provider must not hold a turn
@@ -80,6 +89,9 @@ export class OpenAIProvider implements ModelProvider {
               Authorization: `Bearer ${this.cfg.apiKey}`,
               "Content-Type": "application/json",
               ...this.cfg.headers,
+              ...(this.cfg.sessionHeader
+                ? { [this.cfg.sessionHeader]: request.personaId }
+                : {}),
             },
             signal: deadline.signal,
             body: JSON.stringify({
@@ -97,7 +109,11 @@ export class OpenAIProvider implements ModelProvider {
                         id: c.id,
                         type: "function",
                         function: {
-                          name: toWire.get(c.name) ?? c.name,
+                          // The recorded name is canonical; replay must
+                          // still produce a valid wire name when the tool
+                          // is no longer advertised in this request, so
+                          // the deterministic transform is the fallback.
+                          name: toWire.get(c.name) ?? sanitizeToolName(c.name),
                           // The wire envelope is {route, input} — replay the
                           // decided call in the same shape the model emitted.
                           arguments: encodeCallArguments(c),

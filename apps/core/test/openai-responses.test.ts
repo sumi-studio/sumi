@@ -610,3 +610,115 @@ test("a reserved extra header fails the call, never the credential", async () =>
       e instanceof ModelError && !e.retryable && /reserved/.test(e.message),
   );
 });
+
+test("max_output_tokens is omitted when unconfigured, sent when set", async () => {
+  await withServer(
+    (_req, res) => sse([completed()])(res),
+    async (base, seen) => {
+      await collect(provider(base));
+      const body = JSON.parse(seen[0]!.body) as Record<string, unknown>;
+      // No fixed bound is imposed: the model's own cap applies, so a
+      // lower-cap model cannot fail on our default.
+      assert.equal("max_output_tokens" in body, false);
+      // Persona identity feeds provider prefix-cache routing.
+      assert.equal(body.prompt_cache_key, "p");
+    },
+  );
+  await withServer(
+    (_req, res) => sse([completed()])(res),
+    async (base, seen) => {
+      await collect(provider(base, { maxOutputTokens: 2048 }));
+      const body = JSON.parse(seen[0]!.body) as Record<string, unknown>;
+      assert.equal(body.max_output_tokens, 2048);
+    },
+  );
+});
+
+test("a replayed call keeps a valid wire name after the tool leaves the advertised set", async () => {
+  await withServer(
+    (_req, res) => sse([completed()])(res),
+    async (base, seen) => {
+      // journal.note ran in an earlier generation; this consultation no
+      // longer advertises it (tools: []). The replayed canonical name
+      // must still become a wire-legal name, not the raw dotted name.
+      await collect(
+        provider(base),
+        req(
+          [
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                {
+                  id: "call_abc",
+                  name: "journal.note",
+                  route: "normal",
+                  arguments: { text: "x" },
+                },
+              ],
+            },
+            { role: "tool", toolCallId: "call_abc", content: '{"ok":true}' },
+          ],
+          [],
+        ),
+      );
+      const input = (JSON.parse(seen[0]!.body) as { input: unknown[] })
+        .input as Record<string, unknown>[];
+      assert.deepEqual(input[0], {
+        type: "function_call",
+        call_id: "call_abc",
+        name: "journal_note",
+        arguments: '{"route":"normal","input":{"text":"x"}}',
+        status: "completed",
+      });
+      assert.deepEqual(input[1], {
+        type: "function_call_output",
+        call_id: "call_abc",
+        output: '{"ok":true}',
+      });
+    },
+  );
+});
+
+test("a header value fetch cannot represent fails non-retryably, before transport", async () => {
+  await assert.rejects(
+    collect(
+      provider("http://127.0.0.1:1", {
+        headers: { "X-Name": "値" },
+      }),
+    ),
+    (e: unknown) =>
+      e instanceof ModelError &&
+      !e.retryable &&
+      /Latin-1/.test(e.message) &&
+      // The name may appear; the value must not.
+      !e.message.includes("値"),
+  );
+});
+
+test("a deterministic fetch TypeError is not a transient network failure", async () => {
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" },
+    (() =>
+      Promise.reject(
+        new TypeError("Cannot convert argument to a ByteString"),
+      )) as typeof fetch,
+  );
+  await assert.rejects(
+    collect(p),
+    (e: unknown) => e instanceof ModelError && !e.retryable,
+  );
+});
+
+test("a transport TypeError with a socket cause stays retryable", async () => {
+  const cause = new Error("connect ECONNREFUSED");
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "http://127.0.0.1:1", apiKey: "k", model: "m" },
+    (() =>
+      Promise.reject(new TypeError("fetch failed", { cause }))) as typeof fetch,
+  );
+  await assert.rejects(
+    collect(p),
+    (e: unknown) => e instanceof ModelError && e.retryable,
+  );
+});
