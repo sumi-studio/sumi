@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,13 +135,14 @@ func (f *approvalFixture) decision(decision, id string) ApprovalDecision {
 }
 
 func TestApprovedSendRunsOnceAfterRestart(t *testing.T) {
-	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "会議を15時に移します"}}
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "会議を15時に移します"}}
 	f := newApprovalFixture(t, send)
 	ctx := context.Background()
 
-	// message.send is intrinsically gated even on the normal route.
+	// Only an explicit elevated call asks the human; a normal message.send
+	// would be a structured block (TestNormalSendIsBlocked, below).
 	op, a, fresh := f.claim(t, "t-1", 0, send)
-	if op.Status != "awaiting_approval" || a == nil || a.RequiredBy != "intrinsic" || a.Route != "normal" || !fresh {
+	if op.Status != "awaiting_approval" || a == nil || a.RequiredBy != "route" || a.Route != "elevated" || !fresh {
 		t.Fatalf("gated claim: op=%+v approval=%+v fresh=%v", op, a, fresh)
 	}
 	// A lost claim response re-finds the same request instead of minting one.
@@ -213,7 +216,7 @@ func TestApprovedSendRunsOnceAfterRestart(t *testing.T) {
 }
 
 func TestDeniedSendStaysDenied(t *testing.T) {
-	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "全員に送信"}}
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "全員に送信"}}
 	f := newApprovalFixture(t, send)
 	ctx := context.Background()
 	a := f.park(t, send)
@@ -280,7 +283,7 @@ func TestElevatedDenialBlocksIdenticalNormalCall(t *testing.T) {
 
 func TestDecisionBeforeParkCommitRequeues(t *testing.T) {
 	ctx := context.Background()
-	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "quick"}}
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "quick"}}
 	f := newApprovalFixture(t, send)
 	_, a, _ := f.claim(t, "t-1", 0, send)
 	// The human answers before the secretary's await commit lands.
@@ -300,7 +303,7 @@ func TestDecisionBeforeParkCommitRequeues(t *testing.T) {
 
 func TestCrashWhilePendingKeepsOneRequest(t *testing.T) {
 	ctx := context.Background()
-	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "after crash"}}
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "after crash"}}
 	f := newApprovalFixture(t, send)
 	_, a, _ := f.claim(t, "t-1", 0, send)
 	// Crash before the await commit: the turn is still running.
@@ -344,7 +347,7 @@ func TestSavePlanRequiresRoute(t *testing.T) {
 }
 
 func TestApprovalDecisionRoute(t *testing.T) {
-	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "via http"}}
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "via http"}}
 	f := newApprovalFixture(t, send)
 	srv := NewServer(f.pool, testAdminSecret)
 	mux := http.NewServeMux()
@@ -382,6 +385,103 @@ func TestApprovalDecisionRoute(t *testing.T) {
 	if rec := do(t, mux, "POST", base+"/"+a.ApprovalID+"/decision", testAdminSecret,
 		`{"decision":"deny_once","decision_id":"d-2","decided_by_kind":"human","decided_by_id":"`+f.human+`"}`); rec.Code != 409 {
 		t.Fatalf("conflicting decision status = %d", rec.Code)
+	}
+}
+
+func TestNormalSendIsBlockedNotParked(t *testing.T) {
+	// ADR 0013 §2: the Normal route never produces a human prompt. A
+	// normal message.send is recorded as a structured block — durable,
+	// replayed identically — with no approval row and no outbox ask.
+	ctx := context.Background()
+	send := PlanCall{Tool: "message.send", Route: "normal", Request: map[string]any{"text": "直接送信"}}
+	f := newApprovalFixture(t, send)
+	op, a, fresh := f.claim(t, "t-1", 0, send)
+	if op.Status != "failed" || a != nil || !fresh {
+		t.Fatalf("normal send: op=%+v approval=%+v fresh=%v", op, a, fresh)
+	}
+	if op.Response["blocked"] != "elevated_route_required" {
+		t.Fatalf("block response = %+v", op.Response)
+	}
+	if n := f.outboxCount(t, "approval_requested"); n != 0 {
+		t.Fatal("normal-route send asked the human")
+	}
+	if list, err := f.s.ListApprovals(ctx, f.pa, ""); err != nil || len(list) != 0 {
+		t.Fatalf("approvals = %d err=%v", len(list), err)
+	}
+	// The block is durable: a replayed claim returns the same record.
+	op2, a2, fresh2 := f.claim(t, "t-1", 0, send)
+	if op2.Status != "failed" || a2 != nil || fresh2 {
+		t.Fatalf("blocked replay: op=%+v approval=%+v fresh=%v", op2, a2, fresh2)
+	}
+	if f.outboxCount(t, "secretary_message") != 0 {
+		t.Fatal("blocked send was delivered")
+	}
+}
+
+func TestGatedCallWithInvalidArgsNeverParks(t *testing.T) {
+	// A call that can never execute is not asked of the human and leaves
+	// no approved/unconsumed grant stranded.
+	ctx := context.Background()
+	bad := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{}}
+	f := newApprovalFixture(t, bad)
+	op, a, fresh := f.claim(t, "t-1", 0, bad)
+	if op.Status != "failed" || a != nil || !fresh {
+		t.Fatalf("invalid gated claim: op=%+v approval=%+v fresh=%v", op, a, fresh)
+	}
+	if !strings.Contains(fmt.Sprint(op.Response["error"]), "message.send requires text") {
+		t.Fatalf("invalid response = %+v", op.Response)
+	}
+	if list, err := f.s.ListApprovals(ctx, f.pa, ""); err != nil || len(list) != 0 {
+		t.Fatalf("approvals = %d err=%v", len(list), err)
+	}
+}
+
+func TestEmptyDecisionIDRejected(t *testing.T) {
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "x"}}
+	f := newApprovalFixture(t, send)
+	a := f.park(t, send)
+	if _, err := f.s.ResolveApproval(context.Background(), f.pa, a.ApprovalID,
+		f.decision("approve_once", "")); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("empty decision_id err = %v, want ErrBadRequest", err)
+	}
+	// The approval is still pending and decidable.
+	got, err := f.s.ResolveApproval(context.Background(), f.pa, a.ApprovalID,
+		f.decision("approve_once", "d-1"))
+	if err != nil || got.Status != "approved" {
+		t.Fatalf("approve after empty-id rejection: %+v err=%v", got, err)
+	}
+}
+
+func TestApprovalWaitTimeIsRecorded(t *testing.T) {
+	// The human's thinking time accumulates durably on the input so the
+	// core can exclude it from the provider retry window (F4).
+	ctx := context.Background()
+	send := PlanCall{Tool: "message.send", Route: "elevated", Request: map[string]any{"text": "long wait"}}
+	f := newApprovalFixture(t, send)
+	a := f.park(t, send)
+	// Backdate the wait start so the decision lands "hours" later —
+	// deterministic, no sleeping.
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE core_inputs SET waiting_since = now() - interval '2 hours'
+		 WHERE persona_id = $1 AND input_id = 'in-1'`, f.pa); err != nil {
+		t.Fatalf("backdate wait: %v", err)
+	}
+	if _, err := f.s.ResolveApproval(ctx, f.pa, a.ApprovalID, f.decision("approve_once", "d-1")); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	in, _, err := f.s.GetInput(ctx, f.pa, "in-1")
+	if err != nil {
+		t.Fatalf("get input: %v", err)
+	}
+	if in.WaitedMs < int64(2*time.Hour/time.Millisecond) || in.WaitingSince != nil {
+		t.Fatalf("waited_ms = %d waiting_since = %v", in.WaitedMs, in.WaitingSince)
+	}
+	// The accumulated wait survives a restart — it is column state, not a
+	// process memory.
+	f.restart(t)
+	in2, _, err := f.s.GetInput(ctx, f.pa, "in-1")
+	if err != nil || in2.WaitedMs != in.WaitedMs {
+		t.Fatalf("waited_ms after restart = %d err=%v", in2.WaitedMs, err)
 	}
 }
 

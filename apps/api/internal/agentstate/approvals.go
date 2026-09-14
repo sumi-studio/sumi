@@ -74,19 +74,27 @@ type ApprovalDecision struct {
 	DecidedByID   string `json:"decided_by_id"`
 }
 
-// toolAuthority is the foundation-owned registry of which state-internal
-// tools require a human decision before their effect may run. The model may
-// only ever *raise* a call's requirements (elevated route); it can never
-// lower an intrinsic requirement by proposing route "normal".
+// toolAuthority is the foundation-owned registry of state-internal tools
+// and the authority each may act under (ADR 0013 §3). The model may only
+// ever *raise* a call's requirements (elevated route); it can never lower
+// a tool's own requirement by proposing route "normal" — and the Normal
+// route never produces a human prompt on its own.
 var toolAuthority = map[string]struct {
 	internal         bool
 	requiresApproval bool
+	elevatedOnly     bool
 }{
 	"schedule.set": {internal: true},
 	"journal.note": {internal: true},
-	// Speaking to the shared channel on the human's behalf is an
-	// outward-facing act: it always waits for an explicit human decision.
-	"message.send": {internal: true, requiresApproval: true},
+	// Speaking into the shared channel on the human's behalf is an
+	// outward-facing act requiring consent. Per ADR 0013 §2 the Normal
+	// route does not ask the human, so a normal call is recorded as a
+	// structured block (ClaimOperation); only an explicit elevated call
+	// creates the human's one-shot approval request. This is NOT a blanket
+	// approval rule for every message: an app-level tool like
+	// shared-intake's messaging.send acts under the secretary's own app
+	// membership and needs no human decision.
+	"message.send": {internal: true, elevatedOnly: true},
 }
 
 func isInternalTool(tool string) bool {
@@ -94,9 +102,19 @@ func isInternalTool(tool string) bool {
 	return ok && info.internal
 }
 
+// elevatedOnlyTool reports a tool that may execute only through an
+// approved elevated call.
+func elevatedOnlyTool(tool string) bool {
+	info, ok := toolAuthority[tool]
+	return ok && info.elevatedOnly
+}
+
 // approvalRequirement returns why a recorded call must wait for a human
 // decision: "intrinsic" for a tool that always requires approval, "route"
 // when the model proposed the call on the elevated route, "" otherwise.
+// No foundation tool registers requiresApproval today — the vocabulary
+// and column stay for platform-registered tools (e.g. a shared-intake
+// effect that cannot exist without consent).
 func approvalRequirement(tool, route string) string {
 	if info, ok := toolAuthority[tool]; ok && info.requiresApproval {
 		return "intrinsic"
@@ -105,6 +123,41 @@ func approvalRequirement(tool, route string) string {
 		return "route"
 	}
 	return ""
+}
+
+// validateToolRequest runs the deterministic argument checks a gated call
+// must pass before a human is asked to decide it — the same checks
+// internalToolResponse applies at execution. A call that can never
+// execute is never parked for approval and never leaves a stranded grant
+// (repair F2). Semantic checks that depend on live state (e.g. a
+// schedule_id collision) stay at execution time; this layer only rejects
+// malformed arguments.
+func validateToolRequest(tool string, request map[string]any) error {
+	switch tool {
+	case "schedule.set":
+		wakeAt, _ := request["wake_at"].(string)
+		if _, err := time.Parse(time.RFC3339Nano, wakeAt); err != nil {
+			return fmt.Errorf("%w: schedule.set requires RFC3339 wake_at", ErrBadRequest)
+		}
+		missPolicy, _ := request["miss_policy"].(string)
+		if missPolicy == "" {
+			missPolicy = "fire_late"
+		}
+		switch missPolicy {
+		case "fire_late", "coalesce", "expire", "report_missed":
+		default:
+			return fmt.Errorf("%w: schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed", ErrBadRequest)
+		}
+	case "journal.note":
+		if text, _ := request["text"].(string); text == "" {
+			return fmt.Errorf("%w: journal.note requires text", ErrBadRequest)
+		}
+	case "message.send":
+		if text, _ := request["text"].(string); text == "" {
+			return fmt.Errorf("%w: message.send requires text", ErrBadRequest)
+		}
+	}
+	return nil
 }
 
 // actionDigest is the canonical, domain-separated identity of the exact
@@ -211,6 +264,12 @@ func (s *Store) GetApproval(ctx context.Context, personaID, apprID string) (*Too
 func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, req ApprovalDecision) (*ToolApproval, error) {
 	if req.Decision != "approve_once" && req.Decision != "deny_once" {
 		return nil, fmt.Errorf("%w: decision must be approve_once or deny_once", ErrBadRequest)
+	}
+	// decision_id is the deciding command's idempotent identity: it must
+	// exist before any mutation, or a replay of the same human act can
+	// never be recognized and every re-send would conflict (F3).
+	if req.DecisionID == "" {
+		return nil, fmt.Errorf("%w: decision_id required", ErrBadRequest)
 	}
 	if req.DecidedByKind != "human" || req.DecidedByID == "" {
 		return nil, fmt.Errorf("%w: decided_by_kind 'human' and decided_by_id required", ErrApprovalDecidedBy)
@@ -319,10 +378,14 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 	// Requeue the parked input for resumption. When the parking commit has
 	// not landed yet (input still 'claimed'), the await commit itself sees
 	// no pending approval and queues the input — the decision can never be
-	// stranded between the two.
+	// stranded between the two. The human's thinking time is accumulated
+	// into waited_ms durably so the core's provider retry budget counts
+	// only active processing time (F4); it survives restarts.
 	if _, err := tx.Exec(ctx, `
 		UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
-			turn_id = NULL, not_before = NULL
+			turn_id = NULL, not_before = NULL,
+			waited_ms = waited_ms + COALESCE(EXTRACT(EPOCH FROM (now() - waiting_since)) * 1000, 0)::bigint,
+			waiting_since = NULL
 		WHERE persona_id = $1 AND input_id = $2 AND status = 'waiting'`,
 		personaID, a.InputID); err != nil {
 		return nil, err

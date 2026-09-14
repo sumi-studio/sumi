@@ -118,6 +118,13 @@ type Input struct {
 	// durable bound that keeps one failing input from hot-looping and
 	// starving every later queued input.
 	NotBefore *time.Time `json:"not_before"`
+	// WaitingSince marks when the input entered 'waiting' behind a human
+	// approval decision; null while it is not waiting.
+	WaitingSince *time.Time `json:"waiting_since"`
+	// WaitedMs accumulates every parked interval on requeue, so the
+	// core's provider retry budget can exclude the human's thinking
+	// time — a long decision does not consume the model's retry window.
+	WaitedMs int64 `json:"waited_ms"`
 }
 
 type Turn struct {
@@ -466,7 +473,8 @@ func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, g
 
 const inputCols = `persona_id, input_id, kind, payload, actor_kind, actor_id,
 	source_surface, thread_id, occurred_at, attention, status,
-	claimed_generation, turn_id, created_at, done_at, not_before`
+	claimed_generation, turn_id, created_at, done_at, not_before,
+	waiting_since, waited_ms`
 
 type inputScanner interface {
 	Scan(dest ...any) error
@@ -477,7 +485,8 @@ func scanInput(row inputScanner) (Input, error) {
 	err := row.Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 		&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 		&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-		&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
+		&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore,
+		&in.WaitingSince, &in.WaitedMs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return in, ErrInputNotFound
 	}
@@ -522,7 +531,8 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 		Scan(&stored.PersonaID, &stored.InputID, &stored.Kind, &stored.Payload,
 			&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
 			&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
-			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore)
+			&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore,
+			&stored.WaitingSince, &stored.WaitedMs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
 		err = tx.QueryRow(ctx,
@@ -854,7 +864,8 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			Scan(&in.PersonaID, &in.InputID, &in.Kind, &in.Payload,
 				&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
-				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
+				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore,
+				&in.WaitingSince, &in.WaitedMs)
 		if errors.Is(err, pgx.ErrNoRows) {
 			res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
 			if err != nil {
@@ -1026,7 +1037,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 			}
 		} else {
 			if _, err := tx.Exec(ctx, `
-				UPDATE core_inputs SET status = 'waiting'
+				UPDATE core_inputs SET status = 'waiting', waiting_since = now()
 				WHERE persona_id = $1 AND input_id = $2`,
 				personaID, t.InputID); err != nil {
 				return nil, err
@@ -1594,6 +1605,30 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		}
 		return op, denied, true, nil
 	}
+	// A tool that may only run through an approved elevated call is never
+	// promoted to a human prompt on the normal route (ADR 0013 §2: Normal
+	// does not ask) and never re-routed. The call is recorded as a durable
+	// structured block — replayed identically — so the model learns the
+	// call needed elevation instead of the human being asked for a
+	// decision they were not offered.
+	if elevatedOnlyTool(tool) && flat[callIndex].Route != "elevated" {
+		if err := tx.QueryRow(ctx, `
+			UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
+			WHERE persona_id = $1 AND operation_id = $2
+			RETURNING status, response, completed_at`,
+			personaID, op.OperationID, map[string]any{
+				"error":   "blocked",
+				"blocked": "elevated_route_required",
+				"detail":  tool + " only runs as an elevated call the human approves; a normal call asks no one and is never re-routed",
+			}).
+			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
+			return Operation{}, nil, false, fmt.Errorf("finish blocked operation: %w", dataErr(err))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Operation{}, nil, false, err
+		}
+		return op, nil, true, nil
+	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
 	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, tool, request)
@@ -1636,6 +1671,24 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		return op, a, false, nil
 	}
 	if freshInsert {
+		// A call that can never execute is never asked of the human:
+		// deterministic argument validation runs before the approval row
+		// exists, so nothing parks and no approved/unconsumed grant is
+		// stranded (repair F2). The operation records the honest failure.
+		if verr := validateToolRequest(op.Tool, op.Request); verr != nil {
+			if err := tx.QueryRow(ctx, `
+				UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
+				WHERE persona_id = $1 AND operation_id = $2
+				RETURNING status, response, completed_at`,
+				personaID, op.OperationID, map[string]any{"error": verr.Error()}).
+				Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
+				return Operation{}, nil, false, fmt.Errorf("finish invalid operation: %w", dataErr(err))
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Operation{}, nil, false, err
+			}
+			return op, nil, true, nil
+		}
 		// Park the call: the durable approval request is created with the
 		// operation's recorded route, exact request, and action digest.
 		if _, err := tx.Exec(ctx, `
@@ -1685,7 +1738,27 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		a.ConsumedAt = &now
 		response, internal, err := s.internalToolResponse(ctx, tx, personaID, op.TurnID, op.Tool, op.Request)
 		if err != nil {
-			return Operation{}, nil, false, err
+			// A deterministic failure at execution (e.g. a schedule_id that
+			// was free when the human approved but is now taken) must not
+			// roll the grant back to approved-unconsumed — every re-claim
+			// would fail identically with the operation parked forever
+			// (F2). The grant is spent and the operation records the honest
+			// failure; transient errors still roll back and retry.
+			if !errors.Is(err, ErrBadRequest) {
+				return Operation{}, nil, false, err
+			}
+			if err := tx.QueryRow(ctx, `
+				UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
+				WHERE persona_id = $1 AND operation_id = $2 AND status = 'awaiting_approval'
+				RETURNING status, response, completed_at`,
+				personaID, op.OperationID, map[string]any{"error": err.Error()}).
+				Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
+				return Operation{}, nil, false, fmt.Errorf("finish failed approved operation: %w", dataErr(err))
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Operation{}, nil, false, err
+			}
+			return op, a, true, nil
 		}
 		if internal {
 			if err := tx.QueryRow(ctx, `

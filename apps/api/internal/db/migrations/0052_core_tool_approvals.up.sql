@@ -20,6 +20,13 @@ ALTER TABLE core_operations DROP CONSTRAINT core_operations_status_check;
 ALTER TABLE core_operations ADD CONSTRAINT core_operations_status_check
     CHECK (status IN ('running','awaiting_approval','done','failed'));
 
+-- Time spent parked on a human decision is not model-processing time:
+-- waiting_since marks when the input entered 'waiting' and waited_ms
+-- accumulates every parked interval on requeue, so the core's provider
+-- retry budget excludes the human's thinking time.
+ALTER TABLE core_inputs ADD COLUMN waiting_since timestamptz;
+ALTER TABLE core_inputs ADD COLUMN waited_ms bigint NOT NULL DEFAULT 0;
+
 CREATE TABLE core_tool_approvals (
     approval_id     text        NOT NULL,
     persona_id      uuidv7      NOT NULL REFERENCES core_personas(persona_id) ON DELETE CASCADE,

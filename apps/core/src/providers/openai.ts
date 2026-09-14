@@ -123,7 +123,7 @@ export class OpenAIProvider implements ModelProvider {
                             type: "string",
                             enum: ["normal", "elevated"],
                             description:
-                              "Invocation route: 'normal' runs under your own authority; 'elevated' asks the human for a one-shot approval before the effect runs. Tools that intrinsically require approval are held regardless of route.",
+                              "Invocation route: 'normal' runs under your own authority; 'elevated' asks the human for a one-shot approval before the effect runs. A tool that needs consent can only run elevated — on 'normal' it is blocked without asking anyone.",
                           },
                           input: t.parameters,
                         },

@@ -79,6 +79,24 @@ export type StepResult = "turn" | "idle" | "stopped";
 const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
 
 /**
+ * How long the input has been actively worked on: wall time since
+ * submission minus the durably recorded time it spent parked on human
+ * approval decisions. A person's thinking time is not model failure —
+ * the state service accumulates it in waited_ms on every requeue, so the
+ * budget is identical across restarts and a long wait cannot exhaust the
+ * provider retry window (repair F4).
+ */
+function activeAgeMs(input: Input): number {
+  let active = Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
+  // A still-waiting input cannot be claimed — but a store that exposes
+  // waiting_since without having requeued yet is counted honestly too.
+  if (input.waiting_since) {
+    active -= Date.now() - Date.parse(input.waiting_since);
+  }
+  return active;
+}
+
+/**
  * One continuing secretary life. Boot = acquire writer lease + recover
  * abandoned work, then loop: dispatch due schedules → claim input + begin
  * turn → stream model → ledger tool calls → commit turn + outbox.
@@ -172,8 +190,7 @@ export class Secretary {
       const maxAttempts = this.cfg.maxAttempts ?? 5;
       const budgetMs =
         this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS;
-      const withinBudget =
-        Date.now() - Date.parse(input.created_at) < budgetMs;
+      const withinBudget = activeAgeMs(input) < budgetMs;
       if (turn.attempt > maxAttempts && !withinBudget) {
         // Attempt cap (CR3-N1): an input that has already consumed its
         // allowance — model failures, transient claim errors, a poison
@@ -792,7 +809,7 @@ export class Secretary {
       // retryable failure leaves no partial journal — the next attempt
       // re-emits its full event set.
       const withinBudget =
-        Date.now() - Date.parse(input.created_at) <
+        activeAgeMs(input) <
         (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
       const retryable =
         mErr !== null && !mErr.retryable ? false : withinBudget;
@@ -1011,7 +1028,7 @@ function truncateText(s: string, maxBytes: number): string {
 const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
-  "message.send speaks into the shared channel as you — every call waits for the human's explicit approval before it is sent. " +
+  "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
   "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +

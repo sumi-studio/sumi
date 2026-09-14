@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
-import type {
-  ModelEvent,
-  ModelProvider,
-  ModelRequest,
+import {
+  ModelError,
+  type ModelEvent,
+  type ModelProvider,
+  type ModelRequest,
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
@@ -108,7 +109,7 @@ async function kinds(state: FakeState): Promise<string[]> {
 test("message.send waits for the human, then sends exactly once after approval and restart", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA, "secretary", HUMAN);
-  state.addInput(PERSONA, "in-1", '!message.send {"text":"会議を15時に移します"}');
+  state.addInput(PERSONA, "in-1", '!elevated message.send {"text":"会議を15時に移します"}');
 
   const s1 = new Secretary(cfg(state, "h-1"));
   await s1.start();
@@ -117,7 +118,7 @@ test("message.send waits for the human, then sends exactly once after approval a
   const [appr] = await pending(state);
   assert.ok(appr);
   assert.equal(appr.tool, "message.send");
-  assert.equal(appr.required_by, "intrinsic");
+  assert.equal(appr.required_by, "route");
   // Nothing retries behind the human's back while the request waits.
   assert.equal(await s1.step(), "idle");
   assert.equal(await s1.step(), "idle");
@@ -162,7 +163,7 @@ test("message.send waits for the human, then sends exactly once after approval a
 test("a denied send is never delivered, and the model is told it was denied", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA, "secretary", HUMAN);
-  state.addInput(PERSONA, "in-1", '!message.send {"text":"全員に送信"}');
+  state.addInput(PERSONA, "in-1", '!elevated message.send {"text":"全員に送信"}');
 
   const s1 = new Secretary(cfg(state, "h-1"));
   await s1.start();
@@ -232,8 +233,8 @@ test("several approvals for one request do not exhaust its attempt cap", async (
   state.addPersona(PERSONA, "secretary", HUMAN);
   state.addInput(PERSONA, "in-1", "tell both teams");
   const script = new Script([
-    { text: "a", calls: [{ tool: "message.send", route: "normal", request: { text: "team A" } }] },
-    { text: "b", calls: [{ tool: "message.send", route: "normal", request: { text: "team B" } }] },
+    { text: "a", calls: [{ tool: "message.send", route: "elevated", request: { text: "team A" } }] },
+    { text: "b", calls: [{ tool: "message.send", route: "elevated", request: { text: "team B" } }] },
     { text: "both sent" },
   ]);
   // A tight cap with no provider budget: any spent attempt beyond the
@@ -254,4 +255,145 @@ test("several approvals for one request do not exhaust its attempt cap", async (
   assert.equal(outbox.filter((k) => k === "secretary_message").length, 2);
   assert.equal(outbox.filter((k) => k === "turn_completed").length, 1);
   await s.stop();
+});
+
+test("a normal-route message.send is blocked without ever asking the human", async () => {
+  // ADR 0013 §2: Normal does not ask. The call is a durable structured
+  // block the model sees as a tool error — no approval row, no prompt,
+  // no delivery, and no silent re-route to elevated.
+  const state = new FakeState();
+  state.addPersona(PERSONA, "secretary", HUMAN);
+  state.addInput(PERSONA, "in-1", '!message.send {"text":"勝手に送信"}');
+
+  const s = new Secretary(cfg(state, "h-1"));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+
+  assert.equal((await pending(state)).length, 0, "no approval was requested");
+  const outbox = await kinds(state);
+  assert.equal(outbox.filter((k) => k === "approval_requested").length, 0);
+  assert.equal(outbox.filter((k) => k === "secretary_message").length, 0);
+  assert.equal(outbox.filter((k) => k === "turn_completed").length, 1);
+  const results = state.eventLog.filter((e) => e.kind === "tool_result");
+  assert.equal(results.length, 1);
+  assert.equal(
+    (results[0]?.payload as { error?: string }).error,
+    "blocked",
+  );
+  await s.stop();
+});
+
+test("a gated call whose arguments can never run is not asked of the human", async () => {
+  // F2: deterministic validation precedes the approval record — nothing
+  // parks, no grant is stranded, the model sees the argument error.
+  const state = new FakeState();
+  state.addPersona(PERSONA, "secretary", HUMAN);
+  state.addInput(PERSONA, "in-1", "!elevated message.send {}");
+
+  const s = new Secretary(cfg(state, "h-1"));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal((await pending(state)).length, 0, "invalid call parked");
+  const results = state.eventLog.filter((e) => e.kind === "tool_result");
+  assert.match(String((results[0]?.payload as { error?: string })?.error), /requires text/);
+  await s.stop();
+});
+
+test("an empty decision_id is rejected before any mutation", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA, "secretary", HUMAN);
+  state.addInput(PERSONA, "in-1", '!elevated journal.note {"text":"x"}');
+  const s = new Secretary(cfg(state, "h-1"));
+  await s.start();
+  await s.step();
+  const [appr] = await pending(state);
+  assert.ok(appr);
+  await assert.rejects(
+    state.resolveApproval(PERSONA, appr.approval_id, decide("approve_once", "")),
+    (e: unknown) => e instanceof StateError && e.status === 400,
+  );
+  // Still pending and decidable.
+  const got = await state.resolveApproval(
+    PERSONA,
+    appr.approval_id,
+    decide("approve_once", "d-1"),
+  );
+  assert.equal(got.status, "approved");
+  await s.stop();
+});
+
+test("a long human wait does not consume the provider retry window", async () => {
+  // F4: approve after a wait far beyond the retry budget; the resume
+  // executes the granted effect once, then a transient provider error on
+  // the follow-up consult still retries — the wait is excluded from the
+  // budget because it was recorded durably on the input.
+  const state = new FakeState();
+  state.addPersona(PERSONA, "secretary", HUMAN);
+  state.addInput(PERSONA, "in-1", '!elevated message.send {"text":"遅い承認"}');
+
+  // Round 0 parks; round 1 consults fail once transiently, then succeed.
+  class Flaky implements ModelProvider {
+    readonly name = "flaky";
+    private streams = 0;
+    async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      this.streams++;
+      if (req.round === 0) {
+        yield {
+          type: "tool_call",
+          call: {
+            id: "c-0-0",
+            name: "message.send",
+            route: "elevated",
+            arguments: { text: "遅い承認" },
+          },
+        };
+      } else if (this.streams === 2) {
+        throw new ModelError("provider blip", { retryable: true });
+      } else {
+        yield { type: "text", delta: "done" };
+      }
+      yield { type: "done", usage: {} };
+    }
+  }
+  const provider = new Flaky();
+  const over = { provider, providerRetryBudgetMs: 60_000 };
+
+  const s1 = new Secretary(cfg(state, "h-1", over));
+  await s1.start();
+  assert.equal(await s1.step(), "turn");
+  const [appr] = await pending(state);
+  assert.ok(appr);
+
+  // Two hours pass while the human thinks — past the 60s budget.
+  const input = state.inputs.find((i) => i.input_id === "in-1")!;
+  input.waiting_since = new Date(Date.now() - 2 * 3600_000).toISOString();
+  await state.resolveApproval(PERSONA, appr.approval_id, decide("approve_once", "d-1"));
+  assert.ok(input.waited_ms >= 2 * 3600_000, "wait was recorded durably");
+
+  const s2 = await restart(s1, state, over);
+  // Resume: effect executes once, the round-1 blip is still retryable.
+  assert.equal(await s2.step(), "turn");
+  assert.equal(
+    (await kinds(state)).filter((k) => k === "secretary_message").length,
+    1,
+    "granted effect ran exactly once",
+  );
+  assert.equal(
+    (await kinds(state)).filter((k) => k === "turn_failed").length,
+    0,
+    "the wait exhausted the budget — retryable error became terminal",
+  );
+  await new Promise((r) => setTimeout(r, 300)); // not_before backoff
+  assert.equal(await s2.step(), "turn");
+  assert.equal(
+    (await kinds(state)).filter((k) => k === "turn_completed").length,
+    1,
+  );
+  assert.equal(
+    (await kinds(state)).filter((k) => k === "secretary_message").length,
+    1,
+    "the send was not repeated by the retried attempt",
+  );
+  await s2.stop();
 });

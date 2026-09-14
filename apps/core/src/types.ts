@@ -34,6 +34,12 @@ export interface Input {
   done_at: string | null;
   /** Retryable-failed inputs requeue with a future claim time (backoff). */
   not_before: string | null;
+  /** Set while the input is parked behind a pending human decision. */
+  waiting_since: string | null;
+  /** Total milliseconds spent waiting on human decisions — excluded from
+   *  the provider retry budget (a person's thinking time is not model
+   *  failure). Durable; survives restarts. */
+  waited_ms: number;
 }
 
 export interface Turn {

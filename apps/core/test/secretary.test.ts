@@ -637,6 +637,8 @@ test("assemble flattens tool results to assistant text (no orphaned tool role)",
     created_at: new Date().toISOString(),
     done_at: null,
     not_before: null,
+    waiting_since: null,
+    waited_ms: 0,
   };
   const messages = assemble(context, input);
   assert.equal(

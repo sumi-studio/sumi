@@ -15,6 +15,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync } from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -159,13 +160,13 @@ const messagesWith = async (text) =>
   (await outbox()).filter((o) => o.kind === "secretary_message" && o.payload.text === text);
 
 // --- scenario 1: approval after restarts sends exactly once -----------------
-log("scenario 1: message.send waits for approval across restarts, then sends once");
+log("scenario 1: elevated message.send waits for approval across restarts, then sends once");
 const SENT = "e2e: 会議を15時に移します";
-const in1 = await submit(`!message.send {"text":"${SENT}"}`);
+const in1 = await submit(`!elevated message.send {"text":"${SENT}"}`);
 once("park");
 let [a1] = await approvalFor(in1);
-assert(a1?.status === "pending" && a1.tool === "message.send" && a1.required_by === "intrinsic",
-  `expected pending intrinsic approval, got ${JSON.stringify(a1)}`);
+assert(a1?.status === "pending" && a1.tool === "message.send" && a1.required_by === "route",
+  `expected pending route approval, got ${JSON.stringify(a1)}`);
 let st = (await req("GET", `${P}/state`, ptoken)).json;
 assert(st.waiting_inputs === 1 && st.pending_approvals === 1 && st.running_turn === null,
   `state while waiting: ${JSON.stringify(st)}`);
@@ -193,9 +194,9 @@ assert((await decide(a1.approval_id, "deny_once", "d-2")).status === 409,
 log("  sent once after approval; journal shows the input once");
 
 // --- scenario 2: denial is preserved -----------------------------------------
-log("scenario 2: a denied message.send is never delivered");
+log("scenario 2: a denied elevated message.send is never delivered");
 const DENIED = "e2e: 全員に一斉送信";
-const in2 = await submit(`!message.send {"text":"${DENIED}"}`);
+const in2 = await submit(`!elevated message.send {"text":"${DENIED}"}`);
 once("park");
 const [a2] = await approvalFor(in2);
 assert(a2?.status === "pending", "denial scenario did not park");
@@ -241,5 +242,114 @@ assert(notes.length === 1, `elevated note written ${notes.length} times`);
 assert((await outbox()).filter((o) => o.kind === "turn_completed" && o.payload.input_id === in3).length === 1,
   "elevated request did not complete once");
 
+// --- scenario 4: a normal-route message.send never asks the human -----------
+log("scenario 4: normal message.send is a structured block, not a prompt");
+const BLOCKED = "e2e: normal send must not ask";
+const in4 = await submit(`!message.send {"text":"${BLOCKED}"}`);
+once("normal send");
+assert((await approvalFor(in4)).length === 0, "a normal call created an approval");
+assert((await messagesWith(BLOCKED)).length === 0, "blocked send was delivered");
+const done4 = (await outbox()).find((o) => o.kind === "turn_completed" && o.payload.input_id === in4);
+assert(done4, "blocked input did not complete");
+assert(done4.payload.output.tool_results[0]?.result?.error === "blocked",
+  `model was not told the call is blocked: ${JSON.stringify(done4?.payload)}`);
+assert((await outbox()).filter((o) => o.kind === "approval_requested" && o.payload.input_id === in4).length === 0,
+  "a normal call surfaced an approval request");
+log("  structured block recorded; the human was never asked");
+
+// --- scenario 5: a long human wait does not consume the provider retry window
+// Real OpenAI-provider path against a loopback stub: park, wait far beyond
+// the configured retry budget, approve, then a transient 500 on the resumed
+// consultation must still retry — the send lands exactly once.
+log("scenario 5: long approval wait + transient provider error still recovers");
+const LONGWAIT = "e2e: sent after a long human wait";
+const STUB_PORT = PORT + 7;
+let stubCalls = 0;
+const stub = http.createServer((rq, rs) => {
+  let body = "";
+  rq.on("data", (c) => (body += c));
+  rq.on("end", () => {
+    stubCalls++;
+    // Connection: close — a pooled keep-alive socket would keep the host's
+    // event loop (and its `main()` return) alive past `secretary.stop()`.
+    const sse = (lines) => {
+      rs.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        Connection: "close",
+      });
+      rs.end(lines.map((l) => `data: ${l}`).join("\n") + "\ndata: [DONE]\n\n");
+    };
+    if (stubCalls === 1) {
+      // Round 0: an elevated message.send the human must approve.
+      sse([
+        `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_send","function":{"name":"message_send","arguments":${JSON.stringify(JSON.stringify({ route: "elevated", input: { text: LONGWAIT } }))}}}]}}]}`,
+        `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+      ]);
+    } else if (stubCalls === 2) {
+      // Round 1 after approval: one transient provider failure.
+      rs.writeHead(500, { Connection: "close" }).end("stub transient");
+    } else {
+      sse([
+        `{"choices":[{"delta":{"content":"sent after the wait"}}]}`,
+        `{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":3}}`,
+      ]);
+    }
+  });
+});
+await new Promise((r) => stub.listen(STUB_PORT, "127.0.0.1", r));
+const hostEnv5 = {
+  ...process.env,
+  SUMI_STATE_URL: BASE,
+  SUMI_PERSONA_ID: personaId,
+  SUMI_PERSONA_TOKEN: ptoken,
+  SUMI_MODEL_PROVIDER: "openai",
+  SUMI_MODEL_BASE_URL: `http://127.0.0.1:${STUB_PORT}`,
+  SUMI_MODEL_API_KEY: "e2e-stub-key",
+  SUMI_MODEL_MODEL: "stub-model",
+  // 10s of active processing budget; the human waits ~11s.
+  SUMI_PROVIDER_RETRY_BUDGET_MS: "10000",
+  SUMI_LEASE_TTL_MS: "3000",
+};
+// spawn, not spawnSync: the stub server lives in this process's event loop —
+// a synchronous spawn would starve it and the host's fetch would hang.
+const once5 = (label) =>
+  new Promise((resolve, reject) => {
+    const p = spawn("node", [HOST, "--once"], { env: hostEnv5 });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (out += d));
+    const killer = setTimeout(() => p.kill("SIGKILL"), 90_000);
+    p.on("exit", (code) => {
+      clearTimeout(killer);
+      log(`  core --once (${label}) exit=${code}`);
+      if (code !== 0) {
+        console.error(out);
+        reject(new Error(`core --once (${label}) exited ${code}`));
+      } else resolve();
+    });
+  });
+const in5 = await submit("e2e: please send the long-wait message");
+await once5("park");
+const [a5] = await approvalFor(in5);
+assert(a5?.status === "pending" && a5.required_by === "route",
+  `long-wait call did not park: ${JSON.stringify(a5)}`);
+let in5row = (await req("GET", `${P}/inputs/${in5}`, ptoken)).json.input;
+assert(in5row.status === "waiting" && in5row.waiting_since, `input not waiting: ${JSON.stringify(in5row)}`);
+log("  parked; waiting ~11s past the 10s retry budget before approving");
+await sleep(11_000);
+assert((await decide(a5.approval_id, "approve_once", "d-1")).status === 200, "approve failed");
+in5row = (await req("GET", `${P}/inputs/${in5}`, ptoken)).json.input;
+assert(in5row.waited_ms >= 9_000, `waited_ms = ${in5row.waited_ms} — human wait not recorded`);
+await once5("resume + transient retry");
+await once5("final drain");
+assert((await messagesWith(LONGWAIT)).length === 1, "granted send did not run exactly once");
+assert((await outbox()).filter((o) => o.kind === "turn_failed" && o.payload.input_id === in5).length === 0,
+  "a transient provider error after the long wait was terminal");
+assert((await outbox()).filter((o) => o.kind === "turn_completed" && o.payload.input_id === in5).length === 1,
+  "long-wait request did not complete");
+assert(stubCalls >= 3, `stub saw ${stubCalls} calls — the transient error was never retried`);
+log("  wait excluded from the budget; send landed once, request completed");
+stub.close();
+
 svc.kill("SIGKILL");
-log("PASS — approval scenarios green on real PG + real Go + real Node (scripted mock model)");
+log("PASS — approval scenarios green on real PG + real Go + real Node (scripted mock + stub models)");

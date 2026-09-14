@@ -7,10 +7,11 @@ import type { ToolSpec } from "./provider.ts";
  * inside the claim transaction (no crash window between effect and receipt).
  *
  * message.send is outward-facing — speaking into the shared channel as the
- * secretary — so the state service holds every call for an explicit human
- * decision before its effect may run (ADR 0013). The model may also elevate
- * any call itself via the route field of the provider envelope; it can
- * never lower an intrinsic requirement.
+ * secretary — so it may only run as an elevated call the human approves
+ * (ADR 0013). A normal-route call is recorded as a structured block: the
+ * Normal route never prompts the human and is never silently promoted.
+ * The model may elevate any call itself via the route field of the
+ * provider envelope.
  *
  * Other external-side-effect tools (send email, call a paid API) are
  * deliberately NOT in this registry — they need an external executor before
@@ -58,7 +59,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "message.send",
     description:
-      "Send a message into the shared channel as yourself. This is an outward-facing act: every call waits for an explicit human approval before it is delivered. The call returns once decided.",
+      "Send a message into the shared channel as yourself. This is an outward-facing act: it only runs as an elevated call, waiting for an explicit human approval before it is delivered. A normal-route call is blocked without asking the human.",
     parameters: {
       type: "object",
       properties: {

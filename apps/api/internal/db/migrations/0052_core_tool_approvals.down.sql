@@ -1,5 +1,8 @@
 DROP TABLE IF EXISTS core_tool_approvals;
 
+ALTER TABLE core_inputs DROP COLUMN waiting_since;
+ALTER TABLE core_inputs DROP COLUMN waited_ms;
+
 ALTER TABLE core_operations DROP CONSTRAINT core_operations_status_check;
 ALTER TABLE core_operations ADD CONSTRAINT core_operations_status_check
     CHECK (status IN ('running','done','failed'));
