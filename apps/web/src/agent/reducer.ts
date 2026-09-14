@@ -16,10 +16,11 @@ import { secureRandomUUID } from "../lib/random-uuid";
 import type {
   AgentRun,
   AgentTraceEvent,
+  ConversationChanges,
   ConversationEntry,
   ConversationModel,
 } from "./model";
-import { createEmptyConversation } from "./model";
+import { createConversationChanges, createEmptyConversation } from "./model";
 
 interface MessageStream {
   textByIndex: Record<number, string>;
@@ -287,11 +288,12 @@ function applyMessage(
       delivery: "durable",
       ...(source ? { source } : {}),
     };
+    // Session bookkeeping records are mutable within the session for the
+    // same reason the model containers are: per-event copies made each
+    // streamed token O(history).
+    if (complete) session.completedMessageIds[messageId] = true;
     return {
       ...session,
-      completedMessageIds: complete
-        ? { ...session.completedMessageIds, [messageId]: true }
-        : session.completedMessageIds,
       conversation: upsertEntry(session.conversation, entry),
     };
   }
@@ -326,11 +328,7 @@ function applyMessage(
         { messageId, contentIndex: content.wire_item_index },
         true,
       ));
-      if (runId)
-        session = {
-          ...session,
-          toolRunIds: { ...session.toolRunIds, [content.tool_call.id]: runId },
-        };
+      if (runId) session.toolRunIds[content.tool_call.id] = runId;
       continue;
     }
     if (content.type === "rejected_tool_call" && runId) {
@@ -371,7 +369,9 @@ function applyMessage(
         .filter((item) => item.type === "text" && item.text.length > 0)
         .map((item) => `message:${messageId}:${item.wire_item_index}`),
     );
-    for (const id of conversation.entryOrder) {
+    // entryOrder mutates in place under removeEntry; iterate a snapshot so
+    // adjacent stale blocks cannot slip past the live iterator.
+    for (const id of [...conversation.entryOrder]) {
       const entry = conversation.entries[id];
       if (
         entry?.kind === "prose" &&
@@ -406,17 +406,12 @@ function applyMessage(
     }));
   }
 
-  const { [messageId]: _discardedStream, ...messageStreams } =
-    session.messageStreams;
-  return {
-    ...session,
-    conversation,
-    messageRunIds: { ...session.messageRunIds, [messageId]: runId },
-    messageStreams: complete ? messageStreams : session.messageStreams,
-    completedMessageIds: complete
-      ? { ...session.completedMessageIds, [messageId]: true }
-      : session.completedMessageIds,
-  };
+  if (complete) {
+    delete session.messageStreams[messageId];
+    session.completedMessageIds[messageId] = true;
+  }
+  session.messageRunIds[messageId] = runId;
+  return { ...session, conversation };
 }
 
 function applyMessageUpdate(
@@ -490,13 +485,8 @@ function applyMessageUpdate(
         contentIndex: event.content_index,
       }));
       if (runId) {
-        session = {
-          ...session,
-          toolRunIds: {
-            ...session.toolRunIds,
-            [event.tool_call.id]: runId,
-          },
-        };
+        session.toolRunIds[event.tool_call.id] = runId;
+        session = { ...session };
       }
       break;
     }
@@ -536,12 +526,9 @@ function applyMessageUpdate(
     });
   }
 
-  return {
-    ...session,
-    conversation,
-    messageRunIds: { ...session.messageRunIds, [messageId]: runId },
-    messageStreams: { ...session.messageStreams, [messageId]: stream },
-  };
+  session.messageRunIds[messageId] = runId;
+  session.messageStreams[messageId] = stream;
+  return { ...session, conversation };
 }
 
 function applyToolStart(
@@ -553,9 +540,9 @@ function applyToolStart(
   const runId = session.toolRunIds[toolCallId] ?? session.activeRunId;
   if (!runId) return session;
   const existing = findTrace(session.conversation, runId, toolCallId);
+  session.toolRunIds[toolCallId] = runId;
   return {
     ...session,
-    toolRunIds: { ...session.toolRunIds, [toolCallId]: runId },
     conversation: upsertTrace(session.conversation, runId, {
       type: "tool",
       id: toolCallId,
@@ -578,14 +565,14 @@ function applyToolEnd(
   operationFinal = false,
 ): AgentSession {
   const runId = session.toolRunIds[toolCallId];
-  if (!runId)
-    return {
-      ...session,
-      unresolvedToolOutcomes: {
-        ...session.unresolvedToolOutcomes,
-        [toolCallId]: { result, isError, ...(toolName ? { toolName } : {}) },
-      },
+  if (!runId) {
+    session.unresolvedToolOutcomes[toolCallId] = {
+      result,
+      isError,
+      ...(toolName ? { toolName } : {}),
     };
+    return { ...session };
+  }
   const existing = findTrace(session.conversation, runId, toolCallId);
   const tool =
     existing?.type === "tool"
@@ -604,14 +591,10 @@ function applyToolEnd(
     operationFinal || isError ? null : awaitingApprovalOperation(result);
   if (operationId && session.approvalOperations[operationId]?.completed)
     return session;
-  if (operationId)
-    session = {
-      ...session,
-      approvalOperations: {
-        ...session.approvalOperations,
-        [operationId]: { toolCallId, completed: false },
-      },
-    };
+  if (operationId) {
+    session.approvalOperations[operationId] = { toolCallId, completed: false };
+    session = { ...session };
+  }
   let conversation = upsertTrace(session.conversation, runId, {
     ...tool,
     progress: undefined,
@@ -639,11 +622,8 @@ function applyToolEnd(
       timestamp: null,
     });
   }
-  return {
-    ...session,
-    toolRunIds: { ...session.toolRunIds, [toolCallId]: runId },
-    conversation,
-  };
+  session.toolRunIds[toolCallId] = runId;
+  return { ...session, conversation };
 }
 
 function isApprovalOperationSource(
@@ -683,14 +663,10 @@ function applyApprovalOperationOutcome(
     (known && known.toolCallId !== outcome.tool_call_id)
   )
     return session;
-  if (!session.toolRunIds[outcome.tool_call_id])
-    return {
-      ...session,
-      unresolvedApprovalOutcomes: {
-        ...session.unresolvedApprovalOutcomes,
-        [outcome.operation_id]: outcome,
-      },
-    };
+  if (!session.toolRunIds[outcome.tool_call_id]) {
+    session.unresolvedApprovalOutcomes[outcome.operation_id] = outcome;
+    return { ...session };
+  }
   const next = applyToolEnd(
     session,
     outcome.tool_call_id,
@@ -733,17 +709,14 @@ function applyApprovalOperationOutcome(
           : trace,
       ),
     }));
+  next.approvalOperations[outcome.operation_id] = {
+    toolCallId: outcome.tool_call_id,
+    completed: true,
+  };
   return {
     ...next,
     conversation,
     approval: next.approval?.id === outcome.operation_id ? null : next.approval,
-    approvalOperations: {
-      ...next.approvalOperations,
-      [outcome.operation_id]: {
-        toolCallId: outcome.tool_call_id,
-        completed: true,
-      },
-    },
   };
 }
 
@@ -751,10 +724,9 @@ export function reconcileDeferredTools(session: AgentSession): AgentSession {
   let next = session;
   for (const [callId, payload] of Object.entries(next.unresolvedToolOutcomes)) {
     if (!next.toolRunIds[callId]) continue;
-    const { [callId]: _resolved, ...unresolvedToolOutcomes } =
-      next.unresolvedToolOutcomes;
+    delete next.unresolvedToolOutcomes[callId];
     next = applyToolEnd(
-      { ...next, unresolvedToolOutcomes },
+      next,
       callId,
       payload.result,
       payload.isError,
@@ -765,12 +737,8 @@ export function reconcileDeferredTools(session: AgentSession): AgentSession {
     next.unresolvedApprovalOutcomes,
   )) {
     if (!next.toolRunIds[outcome.tool_call_id]) continue;
-    const { [operationId]: _resolved, ...unresolvedApprovalOutcomes } =
-      next.unresolvedApprovalOutcomes;
-    next = applyApprovalOperationOutcome(
-      { ...next, unresolvedApprovalOutcomes },
-      outcome,
-    );
+    delete next.unresolvedApprovalOutcomes[operationId];
+    next = applyApprovalOperationOutcome(next, outcome);
   }
   return next;
 }
@@ -803,13 +771,11 @@ function applyApprovalRequested(
       decision: null,
     });
   }
+  if (runId) session.approvalRunIds[request.id] = runId;
   return {
     ...session,
     conversation,
     approval: request,
-    approvalRunIds: runId
-      ? { ...session.approvalRunIds, [request.id]: runId }
-      : session.approvalRunIds,
   };
 }
 
@@ -987,11 +953,12 @@ function finalizeTrace(trace: AgentTraceEvent): AgentTraceEvent {
 }
 
 function upsertRun(model: ConversationModel, run: AgentRun): ConversationModel {
-  return {
-    ...model,
-    runOrder: model.runs[run.id] ? model.runOrder : [...model.runOrder, run.id],
-    runs: { ...model.runs, [run.id]: run },
-  };
+  const existed = !!model.runs[run.id];
+  model.runs[run.id] = run;
+  if (!existed) model.runOrder.push(run.id);
+  const changes = writeJournal(model);
+  changes.changedRunIds.add(run.id);
+  return { ...model, changes };
 }
 
 function patchRun(
@@ -1000,9 +967,11 @@ function patchRun(
   patch: (run: AgentRun) => AgentRun,
 ): ConversationModel {
   const run = model.runs[runId];
-  return run
-    ? { ...model, runs: { ...model.runs, [runId]: patch(run) } }
-    : model;
+  if (!run) return model;
+  model.runs[runId] = patch(run);
+  const changes = writeJournal(model);
+  changes.changedRunIds.add(runId);
+  return { ...model, changes };
 }
 
 function upsertTrace(
@@ -1094,22 +1063,44 @@ function upsertMessageEntry(
   );
   const at =
     after?.index ?? (before ? before.index + 1 : model.entryOrder.length);
-  const order = [...model.entryOrder];
-  order.splice(at, 0, entry.id);
-  return { ...next, entryOrder: order };
+  // upsertEntry already appended the new id at the tail; move it into place.
+  next.entryOrder.splice(next.entryOrder.indexOf(entry.id), 1);
+  next.entryOrder.splice(at, 0, entry.id);
+  next.changes?.orderOps.push({ op: "move", id: entry.id, index: at });
+  return next;
+}
+
+/**
+ * The journal that records this write. A model built without one (ad-hoc
+ * literal) gets a structural journal so projection consumers fall back to a
+ * full rescan rather than trusting an incomplete diff.
+ */
+function writeJournal(model: ConversationModel): ConversationChanges {
+  return model.changes ?? createConversationChanges(true);
 }
 
 export function upsertEntry(
   model: ConversationModel,
   entry: ConversationEntry,
 ): ConversationModel {
-  return {
-    ...model,
-    entryOrder: model.entries[entry.id]
-      ? model.entryOrder
-      : [...model.entryOrder, entry.id],
-    entries: { ...model.entries, [entry.id]: entry },
-  };
+  // Entries and their order mutate in place: copying a lifetime-length
+  // record for every streamed token made each delta O(history). The journal
+  // records the write so incremental consumers see exactly what moved.
+  const existed = !!model.entries[entry.id];
+  model.entries[entry.id] = entry;
+  const changes = writeJournal(model);
+  if (!existed) {
+    model.entryOrder.push(entry.id);
+    changes.orderOps.push({
+      op: "insert",
+      id: entry.id,
+      index: model.entryOrder.length - 1,
+    });
+    changes.addedEntryIds.add(entry.id);
+  } else {
+    changes.changedEntryIds.add(entry.id);
+  }
+  return { ...model, changes };
 }
 
 export function removeEntry(
@@ -1117,12 +1108,15 @@ export function removeEntry(
   entryId: string,
 ): ConversationModel {
   if (!model.entries[entryId]) return model;
-  const { [entryId]: _removed, ...entries } = model.entries;
-  return {
-    ...model,
-    entryOrder: model.entryOrder.filter((id) => id !== entryId),
-    entries,
-  };
+  delete model.entries[entryId];
+  const index = model.entryOrder.indexOf(entryId);
+  const changes = writeJournal(model);
+  if (index >= 0) {
+    model.entryOrder.splice(index, 1);
+    changes.orderOps.push({ op: "remove", id: entryId });
+  }
+  changes.removedEntryIds.add(entryId);
+  return { ...model, changes };
 }
 
 export function patchEntry(
@@ -1131,7 +1125,9 @@ export function patchEntry(
   patch: (entry: ConversationEntry) => ConversationEntry,
 ): ConversationModel {
   const entry = model.entries[entryId];
-  return entry
-    ? { ...model, entries: { ...model.entries, [entryId]: patch(entry) } }
-    : model;
+  if (!entry) return model;
+  model.entries[entryId] = patch(entry);
+  const changes = writeJournal(model);
+  changes.changedEntryIds.add(entryId);
+  return { ...model, changes };
 }

@@ -655,13 +655,14 @@ export function createConversationStore({
         // DirectChatSocket has already structurally validated the generated
         // browser contract before exposing this frame.
         const envelope = frame.envelope as unknown as BrowserEventEnvelope;
-        const beforeEntries = session.conversation.entries;
         const reduced = reduceEnvelope(session, envelope, {
           id: reducerId,
         });
         session = reduced.session;
-        for (const id of session.conversation.entryOrder)
-          if (!beforeEntries[id] && !entrySequences.has(id))
+        // The write journal names the entries this frame added; entries and
+        // entryOrder mutate in place so a before/after scan cannot see them.
+        for (const id of session.conversation.changes?.addedEntryIds ?? [])
+          if (!entrySequences.has(id))
             entrySequences.set(
               id,
               "seq" in envelope ? envelope.seq : session.lastDurableSeq + 0.5,

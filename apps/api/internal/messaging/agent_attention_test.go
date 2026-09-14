@@ -92,16 +92,17 @@ func TestAgentAttentionMentionFreezesSourceAndOnlyAdmitsOnce(t *testing.T) {
 	if _, _, err := sender.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "@Kuro 元の相談です", ClientNonce: "attention-once"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sender.EditMessage(ctx, ch.PlaceID, msg.MessageID, "訂正後です", msg.Revision); err != nil {
+	edited, err := sender.EditMessage(ctx, ch.PlaceID, msg.MessageID, "訂正後です", msg.Revision)
+	if err != nil {
 		t.Fatal(err)
 	}
 	d := newAttentionDelivery()
 	stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10)
-	if err != nil || stats.Admitted != 1 {
+	if err != nil || stats.Admitted != 2 {
 		t.Fatalf("first delivery: %+v %v", stats, err)
 	}
 	stats, err = w.store.core.DeliverAgentAttention(ctx, d, 10)
-	if err != nil || stats.Admitted != 0 || len(d.events) != 1 || d.holds != 0 {
+	if err != nil || stats.Admitted != 0 || len(d.events) != 2 || d.holds != 0 {
 		t.Fatalf("repeat: %+v %v events=%d holds=%d", stats, err, len(d.events), d.holds)
 	}
 	event := d.events[0]
@@ -111,9 +112,18 @@ func TestAgentAttentionMentionFreezesSourceAndOnlyAdmitsOnce(t *testing.T) {
 	if event.Content != msg.Content || event.MessageID != msg.MessageID || event.MessageRevision != msg.Revision || !event.OccurredAt.Equal(msg.CreatedAt) || event.Place.ID != ch.PlaceID || event.WorkspaceID != ws.WorkspaceID {
 		t.Fatalf("frozen source changed: %+v", event)
 	}
-	var seq int64
-	if err := w.store.pool.QueryRow(ctx, "SELECT admitted_command_seq FROM agent_attention_deliveries WHERE event_id=$1", event.EventID).Scan(&seq); err != nil || seq != 1 {
-		t.Fatalf("receipt: %d %v", seq, err)
+	// The edit is a second, distinct event carrying the new current view —
+	// it never rewrites the frozen original the secretary already received.
+	edit := d.events[1]
+	if edit.Change != AttentionChangeEdited || edit.Content != "訂正後です" ||
+		edit.MessageID != msg.MessageID || edit.MessageRevision != edited.Revision ||
+		edit.Actor.ID != w.humanB.ID || edit.PersonalityAgentID != w.agent.ID ||
+		edit.OccurredAt.Equal(msg.CreatedAt) {
+		t.Fatalf("edit event: %+v", edit)
+	}
+	var admitted int
+	if err := w.store.pool.QueryRow(ctx, "SELECT count(*) FROM agent_attention_deliveries WHERE message_id=$1 AND admitted_at IS NOT NULL", msg.MessageID).Scan(&admitted); err != nil || admitted != 2 {
+		t.Fatalf("receipts: %d %v", admitted, err)
 	}
 }
 
@@ -208,8 +218,17 @@ func TestAgentAttentionResendsIdenticalEventAfterAdmissionAckFailure(t *testing.
 			}
 			restarted := New(w.store.pool, w.workspaces, w.apps)
 			stats, err = restarted.DeliverAgentAttention(ctx, d, 10)
-			if err != nil || stats.Admitted != 1 || stats.Suppressed != 0 || len(d.events) != 1 || d.calls != 1 || d.holds != 0 {
+			// The delete case additionally issues the PA a tombstone event for
+			// the message it recorded — reconciled original plus tombstone.
+			wantAdmitted, wantCalls := 1, 1
+			if afterFailure == "delete" {
+				wantAdmitted, wantCalls = 2, 2
+			}
+			if err != nil || stats.Admitted != wantAdmitted || stats.Suppressed != 0 || len(d.events) != wantCalls || d.calls != wantCalls || d.holds != 0 {
 				t.Fatalf("reconcile known effect after %s: %+v %v commands=%d calls=%d", afterFailure, stats, err, len(d.events), d.calls)
+			}
+			if afterFailure == "delete" && d.events[1].Change != AttentionChangeDeleted {
+				t.Fatalf("second event is not the tombstone: %+v", d.events[1])
 			}
 		})
 	}
@@ -292,8 +311,19 @@ func TestAgentAttentionRechecksSourceBeforeAdmission(t *testing.T) {
 			}
 			d := newAttentionDelivery()
 			stats, err := w.store.core.DeliverAgentAttention(ctx, d, 10)
-			if err != nil || stats.Suppressed != 1 || len(d.events) != 0 {
+			// A deleted source suppresses the original event, but the deletion
+			// itself is a new recorded fact: the tombstone event still reaches
+			// the recipient as a current-view update.
+			wantEvents := 0
+			wantAdmitted := 0
+			if mutation == "deleted" {
+				wantEvents, wantAdmitted = 1, 1
+			}
+			if err != nil || stats.Suppressed != 1 || stats.Admitted != wantAdmitted || len(d.events) != wantEvents {
 				t.Fatalf("revoked: %+v %v events=%d", stats, err, len(d.events))
+			}
+			if mutation == "deleted" && d.events[0].Change != AttentionChangeDeleted {
+				t.Fatalf("expected the tombstone event, got %+v", d.events[0])
 			}
 		})
 	}

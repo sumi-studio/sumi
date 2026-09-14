@@ -3,6 +3,7 @@ import type {
   DurableHistoryEvent,
 } from "../lib/direct-chat-history";
 import type { ConversationModel } from "./model";
+import { createConversationChanges } from "./model";
 import {
   type AgentSession,
   createAgentSession,
@@ -31,16 +32,28 @@ export function projectHistory(page: DirectChatHistoryPage): ProjectedHistory {
   const entrySeq = new Map<string, number>();
   const visibleIds = new Set<string>();
   for (const event of [...bySeq.values()].sort((a, b) => a.seq - b.seq)) {
-    const before = session.conversation.entries;
     session = reduceEnvelope(session, event).session;
-    for (const id of session.conversation.entryOrder) {
-      if (!entrySeq.has(id)) entrySeq.set(id, event.seq);
-      if (
-        visible.has(event.seq) &&
-        before[id] !== session.conversation.entries[id]
-      )
-        visibleIds.add(id);
+    // The journal names exactly the entries this event added or rewrote;
+    // reading `entries` before/after cannot work because containers mutate
+    // in place. The replay session is private, so the journal is re-armed
+    // for each event.
+    const changes = session.conversation.changes;
+    if (changes?.structural) {
+      for (const id of session.conversation.entryOrder) {
+        if (!entrySeq.has(id)) entrySeq.set(id, event.seq);
+        if (visible.has(event.seq)) visibleIds.add(id);
+      }
+    } else if (changes) {
+      for (const id of changes.addedEntryIds) {
+        if (!entrySeq.has(id)) entrySeq.set(id, event.seq);
+        if (visible.has(event.seq)) visibleIds.add(id);
+      }
+      if (visible.has(event.seq))
+        for (const id of changes.changedEntryIds) visibleIds.add(id);
     }
+    // Re-arm after either branch: a fresh replay session starts structural,
+    // and leaving it armed would scan (and mark) the whole order per event.
+    session.conversation.changes = createConversationChanges();
   }
   const pending = page.pendingApprovals.at(-1)?.event;
   session = {
@@ -59,6 +72,7 @@ export function projectHistory(page: DirectChatHistoryPage): ProjectedHistory {
           visibleIds.has(id),
         ),
       ),
+      changes: createConversationChanges(true),
     },
   };
   return { session, entrySeq };
@@ -97,6 +111,8 @@ export function mergeHistory(
     runOrder: Object.keys(runs).sort(
       (a, b) => runs[a].startedSeq - runs[b].startedSeq,
     ),
+    // Rebuilt containers carry no per-row journal: consumers must rescan.
+    changes: createConversationChanges(true),
   };
   return reconcileDeferredTools({
     ...current,

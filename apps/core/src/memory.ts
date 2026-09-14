@@ -122,6 +122,9 @@ export type InputProvenance = {
   placeKind: unknown;
   messageId: unknown;
   attention: string;
+  /** "edited"/"deleted" when the input reports a change to an
+   * already-delivered message rather than a new message. */
+  change?: string;
 };
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
@@ -148,13 +151,19 @@ export function inputMarker(p: InputProvenance): string {
           str(p.messageId) && ` message_id=${str(p.messageId)}`,
         ].join("")
       : "";
+  const change =
+    p.change === "edited"
+      ? " — edited"
+      : p.change === "deleted"
+        ? " — deleted"
+        : "";
   const hint =
     p.attention === "observe"
       ? " — fyi, no reply needed"
       : p.attention === "defer"
         ? " — deferred"
         : "";
-  return `[${who}${where}${refs}${hint}]`;
+  return `[${who}${where}${refs}${change}${hint}]`;
 }
 
 /** Map one journal event to the model-visible message, or null for kinds
@@ -175,6 +184,7 @@ export function eventMessage(ev: Event): ChatMessage | null {
               placeKind: p.place_kind,
               messageId: p.message_id,
               attention: str(p.attention),
+              change: str(p.message_change),
             });
       return { role: "user", content: `${who} ${String(p.text ?? "")}` };
     }
