@@ -217,7 +217,10 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if rec.Cut.GenerationHighWater != localGen+1 {
 		t.Fatalf("epoch = %d, want %d", rec.Cut.GenerationHighWater, localGen+1)
 	}
-	want := Continuity{JournalEvents: 3, Notes: 2, QueuedInputs: 1, ClaimedInputs: 1, RunningTurns: 1,
+	// Each mid-turn journal.note first journaled its input (received_seq), so
+	// the journal holds 5 events: in-1's input_received + note + commit, and
+	// in-2's input_received + note (its turn never committed).
+	want := Continuity{JournalEvents: 5, Notes: 2, QueuedInputs: 1, ClaimedInputs: 1, RunningTurns: 1,
 		UnfinishedPlans: 1, PendingSchedules: 1, UndeliveredOut: 1}
 	if rec.Continuity != want {
 		t.Fatalf("continuity = %+v, want %+v", rec.Continuity, want)
@@ -332,7 +335,19 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-b", "journal.note", 1, load.Plan.Plan[0].Calls[1].Request); err != nil || !fresh {
 		t.Fatalf("remaining call 1: fresh=%v err=%v", fresh, err)
 	}
-	must(cloud.state.CommitTurn(ctx, pid, "turn-2b", gen, agentstate.CommitRequest{Outcome: "complete", Output: map[string]any{"text": "moving"}}))
+	// The resumed turn presents its input_received copy at commit, as the core
+	// always does. in-2's copy was already journaled on the source — before the
+	// crash, when its first note landed mid-turn — and received_seq carried
+	// across the transfer, so neither the fresh note claim above nor this
+	// commit may journal it a second time.
+	must(cloud.state.CommitTurn(ctx, pid, "turn-2b", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{{Kind: "input_received", Payload: map[string]any{
+			"input_id": "in-2", "kind": "message", "text": "we are moving to the cloud",
+			"actor_kind": "human", "source_surface": "test", "attempt": 2,
+		}}},
+		Output: map[string]any{"text": "moving"},
+	}))
 
 	load = must(cloud.state.LoadTurn(ctx, pid, gen, "turn-3", 50))
 	if load.Input == nil || load.Input.InputID != "in-3" {
@@ -353,12 +368,484 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 			t.Fatalf("note %q appears %d times on the destination, want %d", text, got, n)
 		}
 	}
+	var receivedSeq, secondNoteSeq int64
+	received := 0
+	for _, e := range must(cloud.state.Events(ctx, pid, 0, 1000)) {
+		if e.Kind == "input_received" && e.Payload["input_id"] == "in-2" {
+			received++
+			receivedSeq = e.Seq
+		}
+		if e.Kind == "note" && e.Payload["text"] == "Second note after the move" {
+			secondNoteSeq = e.Seq
+		}
+	}
+	if received != 1 {
+		t.Fatalf("in-2 input_received journaled %d times on the destination, want 1", received)
+	}
+	if secondNoteSeq <= receivedSeq {
+		t.Fatalf("the resumed turn's note at seq %d does not follow its input at %d", secondNoteSeq, receivedSeq)
+	}
+	var carriedSeq int64
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-2'`,
+		pid).Scan(&carriedSeq); err != nil || carriedSeq != receivedSeq {
+		t.Fatalf("carried received_seq %d (err %v) does not point at the input_received at %d", carriedSeq, err, receivedSeq)
+	}
 	after := must(cloud.state.Events(ctx, pid, rec.Cut.LatestEventSeq, 100))
 	if len(after) == 0 || after[0].Seq != rec.Cut.LatestEventSeq+1 {
 		t.Fatalf("journal does not continue after the cut: %+v", after)
 	}
 	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); !errors.Is(err, agentstate.ErrPersonaInactive) {
 		t.Fatalf("source acquire after completion: %v", err)
+	}
+}
+
+// claimSeq claims the oldest claimable chunk and fails the test unless it is
+// the expected one — the sequence is the assertion that sealing order and
+// claim order agree.
+func claimSeq(t *testing.T, p placement, personaID string, generation, wantSeq int64) {
+	t.Helper()
+	claimed := must(p.state.ClaimMemoryChunk(context.Background(), personaID, generation, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != wantSeq {
+		t.Fatalf("claimed chunk %+v, want chunk_seq %d", claimed.Chunk, wantSeq)
+	}
+}
+
+// chunkRow reads one chunk's carried lifecycle fields.
+func chunkRow(t *testing.T, p placement, personaID string, chunkSeq int64) agentstate.MemoryChunk {
+	t.Helper()
+	var c agentstate.MemoryChunk
+	err := p.pool.QueryRow(context.Background(), `
+		SELECT persona_id, chunk_seq, layer, first_seq, last_seq, est_tokens,
+			status, replacement, replacement_est_tokens, attempts, interruptions, last_error,
+			claimed_generation, claimed_at, not_before, created_at, prepared_at, applied_at
+		FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2`,
+		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.FirstSeq, &c.LastSeq,
+		&c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
+		&c.Interruptions, &c.LastError, &c.ClaimedGeneration, &c.ClaimedAt,
+		&c.NotBefore, &c.CreatedAt, &c.PreparedAt, &c.AppliedAt)
+	if err != nil {
+		t.Fatalf("chunk %d: %v", chunkSeq, err)
+	}
+	return c
+}
+
+// rebundle rewrites row lines in an exported bundle and recomputes the
+// content digest, so a deliberately bad row reaches the import integrity
+// checks instead of failing at the digest.
+func rebundle(t *testing.T, bundle []byte, fn func(line string) string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	h := sha256.New()
+	sc := bufio.NewScanner(bytes.NewReader(bundle))
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for sc.Scan() {
+		line := sc.Text() + "\n"
+		if strings.Contains(line, `"record":"trailer"`) {
+			var tr Trailer
+			if err := json.Unmarshal([]byte(line), &tr); err != nil {
+				t.Fatal(err)
+			}
+			tr.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+			raw, _ := json.Marshal(tr)
+			out.Write(append(raw, '\n'))
+			continue
+		}
+		line = fn(line)
+		h.Write([]byte(line))
+		out.WriteString(line)
+	}
+	return out.Bytes()
+}
+
+// A secretary's memory is part of what moves: sealed ranges, accepted
+// replacement text, kept and failed verdicts, prepared candidates, and the
+// attempt/interruption history all cross the transfer with the journal they
+// refer to. A live 'preparing' claim cannot cross — it belongs to the writer
+// generation the seal fenced — so the cut returns that chunk to 'sealed' for
+// the destination to claim under its own writer. The destination's first
+// turn sees the applied fragments at their journal positions, settled
+// verdicts are not re-litigated, and the carried work resumes where the
+// source's authority ended.
+func TestTransferCarriesSecretaryMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+
+	// Seven inputs each commit one ~11k-token record: MemoryMaintain seals
+	// six chunks (one per input) and leaves the seventh input's records as
+	// the live tail.
+	big := strings.Repeat("remembered detail ", 2500)
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 7; i++ {
+		in := fmt.Sprintf("mem-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("day %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("mt-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("mt-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("day %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "note", Payload: map[string]any{"text": big, "day": i}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	st := must(local.state.MemoryMaintain(ctx, pid, gen))
+	if st.Sealed != 6 {
+		t.Fatalf("maintain sealed %d chunks, want 6 (status %+v)", st.Sealed, st)
+	}
+
+	// Drive each lifecycle state through the real service.
+	claimSeq(t, local, pid, gen, 1)
+	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 1, "Day one, compressed.", false))
+	if st = must(local.state.MemoryMaintain(ctx, pid, gen)); st.Applied != 1 {
+		t.Fatalf("chunk 1 did not apply: %+v", st)
+	}
+	claimSeq(t, local, pid, gen, 2)
+	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 2, "", true)) // kept
+	claimSeq(t, local, pid, gen, 3)
+	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "provider timeout", true))
+	claimSeq(t, local, pid, gen, 4) // chunk 3 is backed off; 4 is next
+	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 4, "Day four, compressed.", false))
+	time.Sleep(700 * time.Millisecond) // past chunk 3's first-attempt backoff
+	claimSeq(t, local, pid, gen, 3)
+	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
+	// Chunk 5's claim is orphaned once (an interruption), then reclaimed —
+	// its history crosses the transfer. Chunk 6 is still claimed when the
+	// seal lands: the cut normalizes that dead claim back to 'sealed'.
+	claimSeq(t, local, pid, gen, 5)
+	claimSeq(t, local, pid, gen, 6)
+
+	before := must(local.state.MemoryStatus(ctx, pid))
+	if before.Applied != 1 || before.Kept != 1 || before.Failed != 1 ||
+		before.Prepared != 1 || before.Preparing != 1 || before.Sealed != 1 {
+		t.Fatalf("source memory shape %+v", before)
+	}
+
+	cloudID := placementID(t, cloud)
+	rec := must(local.svc.Seal(ctx, pid, "move-mem", cloudID))
+	want := Continuity{JournalEvents: 14, Notes: 7, UndeliveredOut: 7, MemoryApplied: 1,
+		MemoryPrepared: 1, MemorySealed: 2, MemoryKept: 1, MemoryFailed: 1}
+	if rec.Continuity != want {
+		t.Fatalf("seal continuity = %+v, want %+v", rec.Continuity, want)
+	}
+	// The sealed source shows the cut shape: the dead claim is released.
+	if c := chunkRow(t, local, pid, 6); c.Status != "sealed" || c.ClaimedGeneration != nil || c.ClaimedAt != nil {
+		t.Fatalf("chunk 6 after seal: %+v", c)
+	}
+	if c := chunkRow(t, local, pid, 5); c.Status != "sealed" || c.Interruptions != 1 || c.NotBefore == nil {
+		t.Fatalf("chunk 5 should keep its interruption pacing: %+v", c)
+	}
+	if c := chunkRow(t, local, pid, 3); c.Status != "failed" || c.Attempts != 2 {
+		t.Fatalf("chunk 3 verdict: %+v", c)
+	}
+	bundle, exported := exportBytes(t, local, pid, "move-mem")
+
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	if err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	if staged.Continuity != want {
+		t.Fatalf("staged continuity %+v, want %+v", staged.Continuity, want)
+	}
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-mem"))
+
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+
+	// The destination's first turn already sees the applied fragment at its
+	// journal position — not the raw originals it covers.
+	submit(t, cloud, pid, "mem-8", "first cloud message")
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-1", 50))
+	if len(load.Memory) != 1 || load.Memory[0].ChunkSeq != 1 || load.Memory[0].Text != "Day one, compressed." {
+		t.Fatalf("first destination turn memory %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		if e.Seq >= load.Memory[0].FirstSeq && e.Seq <= load.Memory[0].LastSeq {
+			t.Fatalf("covered original seq %d rendered alongside its applied block", e.Seq)
+		}
+	}
+	must(cloud.state.CommitTurn(ctx, pid, "ct-1", dgen, agentstate.CommitRequest{
+		Outcome: "complete", Output: map[string]any{"text": "hi"},
+	}))
+
+	// Maintenance continues the carried lifecycle: the shelved candidate
+	// applies because live raw still exceeds the limit; settled verdicts are
+	// untouched.
+	dst := must(cloud.state.MemoryMaintain(ctx, pid, dgen))
+	if dst.Applied != 2 || dst.Kept != 1 || dst.Failed != 1 || dst.Prepared != 0 {
+		t.Fatalf("destination maintain %+v", dst)
+	}
+	if c := chunkRow(t, cloud, pid, 4); c.Status != "applied" || c.AppliedAt == nil {
+		t.Fatalf("carried prepared chunk 4: %+v", c)
+	}
+	if c := chunkRow(t, cloud, pid, 2); c.Status != "kept" || c.PreparedAt == nil {
+		t.Fatalf("kept verdict was re-litigated: %+v", c)
+	}
+	if c := chunkRow(t, cloud, pid, 3); c.Status != "failed" || c.Attempts != 2 ||
+		c.LastError == nil || !strings.Contains(*c.LastError, "factually wrong") {
+		t.Fatalf("failed verdict changed on the destination: %+v", c)
+	}
+
+	// Chunk 5's carried backoff may still be running; once claimable the
+	// destination's writer prepares it under its own generation.
+	if c := chunkRow(t, cloud, pid, 5); c.NotBefore != nil && c.NotBefore.After(time.Now()) {
+		time.Sleep(time.Until(*c.NotBefore) + 50*time.Millisecond)
+	}
+	claimSeq(t, cloud, pid, dgen, 5)
+	must(cloud.state.CompleteMemoryChunk(ctx, pid, dgen, 5, "Day five, compressed.", false))
+	if c := chunkRow(t, cloud, pid, 5); c.Status != "prepared" || c.Interruptions != 1 {
+		t.Fatalf("chunk 5 after destination preparation: %+v", c)
+	}
+	// The normalized chunk 6 is ordinary sealed work for the destination.
+	claimSeq(t, cloud, pid, dgen, 6)
+	must(cloud.state.FailMemoryChunk(ctx, pid, dgen, 6, "cloud provider timeout", true))
+	if c := chunkRow(t, cloud, pid, 6); c.Status != "sealed" || c.Attempts != 1 || c.Interruptions != 0 {
+		t.Fatalf("normalized chunk 6 resumed with wrong history: %+v", c)
+	}
+
+	// The source stayed fenced and unchanged: the exported chunk rows still
+	// hold exactly what the cut recorded, and no writer can start.
+	if a := authority(t, local, pid); a != "sealed" {
+		t.Fatalf("source authority %s", a)
+	}
+	if _, err := local.state.ClaimMemoryChunk(ctx, pid, gen, 50); !errors.Is(err, agentstate.ErrGenerationFence) {
+		t.Fatalf("source memory claim after seal: %v, want fenced", err)
+	}
+	must(local.svc.Complete(ctx, pid, "move-mem",
+		must(cloud.svc.Status(ctx, "import", "move-mem")).ActivateProof))
+	if a := authority(t, local, pid); a != "transferred" {
+		t.Fatalf("source authority %s after complete", a)
+	}
+	if staged.ContentSHA256 != exported.ContentSHA256 {
+		t.Fatal("staged receipt does not match the export")
+	}
+}
+
+// A carried chunk can never hold a live claim, and its range must resolve
+// inside the carried journal. Both are integrity violations a valid digest
+// cannot launder.
+func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	submit(t, local, pid, "m-1", "hi")
+	must(local.state.LoadTurn(ctx, pid, gen, "t-1", 50))
+	must(local.state.CommitTurn(ctx, pid, "t-1", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{
+				"input_id": "m-1", "kind": "message", "text": "hi",
+				"actor_kind": "human", "source_surface": "test", "attempt": 1,
+			}},
+			{Kind: "note", Payload: map[string]any{"text": strings.Repeat("x", 45000)}},
+		},
+	}))
+	must(local.state.MemoryMaintain(ctx, pid, gen))
+	// One sealed chunk is not enough — the seal walk needs a following input
+	// boundary. Add a second input so the first chunk seals.
+	submit(t, local, pid, "m-2", "again")
+	must(local.state.LoadTurn(ctx, pid, gen, "t-2", 50))
+	must(local.state.CommitTurn(ctx, pid, "t-2", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{
+				"input_id": "m-2", "kind": "message", "text": "again",
+				"actor_kind": "human", "source_surface": "test", "attempt": 1,
+			}},
+			{Kind: "note", Payload: map[string]any{"text": "second"}},
+		},
+	}))
+	must(local.state.MemoryMaintain(ctx, pid, gen))
+	var sealedChunks int64
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_memory_chunks WHERE persona_id = $1 AND status = 'sealed'`,
+		pid).Scan(&sealedChunks); err != nil || sealedChunks != 1 {
+		t.Fatalf("sealed chunks %d err %v, want 1", sealedChunks, err)
+	}
+	// A queued input carries received_seq NULL — the legitimate unjournaled
+	// state that must survive the marker checks.
+	submit(t, local, pid, "m-3", "queued")
+
+	must(local.svc.Seal(ctx, pid, "move-badmem", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-badmem")
+
+	// mutRow rewrites the data object of every row of table whose data
+	// matches; rebundle then recomputes the content digest. Every case below
+	// is therefore a crafted/recomputed-digest bundle — state an honest
+	// store cannot emit — which is exactly the class verifyCut exists for.
+	mutRow := func(table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
+		return func(line string) string {
+			var rec map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				return line
+			}
+			var name string
+			if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
+				return line
+			}
+			var data map[string]any
+			if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
+				return line
+			}
+			mutate(data)
+			raw, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec["data"] = raw
+			out, err := json.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(out) + "\n"
+		}
+	}
+	chunkRow := func(d map[string]any) bool { return d["chunk_seq"] != nil }
+	inputRow := func(id string) func(map[string]any) bool {
+		return func(d map[string]any) bool { return d["input_id"] == id }
+	}
+	set := func(k string, v any) func(map[string]any) {
+		return func(d map[string]any) { d[k] = v }
+	}
+
+	cases := map[string]struct {
+		fn   func(line string) string
+		want string
+	}{
+		"carried claim": {func(line string) string {
+			if !strings.Contains(line, `"table":"core_memory_chunks"`) {
+				return line
+			}
+			line = strings.Replace(line, `"status": "sealed"`, `"status": "preparing"`, 1)
+			return strings.Replace(line, `"claimed_generation": null`, `"claimed_generation": 5`, 1)
+		}, "memory_chunk_claim_carried"},
+		"range past the journal": {func(line string) string {
+			if !strings.Contains(line, `"table":"core_memory_chunks"`) {
+				return line
+			}
+			return strings.Replace(line, `"last_seq": 2`, `"last_seq": 99`, 1)
+		}, "memory_chunk_range_outside_journal"},
+		"unknown status": {func(line string) string {
+			if !strings.Contains(line, `"table":"core_memory_chunks"`) {
+				return line
+			}
+			return strings.Replace(line, `"status": "sealed"`, `"status": "bogus"`, 1)
+		}, ""},
+		// f70/F-B1: a prepared/applied row without replacement text (or its
+		// estimate) stages today and bricks every destination LoadTurn on the
+		// appliedBlocks scan; the prepared shape is latent until maintain
+		// applies it. kept is checked separately: keep-unchanged stores both
+		// NULL, non-shrinking keeps both set — one without the other is not a
+		// row the store writes.
+		"applied without replacement": {mutRow("core_memory_chunks", chunkRow,
+			set("status", "applied")), "memory_chunk_missing_payload"},
+		"prepared without replacement": {mutRow("core_memory_chunks", chunkRow,
+			set("status", "prepared")), "memory_chunk_missing_payload"},
+		"kept text without estimate": {mutRow("core_memory_chunks", chunkRow, func(d map[string]any) {
+			d["status"] = "kept"
+			d["replacement"] = "condensed"
+		}), "memory_chunk_missing_payload"},
+		// f71/F2: negative sequence/counter values corrupt ordering and the
+		// live-raw accounting while staging cleanly.
+		"negative chunk_seq": {mutRow("core_memory_chunks", chunkRow,
+			set("chunk_seq", -7)), "memory_chunk_negative_values"},
+		"negative est_tokens": {mutRow("core_memory_chunks", chunkRow,
+			set("est_tokens", -900000)), "memory_chunk_negative_values"},
+		"layer zero": {mutRow("core_memory_chunks", chunkRow,
+			set("layer", 0)), "memory_chunk_negative_values"},
+		// F-B2: received_seq that dangles, names the wrong kind, or names
+		// another input's event would make the destination skip journaling
+		// this input's input_received — its original record silently lost.
+		"received_seq another input's event": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", 1)), "input_received_seq_mismatch"},
+		"received_seq wrong kind": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", 2)), "input_received_seq_mismatch"},
+		"received_seq dangling on queued input": {mutRow("core_inputs", inputRow("m-3"),
+			set("received_seq", 99)), "input_received_seq_mismatch"},
+		// The reverse link: m-2's input_received exists in the journal, so a
+		// missing marker would let the destination journal it a second time.
+		"received_seq marker removed": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", nil)), "input_received_seq_not_linked"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := rebundle(t, bundle, tc.fn)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil)
+			if err == nil {
+				t.Fatal("import accepted a malformed memory chunk")
+			}
+			if tc.want != "" && (!errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused bundle left a persona behind: %v", err)
+			}
+		})
+	}
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
+	}
+	// Bounds are floors, not a layer policy: a future consolidation layer and
+	// the queued input's NULL marker must still cross. Re-address the mutated
+	// bundle to a second placement since the first already holds this
+	// transfer under the clean digest.
+	cloud2 := newPlacement(t)
+	higherLayer := rebundle(t, bundle, func(line string) string {
+		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
+		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
+	})
+	if _, created, err := cloud2.svc.Import(ctx, bytes.NewReader(higherLayer), nil); err != nil || !created {
+		t.Fatalf("layer-2 chunk refused: created=%v err=%v", created, err)
+	}
+}
+
+// f74: the Go CommitTurn API accepts a request carrying the same
+// input_received twice — the store dedups at the write boundary, so an
+// accepted commit can never produce the unlinked second receipt that
+// input_received_seq_not_linked would refuse at every later Seal.
+func TestSealAfterStoreProducedDuplicateReceipt(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Dupe receipt")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	submit(t, local, pid, "d-1", "hello")
+	must(local.state.LoadTurn(ctx, pid, gen, "t-1", 50))
+	must(local.state.CommitTurn(ctx, pid, "t-1", gen, agentstate.CommitRequest{
+		Outcome: "complete",
+		Events: []agentstate.EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "d-1"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "d-1"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "hi"}},
+		},
+		Output: map[string]any{"text": "hi"},
+	}))
+	var receipts int64
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pid).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("journaled receipts = %d err=%v, want 1", receipts, err)
+	}
+	// The accepted state must be movable: seal, export, import all succeed.
+	must(local.svc.Seal(ctx, pid, "move-dupe", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-dupe")
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+		t.Fatalf("import after duplicate-receipt commit: created=%v err=%v", created, err)
 	}
 }
 

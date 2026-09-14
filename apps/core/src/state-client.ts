@@ -1,9 +1,12 @@
 import type {
+  ClaimedMemoryChunk,
   CommitRequest,
   Event,
   Job,
   JobTerminalReport,
   LoadResult,
+  MemoryChunk,
+  MemoryStatus,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -132,6 +135,49 @@ export interface StateClient {
     now?: Date,
     limit?: number,
   ): Promise<Schedule[]>;
+  /**
+   * Memory housekeeping between turns: seal newly safe journal ranges,
+   * then apply shelved L1 replacements while the live raw estimate
+   * exceeds the limit. Runs under the writer generation so application
+   * never interleaves with an in-flight model call.
+   */
+  memoryMaintain(persona: string, generation: number): Promise<MemoryStatus>;
+  memoryStatus(persona: string): Promise<MemoryStatus>;
+  /**
+   * Claim the oldest sealable chunk for asynchronous L1 preparation — one
+   * branch at a time. `chunk` is null when nothing is claimable right now
+   * (nothing sealed, another branch preparing, or backoff pending). The
+   * returned context is the rendered parent context at claim time.
+   */
+  claimMemoryChunk(
+    persona: string,
+    generation: number,
+    contextLimit: number,
+  ): Promise<ClaimedMemoryChunk>;
+  /**
+   * Shelve the finished replacement candidate. Completion alone never
+   * changes the sent context — application is a separate threshold-gated
+   * step in memoryMaintain. keepUnchanged is the model's KEEP_UNCHANGED
+   * decision: the originals stay and the chunk is never reprepared.
+   */
+  completeMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    result: { replacement?: string; keepUnchanged?: boolean },
+  ): Promise<MemoryChunk>;
+  /**
+   * Record a failed preparation attempt. Retryable failures return the
+   * chunk to the shelf with backoff while attempts remain; an exhausted
+   * or non-retryable failure is terminal ('failed') — visible, originals
+   * kept, never silently skipped.
+   */
+  failMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    failure: { error: string; retryable: boolean },
+  ): Promise<MemoryChunk>;
   outbox(
     persona: string,
     afterSeq: number,
@@ -434,6 +480,56 @@ export class HttpStateClient implements StateClient {
       { generation, now: now?.toISOString(), limit },
     );
     return res.fired;
+  }
+  memoryMaintain(persona: string, generation: number) {
+    return this.call<MemoryStatus>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/maintain`,
+      { generation },
+    );
+  }
+  memoryStatus(persona: string) {
+    return this.call<MemoryStatus>(
+      "GET",
+      `/internal/core/personas/${persona}/memory`,
+    );
+  }
+  claimMemoryChunk(persona: string, generation: number, contextLimit: number) {
+    return this.call<ClaimedMemoryChunk>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/claim`,
+      { generation, context_limit: contextLimit },
+    );
+  }
+  async completeMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    result: { replacement?: string; keepUnchanged?: boolean },
+  ) {
+    const res = await this.call<{ chunk: MemoryChunk }>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/complete`,
+      {
+        generation,
+        replacement: result.replacement ?? "",
+        keep_unchanged: result.keepUnchanged ?? false,
+      },
+    );
+    return res.chunk;
+  }
+  async failMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    failure: { error: string; retryable: boolean },
+  ) {
+    const res = await this.call<{ chunk: MemoryChunk }>(
+      "POST",
+      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/fail`,
+      { generation, error: failure.error, retryable: failure.retryable },
+    );
+    return res.chunk;
   }
   async outbox(persona: string, afterSeq: number, limit = 200) {
     const res = await this.call<{ outbox: OutboxEntry[] }>(

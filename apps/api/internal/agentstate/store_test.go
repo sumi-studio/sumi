@@ -227,6 +227,89 @@ func TestCrashMidTurnRecovery(t *testing.T) {
 	}
 }
 
+// f74: the store API accepted a commit carrying the same input_received
+// twice, journaled both, and linked the marker to the first — the second
+// copy was then unlinked and the cut's reverse-link check refused every
+// later Seal, permanently. The write boundary now dedups: one receipt per
+// input, per journal. A receipt naming a still-queued input is journaled
+// history and gets its marker linked, so that input's own commit does not
+// repeat it.
+func TestCommitDeduplicatesInputReceived(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	l, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for _, id := range []string{"in-1", "in-2"} {
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": id}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, err := s.LoadTurn(ctx, pa, l.Generation, "t-1", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-1", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}},
+			{Kind: "note", Payload: map[string]any{"text": "between"}},
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-1"}}, // duplicate copy
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-2"}}, // other input's receipt
+		},
+		Output: map[string]any{"text": "ok"},
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var receipts, seq1, seq2 int64
+	var marker1, marker2 *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("journaled receipts = %d err=%v, want exactly 2", receipts, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT min(seq) FILTER (WHERE payload->>'input_id' = 'in-1'),
+				min(seq) FILTER (WHERE payload->>'input_id' = 'in-2')
+		 FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&seq1, &seq2); err != nil || seq1 != 1 || seq2 != 3 {
+		t.Fatalf("receipt seqs = %d,%d err=%v, want 1,3", seq1, seq2, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT max(received_seq) FILTER (WHERE input_id = 'in-1'),
+				max(received_seq) FILTER (WHERE input_id = 'in-2')
+		 FROM core_inputs WHERE persona_id = $1`,
+		pa).Scan(&marker1, &marker2); err != nil {
+		t.Fatalf("markers: %v", err)
+	}
+	if marker1 == nil || *marker1 != seq1 || marker2 == nil || *marker2 != seq2 {
+		t.Fatalf("markers = %v,%v want %d,%d", marker1, marker2, seq1, seq2)
+	}
+	// in-2's own commit must not re-journal its receipt.
+	load2, err := s.LoadTurn(ctx, pa, l.Generation, "t-2", 10)
+	if err != nil || load2.Input == nil || load2.Input.InputID != "in-2" {
+		t.Fatalf("load in-2: %+v err=%v", load2, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-2", l.Generation, CommitRequest{
+		Outcome: "complete",
+		Events: []EventInput{
+			{Kind: "input_received", Payload: map[string]any{"input_id": "in-2"}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "done"}},
+		},
+		Output: map[string]any{"text": "done"},
+	}); err != nil {
+		t.Fatalf("in-2 commit: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'input_received'`,
+		pa).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("receipts after in-2 commit = %d err=%v, want 2", receipts, err)
+	}
+}
+
 // mustPlan records a durable round-0 decision for the turn's input.
 func mustPlan(t *testing.T, s *Store, pa, turnID string, gen int64, calls ...PlanCall) TurnPlan {
 	t.Helper()
@@ -322,8 +405,11 @@ func TestJournalNoteTool(t *testing.T) {
 	if err != nil || !fresh || op.Status != "done" || op.Response["seq"] == nil {
 		t.Fatalf("note claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
+	// The note follows the input that caused it: the effect journals its
+	// input first, so seq order is causal.
 	evs, err := s.Events(ctx, pa, 0, 10)
-	if err != nil || len(evs) != 1 || evs[0].Kind != "note" {
+	if err != nil || len(evs) != 2 || evs[0].Kind != "input_received" ||
+		evs[0].Payload["input_id"] != "in-1" || evs[1].Kind != "note" {
 		t.Fatalf("events: %+v err=%v", evs, err)
 	}
 }

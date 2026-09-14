@@ -251,6 +251,16 @@ type LoadResult struct {
 	Turn    *Turn   `json:"turn"`
 	Input   *Input  `json:"input"`
 	Context []Event `json:"context"`
+	// Memory holds the applied L1 replacement blocks. Each renders at the
+	// journal position where its events were — the core interleaves them
+	// with the raw tail by sequence position.
+	Memory []MemoryBlock `json:"memory"`
+	// Omitted is the extent of older raw records outside the send cap —
+	// still stored and readable through conversation_history; nil if none.
+	Omitted *OmittedRange `json:"omitted"`
+	// MemoryOmitted is the extent of older applied memory blocks outside
+	// the memory cap — stored, originals readable; nil if none.
+	MemoryOmitted *OmittedMemory `json:"memory_omitted"`
 	// Plan is the input's recorded decision, if one exists — returned on
 	// both the fresh-claim and running-turn replay paths so a retried
 	// attempt continues the recorded plan rather than re-planning.
@@ -798,29 +808,6 @@ func clampLimit(v, def, max int) int {
 	return v
 }
 
-func (s *Store) journalTail(ctx context.Context, db interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, personaID string, limit int) ([]Event, error) {
-	limit = clampLimit(limit, 50, 500)
-	rows, err := db.Query(ctx, `
-		SELECT persona_id, seq, turn_id, kind, payload, created_at
-		FROM (SELECT * FROM core_events WHERE persona_id = $1 ORDER BY seq DESC LIMIT $2) recent
-		ORDER BY seq`, personaID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 // LoadTurn is the coarse turn-start read under the writer's generation. If a
 // turn is already running under this generation (a lost load response), it is
 // replayed. Otherwise the oldest queued input is claimed and its turn begun
@@ -866,10 +853,11 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
 				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore)
 		if errors.Is(err, pgx.ErrNoRows) {
-			res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
 			if err != nil {
 				return res, err
 			}
+			res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 			if err := tx.Commit(ctx); err != nil {
 				return res, err
 			}
@@ -927,10 +915,18 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 			return res, err
 		}
 	}
-	res.Context, err = s.journalTail(ctx, tx, personaID, contextLimit)
+	// The turn presents its own input (and its recorded plan re-presents any
+	// mid-turn effects), so records an earlier attempt already journaled for
+	// this input are left out of the rendered history.
+	exclude := ""
+	if res.Input != nil {
+		exclude = res.Input.InputID
+	}
+	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, exclude)
 	if err != nil {
 		return res, err
 	}
+	res.Context, res.Memory, res.Omitted, res.MemoryOmitted = rc.Events, rc.Memory, rc.Omitted, rc.MemoryOmitted
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -1001,8 +997,41 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
-	if err := s.appendEventsTx(ctx, tx, personaID, turnID, req.Events); err != nil {
+	// Exactly one input_received per input ever lands in the journal: if a
+	// mid-turn effect already journaled the input (see ensureInputReceived)
+	// the commit's copy is skipped, and a second copy inside the request
+	// itself is dropped — a duplicate receipt is the same fact twice, not
+	// new history. commit_request keeps the request as sent, so replays
+	// still compare.
+	events, err := withoutJournaledInput(ctx, tx, personaID, req.Events)
+	if err != nil {
+		return nil, err
+	}
+	var base int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM core_events WHERE persona_id = $1`,
+		personaID).Scan(&base); err != nil {
+		return nil, err
+	}
+	if err := s.appendEventsTx(ctx, tx, personaID, turnID, events); err != nil {
 		return nil, dataErr(err)
+	}
+	// Link every input_received this commit journaled to its input's
+	// marker — not only this turn's input: a receipt for another input is
+	// unusual but journaled history, and leaving it unlinked would make the
+	// persona permanently unsealable under the cut's reverse-link check.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_inputs i SET received_seq = s.seq
+		FROM (
+			SELECT payload->>'input_id' AS input_id, MIN(seq) AS seq
+			FROM core_events
+			WHERE persona_id = $1 AND seq > $2 AND kind = 'input_received'
+			GROUP BY 1
+		) s
+		WHERE i.persona_id = $1 AND i.input_id = s.input_id
+			AND i.received_seq IS NULL`,
+		personaID, base); err != nil {
+		return nil, err
 	}
 	switch req.Outcome {
 	case "complete":
@@ -1241,6 +1270,13 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	if err := sRows.Err(); err != nil {
 		return res, err
 	}
+	// Return memory chunks a fenced generation was preparing to the shelf
+	// so the live generation can reprepare them — the originals never left
+	// the context while preparation ran. The lost claim counts as an
+	// interruption, not a failed attempt.
+	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
+		return res, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
@@ -1273,10 +1309,122 @@ func (s *Store) Events(ctx context.Context, personaID string, afterSeq int64, li
 // path yet and must not be claimable.
 func isInternalTool(tool string) bool {
 	switch tool {
-	case "schedule.set", "journal.note", "job.start", "job.status", "job.cancel":
+	case "schedule.set", "journal.note", "conversation_history",
+		"job.start", "job.status", "job.cancel":
 		return true
 	}
 	return false
+}
+
+// ensureInputReceived journals the input a turn is serving before a
+// mid-turn effect lands in the journal, so the effect follows its cause in
+// seq order (and in the memory chunk the seal walk cuts at that input). The
+// payload is the one the core commits for the same input. received_seq makes
+// it happen once per input: later effects, retried attempts and the turn's
+// own commit all see the input as already journaled.
+func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, turnID string) error {
+	var received *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT received_seq FROM core_inputs WHERE persona_id = $1 AND input_id = $2 FOR UPDATE`,
+		personaID, inputID).Scan(&received); err != nil {
+		return fmt.Errorf("input for journal: %w", err)
+	}
+	if received != nil {
+		return nil
+	}
+	in, err := scanInput(tx.QueryRow(ctx,
+		`SELECT `+inputCols+` FROM core_inputs WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID))
+	if err != nil {
+		return err
+	}
+	var attempt int
+	if err := tx.QueryRow(ctx,
+		`SELECT attempt FROM core_turns WHERE persona_id = $1 AND turn_id = $2`,
+		personaID, turnID).Scan(&attempt); err != nil {
+		return err
+	}
+	var text any
+	if t, ok := in.Payload["text"].(string); ok {
+		text = t
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
+		SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, $2, 'input_received', $3
+		FROM core_events WHERE persona_id = $1::uuidv7
+		RETURNING seq`,
+		personaID, turnID, map[string]any{
+			"input_id":       in.InputID,
+			"kind":           in.Kind,
+			"text":           text,
+			"actor_kind":     in.ActorKind,
+			"source_surface": in.SourceSurface,
+			"attempt":        attempt,
+		}).Scan(&seq); err != nil {
+		return fmt.Errorf("journal input: %w", dataErr(err))
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE core_inputs SET received_seq = $3 WHERE persona_id = $1 AND input_id = $2`,
+		personaID, inputID, seq)
+	return err
+}
+
+// withoutJournaledInput enforces one input_received per input in the
+// journal: a copy naming an input whose marker is already set is dropped
+// (the receipt exists), and a second copy inside the request itself is
+// dropped (the first is the receipt). The marker check runs FOR UPDATE so
+// a commit cannot dedup against a marker another in-flight commit has not
+// recorded yet.
+func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, events []EventInput) ([]EventInput, error) {
+	var named []string
+	seen := map[string]bool{}
+	for _, e := range events {
+		if e.Kind != "input_received" {
+			continue
+		}
+		if id, _ := e.Payload["input_id"].(string); !seen[id] {
+			seen[id] = true
+			named = append(named, id)
+		}
+	}
+	if len(named) == 0 {
+		return events, nil
+	}
+	journaled := map[string]bool{}
+	rows, err := tx.Query(ctx,
+		`SELECT input_id FROM core_inputs
+		 WHERE persona_id = $1 AND input_id = ANY($2) AND received_seq IS NOT NULL
+		 FOR UPDATE`,
+		personaID, named)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		journaled[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	out := make([]EventInput, 0, len(events))
+	emitted := map[string]bool{}
+	for _, e := range events {
+		if e.Kind == "input_received" {
+			id, _ := e.Payload["input_id"].(string)
+			if journaled[id] || emitted[id] {
+				continue
+			}
+			emitted[id] = true
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // internalToolResponse applies a state-internal tool's effect inside the
@@ -1356,6 +1504,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		if text == "" {
 			return nil, false, fmt.Errorf("%w: journal.note requires text", ErrBadRequest)
 		}
+		if err := ensureInputReceived(ctx, tx, personaID, inputID, turnID); err != nil {
+			return nil, false, err
+		}
 		var seq int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
@@ -1367,6 +1518,12 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			return nil, false, fmt.Errorf("journal.note: %w", dataErr(err))
 		}
 		return map[string]any{"seq": seq, "kind": "note"}, true, nil
+	case "conversation_history":
+		resp, err := s.conversationHistory(ctx, tx, personaID, request)
+		if err != nil {
+			return nil, false, err
+		}
+		return resp, true, nil
 	default:
 		return nil, false, nil
 	}

@@ -11,6 +11,8 @@
  *   SUMI_PROVIDER_RETRY_BUDGET_MS  wall-clock budget for transient provider
  *                                  retries, measured from input submission
  *                                  (default 30 min)
+ *   SUMI_MEMORY_PREPARATION_TIMEOUT_MS  wall-clock bound on one memory
+ *                                  preparation branch (default 10 min)
  *   --once  drain pending work then exit (used by e2e + dev scripts)
  *
  * Kill -9 safe at any point: nothing canonical lives in this process.
@@ -40,11 +42,15 @@ async function main() {
     provider: providerFromEnv((n) => process.env[n]),
     leaseTtlMs: leaseTtl,
     renewEveryMs: Math.max(250, Math.floor(leaseTtl / 3)),
-    contextLimit: 60,
+    // Row bound only; the state service bounds raw context by capacity.
+    contextLimit: 5_000,
     pollIntervalMs: 500,
     scheduleEveryMs: 1_000,
     providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
       ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
+      : undefined,
+    memoryPreparationTimeoutMs: process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS
+      ? Number(process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS)
       : undefined,
     idgen: () => crypto.randomUUID(),
     log: (msg, fields) =>
@@ -61,11 +67,17 @@ async function main() {
     let lastWork = Date.now();
     while (Date.now() < deadline && Date.now() - lastWork < idleGraceMs) {
       const r = await secretary.step();
-      if (r === "turn") {
-        lastWork = Date.now();
-      } else {
-        await new Promise((res) => setTimeout(res, 100));
-      }
+      // A memory preparation branch in flight is work too: stopping would
+      // interrupt it and leave the chunk to be prepared again next run.
+      if (r === "turn" || secretary.memoryBusy) lastWork = Date.now();
+      if (r !== "turn") await new Promise((res) => setTimeout(res, 100));
+    }
+    // The deadline bounds new work, not a preparation already running: the
+    // branch keeps its lease renewed and ends within its own timeout, by
+    // recording a result or a retryable failure. No new branch starts here.
+    if (secretary.memoryBusy) {
+      console.log("[core] --once: waiting for the running memory preparation");
+      await secretary.settleMemory();
     }
     await secretary.stop();
     return;
