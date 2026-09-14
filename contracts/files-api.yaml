@@ -60,10 +60,13 @@ info:
     pass (a clean unmount leaves a bare directory where everything reads
     missing), so mount interruptions never erase pending intents or
     acknowledged rows. Rename settlement additionally proves destination
-    identity by inode continuity from the declare-time fingerprint — a
-    destination that merely exists is never claimed as the moved source;
-    a proven destination whose content changed post-move records a
-    diverged fingerprint. Dead-owner intents are settled by
+    identity from the declare-time fingerprint — directories by inode
+    continuity, files by inode+size+mtime (inode numbers can be recycled
+    by delete+create, so identity alone is not proof of content). A
+    destination that merely exists, or whose content evidence does not
+    match, is never claimed as the moved source: the intent is dropped
+    and all version rows are kept rather than laundering foreign bytes.
+    Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so
     externally modified content is recorded as diverged

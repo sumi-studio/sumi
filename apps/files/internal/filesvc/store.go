@@ -1085,26 +1085,6 @@ func fpParts(fp string) (ino, size, mtime string, ok bool) {
 	return a[0], a[1], a[2], true
 }
 
-// renameOutcome adjusts the FileInfo applied for a proven rename. Inode
-// continuity proves the object at the destination IS the moved source;
-// for a regular file, a size/mtime difference from the declare-time
-// fingerprint then means the content was rewritten in place after the
-// move — the version is recorded with a diverged fingerprint so the
-// foreign bytes surface as external_change instead of being attributed
-// to the rename (f106). Directory renames stay clean: child rows keep
-// their own fingerprints, which flag per-file external edits.
-func renameOutcome(it intent, info FileInfo) FileInfo {
-	if info.Kind != "file" {
-		return info
-	}
-	_, srcSize, srcMt, sok := fpParts(it.preFP)
-	_, toSize, toMt, tok := fpParts(info.Fingerprint)
-	if sok && tok && (srcSize != toSize || srcMt != toMt) {
-		info.Fingerprint = divergedFP(it.preFP)
-	}
-	return info
-}
-
 func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 	if it.owner == s.owner {
 		if _, ok := s.inflight.Load(it.id); ok {
@@ -1128,17 +1108,28 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 	case "rename":
 		toInfo, terr := s.statFn(it.scope, it.toPath)
 		frInfo, ferr := s.statFn(it.scope, it.path)
-		// The destination counts as the moved source only when the inode
-		// recorded at declare time survived the move (f106/A-F1). A
-		// destination that merely EXISTS could be an unrelated external
-		// create — applying then would mint a clean version + rename
-		// event for foreign bytes and move the source's rows onto paths
-		// that never held them. Unproven destinations are never claimed:
-		// the intent is dropped and all version rows are kept, so nothing
-		// is laundered and acknowledged history is preserved.
-		srcIno, _, _, haveSrc := fpParts(it.preFP)
-		toIno, _, _, haveTo := fpParts(toInfo.Fingerprint)
+		// The destination counts as the moved source only when identity
+		// survives the move (f106/A-F1). A destination that merely EXISTS
+		// could be an unrelated external create — applying then would
+		// mint a clean version + rename event for foreign bytes and move
+		// the source's rows onto paths that never held them. Proof:
+		//   - dirs: inode continuity (a cross-dir rename legitimately
+		//     changes the dir's own mtime via its '..' entry; child rows
+		//     keep their own fingerprints either way).
+		//   - files: inode + size + mtime. Inode alone is not enough —
+		//     deleting the source and recreating the destination can
+		//     recycle the inode number, so content evidence must also
+		//     match the declare-time fingerprint (ctime legitimately
+		//     changes on rename and is not compared).
+		// Unproven destinations are never claimed: the intent is dropped
+		// and all version rows are kept, so nothing is laundered and
+		// acknowledged history is preserved.
+		srcIno, srcSize, srcMt, haveSrc := fpParts(it.preFP)
+		toIno, toSize, toMt, haveTo := fpParts(toInfo.Fingerprint)
 		proven := haveSrc && haveTo && srcIno == toIno
+		if proven && toInfo.Kind == "file" {
+			proven = srcSize == toSize && srcMt == toMt
+		}
 		switch {
 		case ferr == nil && frInfo.Fingerprint == it.preFP:
 			// Source byte-identical to declare (same inode+times) — the
@@ -1153,7 +1144,7 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 			// foreign or absent destination — means no provable rename:
 			// drop the intent, keep every row.
 			if terr == nil && proven {
-				if err := s.apply(ctx, it, renameOutcome(it, toInfo)); err != nil {
+				if err := s.apply(ctx, it, toInfo); err != nil {
 					return false
 				}
 				return true
@@ -1163,7 +1154,7 @@ func (s *Store) reconcileOne(ctx context.Context, it intent) bool {
 			// Source gone: either the rename ran (destination present)
 			// or the source was removed without it.
 			if terr == nil && proven {
-				if err := s.apply(ctx, it, renameOutcome(it, toInfo)); err != nil {
+				if err := s.apply(ctx, it, toInfo); err != nil {
 					return false
 				}
 				return true

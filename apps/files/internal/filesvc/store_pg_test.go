@@ -695,9 +695,10 @@ func TestPGRenameReconcileIdentityMatch(t *testing.T) {
 	}
 }
 
-// f106 content leg: the destination is the moved source by inode, but its
-// content was rewritten in place after the move — the version is recorded
-// with a diverged fingerprint so the foreign bytes stay external.
+// f106 content leg: destination shares the source's inode but its
+// content changed (size/mtime differ) — indistinguishable from inode
+// recycling after delete+recreate, so the rename is unproven: the intent
+// is dropped, no version/event is claimed, and the source row survives.
 func TestPGRenameReconcileDivergedFile(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -711,6 +712,11 @@ func TestPGRenameReconcileDivergedFile(t *testing.T) {
 	preFP := srcInfo.Fingerprint
 	disk.mv("ws", "g1.txt", "g2.txt")    // rename landed
 	disk.edit("ws", "g2.txt", "edited!") // then rewritten in place (same inode)
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','g1.txt',10,$1)`,
+		preFP); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
 	insertIntent(t, s, intent{
 		owner: "dead-inst", scope: "ws", op: "rename", path: "g1.txt", toPath: "g2.txt",
 		version: 22, preFP: preFP, at: time.Now().Add(-time.Minute),
@@ -718,11 +724,10 @@ func TestPGRenameReconcileDivergedFile(t *testing.T) {
 	if got := s.Reconcile(ctx); got != 1 {
 		t.Fatalf("reconcile settled %d", got)
 	}
-	v, fp := versionOf(t, s, "ws", "g2.txt")
-	if v != 22 {
-		t.Fatalf("destination version = %d, want 22", v)
+	if v, _ := versionOf(t, s, "ws", "g2.txt"); v != 0 {
+		t.Fatalf("unproven destination minted version %d", v)
 	}
-	if !hasPrefix(fp, "diverged:") {
-		t.Fatalf("post-move rewrite recorded clean fp %q", fp)
+	if v, _ := versionOf(t, s, "ws", "g1.txt"); v != 10 {
+		t.Fatalf("source row lost: version %d", v)
 	}
 }
