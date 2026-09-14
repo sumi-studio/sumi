@@ -245,8 +245,130 @@ export interface LoadResult {
   turn: Turn | null;
   input: Input | null;
   context: Event[];
+  /**
+   * Applied L1 replacement blocks. Each renders at the journal position
+   * where its events were — the core interleaves them with the raw tail
+   * by sequence position.
+   */
+  memory: MemoryBlock[];
+  /**
+   * Older raw records outside the send cap — still stored and readable
+   * through conversation_history; null when nothing was left out.
+   */
+  omitted: OmittedRange | null;
+  /**
+   * Older applied memory blocks outside the memory cap — stored, their
+   * originals readable; null when every applied block was admitted.
+   */
+  memory_omitted?: OmittedMemory | null;
   /** The input's recorded decision — null when none has been saved yet. */
   plan: TurnPlan | null;
+}
+
+/** The extent of applied memory blocks left outside the sent context. */
+export interface OmittedMemory {
+  count: number;
+  first_chunk_seq: number;
+  last_chunk_seq: number;
+  first_seq: number;
+  last_seq: number;
+  first_time: string;
+  last_time: string;
+  est_tokens: number;
+}
+
+/** The extent of raw records left outside the sent context. */
+export interface OmittedRange {
+  count: number;
+  first_seq: number;
+  last_seq: number;
+  first_time: string;
+  last_time: string;
+}
+
+/** One sealed journal range and its L1 replacement lifecycle. */
+export interface MemoryChunk {
+  persona_id: string;
+  chunk_seq: number;
+  layer: number;
+  first_seq: number;
+  last_seq: number;
+  est_tokens: number;
+  status:
+    | "sealed"
+    | "preparing"
+    | "prepared"
+    | "applied"
+    | "kept"
+    | "failed";
+  replacement: string | null;
+  replacement_est_tokens: number | null;
+  /** Recorded preparation failures (the only thing that spends the budget). */
+  attempts: number;
+  /** Claims that ended without any recorded outcome (host lifecycle). */
+  interruptions: number;
+  last_error: string | null;
+  claimed_generation: number | null;
+  claimed_at: string | null;
+  not_before: string | null;
+  created_at: string;
+  prepared_at: string | null;
+  applied_at: string | null;
+}
+
+/** An applied chunk as it appears in the sent context. */
+export interface MemoryBlock {
+  chunk_seq: number;
+  layer: number;
+  first_seq: number;
+  last_seq: number;
+  /** When the first and last covered events were recorded. */
+  first_time: string;
+  last_time: string;
+  text: string;
+  est_tokens: number;
+}
+
+/** The journal as the model sees it: raw window plus applied blocks. */
+export interface RenderedContext {
+  events: Event[];
+  memory: MemoryBlock[];
+  omitted: OmittedRange | null;
+  memory_omitted?: OmittedMemory | null;
+}
+
+/** The memory layer's current shape (read-only observability). */
+export interface MemoryStatus {
+  live_raw_tokens: number;
+  applied_tokens: number;
+  sealed: number;
+  preparing: number;
+  prepared: number;
+  applied: number;
+  kept: number;
+  failed: number;
+  /** Chunks a claim could take now (sealed past backoff, or orphaned). */
+  claimable: number;
+  /** Earliest time a chunk becomes claimable; null when none waits. */
+  next_claimable_at: string | null;
+  /** Applied blocks left outside the memory cap. */
+  applied_omitted: number;
+  covered_seq: number;
+  latest_seq: number;
+  chunk_min_tokens: number;
+  live_limit_tokens: number;
+  memory_send_cap_tokens: number;
+}
+
+/**
+ * A chunk claimed for asynchronous L1 preparation, with everything the
+ * branch needs: the covered events verbatim and the rendered parent
+ * context at claim time.
+ */
+export interface ClaimedMemoryChunk {
+  chunk: MemoryChunk | null;
+  target_events: Event[];
+  context: RenderedContext;
 }
 
 export interface RecoverResult {

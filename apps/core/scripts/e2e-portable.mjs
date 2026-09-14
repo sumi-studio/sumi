@@ -45,14 +45,11 @@ const EVIDENCE = process.env.SUMI_PORTABLE_EVIDENCE_DIR;
 const API_DIR = resolve(import.meta.dirname, "../../api");
 const CORE_DIR = resolve(import.meta.dirname, "..");
 const run = randomUUID().replaceAll("-", "").slice(0, 10);
-const LOCAL_DB = withDatabase(
-  DB_URL,
-  process.env.SUMI_PORTABLE_LOCAL_DB ?? `sumi_tools_connections_portable_local_${run}`,
-);
-const CLOUD_DB = withDatabase(
-  DB_URL,
-  process.env.SUMI_PORTABLE_CLOUD_DB ?? `sumi_tools_connections_portable_cloud_${run}`,
-);
+// SUMI_PORTABLE_DB_PREFIX namespaces the two databases when parallel
+// worktrees own distinct prefixes on a shared PostgreSQL.
+const DB_PREFIX = process.env.SUMI_PORTABLE_DB_PREFIX ?? "sumi_portable_repair";
+const LOCAL_DB = withDatabase(DB_URL, `${DB_PREFIX}_local_${run}`);
+const CLOUD_DB = withDatabase(DB_URL, `${DB_PREFIX}_cloud_${run}`);
 const LOCAL_ADMIN = `local-admin-${randomUUID()}`;
 const CLOUD_ADMIN = `cloud-admin-${randomUUID()}`;
 const LOCAL_PORT = Number(process.env.SUMI_PORTABLE_LOCAL_PORT ?? 9430);
@@ -624,5 +621,5 @@ if (EVIDENCE) {
   );
   log("evidence written to", EVIDENCE);
 }
-log(`PASS: ${passed} checks. databases left for inspection: ${LOCAL_DB.split("/").pop()}, ${CLOUD_DB.split("/").pop()}`);
+log(`PASS: ${passed} checks. databases left for inspection: ${LOCAL_DB.slice(LOCAL_DB.lastIndexOf("/") + 1).split("?")[0]}, ${CLOUD_DB.slice(CLOUD_DB.lastIndexOf("/") + 1).split("?")[0]}`);
 process.exit(0);

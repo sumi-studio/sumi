@@ -10,12 +10,27 @@
  * including dispatching due schedules — and re-arms. A wake via fetch drains
  * immediately and ensures the alarm exists. Honest scope: this is a fixed
  * heartbeat per active persona, not next-due-wake scheduling; the state
- * contract does not yet expose pending wake times.
+ * contract does not yet expose pending wake times. Memory preparation that
+ * waits is the exception: the alarm is armed for when it can start.
  *
  * Concurrency: drains are serialized per DO instance. A wake arriving while
  * a drain runs marks a re-drain instead of starting a parallel drain — two
  * drains sharing one Secretary sabotaged each other (generation bump fenced
  * the in-flight turn; the loser's stop() aborted the winner's stream).
+ *
+ * Lifetime: a drain started by fetch serves turns for the turn budget
+ * (default 25s) and never starts memory preparation — a preparation branch
+ * can take minutes of model time (~104s observed), and a fetch-started drain
+ * has no platform wall-clock guarantee to hold it. Preparation runs only in
+ * alarm-invoked drains: Cloudflare documents a 15-minute wall time for an
+ * alarm handler, and a Durable Object stays active while the handler has
+ * pending I/O (ctx.waitUntil does not extend a DO's lifetime). The drain
+ * keeps a margin under that limit: it starts a branch only when the branch's
+ * own timeout still fits, keeps the branch alive until it records its
+ * result, and stops at the lifetime end otherwise — a stop records nothing,
+ * so the state service counts an interruption rather than a failed attempt.
+ * After a drain that left preparation waiting, the alarm is armed for when
+ * it can start (at least 1s ahead).
  *
  * Env bindings (worker config):
  *   SUMI_STATE_URL    — base URL of the Go state service
@@ -23,6 +38,12 @@
  *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
  *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
  *                       binding is missing (default 30min)
+ *   SUMI_DRAIN_TURN_BUDGET_MS — how long a fetch-started drain takes new
+ *                       turns (default 25000)
+ *   SUMI_ALARM_DRAIN_LIFETIME_MS — how long an alarm drain may run
+ *                       (default and maximum 14min, under the 15min limit)
+ *   SUMI_MEMORY_PREPARATION_TIMEOUT_MS — bound on one preparation branch
+ *                       (default 10min; clamped to fit the alarm lifetime)
  *   SECRETARY         — Durable Object namespace binding
  * Persona capability tokens are provisioned per-persona via the admin
  * surface (POST /internal/core/personas) — the worker stores them in its
@@ -30,6 +51,7 @@
  */
 
 import { providerForPersona } from "./provider-env.ts";
+import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
 
@@ -66,6 +88,17 @@ const DEFAULT_HEARTBEAT_MS = 30_000;
 // is long: provisioning is a rare operator action, and a fetch wake or a
 // new activation still drains immediately.
 const DEFAULT_DORMANT_REARM_MS = 30 * 60_000;
+/** New turns a fetch-started drain takes before yielding to the alarm. */
+const DEFAULT_DRAIN_TURN_BUDGET_MS = 25_000;
+/**
+ * An alarm drain's lifetime: under Cloudflare's 15-minute alarm handler
+ * wall time, with a minute for stopping and re-arming.
+ */
+const MAX_ALARM_DRAIN_LIFETIME_MS = 14 * 60_000;
+/** Soonest re-arm when memory preparation waits for an alarm drain. */
+const MEMORY_WAKE_MIN_MS = 1_000;
+/** Poll while a preparation branch runs and no turn is waiting. */
+const MEMORY_POLL_MS = 500;
 
 /**
  * Thrown when no SUMI_PERSONA_TOKEN_* binding exists for a persona — a
@@ -92,6 +125,8 @@ export class SecretaryObject {
   private drainPromise: Promise<void> | null = null;
   private wakeAgain = false;
   private missingTokenLogged = false;
+  /** Set while alarm() runs: the drain may use the alarm's lifetime. */
+  private alarmStartedAt: number | null = null;
   private readonly ctx: AlarmState;
   private readonly env: EnvLike;
 
@@ -100,14 +135,53 @@ export class SecretaryObject {
     this.env = env;
   }
 
+  private envMs(name: string, min: number, fallback: number): number {
+    const v = Number(this.env[name]);
+    return Number.isFinite(v) && v >= min ? v : fallback;
+  }
+
   private heartbeatMs(): number {
-    const v = Number(this.env.SUMI_HEARTBEAT_MS);
-    return Number.isFinite(v) && v >= 250 ? v : DEFAULT_HEARTBEAT_MS;
+    return this.envMs("SUMI_HEARTBEAT_MS", 250, DEFAULT_HEARTBEAT_MS);
   }
 
   private dormantRearmMs(): number {
-    const v = Number(this.env.SUMI_DORMANT_REARM_MS);
-    return Number.isFinite(v) && v >= 1_000 ? v : DEFAULT_DORMANT_REARM_MS;
+    return this.envMs("SUMI_DORMANT_REARM_MS", 1_000, DEFAULT_DORMANT_REARM_MS);
+  }
+
+  private turnBudgetMs(): number {
+    return this.envMs(
+      "SUMI_DRAIN_TURN_BUDGET_MS",
+      100,
+      DEFAULT_DRAIN_TURN_BUDGET_MS,
+    );
+  }
+
+  private alarmLifetimeMs(): number {
+    return Math.min(
+      this.envMs(
+        "SUMI_ALARM_DRAIN_LIFETIME_MS",
+        1_000,
+        MAX_ALARM_DRAIN_LIFETIME_MS,
+      ),
+      MAX_ALARM_DRAIN_LIFETIME_MS,
+    );
+  }
+
+  /** Time kept free at the end of an alarm lifetime for recording a result. */
+  private lifetimeMarginMs(): number {
+    return Math.min(60_000, Math.floor(this.alarmLifetimeMs() / 10));
+  }
+
+  /** The preparation bound, clamped so one branch fits an alarm lifetime. */
+  protected memoryPreparationTimeoutMs(): number {
+    return Math.min(
+      this.envMs(
+        "SUMI_MEMORY_PREPARATION_TIMEOUT_MS",
+        1_000,
+        DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+      ),
+      this.alarmLifetimeMs() - this.lifetimeMarginMs(),
+    );
   }
 
   /** Build the per-persona secretary; overridable for tests. */
@@ -133,9 +207,11 @@ export class SecretaryObject {
       provider,
       leaseTtlMs: 30_000,
       renewEveryMs: 10_000,
-      contextLimit: 60,
+      // Row bound only; the state service bounds raw context by capacity.
+      contextLimit: 5_000,
       pollIntervalMs: 0,
       scheduleEveryMs: 1_000,
+      memoryPreparationTimeoutMs: this.memoryPreparationTimeoutMs(),
       idgen: () => crypto.randomUUID(),
     });
   }
@@ -191,7 +267,10 @@ export class SecretaryObject {
       (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
       "";
     if (!persona) return; // never activated — nothing to re-arm either
-    let rearmIn = this.heartbeatMs();
+    const heartbeat = this.heartbeatMs();
+    let rearmIn = heartbeat;
+    let dormant = false;
+    this.alarmStartedAt = Date.now();
     try {
       const s = await this.build(persona);
       this.missingTokenLogged = false;
@@ -204,6 +283,7 @@ export class SecretaryObject {
         // (fresh-review F5). Log once and re-arm on the long dormant
         // cadence: no model/state calls while the token is absent, yet
         // the persona recovers on its own once the binding exists.
+        dormant = true;
         rearmIn = this.dormantRearmMs();
         if (!this.missingTokenLogged) {
           this.missingTokenLogged = true;
@@ -217,6 +297,17 @@ export class SecretaryObject {
         );
       }
     } finally {
+      this.alarmStartedAt = null;
+      // Memory preparation that is waiting (a retry backoff, an
+      // interrupted branch, one that could not fit this lifetime) starts
+      // at the next alarm, armed for when it can start.
+      const memoryAt = dormant ? null : this.secretary?.memoryWakeAt();
+      if (memoryAt != null) {
+        rearmIn = Math.min(
+          Math.max(memoryAt - Date.now(), MEMORY_WAKE_MIN_MS),
+          heartbeat,
+        );
+      }
       // Re-arm on every outcome — nothing must permanently disarm an
       // activated writer.
       await this.ctx.storage.setAlarm(Date.now() + rearmIn);
@@ -252,6 +343,15 @@ export class SecretaryObject {
     }
   }
 
+  /** Arm the alarm no later than `at` (at least MEMORY_WAKE_MIN_MS ahead). */
+  private async armAlarmBy(at: number): Promise<void> {
+    const when = Math.max(at, Date.now() + MEMORY_WAKE_MIN_MS);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > when) {
+      await this.ctx.storage.setAlarm(when);
+    }
+  }
+
   private async drain(s: Secretary): Promise<void> {
     try {
       await s.start();
@@ -263,12 +363,45 @@ export class SecretaryObject {
       return;
     }
     try {
-      const deadline = Date.now() + 25_000; // DO wall-clock budget
-      while (Date.now() < deadline) {
-        const r = await s.step();
-        if (r !== "turn") break;
+      const turnDeadline = Date.now() + this.turnBudgetMs();
+      const margin = this.lifetimeMarginMs();
+      for (;;) {
+        const now = Date.now();
+        // Re-read each round: an alarm firing during a fetch-started drain
+        // joins this drain and lends it the alarm's lifetime.
+        const lifetimeEnd =
+          this.alarmStartedAt === null
+            ? null
+            : this.alarmStartedAt + this.alarmLifetimeMs();
+        const end = lifetimeEnd ?? turnDeadline;
+        if (now >= end) break;
+        // A turn started near the lifetime end could be cut off mid-call;
+        // leave the last stretch to a running branch and the stop.
+        const takeTurns =
+          lifetimeEnd === null ||
+          now < lifetimeEnd - Math.min(this.turnBudgetMs(), margin * 2);
+        if (takeTurns) {
+          const startMemory =
+            lifetimeEnd !== null &&
+            now + s.memoryTimeoutMs + margin <= lifetimeEnd;
+          const r = await s.step({ startMemory });
+          if (r === "stopped") break;
+          if (r === "turn") continue;
+        }
+        // Idle. A preparation branch in flight keeps the drain — and so the
+        // alarm handler's pending I/O — alive until it records its result.
+        if (!s.memoryBusy) break;
+        await new Promise((res) =>
+          setTimeout(res, Math.min(MEMORY_POLL_MS, Math.max(end - now, 1))),
+        );
       }
+      // At the lifetime end this aborts a still-running branch: it records
+      // nothing and the next claim counts an interruption.
       await s.stop();
+      if (this.alarmStartedAt === null) {
+        const memoryAt = s.memoryWakeAt();
+        if (memoryAt !== null) await this.armAlarmBy(memoryAt);
+      }
     } catch (e) {
       // A mid-drain error (state outage, transient step failure) leaves
       // the Secretary running and the lease held — deliberately: the next

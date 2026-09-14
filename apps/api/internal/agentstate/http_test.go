@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
@@ -543,5 +544,64 @@ func TestModelIntentRebindingAndBindRoute(t *testing.T) {
 	}
 	if code, b := getBinding(); code != 200 || b.Selection != "api" {
 		t.Fatalf("post-clear binding: %d %+v", code, b)
+	}
+}
+
+func TestListToolsRoute(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`","display_name":"T"}`)
+	if rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	toolsURL := "/internal/core/personas/" + pa + "/tools"
+	if rec := do(t, mux, "GET", toolsURL, "", ""); rec.Code != 401 {
+		t.Fatalf("no-auth tools: %d", rec.Code)
+	}
+	get := func() map[string]bool {
+		rec := do(t, mux, "GET", toolsURL, created.PersonaToken, "")
+		if rec.Code != 200 {
+			t.Fatalf("tools: %d %s", rec.Code, rec.Body)
+		}
+		var body struct {
+			Tools []string `json:"tools"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, name := range body.Tools {
+			out[name] = true
+		}
+		return out
+	}
+	base := get()
+	for _, want := range []string{"schedule.set", "journal.note", "conversation_history", "job.start", "job.status", "job.cancel", "message.send"} {
+		if !base[want] {
+			t.Fatalf("missing built-in tool %s in %v", want, base)
+		}
+	}
+	// No delegated effect is registered on a bare state service, so
+	// messaging.send must not be advertised — a claim could only fail.
+	if base["messaging.send"] {
+		t.Fatalf("unregistered messaging.send advertised: %v", base)
+	}
+	// Registering the delegated effect makes it claimable and advertised.
+	if err := srv.RegisterToolEffect("messaging.send", ToolEffect{
+		Apply: func(context.Context, pgx.Tx, string, string, map[string]any) (map[string]any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	withEffect := get()
+	if !withEffect["messaging.send"] {
+		t.Fatalf("registered messaging.send not advertised: %v", withEffect)
 	}
 }

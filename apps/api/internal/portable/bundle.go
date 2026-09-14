@@ -216,25 +216,31 @@ func lookupTable(name string) (table, int, bool) {
 }
 
 func (t table) insertSQL() string {
-	names := make([]string, len(t.cols))
-	exprs := make([]string, len(t.cols))
-	for i, c := range t.cols {
-		names[i] = c.name
+	var names, exprs []string
+	for _, c := range t.cols {
+		// Identity columns are allocated by the destination's own sequence:
+		// omit them from the insert so the DEFAULT fires once per row, in
+		// bundle order — preserving the source order the carried values
+		// encode without ever touching sequence state.
+		if identityCols[t.name] == c.name {
+			continue
+		}
+		names = append(names, c.name)
 		switch c.kind {
 		case colText:
-			exprs[i] = fmt.Sprintf("d->>'%s'", c.name)
+			exprs = append(exprs, fmt.Sprintf("d->>'%s'", c.name))
 		case colUUID:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::uuidv7", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::uuidv7", c.name))
 		case colBigint:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::bigint", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::bigint", c.name))
 		case colInt:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::int", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::int", c.name))
 		case colTime:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::timestamptz", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::timestamptz", c.name))
 		case colJSON:
-			exprs[i] = fmt.Sprintf("d->'%s'", c.name)
+			exprs = append(exprs, fmt.Sprintf("d->'%s'", c.name))
 		case colJSONNull:
-			exprs[i] = fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name)
+			exprs = append(exprs, fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name))
 		}
 	}
 	return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM (SELECT $1::jsonb AS d) r",
@@ -355,6 +361,7 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 		counts[t.name] = 0
 	}
 	next := 0
+	lastCarried := map[string]int64{}
 	var trailer Trailer
 	for {
 		line, err := readLine(br)
@@ -414,6 +421,18 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 			if err != nil {
 				return Receipt{}, false, err
 			}
+		}
+		// The destination regenerates identity columns in bundle order, so
+		// that order is the only record of the source's admission order:
+		// carried values must be positive and strictly increasing — the same
+		// shape input_admission_seq_* verify for staged rows.
+		if col, ok := identityCols[t.name]; ok {
+			var v int64
+			if err := unmarshalField(row.Data, col, &v); err != nil || v < 1 || v <= lastCarried[t.name] {
+				return Receipt{}, false, fmt.Errorf("%w: %s.%s must be positive and strictly increasing in bundle order",
+					ErrBadBundle, t.name, col)
+			}
+			lastCarried[t.name] = v
 		}
 		counts[t.name]++
 		h.Write(line)
@@ -664,4 +683,17 @@ func strictDecode(line []byte, v any) error {
 		return fmt.Errorf("%w: more than one JSON value on a line", ErrBadBundle)
 	}
 	return nil
+}
+
+// unmarshalField decodes one field of a row's JSON object into v.
+func unmarshalField(data json.RawMessage, name string, v any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("missing field %s", name)
+	}
+	return json.Unmarshal(raw, v)
 }

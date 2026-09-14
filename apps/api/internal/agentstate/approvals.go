@@ -90,8 +90,9 @@ var toolAuthority = map[string]struct {
 	requiresApproval bool
 	elevatedOnly     bool
 }{
-	"schedule.set": {internal: true},
-	"journal.note": {internal: true},
+	"schedule.set":         {internal: true},
+	"journal.note":         {internal: true},
+	"conversation_history": {internal: true},
 	// Jobs (merged slice): ordinary internal effects under the secretary's
 	// own authority — no human decision on either route.
 	"job.start":  {internal: true},
@@ -166,6 +167,16 @@ func validateToolRequest(tool string, request map[string]any) error {
 	case "message.send":
 		if text, _ := request["text"].(string); text == "" {
 			return fmt.Errorf("%w: message.send requires text", ErrBadRequest)
+		}
+	case "messaging.send":
+		// The delegated Messaging effect performs the full deterministic
+		// validation at execution; the pre-park check only refuses a call
+		// that can never carry a send, so no grant is stranded on it.
+		if placeID, _ := request["place_id"].(string); placeID == "" {
+			return fmt.Errorf("%w: messaging.send requires place_id", ErrBadRequest)
+		}
+		if content, _ := request["content"].(string); content == "" {
+			return fmt.Errorf("%w: messaging.send requires content", ErrBadRequest)
 		}
 	}
 	return nil

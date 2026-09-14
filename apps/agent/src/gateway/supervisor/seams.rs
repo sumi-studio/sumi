@@ -67,6 +67,12 @@ pub(crate) struct DurableAdmissionHook {
     pub(crate) delivery_channel_capacity: Option<usize>,
     pub(crate) forwarder_paused: Arc<Notify>,
     pub(crate) allow_forwarder_receive: Arc<Notify>,
+    // The admission pauses must be armed explicitly: both wait inside
+    // admit_ordered_commit — the first while it still holds the pump lock —
+    // so a hook installed for any other reason would otherwise park a real
+    // admission on notifies nobody sends and deadlock the orderly teardown.
+    pub(crate) pause_before_durable_registration: bool,
+    pub(crate) pause_before_durable_delivery: bool,
     pub(crate) pause_after_post_commit_delivery_cancel: bool,
     pub(crate) post_commit_delivery_cancelled: Arc<Notify>,
     pub(crate) allow_post_commit_delivery_cancel_return: Arc<Notify>,
@@ -535,7 +541,10 @@ impl T17StoreAdapter {
             let epoch = reservation.epoch();
 
             #[cfg(test)]
-            if let Some(hook) = hook.as_ref() {
+            if let Some(hook) = hook
+                .as_ref()
+                .filter(|hook| hook.pause_before_durable_registration)
+            {
                 hook.reserved.notify_one();
                 tokio::select! {
                     biased;
@@ -575,7 +584,10 @@ impl T17StoreAdapter {
         };
 
         #[cfg(test)]
-        if let Some(hook) = hook.as_ref() {
+        if let Some(hook) = hook
+            .as_ref()
+            .filter(|hook| hook.pause_before_durable_delivery)
+        {
             hook.registered.notify_one();
             tokio::select! {
                 biased;

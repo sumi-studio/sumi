@@ -468,3 +468,59 @@ test("an unbound persona binds once, and only while staged or active", async () 
     (e: unknown) => e instanceof StateError && e.status === 409,
   );
 });
+
+test("the model is offered only the store's claimable tools; a registered delegated effect is advertised and runs (f99)", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA, "secretary", HUMAN);
+  // Bare store: built-in internals claimable, delegated messaging.send absent.
+  const bare = await state.listTools(PERSONA);
+  assert.ok(bare.includes("journal.note") && bare.includes("message.send"));
+  assert.ok(!bare.includes("messaging.send"));
+
+  const offered: string[][] = [];
+  const spy = (inner: ModelProvider): ModelProvider => ({
+    name: "spy",
+    stream(req: ModelRequest) {
+      offered.push(req.tools.map((t) => t.name));
+      return inner.stream(req);
+    },
+  });
+
+  state.addInput(PERSONA, "in-1", "hello");
+  const s1 = new Secretary(cfg(state, "h-1", { provider: spy(new MockProvider()) }));
+  await s1.start();
+  await s1.step();
+  assert.ok(offered.length > 0, "the provider was consulted");
+  assert.ok(
+    offered[0]!.includes("journal.note") &&
+      !offered[0]!.includes("messaging.send"),
+    `bare store withheld the unwired effect: ${offered[0]}`,
+  );
+  await s1.stop();
+
+  // Registering the delegated effect makes it claimable, advertised, and
+  // executable through the same claim path — the Go RegisterEffect seam.
+  const sent: Record<string, unknown>[] = [];
+  state.registerEffect("messaging.send", (_persona, _idem, req) => {
+    sent.push(req);
+    return { message_id: "m-9" };
+  });
+  assert.ok((await state.listTools(PERSONA)).includes("messaging.send"));
+
+  state.addInput(
+    PERSONA,
+    "in-2",
+    '!messaging.send {"place_id":"pl-1","content":"hi"}',
+  );
+  const s2 = new Secretary(cfg(state, "h-2", { provider: spy(new MockProvider()) }));
+  await s2.start();
+  await s2.step();
+  await s2.step();
+  const last = offered.at(-1)!;
+  assert.ok(
+    last.includes("messaging.send"),
+    `registered effect advertised: ${last}`,
+  );
+  assert.deepEqual(sent, [{ place_id: "pl-1", content: "hi" }]);
+  await s2.stop();
+});

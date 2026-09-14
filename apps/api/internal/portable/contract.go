@@ -134,7 +134,10 @@ type Trailer struct {
 // the verified rows. Claimed inputs and running turns are interrupted work of
 // a source writer that no longer exists: the destination's first writer
 // recovers them through the ordinary recovery path, continuing any recorded
-// plan without repeating its completed operations.
+// plan without repeating its completed operations. The memory counts describe
+// the carried semantic memory: accepted fragments in context, shelved
+// candidates, verdicts, and the still-unprepared ranges the destination will
+// prepare itself.
 type Continuity struct {
 	JournalEvents    int64 `json:"journal_events"`
 	Notes            int64 `json:"notes"`
@@ -146,6 +149,11 @@ type Continuity struct {
 	PendingApprovals int64 `json:"pending_approvals"`
 	PendingSchedules int64 `json:"pending_schedules"`
 	UndeliveredOut   int64 `json:"undelivered_outbox"`
+	MemoryApplied    int64 `json:"memory_applied"`
+	MemoryPrepared   int64 `json:"memory_prepared"`
+	MemorySealed     int64 `json:"memory_sealed"`
+	MemoryKept       int64 `json:"memory_kept"`
+	MemoryFailed     int64 `json:"memory_failed"`
 }
 
 // Receipt is the verified result of a transfer step, stored in the ledger
@@ -226,6 +234,21 @@ type column struct {
 	kind colKind
 }
 
+// identityCols are GENERATED ALWAYS AS IDENTITY columns backed by one
+// table-global sequence. Their source values are *not* imported: the column
+// is omitted from the insert so the destination's own sequence allocates a
+// fresh value per row — work bounded by the number of transferred records,
+// never by the size of a numeric gap, and structurally unable to rewind the
+// destination's sequence or collide with its in-flight admissions. The
+// carried value still matters: the export orders the table by it and the
+// import requires the carried values to be strictly increasing, so the
+// destination's fresh allocation preserves the source's admission order
+// exactly (gaps may collapse; uniqueness and order are the contract, not the
+// numeric values).
+var identityCols = map[string]string{
+	"core_inputs": "admission_seq",
+}
+
 type table struct {
 	name    string
 	orderBy string
@@ -244,13 +267,17 @@ var personaTable = table{name: "core_personas", cols: []column{
 // inputs). The column lists are the contract: a schema change to these
 // tables must change them deliberately, which the coverage test enforces.
 var coreTables = []table{
-	{name: "core_inputs", orderBy: `input_id COLLATE "C"`, cols: []column{
+	{name: "core_inputs", orderBy: "admission_seq", cols: []column{
 		{"persona_id", colUUID}, {"input_id", colText}, {"kind", colText}, {"payload", colJSON},
 		{"actor_kind", colText}, {"actor_id", colText}, {"source_surface", colText}, {"thread_id", colText},
 		{"occurred_at", colTime}, {"attention", colText}, {"status", colText},
 		{"claimed_generation", colBigint}, {"turn_id", colText}, {"created_at", colTime},
-		{"done_at", colTime}, {"not_before", colTime},
+		{"done_at", colTime}, {"not_before", colTime}, {"received_seq", colBigint},
 		{"waiting_since", colTime}, {"waited_ms", colBigint},
+		// admission_seq is the claim queue's order: carried so the bundle's
+		// row order records the source's admission order; the destination
+		// regenerates it (identityCols) so no sequence state crosses.
+		{"admission_seq", colBigint},
 	}},
 	{name: "core_turns", orderBy: `turn_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"turn_id", colText}, {"input_id", colText}, {"generation", colBigint},
@@ -296,6 +323,22 @@ var coreTables = []table{
 	{name: "core_outbox", orderBy: `seq`, cols: []column{
 		{"persona_id", colUUID}, {"seq", colBigint}, {"kind", colText}, {"payload", colJSON},
 		{"created_at", colTime}, {"delivered_at", colTime},
+	}},
+	// The memory layer's durable semantic memory carries verbatim: accepted
+	// replacement text, kept/failed verdicts, prepared candidates, the
+	// seq-anchored ranges and chunk_seq locators that carried notes and
+	// fragment headers reference, and the attempts/interruptions history
+	// behind each judgment. What does not cross is a live execution claim:
+	// the seal normalizes a 'preparing' row back to 'sealed' and clears its
+	// claim fields first, so no bundle can carry work still bound to a
+	// fenced source writer (verifyCut refuses a bundle that claims one).
+	{name: "core_memory_chunks", orderBy: `chunk_seq`, cols: []column{
+		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"layer", colInt},
+		{"first_seq", colBigint}, {"last_seq", colBigint}, {"est_tokens", colBigint},
+		{"status", colText}, {"replacement", colText}, {"replacement_est_tokens", colBigint},
+		{"attempts", colInt}, {"interruptions", colInt}, {"last_error", colText},
+		{"claimed_generation", colBigint}, {"claimed_at", colTime}, {"not_before", colTime},
+		{"created_at", colTime}, {"prepared_at", colTime}, {"applied_at", colTime},
 	}},
 }
 

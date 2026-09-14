@@ -52,6 +52,18 @@ func (s *Server) SetModelConnections(conns *modelconnections.Store) {
 	s.conns = conns
 }
 
+// Store exposes the state store for in-process integrations hosted on the
+// same service (e.g. Messaging attention delivery admitting core inputs).
+func (s *Server) Store() *Store {
+	return s.store
+}
+
+// RegisterToolEffect delegates one tool's atomic effect to an in-process
+// applier (see Store.RegisterEffect). Call before serving traffic.
+func (s *Server) RegisterToolEffect(tool string, effect ToolEffect) error {
+	return s.store.RegisterEffect(tool, effect)
+}
+
 // PersonaToken derives the scoped capability for one persona.
 func (s *Server) PersonaToken(personaID string) string {
 	mac := hmac.New(sha256.New, s.secret)
@@ -103,6 +115,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/operations/{operation}/complete", s.completeOperation)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/schedules/dispatch", s.dispatchSchedules)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/outbox", s.outbox)
+	// The executable-tool surface: the model is offered exactly this set, so
+	// a store without a delegated effect registered (e.g. no Messaging) never
+	// advertises a call it could only refuse.
+	mux.HandleFunc("GET /internal/core/personas/{persona}/tools", s.listTools)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals", s.listApprovals)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals/{approval}", s.getApproval)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/approvals/{approval}/decision", s.decideApproval)
@@ -116,6 +132,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// The carried model intent is preference, not a credential: the
 	// admin's explicit "start fresh here" escape from needs_rebinding.
 	mux.HandleFunc("DELETE /internal/core/personas/{persona}/model/intent", s.clearModelIntent)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/memory", s.memoryStatus)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/maintain", s.memoryMaintain)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/claim", s.claimMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/complete", s.completeMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/fail", s.failMemoryChunk)
 	// Jobs: persona-token scoped, deliberately NOT writer-generation gated —
 	// a job's lifecycle and completion authority outlive the writer lease.
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs", s.submitJob)
@@ -183,11 +204,13 @@ func storeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
-		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound):
+		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound),
+		errors.Is(err, ErrChunkNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
 		errors.Is(err, ErrApprovalConflict), errors.Is(err, ErrPersonaInactive),
-		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed):
+		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
+		errors.Is(err, ErrMemoryConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool), errors.Is(err, ErrApprovalDecidedBy):
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -667,6 +690,139 @@ func (s *Server) dispatchSchedules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"fired": fired})
 }
 
+// memoryStatus reports the memory layer's current shape: live raw estimate,
+// per-status chunk counts, and how far the journal is covered.
+func (s *Server) memoryStatus(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.store.MemoryStatus(r.Context(), personaID)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// memoryMaintain is the writer's housekeeping step — it seals newly safe
+// journal ranges and applies shelved replacements while the live raw
+// estimate exceeds the limit.
+func (s *Server) memoryMaintain(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Generation int64 `json:"generation"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	st, err := s.store.MemoryMaintain(r.Context(), personaID, req.Generation)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// claimMemoryChunk claims the oldest sealable chunk for asynchronous L1
+// preparation — one branch at a time. The response carries the covered
+// events verbatim plus the rendered parent context at claim time.
+func (s *Server) claimMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Generation   int64 `json:"generation"`
+		ContextLimit int   `json:"context_limit"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	claimed, err := s.store.ClaimMemoryChunk(r.Context(), personaID, req.Generation, req.ContextLimit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, claimed)
+}
+
+// completeMemoryChunk shelves the finished replacement candidate ('prepared')
+// or records the model's KEEP_UNCHANGED decision ('kept'). Completion alone
+// never changes the sent context — application is a separate, threshold-
+// gated step.
+func (s *Server) completeMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "chunk must be an integer")
+		return
+	}
+	var req struct {
+		Generation    int64  `json:"generation"`
+		Replacement   string `json:"replacement"`
+		KeepUnchanged bool   `json:"keep_unchanged"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	chunk, err := s.store.CompleteMemoryChunk(r.Context(), personaID, req.Generation,
+		chunkSeq, req.Replacement, req.KeepUnchanged)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
+// failMemoryChunk records a failed preparation attempt: retryable failures
+// return the chunk to the shelf with backoff; an exhausted or non-retryable
+// failure is terminal ('failed'), visible rather than silently skipped.
+func (s *Server) failMemoryChunk(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "chunk must be an integer")
+		return
+	}
+	var req struct {
+		Generation int64  `json:"generation"`
+		Error      string `json:"error"`
+		Retryable  bool   `json:"retryable"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	chunk, err := s.store.FailMemoryChunk(r.Context(), personaID, req.Generation,
+		chunkSeq, req.Error, req.Retryable)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
 func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
@@ -686,6 +842,15 @@ func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"outbox": entries})
+}
+
+// listTools reports the tools this store can execute for the persona — the
+// contract the secretary filters its model-visible specs against.
+func (s *Server) listTools(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.scope(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": s.store.ClaimableTools()})
 }
 
 // --- jobs (M09): secretary-independent background executions -------------

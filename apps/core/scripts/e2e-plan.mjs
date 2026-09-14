@@ -236,6 +236,7 @@ async function main() {
   }
   const API_DIR = resolve(import.meta.dirname, "../../api");
   const SELF = resolve(import.meta.dirname, "e2e-plan.mjs");
+  // SUMI_E2E_PORT pins the port when parallel worktrees own port ranges.
   const PORT = Number(process.env.SUMI_E2E_PORT ?? 9390 + (process.pid % 500));
   const BASE = `http://127.0.0.1:${PORT}`;
   const ADMIN = `e2e-admin-${randomUUID().replaceAll("-", "")}`;
@@ -858,6 +859,23 @@ async function main() {
       `input ${id} stays honestly queued for retry (claimed + reparked), got ${JSON.stringify(st)}`,
     );
   }
+  // A parked input is not claimable yet, and a --once child exits after 2 s
+  // without work: wait out both reparks so the heal child claims them.
+  const waitClaimable = async (id) => {
+    const t0 = Date.now();
+    for (;;) {
+      const st = await getInput(id);
+      const nb = st?.not_before ? Date.parse(st.not_before) : 0;
+      if (st?.status === "queued" && nb <= Date.now()) return st;
+      assert(
+        Date.now() - t0 < 30_000,
+        `input ${id} never became claimable: ${JSON.stringify(st)}`,
+      );
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
+  await waitClaimable(in13);
+  await waitClaimable(in14);
   // The provider healing completes both, exactly once — the recorded
   // failure was honest retry, not fabrication or a strand.
   runChild({
@@ -923,19 +941,6 @@ async function main() {
     SUMI_ONCE_IDLE_MS: "60",
   };
   const in15 = (await submit("input-fifteen")).json.input.input_id;
-  const waitClaimable = async (id) => {
-    const t0 = Date.now();
-    for (;;) {
-      const st = await getInput(id);
-      const nb = st?.not_before ? Date.parse(st.not_before) : 0;
-      if (st?.status === "queued" && nb <= Date.now()) return st;
-      assert(
-        Date.now() - t0 < 30_000,
-        `input ${id} never became claimable: ${JSON.stringify(st)}`,
-      );
-      await new Promise((r) => setTimeout(r, 200));
-    }
-  };
 
   // The scripted SSE endpoint lives in this parent process, so the
   // openai children MUST be spawned asynchronously — a spawnSync child

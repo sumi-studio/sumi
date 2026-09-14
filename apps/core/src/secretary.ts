@@ -1,9 +1,19 @@
 import { jsonEqual } from "./json.ts";
 import {
+  capacityNoticeMessage,
+  DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+  evictToBudget,
+  inputMarker,
+  renderJournalContext,
+  renderedViewTokens,
+  runMemoryPreparation,
+} from "./memory.ts";
+import {
   ModelError,
   type ChatMessage,
   type ModelProvider,
   type ToolCall,
+  type ToolSpec,
 } from "./provider.ts";
 import {
   FencedError,
@@ -19,6 +29,10 @@ import type {
   EventInput,
   Input,
   Json,
+  MemoryBlock,
+  MemoryStatus,
+  OmittedMemory,
+  OmittedRange,
   PlanCall,
   Turn,
   TurnPlan,
@@ -69,11 +83,27 @@ export interface SecretaryConfig {
    * non-retryable. Default 6.
    */
   maxToolRounds?: number;
+  /**
+   * Wall-clock bound on one memory preparation branch's model call. A
+   * branch past it records a retryable failure (it spends one of the
+   * chunk's attempts); a host must keep the branch alive at least this long
+   * once it starts one. Default 10 minutes.
+   */
+  memoryPreparationTimeoutMs?: number;
   idgen: () => string;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
 
 export type StepResult = "turn" | "idle" | "stopped";
+
+export interface StepOptions {
+  /**
+   * Whether this step may start a memory preparation branch. A host whose
+   * remaining lifetime cannot cover memoryPreparationTimeoutMs passes false
+   * so a preparation it would have to cut short never starts. Default true.
+   */
+  startMemory?: boolean;
+}
 
 /** Default wall-clock budget for transient provider retries (F1). */
 const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
@@ -97,6 +127,15 @@ function activeAgeMs(input: Input): number {
 }
 
 /**
+ * Bounded working-view recoveries after a provider context-capacity refusal,
+ * per model consultation. Each recovery drops more of the oldest raw journal
+ * records from the sent view only; the durable journal, the current input,
+ * and the in-turn suffix are never touched. 2 recoveries mean at most three
+ * provider calls for one decision before the honest recorded failure.
+ */
+const MAX_SEND_VIEW_RECOVERIES = 2;
+
+/**
  * One continuing secretary life. Boot = acquire writer lease + recover
  * abandoned work, then loop: dispatch due schedules → claim input + begin
  * turn → stream model → ledger tool calls → commit turn + outbox.
@@ -118,9 +157,37 @@ function activeAgeMs(input: Input): number {
 export class Secretary {
   private lease: WriterLease | null = null;
   private running = false;
+  /**
+   * Model-visible tool specs, resolved once against the store's claimable
+   * set: the model is never offered a tool this state cannot execute (f99 —
+   * e.g. messaging.send is absent until the host registers its effect).
+   */
+  private specs?: ToolSpec[];
+  private async advertisedSpecs(): Promise<ToolSpec[]> {
+    if (this.specs) return this.specs;
+    try {
+      this.specs = toolSpecs(
+        new Set(await this.cfg.state.listTools(this.cfg.personaId)),
+      );
+    } catch {
+      // An older state service without the tools route: intrinsic internal
+      // tools are always claimable in Go; delegated ones stay withheld.
+      this.specs = toolSpecs();
+    }
+    return this.specs;
+  }
   private inFlight: AbortController | null = null;
   private lastDispatch = 0;
   private poison: { turnId: string; count: number } | null = null;
+  /**
+   * The one in-flight memory preparation branch. Preparation is
+   * asynchronous: it runs alongside turns, never blocks them, and only one
+   * branch exists at a time (the state service also enforces this).
+   */
+  private memoryTask: Promise<void> | null = null;
+  private memoryAbort: AbortController | null = null;
+  /** The memory shape seen by the latest maintenance step. */
+  private memoryShape: MemoryStatus | null = null;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -152,8 +219,7 @@ export class Secretary {
         return;
       } catch (e) {
         if (!(e instanceof FencedError)) throw e;
-        this.running = false;
-        this.lease = null;
+        this.loseFence();
       }
     }
     this.lease = await state.acquireWriter(personaId, holderId, leaseTtlMs);
@@ -168,7 +234,7 @@ export class Secretary {
   }
 
   /** One unit of work: fire due schedules, then take one turn if an input waits. */
-  async step(): Promise<StepResult> {
+  async step(opts: StepOptions = {}): Promise<StepResult> {
     if (!this.running || !this.lease) return "stopped";
     const gen = this.lease.generation;
     const { state, personaId } = this.cfg;
@@ -179,13 +245,35 @@ export class Secretary {
         const fired = await state.dispatchSchedules(personaId, gen, new Date(now));
         if (fired.length) this.log("schedules fired", { count: fired.length });
       }
+      // Memory housekeeping between turns, while the conversation is idle
+      // enough for the sent context to change: seal newly safe journal
+      // ranges, then apply shelved L1 replacements while the live raw
+      // estimate exceeds the limit. Preparation itself is asynchronous —
+      // a claimed chunk's originals stay in the context while the branch
+      // runs, so corrections and new experiences during preparation are
+      // never overwritten.
+      // A 'preparing' chunk while this process runs no branch is orphaned
+      // (lost claim response, stopped branch); the claim counts it as an
+      // interruption and prepares it again once its short pacing passes.
+      const mem = await state.memoryMaintain(personaId, gen);
+      this.memoryShape = mem;
+      if (
+        opts.startMemory !== false &&
+        !this.memoryTask &&
+        mem.claimable > 0
+      ) {
+        this.memoryAbort = new AbortController();
+        this.memoryTask = this.prepareMemory(
+          gen,
+          this.memoryAbort.signal,
+        ).finally(() => {
+          this.memoryTask = null;
+          this.memoryAbort = null;
+        });
+      }
       const turnId = this.cfg.idgen();
-      const { turn, input, context, plan } = await state.loadTurn(
-        personaId,
-        gen,
-        turnId,
-        this.cfg.contextLimit,
-      );
+      const { turn, input, context, memory, omitted, memory_omitted, plan } =
+        await state.loadTurn(personaId, gen, turnId, this.cfg.contextLimit);
       if (!turn || !input) return "idle";
       const maxAttempts = this.cfg.maxAttempts ?? 5;
       const budgetMs =
@@ -214,7 +302,15 @@ export class Secretary {
         return "turn";
       }
       try {
-        await this.runTurn(turn, input, context, plan);
+        await this.runTurn(
+          turn,
+          input,
+          context,
+          memory ?? [],
+          omitted ?? null,
+          plan,
+          memory_omitted ?? null,
+        );
         this.poison = null;
       } catch (e) {
         if (
@@ -251,12 +347,23 @@ export class Secretary {
     } catch (e) {
       if (e instanceof FencedError) {
         this.log("lost writer fence; stopping", { generation: gen });
-        this.running = false;
-        this.lease = null;
+        this.loseFence();
         return "stopped";
       }
       throw e;
     }
+  }
+
+  /**
+   * The writer no longer owns this life: stop everything it was doing on
+   * the old generation — the in-flight turn and the memory branch — so no
+   * further model call is spent without ownership.
+   */
+  private loseFence(): void {
+    this.running = false;
+    this.lease = null;
+    this.inFlight?.abort();
+    this.memoryAbort?.abort();
   }
 
   /**
@@ -380,7 +487,10 @@ export class Secretary {
             this.cfg.leaseTtlMs,
           );
         } catch (e) {
-          if (e instanceof FencedError) break;
+          if (e instanceof FencedError) {
+            this.loseFence();
+            break;
+          }
           this.log("lease renewal failed", { error: String(e) });
         }
       }
@@ -404,13 +514,66 @@ export class Secretary {
         await backoff();
       }
     }
+    // Leaving the loop ends this life's ownership of its branch too: the
+    // lease is about to be released, so the branch must not keep running.
+    this.memoryAbort?.abort();
+    await this.memoryTask;
     await this.shutdown();
   }
 
-  /** Drain in-flight work opportunity and release the lease. */
+  /** True while a memory preparation branch is in flight. */
+  get memoryBusy(): boolean {
+    return this.memoryTask !== null;
+  }
+
+  /** The wall-clock bound this secretary puts on one preparation branch. */
+  get memoryTimeoutMs(): number {
+    return (
+      this.cfg.memoryPreparationTimeoutMs ??
+      DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * When memory preparation could next start, as epoch ms: now if a chunk
+   * is claimable, the end of its backoff if one waits, null when nothing
+   * waits or a branch is already running. Hosts that cannot start
+   * preparation themselves schedule a wake from this.
+   */
+  memoryWakeAt(): number | null {
+    if (this.memoryTask || !this.memoryShape) return null;
+    if (this.memoryShape.claimable > 0) return Date.now();
+    const next = this.memoryShape.next_claimable_at;
+    return next ? Date.parse(next) : null;
+  }
+
+  /**
+   * Wait for the running preparation branch to end on its own — by
+   * recording its result or a failure within its timeout — without starting
+   * another. Bounded by that timeout plus a margin for recording the
+   * outcome; resolves true when the branch settled.
+   */
+  async settleMemory(maxWaitMs = this.memoryTimeoutMs + 30_000): Promise<boolean> {
+    const task = this.memoryTask;
+    if (!task) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      task.then(() => true),
+      new Promise<boolean>((res) => {
+        timer = setTimeout(() => res(false), maxWaitMs);
+      }),
+    ]);
+    clearTimeout(timer);
+    return settled;
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.inFlight?.abort();
+    this.memoryAbort?.abort();
+    // Let the aborted branch settle before the lease is released; it never
+    // rejects (prepareMemory records or logs every outcome).
+    await this.memoryTask;
     await this.shutdown();
   }
 
@@ -436,7 +599,8 @@ export class Secretary {
    * stream lets the lease expire mid-turn and the next writer's acquire
    * fences the in-flight work. Renewal failures other than fencing are
    * logged and retried on the next tick; losing the fence aborts the
-   * in-flight provider call so the turn cannot outlive its ownership.
+   * in-flight provider call and the memory branch so neither outlives its
+   * ownership.
    */
   private renewDuringTurn(generation: number): () => void {
     const every = Math.max(50, this.cfg.renewEveryMs);
@@ -454,9 +618,7 @@ export class Secretary {
         .catch((e: unknown) => {
           if (e instanceof FencedError) {
             this.log("lost writer fence mid-turn", { generation });
-            this.running = false;
-            this.lease = null;
-            this.inFlight?.abort();
+            this.loseFence();
           } else {
             this.log("lease renewal failed mid-turn", { error: String(e) });
           }
@@ -464,6 +626,46 @@ export class Secretary {
     }, every);
     (t as { unref?: () => void }).unref?.();
     return () => clearInterval(t);
+  }
+
+  /**
+   * One asynchronous L1 preparation branch. The state service seals the
+   * chunk and hands back the parent's rendered context at claim time; the
+   * branch consults the same provider with the parent's tools offered (never
+   * executed) and records its verdict (prepared / kept / failed). The claim
+   * is generation-fenced: losing the writer fence mid-preparation aborts the
+   * branch with no further model call, and the next generation counts the
+   * claim as an interruption.
+   */
+  private async prepareMemory(
+    gen: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const stopRenewal = this.renewDuringTurn(gen);
+    try {
+      await runMemoryPreparation({
+        personaId: this.cfg.personaId,
+        generation: gen,
+        state: this.cfg.state,
+        provider: this.cfg.provider,
+        contextLimit: this.cfg.contextLimit,
+        system: SYSTEM,
+        tools: await this.advertisedSpecs(),
+        signal,
+        timeoutMs: this.memoryTimeoutMs,
+        log: (msg, fields) => this.log(msg, fields),
+      });
+    } catch (e) {
+      // A fenced branch stops silently — the next generation's recovery
+      // reseals its chunk. Other errors inside preparation are already
+      // recorded on the chunk by runMemoryPreparation; anything that
+      // escaped that is a defect worth surfacing, not a loop-killer.
+      if (!(e instanceof FencedError)) {
+        this.log("memory preparation error", { error: String(e) });
+      }
+    } finally {
+      stopRenewal();
+    }
   }
 
   /**
@@ -479,7 +681,10 @@ export class Secretary {
     turn: Turn,
     input: Input,
     context: Event[],
+    memory: MemoryBlock[],
+    omitted: OmittedRange | null,
     plan: TurnPlan | null,
+    memoryOmitted: OmittedMemory | null = null,
   ): Promise<void> {
     const gen = turn.generation;
     const maxRounds = this.cfg.maxToolRounds ?? 6;
@@ -487,7 +692,7 @@ export class Secretary {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       const events: EventInput[] = [inputReceivedEvent(input, turn)];
-      const messages = assemble(context, input);
+      const messages = assemble(context, input, memory, omitted, memoryOmitted);
       // The stored plan is the authority — re-sync on every savePlan so a
       // plan that grew further in a lost prior attempt is executed as
       // recorded, never as this attempt would have decided it.
@@ -503,7 +708,12 @@ export class Secretary {
       for (let r = 0; ; r++) {
         let decision = rounds[r];
         if (!decision) {
-          const outcome = await this.decide(turn, input, events, messages, r);
+          const outcome = await this.decide(turn, input, events, messages, r, {
+            events: context,
+            memory,
+            omitted,
+            memoryOmitted,
+          });
           // Failure committed inside decide(); a retryable one is paced
           // durably by the requeue's not_before backoff, so the loop is
           // free to serve other inputs immediately.
@@ -774,65 +984,163 @@ export class Secretary {
     events: EventInput[],
     messages: ChatMessage[],
     round: number,
+    view: {
+      events: Event[];
+      memory: MemoryBlock[];
+      omitted: OmittedRange | null;
+      memoryOmitted: OmittedMemory | null;
+    },
   ): Promise<{ rounds: Decision[] } | { failed: true; retryable: boolean }> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
+
+    // The protected suffix: the current input's user message plus everything
+    // this turn appended so far — assistant text carrying its decided calls,
+    // then one role:"tool" message per committed result. The request itself
+    // and its in-turn flow are never evicted; only older raw journal
+    // records are.
+    const suffixStart = messages.reduce(
+      (last, m, i) => (m.role === "user" ? i : last),
+      messages.length - 1,
+    );
+    const suffix = messages.slice(suffixStart);
+    const system = messages[0] ?? { role: "system" as const, content: SYSTEM };
+
+    let sendMessages = messages;
+    let keptEvents = view.events;
+    const evicted: Event[] = [];
+    let sendRecoveries = 0;
+
     let text = "";
-    const calls: ToolCall[] = [];
+    let calls: ToolCall[] = [];
     let usage: Record<string, unknown> = {};
-    try {
-      for await (const ev of this.cfg.provider.stream({
-        personaId,
-        turnId: turn.turn_id,
-        round,
-        messages,
-        tools: toolSpecs(),
-        signal: this.inFlight?.signal,
-      })) {
-        if (ev.type === "text") text += ev.delta;
-        else if (ev.type === "tool_call") calls.push(ev.call);
-        else usage = ev.usage;
+    for (;;) {
+      text = "";
+      calls = [];
+      usage = {};
+      try {
+        for await (const ev of this.cfg.provider.stream({
+          personaId,
+          turnId: turn.turn_id,
+          round,
+          messages: sendMessages,
+          tools: await this.advertisedSpecs(),
+          signal: this.inFlight?.signal,
+        })) {
+          if (ev.type === "text") text += ev.delta;
+          else if (ev.type === "tool_call") calls.push(ev.call);
+          else usage = ev.usage;
+        }
+        break;
+      } catch (e) {
+        if (!this.running) throw e; // fence lost mid-stream — leave the turn
+        // Provider error text is untrusted bytes: a poisoned message (e.g.
+        // one containing NUL) must not make the failure itself unpersistable.
+        const msg = stripNul(e instanceof Error ? e.message : String(e));
+        const mErr = e instanceof ModelError ? e : null;
+        if (
+          mErr?.refusal === "context_length" &&
+          sendRecoveries < MAX_SEND_VIEW_RECOVERIES
+        ) {
+          // A deterministic capacity refusal can never succeed with the
+          // identical send. Continue the same request on a smaller
+          // temporary working view: the oldest eviction units — deciding
+          // text together with the call/result records it started — drop
+          // first; applied memory blocks, standing notices, the current
+          // input and the in-turn suffix all stay. There is no configured
+          // provider window, so each recovery halves the remaining
+          // rendered tail. The journal is never touched — the capacity
+          // notice names exactly which records left this send and how to
+          // reread them, and the next turn assembles the full context again.
+          const keptEst = renderedViewTokens(keptEvents);
+          const { kept, evicted: dropped } = evictToBudget(
+            keptEvents,
+            Math.floor(keptEst / 2),
+          );
+          if (dropped.length > 0) {
+            keptEvents = kept;
+            evicted.push(...dropped);
+            sendRecoveries += 1;
+            sendMessages = [
+              system,
+              ...renderJournalContext(
+                kept,
+                view.memory,
+                view.omitted,
+                view.memoryOmitted,
+                [
+                  {
+                    seq: (evicted[evicted.length - 1]?.seq ?? 0) + 0.5,
+                    message: capacityNoticeMessage(evicted),
+                  },
+                ],
+              ),
+              ...suffix,
+            ];
+            this.log(
+              "provider refused context; retrying with a reduced working view",
+              {
+                turn_id: turn.turn_id,
+                round,
+                recovery: sendRecoveries,
+                excluded_records: evicted.length,
+                excluded_first_seq: evicted[0]?.seq,
+                excluded_last_seq: evicted[evicted.length - 1]?.seq,
+              },
+            );
+            continue;
+          }
+        }
+        // Deterministic provider rejections cannot be fixed by retrying —
+        // they fail the input outright. Transient failures (5xx/429,
+        // network, timeout, an incomplete stream) stay retryable for a
+        // wall-clock budget measured from the input's submission — a
+        // seconds-long provider outage must not lose a request (F1). The
+        // attempt cap still bounds inputs that die before recording a
+        // failure; committed-transient retries are bounded by time, and a
+        // retryable failure leaves no partial journal — the next attempt
+        // re-emits its full event set. A capacity refusal that could not
+        // be recovered is deterministic too — it records its honest reason
+        // and never spends the transient budget.
+        const withinBudget =
+          activeAgeMs(input) <
+          (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
+        // A capacity refusal is deterministic even when the provider framed
+        // it as a retryable error — the identical send can never succeed.
+        const retryable =
+          mErr !== null &&
+          (!mErr.retryable || mErr.refusal === "context_length")
+            ? false
+            : withinBudget;
+        const detail =
+          mErr?.refusal === "context_length"
+            ? `provider refused the request for context size` +
+              (sendRecoveries > 0
+                ? `; ${sendRecoveries} reduced working-view attempt(s) were also refused`
+                : "; the working view had no reducible records") +
+              `: ${msg}`
+            : msg;
+        await this.commitTurnFinal(turn, {
+          outcome: "fail",
+          retryable,
+          // Bound at the source too: a provider error can be megabytes, and
+          // the first commit upload should never carry that onto a
+          // memory-limited host. The truncation marker stays in the record.
+          error: `model: ${truncateText(detail, RECORDED_ERROR_BYTES)}`,
+          retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
+          events: retryable ? [] : events,
+        });
+        // Bound the log line too — a provider error can be megabytes.
+        this.log("turn failed at model", {
+          turn_id: turn.turn_id,
+          round,
+          attempt: turn.attempt,
+          retryable,
+          retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
+          error: truncateText(msg, 4 * 1024),
+        });
+        return { failed: true, retryable };
       }
-    } catch (e) {
-      if (!this.running) throw e; // fence lost mid-stream — leave the turn
-      // Provider error text is untrusted bytes: a poisoned message (e.g.
-      // one containing NUL) must not make the failure itself unpersistable.
-      const msg = stripNul(e instanceof Error ? e.message : String(e));
-      const mErr = e instanceof ModelError ? e : null;
-      // Deterministic provider rejections cannot be fixed by retrying —
-      // they fail the input outright. Transient failures (5xx/429,
-      // network, timeout, an incomplete stream) stay retryable for a
-      // wall-clock budget measured from the input's submission — a
-      // seconds-long provider outage must not lose a request (F1). The
-      // attempt cap still bounds inputs that die before recording a
-      // failure; committed-transient retries are bounded by time, and a
-      // retryable failure leaves no partial journal — the next attempt
-      // re-emits its full event set.
-      const withinBudget =
-        activeAgeMs(input) <
-        (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
-      const retryable =
-        mErr !== null && !mErr.retryable ? false : withinBudget;
-      await this.commitTurnFinal(turn, {
-        outcome: "fail",
-        retryable,
-        // Bound at the source too: a provider error can be megabytes, and
-        // the first commit upload should never carry that onto a
-        // memory-limited host. The truncation marker stays in the record.
-        error: `model: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
-        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
-        events: retryable ? [] : events,
-      });
-      // Bound the log line too — a provider error can be megabytes.
-      this.log("turn failed at model", {
-        turn_id: turn.turn_id,
-        round,
-        attempt: turn.attempt,
-        retryable,
-        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
-        error: truncateText(msg, 4 * 1024),
-      });
-      return { failed: true, retryable };
     }
     try {
       const saved = await state.savePlan(personaId, gen, {
@@ -1031,73 +1339,75 @@ const SYSTEM =
   "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
   "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
+  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
+  "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
 function inputReceivedEvent(input: Input, turn: Turn): EventInput {
+  const p = input.payload as Record<string, unknown>;
+  const actor = (p.actor ?? {}) as Record<string, unknown>;
+  const place = (p.place ?? {}) as Record<string, unknown>;
   return {
     kind: "input_received",
     payload: {
       input_id: input.input_id,
       kind: input.kind,
-      text: typeof input.payload.text === "string" ? input.payload.text : null,
+      text: typeof p.text === "string" ? p.text : null,
       actor_kind: input.actor_kind,
+      actor_id: input.actor_id || null,
+      actor_display:
+        typeof actor.display_name === "string" ? actor.display_name : null,
       source_surface: input.source_surface,
+      thread_id: input.thread_id || null,
+      place_name: typeof place.name === "string" ? place.name : null,
+      place_kind: typeof place.kind === "string" ? place.kind : null,
+      attention: input.attention,
+      occurred_at: input.occurred_at,
+      event_id: typeof p.event_id === "string" ? p.event_id : null,
+      message_id: typeof p.message_id === "string" ? p.message_id : null,
+      message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
+      reason: typeof p.reason === "string" ? p.reason : null,
       attempt: turn.attempt,
     },
   };
 }
 
-/** Assemble model messages from the journal tail plus the current input. */
-export function assemble(context: Event[], input: Input): ChatMessage[] {
-  const messages: ChatMessage[] = [{ role: "system", content: SYSTEM }];
-  for (const ev of context) {
-    const p = ev.payload;
-    switch (ev.kind) {
-      case "input_received": {
-        const who =
-          p.actor_kind === "schedule"
-            ? "[scheduled wake]"
-            : `[${String(p.actor_kind)}]`;
-        messages.push({
-          role: "user",
-          content: `${who} ${String(p.text ?? "")}`,
-        });
-        break;
-      }
-      case "assistant_message":
-        messages.push({ role: "assistant", content: String(p.text ?? "") });
-        break;
-      case "note":
-        messages.push({
-          role: "assistant",
-          content: `[note] ${String(p.text ?? "")}`,
-        });
-        break;
-      case "tool_result":
-        // Flattened to assistant text: a bare role:"tool" message with no
-        // preceding assistant tool_calls is rejected by chat-completions
-        // providers. The journal keeps the structured record; the model gets
-        // the result inline.
-        messages.push({
-          role: "assistant",
-          content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
-            p.response ?? (p.error ? { error: p.error } : {}),
-          )}`,
-        });
-        break;
-      default:
-        break;
-    }
-  }
+/**
+ * Assemble model messages from the journal tail plus the current input.
+ * Applied L1 memory blocks interleave at the positions where their covered
+ * events were — a replacement never migrates to the top of the context.
+ */
+export function assemble(
+  context: Event[],
+  input: Input,
+  memory: MemoryBlock[] = [],
+  omitted: OmittedRange | null = null,
+  memoryOmitted: OmittedMemory | null = null,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [
+    { role: "system", content: SYSTEM },
+    ...renderJournalContext(context, memory, omitted, memoryOmitted),
+  ];
+  const p = input.payload as Record<string, unknown>;
   const text =
-    typeof input.payload.text === "string"
-      ? input.payload.text
+    typeof p.text === "string" && p.text !== ""
+      ? p.text
       : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"
-      : `[${input.actor_kind}]`;
+      : inputMarker({
+          actorKind: input.actor_kind,
+          actorName: (p.actor as Record<string, unknown> | undefined)
+            ?.display_name,
+          surface: input.source_surface,
+          placeId: input.thread_id,
+          placeName: (p.place as Record<string, unknown> | undefined)?.name,
+          placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
+          messageId: p.message_id,
+          attention: input.attention,
+        });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
 }

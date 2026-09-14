@@ -650,6 +650,74 @@ test("assemble flattens tool results to assistant text (no orphaned tool role)",
   assert.equal(flat?.role, "assistant");
 });
 
+test("assemble shows Messaging provenance a reply can be addressed to", () => {
+  const place = "0190a8a0-0000-7000-8000-000000000001";
+  const earlier: Event[] = [
+    {
+      persona_id: PERSONA,
+      seq: 1,
+      turn_id: "t1",
+      kind: "input_received",
+      payload: {
+        text: "みんなへの周知",
+        actor_kind: "human",
+        actor_display: "Haru",
+        source_surface: "messaging",
+        thread_id: place,
+        place_name: "general",
+        place_kind: "channel",
+        message_id: "m-1",
+        attention: "observe",
+      },
+      created_at: new Date().toISOString(),
+    },
+  ];
+  const input = {
+    persona_id: PERSONA,
+    input_id: "messaging:e-2",
+    kind: "message",
+    payload: {
+      text: "見てくれる？",
+      actor: { kind: "personality_agent", display_name: "Shiro [bot]" },
+      place: { id: place, kind: "channel", name: "general" },
+      message_id: "m-2",
+    },
+    actor_kind: "personality_agent",
+    actor_id: "pa-2",
+    source_surface: "messaging",
+    thread_id: place,
+    occurred_at: new Date().toISOString(),
+    attention: "reply" as const,
+    status: "queued" as const,
+    claimed_generation: null,
+    turn_id: null,
+    created_at: new Date().toISOString(),
+    done_at: null,
+    not_before: null,
+    waiting_since: null,
+    waited_ms: 0,
+  };
+  const messages = assemble(earlier, input);
+  assert.equal(
+    messages.at(-2)?.content,
+    `[Haru (human) in general place_id=${place} message_id=m-1 — fyi, no reply needed] みんなへの周知`,
+  );
+  // Another secretary is named as one; brackets in names cannot close the
+  // marker early, so a directive after it still parses.
+  assert.equal(
+    messages.at(-1)?.content,
+    `[Shiro bot (personality_agent) in general place_id=${place} message_id=m-2] 見てくれる？`,
+  );
+  // Non-Messaging inputs keep the plain actor marker without place refs.
+  const plain = assemble([], {
+    ...input,
+    payload: { text: "hi" },
+    actor_kind: "human",
+    source_surface: "test",
+  });
+  assert.equal(plain.at(-1)?.content, "[human] hi");
+});
+
 test("same-holder acquire bumps generation; release keeps monotonic fencing", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
