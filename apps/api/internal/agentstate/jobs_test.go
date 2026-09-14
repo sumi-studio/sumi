@@ -337,9 +337,9 @@ func TestJobStartTool(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	req := map[string]any{"command": []any{"echo", "hello"}, "timeout_ms": 5000.0}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.start", Request: req})
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.start", Route: "normal", Request: req})
 
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.start", 0, req)
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.start", 0, req)
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("claim job.start: %+v fresh=%v err=%v", op, fresh, err)
 	}
@@ -353,7 +353,7 @@ func TestJobStartTool(t *testing.T) {
 		t.Fatalf("tool job: %+v err=%v", j, err)
 	}
 	// Replayed claim replays the operation — no second job, no second insert.
-	op2, fresh2, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-2", "job.start", 0, req)
+	op2, _, fresh2, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-2", "job.start", 0, req)
 	if err != nil || fresh2 || op2.OperationID != "op-1" {
 		t.Fatalf("replay claim: %+v fresh=%v err=%v", op2, fresh2, err)
 	}
@@ -389,10 +389,10 @@ func TestJobStatusCancelTools(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	mustPlan(t, s, pa, "t-2", lease.Generation,
-		PlanCall{Tool: "job.status", Request: map[string]any{"job_id": "j-1"}},
-		PlanCall{Tool: "job.cancel", Request: map[string]any{"job_id": "j-1"}})
+		PlanCall{Tool: "job.status", Route: "normal", Request: map[string]any{"job_id": "j-1"}},
+		PlanCall{Tool: "job.cancel", Route: "normal", Request: map[string]any{"job_id": "j-1"}})
 
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
 		"op-s", "job.status", 0, map[string]any{"job_id": "j-1"})
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("job.status claim: %+v err=%v", op, err)
@@ -401,7 +401,7 @@ func TestJobStatusCancelTools(t *testing.T) {
 	if jm["job_id"] != "j-1" || jm["status"] != "queued" {
 		t.Fatalf("job.status response: %+v", op.Response)
 	}
-	op, fresh, err = s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
+	op, _, fresh, err = s.ClaimOperation(ctx, pa, "t-2", lease.Generation,
 		"op-c", "job.cancel", 1, map[string]any{"job_id": "j-1"})
 	if err != nil || !fresh || op.Status != "done" {
 		t.Fatalf("job.cancel claim: %+v err=%v", op, err)
@@ -424,8 +424,8 @@ func TestJobStatusCancelTools(t *testing.T) {
 		t.Fatalf("load t-3: %v", err)
 	}
 	mustPlan(t, s, pa, "t-3", lease.Generation,
-		PlanCall{Tool: "job.status", Request: map[string]any{"job_id": "ghost"}})
-	if _, _, err := s.ClaimOperation(ctx, pa, "t-3", lease.Generation,
+		PlanCall{Tool: "job.status", Route: "normal", Request: map[string]any{"job_id": "ghost"}})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-3", lease.Generation,
 		"op-g", "job.status", 0, map[string]any{"job_id": "ghost"}); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("ghost job.status err = %v, want ErrBadRequest", err)
 	}
@@ -497,8 +497,8 @@ func TestJobCompletionBeforeOriginTurn(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	req := map[string]any{"command": []any{"echo", "hi"}}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.start", Request: req})
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.start", 0, req)
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.start", Route: "normal", Request: req})
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.start", 0, req)
 	if err != nil || !fresh {
 		t.Fatalf("claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
@@ -515,7 +515,7 @@ func TestJobCompletionBeforeOriginTurn(t *testing.T) {
 	}
 
 	// Resumed turn: the replay returns the original receipt plus now.
-	op, fresh, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-2", "job.start", 0, req)
+	op, _, fresh, err = s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-2", "job.start", 0, req)
 	if err != nil || fresh {
 		t.Fatalf("replay: %+v fresh=%v err=%v", op, fresh, err)
 	}
@@ -609,7 +609,7 @@ func TestJobToolTransientStoreFailure(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	req := map[string]any{"job_id": "j-1"}
-	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.cancel", Request: req})
+	mustPlan(t, s, pa, "t-1", lease.Generation, PlanCall{Tool: "job.cancel", Route: "normal", Request: req})
 
 	// Hold the job row so the claim's FOR UPDATE waits past its deadline —
 	// a real store failure inside the claim transaction.
@@ -622,7 +622,7 @@ func TestJobToolTransientStoreFailure(t *testing.T) {
 		t.Fatalf("lock: %v", err)
 	}
 	short, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	_, _, err = s.ClaimOperation(short, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
+	_, _, _, err = s.ClaimOperation(short, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
 	cancel()
 	if err == nil || errors.Is(err, ErrBadRequest) {
 		t.Fatalf("transient claim failure must not be a bad request: %v", err)
@@ -632,7 +632,7 @@ func TestJobToolTransientStoreFailure(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM core_operations WHERE persona_id = $1`, pa).Scan(&ops); err != nil || ops != 0 {
 		t.Fatalf("failed claim recorded an operation: n=%d err=%v", ops, err)
 	}
-	op, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
+	op, _, fresh, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation, "op-1", "job.cancel", 0, req)
 	if err != nil || !fresh || op.Response["job"].(map[string]any)["status"] != "cancelled" {
 		t.Fatalf("retried claim: %+v fresh=%v err=%v", op, fresh, err)
 	}

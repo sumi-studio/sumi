@@ -13,6 +13,7 @@ import {
   type ChatMessage,
   type ModelProvider,
   type ToolCall,
+  type ToolSpec,
 } from "./provider.ts";
 import {
   FencedError,
@@ -32,6 +33,7 @@ import type {
   MemoryStatus,
   OmittedMemory,
   OmittedRange,
+  PlanCall,
   Turn,
   TurnPlan,
   WriterLease,
@@ -107,6 +109,24 @@ export interface StepOptions {
 const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
 
 /**
+ * How long the input has been actively worked on: wall time since
+ * submission minus the durably recorded time it spent parked on human
+ * approval decisions. A person's thinking time is not model failure —
+ * the state service accumulates it in waited_ms on every requeue, so the
+ * budget is identical across restarts and a long wait cannot exhaust the
+ * provider retry window (repair F4).
+ */
+function activeAgeMs(input: Input): number {
+  let active = Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
+  // A still-waiting input cannot be claimed — but a store that exposes
+  // waiting_since without having requeued yet is counted honestly too.
+  if (input.waiting_since) {
+    active -= Date.now() - Date.parse(input.waiting_since);
+  }
+  return active;
+}
+
+/**
  * Bounded working-view recoveries after a provider context-capacity refusal,
  * per model consultation. Each recovery drops more of the oldest raw journal
  * records from the sent view only; the durable journal, the current input,
@@ -137,6 +157,25 @@ const MAX_SEND_VIEW_RECOVERIES = 2;
 export class Secretary {
   private lease: WriterLease | null = null;
   private running = false;
+  /**
+   * Model-visible tool specs, resolved once against the store's claimable
+   * set: the model is never offered a tool this state cannot execute (f99 —
+   * e.g. messaging.send is absent until the host registers its effect).
+   */
+  private specs?: ToolSpec[];
+  private async advertisedSpecs(): Promise<ToolSpec[]> {
+    if (this.specs) return this.specs;
+    try {
+      this.specs = toolSpecs(
+        new Set(await this.cfg.state.listTools(this.cfg.personaId)),
+      );
+    } catch {
+      // An older state service without the tools route: intrinsic internal
+      // tools are always claimable in Go; delegated ones stay withheld.
+      this.specs = toolSpecs();
+    }
+    return this.specs;
+  }
   private inFlight: AbortController | null = null;
   private lastDispatch = 0;
   private poison: { turnId: string; count: number } | null = null;
@@ -239,8 +278,7 @@ export class Secretary {
       const maxAttempts = this.cfg.maxAttempts ?? 5;
       const budgetMs =
         this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS;
-      const withinBudget =
-        Date.now() - Date.parse(input.created_at) < budgetMs;
+      const withinBudget = activeAgeMs(input) < budgetMs;
       if (turn.attempt > maxAttempts && !withinBudget) {
         // Attempt cap (CR3-N1): an input that has already consumed its
         // allowance — model failures, transient claim errors, a poison
@@ -612,7 +650,7 @@ export class Secretary {
         provider: this.cfg.provider,
         contextLimit: this.cfg.contextLimit,
         system: SYSTEM,
-        tools: toolSpecs(),
+        tools: await this.advertisedSpecs(),
         signal,
         timeoutMs: this.memoryTimeoutMs,
         log: (msg, fields) => this.log(msg, fields),
@@ -698,6 +736,26 @@ export class Secretary {
         for (const call of decision.calls) {
           const res = await this.executeCall(turn, call, results.length, events);
           if (res === null) return; // divergent — failure committed
+          if (res === "awaited") {
+            // A gated call parked: its planned operation and the pending
+            // approval are durable, so the commit can wait on them. The
+            // store moves the input to waiting and emits the request
+            // notification; an authenticated decision requeues the input
+            // and the next attempt resumes this exact call. The turn is
+            // recorded awaiting — never auto-executed after a restart.
+            // Only the request itself is journaled now: the resuming attempt
+            // replays this plan and journals the whole turn once, so the
+            // input and its reply are not recorded twice.
+            await this.commitTurnFinal(turn, {
+              outcome: "await",
+              events: events.filter((e) => e.kind === "approval_requested"),
+            });
+            this.log("turn awaiting approval", {
+              turn_id: turn.turn_id,
+              input_id: input.input_id,
+            });
+            return;
+          }
           const result = { call_id: call.call_id ?? "", tool: call.tool, ...res };
           results.push(result);
           roundResults.push(result);
@@ -748,6 +806,7 @@ export class Secretary {
           toolCalls: decision.calls.map((c) => ({
             id: c.call_id ?? "",
             name: c.tool,
+            route: c.route,
             arguments: c.request,
           })),
         });
@@ -768,15 +827,16 @@ export class Secretary {
 
   /**
    * Execute one planned call at its flat position. Returns the result to
-   * feed back to the model, or null when a plan-boundary failure was
-   * committed and the turn is over.
+   * feed back to the model, "awaited" when the call parked behind a pending
+   * human decision, or null when a plan-boundary failure was committed and
+   * the turn is over.
    */
   private async executeCall(
     turn: Turn,
-    call: { call_id?: string; tool: string; request: Json },
+    call: PlanCall,
     flatIndex: number,
     events: EventInput[],
-  ): Promise<{ result: unknown; replayed: boolean } | null> {
+  ): Promise<{ result: unknown; replayed: boolean } | "awaited" | null> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
     const callId = call.call_id ?? "";
@@ -822,7 +882,24 @@ export class Secretary {
       // turn running for a future generation to recover and retry.
       throw e;
     }
-    const { operation, fresh } = claim;
+    const { operation, approval, fresh } = claim;
+    if (operation.status === "awaiting_approval") {
+      // Gated call: the store durably recorded the planned operation and a
+      // pending approval before returning — no effect ran. Record exactly
+      // what is waiting on the human, then park.
+      events.push({
+        kind: "approval_requested",
+        payload: {
+          tool: call.tool,
+          call_id: callId,
+          route: call.route,
+          approval_id: approval?.approval_id ?? null,
+          required_by: approval?.required_by ?? null,
+          request: call.request,
+        },
+      });
+      return "awaited";
+    }
     if (!fresh && !jsonEqual(operation.request, call.request)) {
       // Defense in depth: a store that replays a receipt for a different
       // request than the plan position's is detected client-side too.
@@ -852,8 +929,35 @@ export class Secretary {
     }
     events.push({
       kind: "tool_call",
-      payload: { tool: call.tool, call_id: callId, request: call.request },
+      payload: {
+        tool: call.tool,
+        call_id: callId,
+        request: call.request,
+        route: call.route,
+      },
     });
+    if (operation.status === "failed") {
+      // Durable denial (or another finalized failure): the decided call
+      // must not be silently retried or bypassed — the failure itself is
+      // the result the model sees, journaled as denied.
+      const err =
+        operation.response !== null &&
+        typeof operation.response === "object" &&
+        "error" in operation.response
+          ? String((operation.response as { error: unknown }).error)
+          : "operation failed";
+      events.push({
+        kind: "tool_result",
+        payload: {
+          tool: call.tool,
+          call_id: callId,
+          error: err,
+          denied: approval?.status === "denied" || undefined,
+          replayed: !fresh,
+        },
+      });
+      return { result: { error: err }, replayed: !fresh };
+    }
     events.push({
       kind: "tool_result",
       payload: {
@@ -920,7 +1024,7 @@ export class Secretary {
           turnId: turn.turn_id,
           round,
           messages: sendMessages,
-          tools: toolSpecs(),
+          tools: await this.advertisedSpecs(),
           signal: this.inFlight?.signal,
         })) {
           if (ev.type === "text") text += ev.delta;
@@ -999,7 +1103,7 @@ export class Secretary {
         // be recovered is deterministic too — it records its honest reason
         // and never spends the transient budget.
         const withinBudget =
-          Date.now() - Date.parse(input.created_at) <
+          activeAgeMs(input) <
           (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
         // A capacity refusal is deterministic even when the provider framed
         // it as a retryable error — the identical send can never succeed.
@@ -1050,6 +1154,7 @@ export class Secretary {
         calls: calls.map((c) => ({
           call_id: c.id,
           tool: c.name,
+          route: c.route,
           request: c.arguments,
         })),
         usage: stripNulDeep(usage) as Record<string, unknown>,
@@ -1231,6 +1336,8 @@ function truncateText(s: string, maxBytes: number): string {
 const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
+  "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
+  "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
   "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +

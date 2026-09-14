@@ -658,6 +658,7 @@ func newApplicationFromEnv() (*application, error) {
 			return nil, errors.New("SUMI_CORE_STATE_TOKEN must be at least 16 characters")
 		}
 		coreServer = agentstate.NewServer(database.Pool, coreToken)
+		coreServer.SetModelConnections(modelConnections)
 		coreServer.RegisterRoutes(mux)
 		portable.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
 		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")

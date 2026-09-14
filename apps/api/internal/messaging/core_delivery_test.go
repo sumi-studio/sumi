@@ -511,11 +511,11 @@ func TestCoreSendEffectPostsIntoRealPlace(t *testing.T) {
 	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, res.Turn.TurnID, lease.Generation, 0,
 		agentstate.Decision{
 			Text:  "posting",
-			Calls: []agentstate.PlanCall{{CallID: "c1", Tool: MessagingCoreTool, Request: sendReq}},
+			Calls: []agentstate.PlanCall{{CallID: "c1", Tool: MessagingCoreTool, Route: "normal", Request: sendReq}},
 		}); err != nil {
 		t.Fatalf("save plan: %v", err)
 	}
-	op, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+	op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
 		lease.Generation, "turn-1:op:0", MessagingCoreTool, 0, sendReq)
 	if err != nil {
 		t.Fatalf("claim send: %v", err)
@@ -553,7 +553,7 @@ func TestCoreSendEffectPostsIntoRealPlace(t *testing.T) {
 	}
 
 	// A replayed claim returns the stored receipt — no second message.
-	again, freshAgain, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+	again, _, freshAgain, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
 		lease.Generation, "turn-1:op:0", MessagingCoreTool, 0, sendReq)
 	if err != nil {
 		t.Fatalf("replay claim: %v", err)
@@ -572,13 +572,190 @@ func TestCoreSendEffectPostsIntoRealPlace(t *testing.T) {
 	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, res.Turn.TurnID, lease.Generation, 1,
 		agentstate.Decision{
 			Text:  "trying elsewhere",
-			Calls: []agentstate.PlanCall{{CallID: "c2", Tool: MessagingCoreTool, Request: badReq}},
+			Calls: []agentstate.PlanCall{{CallID: "c2", Tool: MessagingCoreTool, Route: "normal", Request: badReq}},
 		}); err != nil {
 		t.Fatalf("save plan 2: %v", err)
 	}
-	if _, _, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+	if _, _, _, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
 		lease.Generation, "turn-1:op:1", MessagingCoreTool, 1, badReq); !errors.Is(err, agentstate.ErrBadRequest) {
 		t.Fatalf("inaccessible place claim: got %v, want ErrBadRequest", err)
+	}
+}
+
+// An elevated-route messaging.send is a recorded outward act the human
+// must approve: the claim parks behind a durable pending approval, the
+// bound human's decision releases exactly one send, and a denial posts
+// nothing — under the same registered effect the normal route uses.
+func TestCoreSendEffectElevatedApprovalGatesTheSend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newSharedIntakeWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, coreStore := newSharedIntakeDelivery(t, w)
+	release, err := delivery.Prepare(ctx, w.agent.ID)
+	if err != nil {
+		t.Fatalf("prepare persona: %v", err)
+	}
+	release()
+
+	occurred := time.Now()
+	if _, _, err := coreStore.SubmitInput(ctx, &agentstate.Input{
+		PersonaID: w.agent.ID, InputID: "messaging:test-elev-1", Kind: "message",
+		Payload:   map[string]any{"text": "post for me"},
+		ActorKind: "human", ActorID: w.humanA.ID, SourceSurface: "messaging",
+		ThreadID: ch.PlaceID, OccurredAt: &occurred, Attention: "reply",
+	}); err != nil {
+		t.Fatalf("submit input: %v", err)
+	}
+	lease, err := coreStore.AcquireWriter(ctx, w.agent.ID, "runtime", 5*time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	res, err := coreStore.LoadTurn(ctx, w.agent.ID, lease.Generation, "turn-1", 20)
+	if err != nil || res.Turn == nil {
+		t.Fatalf("load turn: %v %+v", err, res)
+	}
+	sendReq := map[string]any{"place_id": ch.PlaceID, "content": "共有できました"}
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, res.Turn.TurnID, lease.Generation, 0,
+		agentstate.Decision{
+			Text: "posting with consent",
+			Calls: []agentstate.PlanCall{
+				{CallID: "c1", Tool: MessagingCoreTool, Route: "elevated", Request: sendReq},
+			},
+		}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	// The claim parks: operation awaiting_approval, durable pending grant,
+	// and no message exists while the human has not decided.
+	op, appr, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+		lease.Generation, "turn-1:op:0", MessagingCoreTool, 0, sendReq)
+	if err != nil {
+		t.Fatalf("claim send: %v", err)
+	}
+	if !fresh || op.Status != "awaiting_approval" || appr == nil ||
+		appr.Status != "pending" || appr.RequiredBy != "route" {
+		t.Fatalf("parked claim = op %+v appr %+v fresh=%t", op, appr, fresh)
+	}
+	var posted int
+	if err := w.store.core.pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages WHERE place_id = $1`, ch.PlaceID).Scan(&posted); err != nil {
+		t.Fatal(err)
+	}
+	if posted != 0 {
+		t.Fatalf("message posted before approval: %d", posted)
+	}
+
+	// Only the persona's bound human decides — the other workspace member
+	// cannot consent for this secretary.
+	if _, err := coreStore.ResolveApproval(ctx, w.agent.ID, appr.ApprovalID,
+		agentstate.ApprovalDecision{
+			Decision: "approve_once", DecisionID: "d-wrong",
+			DecidedByKind: "human", DecidedByID: w.humanB.ID,
+		}); !errors.Is(err, agentstate.ErrApprovalForbidden) {
+		t.Fatalf("foreign human decision: got %v, want ErrApprovalForbidden", err)
+	}
+	if _, err := coreStore.ResolveApproval(ctx, w.agent.ID, appr.ApprovalID,
+		agentstate.ApprovalDecision{
+			Decision: "approve_once", DecisionID: "d-1",
+			DecidedByKind: "human", DecidedByID: w.humanA.ID,
+		}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	// The next claim consumes the one-shot grant and sends exactly once,
+	// inside the same transaction as the operation record.
+	op2, appr2, fresh2, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+		lease.Generation, "turn-1:op:0", MessagingCoreTool, 0, sendReq)
+	if err != nil {
+		t.Fatalf("approved claim: %v", err)
+	}
+	if !fresh2 || op2.Status != "done" || appr2 == nil || appr2.ConsumedAt == nil {
+		t.Fatalf("approved claim = op %+v appr %+v fresh=%t", op2, appr2, fresh2)
+	}
+	messageID, _ := op2.Response["message_id"].(string)
+	if messageID == "" {
+		t.Fatalf("send response = %+v", op2.Response)
+	}
+	if err := w.store.core.pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages WHERE place_id = $1`, ch.PlaceID).Scan(&posted); err != nil {
+		t.Fatal(err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted after approval = %d, want exactly one", posted)
+	}
+
+	// Replay: the stored receipt returns, the consumed grant cannot run the
+	// effect a second time.
+	op3, _, fresh3, err := coreStore.ClaimOperation(ctx, w.agent.ID, res.Turn.TurnID,
+		lease.Generation, "turn-1:op:0", MessagingCoreTool, 0, sendReq)
+	if err != nil || fresh3 || op3.Response["message_id"] != messageID {
+		t.Fatalf("replay = %+v fresh=%t err=%v", op3, fresh3, err)
+	}
+	if err := w.store.core.pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages WHERE place_id = $1`, ch.PlaceID).Scan(&posted); err != nil {
+		t.Fatal(err)
+	}
+	if posted != 1 {
+		t.Fatalf("posted after replay = %d, want still one", posted)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, res.Turn.TurnID, lease.Generation,
+		agentstate.CommitRequest{Outcome: "complete", Output: map[string]any{"text": "posted"}}); err != nil {
+		t.Fatalf("commit turn 1: %v", err)
+	}
+
+	// A denied elevated send posts nothing and replays the durable failure.
+	occurred2 := time.Now()
+	if _, _, err := coreStore.SubmitInput(ctx, &agentstate.Input{
+		PersonaID: w.agent.ID, InputID: "messaging:test-elev-2", Kind: "message",
+		Payload:   map[string]any{"text": "post this too"},
+		ActorKind: "human", ActorID: w.humanA.ID, SourceSurface: "messaging",
+		ThreadID: ch.PlaceID, OccurredAt: &occurred2, Attention: "reply",
+	}); err != nil {
+		t.Fatalf("submit input 2: %v", err)
+	}
+	res2, err := coreStore.LoadTurn(ctx, w.agent.ID, lease.Generation, "turn-2", 20)
+	if err != nil || res2.Turn == nil {
+		t.Fatalf("load turn 2: %v %+v", err, res2)
+	}
+	denyReq := map[string]any{"place_id": ch.PlaceID, "content": "却下"}
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, res2.Turn.TurnID, lease.Generation, 0,
+		agentstate.Decision{
+			Text: "posting again",
+			Calls: []agentstate.PlanCall{
+				{CallID: "c1", Tool: MessagingCoreTool, Route: "elevated", Request: denyReq},
+			},
+		}); err != nil {
+		t.Fatalf("save plan 2: %v", err)
+	}
+	op4, appr4, _, err := coreStore.ClaimOperation(ctx, w.agent.ID, res2.Turn.TurnID,
+		lease.Generation, "turn-2:op:0", MessagingCoreTool, 0, denyReq)
+	if err != nil || op4.Status != "awaiting_approval" || appr4 == nil {
+		t.Fatalf("deny-path park = op %+v appr %+v err=%v", op4, appr4, err)
+	}
+	if _, err := coreStore.ResolveApproval(ctx, w.agent.ID, appr4.ApprovalID,
+		agentstate.ApprovalDecision{
+			Decision: "deny_once", DecisionID: "d-2",
+			DecidedByKind: "human", DecidedByID: w.humanA.ID,
+		}); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	op5, _, fresh5, err := coreStore.ClaimOperation(ctx, w.agent.ID, res2.Turn.TurnID,
+		lease.Generation, "turn-2:op:0", MessagingCoreTool, 0, denyReq)
+	if err != nil {
+		t.Fatalf("post-denial claim: %v", err)
+	}
+	if fresh5 || op5.Status != "failed" {
+		t.Fatalf("post-denial op = %+v fresh=%t", op5, fresh5)
+	}
+	var denied int
+	if err := w.store.core.pool.QueryRow(ctx,
+		`SELECT count(*) FROM messages WHERE place_id = $1 AND content = '却下'`,
+		ch.PlaceID).Scan(&denied); err != nil {
+		t.Fatal(err)
+	}
+	if denied != 0 {
+		t.Fatalf("denied send posted %d messages", denied)
 	}
 }
 
