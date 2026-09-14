@@ -85,33 +85,44 @@ info:
     because on FUSE a lost reply can follow an applied request. Only a
     definitive pre-commit rejection (absent source, kind mismatch,
     permission, conflict) drops an intent outright.
-    Rename settlement proves the destination IS the moved source, never
-    that it merely exists: the recorded source kind must match, the
-    inode must be continuous, and then — for files — the recorded
-    content hash must equal the destination's bytes (inode numbers are
-    recycled by delete+create, and preserved timestamps are forgeable);
-    for directories, at least one recorded member's full fingerprint —
-    including ctime, which copy/restore cannot preserve — must appear at
-    the corresponding destination path and no sampled member may
-    contradict. A directory with no recorded members to corroborate is
-    unproven. An unproven destination is never claimed: the intent is
-    resolved, every version row is kept, and no rename event is
-    journaled — foreign bytes are never laundered into the service's
-    audit trail. Hash equality alone is never used to invent a rename:
-    two independently created files with identical bytes produce an
-    unproven outcome, not an adoption.
+    Rename settlement never infers that the rename happened — current
+    state cannot prove causal history (a hardlink or in-scope symlink
+    makes a destination stat identical to the source without any move).
+    The reconciler instead relocates recorded state per object: each
+    version row under the source subtree whose recorded path is
+    definitively absent AND whose exact recorded fingerprint appears at
+    the corresponding destination path is re-keyed to that destination,
+    keeping its version. The intent's own source object changes its
+    ctime by being moved, so an exact fingerprint match is impossible
+    for it: a regular file's row relocates only when inode, size and
+    mtime equal the declare-time fingerprint and the destination bytes
+    hash to the intent's recorded expected hash; a directory's own row
+    is never relocated (an inode number is not identity, and member
+    evidence does not prove a directory moved). Each relocation is
+    journaled as a `relocate` event carrying from_path — an observation
+    of current state, not a service-performed rename. Rows without
+    evidence stay where they are and surface through the ordinary
+    live-fingerprint comparison (404 at the recorded path, version 0 or
+    external_change at the destination), like any external change.
+    A `rename` event is journaled ONLY by the process that observed the
+    rename syscall itself succeed; that process retries DB persistence
+    with bounded backoff while it remains the owner, so a transient
+    store outage after a known fs commit still records the true event
+    instead of leaving inference to the reconciler.
     Late landings: a resolved intent keeps its evidence (pre-state
-    fingerprint, expected hash, source kind) as a tombstone for a
-    retention horizon; every pass re-judges tombstones and can still
-    apply a provably-landed effect — including moving rows minted after
-    the drop whose recorded fingerprints prove a late rename physically
-    carried them. This retention is an evidence horizon, not a
-    quiescence proof: a filesystem effect landing after the horizon
-    cannot be re-judged (no evidence remains), and a successor op
-    admitted after the exclusion window that minted rows under the old
-    subtree can still be stranded with its version at the old path —
-    reported honestly as external_change/404-at-recorded-path, never as
-    a clean record.
+    fingerprint, expected hash, source kind) as a tombstone for as long
+    as its effect remains unproven — tombstone evidence is never erased
+    by a timer, because a filesystem effect may arrive after any
+    horizon. Tombstones are re-judged on a two-tier cadence (recently
+    resolved intents every 30s; older ones hourly) — a cost bound and a
+    worst-case detection latency, not a quiescence claim. A late landing
+    that matches the declared effect is still applied or relocated on
+    the same evidence as a prompt landing. Residual: an effect that
+    lands differently than declared cannot be distinguished from an
+    external change — a delayed unlink removing a file that was
+    recreated after the tombstone, or a late rename overwriting newer
+    destination content, is reported as external_change, never as the
+    intent's outcome.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so
@@ -261,6 +272,11 @@ paths:
       description: >-
         Service-minted mutation journal (seq, op, path, version, at). Only
         API-mediated mutations are journaled; direct executor writes are not.
+        `rename` events are emitted only for renames the serving process
+        observed succeed; `relocate` events (path=new, from_path=old,
+        version=the row's existing version) are reconciler observations
+        that a recorded object's content now lives at a new path — they
+        do not claim the service performed a rename.
       parameters:
         - { name: scope, in: path, required: true, schema: { type: string } }
         - { name: since, in: query, schema: { type: integer } }

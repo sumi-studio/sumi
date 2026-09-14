@@ -70,14 +70,15 @@ type Store struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	scopeMu      sync.Map                                 // scope string -> *sync.Mutex
-	inflight     sync.Map                                 // intent id -> struct{} — fs goroutines executing in this process
-	statFn       StatFn                                   // set by the service once the fs root exists
-	hashFn       HashFn                                   // content probe for expected-outcome verification
-	fsCheck      func() error                             // when set, verdict that the fs root is trustworthy (canonical mount live)
-	viewFn       func(context.Context) (ReconView, error) // pass-pinned fs view; supersedes statFn/hashFn/fsCheck when set
-	reconcile    chan struct{}
-	lastTombScan atomic.Int64 // unix nanos of the last tombstone re-judgment
+	scopeMu          sync.Map                                 // scope string -> *sync.Mutex
+	inflight         sync.Map                                 // intent id -> struct{} — fs goroutines executing in this process
+	statFn           StatFn                                   // set by the service once the fs root exists
+	hashFn           HashFn                                   // content probe for expected-outcome verification
+	fsCheck          func() error                             // when set, verdict that the fs root is trustworthy (canonical mount live)
+	viewFn           func(context.Context) (ReconView, error) // pass-pinned fs view; supersedes statFn/hashFn/fsCheck when set
+	reconcile        chan struct{}
+	lastTombScan     atomic.Int64 // unix nanos of the last hot tombstone re-judgment
+	lastTombScanCold atomic.Int64 // unix nanos of the last cold tombstone re-judgment
 }
 
 // StatFn stats a scope-relative path — injected by the service so the
@@ -117,9 +118,17 @@ const deadGrace = 20 * time.Second
 // set makes every pass re-stat every tombstoned path — holding the pinned
 // root descriptor almost continuously, which keeps the mount busy and
 // breaks ordinary unmount. The interval is the honest detection latency
-// for a late-landing effect; the retention horizon (tombstoneRetain) is
-// unchanged.
+// for a late-landing effect.
 const tombstoneScanInterval = 30 * time.Second
+
+// Tombstone evidence is never erased by a timer: a filesystem effect may
+// arrive after any horizon, and the intent row is the only record that can
+// re-attribute it. Cost is bounded by cadence, not retention — tombstones
+// younger than tombstoneColdAge are re-judged every tombstoneScanInterval;
+// older ones are still re-judged, on the slower tombstoneColdScanInterval.
+// A late effect lands worst-case within one interval of landing.
+const tombstoneColdAge = 24 * time.Hour
+const tombstoneColdScanInterval = time.Hour
 
 func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
@@ -550,18 +559,49 @@ func (s *Store) runFs(it intent, fn func() (FileInfo, bool, error)) <-chan fsRes
 			if it.op == "mkdir" {
 				sha = "" // "dir" is a kind marker, not a content hash
 			}
-			if err := s.apply(context.Background(), it, info, sha, nil); err != nil && !errors.Is(err, errIntentSettled) {
-				// fs committed but the apply did not (DB down, deposed,
-				// or a restart). The intent survives for the reconciler.
-				log.Printf("store: apply of intent %d (%s %s/%s) failed: %v — left for reconcile",
-					it.id, it.op, it.scope, it.path, err)
-				s.kickReconcile()
-				settleErr = err
-			}
+			settleErr = s.applyUntilSettled(it, info, sha)
 		}
 		ch <- fsResult{info, ferr, settleErr}
 	}()
 	return ch
+}
+
+// applyUntilSettled persists a filesystem commit THIS process observed:
+// the syscall returned success, so the outcome is certain here and must
+// not be handed to disk inference (the common failure is a transient DB
+// outage right after commit — retrying apply writes the journal entry
+// with the correct event instead of leaving the reconciler to guess).
+// The intent stays inflight throughout, so the reconciler never judges
+// it. The loop gives up only when another instance owns the store (the
+// successor settles by disk) or the store is closing; either way the
+// intent row survives exactly as before. Each attempt is bounded by
+// dbTimeout and the backoff caps at 5s, so a permanently unavailable DB
+// parks one goroutine — it never spins.
+func (s *Store) applyUntilSettled(it intent, info FileInfo, sha string) error {
+	backoff := 200 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		err := s.apply(context.Background(), it, info, sha, false)
+		if err == nil || errors.Is(err, errIntentSettled) {
+			return nil
+		}
+		if errors.Is(err, errForeignOwner) {
+			log.Printf("store: apply of intent %d (%s %s/%s): %v — left for the owning instance",
+				it.id, it.op, it.scope, it.path, err)
+			return err
+		}
+		if attempt == 0 {
+			log.Printf("store: apply of intent %d (%s %s/%s) failed: %v — retrying",
+				it.id, it.op, it.scope, it.path, err)
+		}
+		select {
+		case <-s.done:
+			return err
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // waitFs bounds the caller's wait on the fs mutation; the settling
@@ -804,12 +844,11 @@ var errIntentSettled = errors.New("intent already settled")
 // the bytes written; reconciled writes: the observed hash; proven file
 // renames: the verified source hash). It feeds the declare-time evidence
 // cache so later renames need not re-read the file.
-// rescue lists additional subtree paths to move on a rename regardless of
-// the version guard — used only by tombstone re-judgment, where each such
-// row's content was proven present at the destination by fingerprint
-// before apply runs (a late-landing rename physically carried rows minted
-// after the intent's drop; their fp match is the evidence, f104).
-func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, rescue []string) error {
+// keepIntent retains the intent as a tombstone instead of deleting it —
+// used when the reconciler recorded a DIVERGED outcome: the observed
+// content is foreign, but the declared effect may still land later. The
+// row carries the only evidence that can re-attribute it.
+func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, keepIntent bool) error {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -824,16 +863,27 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 		return err
 	}
 	if owner != s.owner {
-		return fmt.Errorf("deposed: writer lock held by %s: %w", owner, ErrUnavailable)
+		return fmt.Errorf("deposed: writer lock held by %s: %w (%w)", owner, errForeignOwner, ErrUnavailable)
 	}
-	var claimed int64
-	err = tx.QueryRow(ctx,
-		`DELETE FROM file_op WHERE id=$1 RETURNING id`, it.id).Scan(&claimed)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return errIntentSettled
-	}
-	if err != nil {
-		return err
+	if keepIntent {
+		tag, kerr := tx.Exec(ctx,
+			`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error='' WHERE id=$1`, it.id)
+		if kerr != nil {
+			return kerr
+		}
+		if tag.RowsAffected() == 0 {
+			return errIntentSettled
+		}
+	} else {
+		var claimed int64
+		err = tx.QueryRow(ctx,
+			`DELETE FROM file_op WHERE id=$1 RETURNING id`, it.id).Scan(&claimed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errIntentSettled
+		}
+		if err != nil {
+			return err
+		}
 	}
 
 	switch it.op {
@@ -864,8 +914,8 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 		if _, err := tx.Exec(ctx,
 			`UPDATE file_version SET path = $3 || substr(path, length($2)+1)
 			 WHERE scope=$1 AND starts_with(path, $2 || '/')
-			   AND (version < $4 OR path = ANY($5))`,
-			it.scope, it.path, it.toPath, it.version, rescue); err != nil {
+			   AND version < $4`,
+			it.scope, it.path, it.toPath, it.version); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,
@@ -989,13 +1039,6 @@ func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) b
 	}
 	return tx.Commit(ctx) == nil
 }
-
-// tombstoneRetain bounds how long a reconciler-resolved intent keeps its
-// evidence (pre_fp/expect_sha/src_kind) for late-landing re-judgment
-// (f104/F-RA-6). It is an evidence horizon, not a quiescence proof: an fs
-// effect landing after it can still strand rows minted post-resolution —
-// a documented residual, never silently claimed.
-var tombstoneRetain = 24 * time.Hour
 
 // tombstoneIntent marks an intent resolved WITHOUT deleting its evidence:
 // the reconciler keeps re-judging tombstones so a filesystem effect that
@@ -1296,16 +1339,26 @@ func (s *Store) Reconcile(ctx context.Context) int {
 		return out
 	}
 	pending := load(`resolved_at IS NULL`, s.rootID)
-	// Tombstone re-judgment is rate-limited: scanning every resolved
-	// intent every pass would pin the root descriptor (and the mount)
-	// nearly 100% of the time. Late effects are detected within
-	// tombstoneScanInterval rather than instantly.
-	scanTombs := time.Now().UnixNano()-s.lastTombScan.Load() >= tombstoneScanInterval.Nanoseconds()
+	// Tombstone re-judgment is rate-limited in two tiers: scanning every
+	// resolved intent every pass would pin the root descriptor (and the
+	// mount) nearly 100% of the time. Hot tombstones (younger than
+	// tombstoneColdAge, where late effects realistically arrive) are
+	// re-judged every tombstoneScanInterval; cold ones still carry the
+	// only evidence of a potentially delayed effect, so they are never
+	// deleted — just re-judged on the slower tombstoneColdScanInterval.
+	now := time.Now().UnixNano()
+	scanHot := now-s.lastTombScan.Load() >= tombstoneScanInterval.Nanoseconds()
+	scanCold := now-s.lastTombScanCold.Load() >= tombstoneColdScanInterval.Nanoseconds()
 	var tombs []intent
-	if scanTombs {
+	if scanHot {
 		tombs = load(`resolved_at IS NOT NULL AND resolved_at > now() - $2::interval`,
-			s.rootID, tombstoneRetain.String())
+			s.rootID, tombstoneColdAge.String())
 	}
+	if scanCold {
+		tombs = append(tombs, load(`resolved_at IS NOT NULL AND resolved_at <= now() - $2::interval`,
+			s.rootID, tombstoneColdAge.String())...)
+	}
+	scanTombs := len(tombs) > 0
 
 	settled := 0
 	for _, it := range pending {
@@ -1317,42 +1370,26 @@ func (s *Store) Reconcile(ctx context.Context) int {
 		}
 	}
 	if scanTombs {
-		s.lastTombScan.Store(time.Now().UnixNano())
+		now = time.Now().UnixNano()
+		if scanHot {
+			s.lastTombScan.Store(now)
+		}
+		if scanCold {
+			s.lastTombScanCold.Store(now)
+		}
 		for _, it := range tombs {
 			if s.deposed.Load() {
 				break
 			}
 			// Re-judgment: a tombstoned intent can only be APPLIED (its fs
-			// effect provably landed late) — never re-dropped; evidence stays
-			// until the retention horizon.
+			// effect provably landed late) — never re-dropped; its evidence
+			// is retained for as long as the intent remains unproven.
 			if s.reconcileOne(ctx, it, view, true) {
 				settled++
 			}
 		}
 	}
-	s.sweepTombstones(ctx)
 	return settled
-}
-
-// sweepTombstones deletes resolved intents past the evidence horizon —
-// the only hard-delete of reconciler-resolved intents. Owner-fenced.
-func (s *Store) sweepTombstones(ctx context.Context) {
-	ctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return
-	}
-	defer tx.Rollback(ctx)
-	if err := s.checkOwnerTx(ctx, tx); err != nil {
-		return
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM file_op WHERE resolved_at IS NOT NULL AND resolved_at < now() - $1::interval`,
-		tombstoneRetain.String()); err != nil {
-		return
-	}
-	tx.Commit(ctx)
 }
 
 // absentVerdict reports whether a stat error is a definitive current-path
@@ -1426,50 +1463,42 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 			}
 			return false
 		}
-		proven := false
-		if terr == nil {
-			var perr error
-			proven, perr = s.renameProven(ctx, it, toInfo, view)
-			if perr != nil {
-				if !tombstoned {
-					s.markStalled(ctx, it, perr)
-				}
-				return false
-			}
-		}
 		switch {
 		case ferr == nil && frInfo.Fingerprint == it.preFP:
-			// Source byte-identical to declare — the rename provably
-			// never ran, whatever sits at the destination.
+			// Source byte-identical to declare — the declared effect is
+			// absent; the rows still describe what is at their paths.
 			if tombstoned {
 				return false
 			}
 			return s.tombstoneIntent(ctx, it)
-		case ferr == nil:
-			// Source exists but changed — the rename can only have run
-			// if the destination is the moved original.
-			if terr == nil && proven {
-				return s.applyRename(ctx, it, toInfo, view, tombstoned)
-			}
-			if tombstoned {
-				return false
-			}
-			return s.tombstoneIntent(ctx, it)
-		default: // source absent
-			if terr == nil && proven {
-				return s.applyRename(ctx, it, toInfo, view, tombstoned)
-			}
-			if absentVerdict(terr) {
-				// Both legs absent — the subtree is gone either way.
-				if tombstoned {
-					return false
+		case terr == nil:
+			// Something occupies the destination. The reconciler does not
+			// decide whether "the rename happened": it relocates each
+			// recorded row whose object is observed at the corresponding
+			// destination path and absent at its recorded path (current
+			// state), journals those observations, and resolves the
+			// intent. Whatever is not evidenced stays where it is and is
+			// reported through the ordinary live-fingerprint comparison.
+			n, rerr := s.relocateRows(ctx, it, toInfo, view, absentVerdict(ferr))
+			if rerr != nil {
+				if !tombstoned {
+					s.markStalled(ctx, it, rerr)
 				}
-				return s.tombstoneIntentGhosts(ctx, it, true)
+				return false
 			}
-			if terr == nil {
-				log.Printf("reconcile: rename %s/%s -> %s destination not the moved source; resolving intent, keeping rows",
-					it.scope, it.path, it.toPath)
+			if tombstoned {
+				return n > 0
 			}
+			return s.tombstoneIntent(ctx, it)
+		case absentVerdict(ferr):
+			// Both legs absent — the subtree is gone either way.
+			if tombstoned {
+				return false
+			}
+			return s.tombstoneIntentGhosts(ctx, it, true)
+		default:
+			// Source present but changed, destination absent: nothing is
+			// observed anywhere else; rows stay, stat reports the change.
 			if tombstoned {
 				return false
 			}
@@ -1537,12 +1566,19 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 				// either our write landed and was then edited, or the
 				// write never ran and something else created the file.
 				// Record the version with a diverged fingerprint so
-				// stat/CAS report external_change (f83).
-				log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)
+				// stat/CAS report external_change (f83) — but KEEP the
+				// intent tombstoned: this op's bytes may still land late
+				// and overwrite the foreign content, and the intent is
+				// the only evidence that can re-attribute them.
 				info.Fingerprint = divergedFP(it.expectSHA)
+				if tombstoned && s.fpRecorded(ctx, it.scope, it.path, info.Fingerprint) {
+					return false // divergence already journaled; stay tombstoned
+				}
+				log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)
+				return s.applyKeep(ctx, it, info, contentSHA)
 			}
 		}
-		if err := s.apply(ctx, it, info, contentSHA, nil); err != nil {
+		if err := s.apply(ctx, it, info, contentSHA, false); err != nil {
 			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 			return false
 		}
@@ -1550,139 +1586,178 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 	}
 }
 
-// renameProven reports whether the destination is provably the moved
-// declare-time source — identity evidence, not mere existence (f106).
-//   - kind: destination kind must equal the declared source kind.
-//   - inode continuity: pre_fp ino == dest ino on both kinds (necessary,
-//     never sufficient alone — ext4 recycles inodes on delete+recreate).
-//   - file: size+mtime match AND content hash == the intent's recorded
-//     expect_sha. Metadata-only identity is forgeable (same-size content
-//     with preserved mtime on a recycled inode), so files require bytes.
-//   - dir: member corroboration — among the move-eligible version rows
-//     under the source (version < intent version), at least one sampled
-//     member must appear at the corresponding destination path with its
-//     recorded fingerprint exactly (fp includes ctime, which copy/restore
-//     cannot preserve — a matching member IS the recorded inode), and no
-//     sampled member may contradict (present with a different fp). A dir
-//     with no move-eligible rows carries no corroboratable evidence and
-//     stays unproven. Unsampled members move on the dir-level evidence;
-//     their per-member fp still exposes any foreign content at stat time.
-//
-// A non-nil error means the destination could not be judged this pass —
-// retry, not verdict.
-func (s *Store) renameProven(ctx context.Context, it intent, toInfo FileInfo, view ReconView) (bool, error) {
-	if it.srcKind == "" || it.srcKind != toInfo.Kind {
-		return false, nil
-	}
-	srcIno, srcSize, srcMt, haveSrc := fpParts(it.preFP)
-	toIno, toSize, toMt, haveTo := fpParts(toInfo.Fingerprint)
-	if !haveSrc || !haveTo || srcIno != toIno {
-		return false, nil
-	}
-	switch it.srcKind {
-	case "file":
-		if srcSize != toSize || srcMt != toMt || it.expectSHA == "" {
-			return false, nil
+// applyKeep records the observed (diverged) outcome AND retains the
+// intent as a tombstone — the declared write may still be in flight.
+func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, contentSHA string) bool {
+	if err := s.apply(ctx, it, info, contentSHA, true); err != nil {
+		if !errors.Is(err, errIntentSettled) {
+			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 		}
-		sha, err := view.Hash(it.scope, it.toPath)
-		if err != nil {
-			return false, err
-		}
-		return sha == it.expectSHA, nil
-	case "dir":
-		dctx, cancel := s.dbCtx(ctx)
-		defer cancel()
-		rows, err := s.pool.Query(dctx,
-			`SELECT path, fp FROM file_version
-			 WHERE scope=$1 AND starts_with(path, $2||'/') AND version < $3
-			 ORDER BY path LIMIT 64`,
-			it.scope, it.path, it.version)
-		if err != nil {
-			return false, err
-		}
-		type member struct{ p, fp string }
-		var members []member
-		for rows.Next() {
-			var m member
-			if rows.Scan(&m.p, &m.fp) == nil {
-				members = append(members, m)
-			}
-		}
-		rows.Close()
-		if len(members) == 0 {
-			return false, nil // nothing recorded to corroborate with
-		}
-		matched := 0
-		for _, m := range members {
-			st, serr := view.Stat(it.scope, it.toPath+m.p[len(it.path):])
-			switch {
-			case serr == nil && st.Fingerprint == m.fp:
-				matched++
-			case absentVerdict(serr):
-				// member absent — consistent with a post-move delete
-			case serr == nil:
-				// present with a different fp — positive evidence this
-				// is NOT simply the moved subtree
-				return false, nil
-			default:
-				return false, serr // could not observe this member
-			}
-		}
-		return matched >= 1, nil
-	default:
-		return false, nil
-	}
-}
-
-// applyRename applies a proven rename intent. For a tombstone being
-// re-judged, it first collects rows minted after the intent's declare
-// whose recorded fingerprint appears at the corresponding destination
-// path — evidence the late-landing rename physically carried them —
-// and moves those rows too instead of stranding them (f104/F-RA-6).
-func (s *Store) applyRename(ctx context.Context, it intent, toInfo FileInfo, view ReconView, tombstoned bool) bool {
-	var rescue []string
-	if tombstoned {
-		rescue = s.movedRows(ctx, it, view)
-	}
-	sha := ""
-	if it.srcKind == "file" {
-		sha = it.expectSHA // verified equal by the proof
-	}
-	if err := s.apply(ctx, it, toInfo, sha, rescue); err != nil {
-		log.Printf("reconcile: apply rename %s/%s -> %s: %v", it.scope, it.path, it.toPath, err)
 		return false
 	}
 	return true
 }
 
-// movedRows lists subtree rows minted after the intent's declare
-// (version >= it.version — post-resolution work the exclusion hot window
-// could not cover) whose destination member carries the recorded
-// fingerprint: evidence the late rename moved that object too. Rows
-// without a matching destination member stay at their paths — stranded
-// honestly, never claimed.
-func (s *Store) movedRows(ctx context.Context, it intent, view ReconView) []string {
+// fpRecorded reports whether the version row already carries fp — used to
+// keep a diverged tombstone idempotent: the same foreign content is
+// recorded once, never re-minted every scan.
+func (s *Store) fpRecorded(ctx context.Context, scope, path, fp string) bool {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var cur string
+	if err := s.pool.QueryRow(dctx,
+		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, path).Scan(&cur); err != nil {
+		return false
+	}
+	return cur == fp
+}
+
+// relocateRows re-keys version rows from a rename intent's source subtree
+// to its destination subtree on PER-ROW evidence about the CURRENT state
+// — it never decides whether the rename "happened":
+//
+//   - a member row (below the source path) moves when its recorded path
+//     is definitively absent and the object at the corresponding
+//     destination path carries the row's exact recorded fingerprint
+//     (ino:size:mtime:ctime). A member of a moved directory keeps all
+//     four; copy/restore, link, chmod, or an individual mv change ctime
+//     (verified on ext4 and JuiceFS), so the match identifies the same
+//     inode in the same recorded state.
+//   - the intent's own source object changes its ctime by being moved,
+//     so an exact match is impossible for it. A regular file is relocated
+//     only when its recorded path is absent, ino/size/mtime equal the
+//     declare-time fingerprint and the destination bytes hash to the
+//     recorded expect_sha (the row fp is refreshed to the live one — the
+//     bytes are proven). A directory's own row is never relocated: an
+//     inode number is not identity on ext4 and nothing else survives the
+//     move.
+//
+// Rows keep their versions (no version is minted) and each relocation is
+// journaled as a `relocate` event (path=new, from=old) — an observation,
+// not a claim that the service performed a rename. Rows without evidence
+// stay put and surface through the live-fingerprint comparison (404 at
+// the recorded path / version 0 at the destination) like any external
+// change. There is no version guard: rows minted after the intent are
+// judged on the same evidence, which subsumes the earlier "rescue".
+//
+// srcAbsent short-circuits the per-row source stat when the whole source
+// path is already known absent (every descendant path is then absent as
+// addressed). A non-nil error means some member could not be observed —
+// retry next pass, no verdict.
+func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, view ReconView, srcAbsent bool) (int, error) {
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	rows, err := s.pool.Query(dctx,
 		`SELECT path, fp FROM file_version
-		 WHERE scope=$1 AND starts_with(path, $2||'/') AND version >= $3
-		 ORDER BY path LIMIT 256`,
-		it.scope, it.path, it.version)
+		 WHERE scope=$1 AND (path=$2 OR starts_with(path, $2||'/'))
+		 ORDER BY path`,
+		it.scope, it.path)
 	if err != nil {
-		return nil
+		return 0, err
 	}
-	defer rows.Close()
-	var rescue []string
+	type member struct{ p, fp string }
+	var members []member
 	for rows.Next() {
-		var p, fp string
-		if rows.Scan(&p, &fp) != nil || fp == "" {
+		var m member
+		if rows.Scan(&m.p, &m.fp) == nil {
+			members = append(members, m)
+		}
+	}
+	rows.Close()
+	cancel()
+
+	type move struct{ from, to, fp, sha string }
+	var moves []move
+	for _, m := range members {
+		dest := it.toPath + m.p[len(it.path):]
+		if !srcAbsent {
+			_, serr := view.Stat(it.scope, m.p)
+			if serr == nil {
+				continue // still reachable at its recorded path
+			}
+			if !absentVerdict(serr) {
+				return 0, serr
+			}
+		}
+		if m.p == it.path {
+			// The moved object itself: files by ino/size/mtime + bytes.
+			if it.srcKind != "file" || toInfo.Kind != "file" || it.expectSHA == "" {
+				continue
+			}
+			srcIno, srcSize, srcMt, okS := fpParts(it.preFP)
+			toIno, toSize, toMt, okT := fpParts(toInfo.Fingerprint)
+			if !okS || !okT || srcIno != toIno || srcSize != toSize || srcMt != toMt {
+				continue
+			}
+			h, herr := view.Hash(it.scope, dest)
+			if herr != nil {
+				if absentVerdict(herr) {
+					continue
+				}
+				return 0, herr
+			}
+			if h != it.expectSHA {
+				continue
+			}
+			moves = append(moves, move{m.p, dest, toInfo.Fingerprint, it.expectSHA})
 			continue
 		}
-		st, serr := view.Stat(it.scope, it.toPath+p[len(it.path):])
-		if serr == nil && st.Fingerprint == fp {
-			rescue = append(rescue, p)
+		if m.fp == "" || strings.HasPrefix(m.fp, "diverged:") {
+			continue // nothing exact to match
+		}
+		st, serr := view.Stat(it.scope, dest)
+		if serr != nil {
+			if absentVerdict(serr) {
+				continue
+			}
+			return 0, serr
+		}
+		if st.Fingerprint != m.fp {
+			continue
+		}
+		moves = append(moves, move{m.p, dest, m.fp, ""})
+	}
+	if len(moves) == 0 {
+		return 0, nil
+	}
+
+	tctx, tcancel := s.dbCtx(ctx)
+	defer tcancel()
+	tx, err := s.pool.BeginTx(tctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(tctx)
+	if err := s.checkOwnerTx(tctx, tx); err != nil {
+		return 0, err
+	}
+	for _, mv := range moves {
+		// A row already at the destination path describes an object that
+		// is provably not there any more (the relocated one is).
+		if _, err := tx.Exec(tctx,
+			`DELETE FROM file_version WHERE scope=$1 AND path=$2`, it.scope, mv.to); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(tctx,
+			`UPDATE file_version SET path=$3, fp=$4,
+			        content_sha = CASE WHEN $5 <> '' THEN $5 ELSE content_sha END,
+			        updated = now()
+			 WHERE scope=$1 AND path=$2`,
+			it.scope, mv.from, mv.to, mv.fp, mv.sha); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(tctx,
+			`INSERT INTO file_event (scope, path, from_path, op, version)
+			 SELECT scope, path, $2, 'relocate', version FROM file_version WHERE scope=$1 AND path=$3`,
+			it.scope, mv.from, mv.to); err != nil {
+			return 0, err
 		}
 	}
-	return rescue
+	if err := tx.Commit(tctx); err != nil {
+		return 0, err
+	}
+	log.Printf("reconcile: rename %s/%s -> %s: relocated %d recorded object(s) by fingerprint evidence; no rename claimed",
+		it.scope, it.path, it.toPath, len(moves))
+	return len(moves), nil
 }

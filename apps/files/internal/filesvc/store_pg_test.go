@@ -354,6 +354,12 @@ func TestPGReconcileDivergedWrite(t *testing.T) {
 	if !hasPrefix(fp, "diverged:") {
 		t.Fatalf("fp %q should carry the diverged marker", fp)
 	}
+	// The intent is RETAINED as a tombstone: this op's bytes may still be
+	// in flight and could land late — the intent row is the only evidence
+	// that can re-attribute them. It is never erased by a timer.
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("diverged write intent erased: total=%d", n)
+	}
 }
 
 func hasPrefix(s, p string) bool { return len(s) >= len(p) && s[:len(p)] == p }
@@ -447,12 +453,15 @@ func TestPGStaleRenameKeepsNewerRows(t *testing.T) {
 	if v, _ := versionOf(t, s, "ws", "d1/new.txt"); v != 5 {
 		t.Fatalf("d1/new.txt version = %d — stale rename stole the row", v)
 	}
-	// The declare-time descendant moved with the rename.
+	// The declare-time descendant moved with the rename — relocated,
+	// version preserved.
 	if v, _ := versionOf(t, s, "ws", "d2/old.txt"); v != 2 {
 		t.Fatalf("d2/old.txt version = %d, want 2", v)
 	}
-	if v, _ := versionOf(t, s, "ws", "d2"); v != 4 {
-		t.Fatalf("d2 version = %d, want 4", v)
+	// The directory's own identity is never claimed: no row is minted at
+	// the destination dir.
+	if v, _ := versionOf(t, s, "ws", "d2"); v != 0 {
+		t.Fatalf("d2 version = %d — dir rows are never relocated", v)
 	}
 }
 
@@ -472,10 +481,10 @@ func TestPGApplyIsIdempotent(t *testing.T) {
 	})
 	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
 		path: "f.txt", version: 46}
-	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", nil); err != nil {
+	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", nil)
+	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false)
 	if !errors.Is(err, errIntentSettled) {
 		t.Fatalf("second apply = %v, want errIntentSettled", err)
 	}
@@ -595,7 +604,7 @@ func TestPGDropFencedForeignOwner(t *testing.T) {
 	if s.dropIntentGhosts(ctx, it, true) {
 		t.Fatal("dropIntentGhosts deleted under a foreign owner")
 	}
-	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", nil); err == nil {
+	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", false); err == nil {
 		t.Fatal("apply ran under a foreign owner")
 	}
 	if n := intentCount(t, s); n != 1 {
@@ -699,8 +708,9 @@ func TestPGRenameReconcileForeignDest(t *testing.T) {
 	}
 }
 
-// f106 positive leg: the destination IS the moved source (inode
-// continuity) — the intent applies, moving the subtree rows.
+// Positive leg: the recorded source object is observed at the
+// destination (ino/size/mtime + bytes). The row is RELOCATED keeping its
+// version — no rename is claimed, no version is minted.
 func TestPGRenameReconcileIdentityMatch(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -727,15 +737,28 @@ func TestPGRenameReconcileIdentityMatch(t *testing.T) {
 		t.Fatalf("reconcile settled %d", got)
 	}
 	v, fp := versionOf(t, s, "ws", "f2.txt")
-	if v != 21 {
-		t.Fatalf("destination version = %d, want 21", v)
+	if v != 10 {
+		t.Fatalf("destination version = %d — relocation must keep the row's version 10", v)
 	}
 	live, _ := disk.stat("ws", "f2.txt")
 	if fp != live.Fingerprint {
-		t.Fatalf("clean rename recorded fp %q, want live %q", fp, live.Fingerprint)
+		t.Fatalf("relocated fp %q, want live %q", fp, live.Fingerprint)
 	}
 	if v, _ := versionOf(t, s, "ws", "f1.txt"); v != 0 {
 		t.Fatalf("source row left behind: %d", v)
+	}
+	// The journal records an observation (relocate), never a rename.
+	var nRel, nRen int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op='relocate' AND path='f2.txt'`).Scan(&nRel); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op='rename'`).Scan(&nRen); err != nil {
+		t.Fatal(err)
+	}
+	if nRel != 1 || nRen != 0 {
+		t.Fatalf("events: relocate=%d rename=%d, want 1/0", nRel, nRen)
 	}
 }
 
@@ -1274,8 +1297,8 @@ func TestPGTombstoneLateRenameRescue(t *testing.T) {
 	if got := s.Reconcile(ctx); got != 1 {
 		t.Fatalf("tombstone re-judgment settled %d", got)
 	}
-	if v, _ := versionOf(t, s, "ws", "s2"); v != 5 {
-		t.Fatalf("destination version = %d, want 5", v)
+	if v, _ := versionOf(t, s, "ws", "s2"); v != 0 {
+		t.Fatalf("dir body row claimed: %d — dirs are never relocated", v)
 	}
 	if v, _ := versionOf(t, s, "ws", "s2/k.txt"); v != 2 {
 		t.Fatalf("pre-intent member version = %d, want 2", v)
@@ -1285,5 +1308,184 @@ func TestPGTombstoneLateRenameRescue(t *testing.T) {
 	}
 	if v, _ := versionOf(t, s, "ws", "s1/post.txt"); v != 0 {
 		t.Fatalf("rescued row still at old path: %d", v)
+	}
+}
+
+// Fable defect: a hardlink (or a symlink that stats as the source) makes
+// the destination indistinguishable from the moved object by inode,
+// size, mtime AND content. The source is still present with its
+// declare-time fingerprint, so the intent is tombstoned — the source
+// row is never deleted and no rename/relocate is claimed.
+func TestPGDestStatsAsSourceNotClaimed(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "a.txt", "payload")
+	srcInfo, _ := disk.stat("ws", "a.txt")
+	// `ln a.txt b.txt` / `ln -s a.txt b.txt`: stat(b.txt) returns a.txt's
+	// exact metadata — inode, times, bytes all identical, no rename ran.
+	disk.put("ws", "b.txt", "payload")
+	ino, _, _, _ := fpParts(srcInfo.Fingerprint)
+	var srcIno uint64
+	if _, err := fmt.Sscanf(ino, "%d", &srcIno); err != nil {
+		t.Fatal(err)
+	}
+	disk.setIno("ws", "b.txt", srcIno)
+	// forge identical mtime so the whole fingerprint matches
+	disk.mts["ws/b.txt"] = disk.mts["ws/a.txt"]
+
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES ('ws','a.txt',10,$1)`,
+		srcInfo.Fingerprint); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "a.txt", toPath: "b.txt",
+		version: 30, preFP: srcInfo.Fingerprint, srcKind: "file",
+		expectSHA: sha("payload"), at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "a.txt"); v != 10 {
+		t.Fatalf("still-present source row lost: %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "b.txt"); v != 0 {
+		t.Fatalf("foreign destination claimed: %d", v)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op IN ('rename','relocate')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("move events journaled for a rename that never ran (%d)", n)
+	}
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("tombstone erased: %d", n)
+	}
+}
+
+// Source recreated after a genuine move: the recorded member relocates
+// to the destination on exact fingerprint evidence; a row describing the
+// RECREATED source object (different fp) stays at the source path and is
+// never stolen into the moved subtree.
+func TestPGReconcileSourceRecreatedKeepsRow(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	disk.put("ws", "r1", "dir")
+	r1, _ := disk.stat("ws", "r1")
+	disk.put("ws", "r1/k.txt", "kid")
+	kid, _ := disk.stat("ws", "r1/k.txt")
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp) VALUES
+		 ('ws','r1/k.txt',3,$1), ('ws','r1/late.txt',8,'fp-recreated')`,
+		kid.Fingerprint)
+	if err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+	disk.mv("ws", "r1", "r2")            // genuine move
+	disk.put("ws", "r1", "dir")          // source dir recreated
+	disk.put("ws", "r1/late.txt", "new") // and a NEW object at a recorded path
+
+	insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename", path: "r1", toPath: "r2",
+		version: 6, preFP: r1.Fingerprint, srcKind: "dir",
+		at: time.Now().Add(-time.Minute),
+	})
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("reconcile settled %d", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "r2/k.txt"); v != 3 {
+		t.Fatalf("moved member version = %d, want 3", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "r1/late.txt"); v != 8 {
+		t.Fatalf("recreated-source row stolen: %d", v)
+	}
+	if v, _ := versionOf(t, s, "ws", "r2/late.txt"); v != 0 {
+		t.Fatalf("row relocated despite live source path: %d", v)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_event WHERE op='rename'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("reconciler emitted a rename event (%d)", n)
+	}
+}
+
+// A tombstone is never erased by age: a reconciled intent older than any
+// horizon still carries its evidence and is still re-judged.
+func TestPGTombstoneNeverSwept(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	disk := newFakeDisk()
+	s.SetReconcile(disk.stat, disk.hash, nil)
+	ctx := context.Background()
+
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "old.txt",
+		version: 40, expectSHA: sha("old"), at: time.Now().Add(-72 * time.Hour),
+	})
+	resolveIntent(t, s, id)
+	// Age the tombstone past any horizon.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET resolved_at = now() - interval '72 hours' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	s.lastTombScan.Store(0)
+	s.lastTombScanCold.Store(0)
+	s.Reconcile(ctx)
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("aged tombstone swept: %d intents remain", n)
+	}
+	// And it is still re-judged: the effect landing NOW is applied.
+	disk.put("ws", "old.txt", "old")
+	s.lastTombScanCold.Store(0)
+	if got := s.Reconcile(ctx); got != 1 {
+		t.Fatalf("aged tombstone not re-judged (settled %d)", got)
+	}
+	if v, _ := versionOf(t, s, "ws", "old.txt"); v != 40 {
+		t.Fatalf("late-landed write on aged tombstone not applied: %d", v)
+	}
+}
+
+// applyUntilSettled: a live process that observed fs success retries DB
+// persistence; a foreign owner (lost writer lock) ends the retry and the
+// intent is left for the owner.
+func TestPGApplyUntilSettledForeignOwner(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	s := newPGStore(t, dsn, t.TempDir())
+	ctx := context.Background()
+
+	id := insertIntent(t, s, intent{
+		owner: s.owner, scope: "ws", op: "write", path: "w.txt",
+		version: 50, expectSHA: sha("w"), at: time.Now(),
+	})
+	// Another instance takes the writer lock.
+	if _, err := s.pool.Exec(ctx, `UPDATE store_meta SET owner='other-inst'`); err != nil {
+		t.Fatal(err)
+	}
+	err := s.applyUntilSettled(intent{
+		id: id, owner: s.owner, scope: "ws", op: "write", path: "w.txt",
+		version: 50, expectSHA: sha("w"),
+	}, FileInfo{Fingerprint: "fp-w"}, sha("w"))
+	if !errors.Is(err, errForeignOwner) {
+		t.Fatalf("applyUntilSettled = %v, want foreign owner", err)
+	}
+	if n := intentCount(t, s); n != 1 {
+		t.Fatalf("foreign-owned intent consumed: %d", n)
 	}
 }
