@@ -146,10 +146,15 @@ evidence, so no lost response, retry or partition creates two writers:
   name that input's own `input_received` event in the carried journal, and
   every journaled `input_received` must be the one its input points at —
   otherwise the destination would drop the real event or journal it twice.
-  The store enforces the same invariant at the write boundary: a commit's
-  second copy of an input's receipt is dropped rather than journaled, and
-  every receipt a commit journals is linked to its input's marker — so a
-  commit the store accepted can never make the secretary unsealable.
+  For receipts emitted by the core, the store enforces this invariant at
+  the write boundary: duplicate string IDs naming existing inputs are
+  dropped, and journaled receipts are linked to those inputs' markers.
+  Direct store-API calls can still create an unlinked receipt using a
+  non-string ID, or a receipt for an absent input whose ID is submitted
+  later. Such sequences are not emitted by the current core and are
+  refused at seal; additional input-record validation remains a follow-up.
+  FakeState handles those two edge cases differently and does not establish
+  their PostgreSQL behavior.
 
 ## Secrets
 
