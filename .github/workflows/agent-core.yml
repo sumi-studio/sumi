@@ -71,6 +71,9 @@ jobs:
       - name: Run durable-plan e2e (real Go state service + real PostgreSQL)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:plan
 
+      - name: Run jobs e2e (real runner + real PostgreSQL)
+        run: corepack pnpm --filter @sumi/agent-core test:e2e:jobs
+
       - name: Run workerd smoke (local wrangler dev + real state service)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
 

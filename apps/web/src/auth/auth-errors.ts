@@ -1,4 +1,8 @@
 import { FirebaseError } from "firebase/app";
+import {
+  RedirectSignInAbandonedError,
+  RedirectSignInExpiredError,
+} from "./redirect-sign-in";
 import { AuthAPIError } from "./session-client";
 
 const firebaseErrorMessages: Record<string, string> = {
@@ -9,6 +13,13 @@ const firebaseErrorMessages: Record<string, string> = {
   "auth/popup-blocked":
     "ポップアップがブロックされました。ブラウザの設定を確認してください。",
   "auth/popup-closed-by-user": "ログインがキャンセルされました。",
+  "auth/redirect-cancelled-by-user": "ログインがキャンセルされました。",
+  "auth/redirect-operation-pending":
+    "別のログインを処理しています。少し待ってから、もう一度お試しください。",
+  "auth/unauthorized-domain":
+    "このドメインからはログインできません。別のURLからお試しください。",
+  "auth/web-storage-unsupported":
+    "ブラウザがログイン情報を保存できないため、ログインを完了できません。プライベートモードやCookieのブロックを解除してお試しください。",
   "auth/network-request-failed":
     "通信できませんでした。接続を確認して、もう一度お試しください。",
   "auth/too-many-requests":
@@ -17,6 +28,12 @@ const firebaseErrorMessages: Record<string, string> = {
 };
 
 export function getAuthErrorMessage(error: unknown): string {
+  if (error instanceof RedirectSignInExpiredError) {
+    return "ログインの有効期限が切れました。もう一度お試しください。";
+  }
+  if (error instanceof RedirectSignInAbandonedError) {
+    return "ログインは完了しませんでした。キャンセルされたか、ブラウザがログイン状態を保持できませんでした。もう一度お試しください。";
+  }
   if (error instanceof FirebaseError) {
     return (
       firebaseErrorMessages[error.code] ??
@@ -24,6 +41,10 @@ export function getAuthErrorMessage(error: unknown): string {
     );
   }
   if (error instanceof AuthAPIError) {
+    if (error.status === 410) {
+      // flow_expired: the provider return outlived the server-side flow TTL.
+      return "ログインの有効期限が切れました。もう一度お試しください。";
+    }
     if (error.status === 403) {
       return "このアカウントは Sumi の利用対象に登録されていません。";
     }

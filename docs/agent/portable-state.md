@@ -9,7 +9,7 @@ It is portability for state the new architecture creates, not an importer for
 the old Rust/SQLite data.
 
 Code: `apps/api/internal/portable` (state service), migration
-`0048_core_transfer`. Proof: `go test ./internal/portable/` (two real
+`0049_core_transfer`. Proof: `go test ./internal/portable/` (two real
 PostgreSQL databases) and `apps/core/scripts/e2e-portable.mjs` (two state
 services, two databases, the real Node core).
 
@@ -85,8 +85,12 @@ evidence, so no lost response, retry or partition creates two writers:
   the source mints at the seal; the destination stores it at import and uses it
   to mint the proofs. It authorizes evidence for this one transfer only.
 - Not carried: the writer lease (only its generation, as the epoch floor),
-  placement authority, and the human binding — the destination binds the
-  persona to its own authenticated human.
+  placement authority, the human binding — the destination binds the
+  persona to its own authenticated human — and `core_jobs`. A job is
+  runner-owned execution bound to the placement that queued it; carrying a
+  claim could run the same work twice, so job rows stay behind. A job's
+  terminal notification is an ordinary `job:<job_id>` input and does cross
+  in `core_inputs` — the result still reaches the moved secretary.
 - A reader refuses a format version, section or contract it does not implement.
   There is no compatibility layer; version 1 is the only version.
 - The digest detects truncation and corruption. It is not authentication: the
@@ -98,6 +102,12 @@ evidence, so no lost response, retry or partition creates two writers:
 
 - **Unresolved effects.** Seal refuses while any operation is `running`: its
   external result is unknown, and moving it could repeat or lose the effect.
+  The same rule covers non-terminal jobs (`queued`, `running`,
+  `cancel_requested`): job submission takes a share lock on the persona row
+  and requires `authority = 'active'`, so a submit either lands inside the
+  cut — and the seal then refuses — or is refused on the sealed persona.
+  A job can never slip between the check and the commit, and a claim never
+  starts work for a non-active persona.
 - **Second copy.** Import refuses a persona id already present in the
   destination, whatever its authority. A transfer never overwrites a secretary
   and never creates a duplicate of one that is already there.
@@ -124,7 +134,7 @@ before a transfer may claim to preserve it:
 | Section | Owner | What the section must provide |
 |---|---|---|
 | `files` | fabric-cloud (M11) | Scope↔persona/workspace binding; manifest of path, version and content SHA-256; bytes transferred separately and verified against the manifest before staging completes; version floor so destination CAS versions never go backwards; relative paths and links contained in the declared root. **At the seal, executor writes must actually stop** (unmount or stop the executor): CAS fences API writers only, and a direct POSIX write after the cut would be lost. Large content may pre-copy before the seal and send only the final delta at the cut. |
-| `jobs` | jobs-results (M09) | Job and attempt records keyed to their operations. A running job is never copied as running: before the seal it is drained, cancelled, or recorded as source-bound with a result-reconciliation path, and seal must refuse otherwise (as it does for running operations). Completion authority after the move belongs to the destination; a late result from the source is reconciled, not executed again. |
+| `jobs` | jobs-results (M09) | Today `core_jobs` is placement-local and the seal refuses while any job is non-terminal, so in-flight work can neither be lost nor duplicated; a finished job's `job:<job_id>` notification input does travel with the cut. The section still owed: carrying terminal job *records* for history, and a path that lets a move proceed with in-flight jobs — drained or recorded source-bound with result reconciliation — rather than blocking. Completion authority after the move would belong to the destination; a late source result is reconciled, not executed again. |
 | `memory_projection` | M06 | Encrypted originals may be re-encrypted for the destination. Search projections may be rebuilt there instead of carried. The journal and notes already travel in `core`. |
 | `approvals` | M08 | Pending human approvals carried as evidence, re-validated at the destination against the same operation, target and current permissions before use. |
 | `connections` | M08 / D9 | Connection metadata and provider context references only. Secrets never travel in a bundle; the receipt lists each connection needing reauthorization. |

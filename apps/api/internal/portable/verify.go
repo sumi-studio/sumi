@@ -32,14 +32,22 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE o.persona_id = $1 AND NOT EXISTS (
 			SELECT 1 FROM core_turns t WHERE t.persona_id = o.persona_id AND t.turn_id = o.turn_id)`},
 	// An operation's identity is its position in the input's recorded plan;
-	// without that plan entry a destination could re-execute it as new.
+	// without that plan entry a destination could re-execute it as new. The
+	// key's call index addresses a flat position across every round's calls
+	// in order — the same indexing ClaimOperation applies.
 	{"operation_outside_recorded_plan", `
 		SELECT count(*) FROM core_operations o
 		WHERE o.persona_id = $1 AND NOT EXISTS (
 			SELECT 1 FROM core_turn_plans p
+			CROSS JOIN LATERAL (
+				SELECT row_number() OVER (ORDER BY r.ri, c.ci) - 1 AS flat_idx,
+				       c.call->>'tool' AS tool
+				FROM jsonb_array_elements(p.plan) WITH ORDINALITY AS r(round, ri)
+				CROSS JOIN LATERAL jsonb_array_elements(r.round->'calls') WITH ORDINALITY AS c(call, ci)
+			) AS f
 			WHERE p.persona_id = o.persona_id
-			  AND o.idempotency_key = p.input_id || ':tool:' || substring(o.idempotency_key from ':tool:([0-9]+)$')
-			  AND p.plan->'calls'->(substring(o.idempotency_key from ':tool:([0-9]+)$')::int)->>'tool' = o.tool)`},
+			  AND o.idempotency_key = p.input_id || ':tool:' || f.flat_idx::text
+			  AND f.tool = o.tool)`},
 	// Recovery requeues a running turn's input only while that input is
 	// claimed by the turn; anything else would strand the input.
 	{"running_turn_input_not_claimed", `

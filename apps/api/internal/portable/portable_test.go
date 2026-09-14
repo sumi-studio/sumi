@@ -100,7 +100,7 @@ func liveSecretary(t *testing.T, p placement, personaID string) int64 {
 		"payload":     map[string]any{"text": "tea time"},
 	}}
 	plan1 := agentstate.Decision{Text: "noted", Calls: []agentstate.PlanCall{note("The user takes tea at 15:00"), reminder}}
-	must(drop(p.state.SavePlan(ctx, personaID, "turn-1", gen, plan1)))
+	must(drop(p.state.SavePlan(ctx, personaID, "turn-1", gen, 0, plan1)))
 	for i, c := range plan1.Calls {
 		if _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-1", gen, fmt.Sprintf("op-1-%d", i), c.Tool, i, c.Request); err != nil {
 			t.Fatalf("claim turn-1 call %d: %v", i, err)
@@ -118,7 +118,7 @@ func liveSecretary(t *testing.T, p placement, personaID string) int64 {
 		t.Fatalf("turn-2 claimed %+v", load.Input)
 	}
 	plan2 := agentstate.Decision{Text: "moving", Calls: []agentstate.PlanCall{note("Mid-move note"), note("Second note after the move")}}
-	must(drop(p.state.SavePlan(ctx, personaID, "turn-2", gen, plan2)))
+	must(drop(p.state.SavePlan(ctx, personaID, "turn-2", gen, 0, plan2)))
 	if _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-2", gen, "op-2-a", "journal.note", 0, plan2.Calls[0].Request); err != nil {
 		t.Fatalf("claim turn-2 call 0: %v", err)
 	}
@@ -321,14 +321,15 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 		t.Fatalf("recovery %+v", recovered)
 	}
 	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-2b", 50))
-	if load.Input == nil || load.Input.InputID != "in-2" || load.Turn.Attempt != 2 || load.Plan == nil || len(load.Plan.Plan.Calls) != 2 {
+	if load.Input == nil || load.Input.InputID != "in-2" || load.Turn.Attempt != 2 ||
+		load.Plan == nil || len(load.Plan.Plan) != 1 || len(load.Plan.Plan[0].Calls) != 2 {
 		t.Fatalf("resumed turn %+v input %+v plan %+v", load.Turn, load.Input, load.Plan)
 	}
-	op, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-a", "journal.note", 0, load.Plan.Plan.Calls[0].Request)
+	op, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-a", "journal.note", 0, load.Plan.Plan[0].Calls[0].Request)
 	if err != nil || fresh || op.OperationID != "op-2-a" {
 		t.Fatalf("carried call 0: op=%+v fresh=%v err=%v", op, fresh, err)
 	}
-	if _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-b", "journal.note", 1, load.Plan.Plan.Calls[1].Request); err != nil || !fresh {
+	if _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-b", "journal.note", 1, load.Plan.Plan[0].Calls[1].Request); err != nil || !fresh {
 		t.Fatalf("remaining call 1: fresh=%v err=%v", fresh, err)
 	}
 	must(cloud.state.CommitTurn(ctx, pid, "turn-2b", gen, agentstate.CommitRequest{Outcome: "complete", Output: map[string]any{"text": "moving"}}))
@@ -488,6 +489,122 @@ func TestSealRefusesUnresolvedExternalOperation(t *testing.T) {
 	}
 	if _, err := local.svc.Status(ctx, "export", "move-0004"); !errors.Is(err, ErrTransferNotFound) {
 		t.Fatalf("refused seal recorded a transfer: %v", err)
+	}
+}
+
+// A job is runner-owned execution bound to the placement that queued it, so
+// job rows are never carried. The seal refuses while one is queued, running
+// or cancel-requested — finishing it detached on a sealed source would drop
+// its result into a dead inbox, and carrying the claim could start the same
+// work twice. A refused seal leaves the placement live: the runner still
+// finishes the job, and its terminal notification crosses the boundary as an
+// ordinary input. On the sealed source a fresh submit is refused while a
+// replay of the accepted job still answers, and no claim can start work.
+func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	liveSecretary(t, local, pid)
+	cloudID := placementID(t, cloud)
+
+	jobReq := map[string]any{"command": []any{"echo", "hi"}}
+	if _, created, err := local.state.SubmitJob(ctx, pid, "j-1", "subprocess", jobReq, "api"); err != nil || !created {
+		t.Fatalf("submit j-1: created=%v err=%v", created, err)
+	}
+	if _, err := local.svc.Seal(ctx, pid, "move-jobs", cloudID); !errors.Is(err, ErrUnresolvedOperations) ||
+		!strings.Contains(err.Error(), "j-1") {
+		t.Fatalf("seal with a queued job: %v, want unresolved j-1", err)
+	}
+	if a := authority(t, local, pid); a != "active" {
+		t.Fatalf("refused seal left authority %s", a)
+	}
+
+	claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4)
+	if err != nil || len(claimed) != 1 || claimed[0].JobID != "j-1" {
+		t.Fatalf("claim after refused seal: claimed=%+v err=%v", claimed, err)
+	}
+	if _, err := local.state.CompleteJob(ctx, pid, "j-1", "runner-1", "done",
+		map[string]any{"exit_code": 0.0}, ""); err != nil {
+		t.Fatalf("complete j-1: %v", err)
+	}
+
+	must(local.svc.Seal(ctx, pid, "move-jobs", cloudID))
+	if _, _, err := local.state.SubmitJob(ctx, pid, "j-2", "subprocess", jobReq, "api"); !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("submit after seal: %v, want persona inactive", err)
+	}
+	if j, created, err := local.state.SubmitJob(ctx, pid, "j-1", "subprocess", jobReq, "api"); err != nil || created || j.Status != "done" {
+		t.Fatalf("replay j-1 after seal: created=%v status=%s err=%v", created, j.Status, err)
+	}
+	if claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil || len(claimed) != 0 {
+		t.Fatalf("claim on the sealed persona: claimed=%+v err=%v", claimed, err)
+	}
+
+	bundle, _ := exportBytes(t, local, pid, "move-jobs")
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	act := must(cloud.svc.Activate(ctx, pid, "move-jobs"))
+	must(local.svc.Complete(ctx, pid, "move-jobs", act.ActivateProof))
+
+	var jobs, notes int
+	if err := cloud.pool.QueryRow(ctx, `SELECT count(*) FROM core_jobs WHERE persona_id = $1`, pid).Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatalf("destination carries %d job rows (err=%v), want none", jobs, err)
+	}
+	if err := cloud.pool.QueryRow(ctx, `SELECT count(*) FROM core_inputs WHERE persona_id = $1 AND input_id = 'job:j-1'`, pid).
+		Scan(&notes); err != nil || notes != 1 {
+		t.Fatalf("destination job notification = %d (err=%v), want the one terminal input", notes, err)
+	}
+}
+
+// A submit that loses the race with the seal is refused, never queued on the
+// sealed source; one that wins is inside the cut, where the seal's in-flight
+// check refuses the move. The share-locked persona row makes the two
+// transactions serialize — no job can slip between the check and the commit.
+func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
+	ctx := context.Background()
+	for i := 0; i < 24; i++ {
+		local := newPlacement(t)
+		pid := newID(t)
+		liveSecretary(t, local, pid)
+		jobReq := map[string]any{"command": []any{"echo", "hi"}}
+		jobID := fmt.Sprintf("j-race-%d", i)
+		destination := newID(t)
+
+		submitErr := make(chan error, 1)
+		go func() {
+			_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
+			submitErr <- err
+		}()
+		sealErr := make(chan error, 1)
+		go func() {
+			_, err := local.svc.Seal(ctx, pid, "move-race", destination)
+			sealErr <- err
+		}()
+		sErr, jErr := <-sealErr, <-submitErr
+
+		var queued bool
+		if err := local.pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
+			pid, jobID).Scan(&queued); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case sErr == nil && jErr == nil && queued:
+			t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
+		case sErr == nil:
+			if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
+				t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+			}
+			if queued {
+				t.Fatalf("race %d: refused submit left a job row", i)
+			}
+		case errors.Is(sErr, ErrUnresolvedOperations):
+			if jErr != nil || !queued {
+				t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
+			}
+		default:
+			t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
+		}
 	}
 }
 

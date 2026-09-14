@@ -32,7 +32,8 @@
         }
       ],
       "vars": {
-        "SUMI_ORIGIN_PROTOCOL": "http"
+        "SUMI_ORIGIN_PROTOCOL": "http",
+        "SUMI_FIREBASE_AUTH_DOMAIN": "sumi-studio.firebaseapp.com"
       }
     }
   }

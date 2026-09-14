@@ -270,7 +270,10 @@ var coreTables = []table{
 
 // placementLocalTables reference core_personas but are never carried: the
 // lease is live execution authority (only its generation travels, as the
-// cut's epoch floor).
+// cut's epoch floor), and a job's claim is runner-owned execution authority
+// bound to the placement that queued it (seal refuses while any job is
+// non-terminal, so nothing in flight can be left behind or duplicated).
 var placementLocalTables = map[string]string{
 	"core_writer_leases": "live execution authority; the generation travels as cut.generation_high_water",
+	"core_jobs":          "runner-owned execution authority; seal refuses while a job is non-terminal, so job records stay with the placement that ran them",
 }

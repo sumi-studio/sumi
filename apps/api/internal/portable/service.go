@@ -293,6 +293,23 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		return Receipt{}, fmt.Errorf("%w: %s; reconcile them before sealing",
 			ErrUnresolvedOperations, strings.Join(running, ", "))
 	}
+	// A non-terminal job is an unresolved external effect of the same kind:
+	// its runner claim belongs to this placement, so moving now would leave
+	// work running detached — finishing detached on a sealed source whose
+	// notification lands in a dead inbox — while the destination knows
+	// nothing of it. Finish or cancel the jobs, then seal. The persona row
+	// lock held here serializes this check against submitJobTx's share-lock.
+	inflight, err := strings_(ctx, tx, `
+		SELECT job_id || ' (' || status || ')' FROM core_jobs
+		WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested')
+		ORDER BY job_id COLLATE "C"`, personaID)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if len(inflight) > 0 {
+		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
+			ErrUnresolvedOperations, strings.Join(inflight, ", "))
+	}
 	var literalNulls int64
 	if err := tx.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM core_turns WHERE persona_id = $1 AND (
