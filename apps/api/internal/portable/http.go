@@ -28,15 +28,19 @@ func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
 	return &Server{svc: NewService(pool), secret: []byte(adminSecret), maxBundle: 1 << 30}
 }
 
+// transferPath is the shared route prefix for transfer steps. It is a
+// package-level constant so the edge route-parity discovery can resolve the
+// registrations statically.
+const transferPath = "/internal/core/personas/{persona}/transfers/{transfer}"
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	const p = "/internal/core/personas/{persona}/transfers/{transfer}"
 	mux.HandleFunc("GET /internal/core/placement", s.placement)
-	mux.HandleFunc("POST "+p+"/seal", s.seal)
-	mux.HandleFunc("GET "+p+"/bundle", s.bundle)
-	mux.HandleFunc("POST "+p+"/complete", s.complete)
-	mux.HandleFunc("POST "+p+"/abort", s.abort)
-	mux.HandleFunc("POST "+p+"/activate", s.step((*Service).Activate))
-	mux.HandleFunc("POST "+p+"/retire", s.retire)
+	mux.HandleFunc("POST "+transferPath+"/seal", s.seal)
+	mux.HandleFunc("GET "+transferPath+"/bundle", s.bundle)
+	mux.HandleFunc("POST "+transferPath+"/complete", s.complete)
+	mux.HandleFunc("POST "+transferPath+"/abort", s.abort)
+	mux.HandleFunc("POST "+transferPath+"/activate", s.step((*Service).Activate))
+	mux.HandleFunc("POST "+transferPath+"/retire", s.retire)
 	mux.HandleFunc("POST /internal/core/transfers/import", s.importBundle)
 	mux.HandleFunc("GET /internal/core/transfers/{direction}/{transfer}", s.status)
 }

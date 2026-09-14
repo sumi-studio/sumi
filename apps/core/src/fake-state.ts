@@ -90,7 +90,13 @@ function retryBackoffMs(attempt: number): number {
 export class FakeState implements StateClient {
   personas = new Map<
     string,
-    { human_id: string | null; display_name: string; created_at: string }
+    {
+      human_id: string | null;
+      display_name: string;
+      created_at: string;
+      authority: string;
+      transfer_id: string | null;
+    }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
   leases = new Map<string, WriterLease>();
@@ -127,6 +133,8 @@ export class FakeState implements StateClient {
       human_id: null,
       display_name: displayName,
       created_at: new Date().toISOString(),
+      authority: "active",
+      transfer_id: null,
     });
   }
 
