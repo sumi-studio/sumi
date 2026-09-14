@@ -1,7 +1,4 @@
-import {
-  observeElementOffset,
-  useVirtualizer,
-} from "@tanstack/react-virtual";
+import { observeElementOffset, useVirtualizer } from "@tanstack/react-virtual";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,

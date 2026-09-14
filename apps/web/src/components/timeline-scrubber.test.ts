@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatItem } from "../agent/model";
+import { collectTimelineExchanges } from "../agent/projector";
 import { createConversationTimeline } from "./timeline-scrubber";
 
 const user = (id: string): ChatItem => ({
@@ -11,15 +12,25 @@ const user = (id: string): ChatItem => ({
   delivery: "durable",
 });
 
+const timelineFor = (
+  items: ChatItem[],
+  visibleMessageIds: string[],
+  index?: { id: string; title: string }[],
+) => {
+  const { exchanges, itemIndexById } = collectTimelineExchanges(items);
+  return createConversationTimeline(
+    exchanges,
+    itemIndexById,
+    visibleMessageIds,
+    index,
+  );
+};
+
 describe("paged conversation navigation", () => {
   it("keeps every navigation position while older body pages arrive", () => {
     const index = ["old", "middle", "latest"].map((id) => ({ id, title: id }));
-    const before = createConversationTimeline(
-      [user("latest")],
-      ["latest"],
-      index,
-    );
-    const after = createConversationTimeline(
+    const before = timelineFor([user("latest")], ["latest"], index);
+    const after = timelineFor(
       [user("middle"), user("latest")],
       ["latest"],
       index,
@@ -31,7 +42,7 @@ describe("paged conversation navigation", () => {
 
   it("keeps the history index when jumping and adds live messages without duplicates", () => {
     const index = ["old", "middle", "latest"].map((id) => ({ id, title: id }));
-    const timeline = createConversationTimeline(
+    const timeline = timelineFor(
       [user("old"), user("latest"), user("new")],
       ["old"],
       index,

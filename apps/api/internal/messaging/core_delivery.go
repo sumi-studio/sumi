@@ -1,9 +1,11 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -41,6 +43,14 @@ type CoreAttentionDelivery struct {
 }
 
 var _ AgentAttentionDelivery = (*CoreAttentionDelivery)(nil)
+
+// These delivery failures can never resolve on this placement; the drain
+// maps them to an inspectable suppression reason instead of retrying
+// forever or fabricating a receipt.
+var (
+	errRecipientTransferred   = errors.New("recipient persona has permanently transferred from this placement")
+	errAttentionInputConflict = errors.New("the durable input under this event id already carries different content")
+)
 
 // Prepare ensures the persona exists so an admitted input has a queue to
 // land in while no runtime is running. The persona is the PersonalityAgent;
@@ -83,6 +93,13 @@ func (d *CoreAttentionDelivery) Lookup(ctx context.Context, _ string, event Agen
 	if err != nil {
 		return AgentAttentionReceipt{}, false, err
 	}
+	// A receipt may only stand for an input that actually carries this event.
+	// The same input id bound to different content is a conflict, not a
+	// delivery — matching bytes are what make a replay a deduplication.
+	if !attentionInputMatches(event, input) {
+		return AgentAttentionReceipt{}, false,
+			fmt.Errorf("%w: %s", errAttentionInputConflict, input.InputID)
+	}
 	return coreAttentionReceipt(event, input), true, nil
 }
 
@@ -92,6 +109,20 @@ func (d *CoreAttentionDelivery) Admit(ctx context.Context, _ string, event Agent
 	}
 	input, _, err := d.Core.SubmitInput(ctx, coreInputFromEvent(event))
 	if err != nil {
+		switch {
+		case errors.Is(err, agentstate.ErrTurnConflict):
+			// A row under this input id with different content was admitted
+			// between Lookup and Submit. It can never become this event.
+			return AgentAttentionReceipt{}, fmt.Errorf("%w: %v", errAttentionInputConflict, err)
+		case errors.Is(err, agentstate.ErrPersonaInactive):
+			// 'transferred' is terminal: the persona can never accept input
+			// on this placement again. 'sealed' and 'staged' can still abort
+			// back to active, so those deliveries stay pending and retryable.
+			st, stateErr := d.Core.PersonaState(ctx, event.PersonalityAgentID)
+			if stateErr == nil && st.Persona.Authority == "transferred" {
+				return AgentAttentionReceipt{}, fmt.Errorf("%w: %v", errRecipientTransferred, err)
+			}
+		}
 		return AgentAttentionReceipt{}, err
 	}
 	return coreAttentionReceipt(event, input), nil
@@ -99,6 +130,39 @@ func (d *CoreAttentionDelivery) Admit(ctx context.Context, _ string, event Agent
 
 func coreInputID(event AgentAttentionEvent) string {
 	return "messaging:" + event.EventID
+}
+
+// attentionInputMatches decides whether the durable input under this event's
+// id really is this event — the contract fields and payload must match what
+// SubmitInput would have written. PG stores timestamptz at microsecond
+// precision and jsonb numbers without a Go type, so time and payload
+// comparisons run at the stored precision and the canonical JSON form.
+func attentionInputMatches(event AgentAttentionEvent, input agentstate.Input) bool {
+	expected := coreInputFromEvent(event)
+	if input.Kind != expected.Kind || input.ActorKind != expected.ActorKind ||
+		input.ActorID != expected.ActorID || input.SourceSurface != expected.SourceSurface ||
+		input.ThreadID != expected.ThreadID || input.Attention != expected.Attention {
+		return false
+	}
+	if expected.OccurredAt == nil {
+		if input.OccurredAt != nil {
+			return false
+		}
+	} else if input.OccurredAt == nil ||
+		input.OccurredAt.UnixMicro() != expected.OccurredAt.UnixMicro() {
+		return false
+	}
+	want, err := json.Marshal(expected.Payload)
+	if err != nil {
+		return false
+	}
+	got, err := json.Marshal(input.Payload)
+	if err != nil {
+		return false
+	}
+	// Marshaled maps are canonical (keys sorted) and numeric values print in
+	// their shortest form, so a jsonb-round-tripped int64 equals the original.
+	return bytes.Equal(want, got)
 }
 
 // coreAttentionReceipt is the admission receipt: the command identity is the
@@ -116,6 +180,8 @@ func coreAttentionReceipt(event AgentAttentionEvent, input agentstate.Input) Age
 // mandates — the secretary's own judgment decides whether to speak.
 func coreAttentionFor(event AgentAttentionEvent) string {
 	switch {
+	case event.Change == AttentionChangeDeleted:
+		return "observe" // a tombstone informs; it never asks for a reply
 	case event.Kind == AgentAttentionReminder:
 		return "reply" // the secretary asked to be reminded
 	case event.Kind == AgentAttentionPollVote:
@@ -159,6 +225,9 @@ func coreInputFromEvent(event AgentAttentionEvent) *agentstate.Input {
 	}
 	if event.Reason != "" {
 		payload["reason"] = event.Reason
+	}
+	if event.Change != "" {
+		payload["message_change"] = event.Change
 	}
 	if event.ReplyToMessageID != "" {
 		payload["reply_to_message_id"] = event.ReplyToMessageID

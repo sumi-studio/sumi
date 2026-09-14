@@ -1368,6 +1368,8 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       message_id: typeof p.message_id === "string" ? p.message_id : null,
       message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
       reason: typeof p.reason === "string" ? p.reason : null,
+      message_change:
+        typeof p.message_change === "string" ? p.message_change : null,
       attempt: turn.attempt,
     },
   };
@@ -1407,6 +1409,8 @@ export function assemble(
           placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
           messageId: p.message_id,
           attention: input.attention,
+          change:
+            typeof p.message_change === "string" ? p.message_change : "",
         });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;

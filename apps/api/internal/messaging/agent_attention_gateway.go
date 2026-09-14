@@ -9,14 +9,26 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
-// AgentAttentionGateway is the internal Messaging-to-runtime adapter. Merely
-// constructing it does not activate delivery; the lifecycle owner runs the
-// outbox only after the runtime and browser audience contract are deployed.
+// AgentAttentionGateway is the internal Messaging-to-runtime adapter for the
+// legacy agentevents provenance contract. That contract cannot express
+// edited/deleted message changes: such rows fail clear — terminally
+// suppressed as unsupported_route — rather than degrade into an unmarked
+// external_event (a deletion would otherwise arrive as an empty message).
+// The supported intake route is CoreAttentionDelivery, selected when
+// SUMI_CORE_STATE_TOKEN is configured. Merely constructing the adapter does
+// not activate delivery; the lifecycle owner runs the outbox only after the
+// runtime and browser audience contract are deployed.
 type AgentAttentionGateway struct {
 	Gateway  *agentevents.DurableGateway
 	Spawner  agentevents.DirectChatSpawner
 	TenantID string
 }
+
+// errUnsupportedAttentionEvent marks an attention event this delivery route
+// cannot represent truthfully. The drain treats it as terminal so the row
+// keeps its frozen payload with an inspectable reason instead of retrying
+// forever or claiming a delivery that silently lost its semantics.
+var errUnsupportedAttentionEvent = errors.New("attention event is not representable on this delivery route")
 
 var _ AgentAttentionDelivery = (*AgentAttentionGateway)(nil)
 
@@ -28,6 +40,9 @@ func (a *AgentAttentionGateway) Prepare(ctx context.Context, paID string) (func(
 }
 
 func (a *AgentAttentionGateway) input(event AgentAttentionEvent) (agentevents.IncomingProvenance, json.RawMessage, error) {
+	if event.Change != "" {
+		return agentevents.IncomingProvenance{}, nil, errUnsupportedAttentionEvent
+	}
 	source := agentevents.ProvenanceSource{
 		Surface: "messaging", EventID: event.EventID, Kind: event.Kind,
 		WorkspaceID: event.WorkspaceID, InstallationID: event.InstallationID,
