@@ -599,6 +599,107 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// isSealedName reports whether base is a quarantine name: an
+// opStage-prefixed name carrying "-q-". Sealed names are a structural
+// invariant — once created, NOTHING may write into them (no exchange,
+// no rename target, no link target); they may only be moved out of or
+// unlinked. That is what makes verify-then-unlink on a sealed name
+// race-free: enumerating the name (every reconcile pass does) grants
+// no write authority over it.
+func isSealedName(base string) bool {
+	return strings.HasPrefix(base, opStagePrefix) && strings.Contains(base, "-q-")
+}
+
+// removeStagedPreUnlinkHook is a test-only seam marking the gap between
+// a sealed re-verify and the unlink — the position a retired actor's
+// delayed syscall would land in. Production never sets it.
+var removeStagedPreUnlinkHook func()
+
+// inoAt returns the inode of name beneath dfd (lstat semantics).
+func inoAt(dfd *os.File, name string) (uint64, error) {
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(dfd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return 0, mapPathErr(err)
+	}
+	return st.Ino, nil
+}
+
+// quarantineDeleteMatch deletes the object at name beneath pfd only
+// after re-proving its identity at a sealed name. The object is
+// captured to qname (created by this call, so no delayed syscall can
+// have it as a pending target, and sealed so nothing may write into it
+// once it exists), the match predicate re-run there, and the unlink
+// issued only on a match. A mismatched capture stays parked at the
+// sealed name — preserved bytes for the reconciler — and ErrConflict
+// is returned along with the qname so the caller can restore it if it
+// wants. ENOENT at name reports success: already-gone is the desired
+// end state, and once the name is gone a delayed exchange into it can
+// only ENOENT.
+func quarantineDeleteMatch(pfd *os.File, name string, match func(qname string) (bool, error)) (string, error) {
+	qname := name
+	if !isSealedName(name) {
+		if strings.HasPrefix(name, opStagePrefix) {
+			qname = name + "-q-" + randHex(6)
+		} else {
+			// A non-intent staging name: quarantine under the
+			// never-swept prefix so a parked foreign object can't be
+			// collected by the .filesv-tmp- sweep.
+			qname = opStagePrefix + "q-" + randHex(8)
+		}
+		if err := unix.Renameat2(int(pfd.Fd()), name,
+			int(pfd.Fd()), qname, unix.RENAME_NOREPLACE); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				return qname, nil
+			}
+			return qname, mapPathErr(err)
+		}
+	}
+	ok, err := match(qname)
+	if err != nil {
+		return qname, err
+	}
+	if !ok {
+		return qname, ErrConflict
+	}
+	if removeStagedPreUnlinkHook != nil {
+		removeStagedPreUnlinkHook()
+	}
+	uerr := unix.Unlinkat(int(pfd.Fd()), qname, 0)
+	if errors.Is(uerr, unix.EISDIR) {
+		uerr = unix.Unlinkat(int(pfd.Fd()), qname, unix.AT_REMOVEDIR)
+	}
+	if uerr != nil && !errors.Is(uerr, unix.ENOENT) {
+		return qname, mapPathErr(uerr)
+	}
+	return qname, nil
+}
+
+// quarantineDelete is quarantineDeleteMatch with an fp3 identity check.
+func quarantineDelete(pfd *os.File, name, want3 string) (string, error) {
+	return quarantineDeleteMatch(pfd, name, func(qname string) (bool, error) {
+		q3, _, _, err := fp3at(pfd, qname)
+		if err != nil {
+			return false, err
+		}
+		return q3 == want3, nil
+	})
+}
+
+// discardStaged removes the staged file at tmp only while it is still
+// the inode this call created — a delayed exchange decided earlier could
+// land different bytes at the enumerable slot name between the create
+// and this cleanup; an inode mismatch parks the foreign object at the
+// sealed name for the reconciler instead of deleting it.
+func discardStaged(pfd *os.File, tmp string, ino uint64) {
+	_, _ = quarantineDeleteMatch(pfd, tmp, func(qname string) (bool, error) {
+		qino, err := inoAt(pfd, qname)
+		if err != nil {
+			return false, err
+		}
+		return qino == ino, nil
+	})
+}
+
 // undoDisplaced reverses a committed exchange after verification found
 // the displaced object was not the declared expectation. It repeatedly
 // exchanges (sname under sfd) with (dname under dfd) until the op's own
@@ -984,6 +1085,8 @@ func (v *rootView) Hash(scope, path string) (string, error) {
 // MoveStaged restores a recovery object to an empty name, resolved
 // fd-relative beneath the pinned root. NOREPLACE means it can never
 // overwrite a name a racing writer claimed between the verdict and here.
+// The destination may never be a sealed quarantine name: sealing means
+// nothing — not even a delayed reconcile pass — writes into it.
 func (v *rootView) MoveStaged(scope, from, to string) error {
 	sfd, err := scopeDirFrom(v.rfd, scope, false)
 	if err != nil {
@@ -1000,6 +1103,9 @@ func (v *rootView) MoveStaged(scope, from, to string) error {
 	}
 	fromDir, fromName := splitRel(relFrom)
 	toDir, toName := splitRel(relTo)
+	if isSealedName(toName) {
+		return ErrReserved
+	}
 	fpfd, err := openDirBeneath(sfd, fromDir, false)
 	if err != nil {
 		return err
@@ -1039,6 +1145,13 @@ func (v *rootView) SwapStaged(scope, staged, name string) error {
 	}
 	sDir, sName := splitRel(relS)
 	nDir, nName := splitRel(relN)
+	if isSealedName(sName) {
+		// The exchange writes the name's content into `staged` — a
+		// sealed quarantine name can never be a write target, or the
+		// verify→unlink of a pending delete could land on bytes nobody
+		// checked.
+		return ErrReserved
+	}
 	spfd, err := openDirBeneath(sfd, sDir, false)
 	if err != nil {
 		return err
@@ -1058,11 +1171,12 @@ func (v *rootView) SwapStaged(scope, staged, name string) error {
 }
 
 // RemoveStaged deletes a recovery object beneath the pinned root only
-// after re-proving its identity at a quarantine name nobody else can
-// write. A live retired actor may still exchange into the intent's
-// staging slot between the caller's inspection and the unlink, so the
-// object is first moved to a per-call-unique name, re-verified, and
-// unlinked there. A mismatched capture stays parked at the quarantine
+// after re-proving its identity at a sealed quarantine name. A live
+// retired actor may still exchange into the intent's staging slot
+// between the caller's inspection and the unlink, so the object is
+// first moved to a per-call sealed name — created by this call, and
+// unreachable as a write target by construction — re-verified, and
+// unlinked there. A mismatched capture stays parked at the sealed
 // name — bytes are preserved for a later pass rather than destroyed.
 func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 	sfd, err := scopeDirFrom(v.rfd, scope, false)
@@ -1081,10 +1195,13 @@ func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 	}
 	defer pfd.Close()
 	qname := name
-	if !strings.Contains(name, "-q-") {
-		// Two-hop: move to a name only this call writes. Whoever occupied
-		// `path` at move time is captured — possibly not the object the
-		// caller verified, which is why it is re-verified below.
+	if !isSealedName(name) {
+		// Two-hop: move to a sealed name created by this call. Whoever
+		// occupied `path` at move time is captured — possibly not the
+		// object the caller verified, which is why it is re-verified
+		// below. Sealing means no delayed syscall can write into qname:
+		// it did not exist when any retired effect was issued, and the
+		// writer checks reject it as a target once it exists.
 		qname = name + "-q-" + randHex(6)
 		if err := unix.Renameat2(int(pfd.Fd()), name,
 			int(pfd.Fd()), qname, unix.RENAME_NOREPLACE); err != nil {
@@ -1111,8 +1228,11 @@ func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 	}
 	if !match {
 		// Captured something other than the verified object — leave it
-		// parked at the unforgeable quarantine name.
+		// parked at the sealed quarantine name.
 		return ErrConflict
+	}
+	if removeStagedPreUnlinkHook != nil {
+		removeStagedPreUnlinkHook()
 	}
 	err = unix.Unlinkat(int(pfd.Fd()), qname, 0)
 	if errors.Is(err, unix.EISDIR) {
@@ -1225,25 +1345,45 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	if err != nil {
 		return FileInfo{}, false, err
 	}
+	// The inode binds every later cleanup of this name to THIS object:
+	// a retired pass's delayed exchange can land foreign bytes at the
+	// enumerable slot between create and cleanup, and an inode-mismatched
+	// capture is parked rather than deleted.
+	ourIno, _ := inoAt(pfd, tmp)
 	if _, err := tf.Write(content); err != nil {
 		tf.Close()
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		discardStaged(pfd, tmp, ourIno)
 		return FileInfo{}, false, mapPathErr(err)
 	}
 	if err := tf.Sync(); err != nil {
 		tf.Close()
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		discardStaged(pfd, tmp, ourIno)
 		return FileInfo{}, false, mapPathErr(err)
 	}
 	if err := tf.Close(); err != nil {
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		discardStaged(pfd, tmp, ourIno)
 		return FileInfo{}, false, mapPathErr(err)
 	}
 	// Our object's identity before any exchange — ctime shifts on relink,
 	// so identity is the ino:size:mtime triple only.
 	our3, _, _, ourErr := fp3at(pfd, tmp)
-	commit := func() (FileInfo, bool, error) {
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0) // linkat/exchange leave the staging name
+	// commit deletes the staging name's object, fsyncs, and stats the
+	// result. The slot is enumerable by every reconcile pass and
+	// reachable by swaps a retired pass decided while the name held
+	// these bytes — so the delete goes through quarantineDelete:
+	// capture to a sealed name nothing can write into, re-verify
+	// identity, unlink only what we meant to. want3 is the fp3 the
+	// caller expects at the slot (our staged bytes, or the declared
+	// displaced object). A foreign capture stays parked at the sealed
+	// name: the fs commit stands but the intent must survive for the
+	// reconciler to settle the parked object.
+	commit := func(want3 string) (FileInfo, bool, error) {
+		if _, derr := quarantineDelete(pfd, tmp, want3); derr != nil {
+			if errors.Is(derr, ErrConflict) {
+				return FileInfo{}, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+			}
+			return FileInfo{}, true, derr
+		}
 		syncDir(pfd)
 		info, serr := p.stat(scope, path)
 		if serr != nil {
@@ -1254,10 +1394,10 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	}
 	if exclusive {
 		if err := unix.Linkat(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0); err != nil {
-			unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+			discardStaged(pfd, tmp, ourIno)
 			return FileInfo{}, false, mapPublishErr(err, exclusive)
 		}
-		return commit()
+		return commit(our3)
 	}
 	err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_EXCHANGE)
 	switch {
@@ -1265,12 +1405,12 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		// The name is empty.
 		if expectFP != "" {
 			// The object the intent expected to displace is gone.
-			unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+			discardStaged(pfd, tmp, ourIno)
 			return FileInfo{}, false, ErrExternalChange
 		}
 		if perr := unix.Renameat2(int(pfd.Fd()), tmp,
 			int(pfd.Fd()), name, unix.RENAME_NOREPLACE); perr != nil {
-			unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+			discardStaged(pfd, tmp, ourIno)
 			if errors.Is(perr, unix.EEXIST) {
 				// A foreign object claimed the empty name — do not
 				// overwrite it.
@@ -1278,9 +1418,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 			}
 			return FileInfo{}, false, mapPublishErr(perr, exclusive)
 		}
-		return commit()
+		return commit(our3)
 	case err != nil:
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0)
+		discardStaged(pfd, tmp, ourIno)
 		return FileInfo{}, false, mapPublishErr(err, exclusive)
 	}
 	// Exchanged: tmp now holds the object the name used to hold.
@@ -1291,17 +1431,34 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		return FileInfo{}, true, serr
 	}
 	if d3 == fp3(expectFP) && kindOf(dMode) != "dir" {
-		return commit() // displaced exactly the expected object
+		return commit(fp3(expectFP)) // displaced exactly the expected object
 	}
 	// The displaced object is not what the intent declared — undo the
 	// exchange without ever unlinking foreign bytes.
 	if ourErr != nil {
 		return FileInfo{}, true, ourErr
 	}
+	if p.faultHook != nil {
+		p.faultHook("write.preUndo")
+	}
 	uerr := undoDisplaced(pfd, pfd, tmp, name, park,
 		func(t3 string) bool { return t3 == our3 })
+	if p.faultHook != nil {
+		p.faultHook("write.postUndo")
+	}
 	if uerr == nil {
-		unix.Unlinkat(int(pfd.Fd()), tmp, 0) // tmp holds our own staged bytes
+		// tmp holds our own staged bytes — but the slot name stayed
+		// enumerable throughout the undo, so a retired pass's delayed
+		// swap may have replaced them since undoDisplaced returned.
+		// Capture to a sealed name and re-verify before deleting.
+		if _, derr := quarantineDelete(pfd, tmp, our3); derr != nil {
+			if errors.Is(derr, ErrConflict) {
+				// Whatever landed at the slot is foreign and now
+				// parked; the undo itself already restored the name.
+				return FileInfo{}, false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+			}
+			return FileInfo{}, true, derr
+		}
 		if kindOf(dMode) == "dir" {
 			return FileInfo{}, false, ErrWrongKind
 		}
@@ -1474,11 +1631,12 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 			}
 			return info, true, nil
 		}
-		uerr := unix.Unlinkat(int(srcPfd.Fd()), stage, 0)
-		if errors.Is(uerr, unix.EISDIR) {
-			uerr = unix.Unlinkat(int(srcPfd.Fd()), stage, unix.AT_REMOVEDIR)
-		}
-		if uerr == nil || errors.Is(uerr, unix.ENOENT) {
+		// The slot name is enumerable and reachable by delayed swaps a
+		// retired reconciler decided while the slot held foreign bytes —
+		// the delete must happen under a sealed name: capture stage→-q,
+		// re-verify, unlink only the declared object.
+		qname, uerr := quarantineDelete(srcPfd, stage, fp3(dstFP))
+		if uerr == nil {
 			syncDir(dstPfd)
 			info, serr := p.stat(scope, to)
 			if serr != nil {
@@ -1486,14 +1644,20 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 			}
 			return info, true, nil
 		}
+		if errors.Is(uerr, ErrConflict) {
+			// A foreign object reached the slot between the verify and
+			// the sealed capture — it is parked, not destroyed. The
+			// rename committed; the intent survives for the reconciler.
+			return FileInfo{}, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+		}
 		if !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST) {
-			return FileInfo{}, true, mapPathErr(uerr)
+			return FileInfo{}, true, uerr
 		}
 		// The captured dir gained members — it diverged from what the
 		// intent was allowed to discard. Move it back to srcName and fall
 		// through to the undo, refusing the whole op like a pre-exchange
 		// ENOTEMPTY would have.
-		if unix.Renameat2(int(srcPfd.Fd()), stage,
+		if unix.Renameat2(int(srcPfd.Fd()), qname,
 			int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE) != nil {
 			return FileInfo{}, true, fmt.Errorf("%w: %w", ErrNotEmpty, errUndoParked)
 		}
@@ -1561,20 +1725,45 @@ func (p *posixRoot) remove(scope, path, expectFP, stage string) (bool, error) {
 		return false, serr // captured but unobservable — reconciler settles
 	}
 	if st3 == fp3(expectFP) {
-		// Captured the expected object — complete the removal.
-		uerr := unix.Unlinkat(int(pfd.Fd()), stage, 0)
-		if errors.Is(uerr, unix.EISDIR) {
-			uerr = unix.Unlinkat(int(pfd.Fd()), stage, unix.AT_REMOVEDIR)
-		}
-		if uerr == nil {
+		// Captured the expected object — complete the removal under a
+		// sealed name: the slot stayed enumerable through this window,
+		// so a delayed swap could have replaced the verified object.
+		qname, uerr := quarantineDelete(pfd, stage, st3)
+		switch {
+		case uerr == nil:
+			// If a racing reconcile pass restored the captured object
+			// to its name, the removal did not land — the name holding
+			// an object again means the intent's purpose is unmet.
+			if _, _, _, oerr := fp3at(pfd, name); oerr == nil {
+				return false, ErrExternalChange
+			}
 			syncDir(pfd)
 			return true, nil
-		}
-		if !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST) {
-			return false, mapPathErr(uerr)
+		case errors.Is(uerr, ErrConflict):
+			// Foreign bytes reached the slot between verify and the
+			// sealed capture — parked, not destroyed; the reconciler
+			// settles them.
+			return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+		case !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST):
+			// The post-capture state is uncertain — the object may sit
+			// at the slot, at the sealed name, or be gone. Tombstone so
+			// the reconciler settles whatever was left rather than
+			// dropping the intent over live recovery evidence.
+			return false, fmt.Errorf("%w: %w", uerr, errUndoParked)
 		}
 		// ENOTEMPTY: a dir gained members after capture — it diverged
-		// from the declared object; restore instead of deleting.
+		// from the declared object; restore it from the sealed name
+		// instead of deleting.
+		rerr := unix.Renameat2(int(pfd.Fd()), qname, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
+		switch {
+		case rerr == nil:
+			syncDir(pfd)
+			return false, ErrExternalChange
+		case errors.Is(rerr, unix.EEXIST):
+			return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+		default:
+			return false, rerr
+		}
 	}
 	// Captured object is not what the intent declared — put it back. A
 	// racing writer's object occupying the name keeps it; the captured

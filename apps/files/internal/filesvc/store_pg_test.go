@@ -1694,3 +1694,71 @@ func TestPGReconcileRestoresRecordedOverSquatter(t *testing.T) {
 		t.Fatalf("squatter = %q — foreign object must be preserved parked", got)
 	}
 }
+
+// A sealed (-q-) quarantine object holding the recorded row content must
+// restore onto an occupied name WITHOUT anything ever writing into the
+// sealed name: drainSealed parks the squatter at the unsealed base slot
+// and moves the sealed object out. Through real Reconcile + real
+// file_version rows — not a DB-free branch.
+func TestPGReconcileDrainsSealedObject(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	// Acknowledged content at the path — row v1 records its fingerprint.
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	// A dead intent's quarantined object IS the acknowledged file
+	// (moved, so the recorded fp3 matches); a squatter holds the name.
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 70, preFP: "0:0:0:0", dstFP: "9:9:9",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	qrel := opStagePrefix + strconv.FormatInt(id, 10) + "-q-ab12cd"
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+qrel); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("squatter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q — sealed recorded object not drained onto the name", got)
+	}
+	if durExists(t, dir, "ws/"+qrel) {
+		t.Fatal("sealed name still occupied after the drain")
+	}
+	// The squatter was preserved — parked at the intent's unsealed slot.
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	if got := durRead(t, dir, "ws/"+slot); got != "squatter" {
+		t.Fatalf("squatter = %q at slot — foreign bytes must be preserved", got)
+	}
+	// A second pass settles the squatter decision; nothing is deleted
+	// without identity proof.
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q after second pass", got)
+	}
+}

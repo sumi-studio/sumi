@@ -7,12 +7,15 @@ package filesvc
 // exchange/verify/undo shapes are kernel-level, not simulated.
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func durRoot(t *testing.T) (*posixRoot, string) {
@@ -412,4 +415,352 @@ func TestOpStageReservedAndHidden(t *testing.T) {
 		}
 	}
 	_ = strconv.Itoa
+}
+
+// ---- Sealed-quarantine regression tests (review-witnessed races) ----
+//
+// The independent review demonstrated two reachable losses in the prior
+// candidate: a retired reconciler's delayed SwapStaged could write newer
+// acknowledged bytes into a "-q-" name another pass was about to unlink,
+// and the actor-side post-undo slot unlink could delete foreign bytes a
+// delayed swap landed there. The repair makes "-q-" names SEALED — no
+// syscall may write into one once it exists — and routes every unlink
+// through capture → seal → re-verify → unlink. These tests replay both
+// interleavings on a real filesystem through the real production
+// functions; only the landing instant of the retired actor's syscall is
+// controlled (identical to a FUSE/kernel delayed completion).
+
+// waitOr fails the test if a gate does not fire — keeps a broken premise
+// from hanging the suite.
+func waitOr(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("timeout waiting for %s", what)
+	}
+}
+
+// gatedView wraps a real ReconView and defers the first mutating effect
+// until released — a syscall issued by a retired actor that completes
+// arbitrarily late.
+type gatedView struct {
+	ReconView
+	waiting chan struct{}
+	gate    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+// hold defers the first mutating call until the gate is released;
+// done closes only after that deferred syscall has actually landed —
+// the test then knows the retired actor's effect is in the window it
+// was meant to race.
+func (g *gatedView) hold(fn func() error) error {
+	first := false
+	g.once.Do(func() {
+		close(g.waiting)
+		first = true
+	})
+	if !first {
+		return fn()
+	}
+	<-g.gate
+	err := fn()
+	close(g.done)
+	return err
+}
+
+func (g *gatedView) SwapStaged(scope, staged, name string) error {
+	return g.hold(func() error { return g.ReconView.SwapStaged(scope, staged, name) })
+}
+
+func (g *gatedView) MoveStaged(scope, from, to string) error {
+	return g.hold(func() error { return g.ReconView.MoveStaged(scope, from, to) })
+}
+
+// scanDirFor returns the name of the directory entry under dir/scope
+// holding exactly want bytes, or "".
+func scanDirFor(t *testing.T, dir, scope string, want []byte) string {
+	t.Helper()
+	ents, err := os.ReadDir(filepath.Join(dir, scope))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, scope, e.Name()))
+		if err != nil {
+			continue
+		}
+		if sha(string(b)) == sha(string(want)) {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
+// Seal enforcement, directly: nothing may write INTO a sealed name —
+// not an exchange, not a restore move — while the sealed object may be
+// moved out or verified-then-unlinked in place.
+func TestSealedNameRejectsWrites(t *testing.T) {
+	p, dir := durRoot(t)
+	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "f.txt"), []byte("live"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	q := opStagePrefix + "9-q-aaaaaa"
+	if err := os.WriteFile(filepath.Join(dir, "ws", q), []byte("parked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	view, err := p.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	if err := view.SwapStaged("ws", q, "f.txt"); !errors.Is(err, ErrReserved) {
+		t.Fatalf("SwapStaged into sealed name = %v, want ErrReserved", err)
+	}
+	if err := view.MoveStaged("ws", "f.txt", q); !errors.Is(err, ErrReserved) {
+		t.Fatalf("MoveStaged into sealed name = %v, want ErrReserved", err)
+	}
+	if got := durRead(t, dir, "ws/"+q); got != "parked" {
+		t.Fatalf("sealed object modified: %q", got)
+	}
+	if got := durRead(t, dir, "ws/f.txt"); got != "live" {
+		t.Fatalf("live name modified: %q", got)
+	}
+	// Sealed objects remain enumerable and may move OUT — that is the
+	// only way a preserved object leaves quarantine.
+	if names, err := view.ListStaged("ws", "", opStagePrefix+"9-q-"); err != nil || len(names) != 1 {
+		t.Fatalf("sealed name not enumerable: %v %v", names, err)
+	}
+	if err := view.MoveStaged("ws", q, "restored.txt"); err != nil {
+		t.Fatalf("sealed move-out = %v", err)
+	}
+	if got := durRead(t, dir, "ws/restored.txt"); got != "parked" {
+		t.Fatalf("restored = %q, want %q", got, "parked")
+	}
+}
+
+// Replayed finding 1: a retired reconciler's delayed effects land inside
+// another pass's verify→unlink window on a quarantine name. Under the
+// seal there is no syscall that writes into that name, so the successor's
+// acknowledged save must survive intact.
+func TestSealedRetiredEffectsCannotReachPendingUnlink(t *testing.T) {
+	pR1, dir := durRoot(t)
+	pR2, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pSucc, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	A := []byte("stale-op-bytes")
+	O1 := []byte("row-content")
+	N := []byte("successor-acked")
+	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", "f.txt"), A, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qrel := opStagePrefix + "7-q-aaaaaa"
+	if err := os.WriteFile(filepath.Join(dir, "ws", qrel), O1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	it := intent{id: 7, scope: "ws", op: "write", path: "f.txt",
+		expectSHA: sha(string(A)), dstFP: "999:9:9:9"}
+
+	// R1 (retired): the real settleStaged decides the -q object's
+	// disposition — with sealing that decision is a drain, and its
+	// first move is deferred.
+	gv := &gatedView{
+		waiting: make(chan struct{}),
+		gate:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	v1, err := pR1.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v1.Close()
+	gv.ReconView = v1
+	var s1 Store
+	r1done := make(chan struct{})
+	go func() {
+		defer close(r1done)
+		s1.settleStaged(context.Background(), it, gv, false)
+	}()
+	select {
+	case <-gv.waiting:
+	case <-r1done:
+		t.Fatal("R1 pass finished without a pending effect — premise failed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for R1's decision")
+	}
+
+	// R2 (live): ungated pass — drains the sealed object onto the name
+	// and parks the stale bytes at the base slot.
+	v2, err := pR2.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v2.Close()
+	var s2 Store
+	s2.settleStaged(context.Background(), it, v2, false)
+	if got := durRead(t, dir, "ws/f.txt"); got != string(O1) {
+		t.Fatalf("f.txt = %q, want restored row content", got)
+	}
+
+	// The successor acknowledges a newer save at f.txt through the real
+	// verified write path (displaces O1 with authority).
+	fpO1 := durFP(t, pSucc, "ws", "f.txt")
+	if _, c, err := pSucc.atomicWrite("ws", "f.txt", N, false, fpO1, ""); err != nil || !c {
+		t.Fatalf("successor write: %v", err)
+	}
+
+	// R2's second pass deletes the parked stale bytes — inside its
+	// verify→unlink window, release R1's delayed effects: they must all
+	// land harmlessly (ENOENT/EEXIST), never writing into the pending
+	// unlink's name.
+	removeStagedPreUnlinkHook = func() {
+		close(gv.gate)
+		waitOr(t, gv.done, "retired effects landing")
+	}
+	s2.settleStaged(context.Background(), it, v2, false)
+	removeStagedPreUnlinkHook = nil
+	<-r1done
+
+	// The retired pass's delayed drain may have parked the acknowledged
+	// object at the base slot — displaced, never destroyed. The pending
+	// unlink deleted only the verified stale bytes; N must survive
+	// either at its name or parked where the next pass restores it.
+	where := scanDirFor(t, dir, "ws", N)
+	if where == "" {
+		t.Fatal("successor's acknowledged bytes were destroyed")
+	}
+	if durExists(t, dir, "ws/f.txt") {
+		if got := durRead(t, dir, "ws/f.txt"); got != string(N) {
+			t.Fatalf("f.txt = %q, want the acknowledged save %q", got, N)
+		}
+	}
+	if where := scanDirFor(t, dir, "ws", A); where != "" {
+		t.Fatalf("stale op bytes still parked at %q — drain did not complete", where)
+	}
+}
+
+// Replayed finding 2: the actor's post-undo slot cleanup lands after a
+// retired reconciler's delayed swap placed the successor's acknowledged
+// bytes at the slot. The capture→seal→verify→unlink discipline must park
+// those bytes instead of destroying them, and a reconcile pass must be
+// able to restore them to the recorded name.
+func TestSealedActorSlotUnlinkPreservesSuccessor(t *testing.T) {
+	pOp, dir := durRoot(t)
+	pR1, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pSucc, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := pOp.atomicWrite("ws", "f.txt", []byte("old"), true, "", ""); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	fpOld := durFP(t, pOp, "ws", "f.txt")
+	succ := []byte("succ-acked")
+	if _, _, err := pSucc.atomicWrite("ws", "f.txt", succ, false, fpOld, ""); err != nil {
+		t.Fatalf("successor write: %v", err)
+	}
+	stale := []byte("stale")
+	slot := opStagePrefix + "42"
+	it := intent{id: 42, scope: "ws", op: "write", path: "f.txt",
+		expectSHA: sha(string(stale)), dstFP: fpOld}
+
+	gv := &gatedView{
+		waiting: make(chan struct{}),
+		gate:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	v1, err := pR1.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v1.Close()
+	gv.ReconView = v1
+
+	var r1sync sync.WaitGroup
+	r1sync.Add(1)
+	var s1 Store
+	pOp.faultHook = func(tag string) {
+		switch tag {
+		case "write.preUndo":
+			// Post-exchange, pre-undo: slot=succ-acked (foreign),
+			// f.txt=stale (our bytes). A concurrent pass observes this
+			// and legitimately decides SwapStaged — run the real one;
+			// its exchange stalls.
+			go func() {
+				defer r1sync.Done()
+				s1.settleStaged(context.Background(), it, gv, false)
+			}()
+			waitOr(t, gv.waiting, "retired pass swap decision")
+		case "write.postUndo":
+			// Undo done: f.txt=succ-acked, slot=stale. The retired
+			// pass's pending exchange lands in the undo→cleanup gap:
+			// slot <- succ-acked, f.txt <- stale.
+			close(gv.gate)
+			waitOr(t, gv.done, "retired swap landing")
+		}
+	}
+	_, committed, err := pOp.atomicWrite("ws", "f.txt", stale, false, fpOld, slot)
+	pOp.faultHook = nil
+	if err == nil || !errors.Is(err, ErrExternalChange) {
+		t.Fatalf("stale write err = %v, want external_change", err)
+	}
+	if committed {
+		t.Fatal("stale write reported committed")
+	}
+	r1sync.Wait()
+
+	// Two landing orders are both repaired outcomes: the delayed swap
+	// either placed the acknowledged bytes at the slot before the
+	// sealed capture (→ parked at a -q- name, name holds the late
+	// swap's stale residue) or found the slot already moved (→ ENOENT,
+	// undo's restore stands). In both, the acknowledged bytes survive.
+	where := scanDirFor(t, dir, "ws", succ)
+	if where == "" {
+		t.Fatal("successor's acknowledged bytes were destroyed — the race still bites")
+	}
+	if durExists(t, dir, "ws/f.txt") {
+		if got := durRead(t, dir, "ws/f.txt"); got != string(stale) && got != string(succ) {
+			t.Fatalf("f.txt = %q, want stale residue or restored save", got)
+		}
+	}
+
+	// A reconcile pass restores the recorded version: the sealed object
+	// drains back onto the name and the stale bytes park for discard.
+	var s2 Store
+	v2, err := pOp.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v2.Close()
+	for i := 0; i < 4; i++ {
+		s2.settleStaged(context.Background(), it, v2, false)
+	}
+	if !durExists(t, dir, "ws/f.txt") {
+		t.Fatal("reconcile never restored the name")
+	}
+	if got := durRead(t, dir, "ws/f.txt"); got != string(succ) {
+		t.Fatalf("f.txt = %q after reconcile, want restored %q", got, succ)
+	}
+	if where := scanDirFor(t, dir, "ws", stale); where != "" {
+		t.Fatalf("stale bytes still parked at %q — settle did not discard them", where)
+	}
 }

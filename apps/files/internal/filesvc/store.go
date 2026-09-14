@@ -1235,9 +1235,15 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// If the path still carries THIS op's staged bytes, finish the
 		// undo the dead process could not: exchange restores the
 		// displaced object to its name; whatever comes back is inspected
-		// before any discard.
+		// before any discard. A sealed rel can never be an exchange
+		// target — drain it instead: park the name's bytes at the
+		// unsealed base slot, then move the sealed object onto the name.
 		if it.expectSHA != "" && it.expectSHA != "dir" {
 			if h, herr := view.Hash(it.scope, it.path); herr == nil && h == it.expectSHA {
+				if _, base := splitRel(rel); isSealedName(base) {
+					s.drainSealed(view, it, rel, it.path)
+					return
+				}
 				if view.SwapStaged(it.scope, rel, it.path) == nil {
 					if h2, herr2 := view.Hash(it.scope, rel); herr2 == nil && h2 == it.expectSHA {
 						// Our stale bytes came back — discard them.
@@ -1316,9 +1322,15 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 	switch {
 	case derr == nil:
 		// Occupied: only a proven recorded object swaps back — never
-		// overwrite a name merely because something sits parked.
+		// overwrite a name merely because something sits parked. A
+		// sealed rel cannot receive the displaced squatter, so drain
+		// through the unsealed base slot instead.
 		if rowMatch && fp3(dst.Fingerprint) != fp3(rowFP) {
-			_ = view.SwapStaged(it.scope, rel, destPath)
+			if _, base := splitRel(rel); isSealedName(base) {
+				s.drainSealed(view, it, rel, destPath)
+			} else {
+				_ = view.SwapStaged(it.scope, rel, destPath)
+			}
 		}
 	case absentVerdict(derr):
 		switch {
@@ -1334,6 +1346,21 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 	default:
 		// unverifiable — leave parked
 	}
+}
+
+// drainSealed moves a sealed quarantine object onto its home name when
+// that name holds content that must give way — without ever writing
+// into the sealed name. The name's current object is first parked at
+// the intent's unsealed base slot (NOREPLACE, so an occupied slot
+// defers the whole restore to a later pass); then the sealed object
+// moves onto the now-empty name. A racer claiming the name between the
+// two moves leaves the sealed object parked — bytes are preserved and
+// the next pass retries. Nothing is deleted here.
+func (s *Store) drainSealed(view ReconView, it intent, rel, name string) {
+	if view.MoveStaged(it.scope, name, stageRel(it)) != nil {
+		return
+	}
+	_ = view.MoveStaged(it.scope, rel, name)
 }
 
 func (s *Store) kickReconcile() {
