@@ -2,7 +2,9 @@ package filesvc
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +21,7 @@ import (
 // VersionStore is the persistence surface the service needs — *Store satisfies
 // it against real PG; tests substitute a fake.
 type VersionStore interface {
-	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
+	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
 	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error)
 	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func() error) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
@@ -288,7 +290,9 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 		return
 	}
 	exclusive := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
+	sum := sha256.Sum256(body)
 	ver, _, err := s.store.WithWrite(r.Context(), scope, path, "write", iv,
+		hex.EncodeToString(sum[:]),
 		s.probe(scope, path),
 		func() (FileInfo, error) {
 			return s.root.atomicWrite(scope, path, body, exclusive)
@@ -359,7 +363,7 @@ func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope stri
 		return
 	}
 	ver, _, err := s.store.WithWrite(r.Context(), scope, body.Path, "mkdir",
-		IfVersion{Mode: "any"},
+		IfVersion{Mode: "any"}, "dir",
 		s.probe(scope, body.Path),
 		func() (FileInfo, error) {
 			return s.root.mkdir(scope, body.Path)
@@ -445,13 +449,13 @@ func isStoreErr(err error) bool {
 // diverging. No-op for stores without a journal (test fakes).
 func (s *Service) StartReconciler(ctx context.Context) {
 	st, ok := s.store.(interface {
-		SetReconcile(StatFn, string)
+		SetReconcile(StatFn, HashFn)
 		ReconcileLoop(context.Context)
 	})
 	if !ok {
 		return
 	}
-	st.SetReconcile(s.root.stat, s.root.root)
+	st.SetReconcile(s.root.stat, s.root.hash)
 	go st.ReconcileLoop(ctx)
 }
 

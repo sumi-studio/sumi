@@ -71,7 +71,7 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 	return f.seq, nil
 }
 
-func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
+func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func() (FileInfo, error)) (int64, FileInfo, error) {
 	k := scope + "/" + path
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, path, iv, probe)

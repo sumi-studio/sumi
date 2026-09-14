@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,8 +31,21 @@ func main() {
 		log.Fatal("filesvc: FILESV_ROOT, FILESV_DB_URL and FILESV_TOKENS are required")
 	}
 
+	// The canonical root path is the storage identity the database binds
+	// to: one DB serves one root, and the advisory writer lock makes this
+	// process the only live writer on that DB. A second filesvc on the
+	// same DB+root waits briefly for a rolling handoff, then refuses;
+	// a different root on the same DB is rejected outright.
+	rootID, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		log.Fatalf("filesvc: resolve root: %v", err)
+	}
+	if rootID, err = filepath.Abs(rootID); err != nil {
+		log.Fatalf("filesvc: resolve root: %v", err)
+	}
+
 	ctx := context.Background()
-	store, err := filesvc.NewStore(ctx, dsn)
+	store, err := filesvc.NewStore(ctx, dsn, rootID)
 	if err != nil {
 		log.Fatalf("filesvc: store: %v", err)
 	}

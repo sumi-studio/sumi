@@ -15,16 +15,32 @@ info:
     cooperative among API writers; direct executor/POSIX writes bypass them
     and are reported via external_change.
     Durability: every mutation declares an intent row (with a pre-minted
-    version) before touching the filesystem, then applies version rows and
-    the journal event after the fs commit. A DB failure between fs commit
-    and apply leaves a recoverable intent, never silent divergence: the
-    reconciler re-checks the disk and rolls the DB forward or drops the
-    intent, including after a restart. Errors after a possibly-committed
-    fs mutation are surfaced, never reported as success. All mutations in
-    one scope serialize, so a directory rename cannot interleave with a
-    concurrent write's row bookkeeping. Store faults (deadline, dropped
-    connection, network error) are 503 store_unavailable on every op —
-    never version:0 or external_change:false.
+    version and the declaring instance's owner id) before touching the
+    filesystem, then applies version rows and the journal event after the
+    fs commit. A DB failure between fs commit and apply leaves a
+    recoverable intent, never silent divergence: the reconciler re-checks
+    the disk and rolls the DB forward or drops the intent, including after
+    a restart. A filesystem call that outlives the request deadline is
+    still settled by its own goroutine — intents are never dropped on a
+    timer guess. Errors after a possibly-committed fs mutation are
+    surfaced, never reported as success. All mutations in one scope
+    serialize, so a directory rename cannot interleave with a concurrent
+    write's row bookkeeping. Store faults (deadline, dropped connection,
+    network error) are 503 store_unavailable on every op — never
+    version:0 or external_change:false.
+    Ownership: one database serves exactly one canonical root, enforced at
+    startup by store_meta.root_id binding plus a session-scoped advisory
+    lock — at most one live writer per database. A second instance waits
+    briefly for a rolling-restart handoff, then refuses to start; a
+    different root on an occupied database is rejected outright. If the
+    lock session dies the store is deposed (mutations fail fast with 503);
+    it resumes only if it re-acquires while still the recorded owner, and
+    exits if another instance took over. Dead-owner intents are settled by
+    the live reconciler after a settle grace covering in-kernel/FUSE
+    completions; settlement claims the intent atomically and write intents
+    verify the landed bytes' hash, so externally modified content is
+    recorded as diverged (external_change=true), never laundered into the
+    service's version.
     Scope names must be real directories under the root — a scope name
     that is a symlink is refused (400 wrong_kind), because a scope-root
     alias would grant one scope's tokens access to another scope's files.

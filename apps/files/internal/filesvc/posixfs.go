@@ -2,6 +2,7 @@ package filesvc
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -678,6 +679,22 @@ func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, err
 		}
 	}
 	return f, info, nil
+}
+
+// hash returns the sha256 hex of a scope-relative regular file — the
+// reconciler compares it against an intent's recorded expectation to
+// detect content that is not what the service wrote.
+func (p *posixRoot) hash(scope, path string) (string, error) {
+	f, _, err := p.open(scope, path, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // atomicWrite stages content to a temp sibling, fsyncs, renames over the
