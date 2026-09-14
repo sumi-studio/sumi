@@ -43,6 +43,18 @@ func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
 	return &Server{store: NewStore(pool), secret: []byte(adminSecret), maxBody: 1 << 20}
 }
 
+// Store exposes the state store for in-process integrations hosted on the
+// same service (e.g. Messaging attention delivery admitting core inputs).
+func (s *Server) Store() *Store {
+	return s.store
+}
+
+// RegisterToolEffect delegates one tool's atomic effect to an in-process
+// applier (see Store.RegisterEffect). Call before serving traffic.
+func (s *Server) RegisterToolEffect(tool string, effect ToolEffect) error {
+	return s.store.RegisterEffect(tool, effect)
+}
+
 // PersonaToken derives the scoped capability for one persona.
 func (s *Server) PersonaToken(personaID string) string {
 	mac := hmac.New(sha256.New, s.secret)

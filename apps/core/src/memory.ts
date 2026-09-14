@@ -87,6 +87,50 @@ export function memoryBlockMessage(block: MemoryBlock): ChatMessage {
   };
 }
 
+export type InputProvenance = {
+  actorKind: string;
+  actorName: unknown;
+  surface: string;
+  placeId: unknown;
+  placeName: unknown;
+  placeKind: unknown;
+  messageId: unknown;
+  attention: string;
+};
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * Render the "[who in where]" marker prefixing an input's text in model
+ * context and in the current input. Provenance stays inside one bracket pair
+ * (names are stripped of brackets) so directive-style content still parses
+ * first. A Messaging input names the place_id and message_id the secretary
+ * needs to answer there through messaging.send — without them a real model
+ * could see who spoke but not address a reply. The attention hint is part of
+ * the marker — it informs, never mandates.
+ */
+export function inputMarker(p: InputProvenance): string {
+  const clean = (s: string) => s.replace(/[[\]]/g, "");
+  const name = clean(str(p.actorName));
+  const who = name ? `${name} (${p.actorKind})` : p.actorKind;
+  const placeLabel = clean(str(p.placeName)) || str(p.placeKind);
+  const where = placeLabel ? ` in ${placeLabel}` : "";
+  const refs =
+    p.surface === "messaging"
+      ? [
+          str(p.placeId) && ` place_id=${str(p.placeId)}`,
+          str(p.messageId) && ` message_id=${str(p.messageId)}`,
+        ].join("")
+      : "";
+  const hint =
+    p.attention === "observe"
+      ? " — fyi, no reply needed"
+      : p.attention === "defer"
+        ? " — deferred"
+        : "";
+  return `[${who}${where}${refs}${hint}]`;
+}
+
 /** Map one journal event to the model-visible message, or null for kinds
  * with no context rendering (e.g. internal bookkeeping). */
 export function eventMessage(ev: Event): ChatMessage | null {
@@ -96,7 +140,16 @@ export function eventMessage(ev: Event): ChatMessage | null {
       const who =
         p.actor_kind === "schedule"
           ? "[scheduled wake]"
-          : `[${String(p.actor_kind)}]`;
+          : inputMarker({
+              actorKind: String(p.actor_kind),
+              actorName: p.actor_display,
+              surface: str(p.source_surface),
+              placeId: p.thread_id,
+              placeName: p.place_name,
+              placeKind: p.place_kind,
+              messageId: p.message_id,
+              attention: str(p.attention),
+            });
       return { role: "user", content: `${who} ${String(p.text ?? "")}` };
     }
     case "assistant_message":
@@ -159,13 +212,15 @@ export function memoryOmittedNoticeMessage(om: OmittedMemory): ChatMessage {
  * were. Raw records left outside the send cap and applied blocks left
  * outside the memory cap are each marked by one notice at their position.
  * Every item is ordered by the first journal seq it stands for, so the
- * original ordering holds.
+ * original ordering holds. `extras` are synthetic items (e.g. a capacity
+ * notice) rendered at their given journal position.
  */
 export function renderJournalContext(
   events: Event[],
   memory: MemoryBlock[] = [],
   omitted: OmittedRange | null = null,
   memoryOmitted: OmittedMemory | null = null,
+  extras: { seq: number; message: ChatMessage }[] = [],
 ): ChatMessage[] {
   const items: { seq: number; message: ChatMessage }[] = [];
   if (memoryOmitted) {
@@ -183,12 +238,145 @@ export function renderJournalContext(
   for (const b of memory) {
     items.push({ seq: b.first_seq, message: memoryBlockMessage(b) });
   }
+  for (const x of extras) {
+    items.push(x);
+  }
   for (const ev of events) {
     const m = eventMessage(ev);
     if (m) items.push({ seq: ev.seq, message: m });
   }
   // Array sort is stable: ties keep the order pushed above.
   return items.sort((a, b) => a.seq - b.seq).map((i) => i.message);
+}
+
+/**
+ * Estimated tokens of one journal record — the same ~4-bytes-per-token
+ * accounting the state service uses (estPayloadTokens). Used here only to
+ * size the temporary working view after a provider capacity refusal; it is
+ * not provider billing and never writes durable state.
+ */
+export function estEventTokens(
+  kind: string,
+  payload: Record<string, unknown>,
+): number {
+  return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
+}
+
+/**
+ * Eviction units over the journal view — the port of the reference's
+ * replay_units onto journal kinds. The deciding assistant_message and the
+ * tool_call/tool_result records its calls produced form one indivisible
+ * unit: eviction can never keep a result while dropping its call or the
+ * text that decided it, and never drops an invisible tool_call for no wire
+ * gain. Every other record is its own unit. A unit boundary opens only
+ * before a record that is not part of an open tool flow — never before a
+ * tool_call or tool_result, and never while a call in the unit is still
+ * waiting for its result.
+ */
+function evictionUnits(events: Event[]): Event[][] {
+  const units: Event[][] = [];
+  let open: Event[] = [];
+  const pending = new Set<string>();
+  for (const e of events) {
+    if (
+      open.length > 0 &&
+      pending.size === 0 &&
+      e.kind !== "tool_call" &&
+      e.kind !== "tool_result"
+    ) {
+      units.push(open);
+      open = [];
+    }
+    open.push(e);
+    const callId = e.payload.call_id;
+    if (e.kind === "tool_call" && typeof callId === "string") {
+      pending.add(callId);
+    } else if (e.kind === "tool_result" && typeof callId === "string") {
+      pending.delete(callId);
+    }
+  }
+  if (open.length > 0) units.push(open);
+  return units;
+}
+
+/** Estimated tokens a journal record contributes to the actual send;
+ * records that render nothing (e.g. tool_call) cost nothing on the wire. */
+function estRenderedTokens(e: Event): number {
+  return eventMessage(e) === null ? 0 : estEventTokens(e.kind, e.payload);
+}
+
+/**
+ * Estimated rendered tokens of a journal view — what the send actually
+ * carries for these records.
+ */
+export function renderedViewTokens(events: Event[]): number {
+  let total = 0;
+  for (const e of events) total += estRenderedTokens(e);
+  return total;
+}
+
+/**
+ * Drop the oldest eviction units from a working view until the retained
+ * rendered estimate fits `budget`. Units are indivisible: an oversized unit
+ * drops whole or stays whole — nothing is split or truncated to satisfy the
+ * number, and a flow's deciding text, calls and results leave or stay
+ * together. Newest units are preferred, but a large enough view can lose
+ * all of them — the live request and in-turn suffix are not part of this
+ * view at all and are protected separately.
+ */
+export function evictToBudget(
+  events: Event[],
+  budget: number,
+): { kept: Event[]; evicted: Event[] } {
+  const units = evictionUnits(events);
+  const costs = units.map((u) => {
+    let c = 0;
+    for (const e of u) c += estRenderedTokens(e);
+    return c;
+  });
+  let total = 0;
+  for (const c of costs) total += c;
+  let cut = 0;
+  while (cut < units.length && total > budget) {
+    total -= costs[cut] ?? 0;
+    cut += 1;
+  }
+  return {
+    kept: units.slice(cut).flat(),
+    evicted: units.slice(0, cut).flat(),
+  };
+}
+
+/**
+ * The provider-capacity notice carried in a recovered working view: it names
+ * exactly which raw journal records are out of this send — count, seq range
+ * and recorded times — and how to reread them. It is not a summary, and it
+ * is never written to the journal: the records stay in the canonical
+ * history, and accepted memory notes elsewhere in the view may still
+ * represent parts of the named range — the range bounds where the omitted
+ * raw records sit, not what the view still knows.
+ */
+export function capacityNoticeMessage(evicted: Event[]): ChatMessage {
+  const first = evicted[0];
+  const last = evicted[evicted.length - 1];
+  if (!first || !last) {
+    throw new Error("capacity notice requires evicted records");
+  }
+  const source = JSON.stringify({
+    operation: "read",
+    from_seq: first.seq,
+    limit: 5,
+  });
+  return {
+    role: "user",
+    content:
+      "[Working-context capacity notice; not a new user message]\n" +
+      `${evicted.length} earlier raw records from your private history — journal seq ${first.seq} through ${last.seq}, recorded ${first.created_at} through ${last.created_at} — ` +
+      "are not in this working view because the provider rejected its size. Their raw records have not been summarized or deleted; " +
+      "accepted memory notes in this view may still cover parts of that range. " +
+      `Reread the originals with conversation_history(${source}), following next_after_seq while needed through sequence ${last.seq}. ` +
+      "Do not treat this omission as evidence that those experiences were unimportant.",
+  };
 }
 
 /** The compact_target user message: the sealed range's stored events,

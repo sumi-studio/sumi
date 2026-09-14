@@ -287,11 +287,52 @@ type CommitRequest struct {
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
 // service generates one per attempt internally when needed.
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	effects map[string]ToolEffect
+}
+
+// ToolEffect delegates one tool's atomic, state-internal effect to a
+// registered applier — the seam that lets an in-process domain (Messaging)
+// give the secretary a real action without the state service knowing the
+// domain. Apply runs inside the operation-claim transaction: the operation
+// record and its effect commit or roll back together, exactly like the
+// built-in internal tools. AfterCommit runs after that transaction commits,
+// best-effort (e.g. live fanout); it cannot decide or undo the committed
+// record and its failure is invisible to the caller by design.
+type ToolEffect struct {
+	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
+	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
 }
 
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// RegisterEffect makes tool claimable with its effect applied by effect.
+// Register at construction, before serving — the map is not synchronized for
+// concurrent registration. Built-in internal tools cannot be re-registered.
+func (s *Store) RegisterEffect(tool string, effect ToolEffect) error {
+	if tool == "" || effect.Apply == nil {
+		return fmt.Errorf("%w: tool effect requires a name and Apply", ErrBadRequest)
+	}
+	if isInternalTool(tool) {
+		return fmt.Errorf("%w: %s is a built-in internal tool", ErrBadRequest, tool)
+	}
+	if s.effects == nil {
+		s.effects = map[string]ToolEffect{}
+	}
+	s.effects[tool] = effect
+	return nil
+}
+
+// claimableTool reports whether a tool has an execution path this store can
+// run: the built-in state-internal tools, or a delegated registered effect.
+func (s *Store) claimableTool(tool string) bool {
+	if isInternalTool(tool) {
+		return true
+	}
+	_, ok := s.effects[tool]
+	return ok
 }
 
 // requireGeneration locks the writer lease row and verifies the presented
@@ -844,7 +885,7 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				SELECT persona_id, input_id FROM core_inputs
 				WHERE persona_id = $1 AND status = 'queued'
 					AND (not_before IS NULL OR not_before <= now())
-				ORDER BY created_at, input_id LIMIT 1 FOR UPDATE SKIP LOCKED
+				ORDER BY admission_seq LIMIT 1 FOR UPDATE SKIP LOCKED
 			)
 			RETURNING `+inputCols,
 			personaID, generation).
@@ -1351,20 +1392,46 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	if t, ok := in.Payload["text"].(string); ok {
 		text = t
 	}
+	// The same provenance the core's commit writes for this input: whichever
+	// lands first is the one durable receipt, so both must carry it.
+	strOrNil := func(s string) any {
+		if s == "" {
+			return nil
+		}
+		return s
+	}
+	payload := map[string]any{
+		"input_id":       in.InputID,
+		"kind":           in.Kind,
+		"text":           text,
+		"actor_kind":     in.ActorKind,
+		"actor_id":       strOrNil(in.ActorID),
+		"actor_display":  nil,
+		"source_surface": in.SourceSurface,
+		"thread_id":      strOrNil(in.ThreadID),
+		"place_name":     nil,
+		"place_kind":     nil,
+		"attention":      in.Attention,
+		"occurred_at":    in.OccurredAt,
+		"attempt":        attempt,
+	}
+	if actor, ok := in.Payload["actor"].(map[string]any); ok {
+		payload["actor_display"] = actor["display_name"]
+	}
+	if place, ok := in.Payload["place"].(map[string]any); ok {
+		payload["place_name"] = place["name"]
+		payload["place_kind"] = place["kind"]
+	}
+	for _, k := range []string{"event_id", "message_id", "message_seq", "reason"} {
+		payload[k] = in.Payload[k]
+	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
 		SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, $2, 'input_received', $3
 		FROM core_events WHERE persona_id = $1::uuidv7
 		RETURNING seq`,
-		personaID, turnID, map[string]any{
-			"input_id":       in.InputID,
-			"kind":           in.Kind,
-			"text":           text,
-			"actor_kind":     in.ActorKind,
-			"source_surface": in.SourceSurface,
-			"attempt":        attempt,
-		}).Scan(&seq); err != nil {
+		personaID, turnID, payload).Scan(&seq); err != nil {
 		return fmt.Errorf("journal input: %w", dataErr(err))
 	}
 	_, err = tx.Exec(ctx,
@@ -1473,7 +1540,10 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 // crash cannot leave an unrecorded effect or a dangling record. inputID and
 // callIndex are the claim's plan position — job.start derives its job_id
 // from them so a replayed claim can never mint a second job.
-func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, request map[string]any) (map[string]any, bool, error) {
+// idemKey is the operation's server-owned idempotency identity, which
+// delegated effects (e.g. messaging.send) use to derive their own dedup
+// identity.
+func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, idemKey string, request map[string]any) (map[string]any, bool, error) {
 	if strings.HasPrefix(tool, "job.") {
 		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
 		return resp, resp != nil, err
@@ -1566,6 +1636,13 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		}
 		return resp, true, nil
 	default:
+		if effect, ok := s.effects[tool]; ok {
+			response, err := effect.Apply(ctx, tx, personaID, idemKey, request)
+			if err != nil {
+				return nil, false, err
+			}
+			return response, true, nil
+		}
 		return nil, false, nil
 	}
 }
@@ -1581,7 +1658,7 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // generation reclaims — reconciliation by querying the external system is the
 // caller's duty, the ledger alone cannot prove an ambiguous external effect.
 func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, bool, error) {
-	if !isInternalTool(tool) {
+	if !s.claimableTool(tool) {
 		// This slice has no external executor; claiming an unregistered tool
 		// would record a permanently dangling 'running' operation. Reject at
 		// the boundary — the authorized external-tool contract (M08) adds its
@@ -1703,7 +1780,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
 	// the same transaction.
-	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
+	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, inputID, tool, callIndex, idemKey, request)
 	if err != nil {
 		return Operation{}, false, err
 	}
@@ -1719,6 +1796,14 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Operation{}, false, err
+	}
+	if internal {
+		// Post-commit hook for delegated effects (e.g. live fanout for a
+		// committed message). Best-effort: the record is already durable, a
+		// fanout failure must not fail the committed claim.
+		if effect, ok := s.effects[tool]; ok && effect.AfterCommit != nil {
+			effect.AfterCommit(ctx, personaID, request, op.Response)
+		}
 	}
 	return op, true, nil
 }

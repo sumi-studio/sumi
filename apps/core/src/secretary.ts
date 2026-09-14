@@ -1,7 +1,11 @@
 import { jsonEqual } from "./json.ts";
 import {
+  capacityNoticeMessage,
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+  evictToBudget,
+  inputMarker,
   renderJournalContext,
+  renderedViewTokens,
   runMemoryPreparation,
 } from "./memory.ts";
 import {
@@ -101,6 +105,15 @@ export interface StepOptions {
 
 /** Default wall-clock budget for transient provider retries (F1). */
 const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
+
+/**
+ * Bounded working-view recoveries after a provider context-capacity refusal,
+ * per model consultation. Each recovery drops more of the oldest raw journal
+ * records from the sent view only; the durable journal, the current input,
+ * and the in-turn suffix are never touched. 2 recoveries mean at most three
+ * provider calls for one decision before the honest recorded failure.
+ */
+const MAX_SEND_VIEW_RECOVERIES = 2;
 
 /**
  * One continuing secretary life. Boot = acquire writer lease + recover
@@ -657,7 +670,12 @@ export class Secretary {
       for (let r = 0; ; r++) {
         let decision = rounds[r];
         if (!decision) {
-          const outcome = await this.decide(turn, input, events, messages, r);
+          const outcome = await this.decide(turn, input, events, messages, r, {
+            events: context,
+            memory,
+            omitted,
+            memoryOmitted,
+          });
           // Failure committed inside decide(); a retryable one is paced
           // durably by the requeue's not_before backoff, so the loop is
           // free to serve other inputs immediately.
@@ -862,65 +880,163 @@ export class Secretary {
     events: EventInput[],
     messages: ChatMessage[],
     round: number,
+    view: {
+      events: Event[];
+      memory: MemoryBlock[];
+      omitted: OmittedRange | null;
+      memoryOmitted: OmittedMemory | null;
+    },
   ): Promise<{ rounds: Decision[] } | { failed: true; retryable: boolean }> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
+
+    // The protected suffix: the current input's user message plus everything
+    // this turn appended so far — assistant text carrying its decided calls,
+    // then one role:"tool" message per committed result. The request itself
+    // and its in-turn flow are never evicted; only older raw journal
+    // records are.
+    const suffixStart = messages.reduce(
+      (last, m, i) => (m.role === "user" ? i : last),
+      messages.length - 1,
+    );
+    const suffix = messages.slice(suffixStart);
+    const system = messages[0] ?? { role: "system" as const, content: SYSTEM };
+
+    let sendMessages = messages;
+    let keptEvents = view.events;
+    const evicted: Event[] = [];
+    let sendRecoveries = 0;
+
     let text = "";
-    const calls: ToolCall[] = [];
+    let calls: ToolCall[] = [];
     let usage: Record<string, unknown> = {};
-    try {
-      for await (const ev of this.cfg.provider.stream({
-        personaId,
-        turnId: turn.turn_id,
-        round,
-        messages,
-        tools: toolSpecs(),
-        signal: this.inFlight?.signal,
-      })) {
-        if (ev.type === "text") text += ev.delta;
-        else if (ev.type === "tool_call") calls.push(ev.call);
-        else usage = ev.usage;
+    for (;;) {
+      text = "";
+      calls = [];
+      usage = {};
+      try {
+        for await (const ev of this.cfg.provider.stream({
+          personaId,
+          turnId: turn.turn_id,
+          round,
+          messages: sendMessages,
+          tools: toolSpecs(),
+          signal: this.inFlight?.signal,
+        })) {
+          if (ev.type === "text") text += ev.delta;
+          else if (ev.type === "tool_call") calls.push(ev.call);
+          else usage = ev.usage;
+        }
+        break;
+      } catch (e) {
+        if (!this.running) throw e; // fence lost mid-stream — leave the turn
+        // Provider error text is untrusted bytes: a poisoned message (e.g.
+        // one containing NUL) must not make the failure itself unpersistable.
+        const msg = stripNul(e instanceof Error ? e.message : String(e));
+        const mErr = e instanceof ModelError ? e : null;
+        if (
+          mErr?.refusal === "context_length" &&
+          sendRecoveries < MAX_SEND_VIEW_RECOVERIES
+        ) {
+          // A deterministic capacity refusal can never succeed with the
+          // identical send. Continue the same request on a smaller
+          // temporary working view: the oldest eviction units — deciding
+          // text together with the call/result records it started — drop
+          // first; applied memory blocks, standing notices, the current
+          // input and the in-turn suffix all stay. There is no configured
+          // provider window, so each recovery halves the remaining
+          // rendered tail. The journal is never touched — the capacity
+          // notice names exactly which records left this send and how to
+          // reread them, and the next turn assembles the full context again.
+          const keptEst = renderedViewTokens(keptEvents);
+          const { kept, evicted: dropped } = evictToBudget(
+            keptEvents,
+            Math.floor(keptEst / 2),
+          );
+          if (dropped.length > 0) {
+            keptEvents = kept;
+            evicted.push(...dropped);
+            sendRecoveries += 1;
+            sendMessages = [
+              system,
+              ...renderJournalContext(
+                kept,
+                view.memory,
+                view.omitted,
+                view.memoryOmitted,
+                [
+                  {
+                    seq: (evicted[evicted.length - 1]?.seq ?? 0) + 0.5,
+                    message: capacityNoticeMessage(evicted),
+                  },
+                ],
+              ),
+              ...suffix,
+            ];
+            this.log(
+              "provider refused context; retrying with a reduced working view",
+              {
+                turn_id: turn.turn_id,
+                round,
+                recovery: sendRecoveries,
+                excluded_records: evicted.length,
+                excluded_first_seq: evicted[0]?.seq,
+                excluded_last_seq: evicted[evicted.length - 1]?.seq,
+              },
+            );
+            continue;
+          }
+        }
+        // Deterministic provider rejections cannot be fixed by retrying —
+        // they fail the input outright. Transient failures (5xx/429,
+        // network, timeout, an incomplete stream) stay retryable for a
+        // wall-clock budget measured from the input's submission — a
+        // seconds-long provider outage must not lose a request (F1). The
+        // attempt cap still bounds inputs that die before recording a
+        // failure; committed-transient retries are bounded by time, and a
+        // retryable failure leaves no partial journal — the next attempt
+        // re-emits its full event set. A capacity refusal that could not
+        // be recovered is deterministic too — it records its honest reason
+        // and never spends the transient budget.
+        const withinBudget =
+          Date.now() - Date.parse(input.created_at) <
+          (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
+        // A capacity refusal is deterministic even when the provider framed
+        // it as a retryable error — the identical send can never succeed.
+        const retryable =
+          mErr !== null &&
+          (!mErr.retryable || mErr.refusal === "context_length")
+            ? false
+            : withinBudget;
+        const detail =
+          mErr?.refusal === "context_length"
+            ? `provider refused the request for context size` +
+              (sendRecoveries > 0
+                ? `; ${sendRecoveries} reduced working-view attempt(s) were also refused`
+                : "; the working view had no reducible records") +
+              `: ${msg}`
+            : msg;
+        await this.commitTurnFinal(turn, {
+          outcome: "fail",
+          retryable,
+          // Bound at the source too: a provider error can be megabytes, and
+          // the first commit upload should never carry that onto a
+          // memory-limited host. The truncation marker stays in the record.
+          error: `model: ${truncateText(detail, RECORDED_ERROR_BYTES)}`,
+          retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
+          events: retryable ? [] : events,
+        });
+        // Bound the log line too — a provider error can be megabytes.
+        this.log("turn failed at model", {
+          turn_id: turn.turn_id,
+          round,
+          attempt: turn.attempt,
+          retryable,
+          retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
+          error: truncateText(msg, 4 * 1024),
+        });
+        return { failed: true, retryable };
       }
-    } catch (e) {
-      if (!this.running) throw e; // fence lost mid-stream — leave the turn
-      // Provider error text is untrusted bytes: a poisoned message (e.g.
-      // one containing NUL) must not make the failure itself unpersistable.
-      const msg = stripNul(e instanceof Error ? e.message : String(e));
-      const mErr = e instanceof ModelError ? e : null;
-      // Deterministic provider rejections cannot be fixed by retrying —
-      // they fail the input outright. Transient failures (5xx/429,
-      // network, timeout, an incomplete stream) stay retryable for a
-      // wall-clock budget measured from the input's submission — a
-      // seconds-long provider outage must not lose a request (F1). The
-      // attempt cap still bounds inputs that die before recording a
-      // failure; committed-transient retries are bounded by time, and a
-      // retryable failure leaves no partial journal — the next attempt
-      // re-emits its full event set.
-      const withinBudget =
-        Date.now() - Date.parse(input.created_at) <
-        (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
-      const retryable =
-        mErr !== null && !mErr.retryable ? false : withinBudget;
-      await this.commitTurnFinal(turn, {
-        outcome: "fail",
-        retryable,
-        // Bound at the source too: a provider error can be megabytes, and
-        // the first commit upload should never carry that onto a
-        // memory-limited host. The truncation marker stays in the record.
-        error: `model: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
-        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
-        events: retryable ? [] : events,
-      });
-      // Bound the log line too — a provider error can be megabytes.
-      this.log("turn failed at model", {
-        turn_id: turn.turn_id,
-        round,
-        attempt: turn.attempt,
-        retryable,
-        retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
-        error: truncateText(msg, 4 * 1024),
-      });
-      return { failed: true, retryable };
     }
     try {
       const saved = await state.savePlan(personaId, gen, {
@@ -1116,19 +1232,35 @@ const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
+  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
 function inputReceivedEvent(input: Input, turn: Turn): EventInput {
+  const p = input.payload as Record<string, unknown>;
+  const actor = (p.actor ?? {}) as Record<string, unknown>;
+  const place = (p.place ?? {}) as Record<string, unknown>;
   return {
     kind: "input_received",
     payload: {
       input_id: input.input_id,
       kind: input.kind,
-      text: typeof input.payload.text === "string" ? input.payload.text : null,
+      text: typeof p.text === "string" ? p.text : null,
       actor_kind: input.actor_kind,
+      actor_id: input.actor_id || null,
+      actor_display:
+        typeof actor.display_name === "string" ? actor.display_name : null,
       source_surface: input.source_surface,
+      thread_id: input.thread_id || null,
+      place_name: typeof place.name === "string" ? place.name : null,
+      place_kind: typeof place.kind === "string" ? place.kind : null,
+      attention: input.attention,
+      occurred_at: input.occurred_at,
+      event_id: typeof p.event_id === "string" ? p.event_id : null,
+      message_id: typeof p.message_id === "string" ? p.message_id : null,
+      message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
+      reason: typeof p.reason === "string" ? p.reason : null,
       attempt: turn.attempt,
     },
   };
@@ -1150,14 +1282,25 @@ export function assemble(
     { role: "system", content: SYSTEM },
     ...renderJournalContext(context, memory, omitted, memoryOmitted),
   ];
+  const p = input.payload as Record<string, unknown>;
   const text =
-    typeof input.payload.text === "string"
-      ? input.payload.text
+    typeof p.text === "string" && p.text !== ""
+      ? p.text
       : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"
-      : `[${input.actor_kind}]`;
+      : inputMarker({
+          actorKind: input.actor_kind,
+          actorName: (p.actor as Record<string, unknown> | undefined)
+            ?.display_name,
+          surface: input.source_surface,
+          placeId: input.thread_id,
+          placeName: (p.place as Record<string, unknown> | undefined)?.name,
+          placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
+          messageId: p.message_id,
+          attention: input.attention,
+        });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
 }

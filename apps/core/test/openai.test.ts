@@ -263,6 +263,162 @@ test("unparseable tool arguments are a retryable failure, not a call", async () 
   );
 });
 
+test("context-length refusals classify as deterministic capacity refusals", async () => {
+  // HTTP 413 — authoritative even with an empty body.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(413);
+      res.end();
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // HTTP 400 with the provider's machine-readable code.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end(
+        JSON.stringify({
+          error: {
+            code: "context_length_exceeded",
+            message: "This model's maximum context length is 131072 tokens.",
+          },
+        }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // HTTP 400 with only a message pattern — no structured code.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end("maximum context length is 131072 tokens");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // An in-band error chunk carrying the code.
+  await withServer(
+    (_req, res) =>
+      sse([
+        chunk({
+          error: { code: "model_context_window_exceeded", message: "too long" },
+        }),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+});
+
+test("non-capacity errors are never classified as context refusal", async () => {
+  // A 429 whose body mentions tokens is still a rate limit.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429, { "retry-after": "1" });
+      res.end("rate limit: too many tokens");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // An ordinary invalid request has no capacity signal.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end(
+        JSON.stringify({
+          error: { code: "invalid_request_error", message: "bad param" },
+        }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // A 5xx stays a plain transient failure.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(503);
+      res.end("Service unavailable: try again");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // A retryable status is authoritative in the non-capacity direction even
+  // when bare token wording matches a refusal pattern: a codeless 429/5xx
+  // phrased in tokens is throttling or a server error, never a size refusal.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429);
+      res.end(JSON.stringify({ error: { message: "too many tokens" } }));
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  await withServer(
+    (_req, res) => {
+      res.writeHead(500);
+      res.end(
+        JSON.stringify({ error: { message: "token limit exceeded" } }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+});
+
 test('an "error": null chunk is not an error — stream completes (NF1)', async () => {
   await withServer(
     (_req, res) =>
