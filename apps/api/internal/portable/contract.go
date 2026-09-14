@@ -222,10 +222,17 @@ type column struct {
 	kind colKind
 }
 
-// identityCols are GENERATED ALWAYS AS IDENTITY columns whose values are
-// carried verbatim: the import inserts them with OVERRIDING SYSTEM VALUE and
-// restarts the destination sequence past the staged maximum, so the order
-// they encode (e.g. input admission order) survives the move.
+// identityCols are GENERATED ALWAYS AS IDENTITY columns backed by one
+// table-global sequence. Their source values are *not* imported: the column
+// is omitted from the insert so the destination's own sequence allocates a
+// fresh value per row — work bounded by the number of transferred records,
+// never by the size of a numeric gap, and structurally unable to rewind the
+// destination's sequence or collide with its in-flight admissions. The
+// carried value still matters: the export orders the table by it and the
+// import requires the carried values to be strictly increasing, so the
+// destination's fresh allocation preserves the source's admission order
+// exactly (gaps may collapse; uniqueness and order are the contract, not the
+// numeric values).
 var identityCols = map[string]string{
 	"core_inputs": "admission_seq",
 }
@@ -246,14 +253,15 @@ var personaTable = table{name: "core_personas", cols: []column{
 // inputs). The column lists are the contract: a schema change to these
 // tables must change them deliberately, which the coverage test enforces.
 var coreTables = []table{
-	{name: "core_inputs", orderBy: `input_id COLLATE "C"`, cols: []column{
+	{name: "core_inputs", orderBy: "admission_seq", cols: []column{
 		{"persona_id", colUUID}, {"input_id", colText}, {"kind", colText}, {"payload", colJSON},
 		{"actor_kind", colText}, {"actor_id", colText}, {"source_surface", colText}, {"thread_id", colText},
 		{"occurred_at", colTime}, {"attention", colText}, {"status", colText},
 		{"claimed_generation", colBigint}, {"turn_id", colText}, {"created_at", colTime},
 		{"done_at", colTime}, {"not_before", colTime}, {"received_seq", colBigint},
-		// admission_seq is the claim queue's order: carried verbatim so the
-		// destination claims inputs in the order the source accepted them.
+		// admission_seq is the claim queue's order: carried so the bundle's
+		// row order records the source's admission order; the destination
+		// regenerates it (identityCols) so no sequence state crosses.
 		{"admission_seq", colBigint},
 	}},
 	{name: "core_turns", orderBy: `turn_id COLLATE "C"`, cols: []column{

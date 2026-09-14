@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -153,8 +154,12 @@ func rowLines(t *testing.T, p placement, personaID string) []byte {
 	if _, err := writeRows(ctx, tx, personaID, &buf); err != nil {
 		t.Fatalf("write rows: %v", err)
 	}
-	return buf.Bytes()
+	// admission_seq is destination-allocated on import, so normalize it
+	// before comparing a source's rows to a destination's.
+	return admissionSeqRe.ReplaceAll(buf.Bytes(), []byte(`"admission_seq":0`))
 }
+
+var admissionSeqRe = regexp.MustCompile(`"admission_seq":\d+`)
 
 func notesWithText(t *testing.T, p placement, personaID, text string) int {
 	t.Helper()
@@ -1278,14 +1283,13 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 	}
 }
 
-// admission_seq is backed by one table-global identity sequence: an import
-// must never move it backwards, or the next admission on an *existing*
-// persona can duplicate a queued value and corrupt that persona's claim
-// order. The destination bumps the sequence with nextval against the
-// table-wide maximum — monotone under concurrent admissions and imports —
-// where a setval restart could land below a value already issued to an
-// in-flight admission, and could persist that rewind past a rollback.
-// Regression for the populated-destination finding f-shared-intake-97.
+// admission_seq is backed by one table-global identity sequence. The import
+// regenerates it: every staged row's value comes from the destination's own
+// nextval in bundle order, so no carried value can collide with or rewind
+// the destination's allocations, and the work is bounded by the number of
+// transferred records — a bundle carrying huge admission_seq values from a
+// long-lived source must not force a billion sequence bumps. Regression for
+// the populated-destination finding f-shared-intake-97.
 func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 	ctx := context.Background()
 	local, cloud := newPlacement(t), newPlacement(t)
@@ -1372,6 +1376,25 @@ func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 	if last < globalMax() {
 		t.Fatalf("identity sequence at %d below table max %d after import", last, globalMax())
 	}
+	// The moved persona's claim order is the source's admission order, over
+	// destination-allocated values.
+	var order []string
+	rows, err := cloud.pool.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, id)
+	}
+	rows.Close()
+	if fmt.Sprint(order) != "[m-1 m-2]" {
+		t.Fatalf("destination claim order %v, want [m-1 m-2]", order)
+	}
 
 	// The next admission to the staying persona orders after everything.
 	submit(t, cloud, other, "post-import", "after the move")
@@ -1388,18 +1411,61 @@ func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 		t.Fatalf("%d same-persona duplicate admission_seq values after post-import admission", n)
 	}
 
-	// A rejected bundle must not touch the shared sequence at all.
+	// A rejected bundle can consume at most one nextval per staged row
+	// (the digest is verified after the rows stream in) — a legal gap,
+	// never a rewind.
 	before, _ := seqPos()
 	corrupt := bytes.Clone(bundle)
 	corrupt[len(corrupt)-40] ^= 0xFF
 	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(corrupt), &humanID); err == nil {
 		t.Fatal("corrupted bundle imported")
 	}
-	if after, _ := seqPos(); after != before {
-		t.Fatalf("rejected import moved the sequence %d -> %d", before, after)
+	if after, _ := seqPos(); after < before {
+		t.Fatalf("rejected import rewound the sequence %d -> %d", before, after)
 	}
 
-	// An empty carried persona (no inputs at all) must not rewind either.
+	// A bundle carrying huge admission_seq values — e.g. exported from a
+	// long-lived multi-persona source — costs a bounded number of sequence
+	// allocations: one per carried row, independent of the numeric gap.
+	// (The values are rewritten in the bundle here to stand in for a source
+	// sequence that ran far ahead; carried-shape checks still apply.)
+	big := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, big, nil, "Long-lived secretary")))
+	submit(t, local, big, "b-1", "old input")
+	submit(t, local, big, "b-2", "newer input")
+	must(local.svc.Seal(ctx, big, "move-big", placementID(t, cloud)))
+	bigBundle, _ := exportBytes(t, local, big, "move-big")
+	bigBundle = bytes.ReplaceAll(bigBundle,
+		[]byte(`"admission_seq":3`), []byte(`"admission_seq":4000000003`))
+	bigBundle = bytes.ReplaceAll(bigBundle,
+		[]byte(`"admission_seq":4`), []byte(`"admission_seq":4000000004`))
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bigBundle), &humanID); err != nil || !created {
+		t.Fatalf("big-seq import: created=%v err=%v", created, err)
+	}
+	after, _ := seqPos()
+	if after-before > 10 {
+		t.Fatalf("import advanced the sequence by %d for a 2-row bundle — work is proportional to the numeric gap, not the data", after-before)
+	}
+	var bigSeqs []int64
+	rows, err = cloud.pool.Query(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var s int64
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		bigSeqs = append(bigSeqs, s)
+	}
+	rows.Close()
+	if len(bigSeqs) != 2 || bigSeqs[0] < 1 || bigSeqs[1] <= bigSeqs[0] || bigSeqs[0] > 4000000000 {
+		t.Fatalf("rebased admission_seqs %v: want fresh small values in source order", bigSeqs)
+	}
+
+	// An empty carried persona (no inputs at all) consumes nothing.
 	empty := newID(t)
 	must(drop(local.state.EnsurePersona(ctx, empty, nil, "Empty secretary")))
 	must(local.svc.Seal(ctx, empty, "move-empty", placementID(t, cloud)))
@@ -1408,8 +1474,8 @@ func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(emptyBundle), &humanID); err != nil || !created {
 		t.Fatalf("empty import: created=%v err=%v", created, err)
 	}
-	if after, _ := seqPos(); after < before {
-		t.Fatalf("empty import rewound the sequence %d -> %d", before, after)
+	if after, _ := seqPos(); after != before {
+		t.Fatalf("empty import moved the sequence %d -> %d", before, after)
 	}
 
 	// The staying persona still passes the cut's own integrity checks — its

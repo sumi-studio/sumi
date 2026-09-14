@@ -216,89 +216,35 @@ func lookupTable(name string) (table, int, bool) {
 }
 
 func (t table) insertSQL() string {
-	names := make([]string, len(t.cols))
-	exprs := make([]string, len(t.cols))
-	for i, c := range t.cols {
-		names[i] = c.name
-		switch c.kind {
-		case colText:
-			exprs[i] = fmt.Sprintf("d->>'%s'", c.name)
-		case colUUID:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::uuidv7", c.name)
-		case colBigint:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::bigint", c.name)
-		case colInt:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::int", c.name)
-		case colTime:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::timestamptz", c.name)
-		case colJSON:
-			exprs[i] = fmt.Sprintf("d->'%s'", c.name)
-		case colJSONNull:
-			exprs[i] = fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name)
-		}
-	}
-	// A carried identity column keeps the value the source assigned; without
-	// OVERRIDING SYSTEM VALUE a GENERATED ALWAYS column rejects the insert.
-	override := ""
-	if col, ok := identityCols[t.name]; ok {
-		for _, c := range t.cols {
-			if c.name == col {
-				override = " OVERRIDING SYSTEM VALUE"
-				break
-			}
-		}
-	}
-	return fmt.Sprintf("INSERT INTO %s (%s)%s SELECT %s FROM (SELECT $1::jsonb AS d) r",
-		t.name, strings.Join(names, ", "), override, strings.Join(exprs, ", "))
-}
-
-// advanceIdentities moves each carried identity sequence past every value
-// the destination now holds — including this import's staged rows. The
-// sequence is shared by the whole table, so the floor is the table-wide
-// maximum, never a per-persona one.
-//
-// It bumps with nextval rather than setval, deliberately: nextval cannot
-// rewind. A stale floor read only makes us bump further, and a concurrent
-// admission or another import's bump can interleave freely — every call
-// moves the shared sequence forward. A rolled-back import leaves at most a
-// legal gap; a setval could instead land below a value already issued to an
-// in-flight admission on another persona, and its effect would persist past
-// the rollback.
-func advanceIdentities(ctx context.Context, tx pgx.Tx) error {
-	for name, col := range identityCols {
-		var seq string
-		if err := tx.QueryRow(ctx,
-			`SELECT pg_get_serial_sequence($1, $2)`, name, col).Scan(&seq); err != nil {
-			return fmt.Errorf("identity sequence %s.%s: %w", name, col, err)
-		}
-		var last int64
-		var called bool
-		// The sequence name comes from pg_get_serial_sequence — the
-		// catalog's own qualified, quoted name for this column's sequence.
-		if err := tx.QueryRow(ctx, fmt.Sprintf(
-			`SELECT last_value, is_called FROM %s`, seq)).Scan(&last, &called); err != nil {
-			return fmt.Errorf("identity position %s: %w", seq, err)
-		}
-		var floor int64
-		if err := tx.QueryRow(ctx, fmt.Sprintf(
-			`SELECT COALESCE(max(%s), 0) FROM %s`, col, name)).Scan(&floor); err != nil {
-			return fmt.Errorf("identity floor %s.%s: %w", name, col, err)
-		}
-		issued := last
-		if !called {
-			issued = last - 1 // nothing handed out yet; first nextval returns last_value
-		}
-		need := floor - issued
-		if need <= 0 {
+	var names, exprs []string
+	for _, c := range t.cols {
+		// Identity columns are allocated by the destination's own sequence:
+		// omit them from the insert so the DEFAULT fires once per row, in
+		// bundle order — preserving the source order the carried values
+		// encode without ever touching sequence state.
+		if identityCols[t.name] == c.name {
 			continue
 		}
-		if _, err := tx.Exec(ctx,
-			`SELECT count(nextval($1::regclass)) FROM generate_series(1, $2::bigint)`,
-			seq, need); err != nil {
-			return fmt.Errorf("advance %s: %w", seq, err)
+		names = append(names, c.name)
+		switch c.kind {
+		case colText:
+			exprs = append(exprs, fmt.Sprintf("d->>'%s'", c.name))
+		case colUUID:
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::uuidv7", c.name))
+		case colBigint:
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::bigint", c.name))
+		case colInt:
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::int", c.name))
+		case colTime:
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::timestamptz", c.name))
+		case colJSON:
+			exprs = append(exprs, fmt.Sprintf("d->'%s'", c.name))
+		case colJSONNull:
+			exprs = append(exprs, fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name))
 		}
 	}
-	return nil
+	return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM (SELECT $1::jsonb AS d) r",
+		t.name, strings.Join(names, ", "), strings.Join(exprs, ", "))
 }
 
 // The destination binds the persona to its own authenticated human; the
@@ -400,6 +346,7 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		counts[t.name] = 0
 	}
 	next := 0
+	lastCarried := map[string]int64{}
 	var trailer Trailer
 	for {
 		line, err := readLine(br)
@@ -459,6 +406,18 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 			if err != nil {
 				return Receipt{}, false, err
 			}
+		}
+		// The destination regenerates identity columns in bundle order, so
+		// that order is the only record of the source's admission order:
+		// carried values must be positive and strictly increasing — the same
+		// shape input_admission_seq_* verify for staged rows.
+		if col, ok := identityCols[t.name]; ok {
+			var v int64
+			if err := unmarshalField(row.Data, col, &v); err != nil || v < 1 || v <= lastCarried[t.name] {
+				return Receipt{}, false, fmt.Errorf("%w: %s.%s must be positive and strictly increasing in bundle order",
+					ErrBadBundle, t.name, col)
+			}
+			lastCarried[t.name] = v
 		}
 		counts[t.name]++
 		h.Write(line)
@@ -546,12 +505,6 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		VALUES ('import', $1, $2, 'staged', $3, $4, $5, $6, $7, $8, $8)`,
 		hdr.TransferID, hdr.PersonaID, hdr.FormatVersion, hdr.DestinationID, digest, hdr.TransferKey, raw, now); err != nil {
 		return Receipt{}, false, fmt.Errorf("record transfer: %w", err)
-	}
-	// Last step before commit: a rejected bundle above must not have touched
-	// the shared sequence at all. nextval bumps are non-transactional, so a
-	// crash after this point can only leave the sequence further ahead.
-	if err := advanceIdentities(ctx, tx); err != nil {
-		return Receipt{}, false, err
 	}
 	return rec, true, tx.Commit(ctx)
 }
@@ -688,4 +641,17 @@ func strictDecode(line []byte, v any) error {
 		return fmt.Errorf("%w: more than one JSON value on a line", ErrBadBundle)
 	}
 	return nil
+}
+
+// unmarshalField decodes one field of a row's JSON object into v.
+func unmarshalField(data json.RawMessage, name string, v any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("missing field %s", name)
+	}
+	return json.Unmarshal(raw, v)
 }

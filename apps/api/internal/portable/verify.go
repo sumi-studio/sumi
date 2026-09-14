@@ -137,11 +137,13 @@ var cutChecks = []struct{ name, sql string }{
 			AND i.input_id = e.payload->>'input_id'
 		WHERE e.persona_id = $1 AND e.kind = 'input_received'
 			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`},
-	// admission_seq is the claim queue's order, carried verbatim so the
-	// destination claims inputs in the order the source accepted them. The
-	// identity sequence only ever assigns unique positive values; a
-	// non-positive or duplicated one is a crafted row that corrupts or
-	// makes that order ambiguous.
+	// admission_seq is the claim queue's order. The import regenerates it
+	// from the destination's identity sequence in carried order (the bundle
+	// requires the source values positive and strictly increasing), so
+	// staged values are destination-allocated — these checks are the
+	// postcondition on what actually landed: positive and unique per
+	// persona. A non-positive or duplicated one is a crafted row that
+	// corrupts or makes that order ambiguous.
 	{"input_admission_seq_invalid", `
 		SELECT count(*) FROM core_inputs i
 		WHERE i.persona_id = $1 AND i.admission_seq < 1`},
