@@ -329,7 +329,10 @@ func TestMemoryRecoverResealsStalePreparing(t *testing.T) {
 		t.Fatalf("fenced complete: %v", err)
 	}
 	// The new generation prepares it instead, once the short pacing passes.
-	time.Sleep(300 * time.Millisecond)
+	// not_before is written in the database's wall clock; on hosts whose wall
+	// clock drifts against the monotonic one (observed ~0.85x on WSL2) a thin
+	// sleep margin reclaims too early. Keep a wide margin for the 200ms floor.
+	time.Sleep(700 * time.Millisecond)
 	re, err := s.ClaimMemoryChunk(ctx, pa, gen2, 50)
 	if err != nil || re.Chunk == nil {
 		t.Fatalf("reclaim: %v", err)

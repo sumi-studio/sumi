@@ -20,6 +20,109 @@ const webDirectory = resolve(scriptsDirectory, "..");
 const repositoryRoot = resolve(webDirectory, "../..");
 const run = promisify(execFile);
 
+test("Firebase helpers stay on the browser origin and only reach configured Firebase Hosting", async () => {
+  for (const method of ["GET", "POST"]) {
+    const incoming = new Request(
+      "https://sumi.example:8443/__/auth/handler?state=opaque",
+      {
+        method,
+        headers: {
+          Cookie: "sumi_session=private",
+          Authorization: "Bearer private",
+          "X-CSRF-Token": "private",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        ...(method === "POST" ? { body: "code=opaque" } : {}),
+      },
+    );
+    let forwarded = false;
+    const response = await handleRequest(
+      incoming,
+      {
+        ASSETS: { fetch: () => assert.fail("Firebase helper reached SPA") },
+        SUMI_ORIGIN: {
+          fetch: () => assert.fail("Firebase helper reached private API"),
+        },
+        SUMI_FIREBASE_AUTH_DOMAIN: "sumi-studio.firebaseapp.com",
+      },
+      () => assert.fail("Firebase helper reached origin"),
+      async (input, init) => {
+        forwarded = true;
+        assert(input instanceof Request);
+        assert.equal(
+          input.url,
+          "https://sumi-studio.firebaseapp.com/__/auth/handler?state=opaque",
+        );
+        assert.equal(input.method, method);
+        assert.equal(input.headers.get("Cookie"), null);
+        assert.equal(input.headers.get("Authorization"), null);
+        assert.equal(input.headers.get("X-CSRF-Token"), null);
+        assert.equal(
+          input.headers.get("Content-Type"),
+          "application/x-www-form-urlencoded",
+        );
+        if (method === "POST") assert.equal(await input.text(), "code=opaque");
+        assert.equal(init?.redirect, "manual");
+        return new Response("Firebase helper", {
+          headers: {
+            "Content-Type": "text/html",
+            "Cache-Control": "public, max-age=3600",
+          },
+        });
+      },
+    );
+    assert(forwarded);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Location"), null);
+    assert.equal(response.headers.get("Cache-Control"), "no-store");
+    assert.equal(response.headers.get("Referrer-Policy"), "no-referrer");
+    assert.equal(response.headers.get("X-Frame-Options"), null);
+    assert.equal(await response.text(), "Firebase helper");
+  }
+});
+
+test("unconfigured auth proxy and unsupported requests do not fall through to the SPA", async () => {
+  for (const [domain, method] of [
+    [undefined, "GET"],
+    ["attacker.example", "GET"],
+    ["sumi-studio.firebaseapp.com:8443", "GET"],
+    ["sumi-studio.firebaseapp.com", "DELETE"],
+  ] as const) {
+    const response = await handleRequest(
+      new Request("https://sumi.example/__/auth/iframe", { method }),
+      {
+        ASSETS: { fetch: () => assert.fail("auth helper reached SPA") },
+        SUMI_FIREBASE_AUTH_DOMAIN: domain,
+      },
+      () => assert.fail("origin used"),
+      () => assert.fail("auth upstream used"),
+    );
+    assert.equal(response.status, 404);
+  }
+});
+
+test("the Firebase helper namespace is exact lowercase and other /__/ paths are denied", async () => {
+  for (const path of [
+    "/__/AUTH/handler",
+    "/__/Auth/iframe",
+    "/__/aUth/handler",
+    "/__/firebase/init.json",
+    "/__/anything-else",
+    "/__",
+  ]) {
+    const response = await handleRequest(
+      new Request(`https://sumi.example${path}`),
+      {
+        ASSETS: { fetch: () => assert.fail("reserved path reached SPA") },
+        SUMI_FIREBASE_AUTH_DOMAIN: "sumi-studio.firebaseapp.com",
+      },
+      () => assert.fail("origin used"),
+      () => assert.fail("auth upstream used"),
+    );
+    assert.equal(response.status, 404);
+  }
+});
+
 interface DiscoveredRoute {
   file: string;
   line: number;
@@ -690,7 +793,10 @@ test("static policy is secure, revalidates HTML and sw.js, and only pins hashed 
   assert.match(universalBlock, /X-Content-Type-Options: nosniff/);
   assert.match(universalBlock, /Content-Security-Policy:/);
   assert.match(universalBlock, /camera=\(self\), microphone=\(self\)/);
-  assert.match(universalBlock, /frame-src https:\/\/\*\.firebaseapp\.com/);
+  assert.match(
+    universalBlock,
+    /frame-src 'self' https:\/\/\*\.firebaseapp\.com/,
+  );
   assert.doesNotMatch(universalBlock, /livekit\.cloud/);
   assert.doesNotMatch(universalBlock, /script-src[^;]*'unsafe-inline'/);
   assert.doesNotMatch(universalBlock, /frame-src 'none'/);
