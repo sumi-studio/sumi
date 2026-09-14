@@ -286,11 +286,14 @@ export interface OmittedRange {
   last_time: string;
 }
 
-/** One sealed journal range and its L1 replacement lifecycle. */
+/** One sealed journal range and its replacement lifecycle. Layer-2 chunks
+ * are consolidation targets: `sources` names the accepted fragments they
+ * consume, in order (null for ordinary L0→L1 chunks). */
 export interface MemoryChunk {
   persona_id: string;
   chunk_seq: number;
   layer: number;
+  sources: number[] | null;
   first_seq: number;
   last_seq: number;
   est_tokens: number;
@@ -300,7 +303,8 @@ export interface MemoryChunk {
     | "prepared"
     | "applied"
     | "kept"
-    | "failed";
+    | "failed"
+    | "superseded";
   replacement: string | null;
   replacement_est_tokens: number | null;
   /** Recorded preparation failures (the only thing that spends the budget). */
@@ -347,6 +351,8 @@ export interface MemoryStatus {
   applied: number;
   kept: number;
   failed: number;
+  /** Sources replaced by an applied upper-layer block (kept durable). */
+  superseded: number;
   /** Chunks a claim could take now (sealed past backoff, or orphaned). */
   claimable: number;
   /** Earliest time a chunk becomes claimable; null when none waits. */
@@ -361,13 +367,15 @@ export interface MemoryStatus {
 }
 
 /**
- * A chunk claimed for asynchronous L1 preparation, with everything the
- * branch needs: the covered events verbatim and the rendered parent
- * context at claim time.
+ * A chunk claimed for asynchronous preparation, with everything the branch
+ * needs: for a layer-1 target the covered events verbatim, for an
+ * upper-layer target the selected source fragments' accepted texts with
+ * their locators — plus the rendered parent context at claim time.
  */
 export interface ClaimedMemoryChunk {
   chunk: MemoryChunk | null;
   target_events: Event[];
+  target_fragments: MemoryBlock[];
   context: RenderedContext;
 }
 

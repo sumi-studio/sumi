@@ -1653,7 +1653,7 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 		payload["place_name"] = place["name"]
 		payload["place_kind"] = place["kind"]
 	}
-	for _, k := range []string{"event_id", "message_id", "message_seq", "reason"} {
+	for _, k := range []string{"event_id", "message_id", "message_seq", "reason", "message_change"} {
 		payload[k] = in.Payload[k]
 	}
 	var seq int64

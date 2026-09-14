@@ -114,6 +114,136 @@ test("a late old operation cannot attach to the current run and resolves when it
   assert.deepEqual(merged.unresolvedToolOutcomes, {});
 });
 
+test("context events that create rows stay out of the projected window", () => {
+  const userText = (text: string) => ({
+    role: "user" as const,
+    content: [{ type: "text" as const, text }],
+    timestamp,
+  });
+  const assistantText = (text: string) => ({
+    ...message,
+    content: [{ type: "text" as const, text, wire_item_index: 0 }],
+    stop_reason: "stop" as const,
+  });
+  // The window's dependency context is a complete earlier turn plus a
+  // tool activity + pending approval — all of which create entryOrder rows
+  // that must not be marked visible by the replay loop.
+  const page: DirectChatHistoryPage = {
+    events: [
+      { seq: 10, audience: "direct_chat", event: { type: "agent_start" } },
+      {
+        seq: 11,
+        audience: "direct_chat",
+        event: {
+          type: "message_end",
+          message_id: "win-u",
+          message: userText("window question"),
+        },
+      },
+      {
+        seq: 12,
+        audience: "direct_chat",
+        event: {
+          type: "message_end",
+          message_id: "win-a",
+          message: assistantText("window answer"),
+        },
+      },
+      { seq: 13, audience: "direct_chat", event: { type: "agent_end" } },
+    ],
+    context: [
+      { seq: 1, audience: "direct_chat", event: { type: "agent_start" } },
+      {
+        seq: 2,
+        audience: "direct_chat",
+        event: {
+          type: "message_end",
+          message_id: "ctx-u",
+          message: userText("context question"),
+        },
+      },
+      {
+        seq: 3,
+        audience: "direct_chat",
+        event: {
+          type: "tool_execution_start",
+          tool_call_id: "ctx-call",
+          tool_name: "bash",
+          args: { command: "ls" },
+        },
+      },
+      {
+        seq: 4,
+        audience: "direct_chat",
+        event: {
+          type: "approval_requested",
+          request: {
+            id: "ctx-req",
+            tool_call_id: "ctx-call",
+            tool_name: "bash",
+            action: { reviewable: { command: "ls" } },
+            args_summary: { command: "ls" },
+            reason: "shell access",
+            audit: {
+              outcome: "allow",
+              risk: "low",
+              authorization: "medium",
+              rationale: "read only",
+            },
+          },
+        },
+      },
+      {
+        seq: 5,
+        audience: "direct_chat",
+        event: {
+          type: "message_end",
+          message_id: "ctx-a",
+          message: assistantText("context answer"),
+        },
+      },
+      { seq: 6, audience: "direct_chat", event: { type: "agent_end" } },
+    ],
+    latestSeq: 13,
+    beforeSeq: 10,
+    hasMore: false,
+    index: [],
+    activeRun: null,
+    pendingApprovals: [],
+  };
+  const older = projectHistory(page);
+  const order = older.session.conversation.entryOrder;
+  assert.deepEqual(
+    order.filter(
+      (id) =>
+        id === "ctx-u" ||
+        id.startsWith("message:ctx-") ||
+        id.startsWith("trace:run:1") ||
+        id.startsWith("approval:"),
+    ),
+    [],
+    "context-created rows leaked into the visible window",
+  );
+  assert.ok(order.includes("win-u"));
+  assert.ok(order.includes("message:win-a:0"));
+
+  // Merge/live continuation: context ids must not resurface above the window.
+  const live = reduceEnvelope(createAgentSession(), {
+    seq: 14,
+    audience: "direct_chat",
+    event: { type: "agent_start" },
+  }).session;
+  const merged = mergeHistory(live, older.session, older.entrySeq);
+  assert.deepEqual(
+    merged.conversation.entryOrder.filter(
+      (id) => id === "ctx-u" || id.startsWith("message:ctx-"),
+    ),
+    [],
+    "context rows resurfaced through mergeHistory",
+  );
+  assert.ok(merged.conversation.entryOrder.includes("win-u"));
+});
+
 test("history decoder keeps sparse sequences and rejects state from beyond the snapshot", async () => {
   const { parseDirectChatHistoryPage } = await import(
     "../lib/direct-chat-history"

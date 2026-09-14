@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // bigText returns a reply body whose stored-JSON estimate is ~10.3k tokens
@@ -109,7 +111,7 @@ func TestMemoryForcedSealBeforeLeadingAssistant(t *testing.T) {
 	commitEvents(t, s, pa, "t1", []EventInput{
 		{Kind: "input_received", Payload: map[string]any{
 			"input_id": "in-a", "kind": "message",
-			"payload": map[string]any{"text": strings.Repeat("z", 85_000)},
+			"payload":    map[string]any{"text": strings.Repeat("z", 85_000)},
 			"actor_kind": "human"}},
 		{Kind: "assistant_message", Payload: map[string]any{"text": bigText()}},
 		{Kind: "tool_call", Payload: map[string]any{
@@ -340,7 +342,15 @@ func TestMemorySealClaimComplete(t *testing.T) {
 	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Claimable != 0 || st.NextClaimableAt == nil {
 		t.Fatalf("status while paced: %+v %v", st, err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// The recorded deadline is wall-clock; a host clock step can regress
+	// now() below it (observed on this WSL2 host), which would be a clock
+	// artifact rather than the eligibility contract under test. Push the
+	// deadline into the past directly instead of sleeping.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
+		t.Fatal(err)
+	}
 	again, err = s.ClaimMemoryChunk(ctx, pa, gen, 50)
 	if err != nil || again.Chunk == nil || again.Chunk.ChunkSeq != 1 || again.Chunk.Attempts != 0 {
 		t.Fatalf("claim after pacing: %+v %v", again.Chunk, err)
@@ -518,10 +528,17 @@ func TestMemoryRecoverResealsStalePreparing(t *testing.T) {
 		t.Fatalf("fenced complete: %v", err)
 	}
 	// The new generation prepares it instead, once the short pacing passes.
-	// not_before is written in the database's wall clock; on hosts whose wall
-	// clock drifts against the monotonic one (observed ~0.85x on WSL2) a thin
-	// sleep margin reclaims too early. Keep a wide margin for the 200ms floor.
-	time.Sleep(700 * time.Millisecond)
+	// The recorded deadline is wall-clock; a host clock step can regress
+	// now() below it (observed on this WSL2 host), so push it into the past
+	// directly rather than sleeping on a margin.
+	if c.NotBefore == nil {
+		t.Fatalf("interrupted chunk lost its pacing deadline: %+v", c)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
+		t.Fatal(err)
+	}
 	re, err := s.ClaimMemoryChunk(ctx, pa, gen2, 50)
 	if err != nil || re.Chunk == nil {
 		t.Fatalf("reclaim: %v", err)
@@ -610,6 +627,64 @@ func TestMemoryRetryBackoffThenExhaust(t *testing.T) {
 	c, _ = s.chunk(ctx, s.pool, pa, 1)
 	if c.Status != "failed" || c.Attempts != memoryChunkMaxAttempts {
 		t.Fatalf("exhausted chunk: %+v", c)
+	}
+}
+
+// A model layer that cannot produce a request — an unbound selection, a
+// missing credential, a binding-lookup outage — is a placement condition,
+// not a preparation outcome: the claim returns to the shelf without a
+// verdict and without spending attempts or interruptions, so the same
+// chunk proceeds once a usable binding exists.
+func TestMemoryReshelveKeepsWork(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	seedSealed(t, s, pa, gen, 2)
+	claimed, _ := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if claimed.Chunk == nil {
+		t.Fatal("claim")
+	}
+	c, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "model: selection needs a destination binding")
+	if err != nil {
+		t.Fatalf("reshelve: %v", err)
+	}
+	if c.Status != "sealed" || c.Attempts != 0 || c.Interruptions != 0 {
+		t.Fatalf("reshelve spent verdict budget: %+v", c)
+	}
+	if c.ClaimedGeneration != nil || c.ClaimedAt != nil {
+		t.Fatalf("reshelved chunk still claimed: %+v", c)
+	}
+	if c.LastError == nil || *c.LastError == "" {
+		t.Fatal("reshelve should record the reason for visibility")
+	}
+	if c.NotBefore == nil || !c.NotBefore.After(time.Now()) {
+		t.Fatalf("reshelved chunk should be paced: %+v", c)
+	}
+	// While paced it is not claimable — a persistent unbound window does
+	// not spin claim/reshelve inside one tick.
+	if n, err := s.ClaimMemoryChunk(ctx, pa, gen, 50); err != nil || n.Chunk != nil {
+		t.Fatalf("paced chunk claimed: %+v", n.Chunk)
+	}
+	// The same work proceeds once a usable binding exists — no verdict,
+	// no spent attempt, nothing lost.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("clear pacing: %v", err)
+	}
+	again, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || again.Chunk == nil || again.Chunk.ChunkSeq != 1 {
+		t.Fatalf("reclaim after reshelve: %+v", again.Chunk)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen, 1, "prepared text", false); err != nil {
+		t.Fatalf("complete after reshelve: %v", err)
+	}
+	// A reshelve against a chunk that is not this generation's live claim
+	// is a conflict — the shelf is never rewritten under the wrong claim.
+	if _, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "not claimed"); !errors.Is(err, ErrMemoryConflict) {
+		t.Fatalf("reshelve of unclaimed chunk: %v, want ErrMemoryConflict", err)
 	}
 }
 
@@ -1016,5 +1091,548 @@ func TestMemoryClaimReclaimsOrphanedPreparing(t *testing.T) {
 	}
 	if !contextSeqs(loadContext(t, s, pa, gen))[1] {
 		t.Fatal("failed chunk originals missing from context")
+	}
+}
+
+// --- Upper layers: L1→L2 consolidation and L2-internal reintegration ----
+// (docs/agent/memory.md steps 4–5, memory-boundaries-2026-09-08). Chunk rows
+// under test are produced by the real seal/claim/complete/apply pipeline on
+// PostgreSQL — nothing here writes chunk rows by hand.
+
+// prepareChunk claims chunk seq and shelves replacement text on it.
+func prepareChunk(t *testing.T, s *Store, pa string, gen, seq int64, text string) {
+	t.Helper()
+	cl, err := s.ClaimMemoryChunk(context.Background(), pa, gen, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != seq {
+		t.Fatalf("claim for %d: %v %+v", seq, err, cl.Chunk)
+	}
+	if _, err := s.CompleteMemoryChunk(context.Background(), pa, gen, seq, text, false); err != nil {
+		t.Fatalf("complete %d: %v", seq, err)
+	}
+}
+
+// l1Replacement is ~3.5k estimated tokens — five applied copies (17.5k) sit
+// above the 15k L1 limit and below nothing else.
+func l1Replacement() string { return strings.Repeat("a", 14_000) }
+
+// An L1 overflow creates a sealed layer-2 target over the oldest contiguous
+// applied run; its claim carries the sources' accepted texts (never raw
+// events); applying it supersedes the sources in place; and a later L2
+// overflow reintegrates the contiguous applied L2 run the same way. Every
+// original stays durable and readable through chunk_seq.
+func TestMemoryUpperConsolidatesAndReintegrates(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	// 8 exchanges → 7 sealed L1 chunks [1,2]..[13,14] + tail [15,16].
+	seedSealed(t, s, pa, gen, 8)
+	for seq := int64(1); seq <= 7; seq++ {
+		prepareChunk(t, s, pa, gen, seq, l1Replacement())
+	}
+	// Live raw ≈ 82k > 40k: maintain applies prepared chunks while the
+	// estimate stays over — c1..c5 (removing ~51.5k) — then, with applied
+	// L1 at ~17.5k > 15k, creates the first L2 target.
+	st, err := s.MemoryMaintain(ctx, pa, gen)
+	if err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	if st.Applied != 5 || st.Prepared != 2 || st.Sealed != 1 {
+		t.Fatalf("after apply+target: %+v", st)
+	}
+	target, err := s.chunk(ctx, s.pool, pa, 8)
+	if err != nil {
+		t.Fatalf("upper target: %v", err)
+	}
+	// Oldest contiguous run, oldest-first until the remainder fits 11k:
+	// c1+c2 consumed (7k) leaves 10.5k applied.
+	if target.Layer != 2 || target.Status != "sealed" ||
+		target.FirstSeq != 1 || target.LastSeq != 4 ||
+		len(target.Sources) != 2 || target.Sources[0] != 1 || target.Sources[1] != 2 {
+		t.Fatalf("L2 target shape: %+v", target)
+	}
+	if target.EstTokens != 2*3_500 {
+		t.Fatalf("target est = %d, want the consumed sources' 7000", target.EstTokens)
+	}
+
+	// The claim carries the selected fragments' accepted texts with their
+	// locators — no raw events.
+	cl, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
+		t.Fatalf("upper claim: %v %+v", err, cl.Chunk)
+	}
+	if len(cl.TargetEvents) != 0 || len(cl.TargetFragments) != 2 {
+		t.Fatalf("upper claim input: events=%d fragments=%d",
+			len(cl.TargetEvents), len(cl.TargetFragments))
+	}
+	for i, f := range cl.TargetFragments {
+		if f.Layer != 1 || f.ChunkSeq != int64(i+1) || f.Text != l1Replacement() {
+			t.Fatalf("fragment %d: %+v", i, f)
+		}
+	}
+	if len(cl.Context.Events) == 0 {
+		t.Fatal("upper claim carries the rendered parent context")
+	}
+
+	l2text := strings.Repeat("b", 20_000) // ~5k < the 7k consumed
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen, 8, l2text, false); err != nil {
+		t.Fatalf("complete L2: %v", err)
+	}
+	st, err = s.MemoryMaintain(ctx, pa, gen)
+	if err != nil {
+		t.Fatalf("apply maintain: %v", err)
+	}
+	// The layer was still over its limit: sources superseded, target applied.
+	if st.Applied != 4 || st.Superseded != 2 {
+		t.Fatalf("after L2 apply: %+v", st)
+	}
+	for _, seq := range []int64{1, 2} {
+		c, err := s.chunk(ctx, s.pool, pa, seq)
+		if err != nil || c.Status != "superseded" {
+			t.Fatalf("source %d not superseded: %+v %v", seq, c, err)
+		}
+	}
+	if target, err = s.chunk(ctx, s.pool, pa, 8); err != nil ||
+		target.Status != "applied" || target.AppliedAt == nil {
+		t.Fatalf("target not applied: %+v %v", target, err)
+	}
+
+	// The L2 block renders at its earliest source's position — before the
+	// surviving L1 blocks — and the superseded coverage no longer renders raw.
+	res := loadContext(t, s, pa, gen)
+	if len(res.Memory) != 4 ||
+		res.Memory[0].ChunkSeq != 8 || res.Memory[0].Layer != 2 ||
+		res.Memory[0].FirstSeq != 1 || res.Memory[0].Text != l2text {
+		t.Fatalf("rendered blocks: %+v", res.Memory)
+	}
+	seqs := contextSeqs(res)
+	for seq := int64(1); seq <= 10; seq++ {
+		if seqs[seq] {
+			t.Fatalf("covered seq %d still renders raw", seq)
+		}
+	}
+	// Prepared c6/c7 and the live tail still render raw.
+	for seq := int64(11); seq <= 16; seq++ {
+		if !seqs[seq] {
+			t.Fatalf("uncovered seq %d missing from context", seq)
+		}
+	}
+	// Source reread: a superseded chunk_seq still opens its raw originals —
+	// big records page at one per read, so follow after_seq to the range end.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if got := readChunkSeqs(t, s, tx, pa, 1); fmt.Sprint(got) != "[1 2]" {
+		t.Fatalf("superseded chunk 1 originals unreadable: %v", got)
+	}
+
+	// --- L2-internal reintegration -------------------------------------
+	// Push live raw back over 40k so the shelved L1 candidates apply and a
+	// second L2 target forms over the next contiguous run.
+	for i := 0; i < 3; i++ {
+		commitEvents(t, s, pa, "turn", exchange(fmt.Sprint("u", i), bigText()))
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain u: %v", err)
+	}
+	// New chunks 9,10,11 sealed; c6,c7 applied; target 12 over sources 3,4.
+	target12, err := s.chunk(ctx, s.pool, pa, 12)
+	if err != nil {
+		t.Fatalf("second target: %v", err)
+	}
+	if target12.Layer != 2 || target12.FirstSeq != 5 || target12.LastSeq != 8 ||
+		len(target12.Sources) != 2 || target12.Sources[0] != 3 || target12.Sources[1] != 4 {
+		t.Fatalf("second L2 target: %+v", target12)
+	}
+	l2text2 := strings.Repeat("c", 22_000) // ~5.5k < 7k consumed
+	prepareChunk(t, s, pa, gen, 9, l1Replacement())
+	prepareChunk(t, s, pa, gen, 10, l1Replacement())
+	prepareChunk(t, s, pa, gen, 11, l1Replacement())
+	prepareChunk(t, s, pa, gen, 12, l2text2)
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("apply 12: %v", err)
+	}
+	// Applied L2 = 5k + 5.5k = 10.5k > 10k: the same pass creates the
+	// reintegration target over the whole contiguous applied L2 run —
+	// chunk 8 [1,4] + chunk 12 [5,8] tile [1,8].
+	target13, err := s.chunk(ctx, s.pool, pa, 13)
+	if err != nil {
+		t.Fatalf("reintegration target: %v", err)
+	}
+	if target13.Layer != 2 || target13.Status != "sealed" ||
+		target13.FirstSeq != 1 || target13.LastSeq != 8 ||
+		len(target13.Sources) != 2 || target13.Sources[0] != 8 || target13.Sources[1] != 12 {
+		t.Fatalf("reintegration target: %+v", target13)
+	}
+	// Its claim carries the L2 fragments' texts — reintegration may
+	// rearrange within them but imports nothing else.
+	cl, err = s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 13 {
+		t.Fatalf("reintegration claim: %v %+v", err, cl.Chunk)
+	}
+	if len(cl.TargetFragments) != 2 || len(cl.TargetEvents) != 0 {
+		t.Fatalf("reintegration input: %+v", cl.TargetFragments)
+	}
+	if cl.TargetFragments[0].Layer != 2 || cl.TargetFragments[0].Text != l2text ||
+		cl.TargetFragments[1].Text != l2text2 {
+		t.Fatalf("reintegration fragments: %+v", cl.TargetFragments)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen, 13, "integrated memory", false); err != nil {
+		t.Fatalf("complete 13: %v", err)
+	}
+	st, err = s.MemoryMaintain(ctx, pa, gen)
+	if err != nil {
+		t.Fatalf("apply 13: %v", err)
+	}
+	if st.Superseded != 6 || st.Applied != 5 {
+		t.Fatalf("after reintegration: %+v", st)
+	}
+	for _, seq := range []int64{8, 12} {
+		c, err := s.chunk(ctx, s.pool, pa, seq)
+		if err != nil || c.Status != "superseded" {
+			t.Fatalf("L2 source %d not superseded: %+v %v", seq, c, err)
+		}
+	}
+	res = loadContext(t, s, pa, gen)
+	if len(res.Memory) == 0 || res.Memory[0].ChunkSeq != 13 ||
+		res.Memory[0].FirstSeq != 1 || res.Memory[0].Text != "integrated memory" {
+		t.Fatalf("reintegrated block: %+v", res.Memory)
+	}
+	for seq := int64(1); seq <= 8; seq++ {
+		if seqs = contextSeqs(res); seqs[seq] {
+			t.Fatalf("reintegrated coverage seq %d renders raw", seq)
+		}
+	}
+	// The whole chain stayed durable: 13 chunk rows, originals readable —
+	// the reintegrated L2 source rereads its full four-record coverage.
+	if got := readChunkSeqs(t, s, tx, pa, 8); fmt.Sprint(got) != "[1 2 3 4]" {
+		t.Fatalf("superseded L2 originals unreadable: %v", got)
+	}
+}
+
+// readChunkSeqs pages a chunk_seq read to the end of the chunk's range and
+// returns the distinct record seqs it returned, in order. Each record is a
+// bigText event (~41KB serialized): the 16KB page budget fragments a record
+// through next_read (seq + content_offset) and resumes the chunk query at
+// resume_after_seq, so a record's seq can appear in consecutive messages.
+func readChunkSeqs(t *testing.T, s *Store, tx pgx.Tx, persona string, chunkSeq int64) []int64 {
+	t.Helper()
+	var seqs []int64
+	appendSeq := func(m map[string]any) {
+		seq := m["source"].(map[string]any)["seq"].(int64)
+		if len(seqs) == 0 || seqs[len(seqs)-1] != seq {
+			seqs = append(seqs, seq)
+		}
+	}
+	asInt := func(v any) int64 {
+		switch n := v.(type) {
+		case int64:
+			return n
+		case int:
+			return int64(n)
+		default:
+			t.Fatalf("reread cursor %v (%T) is not an integer", v, v)
+			return 0
+		}
+	}
+	req := map[string]any{"operation": "read", "chunk_seq": float64(chunkSeq), "limit": float64(20)}
+	for i := 0; i < 40; i++ {
+		res, err := s.conversationHistory(context.Background(), tx, persona, req)
+		if err != nil {
+			t.Fatalf("chunk %d reread: %v", chunkSeq, err)
+		}
+		var resumeAfter int64
+		for _, m := range res["messages"].([]map[string]any) {
+			appendSeq(m)
+			if r, ok := m["resume_after_seq"].(int64); ok {
+				resumeAfter = r
+			}
+		}
+		if next, ok := res["next_read"].(map[string]any); ok {
+			// Mid-record fragment: continue inside the same record.
+			req = map[string]any{"operation": "read",
+				"seq":            float64(asInt(next["seq"])),
+				"content_offset": float64(asInt(next["content_offset"]))}
+			continue
+		}
+		if res["next_after_seq"] != nil {
+			req = map[string]any{"operation": "read",
+				"chunk_seq": float64(chunkSeq),
+				"after_seq": float64(asInt(res["next_after_seq"])), "limit": float64(20)}
+			continue
+		}
+		if resumeAfter != 0 {
+			// The fragmented record ended; resume the chunk query past it.
+			req = map[string]any{"operation": "read",
+				"chunk_seq": float64(chunkSeq),
+				"after_seq": float64(resumeAfter), "limit": float64(20)}
+			continue
+		}
+		return seqs
+	}
+	t.Fatalf("chunk %d reread did not terminate", chunkSeq)
+	return nil
+}
+
+// A KEEP_UNCHANGED (or exhausted failure) verdict settles its exact source
+// tuple: the same selection is never resealed, while a different grouping
+// of the remaining shelf still proceeds.
+func TestMemoryUpperSettledTupleNotResealed(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	seedSealed(t, s, pa, gen, 8)
+	for seq := int64(1); seq <= 7; seq++ {
+		prepareChunk(t, s, pa, gen, seq, l1Replacement())
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	// Target 8 covers sources [1,2]; the model keeps them.
+	cl, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
+		t.Fatalf("claim 8: %v %+v", err, cl.Chunk)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen, 8, "", true); err != nil {
+		t.Fatalf("keep: %v", err)
+	}
+	st, err := s.MemoryMaintain(ctx, pa, gen)
+	if err != nil {
+		t.Fatalf("maintain after keep: %v", err)
+	}
+	// The kept tuple is not resealed — but the next contiguous group is a
+	// different tuple and proceeds: target 9 over sources [3,4].
+	c8, err := s.chunk(ctx, s.pool, pa, 8)
+	if err != nil || c8.Status != "kept" {
+		t.Fatalf("kept target: %+v %v", c8, err)
+	}
+	c9, err := s.chunk(ctx, s.pool, pa, 9)
+	if err != nil {
+		t.Fatalf("next target: %v", err)
+	}
+	if c9.Layer != 2 || c9.Status != "sealed" ||
+		len(c9.Sources) != 2 || c9.Sources[0] != 3 || c9.Sources[1] != 4 ||
+		c9.FirstSeq != 5 || c9.LastSeq != 8 {
+		t.Fatalf("regrouped target: %+v", c9)
+	}
+	if st.Sealed != 1 {
+		t.Fatalf("one in-flight upper target: %+v", st)
+	}
+
+	// A terminally failed target settles the same way: the identical tuple
+	// is never resealed (a fresh attempt budget on the same sources would
+	// loop forever), while originals stay applied and rendering.
+	cl, err = s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 9 {
+		t.Fatalf("claim 9: %v %+v", err, cl.Chunk)
+	}
+	if _, err := s.FailMemoryChunk(ctx, pa, gen, 9, "provider refused", false); err != nil {
+		t.Fatalf("fail 9: %v", err)
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain after fail: %v", err)
+	}
+	c9, _ = s.chunk(ctx, s.pool, pa, 9)
+	if c9.Status != "failed" {
+		t.Fatalf("failed target: %+v", c9)
+	}
+	// No new target reselects [1,2] or [3,4]; the remainder of that applied
+	// run is chunk 5 alone (6,7 are still shelved candidates). The reference
+	// sets no minimum group size, so the single-source tuple [5] proceeds —
+	// it is a different grouping, not a relitigated verdict.
+	var next MemoryChunk
+	found := false
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+chunkCols+` FROM core_memory_chunks
+		WHERE persona_id = $1 AND layer = 2 AND status = 'sealed'`, pa)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for rows.Next() {
+		c, err := scanChunk(rows)
+		if err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		if found {
+			t.Fatal("more than one sealed upper target")
+		}
+		next, found = c, true
+	}
+	rows.Close()
+	if !found || len(next.Sources) != 1 || next.Sources[0] != 5 ||
+		next.FirstSeq != 9 || next.LastSeq != 10 {
+		t.Fatalf("next grouping: %+v", next)
+	}
+	for _, seq := range []int64{1, 2, 3, 4} {
+		c, err := s.chunk(ctx, s.pool, pa, seq)
+		if err != nil || c.Status != "applied" {
+			t.Fatalf("settled source %d lost its originals' replacement: %+v %v", seq, c, err)
+		}
+	}
+}
+
+// A prepared upper target applies only while its layer is still over the
+// limit: if the layer has settled under it, the candidate waits shelved and
+// the sources are never superseded.
+func TestMemoryUpperApplyGateShelves(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	seedSealed(t, s, pa, gen, 8)
+	for seq := int64(1); seq <= 7; seq++ {
+		prepareChunk(t, s, pa, gen, seq, l1Replacement())
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	prepareChunk(t, s, pa, gen, 8, strings.Repeat("b", 20_000))
+	// The layer settles under its limit before the candidate can apply:
+	// shrink the unselected applied L1 rows' estimates so applied L1 totals
+	// ~10k < 15k (a direct fixture of the gate condition, as a correction
+	// pass could leave it).
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE core_memory_chunks SET replacement_est_tokens = 2000
+		WHERE persona_id = $1 AND chunk_seq IN (3, 4, 5)`, pa); err != nil {
+		t.Fatalf("settle layer: %v", err)
+	}
+	st, err := s.MemoryMaintain(ctx, pa, gen)
+	if err != nil {
+		t.Fatalf("maintain shelved: %v", err)
+	}
+	c8, err := s.chunk(ctx, s.pool, pa, 8)
+	if err != nil || c8.Status != "prepared" {
+		t.Fatalf("shelved target: %+v %v", c8, err)
+	}
+	if st.Superseded != 0 {
+		t.Fatalf("nothing may be superseded while shelved: %+v", st)
+	}
+	for _, seq := range []int64{1, 2} {
+		c, _ := s.chunk(ctx, s.pool, pa, seq)
+		if c.Status != "applied" {
+			t.Fatalf("source %d touched while shelved: %+v", seq, c)
+		}
+	}
+	// When the layer is over the limit again the same candidate applies.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE core_memory_chunks SET replacement_est_tokens = 3500
+		WHERE persona_id = $1 AND chunk_seq IN (3, 4, 5)`, pa); err != nil {
+		t.Fatalf("restore layer: %v", err)
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain apply: %v", err)
+	}
+	c8, _ = s.chunk(ctx, s.pool, pa, 8)
+	if c8.Status != "applied" {
+		t.Fatalf("target not applied once the gate holds: %+v", c8)
+	}
+}
+
+// An upper target whose sources are no longer all applied is stale — a
+// state the one-in-flight rule cannot produce but a transferred or crafted
+// row can. The claim fails it honestly: no attempts spent, sources
+// untouched, no replacement prepared from a different source set.
+func TestMemoryUpperStaleTargetFailsHonestly(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	seedSealed(t, s, pa, gen, 8)
+	for seq := int64(1); seq <= 7; seq++ {
+		prepareChunk(t, s, pa, gen, seq, l1Replacement())
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen); err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	// Simulate a carried/tampered row: source 1 is no longer applied.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE core_memory_chunks SET status = 'superseded'
+		WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+	cl, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if cl.Chunk != nil {
+		t.Fatalf("stale target claimed for preparation: %+v", cl.Chunk)
+	}
+	c8, err := s.chunk(ctx, s.pool, pa, 8)
+	if err != nil || c8.Status != "failed" || c8.Attempts != 0 ||
+		c8.LastError == nil || !strings.Contains(*c8.LastError, "stale") {
+		t.Fatalf("stale target: %+v %v", c8, err)
+	}
+	c1, _ := s.chunk(ctx, s.pool, pa, 1)
+	if c1.Status != "superseded" {
+		t.Fatalf("source row touched by the honest failure: %+v", c1)
+	}
+}
+
+// Upper-layer claims fence and interrupt like layer-1 ones: a dead
+// generation's preparing target returns to the shelf as an interruption,
+// its outcome can never land, and the live generation reprepares it.
+func TestMemoryUpperClaimFencingAndInterruption(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen1 := acquireWriter(t, s, pa, 50*time.Millisecond)
+
+	seedSealed(t, s, pa, gen1, 8)
+	for seq := int64(1); seq <= 7; seq++ {
+		prepareChunk(t, s, pa, gen1, seq, l1Replacement())
+	}
+	if _, err := s.MemoryMaintain(ctx, pa, gen1); err != nil {
+		t.Fatalf("maintain: %v", err)
+	}
+	cl, err := s.ClaimMemoryChunk(ctx, pa, gen1, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
+		t.Fatalf("claim 8: %v %+v", err, cl.Chunk)
+	}
+	// The writer dies mid-preparation; a new generation recovers.
+	time.Sleep(100 * time.Millisecond)
+	gen2 := acquireWriter(t, s, pa, time.Minute)
+	if _, err := s.Recover(ctx, pa, gen2); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	c8, err := s.chunk(ctx, s.pool, pa, 8)
+	if err != nil || c8.Status != "sealed" || c8.Interruptions != 1 || c8.Attempts != 0 {
+		t.Fatalf("interrupted upper claim: %+v %v", c8, err)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen1, 8, "late answer", false); !errors.Is(err, ErrGenerationFence) {
+		t.Fatalf("fenced upper complete: %v", err)
+	}
+	// The interruption's deadline is wall-clock; a host clock step can
+	// regress now() below it (observed on this WSL2 host), so push it into
+	// the past directly rather than sleeping on a margin.
+	if c8.NotBefore == nil {
+		t.Fatalf("interrupted upper chunk lost its pacing deadline: %+v", c8)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 8`, pa); err != nil {
+		t.Fatal(err)
+	}
+	cl, err = s.ClaimMemoryChunk(ctx, pa, gen2, 50)
+	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
+		t.Fatalf("reclaim 8: %v %+v", err, cl.Chunk)
+	}
+	if len(cl.TargetFragments) != 2 {
+		t.Fatalf("reclaimed fragments: %+v", cl.TargetFragments)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen2, 8, "gen2 L2 text", false); err != nil {
+		t.Fatalf("gen2 complete: %v", err)
 	}
 }

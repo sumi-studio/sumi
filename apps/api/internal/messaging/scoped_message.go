@@ -475,6 +475,9 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 	if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
 		return Message{}, err
 	}
+	if err := s.issueAgentMessageChange(ctx, tx, place, message, AttentionChangeEdited, editedAt); err != nil {
+		return Message{}, fmt.Errorf("issue PA edit attention: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped edit: %w", err)
 	}
@@ -534,10 +537,11 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if message.Author != s.Scope.Actor && place.Kind != PlaceChannel && place.Kind != PlaceThread {
 		return Message{}, ErrForbidden
 	}
+	var deletedAt time.Time
 	if err := tx.QueryRow(ctx, `
 		UPDATE messages SET content = NULL, deleted_at = now(), revision = revision + 1
 		WHERE workspace_id = $1 AND message_id = $2
-		RETURNING revision`, s.Scope.WorkspaceID, messageID).Scan(&message.Revision); err != nil {
+		RETURNING revision, deleted_at`, s.Scope.WorkspaceID, messageID).Scan(&message.Revision, &deletedAt); err != nil {
 		return Message{}, fmt.Errorf("tombstone scoped message: %w", err)
 	}
 	// Bytes leave through the durable deletion outbox after commit; the
@@ -562,6 +566,9 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 		if err := bumpThreadProjectionRevision(ctx, tx, s.Scope.WorkspaceID, place.PlaceID); err != nil {
 			return Message{}, err
 		}
+	}
+	if err := s.issueAgentMessageChange(ctx, tx, place, message, AttentionChangeDeleted, deletedAt); err != nil {
+		return Message{}, fmt.Errorf("issue PA deletion attention: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Message{}, fmt.Errorf("commit scoped delete: %w", err)

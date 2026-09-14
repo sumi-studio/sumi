@@ -181,6 +181,110 @@ var cutChecks = []struct{ name, sql string }{
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (
 			c.status = 'preparing' OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
+	// Upper-layer targets carry their provenance: every source must resolve
+	// to a distinct carried same-persona chunk, all in one layer, and the
+	// target's journal range must be exactly its sources' span — anchored at
+	// both ends AND tiled inside, since bounds alone leave interior gaps and
+	// overlaps unchecked. The array itself must be in first_seq order: the
+	// selection emits it canonically and the settled-tuple dedup compares
+	// arrays order-sensitively, so a reordered carried tuple would silently
+	// relitigate a verdict it was meant to settle. A source is only ever
+	// selected while 'applied'; afterwards it is either still applied or
+	// superseded by the target that consumed it, so any other lifecycle
+	// status is a state the pipeline cannot emit. And applying a target
+	// supersedes its sources in the same transaction: an 'applied' target
+	// over still-live sources double-renders the range — only a crafted row
+	// holds that. Settled or in-flight targets legitimately keep 'applied'
+	// sources, and a failed or stale one's sources may already be
+	// superseded by a different applied target, so the superseded
+	// requirement binds 'applied' targets only.
+	{"memory_chunk_sources_invalid", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			(c.layer = 1 AND c.sources IS NOT NULL)
+			OR (c.layer >= 2 AND (
+				c.sources IS NULL OR cardinality(c.sources) = 0
+				OR (SELECT count(*) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> cardinality(c.sources)
+				OR (SELECT count(DISTINCT s2.layer) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> 1
+				OR (SELECT min(s2.first_seq) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> c.first_seq
+				OR (SELECT max(s2.last_seq) FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)) <> c.last_seq
+				OR c.sources <> (SELECT array_agg(s2.chunk_seq ORDER BY s2.first_seq)
+					FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources))
+				OR EXISTS (
+					SELECT 1 FROM (
+						SELECT s2.first_seq,
+							lag(s2.last_seq) OVER (ORDER BY s2.first_seq) AS prev_last
+						FROM core_memory_chunks s2
+						WHERE s2.persona_id = c.persona_id
+						AND s2.chunk_seq = ANY(c.sources)) tile
+					WHERE tile.first_seq <> tile.prev_last + 1)
+				OR EXISTS (SELECT 1 FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)
+					AND s2.status NOT IN ('applied', 'superseded'))
+				OR (c.status = 'applied' AND EXISTS (
+					SELECT 1 FROM core_memory_chunks s2
+					WHERE s2.persona_id = c.persona_id
+					AND s2.chunk_seq = ANY(c.sources)
+					AND s2.status <> 'superseded'))
+			)))`},
+	// 'superseded' means an applied upper target rendered the row's range —
+	// the store only ever marks a source superseded inside the same
+	// transaction that applies its consumer. So every superseded row must be
+	// reachable as a source of an applied target, transitively through
+	// superseded intermediate targets (a valid L2 block can itself be
+	// reintegrated into a later applied ancestor). A superseded row with no
+	// applied ancestor leaves journal coverage rendered by nothing — the
+	// pipeline cannot produce that, so the bundle is crafted.
+	{"memory_chunk_superseded_uncovered", `
+		WITH RECURSIVE covered AS (
+			SELECT s2.chunk_seq AS seq FROM core_memory_chunks c
+			JOIN core_memory_chunks s2 ON s2.persona_id = c.persona_id
+				AND s2.chunk_seq = ANY(c.sources)
+			WHERE c.persona_id = $1 AND c.status = 'applied'
+			UNION
+			SELECT s2.chunk_seq FROM core_memory_chunks c
+			JOIN covered cov ON cov.seq = c.chunk_seq
+			JOIN core_memory_chunks s2 ON s2.persona_id = c.persona_id
+				AND s2.chunk_seq = ANY(c.sources)
+			WHERE c.persona_id = $1
+		)
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND c.status = 'superseded'
+			AND NOT EXISTS (SELECT 1 FROM covered cov WHERE cov.seq = c.chunk_seq)`},
+	// Coverage is disjoint. The seal walk allocates each L1 range exactly
+	// once and even a failed verdict keeps its range covered, so two L1
+	// rows never share a journal seq — a second L1 over already-covered
+	// seqs (over superseded originals, for example) is crafted state that
+	// the destination's own pipeline could later apply into real overlap.
+	{"memory_chunk_l1_overlap", `
+		SELECT count(*) FROM core_memory_chunks a
+		JOIN core_memory_chunks b ON b.persona_id = a.persona_id
+			AND b.chunk_seq <> a.chunk_seq AND b.layer = 1
+			AND b.first_seq <= a.last_seq AND b.last_seq >= a.first_seq
+		WHERE a.persona_id = $1 AND a.layer = 1`},
+	// Only 'applied' rows render: two applied rows sharing a seq
+	// double-render it. Applying a target supersedes exactly its sources
+	// in one transaction, so the pipeline's applied set is always
+	// disjoint. Dead rows (kept/failed) and in-flight targets legitimately
+	// overlap live coverage — a regrouped retry shares range with the
+	// verdict it replaced — so the rule binds 'applied' rows only.
+	{"memory_chunk_applied_overlap", `
+		SELECT count(*) FROM core_memory_chunks a
+		JOIN core_memory_chunks b ON b.persona_id = a.persona_id
+			AND b.chunk_seq <> a.chunk_seq AND b.status = 'applied'
+			AND b.first_seq <= a.last_seq AND b.last_seq >= a.first_seq
+		WHERE a.persona_id = $1 AND a.status = 'applied'`},
 	// Chunk ranges are locators into the carried journal; a range that
 	// reaches past it would render a fragment for records that do not
 	// exist.
@@ -206,7 +310,8 @@ var cutChecks = []struct{ name, sql string }{
 	// store only ever produces positive or zero: chunk_seq/layer start at 1,
 	// estimates and attempt/interruption counts are >= 0. A negative value is
 	// a crafted row that corrupts ordering and the live-raw accounting; a
-	// layer above 1 is *not* invalid — consolidation layers are future work.
+	// layer above 1 is a consolidation/reintegration target whose sources'
+	// provenance is checked separately above.
 	{"memory_chunk_negative_values", `
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (
