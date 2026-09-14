@@ -130,7 +130,7 @@ func writeRows(ctx context.Context, tx pgx.Tx, personaID string, w io.Writer) (m
 	counts := map[string]int64{}
 	var persona string
 	if err := tx.QueryRow(ctx, `
-		SELECT jsonb_build_object('persona_id', persona_id, 'display_name', display_name, 'created_at', created_at)::text
+		SELECT jsonb_build_object('persona_id', persona_id, 'display_name', display_name, 'created_at', created_at, 'model_intent', model_intent)::text
 		FROM core_personas WHERE persona_id = $1`, personaID).Scan(&persona); err != nil {
 		return nil, err
 	}
@@ -216,25 +216,36 @@ func lookupTable(name string) (table, int, bool) {
 }
 
 func (t table) insertSQL() string {
-	names := make([]string, len(t.cols))
-	exprs := make([]string, len(t.cols))
-	for i, c := range t.cols {
-		names[i] = c.name
+	var names, exprs []string
+	for _, c := range t.cols {
+		// Identity columns are allocated by the destination's own sequence:
+		// omit them from the insert so the DEFAULT fires once per row, in
+		// bundle order — preserving the source order the carried values
+		// encode without ever touching sequence state.
+		if identityCols[t.name] == c.name {
+			continue
+		}
+		names = append(names, c.name)
 		switch c.kind {
 		case colText:
-			exprs[i] = fmt.Sprintf("d->>'%s'", c.name)
+			exprs = append(exprs, fmt.Sprintf("d->>'%s'", c.name))
 		case colUUID:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::uuidv7", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::uuidv7", c.name))
 		case colBigint:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::bigint", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::bigint", c.name))
 		case colInt:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::int", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::int", c.name))
 		case colTime:
-			exprs[i] = fmt.Sprintf("(d->>'%s')::timestamptz", c.name)
+			exprs = append(exprs, fmt.Sprintf("(d->>'%s')::timestamptz", c.name))
 		case colJSON:
-			exprs[i] = fmt.Sprintf("d->'%s'", c.name)
+			exprs = append(exprs, fmt.Sprintf("d->'%s'", c.name))
 		case colJSONNull:
-			exprs[i] = fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name)
+			exprs = append(exprs, fmt.Sprintf("NULLIF(d->'%s', 'null'::jsonb)", c.name))
+		case colBigintList:
+			// A JSON null is SQL NULL; a JSON array aggregates into bigint[].
+			exprs = append(exprs, fmt.Sprintf(
+				"(SELECT array_agg(e::bigint) FROM jsonb_array_elements_text(NULLIF(d->'%s','null'::jsonb)) e)",
+				c.name))
 		}
 	}
 	return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM (SELECT $1::jsonb AS d) r",
@@ -242,10 +253,14 @@ func (t table) insertSQL() string {
 }
 
 // The destination binds the persona to its own authenticated human; the
-// source's human binding is never read from a bundle.
+// source's human binding is never read from a bundle. The carried
+// model_intent is non-secret preference only: the destination enforces it
+// as needs_rebinding until its bound human selects a matching connection
+// (or the intent is explicitly cleared).
 const personaInsertSQL = `
-	INSERT INTO core_personas (persona_id, human_id, display_name, created_at, authority, transfer_id)
-	SELECT (d->>'persona_id')::uuidv7, $2, d->>'display_name', (d->>'created_at')::timestamptz, 'staged', $3
+	INSERT INTO core_personas (persona_id, human_id, display_name, created_at, model_intent, authority, transfer_id)
+	SELECT (d->>'persona_id')::uuidv7, $2, d->>'display_name', (d->>'created_at')::timestamptz,
+		NULLIF(d->>'model_intent', 'null')::jsonb, 'staged', $3
 	FROM (SELECT $1::jsonb AS d) r`
 
 // Import stages a bundle addressed to this placement. Everything happens in
@@ -262,9 +277,20 @@ const personaInsertSQL = `
 // overwritten or duplicated. The same transfer imported again with identical
 // content and the same human_id is answered with the recorded receipt
 // (created=false); a different human_id is a conflict, not a silent rebind.
-func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Receipt, bool, error) {
+// sameHuman is the importing operator's assertion that the bound
+// destination human is the same authority that decided the bundle's
+// approvals at the source. Without it, an approved-but-unconsumed grant —
+// consent recorded under a different account — is re-pended at import:
+// the original decision is preserved in prior_* as provenance, and the
+// destination's bound human must decide again before the effect runs.
+// Decided-and-consumed and denied approvals are receipts/history and keep
+// their state; pending approvals stay pending either way.
+func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, sameHuman bool) (Receipt, bool, error) {
 	if humanID != nil && !uuidv7Re.MatchString(*humanID) {
 		return Receipt{}, false, fmt.Errorf("%w: human_id must be a uuidv7", ErrBadRequest)
+	}
+	if sameHuman && humanID == nil {
+		return Receipt{}, false, fmt.Errorf("%w: same_human requires human_id — the assertion names which human continues the authority", ErrBadRequest)
 	}
 	br := bufio.NewReaderSize(r, 1<<16)
 	h := sha256.New()
@@ -340,6 +366,7 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		counts[t.name] = 0
 	}
 	next := 0
+	lastCarried := map[string]int64{}
 	var trailer Trailer
 	for {
 		line, err := readLine(br)
@@ -400,6 +427,18 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 				return Receipt{}, false, err
 			}
 		}
+		// The destination regenerates identity columns in bundle order, so
+		// that order is the only record of the source's admission order:
+		// carried values must be positive and strictly increasing — the same
+		// shape input_admission_seq_* verify for staged rows.
+		if col, ok := identityCols[t.name]; ok {
+			var v int64
+			if err := unmarshalField(row.Data, col, &v); err != nil || v < 1 || v <= lastCarried[t.name] {
+				return Receipt{}, false, fmt.Errorf("%w: %s.%s must be positive and strictly increasing in bundle order",
+					ErrBadBundle, t.name, col)
+			}
+			lastCarried[t.name] = v
+		}
 		counts[t.name]++
 		h.Write(line)
 	}
@@ -424,6 +463,10 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		if prior.ContentSHA256 != digest {
 			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with different content", ErrTransferConflict, hdr.TransferID)
 		}
+		if prior.SameHuman != sameHuman {
+			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with same_human=%t; the staged authority decision is fixed",
+				ErrTransferConflict, hdr.TransferID, prior.SameHuman)
+		}
 		return prior, false, tx.Commit(ctx)
 	}
 
@@ -440,12 +483,34 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		hdr.PersonaID, hdr.Cut.GenerationHighWater, sealHolder(hdr.TransferID)); err != nil {
 		return Receipt{}, false, fmt.Errorf("write lease epoch floor: %w", err)
 	}
+	// Validate the cut as shipped before any destination-side transform:
+	// the bundle must be coherent in the state the source actually sealed.
 	violations, err := verifyCut(ctx, tx, hdr.PersonaID)
 	if err != nil {
 		return Receipt{}, false, err
 	}
 	if len(violations) > 0 {
 		return Receipt{}, false, fmt.Errorf("%w: %s", ErrIntegrity, describe(violations))
+	}
+	if !sameHuman {
+		// Consent is identity-scoped: a grant decided by the source's human
+		// does not authorize a different destination account. The grant is
+		// re-pended — the original decision moves to prior_* as provenance —
+		// so the destination's bound human decides before the effect runs,
+		// and the operation can neither execute under borrowed authority
+		// nor be silently dropped or denied. The result is a pending
+		// approval on an awaiting operation, already a coherent cut state.
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_tool_approvals
+			SET prior_decision = decision, prior_decided_by_kind = decided_by_kind,
+				prior_decided_by_id = decided_by_id, prior_decided_at = decided_at,
+				status = 'pending', decision = NULL, decision_id = NULL,
+				decided_by_kind = NULL, decided_by_id = NULL, decided_at = NULL,
+				provenance = NULL
+			WHERE persona_id = $1 AND status = 'approved' AND consumed_at IS NULL`,
+			hdr.PersonaID); err != nil {
+			return Receipt{}, false, fmt.Errorf("re-pend cross-authority grants: %w", err)
+		}
 	}
 	rows, cont, cut, err := summarize(ctx, tx, hdr.PersonaID)
 	if err != nil {
@@ -467,6 +532,7 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string) (Rec
 		FormatVersion: hdr.FormatVersion,
 		DestinationID: hdr.DestinationID,
 		HumanID:       humanID,
+		SameHuman:     sameHuman,
 		ContentSHA256: digest,
 		SealedAt:      hdr.SealedAt.UTC(),
 		Cut:           hdr.Cut,
@@ -560,6 +626,18 @@ func insertErr(table string, err error) error {
 		if pgErr.Code == "23505" {
 			return fmt.Errorf("%w: %s row duplicates a key already in this bundle", ErrBadBundle, table)
 		}
+		// A row-shape CHECK on a carried table is the same integrity rule
+		// the cut-time checks name — report it in that vocabulary so a
+		// violation reads identically whether the schema or the verifier
+		// catches it first.
+		if pgErr.Code == "23514" {
+			if check, ok := map[string]string{
+				"core_memory_chunks_sources_check": "memory_chunk_sources_invalid",
+				"core_memory_chunks_layer_check":   "memory_chunk_negative_values",
+			}[pgErr.ConstraintName]; ok {
+				return fmt.Errorf("%w: %s", ErrIntegrity, describe([]Violation{{Check: check, Rows: 1}}))
+			}
+		}
 		return fmt.Errorf("%w: %s row: %v", ErrBadBundle, table, err)
 	}
 	return fmt.Errorf("insert %s row: %w", table, err)
@@ -622,4 +700,17 @@ func strictDecode(line []byte, v any) error {
 		return fmt.Errorf("%w: more than one JSON value on a line", ErrBadBundle)
 	}
 	return nil
+}
+
+// unmarshalField decodes one field of a row's JSON object into v.
+func unmarshalField(data json.RawMessage, name string, v any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("missing field %s", name)
+	}
+	return json.Unmarshal(raw, v)
 }

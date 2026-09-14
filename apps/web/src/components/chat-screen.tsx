@@ -3,6 +3,7 @@ import { Button } from "@sumi/ui/components/button";
 import { ArrowDown, History } from "lucide-react";
 import {
   lazy,
+  memo,
   Suspense,
   useCallback,
   useEffect,
@@ -12,7 +13,8 @@ import {
   useState,
 } from "react";
 import type { ChatItem } from "../agent/model";
-import { collectAgentCopyText, projectConversation } from "../agent/projection";
+import { ConversationProjector } from "../agent/projector";
+import type { useConversation as useConversationStore } from "../agent/store";
 import { useConversation } from "../agent/store";
 import { hasInspectableTrace } from "../agent/work-summary";
 import { userItemSourceLabel, userItemText } from "../lib/user-item-text";
@@ -31,17 +33,46 @@ const ChatItemView = lazy(() =>
   import("./chat-item").then((module) => ({ default: module.ChatItemView })),
 );
 
+type MemoizedChatItemViewProps = Omit<
+  import("./chat-item").ChatItemViewProps,
+  "onOperationOpenChange"
+> & {
+  /** Row-scoped setter keeps the callback identity stable across renders. */
+  onOperationOpenChange: (id: string, open: boolean) => void;
+};
+
+// Item objects stay referentially stable for entries the projector's
+// journal did not touch, so memoization lets a streamed delta re-render
+// only the row it actually changed instead of every mounted row.
+const MemoizedChatItemView = memo(function MemoizedChatItemView({
+  item,
+  onOperationOpenChange,
+  ...props
+}: MemoizedChatItemViewProps) {
+  return (
+    <ChatItemView
+      item={item}
+      {...props}
+      onOperationOpenChange={(open) => onOperationOpenChange(item.id, open)}
+    />
+  );
+});
+
 export function ChatScreen({
   installationId,
   authorityEpoch,
+  store = useConversation,
 }: {
   installationId: string;
   authorityEpoch: string;
+  /** Store override for measurement harnesses; production keeps the singleton. */
+  store?: typeof useConversationStore;
 }) {
   return (
     <ChatScreenContent
       installationId={installationId}
       authorityEpoch={authorityEpoch}
+      store={store}
     />
   );
 }
@@ -62,9 +93,11 @@ type ConversationRow =
 function ChatScreenContent({
   installationId,
   authorityEpoch,
+  store,
 }: {
   installationId: string;
   authorityEpoch: string;
+  store: typeof useConversationStore;
 }) {
   const {
     conversation,
@@ -86,7 +119,7 @@ function ChatScreenContent({
     loadAround,
     loadGap,
     retryHistory,
-  } = useConversation();
+  } = store();
   const [draft, setDraft] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [atEnd, setAtEnd] = useState(true);
@@ -94,20 +127,37 @@ function ChatScreenContent({
     Record<string, boolean>
   >({});
   const [visibleMessageIds, setVisibleMessageIds] = useState<string[]>([]);
+  const handleOperationOpenChange = useCallback(
+    (id: string, open: boolean) =>
+      setExpandedOperations((previous) =>
+        previous[id] === open ? previous : { ...previous, [id]: open },
+      ),
+    [],
+  );
   const conversationRef = useRef<ConversationVirtualizerHandle>(null);
   const jumpRequestRef = useRef(0);
   const [pendingJump, setPendingJump] = useState<string | null>(null);
-  const items = useMemo(
-    () => projectConversation(conversation),
-    [conversation],
-  );
-  const copyTextByRunId = useMemo(
-    () => collectAgentCopyText(conversation),
-    [conversation],
-  );
+  // The projector consumes the model's write journal: streamed deltas update
+  // only the rows they touched instead of rescanning the lifetime transcript.
+  const projectorRef = useRef<ConversationProjector | null>(null);
+  projectorRef.current ??= new ConversationProjector();
+  const projector = projectorRef.current;
+  const items = useMemo(() => {
+    projector.update(conversation);
+    return projector.items;
+  }, [projector, conversation]);
+  const copyTextByRunId = projector.copyTextByRunId;
+  const exchanges = projector.exchanges;
+  const itemIndexById = projector.itemIndexById;
   const timeline = useMemo(
-    () => createConversationTimeline(items, visibleMessageIds, history?.index),
-    [items, visibleMessageIds, history?.index],
+    () =>
+      createConversationTimeline(
+        exchanges,
+        itemIndexById,
+        visibleMessageIds,
+        history?.index,
+      ),
+    [exchanges, itemIndexById, visibleMessageIds, history?.index],
   );
 
   useEffect(() => {
@@ -123,7 +173,7 @@ function ChatScreenContent({
         ? previous
         : Object.fromEntries(retained);
     });
-  }, [conversation.entries]);
+  }, [conversation]);
 
   const available = connection === "connected" && ready === "ready";
   const send = () => {
@@ -180,7 +230,6 @@ function ChatScreenContent({
       history?.loadingAround,
       history?.error,
       loadGap,
-      retryHistory,
     ],
   );
   const scrollToEnd = useCallback((behavior: "smooth" | "auto" = "smooth") => {
@@ -217,6 +266,13 @@ function ChatScreenContent({
   }, [pendingJump, rows]);
   const lastAssistantMessage = items.findLast(
     (item) => item.kind === "prose" && item.agentMessageFinal,
+  );
+  const handleTimelineJump = useCallback(
+    (index: number) => {
+      const messageId = timeline.messageIds[index];
+      if (messageId) void scrollToMessage(messageId);
+    },
+    [timeline.messageIds, scrollToMessage],
   );
   const status = describeAvailability(connection, ready);
   const retryAgent = () => {
@@ -315,17 +371,20 @@ function ChatScreenContent({
               }
               return (
                 <div className="mx-auto w-full max-w-3xl px-4 sm:px-6">
-                  <Suspense fallback={null}>
-                    <ChatItemView
+                  <Suspense
+                    fallback={
+                      // A suspended row must still occupy roughly its
+                      // estimated height. Measuring 0 while the lazy chunk
+                      // loads makes the virtualizer extend the window into
+                      // more unmeasured rows on every pass, which cascades
+                      // into React's nested-update limit on long histories.
+                      <div aria-hidden="true" className="h-24" />
+                    }
+                  >
+                    <MemoizedChatItemView
                       item={row}
                       operationOpen={expandedOperations[row.id] ?? false}
-                      onOperationOpenChange={(open) =>
-                        setExpandedOperations((previous) =>
-                          previous[row.id] === open
-                            ? previous
-                            : { ...previous, [row.id]: open },
-                        )
-                      }
+                      onOperationOpenChange={handleOperationOpenChange}
                       copyAlwaysVisible={
                         row.kind === "prose" &&
                         row.id === lastAssistantMessage?.id &&
@@ -390,12 +449,7 @@ function ChatScreenContent({
               <TimelineScrubber
                 ticks={timeline.ticks}
                 visibleRange={timeline.visibleRange}
-                onJump={(index) => {
-                  const messageId = timeline.messageIds[index];
-                  if (messageId) {
-                    scrollToMessage(messageId);
-                  }
-                }}
+                onJump={handleTimelineJump}
               />
             </div>
           )}

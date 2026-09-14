@@ -26,13 +26,20 @@ export interface Input {
   thread_id: string;
   occurred_at: string | null;
   attention: InputAttention;
-  status: "queued" | "claimed" | "done";
+  /** "waiting" parks the input behind a pending tool approval. */
+  status: "queued" | "claimed" | "waiting" | "done";
   claimed_generation: number | null;
   turn_id: string | null;
   created_at: string;
   done_at: string | null;
   /** Retryable-failed inputs requeue with a future claim time (backoff). */
   not_before: string | null;
+  /** Set while the input is parked behind a pending human decision. */
+  waiting_since: string | null;
+  /** Total milliseconds spent waiting on human decisions — excluded from
+   *  the provider retry budget (a person's thinking time is not model
+   *  failure). Durable; survives restarts. */
+  waited_ms: number;
 }
 
 export interface Turn {
@@ -41,7 +48,7 @@ export interface Turn {
   input_id: string;
   generation: number;
   attempt: number;
-  status: "running" | "done" | "interrupted" | "failed";
+  status: "running" | "awaiting" | "done" | "interrupted" | "failed";
   started_at: string;
   finished_at: string | null;
   output: Json | null;
@@ -70,7 +77,8 @@ export interface Operation {
   tool: string;
   idempotency_key: string;
   request: Json;
-  status: "running" | "done" | "failed";
+  /** "awaiting_approval" parks the op behind a pending human decision. */
+  status: "running" | "awaiting_approval" | "done" | "failed";
   response: Json | null;
   claimed_generation: number;
   created_at: string;
@@ -111,20 +119,99 @@ export interface PersonaState {
   };
   lease: WriterLease | null;
   queued_inputs: number;
+  waiting_inputs: number;
   running_turn: string | null;
+  pending_approvals: number;
   pending_schedules: number;
   latest_event_seq: number;
 }
 
 /**
+ * Invocation route (ADR 0013 §1): "normal" executes under the agent's own
+ * authority; "elevated" explicitly asks a human for a one-shot decision.
+ * Immutable once recorded — part of the durable decision.
+ */
+export type ToolRoute = "normal" | "elevated";
+
+/**
  * One decided tool call inside a durable plan. call_id is the model's own
  * identifier (kept verbatim for later provider tool_calls reconstruction);
- * the call's position in calls is its durable identity.
+ * the call's position in calls is its durable identity. route is the
+ * invocation route recorded with the decision — required, never defaulted.
  */
 export interface PlanCall {
   call_id?: string;
   tool: string;
+  route: ToolRoute;
   request: Json;
+}
+
+/**
+ * Durable record of one planned call's human decision (ADR 0013). Created
+ * pending when a gated call is first claimed; the authenticated decision
+ * command resolves it exactly once — approve_once grants
+ * agent_own_with_human_consent provenance consumed by the executing claim,
+ * deny_once finalizes the operation failed. Never silently retried.
+ */
+export interface Approval {
+  approval_id: string;
+  persona_id: string;
+  input_id: string;
+  call_index: number;
+  operation_id: string;
+  turn_id: string;
+  tool: string;
+  route: ToolRoute;
+  /** Why approval was required: the tool's intrinsic registration, or the
+   *  recorded call's elevated route. */
+  required_by: "intrinsic" | "route";
+  request: Json;
+  action_digest: string;
+  status: "pending" | "approved" | "denied";
+  decision: "approve_once" | "deny_once" | null;
+  decision_id: string | null;
+  decided_by_kind: string | null;
+  decided_by_id: string | null;
+  provenance: string | null;
+  decided_at: string | null;
+  consumed_at: string | null;
+  created_at: string;
+}
+
+/** The authenticated human's one-shot decision command on an approval. */
+export interface ApprovalDecision {
+  decision: "approve_once" | "deny_once";
+  /** The deciding command's identity — identical replays are idempotent. */
+  decision_id: string;
+  decided_by_kind: "human";
+  decided_by_id: string;
+}
+
+/**
+ * The persona's resolved model connection for the core. The selection is
+ * authoritative: "unset"/"none"/"chatgpt"/"needs_rebinding" or an "api"
+ * binding carrying the connection's identity, version, and — only when the
+ * credential store is armed — the decrypted key. Never a substituted
+ * model/provider.
+ */
+export interface ModelBinding {
+  // "needs_rebinding": the persona arrived by transfer carrying a model
+  // selection intent; no model may run until the destination's bound
+  // human selects a matching connection or the intent is cleared.
+  selection: "unset" | "none" | "api" | "chatgpt" | "needs_rebinding";
+  /** The carried non-secret intent, echoed when selection is needs_rebinding. */
+  intent?: { kind: string; connection?: Record<string, unknown> };
+  connection?: {
+    id: string;
+    name: string;
+    preset: string;
+    base_url: string;
+    model: string;
+    version: string;
+  };
+  api_key?: string;
+  credential_available?: boolean;
+  reason?: string;
 }
 
 /**
@@ -199,11 +286,14 @@ export interface OmittedRange {
   last_time: string;
 }
 
-/** One sealed journal range and its L1 replacement lifecycle. */
+/** One sealed journal range and its replacement lifecycle. Layer-2 chunks
+ * are consolidation targets: `sources` names the accepted fragments they
+ * consume, in order (null for ordinary L0→L1 chunks). */
 export interface MemoryChunk {
   persona_id: string;
   chunk_seq: number;
   layer: number;
+  sources: number[] | null;
   first_seq: number;
   last_seq: number;
   est_tokens: number;
@@ -213,7 +303,8 @@ export interface MemoryChunk {
     | "prepared"
     | "applied"
     | "kept"
-    | "failed";
+    | "failed"
+    | "superseded";
   replacement: string | null;
   replacement_est_tokens: number | null;
   /** Recorded preparation failures (the only thing that spends the budget). */
@@ -260,6 +351,8 @@ export interface MemoryStatus {
   applied: number;
   kept: number;
   failed: number;
+  /** Sources replaced by an applied upper-layer block (kept durable). */
+  superseded: number;
   /** Chunks a claim could take now (sealed past backoff, or orphaned). */
   claimable: number;
   /** Earliest time a chunk becomes claimable; null when none waits. */
@@ -274,13 +367,15 @@ export interface MemoryStatus {
 }
 
 /**
- * A chunk claimed for asynchronous L1 preparation, with everything the
- * branch needs: the covered events verbatim and the rendered parent
- * context at claim time.
+ * A chunk claimed for asynchronous preparation, with everything the branch
+ * needs: for a layer-1 target the covered events verbatim, for an
+ * upper-layer target the selected source fragments' accepted texts with
+ * their locators — plus the rendered parent context at claim time.
  */
 export interface ClaimedMemoryChunk {
   chunk: MemoryChunk | null;
   target_events: Event[];
+  target_fragments: MemoryBlock[];
   context: RenderedContext;
 }
 
@@ -291,7 +386,7 @@ export interface RecoverResult {
 }
 
 export interface CommitRequest {
-  outcome: "complete" | "fail";
+  outcome: "complete" | "fail" | "await";
   events: EventInput[];
   output?: Json;
   usage?: Json;

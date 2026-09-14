@@ -106,6 +106,7 @@ async function childMain() {
           call: {
             id: `call-${round}-${i}`,
             name: c.tool,
+            route: c.route ?? "normal",
             arguments: c.request,
           },
         };

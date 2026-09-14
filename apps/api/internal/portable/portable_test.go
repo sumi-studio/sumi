@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
@@ -75,7 +76,7 @@ func submit(t *testing.T, p placement, personaID, inputID, text string) {
 }
 
 func note(text string) agentstate.PlanCall {
-	return agentstate.PlanCall{Tool: "journal.note", Request: map[string]any{"text": text}}
+	return agentstate.PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": text}}
 }
 
 // liveSecretary builds representative state through the real state service:
@@ -94,7 +95,7 @@ func liveSecretary(t *testing.T, p placement, personaID string) int64 {
 	if load.Input == nil || load.Input.InputID != "in-1" {
 		t.Fatalf("turn-1 claimed %+v", load.Input)
 	}
-	reminder := agentstate.PlanCall{Tool: "schedule.set", Request: map[string]any{
+	reminder := agentstate.PlanCall{Tool: "schedule.set", Route: "normal", Request: map[string]any{
 		"schedule_id": "sch-tea",
 		"wake_at":     time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano),
 		"payload":     map[string]any{"text": "tea time"},
@@ -102,7 +103,7 @@ func liveSecretary(t *testing.T, p placement, personaID string) int64 {
 	plan1 := agentstate.Decision{Text: "noted", Calls: []agentstate.PlanCall{note("The user takes tea at 15:00"), reminder}}
 	must(drop(p.state.SavePlan(ctx, personaID, "turn-1", gen, 0, plan1)))
 	for i, c := range plan1.Calls {
-		if _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-1", gen, fmt.Sprintf("op-1-%d", i), c.Tool, i, c.Request); err != nil {
+		if _, _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-1", gen, fmt.Sprintf("op-1-%d", i), c.Tool, i, c.Request); err != nil {
 			t.Fatalf("claim turn-1 call %d: %v", i, err)
 		}
 	}
@@ -119,7 +120,7 @@ func liveSecretary(t *testing.T, p placement, personaID string) int64 {
 	}
 	plan2 := agentstate.Decision{Text: "moving", Calls: []agentstate.PlanCall{note("Mid-move note"), note("Second note after the move")}}
 	must(drop(p.state.SavePlan(ctx, personaID, "turn-2", gen, 0, plan2)))
-	if _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-2", gen, "op-2-a", "journal.note", 0, plan2.Calls[0].Request); err != nil {
+	if _, _, _, err := p.state.ClaimOperation(ctx, personaID, "turn-2", gen, "op-2-a", "journal.note", 0, plan2.Calls[0].Request); err != nil {
 		t.Fatalf("claim turn-2 call 0: %v", err)
 	}
 	// The process dies here: call 1 never runs and the turn never commits.
@@ -153,7 +154,123 @@ func rowLines(t *testing.T, p placement, personaID string) []byte {
 	if _, err := writeRows(ctx, tx, personaID, &buf); err != nil {
 		t.Fatalf("write rows: %v", err)
 	}
-	return buf.Bytes()
+	// admission_seq is destination-allocated on import, so normalize it out
+	// of each row's data before comparing a source's rows to a destination's.
+	// The comparison decodes each row instead of matching the bundle's byte
+	// shape, so a change in how PostgreSQL renders jsonb cannot silently
+	// disable it — TestImportIntoPopulatedDestinationKeepsAdmissionOrder
+	// compares across placements whose identity values genuinely differ and
+	// fails if no carried value is normalized.
+	var out bytes.Buffer
+	for _, line := range bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n")) {
+		var row rowRecord
+		if err := strictDecode(line, &row); err != nil {
+			t.Fatalf("bundle line does not decode: %v", err)
+		}
+		if col, ok := identityCols[row.Table]; ok {
+			row.Data = replaceField(t, row.Data, col, json.RawMessage(`0`))
+		}
+		enc, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Write(enc)
+		out.WriteByte('\n')
+	}
+	return out.Bytes()
+}
+
+// replaceField returns data with one field's value swapped, preserving the
+// other fields byte-for-byte.
+func replaceField(t *testing.T, data json.RawMessage, name string, v json.RawMessage) json.RawMessage {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("row data is not a JSON object: %v", err)
+	}
+	if _, ok := fields[name]; !ok {
+		t.Fatalf("row data lacks field %s", name)
+	}
+	fields[name] = v
+	enc, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return enc
+}
+
+// rewriteBundleAdmissionSeqs returns a copy of bundle with each core_inputs
+// row's carried admission_seq replaced by seqs[i] in bundle order and the
+// trailer's digest recomputed over the new content, so the rewritten bundle
+// still passes import verification. It fails the test if the bundle carries
+// a different number of identity rows than len(seqs), if a rewritten row
+// does not carry the intended value, or if the result is byte-identical —
+// a change in the bundle's byte shape must never turn this into a no-op
+// that imports the original small values.
+func rewriteBundleAdmissionSeqs(t *testing.T, bundle []byte, seqs []int64) []byte {
+	t.Helper()
+	lines := bytes.Split(bundle, []byte("\n"))
+	if len(lines[len(lines)-1]) != 0 {
+		t.Fatal("bundle does not end with a newline")
+	}
+	lines = lines[:len(lines)-1]
+	var trailer Trailer
+	if err := strictDecode(lines[len(lines)-1], &trailer); err != nil || trailer.Record != "trailer" {
+		t.Fatalf("last bundle line is not a trailer: %v", err)
+	}
+	h := sha256.New()
+	var out bytes.Buffer
+	n := 0
+	for _, line := range lines[:len(lines)-1] {
+		var kind struct {
+			Record string `json:"record"`
+		}
+		if err := json.Unmarshal(line, &kind); err != nil {
+			t.Fatalf("malformed bundle line: %v", err)
+		}
+		if kind.Record == "row" {
+			var row rowRecord
+			if err := strictDecode(line, &row); err != nil {
+				t.Fatalf("row line: %v", err)
+			}
+			if col, ok := identityCols[row.Table]; ok {
+				if n >= len(seqs) {
+					t.Fatalf("bundle carries more %s.%s rows than the %d replacement values",
+						row.Table, col, len(seqs))
+				}
+				row.Data = replaceField(t, row.Data, col,
+					json.RawMessage(fmt.Sprintf("%d", seqs[n])))
+				var carried int64
+				if err := unmarshalField(row.Data, col, &carried); err != nil || carried != seqs[n] {
+					t.Fatalf("rewritten row carries %d, want %d: %v", carried, seqs[n], err)
+				}
+				var err error
+				line, err = json.Marshal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				n++
+			}
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	if n != len(seqs) {
+		t.Fatalf("rewrote %d identity values, want %d — the bundle's row shape changed", n, len(seqs))
+	}
+	trailer.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(trailer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(tl)
+	out.WriteByte('\n')
+	if bytes.Equal(out.Bytes(), bundle) {
+		t.Fatal("rewritten bundle is byte-identical to the original — the rewrite did not apply")
+	}
+	return out.Bytes()
 }
 
 func notesWithText(t *testing.T, p placement, personaID, text string) int {
@@ -262,7 +379,7 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
 		t.Fatal(err)
 	}
-	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)
 	if err != nil || !created {
 		t.Fatalf("import: created=%v err=%v", created, err)
 	}
@@ -287,7 +404,7 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if _, _, err := cloud.state.SubmitInput(ctx, &agentstate.Input{PersonaID: pid, InputID: "in-cloud", Kind: "message", Payload: map[string]any{}}); !errors.Is(err, agentstate.ErrPersonaInactive) {
 		t.Fatalf("staged input: %v, want inactive", err)
 	}
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || created {
 		t.Fatalf("import replay: created=%v err=%v", created, err)
 	}
 
@@ -328,11 +445,11 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 		load.Plan == nil || len(load.Plan.Plan) != 1 || len(load.Plan.Plan[0].Calls) != 2 {
 		t.Fatalf("resumed turn %+v input %+v plan %+v", load.Turn, load.Input, load.Plan)
 	}
-	op, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-a", "journal.note", 0, load.Plan.Plan[0].Calls[0].Request)
+	op, _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-a", "journal.note", 0, load.Plan.Plan[0].Calls[0].Request)
 	if err != nil || fresh || op.OperationID != "op-2-a" {
 		t.Fatalf("carried call 0: op=%+v fresh=%v err=%v", op, fresh, err)
 	}
-	if _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-b", "journal.note", 1, load.Plan.Plan[0].Calls[1].Request); err != nil || !fresh {
+	if _, _, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-2b", gen, "op-2b-b", "journal.note", 1, load.Plan.Plan[0].Calls[1].Request); err != nil || !fresh {
 		t.Fatalf("remaining call 1: fresh=%v err=%v", fresh, err)
 	}
 	// The resumed turn presents its input_received copy at commit, as the core
@@ -416,18 +533,50 @@ func chunkRow(t *testing.T, p placement, personaID string, chunkSeq int64) agent
 	t.Helper()
 	var c agentstate.MemoryChunk
 	err := p.pool.QueryRow(context.Background(), `
-		SELECT persona_id, chunk_seq, layer, first_seq, last_seq, est_tokens,
+		SELECT persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
 			status, replacement, replacement_est_tokens, attempts, interruptions, last_error,
 			claimed_generation, claimed_at, not_before, created_at, prepared_at, applied_at
 		FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2`,
-		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.FirstSeq, &c.LastSeq,
-		&c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
+		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.Sources, &c.FirstSeq,
+		&c.LastSeq, &c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
 		&c.Interruptions, &c.LastError, &c.ClaimedGeneration, &c.ClaimedAt,
 		&c.NotBefore, &c.CreatedAt, &c.PreparedAt, &c.AppliedAt)
 	if err != nil {
 		t.Fatalf("chunk %d: %v", chunkSeq, err)
 	}
 	return c
+}
+
+// mutRow rewrites the data object of every row of table whose data
+// matches; rebundle then recomputes the content digest, so a crafted row
+// reaches the import integrity checks instead of failing at the digest.
+func mutRow(t *testing.T, table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
+	t.Helper()
+	return func(line string) string {
+		var rec map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return line
+		}
+		var name string
+		if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
+			return line
+		}
+		var data map[string]any
+		if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
+			return line
+		}
+		mutate(data)
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec["data"] = raw
+		out, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out) + "\n"
+	}
 }
 
 // rebundle rewrites row lines in an exported bundle and recomputes the
@@ -512,7 +661,18 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "provider timeout", true))
 	claimSeq(t, local, pid, gen, 4) // chunk 3 is backed off; 4 is next
 	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 4, "Day four, compressed.", false))
-	time.Sleep(700 * time.Millisecond) // past chunk 3's first-attempt backoff
+	// Chunk 3's backoff must be on the row; then push its deadline into
+	// the past directly — not_before is wall-clock and a host clock step
+	// (observed on this WSL2 host) can regress now() below a recorded
+	// deadline, which is a clock artifact, not the eligibility contract.
+	if c := chunkRow(t, local, pid, 3); c.NotBefore == nil {
+		t.Fatalf("chunk 3 lost its first-attempt backoff: %+v", c)
+	}
+	if _, err := local.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 3`, pid); err != nil {
+		t.Fatal(err)
+	}
 	claimSeq(t, local, pid, gen, 3)
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
 	// Chunk 5's claim is orphaned once (an interruption), then reclaimed —
@@ -550,7 +710,7 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
 		t.Fatal(err)
 	}
-	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)
 	if err != nil || !created {
 		t.Fatalf("import: created=%v err=%v", created, err)
 	}
@@ -599,10 +759,17 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatalf("failed verdict changed on the destination: %+v", c)
 	}
 
-	// Chunk 5's carried backoff may still be running; once claimable the
-	// destination's writer prepares it under its own generation.
-	if c := chunkRow(t, cloud, pid, 5); c.NotBefore != nil && c.NotBefore.After(time.Now()) {
-		time.Sleep(time.Until(*c.NotBefore) + 50*time.Millisecond)
+	// Chunk 5's carried interruption pacing must still be on the row;
+	// then push its deadline into the past directly rather than sleeping —
+	// not_before is wall-clock and a host clock step could keep the claim
+	// deferred, which is a clock artifact, not the contract under test.
+	if c := chunkRow(t, cloud, pid, 5); c.NotBefore == nil {
+		t.Fatalf("chunk 5 lost its carried interruption pacing: %+v", c)
+	}
+	if _, err := cloud.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 5`, pid); err != nil {
+		t.Fatal(err)
 	}
 	claimSeq(t, cloud, pid, dgen, 5)
 	must(cloud.state.CompleteMemoryChunk(ctx, pid, dgen, 5, "Day five, compressed.", false))
@@ -631,6 +798,392 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	}
 	if staged.ContentSHA256 != exported.ContentSHA256 {
 		t.Fatal("staged receipt does not match the export")
+	}
+}
+
+// Upper-layer memory carries its full provenance: the superseded source
+// rows (accepted decisions, texts and ranges durable), the applied L2 block
+// at its sources' position, and an unfinished upper-layer preparation whose
+// live claim cannot cross — the cut returns it to 'sealed' so the
+// destination's own writer reclaims it.
+func TestTransferCarriesUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+
+	// Four small exchanges = seqs 1..8, then chunk rows in the shapes the
+	// upper pipeline writes: two L1 sources superseded by an applied L2
+	// block, two applied L1 fragments, and one L2 reintegration target
+	// still claimed when the cut lands.
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("u-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ut-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ut-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens,
+			 claimed_generation, claimed_at)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, NULL, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, NULL, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60, NULL, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, NULL, NULL),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50, NULL, NULL),
+			($1, 6, 2, '{3,4}', 5, 8, 120, 'preparing', NULL, NULL, $2, now())`,
+		pid, gen); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-upper", cloudID))
+	// The preparing L2 target's claim was dead placement-local execution:
+	// the cut returned it to 'sealed' for the destination to reclaim.
+	if c := chunkRow(t, local, pid, 6); c.Status != "sealed" || c.ClaimedGeneration != nil {
+		t.Fatalf("preparing L2 target after seal: %+v", c)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-upper")
+
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	// Rows — including sources, superseded verdicts and the normalized
+	// sealed target — arrive byte for byte.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-upper"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+
+	// The destination renders the applied L2 block at its earliest source's
+	// journal position and never the superseded coverage raw.
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-1", 50))
+	if len(load.Memory) != 3 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Layer != 2 ||
+		load.Memory[0].Text != "L2: days one and two" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		if e.Seq <= 4 {
+			t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+		}
+	}
+
+	// The carried sealed L2 target is ordinary work for the destination's
+	// writer: claiming it resolves the carried sources to their fragments.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 6 || claimed.Chunk.Layer != 2 {
+		t.Fatalf("destination upper claim: %+v", claimed.Chunk)
+	}
+	if len(claimed.TargetFragments) != 2 || len(claimed.TargetEvents) != 0 ||
+		claimed.TargetFragments[0].Text != "L1 of days three" {
+		t.Fatalf("carried sources unresolved: %+v", claimed.TargetFragments)
+	}
+}
+
+// An upper-layer row can pass the shape checks and still be a state the
+// honest pipeline cannot emit: an applied target whose sources were never
+// superseded (the range would render twice), or a source list with
+// correct endpoints but an interior hole (journal coverage consumed by
+// nothing). The seed below is the legitimate counterpart — an applied L2
+// block over superseded L1s, a failed earlier attempt whose sources a
+// later target consumed, and a sealed in-flight target over an applied
+// source — and it must keep crossing.
+func TestImportRefusesContradictoryUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("c-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ct-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ct-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	// A real history: an earlier consolidation over {1,2} failed
+	// terminally, a later attempt reintegrated {1,2,3} into the applied
+	// L2 block, and chunk 7 is a sealed reintegration target whose source
+	// is still applied. Every row is a state the pipeline itself writes.
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens, attempts, last_error)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, 0, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, 0, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'superseded', 'L1 of days three', 60, 0, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, 0, NULL),
+			($1, 5, 2, '{1,2,3}', 1, 6, 180, 'applied', 'L2: days one through three', 70, 0, NULL),
+			($1, 6, 2, '{1,2}', 1, 4, 120, 'failed', NULL, NULL, 3, 'provider refused'),
+			($1, 7, 2, '{4}', 7, 8, 120, 'sealed', NULL, NULL, 0, NULL)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-contra", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-contra")
+
+	chunk := func(seq int64) func(map[string]any) bool {
+		return func(d map[string]any) bool {
+			v, ok := d["chunk_seq"].(float64)
+			return ok && int64(v) == seq
+		}
+	}
+	cases := map[string]struct {
+		fn   func(string) string
+		want string
+	}{
+		// The applied L2 target's sources are still applied — the same
+		// journal range would render as both L1 fragments and the L2 block.
+		"applied target over a live source": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "applied" }), "memory_chunk_sources_invalid"},
+		// Sources {1,3} keep the target's endpoints right ([1,6]) but leave
+		// [3,4] — chunk 2's range — inside the claimed span yet named by no
+		// source.
+		"source list with an interior gap": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 3} }), "memory_chunk_sources_invalid"},
+		// Overlapping instead of gapped: widening chunk 1 to [1,4] makes
+		// the sources cover [1,6] twice over [3,4] with the target bounds
+		// unchanged.
+		"overlapping source ranges": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["last_seq"] = 4 }), "memory_chunk_sources_invalid"},
+		// The sources tile the range but are listed out of order — the
+		// settled-tuple dedup compares arrays order-sensitively, so this
+		// tuple would not match the canonical one it was settled as.
+		"reordered settled source tuple": {mutRow(t, "core_memory_chunks", chunk(6),
+			func(d map[string]any) { d["sources"] = []any{2, 1} }), "memory_chunk_sources_invalid"},
+		// A source is only ever consumed while applied and only ever
+		// retired as superseded: a sealed or failed source is a state the
+		// pipeline cannot produce.
+		"source still sealed": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "sealed" }), "memory_chunk_sources_invalid"},
+		// One source listed twice inflates the reference list without
+		// resolving to two chunks.
+		"repeated source reference": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 1} }), "memory_chunk_sources_invalid"},
+		// A target cannot consume across layers: {1,6} mixes an L1 source
+		// with the failed L2 row.
+		"cross-layer source": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 6} }), "memory_chunk_sources_invalid"},
+		// Chunk 5 demoted to 'failed' leaves chunks 1-3 superseded with no
+		// applied ancestor anywhere — their journal range renders as
+		// nothing on the destination.
+		"superseded coverage no applied ancestor": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["status"] = "failed" }), "memory_chunk_superseded_uncovered"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := rebundle(t, bundle, tc.fn)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused bundle left a persona behind: %v", err)
+			}
+		})
+	}
+
+	// The legitimate history still crosses: the failed target keeps its
+	// provenance over sources another target consumed, the sealed target
+	// keeps its applied source, and the destination activates and renders
+	// the applied upper block without double-rendering.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
+		t.Fatalf("legitimate upper history import: created=%v err=%v", created, err)
+	}
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-contra"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-d1", 50))
+	if len(load.Memory) != 2 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Text != "L2: days one through three" ||
+		load.Memory[1].ChunkSeq != 4 || load.Memory[1].Text != "L1 of days four" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+	}
+	// The sealed reintegration target is claimable at the destination and
+	// resolves its still-applied source fragment.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 7 ||
+		len(claimed.TargetFragments) != 1 || claimed.TargetFragments[0].Text != "L1 of days four" {
+		t.Fatalf("destination claim on carried sealed target: %+v", claimed.Chunk)
+	}
+}
+
+// addChunkRow appends one crafted core_memory_chunks row after the table's
+// last row (preserving the row order the importer requires) and recomputes
+// the trailer's row count and content digest, so the row reaches import
+// verification instead of failing at the digest.
+func addChunkRow(t *testing.T, bundle []byte, data map[string]any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(
+		`{"record":"row","section":"core","table":"core_memory_chunks","data":%s}`+"\n",
+		raw)
+	sc := bufio.NewScanner(bytes.NewReader(bundle))
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text()+"\n")
+	}
+	lastTableLine := -1
+	for i, l := range lines {
+		if strings.Contains(l, `"table":"core_memory_chunks"`) {
+			lastTableLine = i
+		}
+	}
+	if lastTableLine < 0 {
+		t.Fatal("bundle carries no core_memory_chunks rows to extend")
+	}
+	var tr Trailer
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &tr); err != nil || tr.Record != "trailer" {
+		t.Fatal("last bundle line is not a trailer")
+	}
+	var out bytes.Buffer
+	h := sha256.New()
+	for i, l := range lines[:len(lines)-1] {
+		out.WriteString(l)
+		h.Write([]byte(l))
+		if i == lastTableLine {
+			out.WriteString(line)
+			h.Write([]byte(line))
+		}
+	}
+	tr.Rows["core_memory_chunks"]++
+	tr.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(append(tl, '\n'))
+	return out.Bytes()
+}
+
+// Coverage the pipeline cannot emit: chunk ranges tile disjointly — an L1
+// range is allocated once and stays covered even by a failed verdict, and
+// applying a target supersedes exactly its sources. A second L1 row over
+// already-covered seqs, or two applied rows sharing a seq (the range would
+// render twice), can only come from a crafted bundle.
+func TestImportRefusesOverlappingCoverage(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("o-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ot-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ot-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-overlap", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-overlap")
+
+	ghost := func(status string) map[string]any {
+		return map[string]any{
+			"persona_id": pid, "chunk_seq": 9, "layer": 1, "sources": nil,
+			"first_seq": 2, "last_seq": 3, "est_tokens": 100,
+			"status": status, "replacement": nil, "replacement_est_tokens": nil,
+			"attempts": 0, "interruptions": 0, "last_error": nil,
+			"claimed_generation": nil, "claimed_at": nil, "not_before": nil,
+			"created_at": "2026-09-15T00:00:00Z",
+			"prepared_at": nil, "applied_at": nil,
+		}
+	}
+
+	// A sealed L1 over already-covered seqs is pipeline-impossible — the
+	// destination's own pipeline would claim, prepare and apply it into a
+	// real applied overlap.
+	t.Run("sealed L1 over covered range", func(t *testing.T) {
+		bad := addChunkRow(t, bundle, ghost("sealed"))
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_l1_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_l1_overlap", err)
+		}
+	})
+
+	// An applied L1 inside an applied L2 target's coverage double-renders
+	// the range in every sent view.
+	t.Run("applied L1 inside applied coverage", func(t *testing.T) {
+		g := ghost("applied")
+		g["replacement"] = "ghost fragment"
+		g["replacement_est_tokens"] = 30
+		g["prepared_at"] = "2026-09-15T00:00:00Z"
+		g["applied_at"] = "2026-09-15T00:00:00Z"
+		bad := addChunkRow(t, bundle, g)
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_applied_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_applied_overlap", err)
+		}
+	})
+
+	// The clean bundle still imports: disjoint coverage with a legitimate
+	// applied target over superseded sources.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
+		t.Fatalf("legitimate history import: created=%v err=%v", created, err)
 	}
 }
 
@@ -684,37 +1237,9 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-badmem", placementID(t, cloud)))
 	bundle, _ := exportBytes(t, local, pid, "move-badmem")
 
-	// mutRow rewrites the data object of every row of table whose data
-	// matches; rebundle then recomputes the content digest. Every case below
-	// is therefore a crafted/recomputed-digest bundle — state an honest
-	// store cannot emit — which is exactly the class verifyCut exists for.
-	mutRow := func(table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
-		return func(line string) string {
-			var rec map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				return line
-			}
-			var name string
-			if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
-				return line
-			}
-			var data map[string]any
-			if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
-				return line
-			}
-			mutate(data)
-			raw, err := json.Marshal(data)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rec["data"] = raw
-			out, err := json.Marshal(rec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return string(out) + "\n"
-		}
-	}
+	// Every case below is a crafted/recomputed-digest bundle — state an
+	// honest store cannot emit — which is exactly the class verifyCut
+	// exists for.
 	chunkRow := func(d map[string]any) bool { return d["chunk_seq"] != nil }
 	inputRow := func(id string) func(map[string]any) bool {
 		return func(d map[string]any) bool { return d["input_id"] == id }
@@ -752,40 +1277,55 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 		// applies it. kept is checked separately: keep-unchanged stores both
 		// NULL, non-shrinking keeps both set — one without the other is not a
 		// row the store writes.
-		"applied without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"applied without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "applied")), "memory_chunk_missing_payload"},
-		"prepared without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"prepared without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "prepared")), "memory_chunk_missing_payload"},
-		"kept text without estimate": {mutRow("core_memory_chunks", chunkRow, func(d map[string]any) {
+		"kept text without estimate": {mutRow(t, "core_memory_chunks", chunkRow, func(d map[string]any) {
 			d["status"] = "kept"
 			d["replacement"] = "condensed"
 		}), "memory_chunk_missing_payload"},
 		// f71/F2: negative sequence/counter values corrupt ordering and the
 		// live-raw accounting while staging cleanly.
-		"negative chunk_seq": {mutRow("core_memory_chunks", chunkRow,
+		"negative chunk_seq": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("chunk_seq", -7)), "memory_chunk_negative_values"},
-		"negative est_tokens": {mutRow("core_memory_chunks", chunkRow,
+		"negative est_tokens": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("est_tokens", -900000)), "memory_chunk_negative_values"},
-		"layer zero": {mutRow("core_memory_chunks", chunkRow,
+		"layer zero": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("layer", 0)), "memory_chunk_negative_values"},
+		// Upper-layer provenance: a layer-1 row never carries sources; a
+		// layer-2 target's sources must all resolve to carried chunks whose
+		// span is exactly the target's range.
+		"layer-1 row carrying sources": {mutRow(t, "core_memory_chunks", chunkRow,
+			set("sources", []any{1})), "memory_chunk_sources_invalid"},
+		"upper target with a dangling source": {mutRow(t, "core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{999}
+			}), "memory_chunk_sources_invalid"},
+		"upper target with an empty source set": {mutRow(t, "core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{}
+			}), "memory_chunk_sources_invalid"},
 		// F-B2: received_seq that dangles, names the wrong kind, or names
 		// another input's event would make the destination skip journaling
 		// this input's input_received — its original record silently lost.
-		"received_seq another input's event": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq another input's event": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 1)), "input_received_seq_mismatch"},
-		"received_seq wrong kind": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq wrong kind": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 2)), "input_received_seq_mismatch"},
-		"received_seq dangling on queued input": {mutRow("core_inputs", inputRow("m-3"),
+		"received_seq dangling on queued input": {mutRow(t, "core_inputs", inputRow("m-3"),
 			set("received_seq", 99)), "input_received_seq_mismatch"},
 		// The reverse link: m-2's input_received exists in the journal, so a
 		// missing marker would let the destination journal it a second time.
-		"received_seq marker removed": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq marker removed": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", nil)), "input_received_seq_not_linked"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			bad := rebundle(t, bundle, tc.fn)
-			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
 			if err == nil {
 				t.Fatal("import accepted a malformed memory chunk")
 			}
@@ -797,20 +1337,24 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 			}
 		})
 	}
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
 	}
-	// Bounds are floors, not a layer policy: a future consolidation layer and
-	// the queued input's NULL marker must still cross. Re-address the mutated
-	// bundle to a second placement since the first already holds this
-	// transfer under the clean digest.
+	// Bounds are floors, not a layer policy: the queued input's NULL marker
+	// must still cross (the clean import above proves it). But an upper-layer
+	// row now has a contract — consolidation is real: a layer-2 chunk
+	// without resolvable sources is malformed, not "future work". Re-address
+	// the mutated bundle to a second placement since the first already holds
+	// this transfer under the clean digest.
 	cloud2 := newPlacement(t)
-	higherLayer := rebundle(t, bundle, func(line string) string {
+	sourceless := rebundle(t, bundle, func(line string) string {
 		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
-		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
+		return mutRow(t, "core_memory_chunks", chunkRow, set("layer", 2))(line)
 	})
-	if _, created, err := cloud2.svc.Import(ctx, bytes.NewReader(higherLayer), nil); err != nil || !created {
-		t.Fatalf("layer-2 chunk refused: created=%v err=%v", created, err)
+	if _, _, err := cloud2.svc.Import(ctx, bytes.NewReader(sourceless), nil, false); err == nil ||
+		!errors.Is(err, ErrIntegrity) ||
+		!strings.Contains(err.Error(), "memory_chunk_sources_invalid") {
+		t.Fatalf("sourceless layer-2 chunk: %v, want memory_chunk_sources_invalid", err)
 	}
 }
 
@@ -844,7 +1388,7 @@ func TestSealAfterStoreProducedDuplicateReceipt(t *testing.T) {
 	// The accepted state must be movable: seal, export, import all succeed.
 	must(local.svc.Seal(ctx, pid, "move-dupe", placementID(t, cloud)))
 	bundle, _ := exportBytes(t, local, pid, "move-dupe")
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
 		t.Fatalf("import after duplicate-receipt commit: created=%v err=%v", created, err)
 	}
 }
@@ -909,7 +1453,7 @@ func TestRejectedGhostReceiptKeepsPersonaTransferable(t *testing.T) {
 	bundle, _ := exportBytes(t, local, pid, "move-ghost")
 	humanID := newID(t)
 	must(cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID))
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || !created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || !created {
 		t.Fatalf("import after refused ghost receipt: created=%v err=%v", created, err)
 	}
 	act := must(cloud.svc.Activate(ctx, pid, "move-ghost"))
@@ -990,7 +1534,7 @@ func TestImportRefusesDamagedOrUnsupportedBundles(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(tc.bundle), nil)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(tc.bundle), nil, false)
 			if !errors.Is(err, ErrBadBundle) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("import err = %v, want ErrBadBundle mentioning %q", err, tc.want)
 			}
@@ -1003,7 +1547,7 @@ func TestImportRefusesDamagedOrUnsupportedBundles(t *testing.T) {
 		})
 	}
 	// The undamaged bundle still imports after all of that.
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
 	}
 }
@@ -1042,7 +1586,7 @@ func TestImportRefusesBrokenReferences(t *testing.T) {
 		h.Write([]byte(line))
 		out.WriteString(line)
 	}
-	_, _, err := cloud.svc.Import(ctx, bytes.NewReader(out.Bytes()), nil)
+	_, _, err := cloud.svc.Import(ctx, bytes.NewReader(out.Bytes()), nil, false)
 	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "operation_outside_recorded_plan") {
 		t.Fatalf("import err = %v, want the plan reference violation", err)
 	}
@@ -1125,7 +1669,7 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 	}
 
 	bundle, _ := exportBytes(t, local, pid, "move-jobs")
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 	act := must(cloud.svc.Activate(ctx, pid, "move-jobs"))
@@ -1146,50 +1690,56 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 // check refuses the move. The share-locked persona row makes the two
 // transactions serialize — no job can slip between the check and the commit.
 func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
-	ctx := context.Background()
+	// Each iteration gets its own placement, but as a subtest: a finished
+	// iteration's pool and database are dropped at once instead of twenty-
+	// four of them accumulating against the shared Postgres until the whole
+	// test cleans up.
 	for i := 0; i < 24; i++ {
-		local := newPlacement(t)
-		pid := newID(t)
-		liveSecretary(t, local, pid)
-		jobReq := map[string]any{"command": []any{"echo", "hi"}}
-		jobID := fmt.Sprintf("j-race-%d", i)
-		destination := newID(t)
+		t.Run(fmt.Sprintf("race-%d", i), func(t *testing.T) {
+			ctx := context.Background()
+			local := newPlacement(t)
+			pid := newID(t)
+			liveSecretary(t, local, pid)
+			jobReq := map[string]any{"command": []any{"echo", "hi"}}
+			jobID := fmt.Sprintf("j-race-%d", i)
+			destination := newID(t)
 
-		submitErr := make(chan error, 1)
-		go func() {
-			_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
-			submitErr <- err
-		}()
-		sealErr := make(chan error, 1)
-		go func() {
-			_, err := local.svc.Seal(ctx, pid, "move-race", destination)
-			sealErr <- err
-		}()
-		sErr, jErr := <-sealErr, <-submitErr
+			submitErr := make(chan error, 1)
+			go func() {
+				_, _, err := local.state.SubmitJob(ctx, pid, jobID, "subprocess", jobReq, "api")
+				submitErr <- err
+			}()
+			sealErr := make(chan error, 1)
+			go func() {
+				_, err := local.svc.Seal(ctx, pid, fmt.Sprintf("move-race-%d", i), destination)
+				sealErr <- err
+			}()
+			sErr, jErr := <-sealErr, <-submitErr
 
-		var queued bool
-		if err := local.pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
-			pid, jobID).Scan(&queued); err != nil {
-			t.Fatal(err)
-		}
-		switch {
-		case sErr == nil && jErr == nil && queued:
-			t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
-		case sErr == nil:
-			if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
-				t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+			var queued bool
+			if err := local.pool.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM core_jobs WHERE persona_id = $1 AND job_id = $2)`,
+				pid, jobID).Scan(&queued); err != nil {
+				t.Fatal(err)
 			}
-			if queued {
-				t.Fatalf("race %d: refused submit left a job row", i)
+			switch {
+			case sErr == nil && jErr == nil && queued:
+				t.Fatalf("seal committed yet the job it checked for was queued")
+			case sErr == nil:
+				if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
+					t.Fatalf("submit after seal committed: %v, want persona inactive", jErr)
+				}
+				if queued {
+					t.Fatalf("refused submit left a job row")
+				}
+			case errors.Is(sErr, ErrUnresolvedOperations):
+				if jErr != nil || !queued {
+					t.Fatalf("seal refused for the job but submit err=%v queued=%v", jErr, queued)
+				}
+			default:
+				t.Fatalf("unexpected seal=%v submit=%v queued=%v", sErr, jErr, queued)
 			}
-		case errors.Is(sErr, ErrUnresolvedOperations):
-			if jErr != nil || !queued {
-				t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
-			}
-		default:
-			t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
-		}
+		})
 	}
 }
 
@@ -1206,7 +1756,7 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 	cloudID := must(cloud.svc.PlacementID(ctx))
 	sealed := must(local.svc.Seal(ctx, pid, "move-0005", cloudID))
 	first, _ := exportBytes(t, local, pid, "move-0005")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(first), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(first), nil, false)))
 
 	// Abort without evidence stays sealed; the staged copy alone is enough
 	// to make an unproven abort unsafe.
@@ -1235,7 +1785,7 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 	}
 	// Cancellation is durable: the retired transfer can never be staged or
 	// activated here again, and a new transfer of the same persona can.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("re-import after retire: %v", err)
 	}
 	if _, err := cloud.svc.Activate(ctx, pid, "move-0005"); !errors.Is(err, ErrTransferConflict) {
@@ -1264,13 +1814,13 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 
 	must(local.svc.Seal(ctx, pid, "move-0006", cloudID))
 	second, _ := exportBytes(t, local, pid, "move-0006")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(second), nil)))
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil); !errors.Is(err, ErrTransferConflict) {
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(second), nil, false)))
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("importing the retired cut beside the staged one: %v, want conflict", err)
 	}
 	// A different transfer's bundle for a persona already present is refused.
 	stranger := bytes.Replace(second, []byte(`"transfer_id":"move-0006"`), []byte(`"transfer_id":"move-0006b"`), 1)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(stranger), nil); !errors.Is(err, ErrPersonaExists) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(stranger), nil, false); !errors.Is(err, ErrPersonaExists) {
 		t.Fatalf("importing another transfer for a present persona: %v, want ErrPersonaExists", err)
 	}
 	if _, err := local.svc.Seal(ctx, pid, "move-0005", cloudID); !errors.Is(err, ErrTransferConflict) {
@@ -1376,6 +1926,214 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 	}
 }
 
+// admission_seq is backed by one table-global identity sequence. The import
+// regenerates it: every staged row's value comes from the destination's own
+// nextval in bundle order, so no carried value can collide with or rewind
+// the destination's allocations, and the work is bounded by the number of
+// transferred records — a bundle carrying huge admission_seq values from a
+// long-lived source must not force a billion sequence bumps. Regression for
+// the populated-destination finding f-shared-intake-97.
+func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+
+	seqPos := func() (int64, bool) {
+		var last int64
+		var called bool
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT last_value, is_called FROM core_inputs_admission_seq_seq`).Scan(&last, &called); err != nil {
+			t.Fatalf("sequence position: %v", err)
+		}
+		return last, called
+	}
+	globalMax := func() int64 {
+		var m int64
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT COALESCE(max(admission_seq), 0) FROM core_inputs`).Scan(&m); err != nil {
+			t.Fatalf("table max: %v", err)
+		}
+		return m
+	}
+	dupes := func() int {
+		var n int
+		if err := cloud.pool.QueryRow(ctx, `
+			SELECT count(*) FROM (
+				SELECT 1 FROM core_inputs
+				GROUP BY persona_id, admission_seq HAVING count(*) > 1) d`).Scan(&n); err != nil {
+			t.Fatalf("duplicate check: %v", err)
+		}
+		return n
+	}
+
+	// The destination already hosts a persona whose inputs outrank what the
+	// bundle will carry.
+	other := newID(t)
+	must(drop(cloud.state.EnsurePersona(ctx, other, nil, "Staying secretary")))
+	for i := 1; i <= 4; i++ {
+		submit(t, cloud, other, fmt.Sprintf("pre-%d", i), fmt.Sprintf("existing %d", i))
+	}
+
+	// The moved persona carries a smaller history.
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	submit(t, local, pid, "m-1", "first")
+	submit(t, local, pid, "m-2", "second")
+	must(local.svc.Seal(ctx, pid, "move-seq", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-seq")
+
+	// While the import runs, real admissions to the staying persona race it.
+	// The interleaving is deliberately not pinned — every interleaving must
+	// be safe, so the assertions check the outcome, not a schedule.
+	var wg sync.WaitGroup
+	subErr := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := cloud.state.SubmitInput(ctx, &agentstate.Input{
+				PersonaID: other, InputID: fmt.Sprintf("race-%d", i), Kind: "message",
+				Payload: map[string]any{"text": "racing"}, ActorKind: "human", SourceSurface: "test",
+			})
+			subErr <- err
+		}(i)
+	}
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)
+	if err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	wg.Wait()
+	close(subErr)
+	for err := range subErr {
+		if err != nil {
+			t.Fatalf("concurrent admission during import: %v", err)
+		}
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after import", n)
+	}
+	last, _ := seqPos()
+	if last < globalMax() {
+		t.Fatalf("identity sequence at %d below table max %d after import", last, globalMax())
+	}
+	// The moved persona's claim order is the source's admission order, over
+	// destination-allocated values.
+	var order []string
+	rows, err := cloud.pool.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, id)
+	}
+	rows.Close()
+	if fmt.Sprint(order) != "[m-1 m-2]" {
+		t.Fatalf("destination claim order %v, want [m-1 m-2]", order)
+	}
+	// Every other column carried verbatim across a populated destination.
+	// The source's admission_seq values (1, 2) and the destination's rebased
+	// ones genuinely differ here, so this comparison fails unless rowLines
+	// actually normalizes the identity column out of the row data.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+
+	// The next admission to the staying persona orders after everything.
+	submit(t, cloud, other, "post-import", "after the move")
+	var seq int64
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 AND input_id = 'post-import'`,
+		other).Scan(&seq); err != nil {
+		t.Fatalf("post-import seq: %v", err)
+	}
+	if seq <= last {
+		t.Fatalf("post-import admission_seq %d did not pass sequence position %d", seq, last)
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after post-import admission", n)
+	}
+
+	// A rejected bundle can consume at most one nextval per staged row
+	// (the digest is verified after the rows stream in) — a legal gap,
+	// never a rewind.
+	before, _ := seqPos()
+	corrupt := bytes.Clone(bundle)
+	corrupt[len(corrupt)-40] ^= 0xFF
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(corrupt), &humanID, false); err == nil {
+		t.Fatal("corrupted bundle imported")
+	}
+	if after, _ := seqPos(); after < before {
+		t.Fatalf("rejected import rewound the sequence %d -> %d", before, after)
+	}
+
+	// A bundle carrying huge admission_seq values — e.g. exported from a
+	// long-lived multi-persona source — costs a bounded number of sequence
+	// allocations: one per carried row, independent of the numeric gap.
+	// rewriteBundleAdmissionSeqs decodes each row, swaps the carried value,
+	// and recomputes the trailer digest, so the ~4e9 values below are what
+	// the importer actually checks and stages — it fails rather than degrade
+	// to a no-op if the bundle's byte shape changes.
+	big := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, big, nil, "Long-lived secretary")))
+	submit(t, local, big, "b-1", "old input")
+	submit(t, local, big, "b-2", "newer input")
+	must(local.svc.Seal(ctx, big, "move-big", placementID(t, cloud)))
+	bigBundle, _ := exportBytes(t, local, big, "move-big")
+	bigBundle = rewriteBundleAdmissionSeqs(t, bigBundle, []int64{4000000003, 4000000004})
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bigBundle), &humanID, false); err != nil || !created {
+		t.Fatalf("big-seq import: created=%v err=%v", created, err)
+	}
+	after, _ := seqPos()
+	if after-before > 10 {
+		t.Fatalf("import advanced the sequence by %d for a 2-row bundle — work is proportional to the numeric gap, not the data", after-before)
+	}
+	var bigSeqs []int64
+	rows, err = cloud.pool.Query(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var s int64
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		bigSeqs = append(bigSeqs, s)
+	}
+	rows.Close()
+	if len(bigSeqs) != 2 || bigSeqs[0] < 1 || bigSeqs[1] <= bigSeqs[0] || bigSeqs[0] > 4000000000 {
+		t.Fatalf("rebased admission_seqs %v: want fresh small values in source order", bigSeqs)
+	}
+
+	// An empty carried persona (no inputs at all) consumes nothing.
+	empty := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, empty, nil, "Empty secretary")))
+	must(local.svc.Seal(ctx, empty, "move-empty", placementID(t, cloud)))
+	emptyBundle, _ := exportBytes(t, local, empty, "move-empty")
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(emptyBundle), &humanID, false); err != nil || !created {
+		t.Fatalf("empty import: created=%v err=%v", created, err)
+	}
+	if after, _ := seqPos(); after != before {
+		t.Fatalf("empty import moved the sequence %d -> %d", before, after)
+	}
+
+	// The staying persona still passes the cut's own integrity checks — its
+	// admission order was never corrupted.
+	if _, err := cloud.svc.Seal(ctx, other, "move-away", placementID(t, local)); err != nil {
+		t.Fatalf("seal of pre-existing destination persona after import: %v", err)
+	}
+}
+
 // Every table that belongs to a persona must be carried by core.v1 or be
 // declared placement-local, and carried tables must match the contract's
 // columns. A module that adds persona state without a portability decision
@@ -1476,7 +2234,7 @@ func TestLostActivateResponseKeepsOneWriter(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0010", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0010")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	// Activate commits; the response is lost to the caller.
 	must(cloud.svc.Activate(ctx, pid, "move-0010"))
@@ -1526,7 +2284,7 @@ func TestImportLeaseFloorIsDeadOnArrival(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0010b", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0010b")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	var floorGen int64
 	var holder string
@@ -1566,11 +2324,11 @@ func TestBundleIsBoundToOneDestination(t *testing.T) {
 	}
 
 	// The ordinary retry onto the wrong placement is refused.
-	if _, _, err := cloudB.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrBadBundle) ||
+	if _, _, err := cloudB.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrBadBundle) ||
 		!strings.Contains(err.Error(), "addressed to placement") {
 		t.Fatalf("import on the wrong placement: %v", err)
 	}
-	must(drop(cloudA.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloudA.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 	act := must(cloudA.svc.Activate(ctx, pid, "move-0011"))
 	if _, err := cloudB.svc.Activate(ctx, pid, "move-0011"); !errors.Is(err, ErrTransferNotFound) &&
 		!errors.Is(err, ErrPersonaNotFound) && !errors.Is(err, ErrTransferConflict) {
@@ -1618,7 +2376,7 @@ func TestCompleteRequiresDestinationActivation(t *testing.T) {
 	if tomb.Status != "retired" || tomb.RetireProof == "" {
 		t.Fatalf("tombstone retire: %+v", tomb)
 	}
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("a late import beats the tombstone: %v", err)
 	}
 	must(local.svc.Abort(ctx, pid, "move-0012", tomb.RetireProof))
@@ -1656,7 +2414,7 @@ func TestRetireAndActivateCommitExactlyOnce(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0014", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0014")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	results := make(chan error, 2)
 	go func() { _, err := cloud.svc.Activate(ctx, pid, "move-0014"); results <- err }()
@@ -1704,7 +2462,7 @@ func TestImportAndRetireRaceToOneOutcome(t *testing.T) {
 	}
 	results := make(chan outcome, 2)
 	go func() {
-		_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)
+		_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)
 		results <- outcome{imported: created, err: err}
 	}()
 	go func() {
@@ -1785,13 +2543,13 @@ func TestImportErrorContract(t *testing.T) {
 		return lines
 	})
 	dup = rehashBundle(t, dup)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(dup), nil); !errors.Is(err, ErrBadBundle) ||
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(dup), nil, false); !errors.Is(err, ErrBadBundle) ||
 		!strings.Contains(err.Error(), "duplicates a key") {
 		t.Fatalf("duplicate-key bundle: %v", err)
 	}
 
 	// A human_id that does not exist names the parameter, not the bundle.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), ptr(newID(t))); !errors.Is(err, ErrBadRequest) ||
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), ptr(newID(t)), false); !errors.Is(err, ErrBadRequest) ||
 		!strings.Contains(err.Error(), "human_id") {
 		t.Fatalf("missing human: %v", err)
 	}
@@ -1800,14 +2558,14 @@ func TestImportErrorContract(t *testing.T) {
 	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
 		t.Fatal(err)
 	}
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)))
 	// Replays must carry the same human_id; a different one is a conflict,
 	// never a silent rebind.
 	other := newID(t)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &other); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &other, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("replay with a different human_id: %v", err)
 	}
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || created {
 		t.Fatalf("faithful replay: created=%v err=%v", created, err)
 	}
 }
@@ -1826,7 +2584,7 @@ func TestRetireProofBindsTheDestination(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-0020", cloudID))
 	bundle, _ := exportBytes(t, local, pid, "move-0020")
 	key := bundleHeader(t, bundle).TransferKey
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	// The request itself must name this placement: a retire addressed to
 	// cloud is refused by third before anything is recorded.
@@ -1898,7 +2656,7 @@ func TestTombstoneCorrectionRecoversAWrongKey(t *testing.T) {
 	}
 	must(local.svc.Abort(ctx, pid, "move-0021", fixed.RetireProof))
 	// Foreclosure is durable through correction.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("import after tombstone correction: %v", err)
 	}
 	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); err != nil {
@@ -1926,7 +2684,7 @@ func TestTombstoneCorrectionRecoversAWrongPersona(t *testing.T) {
 	if _, err := local.svc.Abort(ctx, pid, "move-0022", mistaken.RetireProof); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("abort on a proof naming another persona: %v", err)
 	}
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("the real bundle staged beside a wrong-persona tombstone: %v", err)
 	}
 	fixed := must(cloud.svc.Retire(ctx, pid, "move-0022", cloudID, key))
@@ -1934,7 +2692,7 @@ func TestTombstoneCorrectionRecoversAWrongPersona(t *testing.T) {
 		t.Fatalf("correction kept persona %s", fixed.PersonaID)
 	}
 	must(local.svc.Abort(ctx, pid, "move-0022", fixed.RetireProof))
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("import after persona correction: %v", err)
 	}
 }
@@ -1950,7 +2708,7 @@ func TestImportedRetireIsNotCorrectable(t *testing.T) {
 	cloudID := placementID(t, cloud)
 	must(local.svc.Seal(ctx, pid, "move-0023", cloudID))
 	bundle, _ := exportBytes(t, local, pid, "move-0023")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 	retired := retireDest(t, cloud, pid, "move-0023", "")
 	if _, err := cloud.svc.Retire(ctx, pid, "move-0023", cloudID, strings.Repeat("e", 64)); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("re-retire of an imported transfer with a different key: %v", err)
@@ -1962,6 +2720,24 @@ func TestImportedRetireIsNotCorrectable(t *testing.T) {
 		t.Fatal("imported retire replay changed the proof")
 	}
 	must(local.svc.Abort(ctx, pid, "move-0023", retired.RetireProof))
+}
+
+// input returns the persona's input row (the turn half is unused here).
+func input(t *testing.T, p placement, personaID, inputID string) agentstate.Input {
+	t.Helper()
+	in, _, err := p.state.GetInput(context.Background(), personaID, inputID)
+	if err != nil {
+		t.Fatalf("get input %s: %v", inputID, err)
+	}
+	return in
+}
+
+// mustExec runs a plain Exec and fails on error.
+func mustExec(t *testing.T, p placement, sql string, args ...any) {
+	t.Helper()
+	if _, err := p.pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("exec %s: %v", sql, err)
+	}
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -1988,4 +2764,1028 @@ func rehashBundle(t *testing.T, bundle []byte) []byte {
 		t.Fatal(err)
 	}
 	return []byte(strings.Join(append(lines[:len(lines)-1], string(raw)+"\n"), ""))
+}
+
+// --- Approvals and wait accounting travel with the persona (M08 repair f43) ---
+
+// parkedApproval builds a persona whose only input waits on a pending
+// elevated message.send: the operation is awaiting_approval, the turn
+// awaiting, the input waiting with waiting_since set. Returns the
+// approval id.
+func parkedApproval(t *testing.T, p placement, personaID, humanID string) string {
+	t.Helper()
+	ctx := context.Background()
+	must(drop(p.state.EnsurePersona(ctx, personaID, &humanID, "secretary")))
+	submit(t, p, personaID, "in-park", "please send the notice")
+	gen := must(p.state.AcquireWriter(ctx, personaID, "local-core", time.Minute)).Generation
+	load := must(p.state.LoadTurn(ctx, personaID, gen, "turn-park", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("load %+v", load.Input)
+	}
+	send := agentstate.PlanCall{Tool: "message.send", Route: "elevated",
+		Request: map[string]any{"text": "moving notice"}}
+	must(drop(p.state.SavePlan(ctx, personaID, "turn-park", gen, 0,
+		agentstate.Decision{Text: "needs consent", Calls: []agentstate.PlanCall{send}})))
+	op, a, fresh, err := p.state.ClaimOperation(ctx, personaID, "turn-park", gen,
+		"op-park-0", "message.send", 0, send.Request)
+	if err != nil || !fresh || a == nil || a.Status != "pending" || op.Status != "awaiting_approval" {
+		t.Fatalf("park claim: op=%+v a=%+v fresh=%v err=%v", op, a, fresh, err)
+	}
+	must(p.state.CommitTurn(ctx, personaID, "turn-park", gen,
+		agentstate.CommitRequest{Outcome: "await"}))
+	in := input(t, p, personaID, "in-park")
+	if in.Status != "waiting" || in.WaitingSince == nil {
+		t.Fatalf("parked input %+v", in)
+	}
+	return a.ApprovalID
+}
+
+// A pending approval is carried with its operation linkage and stays
+// resolvable at the destination — but only for the destination-bound
+// human: the source human's id and the carried record's provenance are
+// not destination authority. The grant executes exactly once there.
+func TestTransferCarriesAPendingApproval(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+
+	rec := must(local.svc.Seal(ctx, pid, "move-appr", placementID(t, cloud)))
+	if rec.Continuity.PendingApprovals != 1 || rec.Continuity.WaitingInputs != 1 {
+		t.Fatalf("seal continuity %+v", rec.Continuity)
+	}
+	// Once sealed, the source takes no new decisions on it — the pending
+	// approval belongs to the destination now.
+	if _, err := local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src", DecidedByKind: "human", DecidedByID: srcHuman,
+	}); !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("decision on sealed source: %v, want inactive", err)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-appr")
+
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)
+	if err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	if staged.Continuity.PendingApprovals != 1 || staged.Continuity.WaitingInputs != 1 {
+		t.Fatalf("import continuity %+v", staged.Continuity)
+	}
+	// The waiting input and its parked approval arrive intact.
+	in := input(t, cloud, pid, "in-park")
+	if in.Status != "waiting" || in.WaitingSince == nil {
+		t.Fatalf("staged input %+v", in)
+	}
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "pending" || a.Decision != nil || a.DecidedByID != nil || a.ConsumedAt != nil {
+		t.Fatalf("staged approval %+v", a)
+	}
+	// A staged persona takes no decisions.
+	if _, err := cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-x", DecidedByKind: "human", DecidedByID: dstHuman,
+	}); !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("decision on staged persona: %v, want inactive", err)
+	}
+
+	must(cloud.svc.Activate(ctx, pid, "move-appr"))
+	// Neither the source human's id nor a stranger's decides at the
+	// destination — only the human this placement bound at import.
+	for _, who := range []string{srcHuman, newID(t)} {
+		if _, err := cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+			Decision: "approve_once", DecisionID: "d-" + who[:8], DecidedByKind: "human", DecidedByID: who,
+		}); !errors.Is(err, agentstate.ErrApprovalForbidden) {
+			t.Fatalf("decision by %s: %v, want forbidden", who, err)
+		}
+	}
+	got := must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-1", DecidedByKind: "human", DecidedByID: dstHuman,
+	}))
+	if got.Status != "approved" || got.Provenance == nil || *got.Provenance != "agent_own_with_human_consent" {
+		t.Fatalf("destination decision %+v", got)
+	}
+	// The human's thinking time — including the span before the move —
+	// accumulated into waited_ms instead of resetting.
+	in = input(t, cloud, pid, "in-park")
+	if in.Status != "queued" || in.WaitingSince != nil || in.WaitedMs <= 0 {
+		t.Fatalf("requeued input %+v", in)
+	}
+	// The next writer runs the granted call exactly once.
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-resume", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("resume load %+v", load.Input)
+	}
+	op, grant, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-resume", gen,
+		"op-resume-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || op.Status != "done" || !fresh || grant == nil || grant.ConsumedAt == nil {
+		t.Fatalf("consume claim: op=%+v grant=%+v fresh=%v err=%v", op, grant, fresh, err)
+	}
+	// A replayed claim replays the receipt — no second effect.
+	op2, _, fresh2, err := cloud.state.ClaimOperation(ctx, pid, "turn-resume", gen,
+		"op-resume-0b", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || fresh2 || op2.Status != "done" || op2.OperationID != op.OperationID {
+		t.Fatalf("replayed claim: op=%+v fresh=%v err=%v", op2, fresh2, err)
+	}
+	n := 0
+	for _, e := range must(cloud.state.Outbox(ctx, pid, 0, 100)) {
+		if e.Kind == "secretary_message" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("secretary_message outbox entries = %d, want exactly 1", n)
+	}
+	// A replayed decision returns the stored record; a divergent one conflicts.
+	if again := must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-1", DecidedByKind: "human", DecidedByID: dstHuman,
+	})); again.Status != "approved" {
+		t.Fatalf("decision replay %+v", again)
+	}
+	if _, err := cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "deny_once", DecisionID: "d-2", DecidedByKind: "human", DecidedByID: dstHuman,
+	}); !errors.Is(err, agentstate.ErrApprovalConflict) {
+		t.Fatalf("divergent decision: %v, want conflict", err)
+	}
+}
+
+// A denial decided at the source is preserved at the destination: the
+// carried operation replays the recorded denial — it is never re-executed
+// and never re-asked.
+func TestTransferPreservesADenial(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	denied := must(local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "deny_once", DecisionID: "d-deny", DecidedByKind: "human", DecidedByID: srcHuman,
+	}))
+	if denied.Status != "denied" {
+		t.Fatalf("deny %+v", denied)
+	}
+	// The decision requeued the input; the parked op is failed with the
+	// denial as its durable response.
+	in := input(t, local, pid, "in-park")
+	if in.Status != "queued" {
+		t.Fatalf("input after denial %+v", in)
+	}
+
+	must(local.svc.Seal(ctx, pid, "move-deny", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-deny")
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+	must(cloud.svc.Activate(ctx, pid, "move-deny"))
+
+	// The decided record arrived with its provenance.
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "denied" || a.Decision == nil || *a.Decision != "deny_once" ||
+		a.DecidedByID == nil || *a.DecidedByID != srcHuman {
+		t.Fatalf("carried denial %+v", a)
+	}
+	// The destination's writer replays the stored denial — no prompt, no send.
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-deny", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("deny resume load %+v", load.Input)
+	}
+	op, grant, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-deny", gen,
+		"op-deny-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || fresh || op.Status != "failed" || grant == nil || grant.Status != "denied" {
+		t.Fatalf("denied replay: op=%+v grant=%+v fresh=%v err=%v", op, grant, fresh, err)
+	}
+	for _, e := range must(cloud.state.Outbox(ctx, pid, 0, 100)) {
+		if e.Kind == "secretary_message" {
+			t.Fatal("denied message.send delivered at the destination")
+		}
+	}
+	// No new approval was minted: the same one still answers.
+	if l := must(cloud.state.ListApprovals(ctx, pid, "")); len(l) != 1 || l[0].ApprovalID != apprID {
+		t.Fatalf("destination approvals %+v", l)
+	}
+}
+
+// A configured user's selection no longer blocks the move: seal snapshots
+// it onto the persona as non-secret model intent — explicit 'none' and an
+// api selection's provider/model/base_url metadata alike — while no
+// credential or unrelated person's selection travels. An unselected
+// persona snapshots NULL and keeps ordinary unset semantics.
+func TestSealCarriesModelIntent(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+
+	// Explicit 'none' travels as intent — the destination must reproduce
+	// the refusal to run a model, not silently take a default.
+	pid := newID(t)
+	human := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
+	must(drop(local.state.EnsurePersona(ctx, pid, &human, "secretary")))
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	if _, err := local.svc.Seal(ctx, pid, "move-none", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with a none selection: %v", err)
+	}
+	var intent []byte
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	var noneIntent map[string]any
+	if err := json.Unmarshal(intent, &noneIntent); err != nil || noneIntent["kind"] != "none" {
+		t.Fatalf("none intent %s", intent)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-none")
+	if !bytes.Contains(bundle, []byte(`"model_intent"`)) {
+		t.Fatal("bundle persona row does not carry model_intent")
+	}
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	noneIntent = nil
+	if err := json.Unmarshal(intent, &noneIntent); err != nil || noneIntent["kind"] != "none" {
+		t.Fatalf("carried none intent %s", intent)
+	}
+
+	// An api selection travels as kind + non-secret connection metadata;
+	// the credential never appears in the bundle.
+	pid2 := newID(t)
+	human2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human2)
+	must(drop(local.state.EnsurePersona(ctx, pid2, &human2, "configured")))
+	connID := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		human2, connID, uuid.NewString())
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind, connection_id)
+		VALUES ($1, 'api', $2::uuid)`, human2, connID)
+	if _, err := local.svc.Seal(ctx, pid2, "move-api", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with an api selection: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid2).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(intent, &got); err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := got["connection"].(map[string]any)
+	if got["kind"] != "api" || conn["preset"] != "openai-chat" ||
+		conn["model"] != "model-9" || conn["base_url"] != "https://api.example.test" {
+		t.Fatalf("api intent %s", intent)
+	}
+	apiBundle, _ := exportBytes(t, local, pid2, "move-api")
+	if bytes.Contains(apiBundle, []byte("credential_ciphertext")) ||
+		bytes.Contains(apiBundle, []byte("access_token")) {
+		t.Fatal("credential material leaked into the bundle")
+	}
+	for _, line := range bytes.Split(apiBundle, []byte("\n")) {
+		if !bytes.Contains(line, []byte(`"table":"core_personas"`)) {
+			continue
+		}
+		var prow struct {
+			Data struct {
+				ModelIntent map[string]any `json:"model_intent"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(line, &prow); err != nil {
+			t.Fatal(err)
+		}
+		for k := range prow.Data.ModelIntent {
+			if strings.Contains(k, "credential") || strings.Contains(k, "token") {
+				t.Fatalf("model_intent carries a secret field %q", k)
+			}
+		}
+	}
+	// No selection row may ride the bundle, and no other human's
+	// selections are touched.
+	if strings.Contains(string(apiBundle), "model_connection") {
+		t.Fatal("selection rows must not be carried")
+	}
+
+	// An unbound/unselected persona snapshots no intent.
+	pid3 := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid3, nil, "unbound")))
+	if _, err := local.svc.Seal(ctx, pid3, "move-free", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal unbound persona: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid3).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	if intent != nil {
+		t.Fatalf("unbound persona intent %s, want NULL", intent)
+	}
+}
+
+// mutateTableRows rewrites the data object of every row line for a table
+// and rehashes the trailer, producing a structurally valid bundle whose
+// contents are incoherent.
+func mutateTableRows(t *testing.T, bundle []byte, table string, fn func(data map[string]any)) []byte {
+	t.Helper()
+	return rehashBundle(t, mutateLines(bundle, func(lines []string) []string {
+		for i, line := range lines {
+			var row map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &row); err != nil {
+				continue
+			}
+			var tbl string
+			if err := json.Unmarshal(row["table"], &tbl); err != nil || tbl != table {
+				continue
+			}
+			var data map[string]any
+			if err := json.Unmarshal(row["data"], &data); err != nil {
+				t.Fatal(err)
+			}
+			fn(data)
+			raw, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row["data"] = raw
+			out, err := json.Marshal(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines[i] = string(out) + "\n"
+		}
+		return lines
+	}))
+}
+
+// tableRow returns the decoded data of the row in table whose primary key
+// field (approval_id, operation_id, persona_id, …) equals id.
+func tableRow(t *testing.T, bundle []byte, table, id string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(string(bundle), "\n") {
+		var row map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		var tbl string
+		if err := json.Unmarshal(row["table"], &tbl); err != nil || tbl != table {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(row["data"], &data); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"approval_id", "operation_id", "input_id", "persona_id"} {
+			if v, ok := data[key]; ok && v == id {
+				return data
+			}
+		}
+	}
+	t.Fatalf("no %s row for %s in bundle", table, id)
+	return nil
+}
+
+// A grant approved at the source but not yet executed is consent under the
+// source's account. Imported under a different human without a
+// same-authority assertion, it is re-pended — the original decision kept
+// in prior_* as provenance — and the destination's bound human decides
+// before the effect runs once.
+func TestApprovedGrantRependsAcrossAuthority(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	// The source human consents; the send never ran before the move.
+	must(local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src", DecidedByKind: "human", DecidedByID: srcHuman,
+	}))
+
+	must(local.svc.Seal(ctx, pid, "move-grant", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-grant")
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+
+	// The grant did not cross: the approval is pending again, carrying the
+	// source decision as provenance only.
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "pending" || a.Decision != nil || a.DecidedByID != nil {
+		t.Fatalf("re-pended grant %+v", a)
+	}
+	if a.PriorDecision == nil || *a.PriorDecision != "approve_once" ||
+		a.PriorDecidedByID == nil || *a.PriorDecidedByID != srcHuman || a.PriorDecidedAt == nil {
+		t.Fatalf("provenance not preserved %+v", a)
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-grant"))
+	// The parked op must not execute under the source's consent.
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-rp", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("resume load %+v", load.Input)
+	}
+	// Replaying the parked call must not execute: the op stays awaiting and
+	// the re-pended grant is handed back for a destination decision.
+	op, grant, _, err := cloud.state.ClaimOperation(ctx, pid, "turn-rp", gen,
+		"op-rp-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || grant == nil || grant.Status != "pending" || op.Status != "awaiting_approval" {
+		t.Fatalf("claim under re-pended grant: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+	must(cloud.state.CommitTurn(ctx, pid, "turn-rp", gen, agentstate.CommitRequest{Outcome: "await"}))
+	for _, e := range must(cloud.state.Outbox(ctx, pid, 0, 100)) {
+		if e.Kind == "secretary_message" {
+			t.Fatal("the send executed without a destination decision")
+		}
+	}
+	// The source human's id is not destination authority.
+	if _, err := cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src2", DecidedByKind: "human", DecidedByID: srcHuman,
+	}); !errors.Is(err, agentstate.ErrApprovalForbidden) {
+		t.Fatalf("source-human decision at destination: %v, want forbidden", err)
+	}
+	// The bound destination human decides; the call executes exactly once.
+	must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-dst", DecidedByKind: "human", DecidedByID: dstHuman,
+	}))
+	load = must(cloud.state.LoadTurn(ctx, pid, gen, "turn-rp2", 50))
+	if load.Input == nil {
+		t.Fatal("requeued input did not resume")
+	}
+	op2, grant2, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-rp2", gen,
+		"op-rp-1", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || !fresh || op2.Status != "done" || grant2 == nil || grant2.ConsumedAt == nil {
+		t.Fatalf("consume after destination decision: op=%+v grant=%+v err=%v", op2, grant2, err)
+	}
+}
+
+// With an explicit same-authority assertion, a source grant that was never
+// consumed continues at the destination and executes once — no second
+// prompt. decided_by stays provenance; the assertion, not the bundle's
+// fields, is what carries the authority.
+func TestApprovedGrantContinuesWithSameHuman(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src", DecidedByKind: "human", DecidedByID: srcHuman,
+	}))
+
+	must(local.svc.Seal(ctx, pid, "move-same", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-same")
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, true)
+	if err != nil || !created {
+		t.Fatalf("same-human import: created=%v err=%v", created, err)
+	}
+	if !staged.SameHuman {
+		t.Fatalf("receipt does not record the same_human assertion: %+v", staged)
+	}
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "approved" || a.DecidedByID == nil || *a.DecidedByID != srcHuman || a.ConsumedAt != nil {
+		t.Fatalf("same-authority grant %+v", a)
+	}
+	// same_human requires a bound human to assert against.
+	pidB := newID(t)
+	srcB := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcB)
+	parkedApproval(t, local, pidB, srcB)
+	must(local.svc.Seal(ctx, pidB, "move-same-b", placementID(t, cloud)))
+	bundleB, _ := exportBytes(t, local, pidB, "move-same-b")
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundleB), nil, true); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("same_human without human_id: %v, want bad request", err)
+	}
+	// A replay asserting differently conflicts — the staged authority
+	// decision is fixed.
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("replay dropping the assertion: %v, want conflict", err)
+	}
+
+	must(cloud.svc.Activate(ctx, pid, "move-same"))
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-sh", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("resume load %+v", load.Input)
+	}
+	// No new prompt: the grant consumes into the one execution.
+	op, grant, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-sh", gen,
+		"op-sh-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || !fresh || op.Status != "done" || grant == nil || grant.ConsumedAt == nil {
+		t.Fatalf("grant continuation: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+}
+
+// retargetTransfer rewrites a mutated bundle's transfer_id so independent
+// cases do not collide on the ledger's one-content-per-transfer rule.
+func retargetTransfer(t *testing.T, bundle []byte, id string) []byte {
+	t.Helper()
+	return rehashBundle(t, mutateLines(bundle, func(lines []string) []string {
+		var hdr map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(lines[0]), &hdr); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr["transfer_id"] = raw
+		out, err := json.Marshal(hdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines[0] = string(out) + "\n"
+		return lines
+	}))
+}
+
+// An impossible approval cut is refused transactionally — at the source's
+// seal and at the destination's import — leaving no partially staged
+// persona. Approvals and their parked operations must agree on the exact
+// action and on a reachable lifecycle state.
+func TestImportRejectsIncoherentApprovalCuts(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-coh", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-coh")
+
+	cases := map[string]struct {
+		bundle []byte
+		want   string
+	}{
+		// The human saw one request while the operation would run another.
+		"approval request differs from the operation's": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["request"] = map[string]any{"text": "a different action entirely"}
+			}), "approval_operation_request_mismatch"},
+		// A digest that does not recompute from tool+route+request.
+		"forged action digest": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["action_digest"] = strings.Repeat("0", 64)
+			}), "approval_digest_mismatch"},
+		// A denial attached to an operation still awaiting it — the
+		// reviewers' infinite re-park loop.
+		"denied approval on an awaiting operation": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "denied"
+				d["decision"] = "deny_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+			}), "denied_approval_operation_not_failed"},
+		// An already-spent grant on an operation that could run again.
+		"consumed grant on an awaiting operation": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+				d["consumed_at"] = "2026-09-14T00:01:00Z"
+			}), "consumed_grant_operation_unsettled"},
+		// A pending approval carrying a consumption mark.
+		"pending approval marked consumed": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["consumed_at"] = "2026-09-14T00:00:00Z"
+			}), "pending_approval_decided_fields"},
+		// A decided approval missing who decided it.
+		"decided approval without a decider": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "decided_approval_incomplete"},
+		// The parked operation settled while its approval stayed pending.
+		"pending approval on a finished operation": {
+			mutateTableRows(t, bundle, "core_operations", func(d map[string]any) {
+				if d["status"] == "awaiting_approval" {
+					d["status"] = "done"
+				}
+			}), "pending_approval_operation_resolved"},
+		// An awaiting operation whose only approval is already spent —
+		// nothing left that can resolve it.
+		"awaiting operation with no live approval": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+				d["consumed_at"] = "2026-09-14T00:01:00Z"
+			}), "awaiting_operation_without_live_approval"},
+	}
+	n := 0
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			n++
+			tid := fmt.Sprintf("move-coh-%02d", n)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(retargetTransfer(t, tc.bundle, tid)), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			// Transactional refusal: no staged persona, no ledger row.
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused cut left a persona behind: %v", err)
+			}
+			if _, err := cloud.svc.Status(ctx, "import", tid); !errors.Is(err, ErrTransferNotFound) {
+				t.Fatalf("a refused cut left a ledger row: %v", err)
+			}
+		})
+	}
+	// The source applies the same matrix at seal: corrupt the stored cut
+	// and the seal refuses instead of exporting a broken bundle.
+	pid2 := newID(t)
+	src2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, src2)
+	parkedApproval(t, local, pid2, src2)
+	mustExec(t, local, `UPDATE core_tool_approvals SET request = '{"text":"forged"}'::jsonb WHERE persona_id = $1`, pid2)
+	if _, err := local.svc.Seal(ctx, pid2, "move-coh-src", placementID(t, cloud)); !errors.Is(err, ErrIntegrity) ||
+		!strings.Contains(err.Error(), "approval_operation_request_mismatch") {
+		t.Fatalf("seal over an incoherent cut: %v", err)
+	}
+}
+
+// An import without a human is not a trap: a staged persona with a pending
+// approval cannot activate — nothing may decide for it — until the
+// admin binds a human, after which activation, the decision and the one
+// execution all proceed. An unbound persona with nothing pending
+// activates normally; no secretary is required to have an employer.
+func TestUnboundImportBindsAndActivates(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-unbound", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-unbound")
+
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	// Activation refuses truthfully rather than stranding the waiting
+	// input on a decider that does not exist.
+	if _, err := cloud.svc.Activate(ctx, pid, "move-unbound"); !errors.Is(err, ErrTransferConflict) ||
+		!strings.Contains(err.Error(), "bind a human") {
+		t.Fatalf("activate unbound with a pending approval: %v", err)
+	}
+	// Binding is reachable while staged.
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	p := must(cloud.state.BindHuman(ctx, pid, dstHuman))
+	if p.HumanID == nil || *p.HumanID != dstHuman {
+		t.Fatalf("bind %+v", p)
+	}
+	// A second bind to another human conflicts — no silent rebind.
+	other := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, other)
+	if _, err := cloud.state.BindHuman(ctx, pid, other); !errors.Is(err, agentstate.ErrPersonaBound) {
+		t.Fatalf("rebind: %v, want bound conflict", err)
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-unbound"))
+	must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-b", DecidedByKind: "human", DecidedByID: dstHuman,
+	}))
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-ub", 50))
+	if load.Input == nil {
+		t.Fatal("waiting input did not resume after bind")
+	}
+	op, grant, _, err := cloud.state.ClaimOperation(ctx, pid, "turn-ub", gen,
+		"op-ub-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || op.Status != "done" || grant == nil || grant.ConsumedAt == nil {
+		t.Fatalf("post-bind consume: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+
+	// No pending approvals → an unbound persona activates and can bind
+	// later while active. Not every secretary needs an employer; only
+	// capabilities needing a decider do.
+	pid2 := newID(t)
+	liveSecretary(t, local, pid2)
+	must(local.svc.Seal(ctx, pid2, "move-free", placementID(t, cloud)))
+	free, _ := exportBytes(t, local, pid2, "move-free")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(free), nil, false)))
+	must(cloud.svc.Activate(ctx, pid2, "move-free"))
+	if _, err := cloud.state.BindHuman(ctx, pid2, dstHuman); err != nil {
+		t.Fatalf("late bind on an active unbound persona: %v", err)
+	}
+	// EnsurePersona over the bound persona is honest: the same human is
+	// idempotent, a different one conflicts rather than silently reporting
+	// success over an unchanged owner.
+	existing, created, err := cloud.state.EnsurePersona(ctx, pid2, &dstHuman, "x")
+	if err != nil || created || existing.HumanID == nil || *existing.HumanID != dstHuman {
+		t.Fatalf("ensure over bound persona: %+v created=%v err=%v", existing, created, err)
+	}
+	stranger := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, stranger)
+	if _, _, err := cloud.state.EnsurePersona(ctx, pid2, &stranger, "x"); !errors.Is(err, agentstate.ErrPersonaBound) {
+		t.Fatalf("ensure with a different human: %v, want bound conflict", err)
+	}
+}
+
+// --- Abort/clear lifecycle: intent restore and sealed-cut fence (f75/f76) ---
+
+// modelIntent reads the persona's carried intent column.
+func modelIntent(t *testing.T, p placement, personaID string) json.RawMessage {
+	t.Helper()
+	var intent json.RawMessage
+	if err := p.pool.QueryRow(context.Background(),
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, personaID).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	return intent
+}
+
+// binding resolves the persona's model binding through the real HTTP
+// handler on a metadata-only connection store.
+func binding(t *testing.T, p placement, personaID string) (int, agentstate.ModelBinding) {
+	t.Helper()
+	srv := agentstate.NewServer(p.pool, "portable-test-admin-secret")
+	srv.SetModelConnections(modelconnections.MetadataOnly(p.pool))
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	req := httptest.NewRequest("GET", "/internal/core/personas/"+personaID+"/model", nil)
+	req.Header.Set("Authorization", "Bearer "+srv.PersonaToken(personaID))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var b agentstate.ModelBinding
+	if rec.Code == 200 {
+		if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rec.Code, b
+}
+
+// A cancelled transfer restores the source's pre-seal model semantics: the
+// intent snapshot is a transfer artifact, so a persona that never moved
+// gets NULL back (its live selection decides again), while a persona that
+// itself arrived carrying an unresolved intent keeps that intent — the
+// obligation it still owes.
+func TestAbortRestoresSourceModelIntent(t *testing.T) {
+	ctx := context.Background()
+	local, cloud, edge := newPlacement(t), newPlacement(t), newPlacement(t)
+
+	pid := newID(t)
+	human := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
+	must(drop(local.state.EnsurePersona(ctx, pid, &human, "never-moved")))
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	sealed := must(local.svc.Seal(ctx, pid, "move-abort-1", placementID(t, cloud)))
+	var intent map[string]any
+	if err := json.Unmarshal(modelIntent(t, local, pid), &intent); err != nil || intent["kind"] != "none" {
+		t.Fatalf("sealed intent %s", modelIntent(t, local, pid))
+	}
+	if len(sealed.PriorModelIntent) != 0 {
+		t.Fatalf("a never-moved persona recorded prior intent %s", sealed.PriorModelIntent)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-abort-1")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	retired := retireDest(t, cloud, pid, "move-abort-1", "")
+	must(local.svc.Abort(ctx, pid, "move-abort-1", retired.RetireProof))
+	if got := modelIntent(t, local, pid); got != nil {
+		t.Fatalf("abort left intent %s on a persona that never moved", got)
+	}
+	// The human now picks an api connection — an ordinary account change.
+	// With the transfer artifact gone the binding resolves it; nothing is
+	// stranded in needs_rebinding.
+	connID := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		human, connID, uuid.NewString())
+	mustExec(t, local, `UPDATE model_connection_selections SET kind='api', connection_id=$2::uuid WHERE human_id=$1`,
+		human, connID)
+	if code, b := binding(t, local, pid); code != 200 || b.Selection != "api" {
+		t.Fatalf("post-abort binding: %d %+v", code, b)
+	}
+
+	// A persona that itself arrived by transfer: pid2 carries an api
+	// intent onto cloud where its bound human has no selection yet, so
+	// the intent is still owed. Sealing it onward must preserve that
+	// intent (no selection to snapshot), and aborting that second move
+	// restores it — the persona is still gated, exactly as before.
+	pid2 := newID(t)
+	src2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, src2)
+	must(drop(local.state.EnsurePersona(ctx, pid2, &src2, "configured")))
+	conn2 := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		src2, conn2, uuid.NewString())
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind, connection_id) VALUES ($1, 'api', $2::uuid)`, src2, conn2)
+	must(local.svc.Seal(ctx, pid2, "move-in-2", placementID(t, cloud)))
+	b2, _ := exportBytes(t, local, pid2, "move-in-2")
+	dst2 := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dst2)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(b2), &dst2, false)))
+	activated := must(cloud.svc.Activate(ctx, pid2, "move-in-2"))
+	must(local.svc.Complete(ctx, pid2, "move-in-2", activated.ActivateProof))
+	if code, b := binding(t, cloud, pid2); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("carried intent should gate on cloud: %d %+v", code, b)
+	}
+	carried := modelIntent(t, cloud, pid2)
+	// Seal onward with no selection present: the carried intent is what
+	// the persona owes, so it — not NULL — is what the next bundle carries.
+	sealed2 := must(cloud.svc.Seal(ctx, pid2, "move-out-2", placementID(t, edge)))
+	b3, _ := exportBytes(t, cloud, pid2, "move-out-2")
+	must(drop(edge.svc.Import(ctx, bytes.NewReader(b3), nil, false)))
+	var edgeIntent map[string]any
+	if err := json.Unmarshal(modelIntent(t, edge, pid2), &edgeIntent); err != nil || edgeIntent["kind"] != "api" {
+		t.Fatalf("the second move carried intent %s, want the unresolved api intent", modelIntent(t, edge, pid2))
+	}
+	retired2 := retireDest(t, edge, pid2, "move-out-2", "")
+	must(cloud.svc.Abort(ctx, pid2, "move-out-2", retired2.RetireProof))
+	if got := modelIntent(t, cloud, pid2); !bytes.Equal(got, carried) {
+		t.Fatalf("abort restored %s, want the carried intent %s", got, carried)
+	}
+	var prior map[string]any
+	if err := json.Unmarshal(sealed2.PriorModelIntent, &prior); err != nil || prior["kind"] != "api" {
+		t.Fatalf("second seal recorded prior intent %s", sealed2.PriorModelIntent)
+	}
+	if code, b := binding(t, cloud, pid2); code != 200 || b.Selection != "needs_rebinding" {
+		t.Fatalf("the restored intent must still gate: %d %+v", code, b)
+	}
+}
+
+// The intent is part of the sealed cut — Export reads it live — so the
+// clear escape is fenced to staged and active personas. On a sealed source
+// it refuses; the honest path (retire → abort → clear → re-seal) works.
+func TestSealedCutRefusesIntentClear(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	human := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
+	must(drop(local.state.EnsurePersona(ctx, pid, &human, "configured-none")))
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	must(local.svc.Seal(ctx, pid, "move-strip", placementID(t, cloud)))
+
+	// The store fence and the HTTP fence agree: sealed refuses.
+	if err := local.state.ClearModelIntent(ctx, pid); !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("clear on a sealed persona: %v, want inactive", err)
+	}
+	srv := agentstate.NewServer(local.pool, "portable-test-admin-secret")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	req := httptest.NewRequest("DELETE", "/internal/core/personas/"+pid+"/model/intent", nil)
+	req.Header.Set("Authorization", "Bearer portable-test-admin-secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 409 {
+		t.Fatalf("HTTP clear on a sealed persona: %d %s", rec.Code, rec.Body)
+	}
+	// The export still carries the intent — the bundle is not stripped.
+	bundle, _ := exportBytes(t, local, pid, "move-strip")
+	var prow struct {
+		Data struct {
+			ModelIntent map[string]any `json:"model_intent"`
+		} `json:"data"`
+	}
+	for _, line := range bytes.Split(bundle, []byte("\n")) {
+		if bytes.Contains(line, []byte(`"table":"core_personas"`)) {
+			if err := json.Unmarshal(line, &prow); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if prow.Data.ModelIntent["kind"] != "none" {
+		t.Fatalf("bundle intent after refused clear: %v", prow.Data.ModelIntent)
+	}
+
+	// The staged destination may clear it — the recovery escape is real.
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	if err := cloud.state.ClearModelIntent(ctx, pid); err != nil {
+		t.Fatalf("clear on a staged destination persona: %v", err)
+	}
+	if got := modelIntent(t, cloud, pid); got != nil {
+		t.Fatalf("staged clear left intent %s", got)
+	}
+	// Honest source path: retire, abort (restores the pre-seal NULL),
+	// then clearing is permitted and a re-seal works.
+	retired := retireDest(t, cloud, pid, "move-strip", "")
+	must(local.svc.Abort(ctx, pid, "move-strip", retired.RetireProof))
+	if err := local.state.ClearModelIntent(ctx, pid); err != nil {
+		t.Fatalf("clear on the aborted-and-active source: %v", err)
+	}
+	if _, err := local.svc.Seal(ctx, pid, "move-reseal", placementID(t, cloud)); err != nil {
+		t.Fatalf("re-seal after abort+clear: %v", err)
+	}
+	if got := modelIntent(t, local, pid); got == nil || !bytes.Contains(got, []byte(`"none"`)) {
+		t.Fatalf("re-seal re-snapshotted intent %s", got)
+	}
+}
+
+// Crafted incoherence in the persona row and in decision fields is refused
+// transactionally; a pending approval carrying prior_* history is a legal
+// re-pend artifact and is carried through.
+func TestImportRejectsMalformedIntentAndDebris(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-shape", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-shape")
+
+	cases := map[string]struct {
+		bundle []byte
+		want   string
+	}{
+		"intent is not an object": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = 42
+			}), "model_intent_malformed"},
+		"intent kind is not a string": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"kind": 42}
+			}), "model_intent_malformed"},
+		"intent kind is unknown": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"kind": "bogus"}
+			}), "model_intent_malformed"},
+		"intent lacks kind": {
+			mutateTableRows(t, bundle, "core_personas", func(d map[string]any) {
+				d["model_intent"] = map[string]any{"note": "x"}
+			}), "model_intent_malformed"},
+		"pending approval with decision debris": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["decided_by_kind"] = "human"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "pending_approval_decided_fields"},
+		"decided approval without a decider kind": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "decided_approval_incomplete"},
+	}
+	n := 0
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			n++
+			tid := fmt.Sprintf("move-shape-%02d", n)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(retargetTransfer(t, tc.bundle, tid)), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused cut left a persona behind: %v", err)
+			}
+		})
+	}
+
+	// Positive: a pending approval carrying prior_* decision history is
+	// exactly what a cross-authority re-pend produces — legal, carried,
+	// and preserved verbatim through a second move.
+	legal := retargetTransfer(t, mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+		d["prior_decision"] = "approve_once"
+		d["prior_decided_by_kind"] = "human"
+		d["prior_decided_by_id"] = srcHuman
+		d["prior_decided_at"] = "2026-09-14T00:00:00Z"
+	}), "move-shape-legal")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(legal), nil, false)))
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "pending" || a.PriorDecision == nil || *a.PriorDecision != "approve_once" ||
+		a.PriorDecidedByID == nil || *a.PriorDecidedByID != srcHuman {
+		t.Fatalf("carried re-pend provenance %+v", a)
+	}
+	// Moving again while still pending keeps the provenance: bind, activate,
+	// seal, export — the second bundle carries the same prior_* record.
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(cloud.state.BindHuman(ctx, pid, dstHuman))
+	must(cloud.svc.Activate(ctx, pid, "move-shape-legal"))
+	must(cloud.svc.Seal(ctx, pid, "move-shape-again", placementID(t, local)))
+	again, _ := exportBytes(t, cloud, pid, "move-shape-again")
+	againAppr := tableRow(t, again, "core_tool_approvals", apprID)
+	if againAppr["prior_decision"] != "approve_once" ||
+		againAppr["prior_decided_by_id"] != srcHuman || againAppr["status"] != "pending" {
+		t.Fatalf("second move lost re-pend provenance: %v", againAppr)
+	}
 }

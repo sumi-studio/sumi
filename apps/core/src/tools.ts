@@ -5,16 +5,31 @@ import type { ToolSpec } from "./provider.ts";
  * call through the state service operation ledger. For the slice, only
  * state-internal tools are registered: their effects commit atomically
  * inside the claim transaction (no crash window between effect and receipt).
+ * `messaging.send` is state-internal too — its effect is delegated to the
+ * Messaging domain, which applies the append in the same claim transaction.
  *
- * External-side-effect tools (send email, post to Slack, call a paid API)
- * are deliberately NOT in this registry — they need the authorized-tool
- * contract (durable intent → guarded execution → receipt) before the model
- * may invoke them. See progress.md.
+ * message.send is outward-facing — speaking into the shared channel as the
+ * secretary — so it may only run as an elevated call the human approves
+ * (ADR 0013). A normal-route call is recorded as a structured block: the
+ * Normal route never prompts the human and is never silently promoted.
+ * The model may elevate any call itself via the route field of the
+ * provider envelope.
+ *
+ * Other external-side-effect tools (send email, call a paid API) are
+ * deliberately NOT in this registry — they need an external executor before
+ * the model may invoke them.
  */
 
 export interface RegisteredTool extends ToolSpec {
   /** Marked internal: effect applied atomically by the state service. */
   readonly internal: true;
+  /**
+   * Marked delegated: the effect only exists when the host registered a
+   * ToolEffect for it (Go Store.RegisterEffect — e.g. messaging.send needs
+   * the Messaging domain wired). A bare state service cannot execute it, so
+   * it is advertised to the model only when the state lists it claimable.
+   */
+  readonly delegated?: true;
 }
 
 export const INTERNAL_TOOLS: RegisteredTool[] = [
@@ -37,6 +52,28 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
   {
     internal: true,
+    delegated: true,
+    name: "messaging.send",
+    description:
+      "Post a message into a shared Messaging place (channel, DM, or group DM) as yourself, so the people and secretaries there see it. Use the place_id shown in the input's marker; pass its message_id as reply_to to answer that message directly. This is for genuinely replying — do not post merely to acknowledge ambient messages.",
+    parameters: {
+      type: "object",
+      properties: {
+        place_id: {
+          type: "string",
+          description: "the Messaging place id to post into",
+        },
+        content: { type: "string", description: "the message text" },
+        reply_to: {
+          type: "string",
+          description: "optional message_id in the same place to reply to",
+        },
+      },
+      required: ["place_id", "content"],
+    },
+  },
+  {
+    internal: true,
     name: "journal.note",
     description:
       "Append a durable note to your journal. Use for facts, decisions, or memories worth keeping across restarts.",
@@ -45,6 +82,19 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       properties: {
         text: { type: "string", description: "the note content" },
         kind: { type: "string", description: "optional note kind/tag" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    internal: true,
+    name: "message.send",
+    description:
+      "Send a message into the shared channel as yourself. This is an outward-facing act: it only runs as an elevated call, waiting for an explicit human approval before it is delivered. A normal-route call is blocked without asking the human.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "the message text" },
       },
       required: ["text"],
     },
@@ -154,9 +204,16 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
 ];
 
-/** Model-visible specs for the registered internal tools. */
-export function toolSpecs(): ToolSpec[] {
-  return INTERNAL_TOOLS.map(({ name, description, parameters }) => ({
+/**
+ * Model-visible specs for the registered internal tools. `available` is the
+ * store's claimable set (GET .../tools): when given, only those names are
+ * offered. Without it, delegated tools — which a bare state service cannot
+ * execute — are still withheld; a host must confirm them claimable first.
+ */
+export function toolSpecs(available?: ReadonlySet<string>): ToolSpec[] {
+  return INTERNAL_TOOLS.filter(
+    (t) => (available ? available.has(t.name) : !t.delegated),
+  ).map(({ name, description, parameters }) => ({
     name,
     description,
     parameters,

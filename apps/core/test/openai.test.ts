@@ -263,6 +263,162 @@ test("unparseable tool arguments are a retryable failure, not a call", async () 
   );
 });
 
+test("context-length refusals classify as deterministic capacity refusals", async () => {
+  // HTTP 413 — authoritative even with an empty body.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(413);
+      res.end();
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // HTTP 400 with the provider's machine-readable code.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end(
+        JSON.stringify({
+          error: {
+            code: "context_length_exceeded",
+            message: "This model's maximum context length is 131072 tokens.",
+          },
+        }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // HTTP 400 with only a message pattern — no structured code.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end("maximum context length is 131072 tokens");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+  // An in-band error chunk carrying the code.
+  await withServer(
+    (_req, res) =>
+      sse([
+        chunk({
+          error: { code: "model_context_window_exceeded", message: "too long" },
+        }),
+        "[DONE]",
+      ])(res),
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.refusal, "context_length");
+        return true;
+      });
+    },
+  );
+});
+
+test("non-capacity errors are never classified as context refusal", async () => {
+  // A 429 whose body mentions tokens is still a rate limit.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429, { "retry-after": "1" });
+      res.end("rate limit: too many tokens");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // An ordinary invalid request has no capacity signal.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(400);
+      res.end(
+        JSON.stringify({
+          error: { code: "invalid_request_error", message: "bad param" },
+        }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, false);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // A 5xx stays a plain transient failure.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(503);
+      res.end("Service unavailable: try again");
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  // A retryable status is authoritative in the non-capacity direction even
+  // when bare token wording matches a refusal pattern: a codeless 429/5xx
+  // phrased in tokens is throttling or a server error, never a size refusal.
+  await withServer(
+    (_req, res) => {
+      res.writeHead(429);
+      res.end(JSON.stringify({ error: { message: "too many tokens" } }));
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+  await withServer(
+    (_req, res) => {
+      res.writeHead(500);
+      res.end(
+        JSON.stringify({ error: { message: "token limit exceeded" } }),
+      );
+    },
+    async (base) => {
+      await assert.rejects(collect(provider(base)), (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.retryable, true);
+        assert.equal(e.refusal, undefined);
+        return true;
+      });
+    },
+  );
+});
+
 test('an "error": null chunk is not an error — stream completes (NF1)', async () => {
   await withServer(
     (_req, res) =>
@@ -283,4 +439,92 @@ test('an "error": null chunk is not an error — stream completes (NF1)', async 
       assert.ok(evs.some((e) => e.type === "done"));
     },
   );
+});
+
+const NOTE_TOOL = {
+  name: "journal.note",
+  description: "note",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string" } },
+    required: ["text"],
+  },
+};
+
+const toolCallChunk = (args: string) =>
+  chunk({
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            { index: 0, id: "c1", function: { name: "journal_note", arguments: args } },
+          ],
+        },
+      },
+    ],
+  });
+
+test("tools are offered inside the {route, input} envelope and the chosen route is kept (ADR 0013)", async () => {
+  let offered: unknown;
+  await withServer(
+    (req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        offered = (JSON.parse(body) as { tools: { function: { parameters: unknown } }[] })
+          .tools[0]?.function.parameters;
+        sse([
+          toolCallChunk(JSON.stringify({ route: "elevated", input: { text: "x" } })),
+          fin("tool_calls"),
+          "[DONE]",
+        ])(res);
+      });
+    },
+    async (base) => {
+      const out: ModelEvent[] = [];
+      for await (const ev of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+        out.push(ev);
+      }
+      assert.deepEqual(offered, {
+        type: "object",
+        additionalProperties: false,
+        required: ["route", "input"],
+        properties: {
+          route: (offered as { properties: { route: unknown } }).properties.route,
+          input: NOTE_TOOL.parameters,
+        },
+      });
+      const call = out.find((e) => e.type === "tool_call");
+      assert.deepEqual(call, {
+        type: "tool_call",
+        call: { id: "c1", name: "journal.note", route: "elevated", arguments: { text: "x" } },
+      });
+    },
+  );
+});
+
+test("a call without a valid route is malformed, never treated as normal", async () => {
+  for (const args of [
+    { text: "x" },
+    { route: "sideways", input: { text: "x" } },
+    { route: "normal", input: { text: "x" }, extra: 1 },
+    { route: "normal", input: ["x"] },
+  ]) {
+    await withServer(
+      (_req, res) =>
+        sse([toolCallChunk(JSON.stringify(args)), fin("tool_calls"), "[DONE]"])(res),
+      async (base) => {
+        await assert.rejects(
+          (async () => {
+            for await (const _ of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+              /* drain */
+            }
+          })(),
+          (e: unknown) =>
+            e instanceof ModelError && e.retryable && /malformed call envelope/.test(e.message),
+          JSON.stringify(args),
+        );
+      },
+    );
+  }
 });

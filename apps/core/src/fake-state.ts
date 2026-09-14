@@ -1,6 +1,8 @@
 import { jsonEqual } from "./json.ts";
 import { FencedError, type StateClient, StateError } from "./state-client.ts";
 import type {
+  Approval,
+  ApprovalDecision,
   ClaimedMemoryChunk,
   CommitRequest,
   Event,
@@ -12,13 +14,14 @@ import type {
   MemoryBlock,
   MemoryChunk,
   MemoryStatus,
+  ModelBinding,
   OmittedMemory,
   Operation,
-  RenderedContext,
   OutboxEntry,
   PersonaState,
   PlanCall,
   RecoverResult,
+  RenderedContext,
   Schedule,
   Turn,
   TurnPlan,
@@ -90,13 +93,23 @@ function retryBackoffMs(attempt: number): number {
 
 // Memory thresholds mirrored from the Go store (agentstate/memory.go).
 const L0_CHUNK_MIN_TOKENS = 10_000;
+/** Target bound for one sealed chunk: past it, any safe boundary may cut. */
+const L0_FORCED_SEAL_LIMIT_TOKENS = L0_CHUNK_MIN_TOKENS * 2;
 const L0_LIVE_LIMIT_TOKENS = 40_000;
 /** Recorded preparation failures a chunk may spend. */
 const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 /** Claims ending without a recorded outcome before a chunk is marked failed. */
 const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
+/** Go memoryReshelvePacing: shelf delay after an unavailable model layer. */
+const MEMORY_RESHELVE_PACING_MS = 200;
 /** Estimated tokens of applied memory blocks admitted into one context. */
 const MEMORY_SEND_CAP_TOKENS = 25_000;
+/** Applied L1 beyond this triggers an L1→L2 consolidation target. */
+const L1_LIMIT_TOKENS = 15_000;
+/** One L1→L2 target consumes until at most this much applied L1 remains. */
+const L1_DROP_TO_TOKENS = 11_000;
+/** Applied L2 beyond this triggers L2-internal reintegration. */
+const L2_LIMIT_TOKENS = 10_000;
 /** Journal records one conversation_history search call scans. */
 const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
@@ -104,7 +117,10 @@ const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
-function estEventTokens(kind: string, payload: Record<string, unknown>): number {
+function estEventTokens(
+  kind: string,
+  payload: Record<string, unknown>,
+): number {
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
 }
 function estTextTokens(text: string): number {
@@ -169,6 +185,122 @@ function admitApplied(
 }
 
 /**
+ * Mirror of the Go tool registry (approvals.go): which tools exist and
+ * the authority each may act under. message.send may only run through an
+ * approved elevated call — a normal call is a structured block, never a
+ * human prompt (ADR 0013 §2). `requiresApproval` mirrors Go's reserved
+ * intrinsic-gating seam; no foundation tool uses it.
+ */
+// Exported for tests that register a phantom tool to probe edge paths
+// (e.g. a granted call whose tool has no effect — Go toolAuthority parity).
+export const TOOL_AUTHORITY: Record<
+  string,
+  { requiresApproval: boolean; elevatedOnly: boolean }
+> = {
+  "schedule.set": { requiresApproval: false, elevatedOnly: false },
+  "journal.note": { requiresApproval: false, elevatedOnly: false },
+  "job.start": { requiresApproval: false, elevatedOnly: false },
+  "job.status": { requiresApproval: false, elevatedOnly: false },
+  "job.cancel": { requiresApproval: false, elevatedOnly: false },
+  "message.send": { requiresApproval: false, elevatedOnly: true },
+  conversation_history: { requiresApproval: false, elevatedOnly: false },
+};
+
+// Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
+// or any non-RFC3339 shape is rejected even though new Date() would parse
+// it. The double must be at least as strict (review f42).
+const RFC3339_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+function parseRFC3339(v: unknown): Date | null {
+  if (typeof v !== "string" || !RFC3339_RE.test(v)) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function approvalRequirement(
+  tool: string,
+  route: string,
+): "intrinsic" | "route" | "" {
+  if (TOOL_AUTHORITY[tool]?.requiresApproval) return "intrinsic";
+  if (route === "elevated") return "route";
+  return "";
+}
+
+/**
+ * Mirror of Go validateToolRequest: deterministic argument checks a gated
+ * call must pass before a human is asked. Returns the error text, or null
+ * when the call is well-formed.
+ */
+function validateToolRequest(
+  tool: string,
+  request: Record<string, unknown>,
+): string | null {
+  switch (tool) {
+    case "schedule.set": {
+      if (parseRFC3339(request.wake_at) === null) {
+        return "bad request: schedule.set requires RFC3339 wake_at";
+      }
+      const missPolicy = (request.miss_policy as string) || "fire_late";
+      if (!MISS_POLICIES.has(missPolicy)) {
+        return "bad request: schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed";
+      }
+      return null;
+    }
+    case "journal.note":
+      return typeof request.text === "string" && request.text !== ""
+        ? null
+        : "bad request: journal.note requires text";
+    case "message.send":
+      return typeof request.text === "string" && request.text !== ""
+        ? null
+        : "bad request: message.send requires text";
+    default:
+      return null;
+  }
+}
+
+/** Canonical JSON with sorted object keys — matches Go's json.Marshal maps. */
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  const entries = Object.keys(v as Record<string, unknown>)
+    .sort()
+    .map(
+      (k) =>
+        `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`,
+    );
+  return `{${entries.join(",")}}`;
+}
+
+/**
+ * Deterministic FNV-1a digest — the fake does not need real sha256; it
+ * only needs a stable, distinct identity per (tool, route, request).
+ */
+function fakeDigest(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+function actionDigest(tool: string, route: string, request: Json): string {
+  return fakeDigest(
+    `sumi.core.tool-action.v1\x00${tool}\x00${route}\x00${canonicalJson(request)}`,
+  );
+}
+
+function approvalId(
+  persona: string,
+  inputId: string,
+  callIndex: number,
+): string {
+  return `appr-${fakeDigest(`${persona}\x00${inputId}\x00${callIndex}`)}`;
+}
+
+/**
  * In-memory StateClient implementing the same contract semantics as the Go
  * service — fencing, idempotent claims, atomic internal effects, recovery —
  * for fast unit tests. NOT canonical storage; real-PG verification lives in
@@ -183,6 +315,11 @@ export class FakeState implements StateClient {
       created_at: string;
       authority: string;
       transfer_id: string | null;
+      /** Carried non-secret model intent (Go core_personas.model_intent). */
+      model_intent: {
+        kind: string;
+        connection?: Record<string, unknown>;
+      } | null;
     }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
@@ -203,14 +340,22 @@ export class FakeState implements StateClient {
   memoryChunks: MemoryChunk[] = [];
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
+  /** Durable approval records — key: approval_id. */
+  approvals = new Map<string, Approval>();
+  /** Test fixture: the model binding each persona resolves to. */
+  modelBindings = new Map<string, ModelBinding>();
   /** Seq of each input's one input_received event (core_inputs.received_seq). */
   private receivedSeq = new Map<string, number>();
   /** Per-persona seqs — Go allocates MAX(seq)+1 per persona for both
    *  core_events and core_outbox, so a second persona starts at 1. */
   private seq = new Map<string, number>();
   private outboxSeq = new Map<string, number>();
-  /** Next chunk_seq per persona — matches MAX(chunk_seq) WHERE persona_id. */
-  private chunkSeq = new Map<string, number>();
+  /** Registered delegated effects — Go Store.RegisterEffect parity. A tool
+   *  here is claimable; its applier runs where Go would run Apply in-tx. */
+  private registeredEffects = new Map<
+    string,
+    (persona: string, idemKey: string, request: Record<string, unknown>) => Json
+  >();
 
   private key(persona: string, tool: string, idem: string) {
     return `${persona}|${tool}|${idem}`;
@@ -222,6 +367,19 @@ export class FakeState implements StateClient {
     return next;
   }
 
+  /** Go allocates MAX(chunk_seq)+1 per persona, so rows seeded directly —
+   *  or carried in a future transfer — still get the next free seq. */
+  private nextChunkSeq(persona: string) {
+    return (
+      Math.max(
+        0,
+        ...this.memoryChunks
+          .filter((c) => c.persona_id === persona)
+          .map((c) => c.chunk_seq),
+      ) + 1
+    );
+  }
+
   private mustHold(persona: string, generation: number) {
     const lease = this.leases.get(persona);
     if (!lease || lease.generation !== generation) {
@@ -229,14 +387,72 @@ export class FakeState implements StateClient {
     }
   }
 
-  addPersona(personaId: string, displayName = personaId) {
+  addPersona(
+    personaId: string,
+    displayName = personaId,
+    humanId: string | null = null,
+  ) {
     this.personas.set(personaId, {
-      human_id: null,
+      human_id: humanId,
       display_name: displayName,
       created_at: new Date().toISOString(),
       authority: "active",
       transfer_id: null,
+      model_intent: null,
     });
+  }
+
+  /** Test fixture: set the persona's authority state (active|staged|sealed|transferred|retired). */
+  setPersonaAuthority(personaId: string, authority: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    rec.authority = authority;
+  }
+
+  /** Test fixture: set the carried non-secret model intent. */
+  setModelIntent(
+    personaId: string,
+    intent: { kind: string; connection?: Record<string, unknown> } | null,
+  ) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    rec.model_intent = intent;
+  }
+
+  /** Mirror of the Go clear route: the intent is part of a sealed cut, so
+   * clearing is fenced to staged/active personas — a sealed or transferred
+   * one refuses (409) like the real store. */
+  clearModelIntent(personaId: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    if (rec.authority !== "staged" && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: persona authority is ${rec.authority}`,
+      );
+    }
+    rec.model_intent = null;
+  }
+
+  /** Mirror of the Go bind route: an unbound staged/active persona binds; a bound or moved one refuses. */
+  bindHuman(personaId: string, humanId: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    if (rec.human_id !== null) {
+      // Same-human retry is idempotent; a different one conflicts.
+      if (rec.human_id === humanId) return;
+      throw new StateError(
+        409,
+        `persona is already bound to a different human: bound to ${rec.human_id}`,
+      );
+    }
+    if (rec.authority !== "staged" && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: persona authority is ${rec.authority}`,
+      );
+    }
+    rec.human_id = humanId;
   }
 
   addInput(personaId: string, inputId: string, text: string, kind = "message") {
@@ -257,6 +473,8 @@ export class FakeState implements StateClient {
       created_at: new Date().toISOString(),
       done_at: null,
       not_before: null,
+      waiting_since: null,
+      waited_ms: 0,
     });
   }
 
@@ -266,6 +484,19 @@ export class FakeState implements StateClient {
     ttlMs: number,
   ): Promise<WriterLease> {
     const now = Date.now();
+    // Go fences on authority before the lease check: a sealed, staged,
+    // transferred or retired persona may not acquire a writer here, and a
+    // missing persona is a 404 — not a fresh lease on a ghost.
+    const rec = this.personas.get(persona);
+    if (!rec) {
+      throw new StateError(404, "persona not found");
+    }
+    if (rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: authority is ${rec.authority}`,
+      );
+    }
     const held = this.leases.get(persona);
     // Same contract as the Go upsert: an unexpired lease blocks other
     // holders, while the same holder re-acquires and bumps the generation.
@@ -418,9 +649,13 @@ export class FakeState implements StateClient {
       turn_id: turnId,
       input_id: input.input_id,
       generation,
+      // Go: a turn parked behind an approval is not a spent attempt.
       attempt:
         [...this.turns.values()].filter(
-          (t) => t.persona_id === persona && t.input_id === input.input_id,
+          (t) =>
+            t.persona_id === persona &&
+            t.input_id === input.input_id &&
+            t.status !== "awaiting",
         ).length + 1,
       status: "running",
       started_at: new Date().toISOString(),
@@ -456,13 +691,19 @@ export class FakeState implements StateClient {
     limit: number,
     excludeInputId = "",
   ): RenderedContext {
-    const applied = this.memoryChunks.filter(
-      (c) => c.persona_id === persona && c.status === "applied",
+    // Applied and superseded chunks both cover their ranges: a superseded
+    // source's records are represented by the applied upper-layer block
+    // that consumed it, so they no longer render raw.
+    const covering = this.memoryChunks.filter(
+      (c) =>
+        c.persona_id === persona &&
+        (c.status === "applied" || c.status === "superseded"),
     );
+    const applied = covering.filter((c) => c.status === "applied");
     const uncovered = this.eventLog.filter(
       (e) =>
         e.persona_id === persona &&
-        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
+        !covering.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
         !(
           excludeInputId !== "" &&
           this.turns.get(e.turn_id)?.input_id === excludeInputId
@@ -504,7 +745,7 @@ export class FakeState implements StateClient {
       this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
         ?.created_at ?? "";
     const blocks = applied
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .sort((a, b) => a.first_seq - b.first_seq)
       .map((c) => ({
         chunk_seq: c.chunk_seq,
         layer: c.layer,
@@ -648,9 +889,7 @@ export class FakeState implements StateClient {
         );
       }
       if (
-        !this.inputs.some(
-          (i) => i.persona_id === persona && i.input_id === id,
-        )
+        !this.inputs.some((i) => i.persona_id === persona && i.input_id === id)
       ) {
         throw new StateError(400, `input_received names absent input ${id}`);
       }
@@ -702,6 +941,45 @@ export class FakeState implements StateClient {
         created_at: new Date().toISOString(),
         delivered_at: null,
       });
+    } else if (req.outcome === "await") {
+      // Mirror of the Go await commit: the input waits only while an
+      // approval is still pending; a decision that already landed requeues
+      // it directly.
+      turn.status = "awaiting";
+      const pending = [...this.approvals.values()].filter(
+        (a) =>
+          a.persona_id === persona &&
+          a.input_id === input.input_id &&
+          a.status === "pending",
+      );
+      if (pending.length === 0) {
+        input.status = "queued";
+        input.claimed_generation = null;
+        input.turn_id = null;
+        input.not_before = null;
+      } else {
+        input.status = "waiting";
+        input.waiting_since = new Date().toISOString();
+        this.outboxEntries.push({
+          persona_id: persona,
+          seq: this.nextSeq(this.outboxSeq, persona),
+          kind: "approval_requested",
+          payload: {
+            turn_id: turnId,
+            input_id: input.input_id,
+            approvals: pending.map((a) => ({
+              approval_id: a.approval_id,
+              tool: a.tool,
+              route: a.route,
+              required_by: a.required_by,
+              request: a.request,
+              action_digest: a.action_digest,
+            })),
+          },
+          created_at: new Date().toISOString(),
+          delivered_at: null,
+        });
+      }
     } else {
       turn.status = "failed";
       turn.error = req.error ?? "failed";
@@ -760,18 +1038,16 @@ export class FakeState implements StateClient {
       callIndex: number;
       request: Record<string, unknown>;
     },
-  ): Promise<{ operation: Operation; fresh: boolean }> {
+  ): Promise<{
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  }> {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
-    // recorded for a tool no executor can finish.
-    if (
-      op.tool !== "schedule.set" &&
-      op.tool !== "journal.note" &&
-      op.tool !== "conversation_history" &&
-      op.tool !== "job.start" &&
-      op.tool !== "job.status" &&
-      op.tool !== "job.cancel"
-    ) {
+    // recorded for a tool no executor can finish. Go's claimableTool is
+    // internal tools ∪ registered effects; the fake mirrors both.
+    if (!(op.tool in TOOL_AUTHORITY) && !this.registeredEffects.has(op.tool)) {
       throw new StateError(400, `unknown tool: ${op.tool}`);
     }
     // A NUL in the request is a deterministic data error (jsonb cannot
@@ -807,6 +1083,9 @@ export class FakeState implements StateClient {
     ) {
       throw new StateError(409, "claim diverges from recorded plan");
     }
+    // The requirement is derived from the recorded call's route, never
+    // asserted by the caller (Go claimGated).
+    const requiredBy = approvalRequirement(op.tool, planned.route);
     // Effect identity is server-derived: input_id + call_index. A
     // caller-supplied key or a new operation_id can never mint a second
     // effect for a decided position.
@@ -828,7 +1107,16 @@ export class FakeState implements StateClient {
       ) {
         existing.claimed_generation = generation;
         existing.turn_id = op.turnId;
-        return { operation: existing, fresh: true };
+        return { operation: existing, approval: null, fresh: true };
+      }
+      if (existing.status === "awaiting_approval") {
+        return this.claimGated(
+          persona,
+          turn.input_id,
+          op.callIndex,
+          existing,
+          false,
+        );
       }
       // A replayed job.* receipt carries the job's state now next to the
       // original result (Go withCurrentJobTx); the stored receipt stays.
@@ -838,10 +1126,15 @@ export class FakeState implements StateClient {
             ...existing,
             response: this.withCurrentJob(persona, existing.response),
           },
+          approval: null,
           fresh: false,
         };
       }
-      return { operation: existing, fresh: false };
+      return {
+        operation: existing,
+        approval: this.approvalFor(persona, turn.input_id, op.callIndex),
+        fresh: false,
+      };
     }
     const operation: Operation = {
       persona_id: persona,
@@ -850,25 +1143,220 @@ export class FakeState implements StateClient {
       tool: op.tool,
       idempotency_key: idempotencyKey,
       request: op.request,
-      status: "done",
+      // Go inserts 'running' for non-gated calls and 'awaiting_approval'
+      // for gated ones; the claim transaction then finalizes or rolls
+      // the row back entirely.
+      status: requiredBy ? "awaiting_approval" : "running",
       response: null,
       claimed_generation: generation,
       created_at: new Date().toISOString(),
-      completed_at: new Date().toISOString(),
+      completed_at: null,
     };
-    if (op.tool === "schedule.set") {
-      const missPolicy = (op.request.miss_policy as string) ?? "fire_late";
+    if (requiredBy) {
+      // The op row exists before validation on the gated path, exactly
+      // like Go: inserted awaiting_approval, then finalized failed when
+      // the deterministic check rejects it — replay returns the failure.
+      this.ops.set(k, operation);
+      // Go F2: a call that can never execute is never asked of the
+      // human — validate before the approval row exists so nothing parks
+      // and no grant is stranded.
+      const verr = validateToolRequest(op.tool, op.request);
+      if (verr !== null) {
+        operation.status = "failed";
+        operation.completed_at = new Date().toISOString();
+        operation.response = { error: verr };
+        return { operation, approval: null, fresh: true };
+      }
+      // Park: record the durable pending approval before returning — no
+      // effect ran. The await commit turns this into the waiting input.
+      const appr = this.insertApproval(
+        persona,
+        turn.input_id,
+        op.callIndex,
+        operation,
+        planned.route,
+        requiredBy,
+      );
+      return { operation, approval: appr, fresh: true };
+    }
+    // Below here the claim either stores the finalized op or throws — Go
+    // rolls the insert back on an execution error, so nothing is stored
+    // before the outcome is decided (no phantom receipt, review f42).
+    this.ops.set(k, operation);
+    // Go deniedIdenticalCall: a normal-route call identical to one the
+    // human denied for this input finalizes failed with that denial.
+    const denied = [...this.approvals.values()].find(
+      (a) =>
+        a.persona_id === persona &&
+        a.input_id === turn.input_id &&
+        a.tool === op.tool &&
+        a.status === "denied" &&
+        jsonEqual(a.request, op.request),
+    );
+    if (denied) {
+      operation.status = "failed";
+      operation.completed_at = new Date().toISOString();
+      operation.response = {
+        error: "denied",
+        denial: {
+          approval_id: denied.approval_id,
+          decision: denied.decision,
+          decided_by_kind: denied.decided_by_kind,
+          decided_by_id: denied.decided_by_id,
+        },
+      };
+      return { operation, approval: denied, fresh: true };
+    }
+    // Go F1: a normal call never produces a human prompt (ADR 0013 §2).
+    // An elevated-only tool records a durable structured block — replayed
+    // identically — rather than being promoted to an approval or
+    // re-routed.
+    if (TOOL_AUTHORITY[op.tool]?.elevatedOnly && planned.route !== "elevated") {
+      operation.status = "failed";
+      operation.completed_at = new Date().toISOString();
+      operation.response = {
+        error: "blocked",
+        blocked: "elevated_route_required",
+        detail: `${op.tool} only runs as an elevated call the human approves; a normal call asks no one and is never re-routed`,
+      };
+      return { operation, approval: null, fresh: true };
+    }
+    try {
+      this.applyInternal(
+        persona,
+        turn.input_id,
+        op.callIndex,
+        op.turnId,
+        operation,
+      );
+    } catch (e) {
+      // Go's claim transaction rolls back on an execution error — the
+      // row must not survive as a replayable receipt (review f42).
+      this.ops.delete(k);
+      throw e;
+    }
+    return { operation, approval: null, fresh: true };
+  }
+
+  private approvalFor(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+  ): Approval | null {
+    return this.approvals.get(approvalId(persona, inputId, callIndex)) ?? null;
+  }
+
+  private insertApproval(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+    op: Operation,
+    route: "normal" | "elevated",
+    requiredBy: "intrinsic" | "route",
+  ): Approval {
+    const id = approvalId(persona, inputId, callIndex);
+    const existing = this.approvals.get(id);
+    if (existing) return existing;
+    const appr: Approval = {
+      approval_id: id,
+      persona_id: persona,
+      input_id: inputId,
+      call_index: callIndex,
+      operation_id: op.operation_id,
+      turn_id: op.turn_id,
+      tool: op.tool,
+      route,
+      required_by: requiredBy,
+      request: op.request,
+      action_digest: actionDigest(op.tool, route, op.request),
+      status: "pending",
+      decision: null,
+      decision_id: null,
+      decided_by_kind: null,
+      decided_by_id: null,
+      provenance: null,
+      decided_at: null,
+      consumed_at: null,
+      created_at: new Date().toISOString(),
+    };
+    this.approvals.set(id, appr);
+    return appr;
+  }
+
+  /**
+   * Mirror of Go claimGated: the approval row decides what a parked claim
+   * does — pending stays parked, approved consumes the one-shot grant and
+   * applies the effect in the same step, denied replays the finalized
+   * failed operation.
+   */
+  private claimGated(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+    op: Operation,
+    freshInsert: boolean,
+  ): { operation: Operation; approval: Approval | null; fresh: boolean } {
+    const appr = this.approvalFor(persona, inputId, callIndex);
+    if (!appr) {
+      throw new StateError(
+        500,
+        `approval record missing for ${op.operation_id}`,
+      );
+    }
+    if (appr.status === "pending") {
+      return { operation: op, approval: appr, fresh: freshInsert };
+    }
+    if (appr.status === "denied" || appr.consumed_at !== null) {
+      // Denied finalized the op failed at decision time; consumed means
+      // the grant already ran once — replay the stored record either way.
+      return { operation: op, approval: appr, fresh: false };
+    }
+    // approved, unconsumed: the one-shot grant is consumed and the effect
+    // applied in the same step — exactly-once under the granted provenance.
+    appr.consumed_at = new Date().toISOString();
+    try {
+      this.applyInternal(persona, inputId, callIndex, op.turn_id, op);
+    } catch (e) {
+      // Go F2: a deterministic failure at execution (e.g. a schedule_id
+      // taken while the human decided) must not leave the grant
+      // approved-unconsumed with the op parked forever — the grant is
+      // spent and the operation records the honest failure. A transient
+      // (non-400) error rolls the whole claim back in Go — restore the
+      // unconsumed grant so the next claim retries it (review f38).
+      if (e instanceof StateError && e.status === 400) {
+        op.status = "failed";
+        op.completed_at = new Date().toISOString();
+        op.response = { error: e.message };
+        return { operation: op, approval: appr, fresh: true };
+      }
+      appr.consumed_at = null;
+      throw e;
+    }
+    return { operation: op, approval: appr, fresh: true };
+  }
+
+  /** Apply a state-internal tool's effect and finalize the operation. */
+  private applyInternal(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+    turnId: string,
+    operation: Operation,
+  ) {
+    const op = operation.request;
+    if (operation.tool === "schedule.set") {
+      const missPolicy = (op.miss_policy as string) ?? "fire_late";
       if (!MISS_POLICIES.has(missPolicy)) {
         throw new StateError(
           400,
           "schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed",
         );
       }
-      const wakeAt = new Date(String(op.request.wake_at));
-      if (Number.isNaN(wakeAt.getTime())) {
+      const wakeAt = parseRFC3339(op.wake_at);
+      if (wakeAt === null) {
         throw new StateError(400, "schedule.set requires RFC3339 wake_at");
       }
-      const sid = (op.request.schedule_id as string) ?? `sch-${Date.now()}`;
+      const sid = (op.schedule_id as string) ?? `sch-${Date.now()}`;
       const existing = this.schedules.get(`${persona}|${sid}`);
       if (existing) {
         // Crash replay never reaches here — receipts are keyed by plan
@@ -880,7 +1368,7 @@ export class FakeState implements StateClient {
           existing.miss_policy === missPolicy &&
           jsonEqual(
             existing.payload,
-            (op.request.payload as Record<string, unknown>) ?? {},
+            (op.payload as Record<string, unknown>) ?? {},
           );
         if (!identical) {
           throw new StateError(
@@ -900,7 +1388,7 @@ export class FakeState implements StateClient {
           persona_id: persona,
           schedule_id: sid,
           wake_at: wakeAt.toISOString(),
-          payload: (op.request.payload as Record<string, unknown>) ?? {},
+          payload: (op.payload as Record<string, unknown>) ?? {},
           miss_policy: missPolicy as Schedule["miss_policy"],
           status: "pending",
           claimed_generation: null,
@@ -910,37 +1398,62 @@ export class FakeState implements StateClient {
         this.schedules.set(`${persona}|${sid}`, sch);
         operation.response = { schedule: sch };
       }
-    } else if (op.tool === "journal.note") {
+    } else if (operation.tool === "message.send") {
+      // Mirror of Go: the effect is an outbox entry the delivery layer
+      // reads — the durable record of the secretary's outward message.
+      const text = op.text;
+      if (typeof text !== "string" || text === "") {
+        throw new StateError(400, "message.send requires text");
+      }
+      const seq = this.nextSeq(this.outboxSeq, persona);
+      this.outboxEntries.push({
+        persona_id: persona,
+        seq,
+        kind: "secretary_message",
+        payload: { text, turn_id: turnId },
+        created_at: new Date().toISOString(),
+        delivered_at: null,
+      });
+      operation.response = {
+        seq,
+        kind: "secretary_message",
+      };
+    } else if (operation.tool === "journal.note") {
+      const text = op.text;
+      if (typeof text !== "string" || text === "") {
+        throw new StateError(400, "journal.note requires text");
+      }
       // The note is part of this input's experience: the input is journaled
       // first, once, so the note never precedes what it responds to.
-      this.ensureInputReceived(persona, turn);
+      const turn = this.turns.get(turnId);
+      if (turn) this.ensureInputReceived(persona, turn);
       const ev: Event = {
         persona_id: persona,
         seq: this.nextSeq(this.seq, persona),
-        turn_id: op.turnId,
+        turn_id: turnId,
         kind: "note",
-        payload: { text: op.request.text },
+        payload: { text },
         created_at: new Date().toISOString(),
       };
       this.eventLog.push(ev);
       operation.response = { seq: ev.seq, kind: "note" };
-    } else if (op.tool === "job.start") {
+    } else if (operation.tool === "job.start") {
       // The job row is minted inside this claim transaction with a
       // server-derived id (plan position), so a replayed claim can never
       // mint a second job and the model never chooses an id.
-      validateSubprocessRequest(op.request);
-      const jobId = `op:${turn.input_id}:${op.callIndex}`;
+      validateSubprocessRequest(op);
+      const jobId = `op:${inputId}:${callIndex}`;
       const job = this.insertJob(
         persona,
         jobId,
         "subprocess",
-        op.request,
-        `tool:${op.turnId}:${op.callIndex}`,
+        op,
+        `tool:${turnId}:${callIndex}`,
       );
       // Receipts are snapshots (Go stores jsonb), never the live job row.
       operation.response = { job: structuredClone(job) };
-    } else if (op.tool === "job.status") {
-      const jobId = op.request.job_id;
+    } else if (operation.tool === "job.status") {
+      const jobId = op.job_id;
       if (typeof jobId !== "string" || jobId === "") {
         throw new StateError(400, "job.status requires job_id");
       }
@@ -949,21 +1462,210 @@ export class FakeState implements StateClient {
       operation.response = {
         job: structuredClone(this.mustJob400(persona, jobId)),
       };
-    } else if (op.tool === "job.cancel") {
-      const jobId = op.request.job_id;
+    } else if (operation.tool === "job.cancel") {
+      const jobId = op.job_id;
       if (typeof jobId !== "string" || jobId === "") {
         throw new StateError(400, "job.cancel requires job_id");
       }
       operation.response = {
         job: structuredClone(this.cancelJobRow(persona, jobId, true)),
       };
+    } else if (operation.tool === "conversation_history") {
+      // Read-only; runs inside the claim like Go so the receipt reflects
+      // the same committed view.
+      operation.response = this.historyTool(persona, op);
     } else {
-      // conversation_history: read-only; runs inside the claim like Go so
-      // the receipt reflects the same committed view.
-      operation.response = this.historyTool(persona, op.request);
+      const effect = this.registeredEffects.get(operation.tool);
+      if (effect !== undefined) {
+        // Delegated effect — Go runs Apply inside the claim transaction.
+        const response = effect(persona, `${inputId}:tool:${callIndex}`, op);
+        operation.response = response as Record<string, unknown>;
+      } else {
+        // A registered tool with no effect case fails the claim outright —
+        // Go rolls the insert back (no phantom row), so a later claim
+        // reports the same deterministic error (review f44).
+        throw new StateError(
+          400,
+          `${operation.tool} has no registered effect to run`,
+        );
+      }
     }
-    this.ops.set(k, operation);
-    return { operation, fresh: true };
+    operation.status = "done";
+    operation.completed_at = new Date().toISOString();
+  }
+
+  async listApprovals(
+    persona: string,
+    approvalId?: string,
+  ): Promise<Approval[]> {
+    const all = [...this.approvals.values()].filter(
+      (a) => a.persona_id === persona,
+    );
+    if (approvalId !== undefined) {
+      const found = all.find((a) => a.approval_id === approvalId);
+      if (!found) throw new StateError(404, "approval not found");
+      return [found];
+    }
+    return all.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  /**
+   * Mirror of Go ResolveApproval: a pending approval resolves exactly once
+   * under the authenticated human's one-shot decision. Identical replays
+   * (same decision_id) return the stored record; a divergent decision on a
+   * resolved approval conflicts — a denial is never overwritten.
+   */
+  async resolveApproval(
+    persona: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): Promise<Approval> {
+    if (
+      decision.decision !== "approve_once" &&
+      decision.decision !== "deny_once"
+    ) {
+      throw new StateError(400, "decision must be approve_once or deny_once");
+    }
+    // Go F3: decision_id is the command's idempotent identity — an empty
+    // one could never be replayed, so it is rejected before any mutation.
+    if (!decision.decision_id) {
+      throw new StateError(400, "decision_id required");
+    }
+    if (decision.decided_by_kind !== "human" || !decision.decided_by_id) {
+      throw new StateError(
+        400,
+        "decided_by_kind 'human' and decided_by_id required",
+      );
+    }
+    const rec = this.personas.get(persona);
+    // Go: a persona whose authority moved takes no new decisions here,
+    // and an approval is identity-scoped — no bound human, no decider.
+    if (rec && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona authority is ${rec.authority}; it takes no new approval decisions`,
+      );
+    }
+    const owner = rec?.human_id ?? null;
+    if (owner === null) {
+      throw new StateError(
+        403,
+        "persona is not bound to a human; no one may decide",
+      );
+    }
+    if (owner !== decision.decided_by_id) {
+      throw new StateError(403, "only the persona's human may decide");
+    }
+    const appr = this.approvals.get(approvalId);
+    if (!appr || appr.persona_id !== persona) {
+      throw new StateError(404, "approval not found");
+    }
+    if (appr.status !== "pending") {
+      const same =
+        appr.decision === decision.decision &&
+        appr.decision_id === decision.decision_id &&
+        appr.decided_by_kind === decision.decided_by_kind &&
+        appr.decided_by_id === decision.decided_by_id;
+      if (!decision.decision_id || !same) {
+        throw new StateError(
+          409,
+          `approval ${approvalId} already ${appr.status}`,
+        );
+      }
+      return appr;
+    }
+    appr.status = decision.decision === "approve_once" ? "approved" : "denied";
+    appr.decision = decision.decision;
+    appr.decision_id = decision.decision_id;
+    appr.decided_by_kind = decision.decided_by_kind;
+    appr.decided_by_id = decision.decided_by_id;
+    appr.provenance =
+      decision.decision === "approve_once"
+        ? "agent_own_with_human_consent"
+        : null;
+    appr.decided_at = new Date().toISOString();
+    if (decision.decision === "deny_once") {
+      // Finalize the parked operation failed — the next claim replays the
+      // denial rather than executing or waiting again.
+      for (const op of this.ops.values()) {
+        if (
+          op.persona_id === persona &&
+          op.operation_id === appr.operation_id &&
+          op.status === "awaiting_approval"
+        ) {
+          op.status = "failed";
+          op.completed_at = new Date().toISOString();
+          op.response = {
+            error: "denied",
+            denial: {
+              approval_id: appr.approval_id,
+              decision: decision.decision,
+              decided_by_kind: decision.decided_by_kind,
+              decided_by_id: decision.decided_by_id,
+            },
+          };
+        }
+      }
+    }
+    // Journal the decision on the parked turn's record.
+    this.eventLog.push({
+      persona_id: persona,
+      seq: this.nextSeq(this.seq, persona),
+      turn_id: appr.turn_id,
+      kind: "approval_decided",
+      payload: {
+        approval_id: appr.approval_id,
+        input_id: appr.input_id,
+        call_index: appr.call_index,
+        tool: appr.tool,
+        route: appr.route,
+        decision: decision.decision,
+        decided_by_kind: decision.decided_by_kind,
+        decided_by_id: decision.decided_by_id,
+      },
+      created_at: new Date().toISOString(),
+    });
+    // Requeue the parked input for resumption.
+    const input = this.inputs.find(
+      (i) => i.persona_id === persona && i.input_id === appr.input_id,
+    );
+    if (input && input.status === "waiting") {
+      input.status = "queued";
+      input.claimed_generation = null;
+      input.turn_id = null;
+      input.not_before = null;
+      // Go F4: the human's thinking time accumulates durably so the
+      // provider retry budget counts only active processing time.
+      if (input.waiting_since) {
+        input.waited_ms += Date.now() - Date.parse(input.waiting_since);
+        input.waiting_since = null;
+      }
+    }
+    return appr;
+  }
+
+  /** Test fixture: set the binding the persona resolves to. */
+  setModelBinding(persona: string, binding: ModelBinding) {
+    this.modelBindings.set(persona, binding);
+  }
+
+  modelBinding(persona: string): Promise<ModelBinding> {
+    // An explicit test binding overrides, as before. Otherwise a carried
+    // model_intent mirrors the Go gate: the persona may not fall back to
+    // 'unset' — it reports needs_rebinding until the test binds a human
+    // and provides a matching selection (setModelBinding), or clears the
+    // intent (setModelIntent null).
+    const explicit = this.modelBindings.get(persona);
+    if (explicit) return Promise.resolve(explicit);
+    const intent = this.personas.get(persona)?.model_intent ?? null;
+    if (intent) {
+      return Promise.resolve({
+        selection: "needs_rebinding",
+        intent: intent as ModelBinding["intent"],
+        reason: `carried model intent '${intent.kind}' needs a destination selection`,
+      });
+    }
+    return Promise.resolve({ selection: "unset" });
   }
 
   /**
@@ -991,7 +1693,7 @@ export class FakeState implements StateClient {
     if (operation !== "search" && operation !== "read") {
       throw bad("operation must be search or read");
     }
-    if (operation === "search" !== (query !== undefined)) {
+    if ((operation === "search") !== (query !== undefined)) {
       throw bad("search requires query and read must not carry one");
     }
     if (query === "") throw bad("search query must not be empty");
@@ -1002,13 +1704,18 @@ export class FakeState implements StateClient {
       throw bad("content_offset is only valid with read + seq");
     }
     const locators = [seq, chunkSeq, fromSeq].filter((v) => v !== null).length;
-    if (locators > 1) throw bad("seq, chunk_seq and from_seq are alternative locators");
+    if (locators > 1)
+      throw bad("seq, chunk_seq and from_seq are alternative locators");
     // chunk_seq + after_seq continues a page within that chunk's range.
     if (seq !== null && afterSeq !== null) {
       throw bad("seq cannot combine with after_seq");
     }
     const all = this.eventLog.filter((e) => e.persona_id === persona);
-    const details = (messages: Json[], nextAfterSeq: number | null, nextRead: Json | null): Json => ({
+    const details = (
+      messages: Json[],
+      nextAfterSeq: number | null,
+      nextRead: Json | null,
+    ): Json => ({
       operation,
       scope: "your_conversation_history",
       messages,
@@ -1121,7 +1828,9 @@ export class FakeState implements StateClient {
       const totalChars = runes.length;
       const offset = contentOffset ?? 0;
       if (offset > totalChars) {
-        throw bad(`content_offset ${offset} beyond record length ${totalChars}`);
+        throw bad(
+          `content_offset ${offset} beyond record length ${totalChars}`,
+        );
       }
       if (
         i >= limit ||
@@ -1184,10 +1893,15 @@ export class FakeState implements StateClient {
     this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
-    let covered = Math.max(0, ...mine().map((c) => c.last_seq));
+    const covered = Math.max(0, ...mine().map((c) => c.last_seq));
     // Seal walk: accumulate the unsealed tail; cut a chunk just before each
     // input_received once the window reaches the minimum and no tool call
-    // in it is still waiting for its result.
+    // in it is still waiting for its result. Past the forced limit, one
+    // further boundary kind opens — before an assistant_message that does
+    // not directly continue a tool flow. A turn's deciding text and the
+    // calls/results it started are one unit: never cut before a tool_call
+    // or tool_result, and a flow with no interior boundary seals whole past
+    // the limit. Same rules as the Go walk.
     const tail = this.eventLog.filter(
       (e) => e.persona_id === persona && e.seq > covered,
     );
@@ -1195,19 +1909,28 @@ export class FakeState implements StateClient {
     let windowEst = 0;
     let windowStart = -1;
     let window: Event[] = [];
+    let prevKind = "";
     for (const e of tail) {
-      if (
-        e.kind === "input_received" &&
-        windowStart >= 0 &&
-        pending.size === 0 &&
-        windowEst >= L0_CHUNK_MIN_TOKENS
-      ) {
-        const nextChunkSeq = (this.chunkSeq.get(persona) ?? 0) + 1;
-        this.chunkSeq.set(persona, nextChunkSeq);
+      let cut = false;
+      if (windowStart >= 0 && pending.size === 0) {
+        switch (e.kind) {
+          case "input_received":
+            cut = windowEst >= L0_CHUNK_MIN_TOKENS;
+            break;
+          case "assistant_message":
+            cut =
+              windowEst > L0_FORCED_SEAL_LIMIT_TOKENS &&
+              prevKind !== "tool_result";
+            break;
+        }
+      }
+      if (cut) {
+        const nextChunkSeq = this.nextChunkSeq(persona);
         this.memoryChunks.push({
           persona_id: persona,
           chunk_seq: nextChunkSeq,
           layer: 1,
+          sources: null,
           first_seq: windowStart,
           last_seq: window[window.length - 1]?.seq ?? windowStart,
           est_tokens: windowEst,
@@ -1237,21 +1960,147 @@ export class FakeState implements StateClient {
       } else if (e.kind === "tool_result" && typeof callId === "string") {
         pending.delete(callId);
       }
+      prevKind = e.kind;
     }
-    // Live raw = every not-yet-applied chunk plus the unsealed tail.
+    // Live raw = every not-yet-applied layer-1 chunk plus the unsealed
+    // tail. Upper-layer rows and superseded sources never count: their
+    // ranges are represented by applied replacements, not raw events.
     let live =
       windowEst +
       mine()
-        .filter((c) => c.status !== "applied")
+        .filter(
+          (c) =>
+            c.layer === 1 &&
+            c.status !== "applied" &&
+            c.status !== "superseded",
+        )
         .reduce((s, c) => s + c.est_tokens, 0);
     if (live > L0_LIVE_LIMIT_TOKENS) {
       for (const c of mine()
-        .filter((c) => c.status === "prepared")
+        .filter((c) => c.layer === 1 && c.status === "prepared")
         .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
         if (live <= L0_LIVE_LIMIT_TOKENS) break;
         c.status = "applied";
         c.applied_at = new Date().toISOString();
         live -= c.est_tokens;
+      }
+    }
+    // A prepared upper-layer target applies once the layer it consumes is
+    // still over its own limit; its sources become 'superseded' in the same
+    // step so their ranges are represented by the target, not dropped.
+    const appliedTokens = (layer: number) =>
+      mine()
+        .filter((c) => c.layer === layer && c.status === "applied")
+        .reduce((s, c) => s + (c.replacement_est_tokens ?? 0), 0);
+    for (const target of mine()
+      .filter((c) => c.layer >= 2 && c.status === "prepared")
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
+      const srcs = (target.sources ?? []).map((seq) =>
+        mine().find((s) => s.chunk_seq === seq),
+      );
+      const srcLayer = srcs[0]?.layer ?? 0;
+      const stale =
+        srcs.length !== (target.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied" || s.layer !== srcLayer) ||
+        (srcLayer !== 1 && srcLayer !== 2);
+      if (stale) {
+        target.status = "failed";
+        target.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        continue;
+      }
+      const limit = srcLayer === 1 ? L1_LIMIT_TOKENS : L2_LIMIT_TOKENS;
+      if (appliedTokens(srcLayer) <= limit) continue;
+      for (const s of srcs) {
+        if (s) s.status = "superseded";
+      }
+      target.status = "applied";
+      target.applied_at = new Date().toISOString();
+    }
+    // Create the next upper-layer target: one in flight at a time. L1→L2
+    // consumes the oldest contiguous applied L1 run until the remainder
+    // drops to L1_DROP_TO; L2 reintegration takes the whole contiguous
+    // applied L2 run. A 'kept' target's exact source tuple is never
+    // re-selected.
+    const busy = mine().some(
+      (c) =>
+        c.layer >= 2 &&
+        (c.status === "sealed" ||
+          c.status === "preparing" ||
+          c.status === "prepared"),
+    );
+    if (!busy) {
+      for (const sel of [
+        {
+          srcLayer: 1,
+          limit: L1_LIMIT_TOKENS,
+          dropTo: L1_DROP_TO_TOKENS,
+          whole: false,
+        },
+        {
+          srcLayer: 2,
+          limit: L2_LIMIT_TOKENS,
+          dropTo: L2_LIMIT_TOKENS,
+          whole: true,
+        },
+      ]) {
+        const total = appliedTokens(sel.srcLayer);
+        if (total <= sel.limit) continue;
+        const frags = mine()
+          .filter((c) => c.layer === sel.srcLayer && c.status === "applied")
+          .sort((a, b) => a.first_seq - b.first_seq);
+        for (let i = 0; i < frags.length; ) {
+          const group = [frags[i] as MemoryChunk];
+          let consumed = group[0]?.replacement_est_tokens ?? 0;
+          i++;
+          while (
+            i < frags.length &&
+            (frags[i] as MemoryChunk).first_seq ===
+              (group[group.length - 1] as MemoryChunk).last_seq + 1 &&
+            (sel.whole || consumed < total - sel.dropTo)
+          ) {
+            const f = frags[i] as MemoryChunk;
+            group.push(f);
+            consumed += f.replacement_est_tokens ?? 0;
+            i++;
+          }
+          const srcSeqs = group.map((f) => f.chunk_seq);
+          // A 'kept' or 'failed' verdict settles its exact source tuple —
+          // resealing it would relitigate the answer or burn a fresh
+          // attempt budget forever. A different grouping may still run.
+          const dup = mine().some(
+            (c) =>
+              c.layer >= 2 &&
+              (c.status === "kept" || c.status === "failed") &&
+              c.sources !== null &&
+              c.sources.length === srcSeqs.length &&
+              c.sources.every((s, j) => s === srcSeqs[j]),
+          );
+          if (dup) continue;
+          const nextChunkSeq = this.nextChunkSeq(persona);
+          this.memoryChunks.push({
+            persona_id: persona,
+            chunk_seq: nextChunkSeq,
+            layer: 2,
+            sources: srcSeqs,
+            first_seq: (group[0] as MemoryChunk).first_seq,
+            last_seq: (group[group.length - 1] as MemoryChunk).last_seq,
+            est_tokens: consumed,
+            status: "sealed",
+            replacement: null,
+            replacement_est_tokens: null,
+            attempts: 0,
+            interruptions: 0,
+            last_error: null,
+            claimed_generation: null,
+            claimed_at: null,
+            not_before: null,
+            created_at: new Date().toISOString(),
+            prepared_at: null,
+            applied_at: null,
+          });
+          return this.memoryStatus(persona);
+        }
       }
     }
     return this.memoryStatus(persona);
@@ -1273,17 +2122,22 @@ export class FakeState implements StateClient {
         : c.status === "sealed"
           ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
           : null;
-    const ready = mine
-      .map(readyAt)
-      .filter((t): t is number => t !== null);
+    const ready = mine.map(readyAt).filter((t): t is number => t !== null);
     const appliedBlocks = mine
       .filter((c) => c.status === "applied")
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
-      .map((c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock);
+      .sort((a, b) => a.first_seq - b.first_seq)
+      .map(
+        (c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock,
+      );
     return {
       live_raw_tokens:
         mine
-          .filter((c) => c.status !== "applied")
+          .filter(
+            (c) =>
+              c.layer === 1 &&
+              c.status !== "applied" &&
+              c.status !== "superseded",
+          )
           .reduce((s, c) => s + c.est_tokens, 0) + tail,
       applied_tokens: mine
         .filter((c) => c.status === "applied")
@@ -1294,6 +2148,7 @@ export class FakeState implements StateClient {
       applied: count("applied"),
       kept: count("kept"),
       failed: count("failed"),
+      superseded: count("superseded"),
       claimable: ready.filter((t) => t <= now).length,
       next_claimable_at: ready.length
         ? new Date(Math.min(...ready)).toISOString()
@@ -1317,11 +2172,14 @@ export class FakeState implements StateClient {
     const empty = () => ({
       chunk: null,
       target_events: [],
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     });
-    // Every 'preparing' chunk is an orphan from the caller's view (one branch
-    // at a time): its claim ended without an outcome, so it counts an
-    // interruption — not an attempt — and waits out a short pacing.
+    // Every 'preparing' chunk is an orphan from the caller's view: its claim
+    // ended without an outcome, so it counts an interruption — not an
+    // attempt — and waits out a short pacing. (FakeState is single-threaded;
+    // the real store relies on pacing and generation fencing to converge
+    // concurrent claims, not on strict single-flight.)
     this.interruptPreparing(persona, null);
     const c = mine
       .filter(
@@ -1335,6 +2193,47 @@ export class FakeState implements StateClient {
     c.claimed_generation = generation;
     c.claimed_at = new Date().toISOString();
     c.not_before = null;
+    if (c.layer >= 2) {
+      // An upper-layer target prepares from its selected sources' accepted
+      // texts, not raw events. A stale target (a source no longer applied)
+      // is marked failed without spending attempts — the honest answer for
+      // a carried row or one whose sources another target consumed.
+      const at = (seq: number) =>
+        this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
+          ?.created_at ?? "";
+      const srcs = (c.sources ?? []).map((seq) =>
+        this.memoryChunks.find(
+          (s) => s.persona_id === persona && s.chunk_seq === seq,
+        ),
+      );
+      const stale =
+        srcs.length !== (c.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied");
+      if (stale) {
+        c.status = "failed";
+        c.claimed_generation = null;
+        c.claimed_at = null;
+        c.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        return empty();
+      }
+      const fragments = (srcs as MemoryChunk[]).map((s) => ({
+        chunk_seq: s.chunk_seq,
+        layer: s.layer,
+        first_seq: s.first_seq,
+        last_seq: s.last_seq,
+        first_time: at(s.first_seq),
+        last_time: at(s.last_seq),
+        text: s.replacement ?? "",
+        est_tokens: s.replacement_est_tokens ?? 0,
+      }));
+      return {
+        chunk: c,
+        target_events: [],
+        target_fragments: fragments,
+        context: this.renderedContext(persona, contextLimit),
+      };
+    }
     return {
       chunk: c,
       target_events: this.eventLog.filter(
@@ -1343,6 +2242,7 @@ export class FakeState implements StateClient {
           e.seq >= c.first_seq &&
           e.seq <= c.last_seq,
       ),
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     };
   }
@@ -1448,6 +2348,39 @@ export class FakeState implements StateClient {
   }
 
   /**
+   * Go ReshelveMemoryChunk: the model layer was unavailable before any
+   * request was evaluated, so the claim records no verdict and spends
+   * neither attempts nor interruptions; a short pacing keeps a
+   * persistent outage from claiming every tick.
+   */
+  async reshelveMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    pause: { reason: string },
+  ): Promise<MemoryChunk> {
+    this.mustHold(persona, generation);
+    const c = this.memoryChunks.find(
+      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+    );
+    if (!c) throw new StateError(404, "memory chunk not found");
+    if (c.status !== "preparing" || c.claimed_generation !== generation) {
+      throw new StateError(
+        409,
+        `chunk ${chunkSeq} is not preparing under this generation`,
+      );
+    }
+    c.status = "sealed";
+    c.claimed_generation = null;
+    c.claimed_at = null;
+    c.last_error = pause.reason;
+    c.not_before = new Date(
+      Date.now() + MEMORY_RESHELVE_PACING_MS,
+    ).toISOString();
+    return c;
+  }
+
+  /**
    * Go interruptPreparing: a 'preparing' claim that ended without an
    * outcome (host stopped, fence lost, lost response) counts one
    * interruption and returns to the shelf after a short pacing; too many
@@ -1501,7 +2434,8 @@ export class FakeState implements StateClient {
       payload: {
         input_id: input.input_id,
         kind: input.kind,
-        text: typeof input.payload.text === "string" ? input.payload.text : null,
+        text:
+          typeof input.payload.text === "string" ? input.payload.text : null,
         actor_kind: input.actor_kind,
         source_surface: input.source_surface,
         attempt: turn.attempt,
@@ -1569,6 +2503,8 @@ export class FakeState implements StateClient {
           created_at: new Date().toISOString(),
           done_at: null,
           not_before: null,
+          waiting_since: null,
+          waited_ms: 0,
         });
       }
       s.status = "fired";
@@ -1589,6 +2525,32 @@ export class FakeState implements StateClient {
       .slice(0, limit);
   }
 
+  /**
+   * Test wiring — Go Store.RegisterEffect parity. The tool becomes
+   * claimable and advertised by listTools; its applier runs inside the
+   * claim like Go's in-transaction Apply.
+   */
+  registerEffect(
+    tool: string,
+    apply: (
+      persona: string,
+      idemKey: string,
+      request: Record<string, unknown>,
+    ) => Json,
+  ): void {
+    if (tool in TOOL_AUTHORITY) {
+      throw new StateError(400, `${tool} is a built-in internal tool`);
+    }
+    this.registeredEffects.set(tool, apply);
+  }
+
+  async listTools(_persona: string): Promise<string[]> {
+    return [
+      ...Object.keys(TOOL_AUTHORITY),
+      ...this.registeredEffects.keys(),
+    ].sort();
+  }
+
   async personaState(persona: string): Promise<PersonaState> {
     const p = this.personas.get(persona);
     if (!p) throw new Error("unknown persona");
@@ -1601,7 +2563,13 @@ export class FakeState implements StateClient {
       queued_inputs: this.inputs.filter(
         (i) => i.persona_id === persona && i.status === "queued",
       ).length,
+      waiting_inputs: this.inputs.filter(
+        (i) => i.persona_id === persona && i.status === "waiting",
+      ).length,
       running_turn: running?.turn_id ?? null,
+      pending_approvals: [...this.approvals.values()].filter(
+        (a) => a.persona_id === persona && a.status === "pending",
+      ).length,
       pending_schedules: [...this.schedules.values()].filter(
         (s) => s.persona_id === persona && s.status === "pending",
       ).length,
@@ -1720,6 +2688,8 @@ export class FakeState implements StateClient {
         created_at: new Date().toISOString(),
         done_at: null,
         not_before: null,
+        waiting_since: null,
+        waited_ms: 0,
       });
     }
     job.notified_at = new Date().toISOString();

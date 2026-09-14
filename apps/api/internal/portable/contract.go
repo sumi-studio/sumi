@@ -143,8 +143,10 @@ type Continuity struct {
 	Notes            int64 `json:"notes"`
 	QueuedInputs     int64 `json:"queued_inputs"`
 	ClaimedInputs    int64 `json:"claimed_inputs"`
+	WaitingInputs    int64 `json:"waiting_inputs"`
 	RunningTurns     int64 `json:"running_turns"`
 	UnfinishedPlans  int64 `json:"unfinished_plans"`
+	PendingApprovals int64 `json:"pending_approvals"`
 	PendingSchedules int64 `json:"pending_schedules"`
 	UndeliveredOut   int64 `json:"undelivered_outbox"`
 	MemoryApplied    int64 `json:"memory_applied"`
@@ -160,22 +162,32 @@ type Continuity struct {
 // Complete and Abort require, and each names the destination placement in
 // its HMAC input.
 type Receipt struct {
-	Direction     string           `json:"direction"`
-	TransferID    string           `json:"transfer_id"`
-	PersonaID     string           `json:"persona_id"`
-	Status        string           `json:"status"`
-	FormatVersion int              `json:"format_version"`
-	DestinationID string           `json:"destination_id,omitempty"`
-	HumanID       *string          `json:"human_id,omitempty"`
-	ContentSHA256 string           `json:"content_sha256,omitempty"`
-	ActivateProof string           `json:"activate_proof,omitempty"`
-	RetireProof   string           `json:"retire_proof,omitempty"`
-	SealedAt      time.Time        `json:"sealed_at"`
-	Cut           Cut              `json:"cut"`
-	Rows          map[string]int64 `json:"rows"`
-	Continuity    Continuity       `json:"continuity"`
-	NotIncluded   []Exclusion      `json:"not_included"`
-	UpdatedAt     time.Time        `json:"updated_at"`
+	Direction     string  `json:"direction"`
+	TransferID    string  `json:"transfer_id"`
+	PersonaID     string  `json:"persona_id"`
+	Status        string  `json:"status"`
+	FormatVersion int     `json:"format_version"`
+	DestinationID string  `json:"destination_id,omitempty"`
+	HumanID       *string `json:"human_id,omitempty"`
+	// SameHuman records the import-time assertion that the bound human is
+	// the same authority that decided the bundle's approvals; a replay
+	// asserting differently conflicts rather than silently changing what
+	// was staged.
+	SameHuman bool `json:"same_human,omitempty"`
+	// PriorModelIntent is export-side bookkeeping: the intent the seal's
+	// snapshot replaced, so Abort can restore the source's pre-transfer
+	// semantics — NULL for a persona that never arrived by transfer, the
+	// still-unresolved carried intent for one that did.
+	PriorModelIntent json.RawMessage  `json:"prior_model_intent,omitempty"`
+	ContentSHA256    string           `json:"content_sha256,omitempty"`
+	ActivateProof    string           `json:"activate_proof,omitempty"`
+	RetireProof      string           `json:"retire_proof,omitempty"`
+	SealedAt         time.Time        `json:"sealed_at"`
+	Cut              Cut              `json:"cut"`
+	Rows             map[string]int64 `json:"rows"`
+	Continuity       Continuity       `json:"continuity"`
+	NotIncluded      []Exclusion      `json:"not_included"`
+	UpdatedAt        time.Time        `json:"updated_at"`
 
 	// key is the transfer's HMAC key, loaded from the ledger column for
 	// proof verification. It is never serialized into a receipt or stored
@@ -191,10 +203,10 @@ var NotIncluded = []Exclusion{
 		Reason: "file contents, versions and object bytes live in the file service, not core state"},
 	{Name: "jobs", Owner: "jobs-results (M09)",
 		Reason: "background job records and their completion authority are not core state"},
-	{Name: "approvals", Owner: "unassigned (M08)",
-		Reason: "pending human approvals do not exist in core state; recorded turn plans are carried but are the model's decisions, not human approvals"},
 	{Name: "connections", Owner: "unassigned (M08, D9)",
-		Reason: "model and tool connections are not core state; credentials are never written into a bundle"},
+		Reason: "model connections, selections and credentials are human-scoped account state, not core state; credentials are never written into a bundle. Seal snapshots the selection onto the persona as non-secret model_intent (kind and connection metadata only); the destination enforces it as needs_rebinding until its bound human selects a matching connection or the intent is explicitly cleared"},
+	{Name: "memory_projection", Owner: "unassigned (M06)",
+		Reason: "search projections and encrypted originals are not core state; the journal, including notes, is carried verbatim"},
 	{Name: "account_and_workspace", Owner: "koseki / workspace (M21)",
 		Reason: "human account, employer and workspace membership are resolved by the destination's authentication, never imported"},
 	{Name: "usage", Owner: "unassigned (M14)",
@@ -215,11 +227,29 @@ const (
 	// source holding the jsonb literal null there cannot be represented and
 	// is refused at seal.
 	colJSONNull
+	// colBigintList is a nullable bigint[] column: a JSON null is SQL NULL,
+	// a JSON array of integers becomes the Postgres array.
+	colBigintList
 )
 
 type column struct {
 	name string
 	kind colKind
+}
+
+// identityCols are GENERATED ALWAYS AS IDENTITY columns backed by one
+// table-global sequence. Their source values are *not* imported: the column
+// is omitted from the insert so the destination's own sequence allocates a
+// fresh value per row — work bounded by the number of transferred records,
+// never by the size of a numeric gap, and structurally unable to rewind the
+// destination's sequence or collide with its in-flight admissions. The
+// carried value still matters: the export orders the table by it and the
+// import requires the carried values to be strictly increasing, so the
+// destination's fresh allocation preserves the source's admission order
+// exactly (gaps may collapse; uniqueness and order are the contract, not the
+// numeric values).
+var identityCols = map[string]string{
+	"core_inputs": "admission_seq",
 }
 
 type table struct {
@@ -228,22 +258,29 @@ type table struct {
 	cols    []column
 }
 
-// personaTable is the persona row as carried: identity and birth time only.
-// human_id, authority and transfer_id are placement-local.
+// personaTable is the persona row as carried: identity, birth time, and the
+// non-secret model-selection intent snapshotted at seal. human_id,
+// authority and transfer_id are placement-local; credentials never travel.
 var personaTable = table{name: "core_personas", cols: []column{
 	{"persona_id", colUUID}, {"display_name", colText}, {"created_at", colTime},
+	{"model_intent", colJSONNull},
 }}
 
 // coreTables is contract core.v1, in insert order (turns and plans reference
 // inputs). The column lists are the contract: a schema change to these
 // tables must change them deliberately, which the coverage test enforces.
 var coreTables = []table{
-	{name: "core_inputs", orderBy: `input_id COLLATE "C"`, cols: []column{
+	{name: "core_inputs", orderBy: "admission_seq", cols: []column{
 		{"persona_id", colUUID}, {"input_id", colText}, {"kind", colText}, {"payload", colJSON},
 		{"actor_kind", colText}, {"actor_id", colText}, {"source_surface", colText}, {"thread_id", colText},
 		{"occurred_at", colTime}, {"attention", colText}, {"status", colText},
 		{"claimed_generation", colBigint}, {"turn_id", colText}, {"created_at", colTime},
 		{"done_at", colTime}, {"not_before", colTime}, {"received_seq", colBigint},
+		{"waiting_since", colTime}, {"waited_ms", colBigint},
+		// admission_seq is the claim queue's order: carried so the bundle's
+		// row order records the source's admission order; the destination
+		// regenerates it (identityCols) so no sequence state crosses.
+		{"admission_seq", colBigint},
 	}},
 	{name: "core_turns", orderBy: `turn_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"turn_id", colText}, {"input_id", colText}, {"generation", colBigint},
@@ -262,6 +299,24 @@ var coreTables = []table{
 		{"persona_id", colUUID}, {"operation_id", colText}, {"turn_id", colText}, {"tool", colText},
 		{"idempotency_key", colText}, {"request", colJSON}, {"status", colText}, {"response", colJSONNull},
 		{"claimed_generation", colBigint}, {"created_at", colTime}, {"completed_at", colTime},
+	}},
+	// Approvals travel with the operation they park: a pending one stays
+	// pending and resolvable at the destination, a decided one keeps its
+	// decision provenance, and a consumed grant keeps its receipt — none
+	// can be silently dropped, re-decided, or replayed into a second
+	// effect. decided_by_* is provenance, not destination authority: a
+	// decision at the destination requires the destination-bound human.
+	{name: "core_tool_approvals", orderBy: `approval_id COLLATE "C"`, cols: []column{
+		{"persona_id", colUUID}, {"approval_id", colText}, {"input_id", colText},
+		{"call_index", colInt}, {"operation_id", colText}, {"turn_id", colText},
+		{"tool", colText}, {"route", colText}, {"required_by", colText},
+		{"request", colJSON}, {"action_digest", colText}, {"status", colText},
+		{"decision", colText}, {"decision_id", colText},
+		{"decided_by_kind", colText}, {"decided_by_id", colText}, {"provenance", colText},
+		{"decided_at", colTime}, {"consumed_at", colTime},
+		{"prior_decision", colText}, {"prior_decided_by_kind", colText},
+		{"prior_decided_by_id", colText}, {"prior_decided_at", colTime},
+		{"created_at", colTime},
 	}},
 	{name: "core_schedules", orderBy: `schedule_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"schedule_id", colText}, {"wake_at", colTime}, {"payload", colJSON},
@@ -282,6 +337,7 @@ var coreTables = []table{
 	// fenced source writer (verifyCut refuses a bundle that claims one).
 	{name: "core_memory_chunks", orderBy: `chunk_seq`, cols: []column{
 		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"layer", colInt},
+		{"sources", colBigintList},
 		{"first_seq", colBigint}, {"last_seq", colBigint}, {"est_tokens", colBigint},
 		{"status", colText}, {"replacement", colText}, {"replacement_est_tokens", colBigint},
 		{"attempts", colInt}, {"interruptions", colInt}, {"last_error", colText},

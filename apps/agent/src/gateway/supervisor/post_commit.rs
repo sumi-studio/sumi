@@ -944,6 +944,8 @@ mod tests {
                 .bind_delivery_authorization(DeliveryAuthorization::Raw)
                 .unwrap();
             let mut hook = DurableAdmissionHook::default();
+            hook.pause_before_durable_registration = true;
+            hook.pause_before_durable_delivery = true;
             if phase == PendingDeliveryPhase::ChannelSend {
                 hook.pause_forwarder_before_receive = true;
                 hook.delivery_channel_capacity = Some(1);
@@ -1497,7 +1499,11 @@ mod tests {
         let adapter = T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
-        let hook = DurableAdmissionHook::default();
+        let hook = DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            pause_before_durable_delivery: true,
+            ..DurableAdmissionHook::default()
+        };
         adapter.set_durable_admission_hook(Some(hook.clone()));
         let delivery_epoch = DeliveryEpoch::for_test("shutdown-backpressure");
         let (event_tx, mut event_rx) = mpsc::channel(1);
@@ -2451,7 +2457,11 @@ mod tests {
         let base_adapter = T17StoreAdapter::new(store.clone())
             .bind_delivery_authorization(DeliveryAuthorization::Raw)
             .unwrap();
-        let hook = DurableAdmissionHook::default();
+        let hook = DurableAdmissionHook {
+            pause_before_durable_registration: true,
+            pause_before_durable_delivery: true,
+            ..DurableAdmissionHook::default()
+        };
         base_adapter.set_durable_admission_hook(Some(hook.clone()));
         let delivery_epoch = DeliveryEpoch::for_test("enqueued-rollover-delivery");
         let (event_tx, mut event_rx) = mpsc::channel(1);
