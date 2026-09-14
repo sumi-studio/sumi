@@ -311,29 +311,35 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 			ErrUnresolvedOperations, strings.Join(inflight, ", "))
 	}
 	// The model selection is human-scoped account state: it binds the
-	// persona's human, and the destination binds a different account. A
-	// bundle cannot carry it (NotIncluded "connections"), so an explicit
-	// selection at seal would silently become the destination's default —
-	// a different model than the human chose, or a running model where
-	// they chose 'none'. Refuse instead of transferring a broken
-	// selection: clear it (unset) before sealing only if the
-	// destination's default selection is acceptable, and select again
-	// there after the move.
-	var selKind string
-	err = tx.QueryRow(ctx, `
-		SELECT m.kind FROM model_connection_selections m
-		JOIN core_personas p ON p.human_id = m.human_id
-		WHERE p.persona_id = $1`, personaID).Scan(&selKind)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-	case err != nil:
+	// persona's human, and the destination binds a different account whose
+	// connection rows cannot be assumed to exist. Snapshot it onto the
+	// persona as non-secret intent — an explicit 'none', or the selected
+	// connection's kind and metadata without any credential — so the
+	// bundle carries what the user chose. At the destination the intent is
+	// enforced, not silently substituted: modelBinding reports
+	// needs_rebinding until the destination human selects a connection of
+	// the same kind (or the intent is explicitly cleared), and the core
+	// refuses to run a model rather than falling back to an environment
+	// default. A persona with no selection snapshots NULL and keeps the
+	// destination's ordinary unset semantics.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_personas p SET model_intent = (
+			SELECT jsonb_build_object('kind', m.kind, 'connection', CASE
+				WHEN m.kind = 'api' THEN (
+					SELECT jsonb_build_object(
+						'connection_id', c.connection_id::text, 'name', c.name,
+						'preset', c.preset, 'base_url', c.base_url,
+						'model', c.model, 'version', c.version::text)
+					FROM model_api_connections c
+					WHERE c.human_id = m.human_id AND c.connection_id = m.connection_id)
+				WHEN m.kind = 'chatgpt' THEN (
+					SELECT jsonb_build_object('model', g.model, 'effort', g.effort)
+					FROM chatgpt_connections g WHERE g.human_id = m.human_id)
+				ELSE NULL END)
+			FROM model_connection_selections m
+			WHERE m.human_id = p.human_id)
+		WHERE p.persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
-	default:
-		return Receipt{}, fmt.Errorf("%w: the persona's human holds an explicit model selection (%s); "+
-			"bundle %s carries no selection section and the destination binds a different account's "+
-			"selection — the transfer would silently substitute the model. Clear the selection before "+
-			"sealing only if the destination's default is acceptable",
-			ErrNotPortable, selKind, CoreContract)
 	}
 	var literalNulls int64
 	if err := tx.QueryRow(ctx, `
@@ -560,6 +566,29 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	}
 	if authority != "staged" || !heldBy(held, transferID) {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
+	}
+	// An unbound persona may activate only while nothing parked needs a
+	// human decider: an approval is an identity-scoped act and no one may
+	// decide it while human_id is NULL, so activating with a pending
+	// approval would strand its waiting input forever. Binding stays
+	// reachable — POST /internal/core/personas/{id}/bind works on a staged
+	// persona — and retiring the transfer is always allowed.
+	var humanID *string
+	if err := tx.QueryRow(ctx,
+		`SELECT human_id FROM core_personas WHERE persona_id = $1`, personaID).Scan(&humanID); err != nil {
+		return Receipt{}, err
+	}
+	if humanID == nil {
+		var pending int64
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM core_tool_approvals
+			WHERE persona_id = $1 AND status = 'pending'`, personaID).Scan(&pending); err != nil {
+			return Receipt{}, err
+		}
+		if pending > 0 {
+			return Receipt{}, fmt.Errorf("%w: persona is not bound to a human and %d pending approval(s) require a decision only a bound human can make; bind a human (POST /internal/core/personas/%s/bind) before activating, or retire the transfer",
+				ErrTransferConflict, pending, personaID)
+		}
 	}
 	// The proof names this placement's own id — which is the ledger's
 	// destination_id for every import — so it can only ever verify as the

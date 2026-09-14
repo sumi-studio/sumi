@@ -189,12 +189,18 @@ export interface ApprovalDecision {
 
 /**
  * The persona's resolved model connection for the core. The selection is
- * authoritative: "unset"/"none"/"chatgpt" or an "api" binding carrying the
- * connection's identity, version, and — only when the credential store is
- * armed — the decrypted key. Never a substituted model/provider.
+ * authoritative: "unset"/"none"/"chatgpt"/"needs_rebinding" or an "api"
+ * binding carrying the connection's identity, version, and — only when the
+ * credential store is armed — the decrypted key. Never a substituted
+ * model/provider.
  */
 export interface ModelBinding {
-  selection: "unset" | "none" | "api" | "chatgpt";
+  // "needs_rebinding": the persona arrived by transfer carrying a model
+  // selection intent; no model may run until the destination's bound
+  // human selects a matching connection or the intent is cleared.
+  selection: "unset" | "none" | "api" | "chatgpt" | "needs_rebinding";
+  /** The carried non-secret intent, echoed when selection is needs_rebinding. */
+  intent?: { kind: string; connection?: Record<string, unknown> };
   connection?: {
     id: string;
     name: string;

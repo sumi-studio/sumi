@@ -1,6 +1,8 @@
 package agentstate
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
@@ -66,8 +68,11 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 // preset, or endpoint: when the selection cannot be honored the binding
 // says so and the core must fail rather than fall back.
 type ModelBinding struct {
-	Selection string `json:"selection"` // unset | none | api | chatgpt
-	// Connection carries non-secret metadata for an api selection.
+	// unset | none | api | chatgpt | needs_rebinding
+	Selection string `json:"selection"`
+	// Intent echoes the carried model_intent when the persona arrived by
+	// transfer: non-secret preference the destination must satisfy.
+	Intent              json.RawMessage         `json:"intent,omitempty"`
 	Connection          *ModelConnectionBinding `json:"connection,omitempty"`
 	APIKey              string                  `json:"api_key,omitempty"`
 	CredentialAvailable bool                    `json:"credential_available"`
@@ -97,7 +102,34 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 		storeError(w, err)
 		return
 	}
+	// A carried model intent gates everything below: the destination must
+	// satisfy it — a bound human selecting a connection of the same kind —
+	// before any model may run. 'unset' is never the answer for a persona
+	// that had a selection: silently falling back to an environment
+	// default would run a model the user did not choose, or run a model
+	// where they chose 'none'.
+	var intentKind string
+	if len(persona.ModelIntent) > 0 {
+		var intent struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(persona.ModelIntent, &intent); err == nil {
+			intentKind = intent.Kind
+		}
+	}
+	rebind := func(reason string) {
+		writeJSON(w, http.StatusOK, ModelBinding{
+			Selection: "needs_rebinding",
+			Intent:    persona.ModelIntent,
+			Reason:    reason,
+		})
+	}
 	if s.conns == nil || persona.HumanID == nil {
+		if intentKind != "" {
+			rebind(fmt.Sprintf("carried model intent '%s' needs a bound human's matching selection on this placement; bind a human and select a '%s' connection, or DELETE .../model/intent to start fresh",
+				intentKind, intentKind))
+			return
+		}
 		writeJSON(w, http.StatusOK, ModelBinding{Selection: "unset"})
 		return
 	}
@@ -108,7 +140,17 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !exists {
+		if intentKind != "" {
+			rebind(fmt.Sprintf("carried model intent '%s' has no selection on this placement; select a '%s' connection for the bound human, or DELETE .../model/intent to start fresh",
+				intentKind, intentKind))
+			return
+		}
 		writeJSON(w, http.StatusOK, ModelBinding{Selection: "unset"})
+		return
+	}
+	if intentKind != "" && sel.Kind != intentKind {
+		rebind(fmt.Sprintf("carried model intent '%s' does not match the bound human's selection '%s'; select a '%s' connection, or DELETE .../model/intent to start fresh",
+			intentKind, sel.Kind, intentKind))
 		return
 	}
 	switch sel.Kind {

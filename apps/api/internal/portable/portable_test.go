@@ -259,7 +259,7 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
 		t.Fatal(err)
 	}
-	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)
 	if err != nil || !created {
 		t.Fatalf("import: created=%v err=%v", created, err)
 	}
@@ -284,7 +284,7 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if _, _, err := cloud.state.SubmitInput(ctx, &agentstate.Input{PersonaID: pid, InputID: "in-cloud", Kind: "message", Payload: map[string]any{}}); !errors.Is(err, agentstate.ErrPersonaInactive) {
 		t.Fatalf("staged input: %v, want inactive", err)
 	}
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || created {
 		t.Fatalf("import replay: created=%v err=%v", created, err)
 	}
 
@@ -405,7 +405,7 @@ func TestImportRefusesDamagedOrUnsupportedBundles(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(tc.bundle), nil)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(tc.bundle), nil, false)
 			if !errors.Is(err, ErrBadBundle) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("import err = %v, want ErrBadBundle mentioning %q", err, tc.want)
 			}
@@ -418,7 +418,7 @@ func TestImportRefusesDamagedOrUnsupportedBundles(t *testing.T) {
 		})
 	}
 	// The undamaged bundle still imports after all of that.
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
 	}
 }
@@ -457,7 +457,7 @@ func TestImportRefusesBrokenReferences(t *testing.T) {
 		h.Write([]byte(line))
 		out.WriteString(line)
 	}
-	_, _, err := cloud.svc.Import(ctx, bytes.NewReader(out.Bytes()), nil)
+	_, _, err := cloud.svc.Import(ctx, bytes.NewReader(out.Bytes()), nil, false)
 	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "operation_outside_recorded_plan") {
 		t.Fatalf("import err = %v, want the plan reference violation", err)
 	}
@@ -540,7 +540,7 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 	}
 
 	bundle, _ := exportBytes(t, local, pid, "move-jobs")
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 	act := must(cloud.svc.Activate(ctx, pid, "move-jobs"))
@@ -623,7 +623,7 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 	cloudID := must(cloud.svc.PlacementID(ctx))
 	sealed := must(local.svc.Seal(ctx, pid, "move-0005", cloudID))
 	first, _ := exportBytes(t, local, pid, "move-0005")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(first), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(first), nil, false)))
 
 	// Abort without evidence stays sealed; the staged copy alone is enough
 	// to make an unproven abort unsafe.
@@ -652,7 +652,7 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 	}
 	// Cancellation is durable: the retired transfer can never be staged or
 	// activated here again, and a new transfer of the same persona can.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("re-import after retire: %v", err)
 	}
 	if _, err := cloud.svc.Activate(ctx, pid, "move-0005"); !errors.Is(err, ErrTransferConflict) {
@@ -681,13 +681,13 @@ func TestAbortAndRetireKeepOneSecretary(t *testing.T) {
 
 	must(local.svc.Seal(ctx, pid, "move-0006", cloudID))
 	second, _ := exportBytes(t, local, pid, "move-0006")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(second), nil)))
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil); !errors.Is(err, ErrTransferConflict) {
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(second), nil, false)))
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(first), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("importing the retired cut beside the staged one: %v, want conflict", err)
 	}
 	// A different transfer's bundle for a persona already present is refused.
 	stranger := bytes.Replace(second, []byte(`"transfer_id":"move-0006"`), []byte(`"transfer_id":"move-0006b"`), 1)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(stranger), nil); !errors.Is(err, ErrPersonaExists) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(stranger), nil, false); !errors.Is(err, ErrPersonaExists) {
 		t.Fatalf("importing another transfer for a present persona: %v, want ErrPersonaExists", err)
 	}
 	if _, err := local.svc.Seal(ctx, pid, "move-0005", cloudID); !errors.Is(err, ErrTransferConflict) {
@@ -893,7 +893,7 @@ func TestLostActivateResponseKeepsOneWriter(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0010", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0010")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	// Activate commits; the response is lost to the caller.
 	must(cloud.svc.Activate(ctx, pid, "move-0010"))
@@ -943,7 +943,7 @@ func TestImportLeaseFloorIsDeadOnArrival(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0010b", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0010b")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	var floorGen int64
 	var holder string
@@ -983,11 +983,11 @@ func TestBundleIsBoundToOneDestination(t *testing.T) {
 	}
 
 	// The ordinary retry onto the wrong placement is refused.
-	if _, _, err := cloudB.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrBadBundle) ||
+	if _, _, err := cloudB.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrBadBundle) ||
 		!strings.Contains(err.Error(), "addressed to placement") {
 		t.Fatalf("import on the wrong placement: %v", err)
 	}
-	must(drop(cloudA.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloudA.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 	act := must(cloudA.svc.Activate(ctx, pid, "move-0011"))
 	if _, err := cloudB.svc.Activate(ctx, pid, "move-0011"); !errors.Is(err, ErrTransferNotFound) &&
 		!errors.Is(err, ErrPersonaNotFound) && !errors.Is(err, ErrTransferConflict) {
@@ -1035,7 +1035,7 @@ func TestCompleteRequiresDestinationActivation(t *testing.T) {
 	if tomb.Status != "retired" || tomb.RetireProof == "" {
 		t.Fatalf("tombstone retire: %+v", tomb)
 	}
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("a late import beats the tombstone: %v", err)
 	}
 	must(local.svc.Abort(ctx, pid, "move-0012", tomb.RetireProof))
@@ -1073,7 +1073,7 @@ func TestRetireAndActivateCommitExactlyOnce(t *testing.T) {
 	liveSecretary(t, local, pid)
 	must(local.svc.Seal(ctx, pid, "move-0014", must(cloud.svc.PlacementID(ctx))))
 	bundle, _ := exportBytes(t, local, pid, "move-0014")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	results := make(chan error, 2)
 	go func() { _, err := cloud.svc.Activate(ctx, pid, "move-0014"); results <- err }()
@@ -1121,7 +1121,7 @@ func TestImportAndRetireRaceToOneOutcome(t *testing.T) {
 	}
 	results := make(chan outcome, 2)
 	go func() {
-		_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)
+		_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)
 		results <- outcome{imported: created, err: err}
 	}()
 	go func() {
@@ -1202,13 +1202,13 @@ func TestImportErrorContract(t *testing.T) {
 		return lines
 	})
 	dup = rehashBundle(t, dup)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(dup), nil); !errors.Is(err, ErrBadBundle) ||
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(dup), nil, false); !errors.Is(err, ErrBadBundle) ||
 		!strings.Contains(err.Error(), "duplicates a key") {
 		t.Fatalf("duplicate-key bundle: %v", err)
 	}
 
 	// A human_id that does not exist names the parameter, not the bundle.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), ptr(newID(t))); !errors.Is(err, ErrBadRequest) ||
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), ptr(newID(t)), false); !errors.Is(err, ErrBadRequest) ||
 		!strings.Contains(err.Error(), "human_id") {
 		t.Fatalf("missing human: %v", err)
 	}
@@ -1217,14 +1217,14 @@ func TestImportErrorContract(t *testing.T) {
 	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
 		t.Fatal(err)
 	}
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false)))
 	// Replays must carry the same human_id; a different one is a conflict,
 	// never a silent rebind.
 	other := newID(t)
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &other); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &other, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("replay with a different human_id: %v", err)
 	}
-	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID); err != nil || created {
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || created {
 		t.Fatalf("faithful replay: created=%v err=%v", created, err)
 	}
 }
@@ -1243,7 +1243,7 @@ func TestRetireProofBindsTheDestination(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-0020", cloudID))
 	bundle, _ := exportBytes(t, local, pid, "move-0020")
 	key := bundleHeader(t, bundle).TransferKey
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 
 	// The request itself must name this placement: a retire addressed to
 	// cloud is refused by third before anything is recorded.
@@ -1315,7 +1315,7 @@ func TestTombstoneCorrectionRecoversAWrongKey(t *testing.T) {
 	}
 	must(local.svc.Abort(ctx, pid, "move-0021", fixed.RetireProof))
 	// Foreclosure is durable through correction.
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("import after tombstone correction: %v", err)
 	}
 	if _, err := local.state.AcquireWriter(ctx, pid, "local-core", time.Minute); err != nil {
@@ -1343,7 +1343,7 @@ func TestTombstoneCorrectionRecoversAWrongPersona(t *testing.T) {
 	if _, err := local.svc.Abort(ctx, pid, "move-0022", mistaken.RetireProof); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("abort on a proof naming another persona: %v", err)
 	}
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("the real bundle staged beside a wrong-persona tombstone: %v", err)
 	}
 	fixed := must(cloud.svc.Retire(ctx, pid, "move-0022", cloudID, key))
@@ -1351,7 +1351,7 @@ func TestTombstoneCorrectionRecoversAWrongPersona(t *testing.T) {
 		t.Fatalf("correction kept persona %s", fixed.PersonaID)
 	}
 	must(local.svc.Abort(ctx, pid, "move-0022", fixed.RetireProof))
-	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); !errors.Is(err, ErrTransferConflict) {
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("import after persona correction: %v", err)
 	}
 }
@@ -1367,7 +1367,7 @@ func TestImportedRetireIsNotCorrectable(t *testing.T) {
 	cloudID := placementID(t, cloud)
 	must(local.svc.Seal(ctx, pid, "move-0023", cloudID))
 	bundle, _ := exportBytes(t, local, pid, "move-0023")
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
 	retired := retireDest(t, cloud, pid, "move-0023", "")
 	if _, err := cloud.svc.Retire(ctx, pid, "move-0023", cloudID, strings.Repeat("e", 64)); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("re-retire of an imported transfer with a different key: %v", err)
@@ -1486,7 +1486,7 @@ func TestTransferCarriesAPendingApproval(t *testing.T) {
 
 	dstHuman := newID(t)
 	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
-	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)
 	if err != nil || !created {
 		t.Fatalf("import: created=%v err=%v", created, err)
 	}
@@ -1598,7 +1598,7 @@ func TestTransferPreservesADenial(t *testing.T) {
 	bundle, _ := exportBytes(t, local, pid, "move-deny")
 	dstHuman := newID(t)
 	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
-	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman)))
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
 	must(cloud.svc.Activate(ctx, pid, "move-deny"))
 
 	// The decided record arrived with its provenance.
@@ -1630,30 +1630,507 @@ func TestTransferPreservesADenial(t *testing.T) {
 	}
 }
 
-// The human-scoped model selection cannot ride the bundle, so sealing a
-// persona whose human holds an explicit selection is refused rather than
-// silently substituting the destination's default model.
-func TestSealRefusesWhileHumanHoldsAModelSelection(t *testing.T) {
+// A configured user's selection no longer blocks the move: seal snapshots
+// it onto the persona as non-secret model intent — explicit 'none' and an
+// api selection's provider/model/base_url metadata alike — while no
+// credential or unrelated person's selection travels. An unselected
+// persona snapshots NULL and keeps ordinary unset semantics.
+func TestSealCarriesModelIntent(t *testing.T) {
 	ctx := context.Background()
 	local, cloud := newPlacement(t), newPlacement(t)
+
+	// Explicit 'none' travels as intent — the destination must reproduce
+	// the refusal to run a model, not silently take a default.
 	pid := newID(t)
 	human := newID(t)
 	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human)
 	must(drop(local.state.EnsurePersona(ctx, pid, &human, "secretary")))
 	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind) VALUES ($1, 'none')`, human)
+	if _, err := local.svc.Seal(ctx, pid, "move-none", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with a none selection: %v", err)
+	}
+	var intent []byte
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	var noneIntent map[string]any
+	if err := json.Unmarshal(intent, &noneIntent); err != nil || noneIntent["kind"] != "none" {
+		t.Fatalf("none intent %s", intent)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-none")
+	if !bytes.Contains(bundle, []byte(`"model_intent"`)) {
+		t.Fatal("bundle persona row does not carry model_intent")
+	}
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	noneIntent = nil
+	if err := json.Unmarshal(intent, &noneIntent); err != nil || noneIntent["kind"] != "none" {
+		t.Fatalf("carried none intent %s", intent)
+	}
 
-	if _, err := local.svc.Seal(ctx, pid, "move-sel", placementID(t, cloud)); !errors.Is(err, ErrNotPortable) {
-		t.Fatalf("seal with a model selection: %v, want not portable", err)
-	}
-	// The refusal is the selection, not the human: clear it and the seal
-	// proceeds. An unbound persona has no selection and seals too.
-	mustExec(t, local, `DELETE FROM model_connection_selections WHERE human_id = $1`, human)
-	if _, err := local.svc.Seal(ctx, pid, "move-sel", placementID(t, cloud)); err != nil {
-		t.Fatalf("seal after clearing the selection: %v", err)
-	}
+	// An api selection travels as kind + non-secret connection metadata;
+	// the credential never appears in the bundle.
 	pid2 := newID(t)
-	must(drop(local.state.EnsurePersona(ctx, pid2, nil, "unbound")))
-	if _, err := local.svc.Seal(ctx, pid2, "move-free", placementID(t, cloud)); err != nil {
+	human2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, human2)
+	must(drop(local.state.EnsurePersona(ctx, pid2, &human2, "configured")))
+	connID := uuid.NewString()
+	mustExec(t, local, `INSERT INTO model_api_connections
+		(human_id, connection_id, name, preset, base_url, model, credential_ciphertext, version)
+		VALUES ($1, $2::uuid, 'work', 'openai-chat', 'https://api.example.test', 'model-9', '\x00'::bytea, $3::uuid)`,
+		human2, connID, uuid.NewString())
+	mustExec(t, local, `INSERT INTO model_connection_selections (human_id, kind, connection_id)
+		VALUES ($1, 'api', $2::uuid)`, human2, connID)
+	if _, err := local.svc.Seal(ctx, pid2, "move-api", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with an api selection: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid2).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(intent, &got); err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := got["connection"].(map[string]any)
+	if got["kind"] != "api" || conn["preset"] != "openai-chat" ||
+		conn["model"] != "model-9" || conn["base_url"] != "https://api.example.test" {
+		t.Fatalf("api intent %s", intent)
+	}
+	apiBundle, _ := exportBytes(t, local, pid2, "move-api")
+	if bytes.Contains(apiBundle, []byte("credential_ciphertext")) ||
+		bytes.Contains(apiBundle, []byte("access_token")) {
+		t.Fatal("credential material leaked into the bundle")
+	}
+	for _, line := range bytes.Split(apiBundle, []byte("\n")) {
+		if !bytes.Contains(line, []byte(`"table":"core_personas"`)) {
+			continue
+		}
+		var prow struct {
+			Data struct {
+				ModelIntent map[string]any `json:"model_intent"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(line, &prow); err != nil {
+			t.Fatal(err)
+		}
+		for k := range prow.Data.ModelIntent {
+			if strings.Contains(k, "credential") || strings.Contains(k, "token") {
+				t.Fatalf("model_intent carries a secret field %q", k)
+			}
+		}
+	}
+	// No selection row may ride the bundle, and no other human's
+	// selections are touched.
+	if strings.Contains(string(apiBundle), "model_connection") {
+		t.Fatal("selection rows must not be carried")
+	}
+
+	// An unbound/unselected persona snapshots no intent.
+	pid3 := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid3, nil, "unbound")))
+	if _, err := local.svc.Seal(ctx, pid3, "move-free", placementID(t, cloud)); err != nil {
 		t.Fatalf("seal unbound persona: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT model_intent FROM core_personas WHERE persona_id = $1`, pid3).Scan(&intent); err != nil {
+		t.Fatal(err)
+	}
+	if intent != nil {
+		t.Fatalf("unbound persona intent %s, want NULL", intent)
+	}
+}
+
+// mutateTableRows rewrites the data object of every row line for a table
+// and rehashes the trailer, producing a structurally valid bundle whose
+// contents are incoherent.
+func mutateTableRows(t *testing.T, bundle []byte, table string, fn func(data map[string]any)) []byte {
+	t.Helper()
+	return rehashBundle(t, mutateLines(bundle, func(lines []string) []string {
+		for i, line := range lines {
+			var row map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &row); err != nil {
+				continue
+			}
+			var tbl string
+			if err := json.Unmarshal(row["table"], &tbl); err != nil || tbl != table {
+				continue
+			}
+			var data map[string]any
+			if err := json.Unmarshal(row["data"], &data); err != nil {
+				t.Fatal(err)
+			}
+			fn(data)
+			raw, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row["data"] = raw
+			out, err := json.Marshal(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines[i] = string(out) + "\n"
+		}
+		return lines
+	}))
+}
+
+// A grant approved at the source but not yet executed is consent under the
+// source's account. Imported under a different human without a
+// same-authority assertion, it is re-pended — the original decision kept
+// in prior_* as provenance — and the destination's bound human decides
+// before the effect runs once.
+func TestApprovedGrantRependsAcrossAuthority(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	// The source human consents; the send never ran before the move.
+	must(local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src", DecidedByKind: "human", DecidedByID: srcHuman,
+	}))
+
+	must(local.svc.Seal(ctx, pid, "move-grant", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-grant")
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+
+	// The grant did not cross: the approval is pending again, carrying the
+	// source decision as provenance only.
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "pending" || a.Decision != nil || a.DecidedByID != nil {
+		t.Fatalf("re-pended grant %+v", a)
+	}
+	if a.PriorDecision == nil || *a.PriorDecision != "approve_once" ||
+		a.PriorDecidedByID == nil || *a.PriorDecidedByID != srcHuman || a.PriorDecidedAt == nil {
+		t.Fatalf("provenance not preserved %+v", a)
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-grant"))
+	// The parked op must not execute under the source's consent.
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-rp", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("resume load %+v", load.Input)
+	}
+	// Replaying the parked call must not execute: the op stays awaiting and
+	// the re-pended grant is handed back for a destination decision.
+	op, grant, _, err := cloud.state.ClaimOperation(ctx, pid, "turn-rp", gen,
+		"op-rp-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || grant == nil || grant.Status != "pending" || op.Status != "awaiting_approval" {
+		t.Fatalf("claim under re-pended grant: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+	must(cloud.state.CommitTurn(ctx, pid, "turn-rp", gen, agentstate.CommitRequest{Outcome: "await"}))
+	for _, e := range must(cloud.state.Outbox(ctx, pid, 0, 100)) {
+		if e.Kind == "secretary_message" {
+			t.Fatal("the send executed without a destination decision")
+		}
+	}
+	// The source human's id is not destination authority.
+	if _, err := cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src2", DecidedByKind: "human", DecidedByID: srcHuman,
+	}); !errors.Is(err, agentstate.ErrApprovalForbidden) {
+		t.Fatalf("source-human decision at destination: %v, want forbidden", err)
+	}
+	// The bound destination human decides; the call executes exactly once.
+	must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-dst", DecidedByKind: "human", DecidedByID: dstHuman,
+	}))
+	load = must(cloud.state.LoadTurn(ctx, pid, gen, "turn-rp2", 50))
+	if load.Input == nil {
+		t.Fatal("requeued input did not resume")
+	}
+	op2, grant2, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-rp2", gen,
+		"op-rp-1", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || !fresh || op2.Status != "done" || grant2 == nil || grant2.ConsumedAt == nil {
+		t.Fatalf("consume after destination decision: op=%+v grant=%+v err=%v", op2, grant2, err)
+	}
+}
+
+// With an explicit same-authority assertion, a source grant that was never
+// consumed continues at the destination and executes once — no second
+// prompt. decided_by stays provenance; the assertion, not the bundle's
+// fields, is what carries the authority.
+func TestApprovedGrantContinuesWithSameHuman(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-src", DecidedByKind: "human", DecidedByID: srcHuman,
+	}))
+
+	must(local.svc.Seal(ctx, pid, "move-same", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-same")
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	staged, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, true)
+	if err != nil || !created {
+		t.Fatalf("same-human import: created=%v err=%v", created, err)
+	}
+	if !staged.SameHuman {
+		t.Fatalf("receipt does not record the same_human assertion: %+v", staged)
+	}
+	a := must(cloud.state.GetApproval(ctx, pid, apprID))
+	if a.Status != "approved" || a.DecidedByID == nil || *a.DecidedByID != srcHuman || a.ConsumedAt != nil {
+		t.Fatalf("same-authority grant %+v", a)
+	}
+	// same_human requires a bound human to assert against.
+	pidB := newID(t)
+	srcB := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcB)
+	parkedApproval(t, local, pidB, srcB)
+	must(local.svc.Seal(ctx, pidB, "move-same-b", placementID(t, cloud)))
+	bundleB, _ := exportBytes(t, local, pidB, "move-same-b")
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundleB), nil, true); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("same_human without human_id: %v, want bad request", err)
+	}
+	// A replay asserting differently conflicts — the staged authority
+	// decision is fixed.
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false); !errors.Is(err, ErrTransferConflict) {
+		t.Fatalf("replay dropping the assertion: %v, want conflict", err)
+	}
+
+	must(cloud.svc.Activate(ctx, pid, "move-same"))
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-sh", 50))
+	if load.Input == nil || load.Input.InputID != "in-park" {
+		t.Fatalf("resume load %+v", load.Input)
+	}
+	// No new prompt: the grant consumes into the one execution.
+	op, grant, fresh, err := cloud.state.ClaimOperation(ctx, pid, "turn-sh", gen,
+		"op-sh-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || !fresh || op.Status != "done" || grant == nil || grant.ConsumedAt == nil {
+		t.Fatalf("grant continuation: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+}
+
+// retargetTransfer rewrites a mutated bundle's transfer_id so independent
+// cases do not collide on the ledger's one-content-per-transfer rule.
+func retargetTransfer(t *testing.T, bundle []byte, id string) []byte {
+	t.Helper()
+	return rehashBundle(t, mutateLines(bundle, func(lines []string) []string {
+		var hdr map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(lines[0]), &hdr); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr["transfer_id"] = raw
+		out, err := json.Marshal(hdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines[0] = string(out) + "\n"
+		return lines
+	}))
+}
+
+// An impossible approval cut is refused transactionally — at the source's
+// seal and at the destination's import — leaving no partially staged
+// persona. Approvals and their parked operations must agree on the exact
+// action and on a reachable lifecycle state.
+func TestImportRejectsIncoherentApprovalCuts(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-coh", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-coh")
+
+	cases := map[string]struct {
+		bundle []byte
+		want   string
+	}{
+		// The human saw one request while the operation would run another.
+		"approval request differs from the operation's": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["request"] = map[string]any{"text": "a different action entirely"}
+			}), "approval_operation_request_mismatch"},
+		// A digest that does not recompute from tool+route+request.
+		"forged action digest": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["action_digest"] = strings.Repeat("0", 64)
+			}), "approval_digest_mismatch"},
+		// A denial attached to an operation still awaiting it — the
+		// reviewers' infinite re-park loop.
+		"denied approval on an awaiting operation": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "denied"
+				d["decision"] = "deny_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+			}), "denied_approval_operation_not_failed"},
+		// An already-spent grant on an operation that could run again.
+		"consumed grant on an awaiting operation": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+				d["consumed_at"] = "2026-09-14T00:01:00Z"
+			}), "consumed_grant_operation_unsettled"},
+		// A pending approval carrying a consumption mark.
+		"pending approval marked consumed": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["consumed_at"] = "2026-09-14T00:00:00Z"
+			}), "pending_approval_decided_fields"},
+		// A decided approval missing who decided it.
+		"decided approval without a decider": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+			}), "decided_approval_incomplete"},
+		// The parked operation settled while its approval stayed pending.
+		"pending approval on a finished operation": {
+			mutateTableRows(t, bundle, "core_operations", func(d map[string]any) {
+				if d["status"] == "awaiting_approval" {
+					d["status"] = "done"
+				}
+			}), "pending_approval_operation_resolved"},
+		// An awaiting operation whose only approval is already spent —
+		// nothing left that can resolve it.
+		"awaiting operation with no live approval": {
+			mutateTableRows(t, bundle, "core_tool_approvals", func(d map[string]any) {
+				d["status"] = "approved"
+				d["decision"] = "approve_once"
+				d["decision_id"] = "d-forge"
+				d["decided_by_kind"] = "human"
+				d["decided_by_id"] = srcHuman
+				d["decided_at"] = "2026-09-14T00:00:00Z"
+				d["provenance"] = "agent_own_with_human_consent"
+				d["consumed_at"] = "2026-09-14T00:01:00Z"
+			}), "awaiting_operation_without_live_approval"},
+	}
+	n := 0
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			n++
+			tid := fmt.Sprintf("move-coh-%02d", n)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(retargetTransfer(t, tc.bundle, tid)), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			// Transactional refusal: no staged persona, no ledger row.
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused cut left a persona behind: %v", err)
+			}
+			if _, err := cloud.svc.Status(ctx, "import", tid); !errors.Is(err, ErrTransferNotFound) {
+				t.Fatalf("a refused cut left a ledger row: %v", err)
+			}
+		})
+	}
+	// The source applies the same matrix at seal: corrupt the stored cut
+	// and the seal refuses instead of exporting a broken bundle.
+	pid2 := newID(t)
+	src2 := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, src2)
+	parkedApproval(t, local, pid2, src2)
+	mustExec(t, local, `UPDATE core_tool_approvals SET request = '{"text":"forged"}'::jsonb WHERE persona_id = $1`, pid2)
+	if _, err := local.svc.Seal(ctx, pid2, "move-coh-src", placementID(t, cloud)); !errors.Is(err, ErrIntegrity) ||
+		!strings.Contains(err.Error(), "approval_operation_request_mismatch") {
+		t.Fatalf("seal over an incoherent cut: %v", err)
+	}
+}
+
+// An import without a human is not a trap: a staged persona with a pending
+// approval cannot activate — nothing may decide for it — until the
+// admin binds a human, after which activation, the decision and the one
+// execution all proceed. An unbound persona with nothing pending
+// activates normally; no secretary is required to have an employer.
+func TestUnboundImportBindsAndActivates(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	srcHuman := newID(t)
+	mustExec(t, local, `INSERT INTO humans (human_id) VALUES ($1)`, srcHuman)
+	apprID := parkedApproval(t, local, pid, srcHuman)
+	must(local.svc.Seal(ctx, pid, "move-unbound", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-unbound")
+
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false)))
+	// Activation refuses truthfully rather than stranding the waiting
+	// input on a decider that does not exist.
+	if _, err := cloud.svc.Activate(ctx, pid, "move-unbound"); !errors.Is(err, ErrTransferConflict) ||
+		!strings.Contains(err.Error(), "bind a human") {
+		t.Fatalf("activate unbound with a pending approval: %v", err)
+	}
+	// Binding is reachable while staged.
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	p := must(cloud.state.BindHuman(ctx, pid, dstHuman))
+	if p.HumanID == nil || *p.HumanID != dstHuman {
+		t.Fatalf("bind %+v", p)
+	}
+	// A second bind to another human conflicts — no silent rebind.
+	other := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, other)
+	if _, err := cloud.state.BindHuman(ctx, pid, other); !errors.Is(err, agentstate.ErrPersonaBound) {
+		t.Fatalf("rebind: %v, want bound conflict", err)
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-unbound"))
+	must(cloud.state.ResolveApproval(ctx, pid, apprID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-b", DecidedByKind: "human", DecidedByID: dstHuman,
+	}))
+	gen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, gen))
+	load := must(cloud.state.LoadTurn(ctx, pid, gen, "turn-ub", 50))
+	if load.Input == nil {
+		t.Fatal("waiting input did not resume after bind")
+	}
+	op, grant, _, err := cloud.state.ClaimOperation(ctx, pid, "turn-ub", gen,
+		"op-ub-0", "message.send", 0, map[string]any{"text": "moving notice"})
+	if err != nil || op.Status != "done" || grant == nil || grant.ConsumedAt == nil {
+		t.Fatalf("post-bind consume: op=%+v grant=%+v err=%v", op, grant, err)
+	}
+
+	// No pending approvals → an unbound persona activates and can bind
+	// later while active. Not every secretary needs an employer; only
+	// capabilities needing a decider do.
+	pid2 := newID(t)
+	liveSecretary(t, local, pid2)
+	must(local.svc.Seal(ctx, pid2, "move-free", placementID(t, cloud)))
+	free, _ := exportBytes(t, local, pid2, "move-free")
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(free), nil, false)))
+	must(cloud.svc.Activate(ctx, pid2, "move-free"))
+	if _, err := cloud.state.BindHuman(ctx, pid2, dstHuman); err != nil {
+		t.Fatalf("late bind on an active unbound persona: %v", err)
+	}
+	// EnsurePersona over the bound persona is honest: the same human is
+	// idempotent, a different one conflicts rather than silently reporting
+	// success over an unchanged owner.
+	existing, created, err := cloud.state.EnsurePersona(ctx, pid2, &dstHuman, "x")
+	if err != nil || created || existing.HumanID == nil || *existing.HumanID != dstHuman {
+		t.Fatalf("ensure over bound persona: %+v created=%v err=%v", existing, created, err)
+	}
+	stranger := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, stranger)
+	if _, _, err := cloud.state.EnsurePersona(ctx, pid2, &stranger, "x"); !errors.Is(err, agentstate.ErrPersonaBound) {
+		t.Fatalf("ensure with a different human: %v, want bound conflict", err)
 	}
 }

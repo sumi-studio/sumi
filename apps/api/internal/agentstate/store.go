@@ -43,6 +43,10 @@ var (
 	// moved by a transfer (internal/portable), so this placement may not run
 	// it or accept new inputs for it.
 	ErrPersonaInactive = errors.New("persona is not active in this placement")
+	// ErrPersonaBound: a binding request named a human, but the persona is
+	// already bound to a different one — an identity change is a transfer
+	// or a new persona, never a silent rebind.
+	ErrPersonaBound = errors.New("persona is already bound to a different human")
 )
 
 // dataErr maps deterministic PostgreSQL data errors — class 22 data
@@ -92,6 +96,12 @@ type Persona struct {
 	// Authority is active, sealed, staged or transferred (migration 0049).
 	Authority  string  `json:"authority"`
 	TransferID *string `json:"transfer_id"`
+	// ModelIntent is the non-secret model-selection intent carried by a
+	// transfer (migration 0052): {kind, connection?} — explicit 'none' or
+	// the selected connection's metadata without credentials. When set,
+	// modelBinding reports needs_rebinding until the bound human selects
+	// a connection of the same kind.
+	ModelIntent json.RawMessage `json:"model_intent,omitempty"`
 }
 
 type WriterLease struct {
@@ -336,17 +346,36 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 		INSERT INTO core_personas (persona_id, human_id, display_name)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (persona_id) DO NOTHING
-		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id`,
+		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent`,
 		personaID, humanID, displayName).
-		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
+		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID, &p.ModelIntent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = s.pool.QueryRow(ctx,
-			`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
-			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID)
+			`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID, &p.ModelIntent)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return p, false, ErrPersonaNotFound
 		}
-		return p, false, err
+		if err != nil {
+			return p, false, err
+		}
+		// A requested binding must be honest: an existing unbound persona
+		// (e.g. an imported one) binds on demand — the same reachable
+		// path as POST .../bind — while a persona bound to a different
+		// human conflicts rather than reporting success over the wrong
+		// identity or silently leaving the requested binding unset.
+		if humanID != nil {
+			switch {
+			case p.HumanID == nil:
+				if _, err := s.BindHuman(ctx, personaID, *humanID); err != nil {
+					return p, false, err
+				}
+				p.HumanID = humanID
+			case *p.HumanID != *humanID:
+				return p, false, fmt.Errorf("%w: bound to %s, requested %s", ErrPersonaBound, *p.HumanID, *humanID)
+			}
+		}
+		return p, false, nil
 	}
 	if err != nil {
 		return Persona{}, false, fmt.Errorf("ensure persona: %w", err)
@@ -354,12 +383,70 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 	return p, true, nil
 }
 
+// BindHuman binds an unbound persona to a human — the reachable recovery
+// for an import staged without one, and the path an already-active but
+// unbound persona takes to gain a decider. A staged persona binds so an
+// unbound import can be finalized before activation; a bound persona is
+// never silently rebound, and a sealed or transferred one cannot bind at
+// all — this placement no longer owns it.
+func (s *Store) BindHuman(ctx context.Context, personaID, humanID string) (Persona, error) {
+	var exists int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT 1 FROM humans WHERE human_id = $1`, humanID).Scan(&exists); errors.Is(err, pgx.ErrNoRows) {
+		return Persona{}, fmt.Errorf("%w: human %s does not exist", ErrBadRequest, humanID)
+	} else if err != nil {
+		return Persona{}, err
+	}
+	var p Persona
+	err := s.pool.QueryRow(ctx, `
+		UPDATE core_personas SET human_id = $2
+		WHERE persona_id = $1 AND human_id IS NULL AND authority IN ('staged','active')
+		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent`,
+		personaID, humanID).
+		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID, &p.ModelIntent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, perr := s.persona(ctx, personaID)
+		if perr != nil {
+			return Persona{}, perr
+		}
+		if existing.HumanID != nil {
+			if *existing.HumanID == humanID {
+				// An idempotent retry of the same binding is not a rebind.
+				return existing, nil
+			}
+			return Persona{}, fmt.Errorf("%w: bound to %s", ErrPersonaBound, *existing.HumanID)
+		}
+		return Persona{}, fmt.Errorf("%w: persona authority is %s", ErrPersonaInactive, existing.Authority)
+	}
+	if err != nil {
+		return Persona{}, err
+	}
+	return p, nil
+}
+
+// ClearModelIntent drops the carried model-selection intent: the operator's
+// explicit "start fresh on this placement" escape for needs_rebinding. The
+// intent is preference, not a credential, so clearing it restores ordinary
+// unset/selection semantics — it can never grant a connection the
+// destination human did not choose.
+func (s *Store) ClearModelIntent(ctx context.Context, personaID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE core_personas SET model_intent = NULL WHERE persona_id = $1`, personaID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrPersonaNotFound
+	}
+	return nil
+}
+
 func (s *Store) persona(ctx context.Context, personaID string) (Persona, error) {
 	var p Persona
 	err := s.pool.QueryRow(ctx,
-		`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id FROM core_personas WHERE persona_id = $1`,
+		`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent FROM core_personas WHERE persona_id = $1`,
 		personaID).Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt,
-		&p.Authority, &p.TransferID)
+		&p.Authority, &p.TransferID, &p.ModelIntent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return p, ErrPersonaNotFound
 	}
@@ -1757,7 +1844,7 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 			approvalID(personaID, inputID, callIndex),
 			personaID, inputID, callIndex,
 			op.OperationID, op.TurnID, op.Tool, route, requiredBy,
-			op.Request, actionDigest(op.Tool, route, op.Request)); err != nil {
+			op.Request, ActionDigest(op.Tool, route, op.Request)); err != nil {
 			return Operation{}, nil, false, fmt.Errorf("record approval request: %w", err)
 		}
 	}

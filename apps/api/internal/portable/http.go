@@ -211,7 +211,11 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("human_id"); v != "" {
 		humanID = &v
 	}
-	rec, created, err := s.svc.Import(r.Context(), http.MaxBytesReader(w, r.Body, s.maxBundle), humanID)
+	// same_human=true asserts the bound human is the same authority that
+	// decided the bundle's approvals at the source; without it,
+	// approved-but-unconsumed grants are re-pended for the destination.
+	sameHuman := r.URL.Query().Get("same_human") == "true"
+	rec, created, err := s.svc.Import(r.Context(), http.MaxBytesReader(w, r.Body, s.maxBundle), humanID, sameHuman)
 	if err != nil {
 		writeErr(w, err)
 		return

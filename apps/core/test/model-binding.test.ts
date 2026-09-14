@@ -193,3 +193,46 @@ test("no selection uses the operator default; a lookup outage retries rather tha
   );
   assert.equal(fallback.calls, 1, "the default is never a fallback for a failed lookup");
 });
+
+test("a carried model intent blocks model calls until the destination binds", async () => {
+  await withModelServer(async (baseUrl, seen) => {
+    const state = new FakeState();
+    state.addPersona(PERSONA);
+    state.setModelIntent(PERSONA, {
+      kind: "api",
+      connection: { preset: "openai-chat", model: "model-9" },
+    });
+    const fallback = new Fallback();
+    // The intent is unsatisfied: the env default is not an answer.
+    await assert.rejects(
+      collect(selected(state, fallback)),
+      (e: unknown) => e instanceof ModelError && !e.retryable,
+    );
+    assert.equal(fallback.calls, 0, "operator default never substitutes for carried intent");
+    assert.equal(seen.length, 0, "no request reached any model");
+    const b = await state.modelBinding(PERSONA);
+    assert.equal(b.selection, "needs_rebinding");
+    assert.equal(b.intent?.kind, "api");
+
+    // The destination's bound human selects a matching connection — the
+    // test's explicit binding stands in for that selection — and the
+    // carried intent no longer blocks.
+    state.setModelBinding(PERSONA, api(baseUrl));
+    const evs = await collect(selected(state, fallback));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]?.model, "model-a");
+    assert.deepEqual(
+      (evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage.model_binding,
+      { selection: "api", connection_id: "conn-1", preset: "openai-chat", model: "model-a", version: "v1" },
+    );
+
+    // Clearing the intent restores ordinary unset semantics — the
+    // operator's explicit fresh start, not a silent fallback.
+    const cleared = new FakeState();
+    cleared.addPersona(PERSONA);
+    cleared.setModelIntent(PERSONA, null);
+    const fb2 = new Fallback();
+    await collect(selected(cleared, fb2));
+    assert.equal(fb2.calls, 1);
+  });
+});

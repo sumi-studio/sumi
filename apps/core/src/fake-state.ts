@@ -211,6 +211,8 @@ export class FakeState implements StateClient {
       created_at: string;
       authority: string;
       transfer_id: string | null;
+      /** Carried non-secret model intent (Go core_personas.model_intent). */
+      model_intent: { kind: string; connection?: Record<string, unknown> } | null;
     }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
@@ -258,7 +260,46 @@ export class FakeState implements StateClient {
       created_at: new Date().toISOString(),
       authority: "active",
       transfer_id: null,
+      model_intent: null,
     });
+  }
+
+  /** Test fixture: set the persona's authority state (active|staged|sealed|transferred|retired). */
+  setPersonaAuthority(personaId: string, authority: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    rec.authority = authority;
+  }
+
+  /** Test fixture: set the carried non-secret model intent. */
+  setModelIntent(
+    personaId: string,
+    intent: { kind: string; connection?: Record<string, unknown> } | null,
+  ) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    rec.model_intent = intent;
+  }
+
+  /** Mirror of the Go bind route: an unbound staged/active persona binds; a bound or moved one refuses. */
+  bindHuman(personaId: string, humanId: string) {
+    const rec = this.personas.get(personaId);
+    if (!rec) throw new StateError(404, "persona not found");
+    if (rec.human_id !== null) {
+      // Same-human retry is idempotent; a different one conflicts.
+      if (rec.human_id === humanId) return;
+      throw new StateError(
+        409,
+        `persona is already bound to a different human: bound to ${rec.human_id}`,
+      );
+    }
+    if (rec.authority !== "staged" && rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: persona authority is ${rec.authority}`,
+      );
+    }
+    rec.human_id = humanId;
   }
 
   addInput(personaId: string, inputId: string, text: string, kind = "message") {
@@ -290,6 +331,19 @@ export class FakeState implements StateClient {
     ttlMs: number,
   ): Promise<WriterLease> {
     const now = Date.now();
+    // Go fences on authority before the lease check: a sealed, staged,
+    // transferred or retired persona may not acquire a writer here, and a
+    // missing persona is a 404 — not a fresh lease on a ghost.
+    const rec = this.personas.get(persona);
+    if (!rec) {
+      throw new StateError(404, "persona not found");
+    }
+    if (rec.authority !== "active") {
+      throw new StateError(
+        409,
+        `persona is not active in this placement: authority is ${rec.authority}`,
+      );
+    }
     const held = this.leases.get(persona);
     // Same contract as the Go upsert: an unexpired lease blocks other
     // holders, while the same holder re-acquires and bumps the generation.
@@ -1254,9 +1308,22 @@ export class FakeState implements StateClient {
   }
 
   modelBinding(persona: string): Promise<ModelBinding> {
-    return Promise.resolve(
-      this.modelBindings.get(persona) ?? { selection: "unset" },
-    );
+    // An explicit test binding overrides, as before. Otherwise a carried
+    // model_intent mirrors the Go gate: the persona may not fall back to
+    // 'unset' — it reports needs_rebinding until the test binds a human
+    // and provides a matching selection (setModelBinding), or clears the
+    // intent (setModelIntent null).
+    const explicit = this.modelBindings.get(persona);
+    if (explicit) return Promise.resolve(explicit);
+    const intent = this.personas.get(persona)?.model_intent ?? null;
+    if (intent) {
+      return Promise.resolve({
+        selection: "needs_rebinding",
+        intent: intent as ModelBinding["intent"],
+        reason: `carried model intent '${intent.kind}' needs a destination selection`,
+      });
+    }
+    return Promise.resolve({ selection: "unset" });
   }
 
   async completeOperation(

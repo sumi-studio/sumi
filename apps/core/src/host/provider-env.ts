@@ -139,6 +139,15 @@ export class SelectedModelProvider implements ModelProvider {
           provider: this.opts.fallback,
           identity: { selection: "unset", provider: this.opts.fallback.name },
         };
+      case "needs_rebinding":
+        // A transferred secretary's carried selection intent is not yet
+        // satisfied here. Running the environment default now would be a
+        // silent model substitution — fail closed until the destination
+        // binds a matching connection (or clears the intent).
+        throw unusable(
+          binding.reason ??
+            `the secretary's model selection intent (${binding.intent?.kind ?? "unknown"}) needs a destination connection binding`,
+        );
       case "none":
         throw unusable(
           "the selected model connection is 接続しない (none); choose a connection to let the secretary answer",

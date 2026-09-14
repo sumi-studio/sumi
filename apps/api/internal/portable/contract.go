@@ -161,6 +161,11 @@ type Receipt struct {
 	FormatVersion int              `json:"format_version"`
 	DestinationID string           `json:"destination_id,omitempty"`
 	HumanID       *string          `json:"human_id,omitempty"`
+	// SameHuman records the import-time assertion that the bound human is
+	// the same authority that decided the bundle's approvals; a replay
+	// asserting differently conflicts rather than silently changing what
+	// was staged.
+	SameHuman     bool             `json:"same_human,omitempty"`
 	ContentSHA256 string           `json:"content_sha256,omitempty"`
 	ActivateProof string           `json:"activate_proof,omitempty"`
 	RetireProof   string           `json:"retire_proof,omitempty"`
@@ -186,7 +191,7 @@ var NotIncluded = []Exclusion{
 	{Name: "jobs", Owner: "jobs-results (M09)",
 		Reason: "background job records and their completion authority are not core state"},
 	{Name: "connections", Owner: "unassigned (M08, D9)",
-		Reason: "model connections and the human-scoped model selection are account state, not core state; credentials are never written into a bundle. Sealing refuses while the persona's human holds an explicit selection — the destination binds a different account's selection, so carrying the intent would silently substitute the model"},
+		Reason: "model connections, selections and credentials are human-scoped account state, not core state; credentials are never written into a bundle. Seal snapshots the selection onto the persona as non-secret model_intent (kind and connection metadata only); the destination enforces it as needs_rebinding until its bound human selects a matching connection or the intent is explicitly cleared"},
 	{Name: "memory_projection", Owner: "unassigned (M06)",
 		Reason: "search projections and encrypted originals are not core state; the journal, including notes, is carried verbatim"},
 	{Name: "account_and_workspace", Owner: "koseki / workspace (M21)",
@@ -222,10 +227,12 @@ type table struct {
 	cols    []column
 }
 
-// personaTable is the persona row as carried: identity and birth time only.
-// human_id, authority and transfer_id are placement-local.
+// personaTable is the persona row as carried: identity, birth time, and the
+// non-secret model-selection intent snapshotted at seal. human_id,
+// authority and transfer_id are placement-local; credentials never travel.
 var personaTable = table{name: "core_personas", cols: []column{
 	{"persona_id", colUUID}, {"display_name", colText}, {"created_at", colTime},
+	{"model_intent", colJSONNull},
 }}
 
 // coreTables is contract core.v1, in insert order (turns and plans reference
@@ -271,7 +278,10 @@ var coreTables = []table{
 		{"request", colJSON}, {"action_digest", colText}, {"status", colText},
 		{"decision", colText}, {"decision_id", colText},
 		{"decided_by_kind", colText}, {"decided_by_id", colText}, {"provenance", colText},
-		{"decided_at", colTime}, {"consumed_at", colTime}, {"created_at", colTime},
+		{"decided_at", colTime}, {"consumed_at", colTime},
+		{"prior_decision", colText}, {"prior_decided_by_kind", colText},
+		{"prior_decided_by_id", colText}, {"prior_decided_at", colTime},
+		{"created_at", colTime},
 	}},
 	{name: "core_schedules", orderBy: `schedule_id COLLATE "C"`, cols: []column{
 		{"persona_id", colUUID}, {"schedule_id", colText}, {"wake_at", colTime}, {"payload", colJSON},

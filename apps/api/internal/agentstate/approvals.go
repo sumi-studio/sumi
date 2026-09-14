@@ -60,7 +60,13 @@ type ToolApproval struct {
 	Provenance    *string        `json:"provenance"`
 	DecidedAt     *time.Time     `json:"decided_at"`
 	ConsumedAt    *time.Time     `json:"consumed_at"`
-	CreatedAt     time.Time      `json:"created_at"`
+	// Prior* record the source placement's decision when a transfer across
+	// authority re-pended this grant: history is preserved, not rewritten.
+	PriorDecision      *string    `json:"prior_decision,omitempty"`
+	PriorDecidedByKind *string    `json:"prior_decided_by_kind,omitempty"`
+	PriorDecidedByID   *string    `json:"prior_decided_by_id,omitempty"`
+	PriorDecidedAt     *time.Time `json:"prior_decided_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 // ApprovalDecision is the authenticated one-shot human decision on a
@@ -165,10 +171,10 @@ func validateToolRequest(tool string, request map[string]any) error {
 	return nil
 }
 
-// actionDigest is the canonical, domain-separated identity of the exact
+// ActionDigest is the canonical, domain-separated identity of the exact
 // action a human decides on: tool + route + request. Two calls differing in
 // any of these are different decisions.
-func actionDigest(tool, route string, request map[string]any) string {
+func ActionDigest(tool, route string, request map[string]any) string {
 	// json.Marshal sorts map keys — canonical for this map shape.
 	reqJSON, _ := json.Marshal(request)
 	sum := sha256.Sum256([]byte("sumi.core.tool-action.v1\x00" + tool + "\x00" + route + "\x00" + string(reqJSON)))
@@ -190,13 +196,15 @@ func scanApproval(row pgx.Row) (ToolApproval, error) {
 		&a.OperationID, &a.TurnID, &a.Tool, &a.Route, &a.RequiredBy,
 		&a.Request, &a.ActionDigest, &a.Status, &a.Decision, &a.DecisionID,
 		&a.DecidedByKind, &a.DecidedByID, &a.Provenance, &a.DecidedAt,
-		&a.ConsumedAt, &a.CreatedAt)
+		&a.ConsumedAt, &a.PriorDecision, &a.PriorDecidedByKind,
+		&a.PriorDecidedByID, &a.PriorDecidedAt, &a.CreatedAt)
 	return a, err
 }
 
 const approvalCols = `approval_id, persona_id, input_id, call_index, operation_id, turn_id,
 	tool, route, required_by, request, action_digest, status, decision, decision_id,
-	decided_by_kind, decided_by_id, provenance, decided_at, consumed_at, created_at`
+	decided_by_kind, decided_by_id, provenance, decided_at, consumed_at,
+	prior_decision, prior_decided_by_kind, prior_decided_by_id, prior_decided_at, created_at`
 
 func (s *Store) approvalForCall(ctx context.Context, db queryRower, personaID, inputID string, callIndex int, forUpdate bool) (*ToolApproval, error) {
 	q := `SELECT ` + approvalCols + ` FROM core_tool_approvals
@@ -352,7 +360,8 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 			&a.OperationID, &a.TurnID, &a.Tool, &a.Route, &a.RequiredBy,
 			&a.Request, &a.ActionDigest, &a.Status, &a.Decision, &a.DecisionID,
 			&a.DecidedByKind, &a.DecidedByID, &a.Provenance, &a.DecidedAt,
-			&a.ConsumedAt, &a.CreatedAt)
+			&a.ConsumedAt, &a.PriorDecision, &a.PriorDecidedByKind,
+			&a.PriorDecidedByID, &a.PriorDecidedAt, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}

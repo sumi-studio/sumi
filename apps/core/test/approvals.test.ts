@@ -427,3 +427,44 @@ test("an approved grant on a tool with no effect settles failed, not parked fore
     delete TOOL_AUTHORITY["phantom.gated"];
   }
 });
+
+test("acquireWriter fences non-active authority like the Go store", async () => {
+  // f69 parity: the double must refuse what real PostgreSQL refuses — a
+  // sealed, staged, transferred or retired persona cannot run here.
+  const state = new FakeState();
+  const P2 = "01930e00-0000-7000-8000-0000000000f2";
+  state.addPersona(PERSONA, "one", HUMAN);
+  state.addPersona(P2, "two", null);
+  await assert.rejects(
+    state.acquireWriter("01930e00-0000-7000-8000-000000000099", "h", 60_000),
+    (e: unknown) => e instanceof StateError && e.status === 404,
+  );
+  const lease = await state.acquireWriter(PERSONA, "h-1", 60_000);
+  assert.ok(lease.generation >= 1);
+  // A lease on one persona never fences the other.
+  const lease2 = await state.acquireWriter(P2, "h-2", 60_000);
+  assert.ok(lease2.generation >= 1);
+  for (const authority of ["sealed", "staged", "transferred", "retired"]) {
+    state.setPersonaAuthority(PERSONA, authority);
+    await assert.rejects(
+      state.acquireWriter(PERSONA, "h-1", 60_000),
+      (e: unknown) => e instanceof StateError && e.status === 409,
+      authority,
+    );
+  }
+  // The fence lifted when the persona is active again.
+  state.setPersonaAuthority(PERSONA, "active");
+  const back = await state.acquireWriter(PERSONA, "h-1", 60_000);
+  assert.ok(back.generation > lease.generation);
+});
+
+test("an unbound persona binds once, and only while staged or active", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.bindHuman(PERSONA, HUMAN);
+  assert.equal(state.personas.get(PERSONA)?.human_id, HUMAN);
+  await assert.rejects(
+    Promise.resolve().then(() => state.bindHuman(PERSONA, "01930e00-0000-7000-8000-0000000000ff")),
+    (e: unknown) => e instanceof StateError && e.status === 409,
+  );
+});

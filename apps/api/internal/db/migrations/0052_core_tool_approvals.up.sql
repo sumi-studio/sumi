@@ -62,7 +62,27 @@ CREATE TABLE core_tool_approvals (
     -- approved call, atomically with the effect.
     consumed_at     timestamptz,
     created_at      timestamptz NOT NULL DEFAULT now(),
+    -- Provenance of the source placement's decision when a transfer across
+    -- authority re-pends an approved-but-unconsumed grant: the destination's
+    -- bound human must decide again, and the original decision is kept here
+    -- as history rather than being rewritten or dropped.
+    prior_decision        text        CHECK (prior_decision IN ('approve_once','deny_once')),
+    prior_decided_by_kind text,
+    prior_decided_by_id   text,
+    prior_decided_at      timestamptz,
     PRIMARY KEY (persona_id, approval_id),
     UNIQUE (persona_id, input_id, call_index)
 );
 CREATE INDEX core_tool_approvals_status ON core_tool_approvals(persona_id, status);
+
+-- The persona's model selection is account state (model_connection_* are
+-- keyed by humans, not personas) and cannot travel as-is. At seal the
+-- service snapshots it here as non-secret intent — explicit 'none',
+-- or the selected connection's kind/provider/preset/model/base_url
+-- metadata without any credential — so the destination persona carries
+-- what the user chose. A carried intent is enforced at model execution:
+-- until the destination binds a human and selects a matching connection
+-- (or the intent is explicitly cleared), the binding reports
+-- needs_rebinding and the core refuses rather than falling back to an
+-- environment default.
+ALTER TABLE core_personas ADD COLUMN model_intent jsonb;

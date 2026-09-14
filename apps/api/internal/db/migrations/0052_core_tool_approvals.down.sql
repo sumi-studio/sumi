@@ -1,3 +1,5 @@
+ALTER TABLE core_personas DROP COLUMN model_intent;
+
 DROP TABLE IF EXISTS core_tool_approvals;
 
 ALTER TABLE core_inputs DROP COLUMN waiting_since;
