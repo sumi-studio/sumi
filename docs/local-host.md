@@ -56,13 +56,18 @@ Installing drops a `sumi-local` shim in `~/.local/bin`.
 | Path | Contents | Survives `uninstall`? |
 | --- | --- | --- |
 | `~/.local/lib/sumi-local` (`--prefix`) | executables: service binary, `core/` TypeScript sources, CLI | no — removed |
-| `$XDG_STATE_HOME/sumi/local` (`--home`) | `config.env` (0600: identity, secrets, model), `run/` pids, `log/`, `workspace/` | yes — `--purge` to delete |
+| `$XDG_STATE_HOME/sumi/local` (`--home`) | `config.env` (0600: identity, secrets, model), `.sumi-local-home` ownership marker, `run/` pids, `log/`, `workspace/` | yes — `--purge` to delete |
 | `~/.local/bin/sumi-local` | CLI symlink | no — removed |
 | managed PG volume | canonical database (managed mode) | yes — `--purge` deletes it, after an ownership check |
 
 Identity lives in `config.env`: `SUMI_PERSONA_ID` is generated once at
 first install and preserved on reinstall — that is what makes the
 reinstalled secretary *the same individual* with the same history.
+`.sumi-local-home` is the ownership marker `install` writes next to it:
+it records `SUMI_LOCAL_ID` so `uninstall`/`--purge` can still prove the
+home is a sumi-local install — and find its managed docker resources —
+even after `config.env` is deleted or corrupted. Generic directories
+(`run/`, `log/`, `workspace/`) are *not* ownership evidence.
 
 ## Multiple installs / non-default paths
 
@@ -87,9 +92,20 @@ sumi-local start
 If a previous install's config was deleted but its managed volume remains,
 a fresh install at the same home **refuses to adopt it** — restore the old
 `config.env` to keep that secretary's data, or remove the volume yourself
-for a fresh start. `uninstall` likewise refuses to remove a prefix/home
-that lacks this install's payload markers, and refuses to delete a docker
-volume that isn't labeled for this install's compose project.
+for a fresh start. `uninstall` refuses to remove a prefix that lacks this
+install's payload markers, refuses to purge a home with neither
+`config.env` nor the `.sumi-local-home` marker, and refuses to delete a
+docker volume that isn't labeled for this install's compose project. If
+`config.env` is lost, `stop`/`uninstall` still stop recorded processes and
+the marker-derived managed container, with docker project-label checks —
+a deleted config is never treated as license to guess and remove
+resources.
+
+Copying or moving the state home copies/moves the install itself: the
+recorded `SUMI_LOCAL_ID` follows the config, so the copy aliases the same
+docker resources and listen address (two copies cannot run at once — the
+second is refused by the foreign-listener check). To relocate, *move* the
+home and update `SUMI_LOCAL_HOME`.
 
 ## Model connection
 
@@ -119,7 +135,15 @@ from the environment without editing `config.env` — see
   port held by a foreign process is refused, never adopted or killed.
 - `stop` terminates the secretary first (SIGTERM → graceful lease
   release), then the service, then managed Postgres. Stale pid files are
-  checked against `/proc/<pid>/cmdline` before any signal.
+  checked against `/proc/<pid>/cmdline` before any signal. If a pid file
+  was lost but the listen port stays occupied, `stop` warns instead of
+  claiming success — identify the holder with `ss -tlnp`, verify its
+  path is this install's prefix, and only then terminate it.
+- Managed Postgres is addressed by its docker-assigned port at every
+  `start`; docker re-allocates that port on container restart, so after a
+  `docker restart`/`docker stop`/`docker start` of the managed container
+  outside the CLI, run `sumi-local start` again to repoint a stale
+  service (it restarts the service only when the DB endpoint changed).
 - `status` exits 0 (up), 2 (degraded — e.g. service up but secretary not
   holding the lease), 1 (down/not installed).
 - Crash recovery: if the secretary dies mid-turn, the next `start` waits

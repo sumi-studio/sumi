@@ -102,6 +102,8 @@ load_config() {
   PREFIX="$(canon "$(sumi_prefix)")"
   CONFIG="$HOME_DIR/config.env"
   [[ -f $CONFIG ]] || return 1
+  bash -n "$CONFIG" 2>/dev/null \
+    || { info "config at $CONFIG is not valid shell (corrupt?)"; return 1; }
   local k
   local -a saved=()
   for k in "${OVERRIDABLE[@]}"; do
@@ -112,24 +114,26 @@ load_config() {
   source "$CONFIG"
   set +a
   for k in "${saved[@]}"; do export "${k?}"; done
-  : "${SUMI_LOCAL_ID:?config missing SUMI_LOCAL_ID}"
-  : "${SUMI_LOCAL_LISTEN:?config missing SUMI_LOCAL_LISTEN}"
-  : "${SUMI_LOCAL_DB_MODE:?config missing SUMI_LOCAL_DB_MODE}"
-  : "${SUMI_CORE_STATE_TOKEN:?config missing SUMI_CORE_STATE_TOKEN}"
-  : "${SUMI_PERSONA_ID:?config missing SUMI_PERSONA_ID}"
+  # soft-fail with a reason so callers like `uninstall` can recover from a
+  # corrupt config instead of aborting mid-cleanup
+  local v
+  for v in SUMI_LOCAL_ID SUMI_LOCAL_LISTEN SUMI_LOCAL_DB_MODE \
+           SUMI_CORE_STATE_TOKEN SUMI_PERSONA_ID; do
+    [[ -n ${!v:-} ]] || { info "config incomplete: missing $v"; return 1; }
+  done
   : "${SUMI_PERSONA_NAME:=Sumi}"
   : "${SUMI_MODEL_PROVIDER:=mock}"
   if [[ $SUMI_LOCAL_DB_MODE == managed ]]; then
-    : "${SUMI_LOCAL_PG_CONTAINER:?config missing SUMI_LOCAL_PG_CONTAINER}"
-    : "${SUMI_LOCAL_PG_VOLUME:?config missing SUMI_LOCAL_PG_VOLUME}"
-    : "${SUMI_LOCAL_PG_PASSWORD:?config missing SUMI_LOCAL_PG_PASSWORD}"
+    for v in SUMI_LOCAL_PG_CONTAINER SUMI_LOCAL_PG_VOLUME SUMI_LOCAL_PG_PASSWORD; do
+      [[ -n ${!v:-} ]] || { info "config incomplete: missing $v"; return 1; }
+    done
     : "${SUMI_LOCAL_PG_LISTEN:=127.0.0.1:0}"
     SUMI_LOCAL_PG_PROJECT="sumi-local-$SUMI_LOCAL_ID"
     # SUMI_DB_URL is resolved after the container is up — the host port is
     # docker-assigned and can change between starts (managed_db_url).
     SUMI_DB_URL=
   else
-    : "${SUMI_DB_URL:?config missing SUMI_DB_URL}"
+    [[ -n ${SUMI_DB_URL:-} ]] || { info "config incomplete: missing SUMI_DB_URL"; return 1; }
   fi
 }
 
@@ -137,6 +141,13 @@ RUN_DIR() { printf '%s/run' "$HOME_DIR"; }
 LOG_DIR() { printf '%s/log' "$HOME_DIR"; }
 SERVICE_BIN() { printf '%s/bin/sumi-local-service' "$PREFIX"; }
 CORE_ENTRY() { printf '%s/core/host/local.ts' "$PREFIX"; }
+# Written by install; durable ownership evidence for the state home that
+# survives config.env loss and records the install id for recovery.
+MARKER_FILE() { printf '%s/.sumi-local-home' "$HOME_DIR"; }
+
+# Parse the install id recorded in a marker file (never sourced — a foreign
+# directory's file must not become shell code).
+marker_id() { sed -n "s/^SUMI_LOCAL_ID=['\"]\\{0,1\\}\\(sl[0-9a-f]\\{10\\}\\).*/\\1/p" "$1" 2>/dev/null; }
 
 require_installed() {
   [[ -x $(SERVICE_BIN) ]] || die "missing $(SERVICE_BIN) — run: $PROG install"
@@ -307,6 +318,19 @@ cmd_install() {
   prefix="$(canon "${prefix:-$(sumi_prefix)}")"
   mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
+  # Claim the home before any payload/config work: .sumi-local-home is the
+  # durable ownership marker — it makes even a failed install recognizable
+  # (and cleanable) as ours, and records the install id so uninstall/purge
+  # can recover managed resource names if config.env is later lost. The
+  # config's id wins when a config already exists (e.g. a moved home).
+  if [[ ! -f $home/.sumi-local-home ]]; then
+    local claim_id
+    if [[ -f $home/config.env ]]; then
+      claim_id="$(marker_id "$home/config.env")"
+    fi
+    printf 'SUMI_LOCAL_ID=%s\n' "$(shq "${claim_id:-$(install_id "$home")}")" \
+      >"$home/.sumi-local-home"
+  fi
 
   # --- payloads -------------------------------------------------------------
   if [[ -n $PACK_ROOT ]]; then
@@ -367,14 +391,24 @@ cmd_install() {
       die "no database configured: pass --db-url postgres://… or install Docker for --managed-pg"
     fi
     if [[ $mode == managed ]]; then
-      # A volume/container named for this install id must never be adopted:
-      # it holds an earlier install's database and POSTGRES_PASSWORD would
-      # not re-initialize it — adopting it would wedge this install, and a
-      # later purge would delete that install's data.
-      if docker volume inspect "sumi-local-pgdata-$iid" >/dev/null 2>&1 \
-         || docker inspect "sumi-local-pg-$iid" >/dev/null 2>&1; then
-        die "docker resources 'sumi-local-pg-$iid' / 'sumi-local-pgdata-$iid' already exist — a previous install at this home left them behind after its config.env was removed. Refusing to adopt: restore the old config.env to keep that secretary's data, or remove the volume yourself (docker volume rm sumi-local-pgdata-$iid) for a fresh install here"
+      # A volume/container named for a candidate install id must never be
+      # adopted: it holds an earlier install's database and
+      # POSTGRES_PASSWORD would not re-initialize it — adopting it would
+      # wedge this install, and a later purge would delete that install's
+      # data. Candidates: the path-derived id plus any id recorded by a
+      # leftover marker (covers a moved home whose config was lost).
+      local cand cid
+      local -a cands=("$iid")
+      if [[ -f $home/.sumi-local-home ]]; then
+        cid="$(marker_id "$home/.sumi-local-home")"
+        [[ -n $cid && $cid != "$iid" ]] && cands+=("$cid")
       fi
+      for cand in "${cands[@]}"; do
+        if docker volume inspect "sumi-local-pgdata-$cand" >/dev/null 2>&1 \
+           || docker inspect "sumi-local-pg-$cand" >/dev/null 2>&1; then
+          die "docker resources 'sumi-local-pg-$cand' / 'sumi-local-pgdata-$cand' already exist — a previous install at this home left them behind after its config.env was removed. Refusing to adopt: restore the old config.env to keep that secretary's data, or remove the volume yourself (docker volume rm sumi-local-pgdata-$cand) for a fresh install here"
+        fi
+      done
     fi
     {
       printf '# sumi-local configuration — generated %s\n' "$(date -u +%FT%TZ)"
@@ -407,7 +441,6 @@ cmd_install() {
     chmod 600 "$cfg"
     info "wrote $cfg (persona $persona, install $iid)"
   fi
-
   cat <<EOF
 [$PROG] installed.
   executables : $prefix
@@ -507,6 +540,11 @@ owned_container() {
       --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null) \
      == "$SUMI_LOCAL_PG_PROJECT" ]]
 }
+owned_network() {
+  [[ $(docker network inspect "$1" \
+      --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null) \
+     == "$SUMI_LOCAL_PG_PROJECT" ]]
+}
 
 db_probe() { # external mode: TCP-connect the DB host:port
   local hp
@@ -540,7 +578,7 @@ build_core_env() { # array-name
 }
 
 cmd_start() {
-  load_config || die "not installed — run: $PROG install"
+  load_config || die "not installed, or config unreadable ($CONFIG) — run: $PROG install"
   check_listen || die "refusing to start"
   require_installed
   require_proc
@@ -662,8 +700,35 @@ pid_pat() { # pidfile-path → absolute cmdline substring
 }
 
 cmd_stop() {
-  load_config || die "not installed — nothing to stop"
+  HOME_DIR="$(canon "$(sumi_home)")"; PREFIX="$(canon "$(sumi_prefix)")"
+  CONFIG="$HOME_DIR/config.env"
   require_proc
+  if ! load_config; then
+    # config missing or corrupt — still stop what we can prove is ours:
+    # pidfiles re-verify absolute process paths, and the install marker
+    # recovers the managed container's name for a label-checked stop.
+    [[ -f $(MARKER_FILE) || -d $(RUN_DIR) ]] \
+      || die "not installed — nothing to stop (no config, marker, or pidfiles under $HOME_DIR)"
+    info "config unavailable — stopping via recorded evidence only"
+    # only lock when the home is proven ours; lock() would create run/
+    [[ -f $(MARKER_FILE) ]] && lock
+    local f stopped=0
+    for f in "$(RUN_DIR)"/*.pid; do
+      [[ -f $f ]] && { kill_pid "$f" 10 "$(pid_pat "$f")"; stopped=1; }
+    done
+    local mid
+    mid="$(marker_id "$(MARKER_FILE)")"
+    if [[ -n $mid ]] && docker inspect "sumi-local-pg-$mid" >/dev/null 2>&1; then
+      SUMI_LOCAL_PG_PROJECT="sumi-local-$mid"
+      if owned_container "sumi-local-pg-$mid"; then
+        docker stop "sumi-local-pg-$mid" >/dev/null 2>&1 \
+          && info "stopped managed container sumi-local-pg-$mid" \
+          || info "warning: could not stop container sumi-local-pg-$mid"
+      fi
+    fi
+    ((stopped)) || info "no recorded processes were running"
+    return 0
+  fi
   lock
   local f
   for f in "$(RUN_DIR)"/*.pid; do
@@ -675,12 +740,18 @@ cmd_stop() {
   info "stopping state service…"
   kill_pid "$(RUN_DIR)/service.pid" 10 "$(SERVICE_BIN)"
   [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]] && pg_down
+  check_listen >/dev/null 2>&1 || true
+  if [[ -n $LISTEN_PORT ]] && port_busy; then
+    # a pidfile could be lost while the service keeps running — never claim
+    # we stopped a listener we cannot verify
+    info "warning: $(base_url) is still occupied by a process this install cannot verify — left running, NOT stopped. Identify it yourself first (e.g. ss -ltnp 'sport = :$LISTEN_PORT'), confirm it is $PREFIX/bin/sumi-local-service, then terminate it."
+  fi
   info "stopped. State remains in $HOME_DIR and the database."
 }
 
 cmd_status() {
   if ! load_config; then
-    info "not installed — run: $PROG install"
+    info "not installed, or config unreadable ($CONFIG) — run: $PROG install"
     exit 1
   fi
   require_proc
@@ -750,7 +821,7 @@ cmd_say() {
       *) text+="${text:+ }$1"; shift;;
     esac
   done
-  load_config || die "not installed — run: $PROG install"
+  load_config || die "not installed, or config unreadable ($CONFIG) — run: $PROG install"
   svc_health || die "service is not running — start it first"
   if [[ -z $text && ! -t 0 ]]; then text="$(cat)"; fi
   [[ -n $text ]] || die "usage: $PROG say [--wait N] [--id ID] <message>"
@@ -794,12 +865,12 @@ cmd_say() {
 }
 
 cmd_url() {
-  load_config || die "not installed"
+  load_config || die "not installed, or config unreadable ($CONFIG)"
   printf '%s/?persona=%s&fm=%s\n' "$(base_url)" "$SUMI_PERSONA_ID" "$(fm_token)"
 }
 
 cmd_logs() {
-  load_config || die "not installed"
+  load_config || die "not installed, or config unreadable ($CONFIG)"
   if [[ ${1:-} == -f ]]; then
     tail -f -n 50 "$(LOG_DIR)"/*.log
   else
@@ -811,7 +882,7 @@ cmd_logs() {
 # doctor
 # --------------------------------------------------------------------------
 cmd_doctor() {
-  load_config || die "not installed — run: $PROG install"
+  load_config || die "not installed, or config unreadable ($CONFIG) — run: $PROG install"
   local fail=0
   ok() { printf '  ok    %s\n' "$1"; }
   bad() { printf '  FAIL  %s\n' "$1"; fail=1; }
@@ -900,59 +971,114 @@ cmd_uninstall() {
   CONFIG="$HOME_DIR/config.env"
   require_proc
   local have_config=0
-  load_config && have_config=1 || true
-  if ((purge)) && [[ -d $HOME_DIR ]]; then
-    # verify BEFORE lock() — lock creates $HOME_DIR/run, which would then
-    # satisfy this very check. A mistaken SUMI_LOCAL_HOME must never rm -rf
-    # an unrelated directory.
-    [[ -f $CONFIG || -d $HOME_DIR/run || -d $HOME_DIR/log || -d $HOME_DIR/workspace ]] \
-      || die "refusing to purge $HOME_DIR — it does not look like a $PROG state home (check SUMI_LOCAL_HOME)"
-    [[ $HOME_DIR != / && $HOME_DIR != "$HOME" ]] \
-      || die "refusing to purge $HOME_DIR — not a $PROG state home"
+  if load_config; then
+    have_config=1
+  else
+    [[ -f $CONFIG ]] \
+      && info "warning: $CONFIG exists but is incomplete/corrupt — continuing from the install marker"
+    # a partially-sourced config can leave stray values behind — an
+    # incomplete config is untrusted, so drop every name it might set
+    unset SUMI_LOCAL_ID SUMI_LOCAL_DB_MODE SUMI_DB_URL SUMI_PERSONA_ID \
+          SUMI_CORE_STATE_TOKEN SUMI_LOCAL_LISTEN SUMI_LOCAL_PG_CONTAINER \
+          SUMI_LOCAL_PG_VOLUME SUMI_LOCAL_PG_PROJECT SUMI_LOCAL_PG_LISTEN \
+          SUMI_LOCAL_PG_PASSWORD
   fi
-  lock
-  local f
-  for f in "$(RUN_DIR)"/*.pid; do
-    [[ -f $f ]] && kill_pid "$f" 10 "$(pid_pat "$f")"
-  done
-  if ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]]; then
-    # remove only this install's container; the volume (the data) stays
-    if docker inspect "$SUMI_LOCAL_PG_CONTAINER" >/dev/null 2>&1; then
-      if owned_container "$SUMI_LOCAL_PG_CONTAINER"; then
-        pg_compose rm -sf postgres >/dev/null 2>&1 || true
-      else
-        info "container $SUMI_LOCAL_PG_CONTAINER is not labeled for this install — leaving it"
-      fi
+  # Ownership evidence is config.env or the .sumi-local-home marker written
+  # by install — never generic directory names like run/, log/, workspace/,
+  # which unrelated directories may contain (and run/ could be created by
+  # an earlier sumi-local call itself).
+  local marker_id="" home_owned=0
+  [[ -f $(MARKER_FILE) ]] && marker_id="$(marker_id "$(MARKER_FILE)")"
+  # A complete config.env or the install marker is ownership evidence; a
+  # corrupt/foreign file merely named config.env is not.
+  ((have_config)) || [[ -f $(MARKER_FILE) ]] && home_owned=1
+  # The install id comes only from recorded evidence — config first (it is
+  # authoritative, e.g. after the home was moved), then the marker. Never
+  # guessed from the path alone: a deleted config is not permission to
+  # delete resources a guessed hash happens to name.
+  local iid="${SUMI_LOCAL_ID:-$marker_id}"
+  local pg_ctr="" pg_vol="" pg_proj=""
+  if [[ -n $iid ]]; then
+    pg_ctr="${SUMI_LOCAL_PG_CONTAINER:-sumi-local-pg-$iid}"
+    pg_vol="${SUMI_LOCAL_PG_VOLUME:-sumi-local-pgdata-$iid}"
+    pg_proj="sumi-local-$iid"
+    : "${SUMI_LOCAL_PG_PROJECT:=$pg_proj}"
+  fi
+  if ((purge)) && [[ -d $HOME_DIR ]] && ((home_owned == 0)); then
+    die "refusing to purge $HOME_DIR — no config.env or .sumi-local-home marker; it does not look like a $PROG state home (check SUMI_LOCAL_HOME)"
+  fi
+  ((purge)) && [[ -d $HOME_DIR ]] \
+    && { [[ $HOME_DIR != / && $HOME_DIR != "$HOME" ]] \
+         || die "refusing to purge $HOME_DIR — not a $PROG state home"; }
+  # Lock (which creates run/) only when the home is proven ours — never
+  # create artifacts inside a foreign directory. When ownership is
+  # unproven but a run/ already exists, still evaluate its pidfiles
+  # read-only: kill_pid only signals processes it can verify as ours via
+  # the absolute-prefix anchor, and nothing is created.
+  ((home_owned)) && lock
+  if ((home_owned)) || [[ -d $(RUN_DIR) ]]; then
+    local f
+    for f in "$(RUN_DIR)"/*.pid; do
+      [[ -f $f ]] && kill_pid "$f" 10 "$(pid_pat "$f")"
+    done
+  elif [[ -e $HOME_DIR ]]; then
+    info "$HOME_DIR has no $PROG install evidence — nothing to stop there"
+  fi
+  # --- managed docker resources ------------------------------------------
+  # Reachable whenever the install id is known — including config-less or
+  # corrupt-config recovery via the marker. Names come from recorded
+  # evidence; deletion additionally requires docker's own project label.
+  if [[ -n $pg_ctr ]] && docker inspect "$pg_ctr" >/dev/null 2>&1; then
+    if owned_container "$pg_ctr"; then
+      docker rm -f "$pg_ctr" >/dev/null 2>&1 \
+        && info "removed managed container $pg_ctr" \
+        || info "warning: could not remove container $pg_ctr"
+    else
+      info "container $pg_ctr is not labeled for project $pg_proj — leaving it"
+    fi
+  fi
+  if [[ -n $pg_proj ]] && docker network inspect "${pg_proj}_default" >/dev/null 2>&1; then
+    if owned_network "${pg_proj}_default"; then
+      docker network rm "${pg_proj}_default" >/dev/null 2>&1 \
+        && info "removed network ${pg_proj}_default" \
+        || info "warning: could not remove network ${pg_proj}_default"
     fi
   fi
   if ((purge)); then
     local -a doomed=("$HOME_DIR")
-    ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]] \
-      && doomed+=("docker volume $SUMI_LOCAL_PG_VOLUME")
+    [[ -n $pg_vol ]] && doomed+=("docker volume $pg_vol")
     ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == external ]] \
       && doomed+=("NOTE: external database rows are NOT removed — drop the database yourself if wanted")
+    if ((!have_config)) && [[ -z $iid ]]; then
+      doomed+=("NOTE: no install id recoverable — if this was a managed install, look for 'sumi-local-*' docker objects yourself")
+    fi
+    printf 'This permanently deletes the secretary identity, its history, and queued work:\n' >&2
+    printf '  %s\n' "${doomed[@]}" >&2
     if ((yes == 0)); then
-      printf 'This permanently deletes the secretary identity, its history, and queued work:\n' >&2
-      printf '  %s\n' "${doomed[@]}" >&2
       printf 'Type "purge" to confirm: ' >&2
       local ans; read -r ans
       [[ $ans == purge ]] || die "aborted"
     fi
-    if ((have_config)) && [[ ${SUMI_LOCAL_DB_MODE:-} == managed ]]; then
+    if [[ -n $pg_vol ]] && docker volume inspect "$pg_vol" >/dev/null 2>&1; then
       # the volume holds the secretary's whole authored history — delete it
       # only when docker itself attributes it to this install's project
-      if docker volume inspect "$SUMI_LOCAL_PG_VOLUME" >/dev/null 2>&1 \
-         && ! owned_volume "$SUMI_LOCAL_PG_VOLUME"; then
-        die "volume $SUMI_LOCAL_PG_VOLUME exists but is not labeled for project $SUMI_LOCAL_PG_PROJECT — refusing to delete another install's data"
-      fi
-      pg_compose down -v >/dev/null 2>&1 \
-        || info "warning: 'compose down -v' failed — docker resources for project $SUMI_LOCAL_PG_PROJECT may remain"
+      owned_volume "$pg_vol" \
+        || die "volume $pg_vol exists but is not labeled for project $pg_proj — refusing to delete another install's data"
+      docker volume rm "$pg_vol" >/dev/null 2>&1 \
+        && info "removed volume $pg_vol" \
+        || info "warning: could not remove volume $pg_vol"
     fi
     rm -rf "$HOME_DIR"
     info "purged state home and managed data"
   elif [[ -d $HOME_DIR ]]; then
-    info "kept state home $HOME_DIR (identity, history, secrets)"
-    info "to delete the data too: $PROG uninstall --purge"
+    if ((home_owned)); then
+      info "kept state home $HOME_DIR (identity, history, secrets)"
+      [[ -n $pg_vol ]] && docker volume inspect "$pg_vol" >/dev/null 2>&1 \
+        && info "kept managed volume $pg_vol"
+      info "to delete the data too: $PROG uninstall --purge"
+    else
+      info "left $HOME_DIR untouched — no $PROG install evidence (check SUMI_LOCAL_HOME)"
+    fi
   fi
   if [[ -e $PREFIX ]]; then
     # verify this is an actual sumi-local install before rm -rf — a bad
@@ -962,10 +1088,10 @@ cmd_uninstall() {
     [[ $PREFIX != / && $PREFIX != "$HOME" ]] \
       || die "refusing to remove $PREFIX — not a $PROG install root"
     rm -rf "$PREFIX"
+    info "removed executables at $PREFIX"
   fi
   local shim="$HOME/.local/bin/sumi-local"
   [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/sumi-local" ]] && rm -f "$shim"
-  info "removed executables at $PREFIX"
 }
 
 cmd_version() {

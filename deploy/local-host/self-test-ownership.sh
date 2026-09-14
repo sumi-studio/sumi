@@ -58,9 +58,11 @@ persona_of() { grep '^SUMI_PERSONA_ID=' "$1/config.env" | cut -d"'" -f2; }
 a_inputs() { docker exec "$A_CTR" psql -U sumi -d sumi -tAc 'select count(*) from core_inputs' 2>/dev/null | tr -d '[:space:]'; }
 
 cleanup() {
-  a stop >/dev/null 2>&1 || true;  b stop >/dev/null 2>&1 || true
-  a uninstall --purge --yes >/dev/null 2>&1 || true
-  b uninstall --purge --yes >/dev/null 2>&1 || true
+  local x
+  for x in a b c d e f; do
+    "$x" stop >/dev/null 2>&1 || true
+    "$x" uninstall --purge --yes >/dev/null 2>&1 || true
+  done
 }
 trap cleanup EXIT
 
@@ -110,6 +112,24 @@ b start >/dev/null   # B's real service was never stopped; core restarts
 b say "beta again" >/dev/null && ok "B ordinary stop/start still works" \
   || bad "B broken after pid-restore"
 
+echo "== f45: lost pidfile -> stop warns, does not claim success"
+rm -f "$B_HOME/run/service.pid" "$B_HOME/run/local.pid"
+out="$(b stop 2>&1)"
+[[ $out == *"still"* || $out == *"occupied"* ]] \
+  && ok "lost pidfile: stop warns about held port" \
+  || bad "lost-pidfile stop not truthful: $(echo "$out" | tail -3)"
+# documented recovery: rebuild the pidfiles from the live, verified processes
+spid="$(pgrep -f "$B_PREFIX/bin/sumi-local-service" | head -1)"
+cpid="$(pgrep -f "$B_PREFIX/core" | head -1)"
+if [[ -n $spid && -n $cpid ]]; then
+  printf '%s %s\n' "$spid" "$(awk '{print $22}' "/proc/$spid/stat")" > "$B_HOME/run/service.pid"
+  printf '%s %s\n' "$cpid" "$(awk '{print $22}' "/proc/$cpid/stat")" > "$B_HOME/run/local.pid"
+  b stop >/dev/null && ok "rebuilt pidfiles -> clean stop" || bad "stop failed after pidfile rebuild"
+else
+  bad "could not find B service/core pid for rebuild"
+fi
+b start >/dev/null   # running again for the F1 section
+
 echo "== F2: foreign/stale pidfile is never signaled"
 sleep 600 & SLEEP_PID=$!
 SLEEP_ST="$(awk '{print $22}' "/proc/$SLEEP_PID/stat")"
@@ -129,15 +149,33 @@ kill -0 "$SLEEP_PID" 2>/dev/null && ok "reused-pid guard held" \
   || bad "reused-pid guard failed"
 kill "$SLEEP_PID" 2>/dev/null || true
 
-echo "== F9: unowned prefix / home refused"
+echo "== F9 + f35: unowned prefix / home refused"
 INN_PRE="$FIX/innocent-prefix"; mkdir -p "$INN_PRE"; echo keep > "$INN_PRE/userfile"
 expect_die "uninstall against unowned prefix" "refusing to remove" \
   env SUMI_LOCAL_HOME="$B_HOME" SUMI_LOCAL_PREFIX="$INN_PRE" "$SRC" uninstall --yes
 [[ -f $INN_PRE/userfile ]] && ok "unowned prefix untouched" || bad "unowned prefix modified!"
-INN_HOME="$FIX/innocent-home"; mkdir -p "$INN_HOME"; echo keep > "$INN_HOME/userfile"
-expect_die "purge against unowned home" "does not look like" \
-  env SUMI_LOCAL_HOME="$INN_HOME" SUMI_LOCAL_PREFIX="$B_PREFIX" "$SRC" uninstall --purge --yes
-[[ -f $INN_HOME/userfile ]] && ok "unowned home untouched" || bad "unowned home modified!"
+
+# review-A exact repro: a wrong --home holding only generic dirs must stay
+# intact; a non-purge uninstall must not plant a run/ marker that later
+# legitimizes a purge of that wrong home.
+INN_HOME="$FIX/innocent-home"; mkdir -p "$INN_HOME/log"; echo sentinel > "$INN_HOME/log/keep.txt"
+INN_PRE2="$FIX/innocent-prefix2"; mkdir -p "$INN_PRE2"
+expect_die "uninstall against log-only home" "refusing to remove" \
+  env SUMI_LOCAL_HOME="$INN_HOME" SUMI_LOCAL_PREFIX="$INN_PRE2" "$SRC" uninstall --yes
+[[ -f $INN_HOME/log/keep.txt && $(cat "$INN_HOME/log/keep.txt") == sentinel && ! -e $INN_HOME/run ]] \
+  && ok "non-purge uninstall left log-only home untouched (no run/ planted)" \
+  || bad "non-purge uninstall mutated the wrong home!"
+expect_die "purge still refuses the same wrong home" "refusing to purge" \
+  env SUMI_LOCAL_HOME="$INN_HOME" SUMI_LOCAL_PREFIX="$INN_PRE2" "$SRC" uninstall --purge --yes
+[[ -f $INN_HOME/log/keep.txt && $(cat "$INN_HOME/log/keep.txt") == sentinel ]] \
+  && ok "sentinel content survived purge attempt" || bad "wrong home was purged!"
+# generic payload dirs alone are never ownership evidence
+for d in run log workspace; do
+  W="$FIX/wrong-$d"; mkdir -p "$W/$d"; echo s > "$W/$d/x"
+  expect_die "purge refuses $d-only home" "refusing to purge" \
+    env SUMI_LOCAL_HOME="$W" SUMI_LOCAL_PREFIX="$INN_PRE2" "$SRC" uninstall --purge --yes
+  [[ -f $W/$d/x ]] && ok "$d-only home intact" || bad "$d-only home purged!"
+done
 
 echo "== F3: install via the installed prefix binary (self-copy)"
 out="$(a_prefix="$A_PREFIX/bin/sumi-local"; env SUMI_LOCAL_HOME="$A_HOME" SUMI_LOCAL_PREFIX="$A_PREFIX" "$a_prefix" install 2>&1)" \
@@ -161,6 +199,9 @@ a uninstall --yes >/dev/null          # executables gone; home + volume kept
 [[ ! -d $A_PREFIX ]] && docker volume inspect "$A_VOL" >/dev/null 2>&1 \
   && ok "A uninstall kept data volume, removed prefix" \
   || bad "A uninstall state wrong"
+docker network ls --filter "name=^sumi-local-$A_ID" --format '{{.Name}}' | grep -q . \
+  && bad "non-purge uninstall leaked A's compose network" \
+  || ok "non-purge uninstall removed A's compose network"
 a install >/dev/null            # config.env kept -> same identity
 [[ $(persona_of "$A_HOME") == "$A_PERSONA" ]] \
   && ok "reinstall kept persona $A_PERSONA" || bad "reinstall changed persona"
@@ -188,6 +229,77 @@ c install --managed-pg --listen 127.0.0.1:9552 >/dev/null \
   || bad "fresh install still blocked after resource removal"
 c stop >/dev/null 2>&1 || true
 env SUMI_LOCAL_HOME="$C_HOME" SUMI_LOCAL_PREFIX="$C_PREFIX" "$SRC" uninstall --purge --yes >/dev/null 2>&1 || true
+
+echo "== f36: lost config — marker recovers managed resources, reports truthfully"
+D_HOME="$FIX/home-d"; D_PREFIX="$FIX/prefix-d"
+d() { env SUMI_LOCAL_HOME="$D_HOME" SUMI_LOCAL_PREFIX="$D_PREFIX" "$SRC" "$@"; }
+d install --managed-pg --listen 127.0.0.1:9553 >/dev/null
+D_ID="$(grep '^SUMI_LOCAL_ID=' "$D_HOME/config.env" | cut -d"'" -f2)"
+d start >/dev/null
+d say "dee ping" >/dev/null && ok "D serving" || bad "D failed to start"
+rm -f "$D_HOME/config.env"             # config lost; marker + pidfiles + resources remain
+out="$(d stop 2>&1)"                  # degraded stop via marker + pidfiles
+[[ $out == *"marker"* || $out == *"config"* ]] \
+  && ok "config-less stop explains degraded mode" \
+  || bad "config-less stop silent: $(echo "$out" | tail -3)"
+! docker inspect "sumi-local-pg-$D_ID" --format '{{.State.Running}}' 2>/dev/null | grep -q true \
+  && ok "config-less stop stopped D's managed container" \
+  || bad "managed container still running after config-less stop"
+out="$(d uninstall --yes 2>&1)"        # non-purge: container+network gone, volume+home kept
+[[ $out == *"removed managed container"* ]] \
+  && ok "config-less uninstall removed managed container" \
+  || bad "container removal unreported: $(echo "$out" | tail -3)"
+docker volume inspect "sumi-local-pgdata-$D_ID" >/dev/null 2>&1 \
+  && [[ $out == *"kept managed volume"* ]] \
+  && ok "config-less uninstall kept + reported managed volume" \
+  || bad "volume state/reporting wrong: $(echo "$out" | tail -3)"
+docker network ls --filter "name=^sumi-local-$D_ID" --format '{{.Name}}' | grep -q . \
+  && bad "compose network leaked" || ok "compose network removed"
+[[ -d $D_HOME && -f $D_HOME/.sumi-local-home ]] \
+  && ok "home + marker retained" || bad "home/marker wrongly removed"
+out="$(d uninstall --purge --yes 2>&1)"   # still works without config via marker
+! docker volume inspect "sumi-local-pgdata-$D_ID" >/dev/null 2>&1 \
+  && [[ ! -d $D_HOME ]] \
+  && ok "config-less purge removed volume + home" \
+  || bad "config-less purge incomplete: $(echo "$out" | tail -3)"
+
+echo "== f45: corrupt config — purge still recovers via marker"
+E_HOME="$FIX/home-e"; E_PREFIX="$FIX/prefix-e"
+e() { env SUMI_LOCAL_HOME="$E_HOME" SUMI_LOCAL_PREFIX="$E_PREFIX" "$SRC" "$@"; }
+e install --managed-pg --listen 127.0.0.1:9554 >/dev/null
+E_ID="$(grep '^SUMI_LOCAL_ID=' "$E_HOME/config.env" | cut -d"'" -f2)"
+e start >/dev/null
+printf 'SUMI_LOCAL_ID=broken\n' > "$E_HOME/config.env"   # syntactically valid, incomplete
+out="$(e uninstall --purge --yes 2>&1)"
+[[ $out == *"config incomplete"* ]] \
+  && ok "corrupt config reported, not silently trusted" \
+  || bad "corrupt config not reported: $(echo "$out" | tail -3)"
+! docker inspect "sumi-local-pg-$E_ID" >/dev/null 2>&1 \
+  && ! docker volume inspect "sumi-local-pgdata-$E_ID" >/dev/null 2>&1 \
+  && [[ ! -d $E_HOME && ! -d $E_PREFIX ]] \
+  && ok "corrupt-config purge removed all owned resources" \
+  || bad "corrupt-config purge left resources behind"
+
+echo "== failed install: marker-only home is recognized and cleanable"
+G_HOME="$FIX/home-failed"; mkdir -p "$G_HOME/run" "$G_HOME/log"
+printf 'SUMI_LOCAL_ID='"'"'sldeadbeef01'"'"'\n' > "$G_HOME/.sumi-local-home"
+env SUMI_LOCAL_HOME="$G_HOME" SUMI_LOCAL_PREFIX="$FIX/prefix-failed" "$SRC" uninstall --purge --yes >/dev/null 2>&1
+[[ ! -d $G_HOME ]] && ok "marker-only (failed install) home purged" \
+  || bad "marker-only home not cleanable"
+
+echo "== moved home: config id stays authoritative for resource recovery"
+F_HOME="$FIX/home-f"; F_PREFIX="$FIX/prefix-f"
+f() { env SUMI_LOCAL_HOME="$F_HOME" SUMI_LOCAL_PREFIX="$F_PREFIX" "$SRC" "$@"; }
+f install --managed-pg --listen 127.0.0.1:9555 >/dev/null
+F_ID="$(grep '^SUMI_LOCAL_ID=' "$F_HOME/config.env" | cut -d"'" -f2)"
+f start >/dev/null; f stop >/dev/null
+mv "$F_HOME" "$FIX/home-f-moved"; F_HOME="$FIX/home-f-moved"
+# path-derived id now differs from the recorded id — recorded evidence must win
+f uninstall --purge --yes >/dev/null 2>&1
+! docker volume inspect "sumi-local-pgdata-$F_ID" >/dev/null 2>&1 \
+  && [[ ! -d $F_HOME ]] \
+  && ok "moved-home purge removed recorded-id resources + home" \
+  || bad "moved-home purge failed (id drifted to new path)"
 
 echo
 echo "ownership test: $pass passed, $fail failed"
