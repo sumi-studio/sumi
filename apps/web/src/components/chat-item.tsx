@@ -13,7 +13,7 @@ import { userItemSourceLabel, userItemText } from "../lib/user-item-text";
 import { ApprovalConfirmation } from "./approval-confirmation";
 import { TraceRow } from "./work-summary";
 
-interface ChatItemViewProps {
+export interface ChatItemViewProps {
   item: ChatItem;
   operationOpen?: boolean;
   onOperationOpenChange?: (open: boolean) => void;

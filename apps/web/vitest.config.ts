@@ -8,6 +8,7 @@ export default defineConfig({
       "src/agent/reducer.test.ts",
       "src/agent/store.test.ts",
       "src/agent/history.test.ts",
+      "src/agent/projector.test.ts",
       "e2e/**",
       "scripts/**",
     ],

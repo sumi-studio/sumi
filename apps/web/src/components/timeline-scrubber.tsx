@@ -7,8 +7,8 @@ import {
 } from "@sumi/ui/components/sheet";
 import { cn } from "@sumi/ui/lib/utils";
 import { FileText } from "lucide-react";
-import { useLayoutEffect, useState } from "react";
-import type { ChatItem } from "../agent/model";
+import { memo, useLayoutEffect, useState } from "react";
+import type { TimelineExchange } from "../agent/projector";
 
 export interface ScrubberTick {
   id: string;
@@ -48,7 +48,10 @@ const PEAK_FALLOFF = 4;
  * 既定はごく控えめ (全目盛り同サイズ、ビュー内は色だけ濃く)。ホバーすると
  * 触れた目盛りを頂点に山なりに伸び、他は一様に薄くなる。
  */
-export function TimelineScrubber({
+// Memoized: during streaming the scrubber re-renders once per delta
+// otherwise, even though its props only change when an exchange boundary
+// moves. The projector publishes a stable `ticks` identity between those.
+export const TimelineScrubber = memo(function TimelineScrubber({
   ticks,
   visibleRange,
   onJump,
@@ -280,7 +283,7 @@ export function TimelineScrubber({
       )}
     </nav>
   );
-}
+});
 
 export function MobileTimelineSheet({
   open,
@@ -329,46 +332,16 @@ export function MobileTimelineSheet({
   );
 }
 
-interface Exchange {
-  startIndex: number;
-  endIndex: number;
-  tick: ScrubberTick;
-}
-
-/** チャット項目列を、タイムライン表示に必要な1往復単位へ変換する。 */
+/**
+ * 1往復単位のタイムライン。`exchanges` と `itemIndexById` は
+ * ConversationProjector が書き込みジャーナルから増分更新したものを受け取る。
+ */
 export function createConversationTimeline(
-  items: ChatItem[],
+  exchanges: readonly TimelineExchange[],
+  itemIndexById: ReadonlyMap<string, number>,
   visibleMessageIds: string[],
   historyIndex?: readonly ScrubberTick[],
 ): ConversationTimeline {
-  const exchanges: Exchange[] = [];
-  const itemIndexById = new Map<string, number>();
-  items.forEach((item, index) => {
-    itemIndexById.set(item.id, index);
-    if (item.kind === "user") {
-      const previous = exchanges.at(-1);
-      if (previous) {
-        previous.endIndex = index - 1;
-      }
-      exchanges.push({
-        startIndex: index,
-        endIndex: items.length - 1,
-        tick: {
-          id: item.id,
-          title: item.text,
-        },
-      });
-      return;
-    }
-
-    if (item.kind === "prose") {
-      const current = exchanges.at(-1);
-      if (current && !current.tick.preview) {
-        current.tick.preview = toExcerpt(item.text);
-      }
-    }
-  });
-
   const visibleIndexes = visibleMessageIds
     .flatMap((id) => {
       const index = itemIndexById.get(id);
@@ -407,18 +380,8 @@ export function createConversationTimeline(
   };
 }
 
-function toExcerpt(text: string): string {
-  return text
-    .replace(/```[\s\S]*?```/g, " (コード) ")
-    .replace(/\$\$[\s\S]*?\$\$/g, " (数式) ")
-    .replace(/[#*`>|$_-]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 140);
-}
-
 function computeVisibleRange(
-  exchanges: Exchange[],
+  exchanges: readonly TimelineExchange[],
   firstVisible: number | undefined,
   lastVisible: number | undefined,
 ): [number, number] | null {
