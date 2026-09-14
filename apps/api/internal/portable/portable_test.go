@@ -153,7 +153,123 @@ func rowLines(t *testing.T, p placement, personaID string) []byte {
 	if _, err := writeRows(ctx, tx, personaID, &buf); err != nil {
 		t.Fatalf("write rows: %v", err)
 	}
-	return buf.Bytes()
+	// admission_seq is destination-allocated on import, so normalize it out
+	// of each row's data before comparing a source's rows to a destination's.
+	// The comparison decodes each row instead of matching the bundle's byte
+	// shape, so a change in how PostgreSQL renders jsonb cannot silently
+	// disable it — TestImportIntoPopulatedDestinationKeepsAdmissionOrder
+	// compares across placements whose identity values genuinely differ and
+	// fails if no carried value is normalized.
+	var out bytes.Buffer
+	for _, line := range bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n")) {
+		var row rowRecord
+		if err := strictDecode(line, &row); err != nil {
+			t.Fatalf("bundle line does not decode: %v", err)
+		}
+		if col, ok := identityCols[row.Table]; ok {
+			row.Data = replaceField(t, row.Data, col, json.RawMessage(`0`))
+		}
+		enc, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out.Write(enc)
+		out.WriteByte('\n')
+	}
+	return out.Bytes()
+}
+
+// replaceField returns data with one field's value swapped, preserving the
+// other fields byte-for-byte.
+func replaceField(t *testing.T, data json.RawMessage, name string, v json.RawMessage) json.RawMessage {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("row data is not a JSON object: %v", err)
+	}
+	if _, ok := fields[name]; !ok {
+		t.Fatalf("row data lacks field %s", name)
+	}
+	fields[name] = v
+	enc, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return enc
+}
+
+// rewriteBundleAdmissionSeqs returns a copy of bundle with each core_inputs
+// row's carried admission_seq replaced by seqs[i] in bundle order and the
+// trailer's digest recomputed over the new content, so the rewritten bundle
+// still passes import verification. It fails the test if the bundle carries
+// a different number of identity rows than len(seqs), if a rewritten row
+// does not carry the intended value, or if the result is byte-identical —
+// a change in the bundle's byte shape must never turn this into a no-op
+// that imports the original small values.
+func rewriteBundleAdmissionSeqs(t *testing.T, bundle []byte, seqs []int64) []byte {
+	t.Helper()
+	lines := bytes.Split(bundle, []byte("\n"))
+	if len(lines[len(lines)-1]) != 0 {
+		t.Fatal("bundle does not end with a newline")
+	}
+	lines = lines[:len(lines)-1]
+	var trailer Trailer
+	if err := strictDecode(lines[len(lines)-1], &trailer); err != nil || trailer.Record != "trailer" {
+		t.Fatalf("last bundle line is not a trailer: %v", err)
+	}
+	h := sha256.New()
+	var out bytes.Buffer
+	n := 0
+	for _, line := range lines[:len(lines)-1] {
+		var kind struct {
+			Record string `json:"record"`
+		}
+		if err := json.Unmarshal(line, &kind); err != nil {
+			t.Fatalf("malformed bundle line: %v", err)
+		}
+		if kind.Record == "row" {
+			var row rowRecord
+			if err := strictDecode(line, &row); err != nil {
+				t.Fatalf("row line: %v", err)
+			}
+			if col, ok := identityCols[row.Table]; ok {
+				if n >= len(seqs) {
+					t.Fatalf("bundle carries more %s.%s rows than the %d replacement values",
+						row.Table, col, len(seqs))
+				}
+				row.Data = replaceField(t, row.Data, col,
+					json.RawMessage(fmt.Sprintf("%d", seqs[n])))
+				var carried int64
+				if err := unmarshalField(row.Data, col, &carried); err != nil || carried != seqs[n] {
+					t.Fatalf("rewritten row carries %d, want %d: %v", carried, seqs[n], err)
+				}
+				var err error
+				line, err = json.Marshal(row)
+				if err != nil {
+					t.Fatal(err)
+				}
+				n++
+			}
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	if n != len(seqs) {
+		t.Fatalf("rewrote %d identity values, want %d — the bundle's row shape changed", n, len(seqs))
+	}
+	trailer.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(trailer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(tl)
+	out.WriteByte('\n')
+	if bytes.Equal(out.Bytes(), bundle) {
+		t.Fatal("rewritten bundle is byte-identical to the original — the rewrite did not apply")
+	}
+	return out.Bytes()
 }
 
 func notesWithText(t *testing.T, p placement, personaID, text string) int {
@@ -1265,9 +1381,13 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 // check refuses the move. The share-locked persona row makes the two
 // transactions serialize — no job can slip between the check and the commit.
 func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
-	ctx := context.Background()
+	// Each iteration gets its own placement, but as a subtest: a finished
+	// iteration's pool and database are dropped at once instead of twenty-
+	// four of them accumulating against the shared Postgres until the whole
+	// test cleans up.
 	for i := 0; i < 24; i++ {
 		t.Run(fmt.Sprintf("race-%d", i), func(t *testing.T) {
+			ctx := context.Background()
 			local := newPlacement(t)
 			pid := newID(t)
 			liveSecretary(t, local, pid)
@@ -1295,20 +1415,20 @@ func TestJobSubmitRacingTheSealLandsOnOneSide(t *testing.T) {
 			}
 			switch {
 			case sErr == nil && jErr == nil && queued:
-				t.Fatalf("race %d: seal committed yet the job it checked for was queued", i)
+				t.Fatalf("seal committed yet the job it checked for was queued")
 			case sErr == nil:
 				if !errors.Is(jErr, agentstate.ErrPersonaInactive) {
-					t.Fatalf("race %d: submit after seal committed: %v, want persona inactive", i, jErr)
+					t.Fatalf("submit after seal committed: %v, want persona inactive", jErr)
 				}
 				if queued {
-					t.Fatalf("race %d: refused submit left a job row", i)
+					t.Fatalf("refused submit left a job row")
 				}
 			case errors.Is(sErr, ErrUnresolvedOperations):
 				if jErr != nil || !queued {
-					t.Fatalf("race %d: seal refused for the job but submit err=%v queued=%v", i, jErr, queued)
+					t.Fatalf("seal refused for the job but submit err=%v queued=%v", jErr, queued)
 				}
 			default:
-				t.Fatalf("race %d: unexpected seal=%v submit=%v queued=%v", i, sErr, jErr, queued)
+				t.Fatalf("unexpected seal=%v submit=%v queued=%v", sErr, jErr, queued)
 			}
 		})
 	}
@@ -1494,6 +1614,214 @@ func TestInputsRacingTheSealAreCarriedOrRefused(t *testing.T) {
 	}
 	if len(exported) != len(accepted) {
 		t.Fatalf("cut has %d inputs, %d were accepted", len(exported), len(accepted))
+	}
+}
+
+// admission_seq is backed by one table-global identity sequence. The import
+// regenerates it: every staged row's value comes from the destination's own
+// nextval in bundle order, so no carried value can collide with or rewind
+// the destination's allocations, and the work is bounded by the number of
+// transferred records — a bundle carrying huge admission_seq values from a
+// long-lived source must not force a billion sequence bumps. Regression for
+// the populated-destination finding f-shared-intake-97.
+func TestImportIntoPopulatedDestinationKeepsAdmissionOrder(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+
+	seqPos := func() (int64, bool) {
+		var last int64
+		var called bool
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT last_value, is_called FROM core_inputs_admission_seq_seq`).Scan(&last, &called); err != nil {
+			t.Fatalf("sequence position: %v", err)
+		}
+		return last, called
+	}
+	globalMax := func() int64 {
+		var m int64
+		if err := cloud.pool.QueryRow(ctx,
+			`SELECT COALESCE(max(admission_seq), 0) FROM core_inputs`).Scan(&m); err != nil {
+			t.Fatalf("table max: %v", err)
+		}
+		return m
+	}
+	dupes := func() int {
+		var n int
+		if err := cloud.pool.QueryRow(ctx, `
+			SELECT count(*) FROM (
+				SELECT 1 FROM core_inputs
+				GROUP BY persona_id, admission_seq HAVING count(*) > 1) d`).Scan(&n); err != nil {
+			t.Fatalf("duplicate check: %v", err)
+		}
+		return n
+	}
+
+	// The destination already hosts a persona whose inputs outrank what the
+	// bundle will carry.
+	other := newID(t)
+	must(drop(cloud.state.EnsurePersona(ctx, other, nil, "Staying secretary")))
+	for i := 1; i <= 4; i++ {
+		submit(t, cloud, other, fmt.Sprintf("pre-%d", i), fmt.Sprintf("existing %d", i))
+	}
+
+	// The moved persona carries a smaller history.
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	submit(t, local, pid, "m-1", "first")
+	submit(t, local, pid, "m-2", "second")
+	must(local.svc.Seal(ctx, pid, "move-seq", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-seq")
+
+	// While the import runs, real admissions to the staying persona race it.
+	// The interleaving is deliberately not pinned — every interleaving must
+	// be safe, so the assertions check the outcome, not a schedule.
+	var wg sync.WaitGroup
+	subErr := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := cloud.state.SubmitInput(ctx, &agentstate.Input{
+				PersonaID: other, InputID: fmt.Sprintf("race-%d", i), Kind: "message",
+				Payload: map[string]any{"text": "racing"}, ActorKind: "human", SourceSurface: "test",
+			})
+			subErr <- err
+		}(i)
+	}
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID)
+	if err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	wg.Wait()
+	close(subErr)
+	for err := range subErr {
+		if err != nil {
+			t.Fatalf("concurrent admission during import: %v", err)
+		}
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after import", n)
+	}
+	last, _ := seqPos()
+	if last < globalMax() {
+		t.Fatalf("identity sequence at %d below table max %d after import", last, globalMax())
+	}
+	// The moved persona's claim order is the source's admission order, over
+	// destination-allocated values.
+	var order []string
+	rows, err := cloud.pool.Query(ctx,
+		`SELECT input_id FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, id)
+	}
+	rows.Close()
+	if fmt.Sprint(order) != "[m-1 m-2]" {
+		t.Fatalf("destination claim order %v, want [m-1 m-2]", order)
+	}
+	// Every other column carried verbatim across a populated destination.
+	// The source's admission_seq values (1, 2) and the destination's rebased
+	// ones genuinely differ here, so this comparison fails unless rowLines
+	// actually normalizes the identity column out of the row data.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+
+	// The next admission to the staying persona orders after everything.
+	submit(t, cloud, other, "post-import", "after the move")
+	var seq int64
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 AND input_id = 'post-import'`,
+		other).Scan(&seq); err != nil {
+		t.Fatalf("post-import seq: %v", err)
+	}
+	if seq <= last {
+		t.Fatalf("post-import admission_seq %d did not pass sequence position %d", seq, last)
+	}
+	if n := dupes(); n != 0 {
+		t.Fatalf("%d same-persona duplicate admission_seq values after post-import admission", n)
+	}
+
+	// A rejected bundle can consume at most one nextval per staged row
+	// (the digest is verified after the rows stream in) — a legal gap,
+	// never a rewind.
+	before, _ := seqPos()
+	corrupt := bytes.Clone(bundle)
+	corrupt[len(corrupt)-40] ^= 0xFF
+	if _, _, err := cloud.svc.Import(ctx, bytes.NewReader(corrupt), &humanID); err == nil {
+		t.Fatal("corrupted bundle imported")
+	}
+	if after, _ := seqPos(); after < before {
+		t.Fatalf("rejected import rewound the sequence %d -> %d", before, after)
+	}
+
+	// A bundle carrying huge admission_seq values — e.g. exported from a
+	// long-lived multi-persona source — costs a bounded number of sequence
+	// allocations: one per carried row, independent of the numeric gap.
+	// rewriteBundleAdmissionSeqs decodes each row, swaps the carried value,
+	// and recomputes the trailer digest, so the ~4e9 values below are what
+	// the importer actually checks and stages — it fails rather than degrade
+	// to a no-op if the bundle's byte shape changes.
+	big := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, big, nil, "Long-lived secretary")))
+	submit(t, local, big, "b-1", "old input")
+	submit(t, local, big, "b-2", "newer input")
+	must(local.svc.Seal(ctx, big, "move-big", placementID(t, cloud)))
+	bigBundle, _ := exportBytes(t, local, big, "move-big")
+	bigBundle = rewriteBundleAdmissionSeqs(t, bigBundle, []int64{4000000003, 4000000004})
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bigBundle), &humanID); err != nil || !created {
+		t.Fatalf("big-seq import: created=%v err=%v", created, err)
+	}
+	after, _ := seqPos()
+	if after-before > 10 {
+		t.Fatalf("import advanced the sequence by %d for a 2-row bundle — work is proportional to the numeric gap, not the data", after-before)
+	}
+	var bigSeqs []int64
+	rows, err = cloud.pool.Query(ctx,
+		`SELECT admission_seq FROM core_inputs WHERE persona_id = $1 ORDER BY admission_seq`, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var s int64
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		bigSeqs = append(bigSeqs, s)
+	}
+	rows.Close()
+	if len(bigSeqs) != 2 || bigSeqs[0] < 1 || bigSeqs[1] <= bigSeqs[0] || bigSeqs[0] > 4000000000 {
+		t.Fatalf("rebased admission_seqs %v: want fresh small values in source order", bigSeqs)
+	}
+
+	// An empty carried persona (no inputs at all) consumes nothing.
+	empty := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, empty, nil, "Empty secretary")))
+	must(local.svc.Seal(ctx, empty, "move-empty", placementID(t, cloud)))
+	emptyBundle, _ := exportBytes(t, local, empty, "move-empty")
+	before, _ = seqPos()
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(emptyBundle), &humanID); err != nil || !created {
+		t.Fatalf("empty import: created=%v err=%v", created, err)
+	}
+	if after, _ := seqPos(); after != before {
+		t.Fatalf("empty import moved the sequence %d -> %d", before, after)
+	}
+
+	// The staying persona still passes the cut's own integrity checks — its
+	// admission order was never corrupted.
+	if _, err := cloud.svc.Seal(ctx, other, "move-away", placementID(t, local)); err != nil {
+		t.Fatalf("seal of pre-existing destination persona after import: %v", err)
 	}
 }
 

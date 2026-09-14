@@ -4,8 +4,9 @@ import {
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
   estTextTokens,
   evictToBudget,
-  renderedViewTokens,
+  inputMarker,
   renderJournalContext,
+  renderedViewTokens,
   runMemoryPreparation,
 } from "./memory.ts";
 import {
@@ -1263,19 +1264,35 @@ const SYSTEM =
   "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
   "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
+  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
 function inputReceivedEvent(input: Input, turn: Turn): EventInput {
+  const p = input.payload as Record<string, unknown>;
+  const actor = (p.actor ?? {}) as Record<string, unknown>;
+  const place = (p.place ?? {}) as Record<string, unknown>;
   return {
     kind: "input_received",
     payload: {
       input_id: input.input_id,
       kind: input.kind,
-      text: typeof input.payload.text === "string" ? input.payload.text : null,
+      text: typeof p.text === "string" ? p.text : null,
       actor_kind: input.actor_kind,
+      actor_id: input.actor_id || null,
+      actor_display:
+        typeof actor.display_name === "string" ? actor.display_name : null,
       source_surface: input.source_surface,
+      thread_id: input.thread_id || null,
+      place_name: typeof place.name === "string" ? place.name : null,
+      place_kind: typeof place.kind === "string" ? place.kind : null,
+      attention: input.attention,
+      occurred_at: input.occurred_at,
+      event_id: typeof p.event_id === "string" ? p.event_id : null,
+      message_id: typeof p.message_id === "string" ? p.message_id : null,
+      message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
+      reason: typeof p.reason === "string" ? p.reason : null,
       attempt: turn.attempt,
     },
   };
@@ -1297,14 +1314,25 @@ export function assemble(
     { role: "system", content: SYSTEM },
     ...renderJournalContext(context, memory, omitted, memoryOmitted),
   ];
+  const p = input.payload as Record<string, unknown>;
   const text =
-    typeof input.payload.text === "string"
-      ? input.payload.text
+    typeof p.text === "string" && p.text !== ""
+      ? p.text
       : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"
-      : `[${input.actor_kind}]`;
+      : inputMarker({
+          actorKind: input.actor_kind,
+          actorName: (p.actor as Record<string, unknown> | undefined)
+            ?.display_name,
+          surface: input.source_surface,
+          placeId: input.thread_id,
+          placeName: (p.place as Record<string, unknown> | undefined)?.name,
+          placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
+          messageId: p.message_id,
+          attention: input.attention,
+        });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
 }

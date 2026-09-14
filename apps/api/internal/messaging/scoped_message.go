@@ -10,39 +10,50 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Message, bool, error) {
-	if in.Author != (ParticipantRef{}) && in.Author != s.Scope.Actor {
-		return Message{}, false, errors.New("message author must come from authenticated scope")
-	}
-	in.Author = s.Scope.Actor
+// normalizeAppendInput applies the admission-time request rules every send
+// path shares — transports and the core messaging.send effect alike — so a
+// delegated send cannot reach the table with an un-normalized urgency or
+// content the deferred trigger would reject at commit.
+func normalizeAppendInput(in *AppendInput) error {
 	switch in.Urgency {
 	case "":
 		in.Urgency = UrgencyNormal
 	case UrgencyUrgent, UrgencyNormal, UrgencyFYI:
 	default:
-		return Message{}, false, fmt.Errorf("unknown urgency %q", in.Urgency)
+		return fmt.Errorf("unknown urgency %q", in.Urgency)
 	}
 	if in.Poll != nil && len(in.AttachmentIDs) != 0 {
-		return Message{}, false, fmt.Errorf("%w: polls cannot carry attachments in v0", ErrInvalidPoll)
+		return fmt.Errorf("%w: polls cannot carry attachments in v0", ErrInvalidPoll)
 	}
 	// Empty text is valid only when at least one attachment or a poll binds; the
 	// deferred database trigger enforces the same rule at commit.
 	if in.Content == "" && len(in.AttachmentIDs) == 0 && in.Poll == nil {
-		return Message{}, false, errors.New("content must not be empty")
+		return errors.New("content must not be empty")
 	}
 	if !messageContentFitsStorage(in.Content) {
-		return Message{}, false, fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
+		return fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
 	}
 	if len(in.AttachmentIDs) > MaxAttachmentsPerMessage {
-		return Message{}, false, ErrTooManyAttachments
+		return ErrTooManyAttachments
 	}
 	if in.Poll != nil {
 		if err := in.Poll.validateFields(); err != nil {
-			return Message{}, false, err
+			return err
 		}
 	}
 	if !clientNonceValid(in.ClientNonce) {
-		return Message{}, false, errors.New("client nonce must be 1..128 bytes")
+		return errors.New("client nonce must be 1..128 bytes")
+	}
+	return nil
+}
+
+func (s *ScopedStore) AppendMessage(ctx context.Context, in AppendInput) (Message, bool, error) {
+	if in.Author != (ParticipantRef{}) && in.Author != s.Scope.Actor {
+		return Message{}, false, errors.New("message author must come from authenticated scope")
+	}
+	in.Author = s.Scope.Actor
+	if err := normalizeAppendInput(&in); err != nil {
+		return Message{}, false, err
 	}
 	message, created, err := s.appendScopedOnce(ctx, in)
 	if err == nil || !isUniqueViolation(err) {
@@ -105,6 +116,21 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		return Message{}, false, fmt.Errorf("begin scoped append: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	message, created, err := s.appendScopedInTx(ctx, tx, in)
+	if err != nil {
+		return Message{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Message{}, false, fmt.Errorf("commit scoped append: %w", err)
+	}
+	return message, created, nil
+}
+
+// appendScopedInTx is the commit body of appendScopedOnce on a caller-owned
+// transaction. The core reply effect uses it so a secretary's message, its
+// seq, and its notification intents share the operation-claim transaction —
+// record and effect are atomic. The caller owns commit and rollback.
+func (s *ScopedStore) appendScopedInTx(ctx context.Context, tx pgx.Tx, in AppendInput) (Message, bool, error) {
 	actorMembership, err := s.authorizeMutationInTx(ctx, tx)
 	if err != nil {
 		return Message{}, false, err
@@ -125,9 +151,6 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 		}
 		if !requestMatchesReplay(in, digest) {
 			return Message{}, false, ErrIdempotencyConflict
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return Message{}, false, fmt.Errorf("commit idempotent scoped append: %w", err)
 		}
 		return existing, false, nil
 	}
@@ -218,9 +241,6 @@ func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Mes
 	// post-commit/best-effort, but authoritative recipient intent never is.
 	if err := s.issueScopedNotificationIntents(ctx, tx, place, message, members); err != nil {
 		return Message{}, false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Message{}, false, fmt.Errorf("commit scoped append: %w", err)
 	}
 	return message, true, nil
 }

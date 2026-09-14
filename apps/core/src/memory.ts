@@ -113,6 +113,50 @@ export function memoryBlockMessage(block: MemoryBlock): ChatMessage {
   };
 }
 
+export type InputProvenance = {
+  actorKind: string;
+  actorName: unknown;
+  surface: string;
+  placeId: unknown;
+  placeName: unknown;
+  placeKind: unknown;
+  messageId: unknown;
+  attention: string;
+};
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * Render the "[who in where]" marker prefixing an input's text in model
+ * context and in the current input. Provenance stays inside one bracket pair
+ * (names are stripped of brackets) so directive-style content still parses
+ * first. A Messaging input names the place_id and message_id the secretary
+ * needs to answer there through messaging.send — without them a real model
+ * could see who spoke but not address a reply. The attention hint is part of
+ * the marker — it informs, never mandates.
+ */
+export function inputMarker(p: InputProvenance): string {
+  const clean = (s: string) => s.replace(/[[\]]/g, "");
+  const name = clean(str(p.actorName));
+  const who = name ? `${name} (${p.actorKind})` : p.actorKind;
+  const placeLabel = clean(str(p.placeName)) || str(p.placeKind);
+  const where = placeLabel ? ` in ${placeLabel}` : "";
+  const refs =
+    p.surface === "messaging"
+      ? [
+          str(p.placeId) && ` place_id=${str(p.placeId)}`,
+          str(p.messageId) && ` message_id=${str(p.messageId)}`,
+        ].join("")
+      : "";
+  const hint =
+    p.attention === "observe"
+      ? " — fyi, no reply needed"
+      : p.attention === "defer"
+        ? " — deferred"
+        : "";
+  return `[${who}${where}${refs}${hint}]`;
+}
+
 /** Map one journal event to the model-visible message, or null for kinds
  * with no context rendering (e.g. internal bookkeeping). */
 export function eventMessage(ev: Event): ChatMessage | null {
@@ -122,7 +166,16 @@ export function eventMessage(ev: Event): ChatMessage | null {
       const who =
         p.actor_kind === "schedule"
           ? "[scheduled wake]"
-          : `[${String(p.actor_kind)}]`;
+          : inputMarker({
+              actorKind: String(p.actor_kind),
+              actorName: p.actor_display,
+              surface: str(p.source_surface),
+              placeId: p.thread_id,
+              placeName: p.place_name,
+              placeKind: p.place_kind,
+              messageId: p.message_id,
+              attention: str(p.attention),
+            });
       return { role: "user", content: `${who} ${String(p.text ?? "")}` };
     }
     case "assistant_message":

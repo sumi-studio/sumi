@@ -33,15 +33,20 @@ type AgentAttentionEvent struct {
 	MessageID          string              `json:"message_id"`
 	// ReplyRequired is an outbox-only authorization condition. DM/mention
 	// delivery does not depend on the continued existence of the parent.
-	ReplyRequired    bool                        `json:"reply_required,omitempty"`
-	ReplyToMessageID string                      `json:"reply_to_message_id,omitempty"`
-	MessageRevision  int64                       `json:"message_revision"`
-	MessageSeq       int64                       `json:"message_seq"`
-	OccurredAt       time.Time                   `json:"occurred_at"`
-	Content          string                      `json:"content"`
-	MarkerID         string                      `json:"marker_id,omitempty"`
-	DueAt            *time.Time                  `json:"due_at,omitempty"`
-	PollVote         *AgentAttentionPollVoteData `json:"poll_vote,omitempty"`
+	ReplyRequired    bool   `json:"reply_required,omitempty"`
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	// Reason is the notification rule that selected this recipient
+	// (dm/mention/keyword/all). It rides along so the delivery adapter can
+	// carry the same attention hint into the core input — it is a hint about
+	// how strongly the message asks for a response, not a mandate to answer.
+	Reason          string                      `json:"reason,omitempty"`
+	MessageRevision int64                       `json:"message_revision"`
+	MessageSeq      int64                       `json:"message_seq"`
+	OccurredAt      time.Time                   `json:"occurred_at"`
+	Content         string                      `json:"content"`
+	MarkerID        string                      `json:"marker_id,omitempty"`
+	DueAt           *time.Time                  `json:"due_at,omitempty"`
+	PollVote        *AgentAttentionPollVoteData `json:"poll_vote,omitempty"`
 }
 
 // The frozen complete selection at one poll revision, in poll display order.
@@ -126,6 +131,7 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 	}
 	event := s.attentionEvent(place, message, message.Author, authorName)
 	event.Kind, event.PersonalityAgentID = AgentAttentionMessage, decision.Participant.ID
+	event.Reason = decision.Reason
 	if mentioned && decision.Reason != NotifyReasonDM {
 		event.Kind = AgentAttentionMention
 	}
@@ -190,6 +196,7 @@ func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Plac
 		// Any independently selected notification still belongs to the recipient
 		// if the quoted parent disappears before delivery (all/keyword included).
 		event.ReplyRequired = false
+		event.Reason = decision.Reason
 		if decision.Reason != NotifyReasonDM {
 			for _, mention := range message.Mentions {
 				if mention == parent.Author {
