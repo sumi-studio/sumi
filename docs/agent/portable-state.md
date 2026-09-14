@@ -93,7 +93,11 @@ evidence, so no lost response, retry or partition creates two writers:
   the seal fenced, so the seal returns it to `sealed` and clears
   `claimed_generation`/`claimed_at`/`not_before` before the cut. A bundle
   carrying a claim, a chunk range outside the carried journal, or an
-  impossible range is refused at import. On the destination the memory
+  impossible range is refused at import. So is a lifecycle row that cannot
+  render — `applied`/`prepared` must carry replacement text and its estimate
+  (a `kept` verdict carries both or neither), and sequence, token and counter
+  columns only ever carry non-negative values (`chunk_seq`/`layer` start at
+  1; higher layers are future consolidation, not corruption). On the destination the memory
   lifecycle continues ordinarily: `sealed` ranges (including a normalized
   one) wait for their pacing and are claimed by the destination's writer, a
   `prepared` candidate applies when live raw exceeds the limit, and the
@@ -136,8 +140,12 @@ evidence, so no lost response, retry or partition creates two writers:
   enforce: input↔turn, event/operation↔turn, operation↔recorded plan position,
   running turn↔claimed input, wake input↔schedule, outbox↔turn/input,
   contiguous journal and outbox sequences, no generation at or above the
-  cut epoch, no carried memory chunk holding a live claim, and every chunk
-  range inside the carried journal.
+  cut epoch, no carried memory chunk holding a live claim, every chunk
+  range inside the carried journal, the lifecycle payload and scalar
+  invariants above, and the `received_seq` markers: a non-NULL marker must
+  name that input's own `input_received` event in the carried journal, and
+  every journaled `input_received` must be the one its input points at —
+  otherwise the destination would drop the real event or journal it twice.
 
 ## Secrets
 

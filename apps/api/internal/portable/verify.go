@@ -92,6 +92,51 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE c.persona_id = $1 AND (
 			c.first_seq < 1
 			OR c.last_seq > (SELECT COALESCE(max(seq), 0) FROM core_events WHERE persona_id = $1))`},
+	// The lifecycle's own payload invariants: a prepared/applied row only
+	// ever exists with replacement text and its estimate — the renderer scans
+	// both into non-nullable fields, so a NULL there would fail every context
+	// load on the destination. 'kept' allows either shape the store writes —
+	// keep-unchanged (both NULL) or a non-shrinking text (both set) — but not
+	// one without the other. Missing timestamps are not corruption.
+	{"memory_chunk_missing_payload", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			(c.status IN ('prepared','applied')
+				AND (c.replacement IS NULL OR c.replacement_est_tokens IS NULL))
+			OR (c.status = 'kept'
+				AND (c.replacement IS NULL) <> (c.replacement_est_tokens IS NULL)))`},
+	// Sequence numbers, token estimates and counters are semantic values the
+	// store only ever produces positive or zero: chunk_seq/layer start at 1,
+	// estimates and attempt/interruption counts are >= 0. A negative value is
+	// a crafted row that corrupts ordering and the live-raw accounting; a
+	// layer above 1 is *not* invalid — consolidation layers are future work.
+	{"memory_chunk_negative_values", `
+		SELECT count(*) FROM core_memory_chunks c
+		WHERE c.persona_id = $1 AND (
+			c.chunk_seq < 1 OR c.layer < 1 OR c.est_tokens < 0
+			OR c.replacement_est_tokens < 0 OR c.attempts < 0 OR c.interruptions < 0)`},
+	// received_seq is the causal-dedup pointer: it must name this input's own
+	// carried input_received event. A marker that dangles, points at another
+	// kind, or names another input's event makes the destination skip
+	// journaling the real input_received — the input's original record would
+	// be silently absent from the journal it moves with.
+	{"input_received_seq_mismatch", `
+		SELECT count(*) FROM core_inputs i
+		WHERE i.persona_id = $1 AND i.received_seq IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM core_events e
+			WHERE e.persona_id = i.persona_id AND e.seq = i.received_seq
+				AND e.kind = 'input_received'
+				AND e.payload->>'input_id' = i.input_id)`},
+	// The reverse link: an input_received already in the journal must be the
+	// one its input points at. A missing or mismatched marker would let the
+	// destination journal the same input a second time. A queued or claimed
+	// input with no journaled event legitimately keeps NULL.
+	{"input_received_seq_not_linked", `
+		SELECT count(*) FROM core_events e
+		JOIN core_inputs i ON i.persona_id = e.persona_id
+			AND i.input_id = e.payload->>'input_id'
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND (i.received_seq IS NULL OR i.received_seq <> e.seq)`},
 	{"journal_seq_not_contiguous", `
 		SELECT CASE WHEN count(*) = COALESCE(max(seq), 0) AND COALESCE(min(seq), 1) >= 1 THEN 0 ELSE 1 END
 		FROM core_events WHERE persona_id = $1`},

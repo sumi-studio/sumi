@@ -205,13 +205,21 @@ export class FakeState implements StateClient {
   private commits = new Map<string, CommitRequest>();
   /** Seq of each input's one input_received event (core_inputs.received_seq). */
   private receivedSeq = new Map<string, number>();
-  private seq = 0;
-  private outboxSeq = 0;
+  /** Per-persona seqs — Go allocates MAX(seq)+1 per persona for both
+   *  core_events and core_outbox, so a second persona starts at 1. */
+  private seq = new Map<string, number>();
+  private outboxSeq = new Map<string, number>();
   /** Next chunk_seq per persona — matches MAX(chunk_seq) WHERE persona_id. */
   private chunkSeq = new Map<string, number>();
 
   private key(persona: string, tool: string, idem: string) {
     return `${persona}|${tool}|${idem}`;
+  }
+
+  private nextSeq(map: Map<string, number>, persona: string) {
+    const next = (map.get(persona) ?? 0) + 1;
+    map.set(persona, next);
+    return next;
   }
 
   private mustHold(persona: string, generation: number) {
@@ -632,7 +640,7 @@ export class FakeState implements StateClient {
       ) {
         continue;
       }
-      const seq = ++this.seq;
+      const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
         persona_id: persona,
         seq,
@@ -659,7 +667,7 @@ export class FakeState implements StateClient {
       input.done_at = new Date().toISOString();
       this.outboxEntries.push({
         persona_id: persona,
-        seq: ++this.outboxSeq,
+        seq: this.nextSeq(this.outboxSeq, persona),
         kind: "turn_completed",
         payload: {
           turn_id: turnId,
@@ -690,7 +698,7 @@ export class FakeState implements StateClient {
         // requester — the failure itself is the reply.
         this.outboxEntries.push({
           persona_id: persona,
-          seq: ++this.outboxSeq,
+          seq: this.nextSeq(this.outboxSeq, persona),
           kind: "turn_failed",
           payload: {
             turn_id: turnId,
@@ -883,7 +891,7 @@ export class FakeState implements StateClient {
       this.ensureInputReceived(persona, turn);
       const ev: Event = {
         persona_id: persona,
-        seq: ++this.seq,
+        seq: this.nextSeq(this.seq, persona),
         turn_id: op.turnId,
         kind: "note",
         payload: { text: op.request.text },
@@ -1459,7 +1467,7 @@ export class FakeState implements StateClient {
       (i) => i.persona_id === persona && i.input_id === turn.input_id,
     );
     if (!input) throw new Error("turn input missing");
-    const seq = ++this.seq;
+    const seq = this.nextSeq(this.seq, persona);
     this.eventLog.push({
       persona_id: persona,
       seq,

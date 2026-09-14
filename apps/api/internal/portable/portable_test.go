@@ -677,9 +677,51 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 		pid).Scan(&sealedChunks); err != nil || sealedChunks != 1 {
 		t.Fatalf("sealed chunks %d err %v, want 1", sealedChunks, err)
 	}
+	// A queued input carries received_seq NULL — the legitimate unjournaled
+	// state that must survive the marker checks.
+	submit(t, local, pid, "m-3", "queued")
 
 	must(local.svc.Seal(ctx, pid, "move-badmem", placementID(t, cloud)))
 	bundle, _ := exportBytes(t, local, pid, "move-badmem")
+
+	// mutRow rewrites the data object of every row of table whose data
+	// matches; rebundle then recomputes the content digest. Every case below
+	// is therefore a crafted/recomputed-digest bundle — state an honest
+	// store cannot emit — which is exactly the class verifyCut exists for.
+	mutRow := func(table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
+		return func(line string) string {
+			var rec map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				return line
+			}
+			var name string
+			if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
+				return line
+			}
+			var data map[string]any
+			if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
+				return line
+			}
+			mutate(data)
+			raw, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec["data"] = raw
+			out, err := json.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(out) + "\n"
+		}
+	}
+	chunkRow := func(d map[string]any) bool { return d["chunk_seq"] != nil }
+	inputRow := func(id string) func(map[string]any) bool {
+		return func(d map[string]any) bool { return d["input_id"] == id }
+	}
+	set := func(k string, v any) func(map[string]any) {
+		return func(d map[string]any) { d[k] = v }
+	}
 
 	cases := map[string]struct {
 		fn   func(line string) string
@@ -704,6 +746,41 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 			}
 			return strings.Replace(line, `"status": "sealed"`, `"status": "bogus"`, 1)
 		}, ""},
+		// f70/F-B1: a prepared/applied row without replacement text (or its
+		// estimate) stages today and bricks every destination LoadTurn on the
+		// appliedBlocks scan; the prepared shape is latent until maintain
+		// applies it. kept is checked separately: keep-unchanged stores both
+		// NULL, non-shrinking keeps both set — one without the other is not a
+		// row the store writes.
+		"applied without replacement": {mutRow("core_memory_chunks", chunkRow,
+			set("status", "applied")), "memory_chunk_missing_payload"},
+		"prepared without replacement": {mutRow("core_memory_chunks", chunkRow,
+			set("status", "prepared")), "memory_chunk_missing_payload"},
+		"kept text without estimate": {mutRow("core_memory_chunks", chunkRow, func(d map[string]any) {
+			d["status"] = "kept"
+			d["replacement"] = "condensed"
+		}), "memory_chunk_missing_payload"},
+		// f71/F2: negative sequence/counter values corrupt ordering and the
+		// live-raw accounting while staging cleanly.
+		"negative chunk_seq": {mutRow("core_memory_chunks", chunkRow,
+			set("chunk_seq", -7)), "memory_chunk_negative_values"},
+		"negative est_tokens": {mutRow("core_memory_chunks", chunkRow,
+			set("est_tokens", -900000)), "memory_chunk_negative_values"},
+		"layer zero": {mutRow("core_memory_chunks", chunkRow,
+			set("layer", 0)), "memory_chunk_negative_values"},
+		// F-B2: received_seq that dangles, names the wrong kind, or names
+		// another input's event would make the destination skip journaling
+		// this input's input_received — its original record silently lost.
+		"received_seq another input's event": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", 1)), "input_received_seq_mismatch"},
+		"received_seq wrong kind": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", 2)), "input_received_seq_mismatch"},
+		"received_seq dangling on queued input": {mutRow("core_inputs", inputRow("m-3"),
+			set("received_seq", 99)), "input_received_seq_mismatch"},
+		// The reverse link: m-2's input_received exists in the journal, so a
+		// missing marker would let the destination journal it a second time.
+		"received_seq marker removed": {mutRow("core_inputs", inputRow("m-2"),
+			set("received_seq", nil)), "input_received_seq_not_linked"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -722,6 +799,18 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	}
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
+	}
+	// Bounds are floors, not a layer policy: a future consolidation layer and
+	// the queued input's NULL marker must still cross. Re-address the mutated
+	// bundle to a second placement since the first already holds this
+	// transfer under the clean digest.
+	cloud2 := newPlacement(t)
+	higherLayer := rebundle(t, bundle, func(line string) string {
+		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
+		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
+	})
+	if _, created, err := cloud2.svc.Import(ctx, bytes.NewReader(higherLayer), nil); err != nil || !created {
+		t.Fatalf("layer-2 chunk refused: created=%v err=%v", created, err)
 	}
 }
 
