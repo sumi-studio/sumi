@@ -544,6 +544,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 type PreparationOutcome =
   | { kind: "prepared"; replacement: string }
   | { kind: "kept" }
+  | { kind: "unavailable"; reason: string }
   | { kind: "failed"; error: string; retryable: boolean };
 
 /**
@@ -572,6 +573,14 @@ async function recordMemoryOutcome(
           keepUnchanged: true,
         });
         log("memory preparation kept originals", { chunk_seq: chunkSeq });
+      } else if (outcome.kind === "unavailable") {
+        await state.reshelveMemoryChunk(personaId, generation, chunkSeq, {
+          reason: outcome.reason,
+        });
+        log("memory preparation paused: model unavailable", {
+          chunk_seq: chunkSeq,
+          reason: outcome.reason,
+        });
       } else {
         await state.failMemoryChunk(personaId, generation, chunkSeq, {
           error: outcome.error,
@@ -663,7 +672,10 @@ async function* untilAborted(
  * recorded on the chunk (retryable failures — provider errors, a stream that
  * ends incomplete, truncated or empty output, the timeout — return it to the
  * shelf with backoff; a spent budget marks it 'failed', visible rather than
- * silently skipped). A stop or fence loss records nothing.
+ * silently skipped). A model layer that cannot produce a request at all —
+ * an unbound selection, a missing credential — is a pause, not a verdict:
+ * the work waits, unclaimed or reshelved with its budgets intact, until a
+ * usable binding exists. A stop or fence loss records nothing.
  */
 export async function runMemoryPreparation(
   deps: MemoryPreparationDeps,
@@ -672,6 +684,24 @@ export async function runMemoryPreparation(
   const log = deps.log ?? (() => {});
   // A stopped or fenced writer claims nothing and spends no model call.
   if (deps.signal?.aborted) return;
+  // Binding preflight: an unusable selection (post-transfer
+  // needs_rebinding, "none", a missing credential, a selection lookup
+  // outage) pauses the work instead of letting a claim reach the model
+  // layer's refusal. Anything not marked unavailable falls through and
+  // the real call classifies it. The call-time path still handles the
+  // same error — the binding can die between this check and the stream.
+  if (provider.probe) {
+    try {
+      await provider.probe();
+    } catch (e) {
+      if (e instanceof ModelError && e.unavailable) {
+        log("memory preparation paused: model unavailable", {
+          reason: e.message.slice(0, 4 * 1024),
+        });
+        return;
+      }
+    }
+  }
   const claimed = await state.claimMemoryChunk(
     personaId,
     generation,
@@ -733,6 +763,18 @@ export async function runMemoryPreparation(
   }
   if (streamError !== null) {
     const e = streamError;
+    // An unusable binding refused before any request was evaluated — a
+    // placement condition, not a verdict on the chunk (a transferred
+    // secretary is needs_rebinding until its human binds a connection).
+    // The claim returns to the shelf with its attempt budget intact so
+    // the same work proceeds once a usable binding exists.
+    if (e instanceof ModelError && e.unavailable) {
+      await recordMemoryOutcome(deps, chunk.chunk_seq, {
+        kind: "unavailable",
+        reason: `model: ${e.message.slice(0, 4 * 1024)}`,
+      });
+      return;
+    }
     // A capacity refusal is deterministic even when the provider framed it
     // retryable: the preparation sends the identical target again, which
     // can never succeed — the chunk records a terminal failure (its

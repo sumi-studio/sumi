@@ -630,6 +630,64 @@ func TestMemoryRetryBackoffThenExhaust(t *testing.T) {
 	}
 }
 
+// A model layer that cannot produce a request — an unbound selection, a
+// missing credential, a binding-lookup outage — is a placement condition,
+// not a preparation outcome: the claim returns to the shelf without a
+// verdict and without spending attempts or interruptions, so the same
+// chunk proceeds once a usable binding exists.
+func TestMemoryReshelveKeepsWork(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	seedSealed(t, s, pa, gen, 2)
+	claimed, _ := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if claimed.Chunk == nil {
+		t.Fatal("claim")
+	}
+	c, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "model: selection needs a destination binding")
+	if err != nil {
+		t.Fatalf("reshelve: %v", err)
+	}
+	if c.Status != "sealed" || c.Attempts != 0 || c.Interruptions != 0 {
+		t.Fatalf("reshelve spent verdict budget: %+v", c)
+	}
+	if c.ClaimedGeneration != nil || c.ClaimedAt != nil {
+		t.Fatalf("reshelved chunk still claimed: %+v", c)
+	}
+	if c.LastError == nil || *c.LastError == "" {
+		t.Fatal("reshelve should record the reason for visibility")
+	}
+	if c.NotBefore == nil || !c.NotBefore.After(time.Now()) {
+		t.Fatalf("reshelved chunk should be paced: %+v", c)
+	}
+	// While paced it is not claimable — a persistent unbound window does
+	// not spin claim/reshelve inside one tick.
+	if n, err := s.ClaimMemoryChunk(ctx, pa, gen, 50); err != nil || n.Chunk != nil {
+		t.Fatalf("paced chunk claimed: %+v", n.Chunk)
+	}
+	// The same work proceeds once a usable binding exists — no verdict,
+	// no spent attempt, nothing lost.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = NULL WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("clear pacing: %v", err)
+	}
+	again, err := s.ClaimMemoryChunk(ctx, pa, gen, 50)
+	if err != nil || again.Chunk == nil || again.Chunk.ChunkSeq != 1 {
+		t.Fatalf("reclaim after reshelve: %+v", again.Chunk)
+	}
+	if _, err := s.CompleteMemoryChunk(ctx, pa, gen, 1, "prepared text", false); err != nil {
+		t.Fatalf("complete after reshelve: %v", err)
+	}
+	// A reshelve against a chunk that is not this generation's live claim
+	// is a conflict — the shelf is never rewritten under the wrong claim.
+	if _, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "not claimed"); !errors.Is(err, ErrMemoryConflict) {
+		t.Fatalf("reshelve of unclaimed chunk: %v, want ErrMemoryConflict", err)
+	}
+}
+
 func TestMemoryKeepUnchanged(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()

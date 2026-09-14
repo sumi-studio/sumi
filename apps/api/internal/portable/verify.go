@@ -262,6 +262,29 @@ var cutChecks = []struct{ name, sql string }{
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND c.status = 'superseded'
 			AND NOT EXISTS (SELECT 1 FROM covered cov WHERE cov.seq = c.chunk_seq)`},
+	// Coverage is disjoint. The seal walk allocates each L1 range exactly
+	// once and even a failed verdict keeps its range covered, so two L1
+	// rows never share a journal seq — a second L1 over already-covered
+	// seqs (over superseded originals, for example) is crafted state that
+	// the destination's own pipeline could later apply into real overlap.
+	{"memory_chunk_l1_overlap", `
+		SELECT count(*) FROM core_memory_chunks a
+		JOIN core_memory_chunks b ON b.persona_id = a.persona_id
+			AND b.chunk_seq <> a.chunk_seq AND b.layer = 1
+			AND b.first_seq <= a.last_seq AND b.last_seq >= a.first_seq
+		WHERE a.persona_id = $1 AND a.layer = 1`},
+	// Only 'applied' rows render: two applied rows sharing a seq
+	// double-render it. Applying a target supersedes exactly its sources
+	// in one transaction, so the pipeline's applied set is always
+	// disjoint. Dead rows (kept/failed) and in-flight targets legitimately
+	// overlap live coverage — a regrouped retry shares range with the
+	// verdict it replaced — so the rule binds 'applied' rows only.
+	{"memory_chunk_applied_overlap", `
+		SELECT count(*) FROM core_memory_chunks a
+		JOIN core_memory_chunks b ON b.persona_id = a.persona_id
+			AND b.chunk_seq <> a.chunk_seq AND b.status = 'applied'
+			AND b.first_seq <= a.last_seq AND b.last_seq >= a.first_seq
+		WHERE a.persona_id = $1 AND a.status = 'applied'`},
 	// Chunk ranges are locators into the carried journal; a range that
 	// reaches past it would render a fragment for records that do not
 	// exist.

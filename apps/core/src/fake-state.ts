@@ -100,6 +100,8 @@ const L0_LIVE_LIMIT_TOKENS = 40_000;
 const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 /** Claims ending without a recorded outcome before a chunk is marked failed. */
 const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
+/** Go memoryReshelvePacing: shelf delay after an unavailable model layer. */
+const MEMORY_RESHELVE_PACING_MS = 200;
 /** Estimated tokens of applied memory blocks admitted into one context. */
 const MEMORY_SEND_CAP_TOKENS = 25_000;
 /** Applied L1 beyond this triggers an L1→L2 consolidation target. */
@@ -201,7 +203,7 @@ export const TOOL_AUTHORITY: Record<
   "job.status": { requiresApproval: false, elevatedOnly: false },
   "job.cancel": { requiresApproval: false, elevatedOnly: false },
   "message.send": { requiresApproval: false, elevatedOnly: true },
-  "conversation_history": { requiresApproval: false, elevatedOnly: false },
+  conversation_history: { requiresApproval: false, elevatedOnly: false },
 };
 
 // Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
@@ -290,7 +292,11 @@ function actionDigest(tool: string, route: string, request: Json): string {
   );
 }
 
-function approvalId(persona: string, inputId: string, callIndex: number): string {
+function approvalId(
+  persona: string,
+  inputId: string,
+  callIndex: number,
+): string {
   return `appr-${fakeDigest(`${persona}\x00${inputId}\x00${callIndex}`)}`;
 }
 
@@ -310,7 +316,10 @@ export class FakeState implements StateClient {
       authority: string;
       transfer_id: string | null;
       /** Carried non-secret model intent (Go core_personas.model_intent). */
-      model_intent: { kind: string; connection?: Record<string, unknown> } | null;
+      model_intent: {
+        kind: string;
+        connection?: Record<string, unknown>;
+      } | null;
     }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
@@ -938,7 +947,9 @@ export class FakeState implements StateClient {
       // it directly.
       turn.status = "awaiting";
       const pending = [...this.approvals.values()].filter(
-        (a) => a.persona_id === persona && a.input_id === input.input_id &&
+        (a) =>
+          a.persona_id === persona &&
+          a.input_id === input.input_id &&
           a.status === "pending",
       );
       if (pending.length === 0) {
@@ -1027,7 +1038,11 @@ export class FakeState implements StateClient {
       callIndex: number;
       request: Record<string, unknown>;
     },
-  ): Promise<{ operation: Operation; approval: Approval | null; fresh: boolean }> {
+  ): Promise<{
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  }> {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish. Go's claimableTool is
@@ -1095,7 +1110,13 @@ export class FakeState implements StateClient {
         return { operation: existing, approval: null, fresh: true };
       }
       if (existing.status === "awaiting_approval") {
-        return this.claimGated(persona, turn.input_id, op.callIndex, existing, false);
+        return this.claimGated(
+          persona,
+          turn.input_id,
+          op.callIndex,
+          existing,
+          false,
+        );
       }
       // A replayed job.* receipt carries the job's state now next to the
       // original result (Go withCurrentJobTx); the stored receipt stays.
@@ -1201,7 +1222,13 @@ export class FakeState implements StateClient {
       return { operation, approval: null, fresh: true };
     }
     try {
-      this.applyInternal(persona, turn.input_id, op.callIndex, op.turnId, operation);
+      this.applyInternal(
+        persona,
+        turn.input_id,
+        op.callIndex,
+        op.turnId,
+        operation,
+      );
     } catch (e) {
       // Go's claim transaction rolls back on an execution error — the
       // row must not survive as a replayable receipt (review f42).
@@ -1271,7 +1298,10 @@ export class FakeState implements StateClient {
   ): { operation: Operation; approval: Approval | null; fresh: boolean } {
     const appr = this.approvalFor(persona, inputId, callIndex);
     if (!appr) {
-      throw new StateError(500, `approval record missing for ${op.operation_id}`);
+      throw new StateError(
+        500,
+        `approval record missing for ${op.operation_id}`,
+      );
     }
     if (appr.status === "pending") {
       return { operation: op, approval: appr, fresh: freshInsert };
@@ -1464,7 +1494,10 @@ export class FakeState implements StateClient {
     operation.completed_at = new Date().toISOString();
   }
 
-  async listApprovals(persona: string, approvalId?: string): Promise<Approval[]> {
+  async listApprovals(
+    persona: string,
+    approvalId?: string,
+  ): Promise<Approval[]> {
     const all = [...this.approvals.values()].filter(
       (a) => a.persona_id === persona,
     );
@@ -1487,7 +1520,10 @@ export class FakeState implements StateClient {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<Approval> {
-    if (decision.decision !== "approve_once" && decision.decision !== "deny_once") {
+    if (
+      decision.decision !== "approve_once" &&
+      decision.decision !== "deny_once"
+    ) {
       throw new StateError(400, "decision must be approve_once or deny_once");
     }
     // Go F3: decision_id is the command's idempotent identity — an empty
@@ -2308,6 +2344,39 @@ export class FakeState implements StateClient {
       c.status = "failed";
       c.not_before = null;
     }
+    return c;
+  }
+
+  /**
+   * Go ReshelveMemoryChunk: the model layer was unavailable before any
+   * request was evaluated, so the claim records no verdict and spends
+   * neither attempts nor interruptions; a short pacing keeps a
+   * persistent outage from claiming every tick.
+   */
+  async reshelveMemoryChunk(
+    persona: string,
+    generation: number,
+    chunkSeq: number,
+    pause: { reason: string },
+  ): Promise<MemoryChunk> {
+    this.mustHold(persona, generation);
+    const c = this.memoryChunks.find(
+      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
+    );
+    if (!c) throw new StateError(404, "memory chunk not found");
+    if (c.status !== "preparing" || c.claimed_generation !== generation) {
+      throw new StateError(
+        409,
+        `chunk ${chunkSeq} is not preparing under this generation`,
+      );
+    }
+    c.status = "sealed";
+    c.claimed_generation = null;
+    c.claimed_at = null;
+    c.last_error = pause.reason;
+    c.not_before = new Date(
+      Date.now() + MEMORY_RESHELVE_PACING_MS,
+    ).toISOString();
     return c;
   }
 

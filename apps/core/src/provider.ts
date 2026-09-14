@@ -59,6 +59,14 @@ export interface ModelProvider {
   readonly name: string;
   /** Streaming contract: text deltas, tool calls, then exactly one done. */
   stream(request: ModelRequest): AsyncIterable<ModelEvent>;
+  /**
+   * Optional preflight: resolves whatever would gate the next call —
+   * selected binding, credential — without sending a request. Throws
+   * `ModelError` with `unavailable` set when no call can currently be
+   * made; other errors are left for the real call to surface. Providers
+   * without a selection layer omit it entirely (always assumed usable).
+   */
+  probe?(): Promise<void>;
 }
 
 /**
@@ -75,17 +83,25 @@ export interface ModelProvider {
  * transient-retry budget — but the same turn may continue with a smaller
  * temporary working view. It is classified from the provider's own
  * status/code/message, never from a configured context window.
+ *
+ * `unavailable` marks a failure of the call's *plumbing*, not its content:
+ * the model layer could not produce a request at all (no usable binding,
+ * missing credential, a selection lookup outage). Nothing about the work
+ * was evaluated, so callers that budget per-request verdicts (memory
+ * chunk attempts) must treat it as a pause, not a failure.
  */
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
   readonly refusal?: "context_length";
+  readonly unavailable?: boolean;
   constructor(
     message: string,
     opts: {
       retryable: boolean;
       retryAfterMs?: number;
       refusal?: "context_length";
+      unavailable?: boolean;
     },
   ) {
     super(message);
@@ -93,5 +109,6 @@ export class ModelError extends Error {
     this.retryable = opts.retryable;
     this.retryAfterMs = opts.retryAfterMs;
     this.refusal = opts.refusal;
+    this.unavailable = opts.unavailable;
   }
 }

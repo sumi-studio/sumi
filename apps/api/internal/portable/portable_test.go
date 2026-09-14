@@ -1046,6 +1046,147 @@ func TestImportRefusesContradictoryUpperMemory(t *testing.T) {
 	}
 }
 
+// addChunkRow appends one crafted core_memory_chunks row after the table's
+// last row (preserving the row order the importer requires) and recomputes
+// the trailer's row count and content digest, so the row reaches import
+// verification instead of failing at the digest.
+func addChunkRow(t *testing.T, bundle []byte, data map[string]any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(
+		`{"record":"row","section":"core","table":"core_memory_chunks","data":%s}`+"\n",
+		raw)
+	sc := bufio.NewScanner(bytes.NewReader(bundle))
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text()+"\n")
+	}
+	lastTableLine := -1
+	for i, l := range lines {
+		if strings.Contains(l, `"table":"core_memory_chunks"`) {
+			lastTableLine = i
+		}
+	}
+	if lastTableLine < 0 {
+		t.Fatal("bundle carries no core_memory_chunks rows to extend")
+	}
+	var tr Trailer
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &tr); err != nil || tr.Record != "trailer" {
+		t.Fatal("last bundle line is not a trailer")
+	}
+	var out bytes.Buffer
+	h := sha256.New()
+	for i, l := range lines[:len(lines)-1] {
+		out.WriteString(l)
+		h.Write([]byte(l))
+		if i == lastTableLine {
+			out.WriteString(line)
+			h.Write([]byte(line))
+		}
+	}
+	tr.Rows["core_memory_chunks"]++
+	tr.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(append(tl, '\n'))
+	return out.Bytes()
+}
+
+// Coverage the pipeline cannot emit: chunk ranges tile disjointly — an L1
+// range is allocated once and stays covered even by a failed verdict, and
+// applying a target supersedes exactly its sources. A second L1 row over
+// already-covered seqs, or two applied rows sharing a seq (the range would
+// render twice), can only come from a crafted bundle.
+func TestImportRefusesOverlappingCoverage(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("o-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ot-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ot-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-overlap", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-overlap")
+
+	ghost := func(status string) map[string]any {
+		return map[string]any{
+			"persona_id": pid, "chunk_seq": 9, "layer": 1, "sources": nil,
+			"first_seq": 2, "last_seq": 3, "est_tokens": 100,
+			"status": status, "replacement": nil, "replacement_est_tokens": nil,
+			"attempts": 0, "interruptions": 0, "last_error": nil,
+			"claimed_generation": nil, "claimed_at": nil, "not_before": nil,
+			"created_at": "2026-09-15T00:00:00Z",
+			"prepared_at": nil, "applied_at": nil,
+		}
+	}
+
+	// A sealed L1 over already-covered seqs is pipeline-impossible — the
+	// destination's own pipeline would claim, prepare and apply it into a
+	// real applied overlap.
+	t.Run("sealed L1 over covered range", func(t *testing.T) {
+		bad := addChunkRow(t, bundle, ghost("sealed"))
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_l1_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_l1_overlap", err)
+		}
+	})
+
+	// An applied L1 inside an applied L2 target's coverage double-renders
+	// the range in every sent view.
+	t.Run("applied L1 inside applied coverage", func(t *testing.T) {
+		g := ghost("applied")
+		g["replacement"] = "ghost fragment"
+		g["replacement_est_tokens"] = 30
+		g["prepared_at"] = "2026-09-15T00:00:00Z"
+		g["applied_at"] = "2026-09-15T00:00:00Z"
+		bad := addChunkRow(t, bundle, g)
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_applied_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_applied_overlap", err)
+		}
+	})
+
+	// The clean bundle still imports: disjoint coverage with a legitimate
+	// applied target over superseded sources.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
+		t.Fatalf("legitimate history import: created=%v err=%v", created, err)
+	}
+}
+
 // A carried chunk can never hold a live claim, and its range must resolve
 // inside the carried journal. Both are integrity violations a valid digest
 // cannot launder.
