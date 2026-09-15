@@ -1303,6 +1303,33 @@ func (v *rootView) ListStaged(scope, dir, prefix string) ([]string, error) {
 	return out, nil
 }
 
+// EnsureDir creates dir and any missing parents beneath the scope —
+// fd-relative mkdir-p under the pinned root, so the walk cannot be
+// redirected outside it by a racing rename. Recovery uses it to
+// recreate a recorded home's parent chain before restoring a member
+// out of a parked container.
+func (v *rootView) EnsureDir(scope, dir string) error {
+	sfd, err := scopeDirFrom(v.rfd, scope, false)
+	if err != nil {
+		return err
+	}
+	defer sfd.Close()
+	rel, err := relPath(dir)
+	if err != nil {
+		return err
+	}
+	if rel == "" {
+		return nil
+	}
+	dfd, err := openDirBeneath(sfd, rel, true)
+	if err != nil {
+		return err
+	}
+	syncDir(dfd)
+	dfd.Close()
+	return nil
+}
+
 func (v *rootView) Close() error { return v.rfd.Close() }
 
 // atomicWrite stages content to a temp sibling, fsyncs, renames over the
@@ -1904,13 +1931,23 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	if err != nil {
 		return FileInfo{}, false, err
 	}
+	if p.faultHook != nil {
+		p.faultHook("mkdir.postCreate")
+	}
+	// The opened descriptor IS the object this mkdir committed — an
+	// fd-bound stat observes it even if a racer replaces the name a
+	// microsecond later. A post-hoc stat of the public path could
+	// observe a different object and journal foreign content as this
+	// op's acknowledgement — the same false-identity class as the
+	// write/rename commit paths.
+	st, serr := pfd.Stat()
 	pfd.Close()
 	syncDir(sfd)
-	info, serr := p.stat(scope, path)
 	if serr != nil {
-		return FileInfo{}, true, serr
+		return FileInfo{}, true, mapPathErr(serr)
 	}
-	return info, true, nil
+	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, true, nil
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.

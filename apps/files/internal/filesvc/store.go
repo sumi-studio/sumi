@@ -140,6 +140,10 @@ type ReconView interface {
 	// beginning with prefix — used to find crash-orphaned quarantine
 	// objects left by a reconciler that died mid-delete.
 	ListStaged(scope, dir, prefix string) ([]string, error)
+	// EnsureDir creates dir and any missing parents beneath the scope
+	// (fd-relative mkdir-p). Used to recreate a recorded home's parent
+	// chain before moving a member out of a parked container.
+	EnsureDir(scope, dir string) error
 	Close() error
 }
 
@@ -1811,21 +1815,21 @@ func (s *Store) sweepOrphanStaged(ctx context.Context, view ReconView) {
 		// moves) already fence against in-flight settlers. Taking the
 		// scope lock would let an in-flight op stall a pass that only
 		// touches dead namespaces.
-		s.settleOrphanDir(ctx, scope, view, "", 0)
+		s.settleOrphanDir(ctx, scope, view, "", map[string]struct{}{})
 	}
 }
 
 // settleOrphanDir walks one directory for orphaned staged objects,
 // recursing into subdirectories. It enumerates every entry — staged
 // names are found by prefix, directories by stat — so its cost is the
-// scope's entry count, not the number of parked objects. Depth is
-// bounded — a symlink loop resolves through the pinned root and cannot
-// escape the scope, but a cyclic name chain must not loop the pass
-// forever.
-func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconView, dir string, depth int) {
-	if depth > 32 {
-		return
-	}
+// scope's entry count, not the number of parked objects. There is no
+// depth bound: relPath accepts paths of any depth and intents' staging
+// namespaces can sit that deep, so a cutoff would strand recorded
+// content where no pass ever enumerates it. Loop safety comes from the
+// seen set: a directory revisited under a second path (a bind mount or
+// cyclic name chain) is identified by inode — or by path when the
+// fingerprint carries no inode — and not walked twice.
+func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconView, dir string, seen map[string]struct{}) {
 	names, err := view.ListStaged(scope, dir, "")
 	if err != nil {
 		return
@@ -1836,7 +1840,7 @@ func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconVie
 			rel = dir + "/" + n
 		}
 		if strings.HasPrefix(n, opStagePrefix) {
-			s.settleOrphanStaged(ctx, scope, view, rel, n)
+			s.settleOrphanStaged(ctx, scope, view, rel, n, seen)
 			continue
 		}
 		if strings.HasPrefix(n, stagingPrefix) {
@@ -1844,9 +1848,30 @@ func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconVie
 		}
 		st, serr := view.Stat(scope, rel)
 		if serr == nil && st.Kind == "dir" {
-			s.settleOrphanDir(ctx, scope, view, rel, depth+1)
+			if !markSeen(seen, st, rel) {
+				continue
+			}
+			s.settleOrphanDir(ctx, scope, view, rel, seen)
 		}
 	}
+}
+
+// markSeen records a directory identity for the sweep's loop guard.
+// The inode leg of the fingerprint is the object identity across
+// renames and bind-mounted aliases; when the fingerprint has no inode
+// (the two-field fallback form) the path itself keys the entry — a
+// cyclic structure of unidentifiable dirs can still lengthen paths,
+// but path resolution fails closed at the OS limit, ending the walk.
+func markSeen(seen map[string]struct{}, st FileInfo, rel string) bool {
+	key := "p:" + rel
+	if ino, _, _, ok := fpParts(st.Fingerprint); ok {
+		key = "i:" + ino
+	}
+	if _, dup := seen[key]; dup {
+		return false
+	}
+	seen[key] = struct{}{}
+	return true
 }
 
 // settleOrphanStaged handles one staged name whose owning intent may be
@@ -1856,7 +1881,7 @@ func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconVie
 // orphan that a version row still records is moved — restored to its
 // recorded home. Everything else (unverifiable row set, unrecorded
 // bytes) stays parked.
-func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view ReconView, rel, name string) {
+func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view ReconView, rel, name string, seen map[string]struct{}) {
 	rest := name[len(opStagePrefix):]
 	if idStr, _, _ := strings.Cut(rest, "-"); idStr != "" {
 		if id, perr := strconv.ParseInt(idStr, 10, 64); perr == nil {
@@ -1879,13 +1904,70 @@ func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view Recon
 	}
 	st3 := fp3(st.Fingerprint)
 	home, found, derr := s.recordedAt(ctx, scope, st3)
-	if derr != nil || !found {
-		return // unrecorded or unverifiable — retained, never collected
+	if derr != nil {
+		return // unverifiable — preserve
 	}
-	if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
-		return // still present at its recorded home — surplus link, leave it
+	if found {
+		if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
+			return // still present at its recorded home — surplus link, leave it
+		}
+		s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
+		return
 	}
-	s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
+	// The staged object is unrecorded. If it is a directory it can hold
+	// recorded members: auto-created parent dirs carry no version row,
+	// so the container's fingerprint says nothing about its contents —
+	// a delayed drain/swap can deposit an entire unrecorded container
+	// under a dead namespace. Descend and judge each member by its own
+	// row; the container and unrecorded residue stay parked.
+	if st.Kind == "dir" && markSeen(seen, st, rel) {
+		s.settleOrphanContents(ctx, scope, view, rel, seen)
+	}
+}
+
+// settleOrphanContents walks the members of an unrecorded parked
+// directory. Every member is judged by its own version row: a recorded
+// object is restored to its recorded home (the home's parent chain is
+// recreated first — the parked container often IS the missing parent);
+// staged names inside are routed through settleOrphanStaged for the
+// usual intent-row check; unrecorded members stay inside the container,
+// preserved.
+func (s *Store) settleOrphanContents(ctx context.Context, scope string, view ReconView, dir string, seen map[string]struct{}) {
+	names, err := view.ListStaged(scope, dir, "")
+	if err != nil {
+		return
+	}
+	for _, n := range names {
+		rel := dir + "/" + n
+		if strings.HasPrefix(n, opStagePrefix) {
+			s.settleOrphanStaged(ctx, scope, view, rel, n, seen)
+			continue
+		}
+		st, serr := view.Stat(scope, rel)
+		if serr != nil {
+			continue
+		}
+		if st.Kind == "dir" {
+			if markSeen(seen, st, rel) {
+				s.settleOrphanContents(ctx, scope, view, rel, seen)
+			}
+			continue
+		}
+		st3 := fp3(st.Fingerprint)
+		home, found, derr := s.recordedAt(ctx, scope, st3)
+		if derr != nil || !found {
+			continue
+		}
+		if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
+			continue // already present at its recorded home — surplus link
+		}
+		if pdir, _ := splitRel(home); pdir != "" {
+			if err := view.EnsureDir(scope, pdir); err != nil {
+				continue // parent chain unverifiable — retry next pass
+			}
+		}
+		s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
+	}
 }
 
 // orphanParkBase picks the sibling park base for a squatter displaced
@@ -2090,7 +2172,8 @@ func (v funcView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
 func (v funcView) ListStaged(scope, dir, prefix string) ([]string, error) {
 	return nil, nil
 }
-func (v funcView) Close() error { return nil }
+func (v funcView) EnsureDir(scope, dir string) error { return ErrUnavailable }
+func (v funcView) Close() error                      { return nil }
 
 // Reconcile processes all pending intents once, then re-judges retained
 // tombstones. Returns how many it settled. The pass judges only beneath a

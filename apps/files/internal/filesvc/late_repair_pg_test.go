@@ -16,6 +16,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1224,5 +1225,195 @@ func TestLateRepairCommitParkedUnverifiedIdentity(t *testing.T) {
 	}
 	if where := scanDirFor(t, dir, "ws", []byte("FOREIGN-X")); where == "" {
 		t.Fatal("foreign capture destroyed")
+	}
+}
+
+// ─── Findings 195/196: orphan-sweep discovery bounds ────────────────────
+//
+// settleOrphanDir used to stop at depth 32 while relPath accepts any
+// depth — a staged namespace deeper than that was enumerable only while
+// its intent row lived, and unreachable forever after (195). And an
+// orphaned staged DIRECTORY was judged as a leaf by its own
+// fingerprint: an auto-created container has no row, so recorded
+// members inside it were never inspected (196). Both stranded recorded
+// content with bytes preserved — the exact outcome class 186 filed.
+
+// lateDeepOrphanSetup parks a recorded object under a dead intent's
+// namespace `parents` components deep, then removes the intent row —
+// the post-deletion state the sweep is the only channel for. Ported
+// from reviewer B's schedule.
+func lateDeepOrphanSetup(t *testing.T, s *Store, root *posixRoot, dir string, parents int) string {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := s.WithWrite(ctx, "ws", "hdeep.txt", "write", IfVersion{Mode: "any"},
+		sha("DEEP"), authProbe(root, "hdeep.txt"), authWriteFn(root, "hdeep.txt", "DEEP")); err != nil {
+		t.Fatalf("write hdeep.txt: %v", err)
+	}
+	var b strings.Builder
+	for i := 1; i <= parents; i++ {
+		if i > 1 {
+			b.WriteByte('/')
+		}
+		b.WriteString("d")
+		b.WriteString(strconv.Itoa(i))
+	}
+	deep := b.String()
+	if err := os.MkdirAll(dir+"/ws/"+deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	it := intent{owner: "dead-inst", scope: "ws", op: "write",
+		path: deep + "/r.txt", version: authMint(t, s), preFP: "0:0:0:0",
+		dstFP: "9:9:9:9", expectSHA: sha("X"), at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := deep + "/" + opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-dd"
+	if err := os.Rename(dir+"/ws/hdeep.txt", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	// The intent row is gone before any pass sees the deposit.
+	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+	return parked
+}
+
+// 195 control: a parked recorded object beneath a mid-depth parent
+// converges — the sweep must reach staged names at ANY real depth.
+func TestLateRepairOrphanDeepSweepRestores(t *testing.T) {
+	for _, parents := range []int{32, 33, 48} {
+		t.Run(strconv.Itoa(parents), func(t *testing.T) {
+			dsn := pgDSN(t)
+			resetTables(t, dsn)
+			dir := t.TempDir()
+			root, err := newRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := newPGStore(t, dsn, dir)
+			s.SetReconcileView(authPinned(root, nil))
+			lateDeepOrphanSetup(t, s, root, dir, parents)
+			authSettle(t, s)
+			if got, ok := authReadOpt(dir, "ws/hdeep.txt"); !ok || got != "DEEP" {
+				where := scanDirFor(t, dir, "ws", []byte("DEEP"))
+				t.Fatalf("recorded object parked at parent depth %d not restored: "+
+					"hdeep.txt=%q present=%v, bytes at %q", parents, got, ok, where)
+			}
+			if _, fp, found := authRow(t, s, "hdeep.txt"); !found || fp == "" {
+				t.Fatalf("row(hdeep.txt) = %q found=%v", fp, found)
+			}
+		})
+	}
+}
+
+// 196 — a parked OBJECT that is itself a directory: the container is
+// unrecorded (auto-created parents carry no version row), so its own
+// fingerprint proves nothing about its contents. The sweep must descend
+// and re-home each recorded member; unrecorded residue stays inside.
+func TestLateRepairOrphanedDirRestoresRecordedMembers(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	// dirO is auto-created by the write (no version row); f.txt is
+	// recorded; extra.bin is unrecorded foreign content inside.
+	if _, _, err := s.WithWrite(ctx, "ws", "dirO/f.txt", "write", IfVersion{Mode: "any"},
+		sha("MEMBER"), authProbe(root, "dirO/f.txt"), authWriteFn(root, "dirO/f.txt", "MEMBER")); err != nil {
+		t.Fatalf("write dirO/f.txt: %v", err)
+	}
+	if _, _, found := authRow(t, s, "dirO"); found {
+		t.Skip("dirO unexpectedly has a row — premise does not hold")
+	}
+	if err := os.WriteFile(dir+"/ws/dirO/extra.bin", []byte("EXTRA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir+"/ws/dirO/sub", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "dirO/sub/g.txt", "write", IfVersion{Mode: "any"},
+		sha("NESTED"), authProbe(root, "dirO/sub/g.txt"), authWriteFn(root, "dirO/sub/g.txt", "NESTED")); err != nil {
+		t.Fatalf("write dirO/sub/g.txt: %v", err)
+	}
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "dead.txt",
+		version: authMint(t, s), preFP: "0:0:0:0", at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-dir9"
+	// A delayed drain deposits the whole unrecorded dir under the dead
+	// namespace — the drainSealed/SwapStaged idiom.
+	if err := os.Rename(dir+"/ws/dirO", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+	authSettle(t, s)
+	if got, ok := authReadOpt(dir, "ws/dirO/f.txt"); !ok || got != "MEMBER" {
+		pgot, _ := authReadOpt(dir, "ws/"+parked+"/f.txt")
+		_, fp, found := authRow(t, s, "dirO/f.txt")
+		t.Fatalf("recorded member stranded inside unrecorded parked dir: "+
+			"dirO/f.txt=%q present=%v, bytes inside parked dir=%q, row=%q found=%v",
+			got, ok, pgot, fp, found)
+	}
+	if got, ok := authReadOpt(dir, "ws/dirO/sub/g.txt"); !ok || got != "NESTED" {
+		t.Fatalf("nested recorded member not restored: dirO/sub/g.txt=%q present=%v", got, ok)
+	}
+	// Unrecorded residue stays inside the parked container — preserved,
+	// never installed at public names under the sweep's authority.
+	if got, ok := authReadOpt(dir, "ws/"+parked+"/extra.bin"); !ok || got != "EXTRA" {
+		t.Fatalf("unrecorded member inside parked dir destroyed or displaced: %q present=%v", got, ok)
+	}
+	if _, ok := authReadOpt(dir, "ws/dirO/extra.bin"); ok {
+		t.Fatal("unrecorded member was installed at a public name by the sweep")
+	}
+}
+
+// mkdir identity: the commit observation must be bound to the created
+// object, not the path. A racer that replaces the fresh dir between
+// creation and observation must not have its object journaled as this
+// op's acknowledgement — the fd of the created dir is the identity.
+func TestLateRepairMkdirJournalsBoundIdentity(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root.faultHook = func(tag string) {
+		if tag != "mkdir.postCreate" {
+			return
+		}
+		// A racer removes the just-created dir and installs a different
+		// one at the name — inside the commit→observe window.
+		if err := os.Remove(dir + "/ws/mkd"); err != nil {
+			panic(err)
+		}
+		if err := os.Mkdir(dir+"/ws/mkd", 0o755); err != nil {
+			panic(err)
+		}
+	}
+	_, _, err = s.WithWrite(ctx, "ws", "mkd", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "mkd"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "mkd")
+		})
+	root.faultHook = nil
+	if err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	live := durFP(t, root, "ws", "mkd")
+	_, fp, found := authRow(t, s, "mkd")
+	if !found || fp == "" {
+		t.Fatalf("committed mkdir produced row fp=%q found=%v", fp, found)
+	}
+	if fp3(fp) == fp3(live) {
+		t.Fatalf("mkdir journaled the RACER's dir (fp=%q) — the record must "+
+			"name the object this op committed, divergent or not", fp)
 	}
 }
