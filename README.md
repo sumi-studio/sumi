@@ -65,9 +65,9 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 ## Run the Web app from source
 
-`make dev` starts the full Web app with one real secretary on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor, and Vite. This developer stack runs the secretary on the Rust agent runtime (`apps/agent`), not on the new TypeScript secretary core used by the Local host and Sumi Cloud.
+`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the TypeScript secretary core (`apps/core`) on a local dev pool, and Vite — the same core the Local host and Sumi Cloud use. `make dev-rust` keeps the transitional launch on the Rust agent runtime and tool executor (`apps/agent`) while it still has remaining consumers.
 
-Requirements: Node.js 20.19 or newer, pnpm 11, Go, Rust stable, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; and model-provider credentials for the conversation model and for two separate review models.
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. No model credential is needed for the default deterministic provider. The Rust path additionally needs Rust stable and model-provider credentials for the conversation model and two separate review models.
 
 ```sh
 make setup
@@ -89,7 +89,7 @@ apps/
   api/                Go API: sign-in sessions, identity, Workspaces, Messaging, approvals,
                       model connections, usage, and the state service the secretary core uses
   core/               TypeScript secretary core: Node.js hosts and the Cloudflare Durable Object host
-  agent/              Rust agent runtime and isolated tool executor used by `make dev`
+  agent/              Rust agent runtime and isolated tool executor used by `make dev-rust`
 packages/
   ui/                 @sumi/ui component catalog (based on shadcn/ui)
   sdui/               @sumi/sdui declarative UI schema (zod) and renderer
@@ -111,7 +111,7 @@ CONTEXT.md            domain glossary (Japanese)
 | Sign-in | Firebase Authentication, with sessions issued by the Go API |
 | API and canonical state | Go, PostgreSQL |
 | Secretary core | TypeScript on Node.js (Local) and Cloudflare Workers Durable Objects (Cloud) |
-| Agent runtime for the developer stack | Rust |
+| Transitional agent runtime (`make dev-rust`) | Rust |
 | Calls | LiveKit |
 | Contracts | OpenAPI, JSON Schema |
 | Monorepo and tooling | pnpm workspaces, Turborepo, Biome |

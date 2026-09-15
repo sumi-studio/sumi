@@ -6,11 +6,13 @@ readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly LOCAL_CONTROL_ORIGIN="http://127.0.0.1:8081"
 readonly LOOPBACK_GATEWAY_LISTEN="127.0.0.1:8082"
+readonly DEV_POOL_LISTEN_DEFAULT="127.0.0.1:8083"
 readonly WEB_PORT=5173
 readonly POSTGRES_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.yaml"
 readonly POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
+RUNTIME_MODE="${SUMI_DEV_RUNTIME:-core}"
 CHECK_ONLY=0
 RUNTIME_ROOT=
 PUBLIC_HOST=
@@ -30,11 +32,15 @@ fail() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev/real-stack [--check] [--env-file PATH]
+Usage: scripts/dev/real-stack [--check] [--env-file PATH] [--runtime core|rust]
 
-Starts the real local Sumi API, tool executor, production PersonalityAgent,
-and Vite frontend. --check validates credentials and identity configuration
-without building or starting processes.
+Starts the real local Sumi API, the shared TypeScript secretary core, and the
+Vite frontend. The default `core` runtime runs each secretary on the new
+TypeScript core (apps/core) driven by the API's wake sweep; `--runtime rust`
+(SUMI_DEV_RUNTIME=rust) keeps the transitional tool-executor +
+PersonalityAgent launch while that runtime is still needed. --check validates
+credentials and identity configuration without building or starting
+processes.
 EOF
 }
 
@@ -48,6 +54,11 @@ while (($# > 0)); do
       ENV_FILE="$2"
       shift
       ;;
+    --runtime)
+      (($# >= 2)) || fail "--runtime requires a mode (core|rust)"
+      RUNTIME_MODE="$2"
+      shift
+      ;;
     -h | --help)
       usage
       exit 0
@@ -58,6 +69,13 @@ while (($# > 0)); do
   esac
   shift
 done
+
+case "${RUNTIME_MODE}" in
+  core | rust) ;;
+  *)
+    fail "--runtime must be core or rust (got ${RUNTIME_MODE})"
+    ;;
+esac
 
 load_env_file() {
   local file="$1"
@@ -195,6 +213,13 @@ validate_firebase_web_config() {
   fi
 }
 
+validate_dev_pool_listen() {
+  DEV_POOL_LISTEN="${SUMI_DEV_POOL_LISTEN:-${DEV_POOL_LISTEN_DEFAULT}}"
+  export DEV_POOL_LISTEN
+  [[ "${DEV_POOL_LISTEN}" =~ ^(127\.0\.0\.1):([0-9]{1,5})$ ]] ||
+    fail "SUMI_DEV_POOL_LISTEN must be a 127.0.0.1:port loopback address (got ${DEV_POOL_LISTEN})"
+}
+
 validate_public_listen() {
   SUMI_PUBLIC_LISTEN="${SUMI_PUBLIC_LISTEN:-127.0.0.1:8080}"
   export SUMI_PUBLIC_LISTEN
@@ -208,6 +233,11 @@ validate_public_listen() {
     fail "SUMI_PUBLIC_LISTEN must not expose an all-interface wildcard"
   [[ "${API_PORT}" != "8081" && "${API_PORT}" != "8082" && "${API_PORT}" != "${WEB_PORT}" ]] ||
     fail "SUMI_PUBLIC_LISTEN collides with a reserved local-stack port"
+  if [[ "${RUNTIME_MODE}" == "core" ]]; then
+    local pool_port="${DEV_POOL_LISTEN##*:}"
+    [[ "${API_PORT}" != "${pool_port}" ]] ||
+      fail "SUMI_PUBLIC_LISTEN collides with the dev core pool port"
+  fi
   if [[ "${PUBLIC_HOST}" != "127.0.0.1" ]]; then
     node -e '
       const octets = process.argv[1].split(".").map(Number);
@@ -313,9 +343,8 @@ validate_firebase_admin_mode() {
     fail "Firebase Auth emulator endpoints must be exact literal-IPv4 HTTP endpoints, and the browser endpoint must use the public Tailnet host"
 }
 
-validate_configuration() {
-  local web_project provider_api_key prefix key_env_name reviewer_api_key_env reviewer_api_key
-  validate_public_listen
+validate_rust_runtime_configuration() {
+  local provider_api_key prefix key_env_name reviewer_api_key_env reviewer_api_key
   require_value SUMI_PERSONALITY_AGENT_ID
   valid_paid "${SUMI_PERSONALITY_AGENT_ID}" ||
     fail "SUMI_PERSONALITY_AGENT_ID must be a canonical lowercase UUIDv7"
@@ -326,10 +355,72 @@ validate_configuration() {
     fail "SUMI_AUTH_PERSONALITY_AGENT_ID must equal SUMI_PERSONALITY_AGENT_ID"
 
   for name in \
-    SUMI_AUTH_FIREBASE_PROJECT_ID \
-    SUMI_AUTH_TENANT_ID \
     SUMI_MODEL_PRESET \
     SUMI_MODEL_API_KEY_ENV
+  do
+    require_value "${name}"
+  done
+
+  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
+  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
+  [[ -n "${provider_api_key}" ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured real model provider"
+  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
+    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
+  for prefix in SUMI_EXECUTION_REVIEWER_MODEL SUMI_ESCALATION_REVIEWER_MODEL; do
+    key_env_name="${prefix}_API_KEY_ENV"
+    reviewer_api_key_env="${!key_env_name:-}"
+    [[ -z "${reviewer_api_key_env}" ]] && continue
+    [[ "${reviewer_api_key_env}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+      fail "${key_env_name} must name one environment variable"
+    reviewer_api_key="${!reviewer_api_key_env:-}"
+    [[ -n "${reviewer_api_key}" ]] ||
+      fail "${reviewer_api_key_env} is required by the configured reviewer provider"
+    [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
+      fail "${reviewer_api_key_env} must be one line"
+  done
+}
+
+# The core runtime resolves the model provider per persona from
+# apps/core/src/host/provider-env.ts: mock (the default, deterministic and
+# network-free), fixture (scripted rules for bounded integration checks),
+# openai (an OpenAI-compatible endpoint — local stubs need no real key), or
+# none (no model; durable tools still run). A persona's selected model
+# connection in the app overrides these environment settings.
+validate_core_runtime_configuration() {
+  local provider="${SUMI_MODEL_PROVIDER:-mock}"
+  case "${provider}" in
+    mock | none) ;;
+    openai)
+      for name in SUMI_MODEL_BASE_URL SUMI_MODEL_API_KEY SUMI_MODEL_MODEL; do
+        require_value "${name}"
+      done
+      ;;
+    fixture)
+      if [[ -n "${SUMI_MODEL_FIXTURE:-}" ]]; then
+        [[ -f "${SUMI_MODEL_FIXTURE}" ]] ||
+          fail "SUMI_MODEL_FIXTURE is not a readable file: ${SUMI_MODEL_FIXTURE}"
+      else
+        require_value SUMI_MODEL_FIXTURE_JSON
+      fi
+      ;;
+    *)
+      fail "SUMI_MODEL_PROVIDER must be mock, fixture, openai, or none (got ${provider})"
+      ;;
+  esac
+}
+
+validate_configuration() {
+  local web_project
+  if [[ "${RUNTIME_MODE}" == "core" ]]; then
+    validate_dev_pool_listen
+  fi
+  validate_public_listen
+
+  for name in \
+    SUMI_AUTH_FIREBASE_PROJECT_ID \
+    SUMI_AUTH_TENANT_ID
   do
     require_value "${name}"
   done
@@ -357,27 +448,12 @@ validate_configuration() {
   [[ "${web_project}" == "${SUMI_AUTH_FIREBASE_PROJECT_ID}" ]] ||
     fail "Firebase web and Admin project IDs must match"
 
-  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
-  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
-  [[ -n "${provider_api_key}" ]] ||
-    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured real model provider"
-  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
-    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
-  for prefix in SUMI_EXECUTION_REVIEWER_MODEL SUMI_ESCALATION_REVIEWER_MODEL; do
-    key_env_name="${prefix}_API_KEY_ENV"
-    reviewer_api_key_env="${!key_env_name:-}"
-    [[ -z "${reviewer_api_key_env}" ]] && continue
-    [[ "${reviewer_api_key_env}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-      fail "${key_env_name} must name one environment variable"
-    reviewer_api_key="${!reviewer_api_key_env:-}"
-    [[ -n "${reviewer_api_key}" ]] ||
-      fail "${reviewer_api_key_env} is required by the configured reviewer provider"
-    [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
-      fail "${reviewer_api_key_env} must be one line"
-  done
-
   validate_firebase_admin_mode
+
+  case "${RUNTIME_MODE}" in
+    core) validate_core_runtime_configuration ;;
+    rust) validate_rust_runtime_configuration ;;
+  esac
 }
 
 process_is_running() {
@@ -495,6 +571,53 @@ start_loopback_gateway_relay() {
   fail "timed out waiting for loopback gateway relay"
 }
 
+# The dev pool is the Local-development half of the Cloud wake contract: the
+# API's wake sweep POSTs {SUMI_DEV_POOL_LISTEN}/personas/{id}/wake, and the
+# pool runs one apps/core/src/host/local.ts child per persona against the
+# state service. The writer lease in Postgres — not this process — is what
+# keeps a persona to one operative execution owner.
+start_dev_pool() {
+  log "starting dev core pool (TypeScript secretary host)"
+  declare -a pool_environment=(
+    "PATH=${PATH}"
+    "HOME=${AGENT_STATE_DIR}"
+    "LANG=C.UTF-8"
+    "SUMI_STATE_URL=${API_ORIGIN}"
+    "SUMI_DEV_POOL_LISTEN=${DEV_POOL_LISTEN}"
+    "SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"
+    "SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"
+    "SUMI_MODEL_PROVIDER=${SUMI_MODEL_PROVIDER:-mock}"
+  )
+  for name in \
+    SUMI_MODEL_BASE_URL \
+    SUMI_MODEL_API_KEY \
+    SUMI_MODEL_MODEL \
+    SUMI_MODEL_HEADERS_JSON \
+    SUMI_MODEL_EXTRA_JSON \
+    SUMI_MODEL_TIMEOUT_MS \
+    SUMI_MODEL_FIXTURE \
+    SUMI_MODEL_FIXTURE_JSON \
+    SUMI_LEASE_TTL_MS \
+    SUMI_PROVIDER_RETRY_BUDGET_MS \
+    SUMI_MEMORY_PREPARATION_TIMEOUT_MS \
+    SUMI_MEMORY_UNAVAILABLE_PAUSE_MS
+  do
+    if [[ -n "${!name:-}" ]]; then
+      pool_environment+=("${name}=${!name}")
+    fi
+  done
+  (
+    cd "${REPOSITORY_ROOT}/apps/core"
+    exec setsid env -i \
+      "${pool_environment[@]}" \
+      node src/host/dev-pool.ts
+  ) >"${LOG_DIR}/dev-pool.log" 2>&1 &
+  DEV_POOL_PID=$!
+  CHILD_PIDS+=("${DEV_POOL_PID}")
+  wait_for_http "http://${DEV_POOL_LISTEN}/health" "${DEV_POOL_PID}" "dev core pool"
+  assert_exact_tcp_listener "${DEV_POOL_LISTEN}" "${DEV_POOL_LISTEN##*:}" "dev core pool"
+}
+
 wait_for_runtime_ready() {
   local state_file="$1"
   local pid="$2"
@@ -577,9 +700,15 @@ if ((CHECK_ONLY)); then
   exit 0
 fi
 
-for command in awk cargo curl docker flock go openssl pnpm setsid ss; do
+for command in awk curl docker flock go openssl pnpm setsid ss; do
   require_command "${command}"
 done
+if [[ "${RUNTIME_MODE}" == "rust" ]]; then
+  require_command cargo
+else
+  node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 18) ? 0 : 1)' ||
+    fail "the dev core pool runs TypeScript directly and needs Node.js 22.18 or newer"
+fi
 [[ -x "${REPOSITORY_ROOT}/apps/web/node_modules/vite/bin/vite.js" ]] ||
   fail "web dependencies are missing; run make setup first"
 
@@ -632,28 +761,43 @@ readonly API_BINARY="${BIN_DIR}/sumi-api"
 readonly AGENT_BINARY="${REPOSITORY_ROOT}/apps/agent/target/debug/sumi-agent"
 readonly EXECUTOR_SOCKET="${IPC_DIR}/executor.sock"
 
-log "building the Go API and Rust PersonalityAgent entrypoints"
+log "building the Go API"
 (
   cd "${REPOSITORY_ROOT}/apps/api"
   go build -o "${API_BINARY}" ./cmd/server
 )
-(
-  cd "${REPOSITORY_ROOT}/apps/agent"
-  cargo build --bin sumi-agent
-)
+if [[ "${RUNTIME_MODE}" == "rust" ]]; then
+  log "building the Rust PersonalityAgent entrypoint"
+  (
+    cd "${REPOSITORY_ROOT}/apps/agent"
+    cargo build --bin sumi-agent
+  )
+fi
 
 start_postgres
 
-SUMI_RPC_GENERATION=0
-SUMI_RPC_NONCE="local-$(random_token)"
-SUMI_PROCESS_GENERATION_LEASE_ID="local-lease-$(random_token)"
-SUMI_GENERATION_RECOVERY_FENCE_ID="local-fence-$(random_token)"
 SUMI_AGENT_TOKEN_SECRET="$(random_base64)"
 SUMI_BROWSER_SESSION_SECRET="$(random_base64)"
-SUMI_LOCAL_CONTROL_BEARER="$(random_token)"
-SUMI_AGENT_WRAPPING_KEY="$(random_token)"
-SUMI_APPROVAL_SECRET_DIGEST_KEY="$(random_token)"
-mapfile -t executor_call_authority_key_pair < <(
+readonly SUMI_AGENT_TOKEN_SECRET SUMI_BROWSER_SESSION_SECRET
+
+if [[ "${RUNTIME_MODE}" == "core" ]]; then
+  # The API mounts /internal/core on this token; the dev pool's children
+  # authenticate to persona-scoped routes with the runtime credential, and
+  # the API's wake sweep authenticates to the pool with the wake token —
+  # the same credential split Cloud uses for its core host.
+  SUMI_CORE_STATE_TOKEN="$(random_token)"
+  SUMI_CORE_RUNTIME_TOKEN="$(random_token)"
+  SUMI_CORE_WAKE_TOKEN="$(random_token)"
+  readonly SUMI_CORE_STATE_TOKEN SUMI_CORE_RUNTIME_TOKEN SUMI_CORE_WAKE_TOKEN
+else
+  SUMI_RPC_GENERATION=0
+  SUMI_RPC_NONCE="local-$(random_token)"
+  SUMI_PROCESS_GENERATION_LEASE_ID="local-lease-$(random_token)"
+  SUMI_GENERATION_RECOVERY_FENCE_ID="local-fence-$(random_token)"
+  SUMI_LOCAL_CONTROL_BEARER="$(random_token)"
+  SUMI_AGENT_WRAPPING_KEY="$(random_token)"
+  SUMI_APPROVAL_SECRET_DIGEST_KEY="$(random_token)"
+  mapfile -t executor_call_authority_key_pair < <(
   node <<'NODE'
 const { generateKeyPairSync } = require("node:crypto");
 
@@ -695,14 +839,14 @@ NODE
   fail "failed to generate one Executor call-authority key pair"
 SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY="${executor_call_authority_key_pair[0]}"
 SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY="${executor_call_authority_key_pair[1]}"
-unset executor_call_authority_key_pair
-readonly SUMI_RPC_GENERATION SUMI_RPC_NONCE
-readonly SUMI_PROCESS_GENERATION_LEASE_ID SUMI_GENERATION_RECOVERY_FENCE_ID
-readonly SUMI_AGENT_TOKEN_SECRET SUMI_BROWSER_SESSION_SECRET
-readonly SUMI_LOCAL_CONTROL_BEARER SUMI_AGENT_WRAPPING_KEY
-readonly SUMI_APPROVAL_SECRET_DIGEST_KEY
-readonly SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY
-readonly SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY
+  unset executor_call_authority_key_pair
+  readonly SUMI_RPC_GENERATION SUMI_RPC_NONCE
+  readonly SUMI_PROCESS_GENERATION_LEASE_ID SUMI_GENERATION_RECOVERY_FENCE_ID
+  readonly SUMI_LOCAL_CONTROL_BEARER SUMI_AGENT_WRAPPING_KEY
+  readonly SUMI_APPROVAL_SECRET_DIGEST_KEY
+  readonly SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY
+  readonly SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY
+fi
 
 declare -a adc_environment=("HOME=${HOME}" "GOOGLE_CLOUD_PROJECT=${SUMI_AUTH_FIREBASE_PROJECT_ID}")
 if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
@@ -712,53 +856,74 @@ if [[ -n "${FIREBASE_AUTH_EMULATOR_HOST:-}" ]]; then
   adc_environment+=("FIREBASE_AUTH_EMULATOR_HOST=${FIREBASE_AUTH_EMULATOR_HOST}")
 fi
 
+declare -a api_environment=(
+  "PORT=${API_PORT}"
+  "SUMI_PUBLIC_LISTEN=${SUMI_PUBLIC_LISTEN}"
+  "SUMI_COMMAND_LOG_DIR=${COMMAND_LOG_DIR}"
+  "SUMI_AGENT_RUNTIME_STATE_DIR=${GATEWAY_STATE_DIR}"
+  "SUMI_MESSAGING_ATTACHMENT_ROOT=${MESSAGING_ATTACHMENT_DIR}"
+  "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES=${MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES}"
+  "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS}"
+  "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES}"
+  "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS}"
+  "SUMI_MESSAGING_PUSH_SUBJECT=${MESSAGING_PUSH_SUBJECT}"
+  "SUMI_FEEDBACK_RECIPIENTS=${SUMI_FEEDBACK_RECIPIENTS:-}"
+  "SUMI_AGENT_TOKEN_SECRET=${SUMI_AGENT_TOKEN_SECRET}"
+  "SUMI_BROWSER_SESSION_SECRET=${SUMI_BROWSER_SESSION_SECRET}"
+  "SUMI_BROWSER_SESSION_AUDIENCE=sumi:web"
+  "SUMI_BROWSER_WS_ALLOWED_ORIGINS=${WEB_ORIGIN}"
+  "SUMI_AUTH_FIREBASE_UID=${SUMI_AUTH_FIREBASE_UID:-}"
+  "SUMI_AUTH_FIREBASE_TENANT_ID=${SUMI_AUTH_FIREBASE_TENANT_ID:-}"
+  "SUMI_AUTH_FIREBASE_PROJECT_ID=${SUMI_AUTH_FIREBASE_PROJECT_ID}"
+  "SUMI_AUTH_TENANT_ID=${SUMI_AUTH_TENANT_ID}"
+  "SUMI_AUTH_USER_ID=${SUMI_AUTH_USER_ID:-}"
+  "SUMI_AUTH_ALLOW_INSECURE_COOKIES=true"
+  "SUMI_AUTH_SESSION_TTL=1h"
+  "SUMI_DB_URL=${POSTGRES_DB_URL}"
+  "SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1"
+)
+if [[ "${RUNTIME_MODE}" == "core" ]]; then
+  # Mounts /internal/core and the wake sweep, and switches Messaging
+  # attention to the durable core-input path (see cmd/server/main.go).
+  api_environment+=(
+    "SUMI_CORE_STATE_TOKEN=${SUMI_CORE_STATE_TOKEN}"
+    "SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"
+    "SUMI_CORE_WAKE_URL=http://${DEV_POOL_LISTEN}"
+    "SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"
+  )
+else
+  api_environment+=(
+    "SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}"
+    "SUMI_LOCAL_CONTROL_ENABLED=1"
+    "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}"
+    "SUMI_LOCAL_CONTROL_TENANT_ID=${SUMI_AUTH_TENANT_ID}"
+    "SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}"
+    "SUMI_LOCAL_CONTROL_GENERATION=${SUMI_RPC_GENERATION}"
+    "SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE=${SUMI_RPC_NONCE}"
+    "SUMI_LOCAL_CONTROL_AUDIENCE=sumi:agent:events"
+    "SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION=raw"
+    "SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN=127.0.0.1:8081"
+  )
+fi
+
 log "starting API"
 (
   cd "${REPOSITORY_ROOT}/apps/api"
   exec setsid env -i \
     "PATH=${PATH}" \
     "${adc_environment[@]}" \
-    "PORT=${API_PORT}" \
-    "SUMI_PUBLIC_LISTEN=${SUMI_PUBLIC_LISTEN}" \
-    "SUMI_COMMAND_LOG_DIR=${COMMAND_LOG_DIR}" \
-    "SUMI_AGENT_RUNTIME_STATE_DIR=${GATEWAY_STATE_DIR}" \
-    "SUMI_MESSAGING_ATTACHMENT_ROOT=${MESSAGING_ATTACHMENT_DIR}" \
-    "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES=${MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES}" \
-    "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS}" \
-    "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES}" \
-    "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS=${MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS}" \
-    "SUMI_MESSAGING_PUSH_SUBJECT=${MESSAGING_PUSH_SUBJECT}" \
-    "SUMI_FEEDBACK_RECIPIENTS=${SUMI_FEEDBACK_RECIPIENTS:-}" \
-    "SUMI_AGENT_TOKEN_SECRET=${SUMI_AGENT_TOKEN_SECRET}" \
-    "SUMI_BROWSER_SESSION_SECRET=${SUMI_BROWSER_SESSION_SECRET}" \
-    "SUMI_BROWSER_SESSION_AUDIENCE=sumi:web" \
-    "SUMI_BROWSER_WS_ALLOWED_ORIGINS=${WEB_ORIGIN}" \
-    "SUMI_AUTH_FIREBASE_UID=${SUMI_AUTH_FIREBASE_UID}" \
-    "SUMI_AUTH_FIREBASE_TENANT_ID=${SUMI_AUTH_FIREBASE_TENANT_ID:-}" \
-    "SUMI_AUTH_FIREBASE_PROJECT_ID=${SUMI_AUTH_FIREBASE_PROJECT_ID}" \
-    "SUMI_AUTH_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \
-    "SUMI_AUTH_USER_ID=${SUMI_AUTH_USER_ID}" \
-    "SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}" \
-    "SUMI_AUTH_ALLOW_INSECURE_COOKIES=true" \
-    "SUMI_AUTH_SESSION_TTL=1h" \
-    "SUMI_DB_URL=${POSTGRES_DB_URL}" \
-    "SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1" \
-    "SUMI_LOCAL_CONTROL_ENABLED=1" \
-    "SUMI_LOCAL_CONTROL_BEARER=${SUMI_LOCAL_CONTROL_BEARER}" \
-    "SUMI_LOCAL_CONTROL_TENANT_ID=${SUMI_AUTH_TENANT_ID}" \
-    "SUMI_LOCAL_CONTROL_PERSONALITY_AGENT_ID=${SUMI_PERSONALITY_AGENT_ID}" \
-    "SUMI_LOCAL_CONTROL_GENERATION=${SUMI_RPC_GENERATION}" \
-    "SUMI_LOCAL_CONTROL_RPC_BOOT_NONCE=${SUMI_RPC_NONCE}" \
-    "SUMI_LOCAL_CONTROL_AUDIENCE=sumi:agent:events" \
-    "SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION=raw" \
-    "SUMI_LOCAL_CONTROL_LOOPBACK_LISTEN=127.0.0.1:8081" \
+    "${api_environment[@]}" \
     "${API_BINARY}"
 ) >"${LOG_DIR}/api.log" 2>&1 &
 API_PID=$!
 CHILD_PIDS+=("${API_PID}")
 wait_for_http "${API_ORIGIN}/health" "${API_PID}" "API"
 assert_exact_tcp_listener "${SUMI_PUBLIC_LISTEN}" "${API_PORT}" "API"
-start_loopback_gateway_relay
+
+if [[ "${RUNTIME_MODE}" == "core" ]]; then
+  start_dev_pool
+else
+  start_loopback_gateway_relay
 
 log "starting authenticated tool executor"
 (
@@ -849,6 +1014,7 @@ runtime_state_name="$(
 wait_for_runtime_ready \
   "${GATEWAY_STATE_DIR}/runtime-${runtime_state_name}.json" \
   "${AGENT_PID}"
+fi
 
 declare -a vite_environment=(
   "PATH=${PATH}"

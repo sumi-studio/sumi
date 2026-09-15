@@ -1,18 +1,21 @@
 # Real local stack
 
-This is the supported developer entrypoint for using the browser chat with one
-real `PersonalityAgent`. It runs the Go API, Rust tool executor, Rust production
-runtime, and Vite as native processes. The Playwright stack remains a test
-fixture and is not the product entrypoint.
+This is the supported developer entrypoint for using the browser chat with a
+real secretary. It runs the Go API, the shared TypeScript secretary core
+(`apps/core`), and Vite as native processes, with PostgreSQL in Docker. The
+Playwright stack remains a test fixture and is not the product entrypoint.
 
 ## Prerequisites
 
-- Node.js 20.19 or newer, pnpm 11, Go, Rust stable, `curl`, `openssl`, and
-  `flock`
+- Node.js 22.18 or newer, pnpm 11, Go, `curl`, `openssl`, `flock`, and Docker
+  (for the development PostgreSQL)
 - `pnpm install` (`make setup`) completed
 - a Firebase project with Authentication enabled
 - Google and/or GitHub enabled under Firebase Authentication → Sign-in method
-- a real model-provider credential for a preset supported by `apps/agent`
+- no model credential is required for the default deterministic `mock`
+  provider; set `SUMI_MODEL_PROVIDER` for a real endpoint
+- for the transitional `--runtime rust` launch only: Rust stable and a real
+  model-provider credential for a preset supported by `apps/agent`
 
 The Vite development build has a public `sumi-studio` Firebase web
 configuration fallback. It is an identifier, not a server credential, and is
@@ -73,7 +76,8 @@ the exact `SUMI_AUTH_FIREBASE_TENANT_ID`; leave it blank for ordinary Firebase
 Auth. `SUMI_AUTH_TENANT_ID` and `SUMI_AUTH_USER_ID` are server-owned Sumi
 identifiers, not claims accepted from the browser.
 
-The following identity must be equal everywhere:
+On the transitional Rust runtime (`--runtime rust`), the following identity
+must be equal everywhere:
 
 ```text
 SUMI_PERSONALITY_AGENT_ID
@@ -84,9 +88,11 @@ SUMI_PERSONALITY_AGENT_ID
 
 The launcher derives the local-control and executor/runtime values from
 `SUMI_PERSONALITY_AGENT_ID` and rejects an unequal auth binding. The ID must be
-a canonical lowercase UUIDv7.
+a canonical lowercase UUIDv7. The default core runtime needs none of this:
+each secretary's persona comes from the signed-in human's 戸籍 registration,
+and the dev pool derives the persona id from each wake.
 
-For the model, `SUMI_MODEL_API_KEY_ENV` names the credential variable. For
+For the Rust runtime's model, `SUMI_MODEL_API_KEY_ENV` names the credential variable. For
 example, the template selects `opencode-go` and therefore requires:
 
 ```text
@@ -98,7 +104,8 @@ OPENCODE_GO_API_KEY=<real credential>
 The launcher never prints Firebase or provider credentials.
 
 Production AutoReview has no conversation-model fallback. Before spawning a
-PersonalityAgent, configure both `SUMI_EXECUTION_REVIEWER_MODEL_*` and
+PersonalityAgent on `--runtime rust`, configure both
+`SUMI_EXECUTION_REVIEWER_MODEL_*` and
 `SUMI_ESCALATION_REVIEWER_MODEL_*`, and provide
 `SUMI_EXECUTION_REVIEWER_API_KEY` and `SUMI_ESCALATION_REVIEWER_API_KEY` from
 separate secret sources. The resolved reviewer origins and credential variable
@@ -108,6 +115,9 @@ declared `account_scope` remains part of the trust identity, but its text alone
 does not prove that two credentials belong to separate provider accounts.
 
 ### Codex OAuth bridge provider
+
+This bridge serves the Rust runtime (`--runtime rust`); the core runtime's
+`openai` provider can point at any OpenAI-compatible endpoint directly.
 
 The existing development-only Codex Responses bridge can provide a real model
 without a public OpenAI API key. It reads an owner-only Codex login file,
@@ -192,6 +202,29 @@ First validate configuration, then start:
 make dev-check
 make dev
 ```
+
+### Runtime mode
+
+`make dev` runs each secretary on the shared TypeScript core
+(`apps/core`): the API mounts the persona-scoped state service at
+`/internal/core`, Messaging attention is admitted as durable core inputs, and
+a local dev pool (`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`)
+runs one `host/local.ts` Node process per persona, started by the API's wake
+sweep — the same wake contract Cloud uses. The writer lease in Postgres keeps
+one operative execution owner per secretary, so restarting the pool or a host
+preserves saved work and does not duplicate committed effects.
+
+The default `mock` model provider is deterministic and network-free — enough
+to develop against the real application without a paid account.
+`SUMI_MODEL_PROVIDER` selects `fixture` (scripted rules),
+`openai` (an OpenAI-compatible endpoint), or `none` instead; a model
+connection selected in the app overrides the environment.
+
+`make dev-rust` (`scripts/dev/real-stack --runtime rust`, or
+`SUMI_DEV_RUNTIME=rust` in `.env.local`) keeps the transitional launch on the
+Rust tool executor + `PersonalityAgent` while that runtime still has
+remaining consumers; it requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
+`SUMI_MODEL_PRESET` and the provider/reviewer credentials in `.env.local`.
 
 Open exactly <http://127.0.0.1:5173>. The fixed Vite server proxies HTTP
 `/auth` and WebSocket `/direct-chat` to <http://127.0.0.1:8080>, so the browser
@@ -350,6 +383,11 @@ orchestrate an authenticated usable Sumi stack.
 
 ## Recovery after a provider error
 
+This section describes the Rust runtime (`--runtime rust`). The core
+runtime's restart behavior is simpler: all state is durable in the state
+service, so a restarted host resumes pending work without a recovery
+procedure.
+
 For a persistent agent, a process stop after a completed, tool-free Error
 `MessageEnd` can leave the command awaiting its lifecycle suffix. Cold recovery
 now preserves that exact error and transcript, atomically appends `TurnEnd` and
@@ -376,6 +414,10 @@ Do not report these states as recovered or reset the agent's identity or erase
 their memory to hide them. See [issue #339](https://github.com/sumi-studio/sumi/issues/339).
 
 ## Long-running local-control connections
+
+This section describes the Rust runtime (`--runtime rust`); the core runtime
+has no local-control connection — each host authenticates to the state
+service directly.
 
 The internal local-control bearer belongs to one runtime epoch. It remains
 usable for that epoch's lifetime, including Gateway reconnects after eight

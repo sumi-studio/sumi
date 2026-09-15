@@ -1,12 +1,15 @@
 # Entry points for common commands. See README.md for details.
 
-.PHONY: setup dev dev-check dev-workspaces build lint test format api-dev db-up db-down migrate
+.PHONY: setup dev dev-rust dev-check dev-workspaces build lint test format api-dev db-up db-down migrate
 
 setup: ## Install JS dependencies
 	pnpm install
 
-dev: ## Start the supported authenticated local Sumi stack
+dev: ## Start the supported authenticated local Sumi stack (TypeScript core)
 	pnpm dev
+
+dev-rust: ## Start the transitional stack on the Rust PersonalityAgent runtime
+	pnpm dev:rust
 
 dev-check: ## Validate real-stack credentials and identity configuration
 	pnpm dev:check
