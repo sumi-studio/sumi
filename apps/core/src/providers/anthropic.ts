@@ -14,6 +14,8 @@ import {
   parseCallEnvelope,
   redirectRefusal,
   requestDeadline,
+  requestHeaders,
+  SUMI_USER_AGENT,
   sanitizeToolName,
   sseEvents,
   wireTools,
@@ -41,6 +43,13 @@ export interface AnthropicConfig {
    * the legacy agent's default output budget for this protocol.
    */
   maxTokens?: number;
+  /**
+   * When set, the request carries this header with the persona's stable
+   * identity (request.personaId) — e.g. x-opencode-session, which
+   * OpenCode Go requires on every endpoint for routing. Applied after
+   * `headers` so the live identity always wins over a static value.
+   */
+  sessionHeader?: string;
 }
 
 const API_VERSION = "2023-06-01";
@@ -94,12 +103,18 @@ export class AnthropicProvider implements ModelProvider {
       try {
         res = await this.fetchImpl(messagesUrl(this.cfg.baseUrl), {
           method: "POST",
-          headers: {
-            "x-api-key": this.cfg.apiKey,
-            "anthropic-version": API_VERSION,
-            "Content-Type": "application/json",
-            ...this.cfg.headers,
-          },
+          headers: requestHeaders(
+            {
+              "x-api-key": this.cfg.apiKey,
+              "anthropic-version": API_VERSION,
+              "Content-Type": "application/json",
+              "User-Agent": SUMI_USER_AGENT,
+            },
+            this.cfg.headers,
+            this.cfg.sessionHeader
+              ? { header: this.cfg.sessionHeader, value: request.personaId }
+              : undefined,
+          ),
           signal: deadline.signal,
           // Never follow a redirect: this request carries credentials
           // and fetch forwards x-api-key/extra headers cross-origin.

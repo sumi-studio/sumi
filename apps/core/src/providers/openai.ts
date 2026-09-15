@@ -14,7 +14,9 @@ import {
   parseCallEnvelope,
   redirectRefusal,
   requestDeadline,
+  requestHeaders,
   routeEnvelope,
+  SUMI_USER_AGENT,
   sanitizeToolName,
   toolNameMaps,
 } from "./shared.ts";
@@ -103,14 +105,17 @@ export class OpenAIProvider implements ModelProvider {
           `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`,
           {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${this.cfg.apiKey}`,
-              "Content-Type": "application/json",
-              ...this.cfg.headers,
-              ...(this.cfg.sessionHeader
-                ? { [this.cfg.sessionHeader]: request.personaId }
-                : {}),
-            },
+            headers: requestHeaders(
+              {
+                Authorization: `Bearer ${this.cfg.apiKey}`,
+                "Content-Type": "application/json",
+                "User-Agent": SUMI_USER_AGENT,
+              },
+              this.cfg.headers,
+              this.cfg.sessionHeader
+                ? { header: this.cfg.sessionHeader, value: request.personaId }
+                : undefined,
+            ),
             signal: deadline.signal,
             // Never follow a redirect: this request carries credentials
             // and fetch forwards x-api-key/extra headers cross-origin.
@@ -126,7 +131,11 @@ export class OpenAIProvider implements ModelProvider {
                 role: m.role,
                 content: m.content,
                 ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
-                ...(m.name ? { name: m.name } : {}),
+                // `tool_call_id` links a tool result to its call. Some upstreams
+                // reject an extra `name` field — omen-alpha 400s with 'messages[i]:
+                // "name" is not supported by this endpoint'. Other roles
+                // still pass it through.
+                ...(m.name && m.role !== "tool" ? { name: m.name } : {}),
                 ...(m.toolCalls?.length
                   ? {
                       tool_calls: m.toolCalls.map((c) => ({
