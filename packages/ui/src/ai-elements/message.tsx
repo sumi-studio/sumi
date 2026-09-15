@@ -8,6 +8,7 @@ import { type DiagramPlugin, Streamdown } from "streamdown";
 import { Button } from "../components/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/tooltip";
 import { cn } from "../lib/utils";
+import { MarkdownImageLink } from "./markdown-image-link";
 import "katex/dist/katex.min.css";
 
 export type MessageProps = ComponentProps<"div"> & {
@@ -118,8 +119,22 @@ const streamdownControls = {
   },
 } as const;
 
-export type MessageResponseProps = ComponentProps<typeof Streamdown> & {
+/**
+ * 画像・リンクの出所ポリシーは共有rendererが所有し、呼び出し側から
+ * 差し替えられない。`components`/`rehypePlugins`/`urlTransform` を
+ * 閉じるのはcompact側（compact-message-response）と同じ契約。
+ */
+export type MessageResponseProps = Omit<
+  ComponentProps<typeof Streamdown>,
+  "components" | "rehypePlugins" | "urlTransform"
+> & {
   onRenderSettled?: () => void;
+};
+
+const streamdownComponents: NonNullable<
+  ComponentProps<typeof Streamdown>["components"]
+> = {
+  img: MarkdownImageLink,
 };
 
 /** AI Elements標準のStreamdown組版。図・コードの判定もStreamdownへ委譲する。 */
@@ -183,6 +198,9 @@ export const MessageResponse = memo(
           plugins={streamdownPlugins}
           allowedTags={{ kbd: [], sub: [], sup: [] }}
           {...props}
+          components={streamdownComponents}
+          rehypePlugins={undefined}
+          urlTransform={undefined}
         >
           {children}
         </Streamdown>
