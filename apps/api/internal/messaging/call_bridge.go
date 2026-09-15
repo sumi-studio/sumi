@@ -55,31 +55,55 @@ func (c *CallService) ClaimCallSessions(ctx context.Context, personaID, runnerID
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
-	// A claim whose lease lapsed no longer holds authority: the session
-	// becomes reclaimable and its unfinished speech is recorded unknown —
-	// never auto-replayed by a later claim.
-	lapsed, err := tx.Query(ctx, `
-		UPDATE call_sessions
-		SET status='interrupted', updated_at=now()
-		WHERE personality_agent_id = $1
-		  AND status IN ('claimed','active','ending')
-		  AND claim_expires_at < now()
-		RETURNING session_id`, personaID)
+	// Placement authority first: a persona whose authority was sealed or
+	// transferred cannot gain or renew call presence. The share lock also
+	// serializes this claim against an in-flight seal of the same persona.
+	authority, found, err := c.callPersonaAuthorityInTx(ctx, tx, personaID)
 	if err != nil {
 		return nil, err
 	}
-	lapsedIDs := []string{}
+	if !found || authority != "active" {
+		return nil, fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
+	}
+
+	// A claim whose lease lapsed no longer holds authority. A session the
+	// secretary already committed to leaving ('ending') ends for good —
+	// durable departure intent survives the crash window and the next claim
+	// must not resurrect presence. Sessions still wanted live become
+	// reclaimable 'interrupted' and their unfinished speech is recorded —
+	// never auto-replayed by a later claim.
+	lapsed, err := tx.Query(ctx, `
+		UPDATE call_sessions
+		SET status = CASE WHEN status = 'ending' THEN 'ended' ELSE 'interrupted' END,
+		    ended_at = CASE WHEN status = 'ending' THEN now() ELSE ended_at END,
+		    end_reason = CASE WHEN status = 'ending' THEN 'claim_lapsed_after_leave' ELSE end_reason END,
+		    claimed_by = NULL, claim_expires_at = NULL, updated_at = now()
+		WHERE personality_agent_id = $1
+		  AND status IN ('claimed','active','ending')
+		  AND claim_expires_at < now()
+		RETURNING `+callSessionCols, personaID)
+	if err != nil {
+		return nil, err
+	}
+	lapsedSessions := []CallSession{}
 	for lapsed.Next() {
-		var id string
-		if err := lapsed.Scan(&id); err != nil {
+		var session CallSession
+		if err := lapsed.Scan(callSessionScan(&session)...); err != nil {
 			lapsed.Close()
 			return nil, err
 		}
-		lapsedIDs = append(lapsedIDs, id)
+		lapsedSessions = append(lapsedSessions, session)
 	}
 	lapsed.Close()
-	for _, id := range lapsedIDs {
-		if err := sweepCallUtterancesInTx(ctx, tx, id, "runner_claim_lapsed"); err != nil {
+	if err := lapsed.Err(); err != nil {
+		return nil, err
+	}
+	endedOnLapse := []CallSession{}
+	for _, session := range lapsedSessions {
+		if session.Status == CallSessionEnded {
+			endedOnLapse = append(endedOnLapse, session)
+		}
+		if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "runner_claim_lapsed"); err != nil {
 			return nil, err
 		}
 	}
@@ -106,18 +130,40 @@ func (c *CallService) ClaimCallSessions(ctx context.Context, personaID, runnerID
 	}
 	defer rows.Close()
 	claimed := []agentstate.CallSession{}
+	claimedSessions := []CallSession{}
 	for rows.Next() {
 		var session CallSession
 		if err := rows.Scan(callSessionScan(&session)...); err != nil {
 			return nil, err
 		}
-		claimed = append(claimed, callSessionWire(session))
+		claimedSessions = append(claimedSessions, session)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	for _, session := range claimedSessions {
+		if session.RoomSID == "" {
+			// Bind the session's room generation durably so a delayed
+			// room_finished for a dead generation cannot end it.
+			if sid := c.currentRoomSID(session.PlaceID); sid != "" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE call_sessions SET room_sid = $2
+					WHERE session_id = $1 AND (room_sid IS NULL OR room_sid = '')`,
+					session.SessionID, sid); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := c.adoptOrSweepUtterancesInTx(ctx, tx, session); err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, callSessionWire(session))
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit call session claim: %w", err)
+	}
+	for _, session := range endedOnLapse {
+		c.notifyCallEnded(ctx, session)
 	}
 	// A fresh claim supersedes every connected actor of this persona in that
 	// room — any still-connected identity belongs to a dead or stale claim
@@ -128,6 +174,36 @@ func (c *CallService) ClaimCallSessions(ctx context.Context, personaID, runnerID
 		}
 	}
 	return claimed, nil
+}
+
+// adoptOrSweepUtterancesInTx resolves every non-terminal utterance when a
+// claim takes a session. Speech committed before any claim existed
+// (session_epoch 0) was never exposed to a media generation, so it is
+// adopted into the new epoch and delivered once — the model was told
+// 'queued', not 'spoken'. Speech tied to a superseded generation may
+// already have been heard; it is never replayed: 'intended' expires and
+// anything mid-flight is recorded unknown.
+func (c *CallService) adoptOrSweepUtterancesInTx(ctx context.Context, tx pgx.Tx, session CallSession) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE call_utterances SET session_epoch = $2, updated_at = now()
+		WHERE session_id = $1 AND session_epoch = 0 AND status = 'intended'`,
+		session.SessionID, session.Epoch); err != nil {
+		return err
+	}
+	detail, err := json.Marshal(map[string]any{"reason": "epoch_superseded"})
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE call_utterances
+		SET status = CASE WHEN status = 'intended' THEN 'expired' ELSE 'unknown' END,
+		    detail = CASE WHEN jsonb_typeof(detail) = 'object'
+		                  THEN detail || $3::jsonb ELSE $3::jsonb END,
+		    updated_at = now()
+		WHERE session_id = $1 AND session_epoch <> $2
+		  AND status IN ('intended','dequeued','emitting')`,
+		session.SessionID, session.Epoch, detail)
+	return err
 }
 
 // sweepPersonaCallParticipants removes every connected participant whose ref
@@ -152,15 +228,25 @@ func (c *CallService) sweepPersonaCallParticipants(ctx context.Context, placeID,
 func (c *CallService) HeartbeatCallSession(ctx context.Context, personaID, sessionID, runnerID string, epoch int64, lease time.Duration) (agentstate.CallSession, error) {
 	lease = clampCallLease(lease)
 	var session CallSession
-	err := c.Server.Store.pool.QueryRow(ctx, `
-		UPDATE call_sessions
-		SET claim_expires_at = now() + $4::interval, updated_at = now()
-		WHERE session_id = $1 AND personality_agent_id = $2
-		  AND claimed_by = $3 AND epoch = $5
-		  AND status IN ('claimed','active','ending')
-		RETURNING `+callSessionCols,
-		sessionID, personaID, runnerID, fmt.Sprintf("%f seconds", lease.Seconds()), epoch,
-	).Scan(callSessionScan(&session)...)
+	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
+		authority, found, err := c.callPersonaAuthorityInTx(ctx, tx, personaID)
+		if err != nil {
+			return err
+		}
+		if !found || authority != "active" {
+			return fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
+		}
+		return tx.QueryRow(ctx, `
+			UPDATE call_sessions
+			SET claim_expires_at = now() + $4::interval, updated_at = now()
+			WHERE session_id = $1 AND personality_agent_id = $2
+			  AND claimed_by = $3 AND epoch = $5
+			  AND claim_expires_at > now()
+			  AND status IN ('claimed','active','ending')
+			RETURNING `+callSessionCols,
+			sessionID, personaID, runnerID, fmt.Sprintf("%f seconds", lease.Seconds()), epoch,
+		).Scan(callSessionScan(&session)...)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return agentstate.CallSession{}, ErrCallClaimLost
 	}
@@ -185,6 +271,18 @@ func (c *CallService) CallSessionTicket(ctx context.Context, personaID, sessionI
 	if session.Status != CallSessionClaimed && session.Status != CallSessionActive {
 		return agentstate.CallTicket{}, fmt.Errorf("%w: status %s cannot mint a ticket", ErrCallSessionNotLive, session.Status)
 	}
+	if session.RoomSID == "" {
+		// The session predates the registry learning the room SID — stamp it
+		// now so a stale room_finished for a dead generation can't end it.
+		if sid := c.currentRoomSID(session.PlaceID); sid != "" {
+			if _, err := c.Server.Store.pool.Exec(ctx, `
+				UPDATE call_sessions SET room_sid = $2
+				WHERE session_id = $1 AND (room_sid IS NULL OR room_sid = '')`,
+				sessionID, sid); err == nil {
+				session.RoomSID = sid
+			}
+		}
+	}
 	identity := callSessionIdentity(&session)
 	token, err := c.LiveKit.accessToken(session.PlaceID, identity, "", c.now(), CallBridgeTicketTTL)
 	if err != nil {
@@ -206,8 +304,15 @@ func (c *CallService) ReportCallSessionStatus(ctx context.Context, personaID, se
 	var session CallSession
 	var notify bool
 	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
+		authority, found, err := c.callPersonaAuthorityInTx(ctx, tx, personaID)
+		if err != nil {
+			return err
+		}
+		if !found || authority != "active" {
+			return fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
+		}
 		var current CallSession
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			SELECT `+callSessionCols+` FROM call_sessions
 			WHERE session_id = $1 AND personality_agent_id = $2 FOR UPDATE`,
 			sessionID, personaID).Scan(callSessionScan(&current)...)
@@ -218,7 +323,8 @@ func (c *CallService) ReportCallSessionStatus(ctx context.Context, personaID, se
 			return err
 		}
 		if current.ClaimedBy != runnerID || current.Epoch != epoch ||
-			!callSessionLive(current.Status) || current.Status == CallSessionRequested {
+			!callSessionLive(current.Status) || current.Status == CallSessionRequested ||
+			current.ClaimExpiresAt == nil || !current.ClaimExpiresAt.After(c.now()) {
 			return ErrCallClaimLost
 		}
 		switch status {
@@ -266,13 +372,18 @@ func (c *CallService) ReportCallSessionStatus(ctx context.Context, personaID, se
 // claim. Dequeue is a separate disposition report so a bridge crash between
 // read and play cannot double-emit.
 func (c *CallService) PendingCallUtterances(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) ([]agentstate.CallUtterance, error) {
-	if _, err := c.requireCallClaim(ctx, personaID, sessionID, runnerID, epoch); err != nil {
+	session, err := c.requireCallClaim(ctx, personaID, sessionID, runnerID, epoch)
+	if err != nil {
 		return nil, err
 	}
+	// Only utterances bound to the claiming epoch are deliverable; stale-
+	// epoch rows are already swept, but the filter keeps a read between
+	// claim and sweep from ever exposing one to a runner.
 	rows, err := c.Server.Store.pool.Query(ctx, `
 		SELECT `+callUtteranceCols+` FROM call_utterances
-		WHERE session_id = $1 AND status = 'intended' ORDER BY seq LIMIT 50`,
-		sessionID)
+		WHERE session_id = $1 AND status = 'intended' AND session_epoch = $2
+		ORDER BY seq LIMIT 50`,
+		sessionID, session.Epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -349,12 +460,24 @@ func (c *CallService) ReportUtteranceDisposition(ctx context.Context, personaID,
 			}
 			return fmt.Errorf("%w: %s -> %s", agentstate.ErrBadRequest, current.Status, status)
 		}
+		if detail == nil {
+			// The API shape is an object; storing a bare null would make a
+			// later detail merge produce an array and corrupt the row.
+			detail = map[string]any{}
+		}
 		encoded, err := json.Marshal(detail)
 		if err != nil {
 			return fmt.Errorf("%w: detail is not json", agentstate.ErrBadRequest)
 		}
+		// Merge rather than replace detail: each hop's report (dequeue
+		// timestamp, interruption fraction, failure) stays readable, later
+		// keys win.
 		return tx.QueryRow(ctx, `
-			UPDATE call_utterances SET status=$3, detail=$4, updated_at=now()
+			UPDATE call_utterances
+			SET status=$3,
+			    detail = CASE WHEN jsonb_typeof(detail) = 'object'
+			                  THEN detail ELSE '{}'::jsonb END || $4::jsonb,
+			    updated_at=now()
 			WHERE utterance_id=$1 AND session_id=$2
 			RETURNING `+callUtteranceCols,
 			utteranceID, sessionID, status, encoded,
@@ -414,6 +537,23 @@ func (c *CallService) RevokePlaceCallSessions(ctx context.Context, personaID, pl
 	return nil
 }
 
+// callPersonaAuthorityInTx share-locks the persona row so call authority
+// serializes with a placement seal: the seal holds FOR NO KEY UPDATE, so a
+// call mutation either commits before it (and is then revoked by the seal's
+// own session sweep) or observes the retired authority and is refused.
+// This is placement authority only — an ordinary writer-generation change
+// never disturbs an independently live media claim.
+func (c *CallService) callPersonaAuthorityInTx(ctx context.Context, tx pgx.Tx, personaID string) (string, bool, error) {
+	var authority string
+	err := tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1 FOR SHARE`,
+		personaID).Scan(&authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return authority, true, err
+}
+
 // requireCallClaim loads the session and enforces the caller's live claim.
 func (c *CallService) requireCallClaim(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) (CallSession, error) {
 	var session CallSession
@@ -429,8 +569,15 @@ func (c *CallService) requireCallClaimInTx(ctx context.Context, tx pgx.Tx, perso
 	if !canonicalid.IsUUIDv7(sessionID) {
 		return CallSession{}, fmt.Errorf("%w: session id must be a uuidv7", agentstate.ErrBadRequest)
 	}
+	authority, found, err := c.callPersonaAuthorityInTx(ctx, tx, personaID)
+	if err != nil {
+		return CallSession{}, err
+	}
+	if !found || authority != "active" {
+		return CallSession{}, fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
+	}
 	var session CallSession
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT `+callSessionCols+` FROM call_sessions
 		WHERE session_id = $1 AND personality_agent_id = $2`,
 		sessionID, personaID).Scan(callSessionScan(&session)...)
@@ -460,6 +607,35 @@ func (c *CallService) RemoveStaleCallParticipant(ctx context.Context, placeID, i
 	if err := c.RoomService.RemoveParticipant(ctx, placeID, identity); err != nil {
 		log.Printf("call: remove stale participant %s in %s: %v", identity, placeID, err)
 	}
+}
+
+// ensureCallPersona lazily provisions the core persona for a place member
+// before its input is submitted — the same ensure CoreAttentionDelivery
+// performs on message admission. It never resurrects a sealed or
+// transferred persona: EnsurePersona only creates a missing row, and
+// SubmitInput still refuses non-active authority.
+func (c *CallService) ensureCallPersona(ctx context.Context, paID string) error {
+	core := c.coreStore()
+	if core == nil {
+		return nil
+	}
+	var humanID *string
+	var displayName string
+	var hid string
+	err := c.Server.Store.pool.QueryRow(ctx,
+		"SELECT human_id::text, display_name FROM agents WHERE personality_agent_id = $1",
+		paID).Scan(&hid, &displayName)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// No agent record to provision from; SubmitInput will report the
+		// missing persona and the caller logs it.
+	case err != nil:
+		return fmt.Errorf("resolve agent for call persona: %w", err)
+	default:
+		humanID = &hid
+	}
+	_, _, err = core.EnsurePersona(ctx, paID, humanID, displayName)
+	return err
 }
 
 // notifyCallStarted delivers a durable 'call_started' input to each PA member
@@ -503,6 +679,10 @@ func (c *CallService) notifyCallStarted(placeID, roomSID string) {
 			// channel call is ambient unless the secretary judges otherwise.
 			attention = "reply"
 		}
+		if err := c.ensureCallPersona(ctx, m.paID); err != nil {
+			log.Printf("call: ensure persona %s for call_started: %v", m.paID, err)
+			continue
+		}
 		_, _, err := core.SubmitInput(ctx, &agentstate.Input{
 			PersonaID:     m.paID,
 			InputID:       "call_started:" + placeID + ":" + roomSID,
@@ -536,6 +716,10 @@ func (c *CallService) notifyCallEnded(ctx context.Context, session CallSession) 
 	}
 	submitCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if err := c.ensureCallPersona(submitCtx, session.PersonalityAgentID); err != nil {
+		log.Printf("call: ensure persona %s for call_ended: %v", session.PersonalityAgentID, err)
+		return
+	}
 	_, _, err := core.SubmitInput(submitCtx, &agentstate.Input{
 		PersonaID:     session.PersonalityAgentID,
 		InputID:       "call_ended:" + session.SessionID + ":" + session.Status,

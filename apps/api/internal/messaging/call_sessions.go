@@ -59,13 +59,16 @@ const CallBridgeTicketTTL = 60 * time.Second
 // heartbeat. The value a runner passes is clamped to this ceiling.
 const CallBridgeMaxLease = 90 * time.Second
 
+// The bridge-facing sentinels live in agentstate so the HTTP layer can map
+// them by errors.Is instead of message text. The aliases below keep the
+// messaging-local names for existing callers and tests.
 var (
-	ErrCallSessionNotFound = errors.New("call session not found")
-	ErrCallSessionNotLive  = errors.New("call session is not live")
-	ErrCallClaimLost       = errors.New("call session claim is held by another runner or epoch")
+	ErrCallSessionNotFound = agentstate.ErrCallSessionNotFound
+	ErrCallSessionNotLive  = agentstate.ErrCallSessionNotLive
+	ErrCallClaimLost       = agentstate.ErrCallClaimLost
 	ErrNoActiveCall        = errors.New("no active call in this place")
-	ErrUtteranceNotFound   = errors.New("call utterance not found")
-	ErrUtteranceTerminal   = errors.New("call utterance disposition is terminal")
+	ErrUtteranceNotFound   = agentstate.ErrCallUtteranceNotFound
+	ErrUtteranceTerminal   = agentstate.ErrCallUtteranceTerminal
 )
 
 // CallSession is one durable authority record for a secretary in a room.
@@ -160,6 +163,17 @@ func (c *CallService) applyCallJoin(ctx context.Context, tx pgx.Tx, personaID, _
 	if place.Kind == PlaceChannel && !place.Voice {
 		return nil, fmt.Errorf("%w: channel is not voice-enabled", agentstate.ErrBadRequest)
 	}
+	// Share-lock the persona row: a transfer seal holds FOR NO KEY UPDATE,
+	// so this join either commits before the seal (and is revoked by its
+	// session sweep) or observes the retired authority and is refused — a
+	// join can never land on a retired placement's behalf.
+	authority, found, err := c.callPersonaAuthorityInTx(ctx, tx, personaID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || authority != "active" {
+		return nil, fmt.Errorf("%w: persona authority is %s", agentstate.ErrBadRequest, authority)
+	}
 	// A session is only useful while a call is actually running in the
 	// place. The registry is volatile; rebuild once if it has never been
 	// populated (e.g. fresh API start before the first webhook).
@@ -168,27 +182,46 @@ func (c *CallService) applyCallJoin(ctx context.Context, tx pgx.Tx, personaID, _
 		return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, ErrNoActiveCall)
 	}
 	var session CallSession
+	// ON CONFLICT DO NOTHING keeps the operation transaction healthy: a
+	// re-ring or retried join returns the live session instead of aborting
+	// the tx (and every sibling effect) on the partial unique index.
+	// room_sid is stamped from the volatile projection — the durable guard
+	// against a delayed room_finished for a dead generation ending a
+	// session that belongs to the live one.
 	err = tx.QueryRow(ctx, `
 		INSERT INTO call_sessions
 			(session_id, workspace_id, place_id, personality_agent_id,
-			 status, requested_by)
-		VALUES ($1, $2, $3, $4, 'requested', 'call.join')
+			 room_sid, status, requested_by)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), 'requested', 'call.join')
+		ON CONFLICT (personality_agent_id, place_id)
+			WHERE status IN ('requested','claimed','active','ending','interrupted')
+		DO NOTHING
 		RETURNING `+callSessionCols,
 		newUUIDv7(), scoped.Scope.WorkspaceID, place.PlaceID, personaID,
+		c.currentRoomSID(place.PlaceID),
 	).Scan(callSessionScan(&session)...)
-	if err != nil {
-		if isUniqueViolation(err) {
-			// A live session for this secretary in this place already
-			// exists — return it rather than forking a second presence.
-			session, err = c.liveCallSessionInTx(ctx, tx, personaID, place.PlaceID)
-			if err != nil {
-				return nil, callEffectFailure(err)
-			}
-			return map[string]any{"session": session, "joined": true, "existing": true}, nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A live session for this secretary in this place already
+		// exists — return it rather than forking a second presence.
+		session, err = c.liveCallSessionInTx(ctx, tx, personaID, place.PlaceID)
+		if err != nil {
+			return nil, callEffectFailure(err)
 		}
+		return map[string]any{"session": session, "joined": true, "existing": true}, nil
+	}
+	if err != nil {
 		return nil, fmt.Errorf("insert call session: %w", err)
 	}
 	return map[string]any{"session": session, "joined": true}, nil
+}
+
+// currentRoomSID reads the volatile registry's live room SID for a place,
+// or "" when no registry is wired or the room is unknown.
+func (c *CallService) currentRoomSID(placeID string) string {
+	if c == nil || c.Registry == nil {
+		return ""
+	}
+	return c.Registry.roomSIDFor(placeID)
 }
 
 func (c *CallService) liveCallSessionInTx(ctx context.Context, tx pgx.Tx, personaID, placeID string) (CallSession, error) {
@@ -275,6 +308,12 @@ func (c *CallService) applyCallSay(ctx context.Context, tx pgx.Tx, personaID, _ 
 	if !callSessionLive(session.Status) {
 		return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, ErrCallSessionNotLive)
 	}
+	if session.Status == CallSessionEnding {
+		// The secretary already committed to leaving; no claim will pick up
+		// new speech for a session on its way out. Answer honestly rather
+		// than queueing intent that can only ever expire.
+		return nil, fmt.Errorf("%w: session %s is ending; speech cannot be committed", agentstate.ErrBadRequest, sessionID)
+	}
 	var utterance CallUtterance
 	err = tx.QueryRow(ctx, `
 		INSERT INTO call_utterances (utterance_id, session_id, session_epoch, seq, text, status)
@@ -286,7 +325,16 @@ func (c *CallService) applyCallSay(ctx context.Context, tx pgx.Tx, personaID, _ 
 	if err != nil {
 		return nil, fmt.Errorf("insert call utterance: %w", err)
 	}
-	return map[string]any{"utterance": utterance, "queued": true}, nil
+	// Honest result: committed intent is not media. When no live claim
+	// could play it, the model is told so — pre-claim speech is adopted by
+	// the first claim and delivered once; speech stamped to a superseded
+	// epoch is recorded expired at reclaim, never replayed.
+	result := map[string]any{"utterance": utterance, "queued": true}
+	if session.ClaimedBy == "" || session.ClaimExpiresAt == nil ||
+		session.ClaimExpiresAt.Before(c.now()) {
+		result["awaiting_claim"] = true
+	}
+	return result, nil
 }
 
 // CallStateEffect is a read: the place's call state plus this persona's own
@@ -425,7 +473,9 @@ func sweepCallUtterancesInTx(ctx context.Context, tx pgx.Tx, sessionID, reason s
 	_, err = tx.Exec(ctx, `
 		UPDATE call_utterances
 		SET status = CASE WHEN status = 'intended' THEN 'expired' ELSE 'unknown' END,
-		    detail = COALESCE(detail, '{}'::jsonb) || $2::jsonb, updated_at = now()
+		    detail = CASE WHEN jsonb_typeof(detail) = 'object'
+		                  THEN detail || $2::jsonb ELSE $2::jsonb END,
+		    updated_at = now()
 		WHERE session_id = $1 AND status IN ('intended','dequeued','emitting')`,
 		sessionID, detail)
 	return err

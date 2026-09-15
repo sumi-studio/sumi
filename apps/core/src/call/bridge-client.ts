@@ -18,6 +18,18 @@ export class CallClaimLostError extends Error {
   }
 }
 
+/**
+ * Raised when one utterance's disposition is already terminal — e.g. its
+ * epoch was superseded before it could be delivered. This is a per-item
+ * outcome: the runner skips the utterance; the session claim is intact.
+ */
+export class CallUtteranceTerminalError extends Error {
+  constructor(message = "call utterance is terminal") {
+    super(message);
+    this.name = "CallUtteranceTerminalError";
+  }
+}
+
 export class CallBridgeError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -80,13 +92,23 @@ export class CallBridgeClient {
       return (await res.json()) as T;
     }
     let message = `call bridge ${res.status}`;
+    let code = "";
     try {
-      const parsed = (await res.json()) as { error?: string };
+      const parsed = (await res.json()) as { error?: string; code?: string };
       if (parsed.error) message = parsed.error;
+      if (parsed.code) code = parsed.code;
     } catch {
       /* non-JSON error body */
     }
-    if (res.status === 409) throw new CallClaimLostError(message);
+    if (res.status === 409) {
+      // The API tags conflicts with a code. Only an explicit per-utterance
+      // outcome is skippable; any other 409 means the claim itself is in
+      // doubt — stop, never keep publishing on uncertain authority.
+      if (code === "utterance_terminal") {
+        throw new CallUtteranceTerminalError(message);
+      }
+      throw new CallClaimLostError(message);
+    }
     throw new CallBridgeError(res.status, message);
   }
 

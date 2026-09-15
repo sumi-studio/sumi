@@ -183,27 +183,31 @@ func (s *Server) reportCallUtterance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"utterance": utterance})
 }
 
-// callError maps bridge errors onto the same shape the rest of the surface
-// uses; claim-loss and session-lifecycle rejections are conflicts the runner
-// treats as stop signals rather than retries.
+// callError maps bridge errors by sentinel, not message text. The wire
+// carries a machine-readable code so the runner can tell a lost claim
+// (stop all media) apart from a terminal utterance (skip it) or an
+// ordinary bad request.
 func (s *Server) callError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrBadRequest):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrPersonaNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrCallSessionNotFound), errors.Is(err, ErrCallUtteranceNotFound):
+		writeCallError(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, ErrCallClaimLost):
+		writeCallError(w, http.StatusConflict, "claim_lost", err.Error())
+	case errors.Is(err, ErrCallSessionNotLive):
+		writeCallError(w, http.StatusConflict, "session_not_live", err.Error())
+	case errors.Is(err, ErrCallUtteranceTerminal):
+		writeCallError(w, http.StatusConflict, "utterance_terminal", err.Error())
 	default:
-		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "claim"), strings.Contains(msg, "not live"),
-			strings.Contains(msg, "terminal"):
-			writeError(w, http.StatusConflict, msg)
-		case strings.Contains(msg, "not found"):
-			writeError(w, http.StatusNotFound, msg)
-		default:
-			writeError(w, http.StatusInternalServerError, msg)
-		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func writeCallError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{"error": msg, "code": code})
 }
 
 func parseInt64Query(r *http.Request, key string) int64 {

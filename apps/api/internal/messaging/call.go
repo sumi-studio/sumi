@@ -47,11 +47,16 @@ type CallParticipant struct {
 	Participant ParticipantRef
 	JoinedAt    time.Time
 	ScreenShare bool
-	// Identity is the raw LiveKit identity, including any claim-epoch tag.
-	// A participant_left event removes the roster entry only when its raw
-	// identity matches, so a stale-generation ghost's departure cannot drop
-	// the current generation's entry.
+	// Identity is the raw LiveKit identity of the most recently confirmed
+	// live connection, including any claim-epoch tag.
 	Identity string
+	// Connections tracks each live connection under this participant ref,
+	// keyed by the LiveKit participant SID (falling back to identity when a
+	// caller supplies none). A secretary's reclaimed actor (#e1 then #e2)
+	// and a human's reconnect both hold distinct connections; the roster
+	// entry is present exactly while at least one is live, so a stale
+	// connection's departure cannot drop the current generation's entry.
+	Connections map[string]string
 }
 
 type CallState struct {
@@ -72,6 +77,11 @@ type CallRegistry struct {
 	roomSID      map[string]string
 	finishedSIDs map[string]map[string]struct{}
 	pendingShare map[string]map[ParticipantRef]bool
+	// leftConns tombstones participant SIDs whose participant_left was
+	// processed, so a reordered delayed participant_joined for that same
+	// dead connection cannot re-add it to the roster. Cleared per room
+	// generation.
+	leftConns map[string]map[string]bool
 }
 
 func NewCallRegistry() *CallRegistry {
@@ -79,6 +89,7 @@ func NewCallRegistry() *CallRegistry {
 		rooms: map[string]*CallState{}, roomSequence: map[string]uint64{},
 		roomSID:      map[string]string{},
 		finishedSIDs: map[string]map[string]struct{}{}, pendingShare: map[string]map[ParticipantRef]bool{},
+		leftConns: map[string]map[string]bool{},
 	}
 }
 
@@ -176,7 +187,16 @@ func (r *CallRegistry) changed(placeID string) {
 }
 
 func cloneCallState(state *CallState) CallState {
-	participants := append([]CallParticipant(nil), state.Participants...)
+	participants := make([]CallParticipant, len(state.Participants))
+	for i, p := range state.Participants {
+		participants[i] = p
+		if p.Connections != nil {
+			participants[i].Connections = make(map[string]string, len(p.Connections))
+			for k, v := range p.Connections {
+				participants[i].Connections[k] = v
+			}
+		}
+	}
 	return CallState{
 		PlaceID: state.PlaceID, Active: state.Active, StartedAt: state.StartedAt,
 		Participants: participants,
@@ -218,6 +238,7 @@ func (r *CallRegistry) open(placeID, sid string, at time.Time) (CallState, bool)
 	r.rooms[placeID] = state
 	r.roomSID[placeID] = sid
 	delete(r.pendingShare, placeID)
+	delete(r.leftConns, placeID)
 	r.changed(placeID)
 	return cloneCallState(state), true
 }
@@ -230,23 +251,55 @@ func (r *CallRegistry) close(placeID, sid string) (CallState, bool) {
 	}
 	delete(r.rooms, placeID)
 	delete(r.pendingShare, placeID)
+	delete(r.leftConns, placeID)
 	r.roomSID[placeID] = sid
 	r.retire(placeID, sid)
 	r.changed(placeID)
 	return CallState{PlaceID: placeID}, true
 }
 
-func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, identity string, at time.Time) (CallState, bool) {
+// connKey identifies one LiveKit connection within a participant entry. The
+// participant SID is unique per connection; an identity is reused by a
+// reconnecting participant, so it is only the fallback when no SID is
+// available (synthetic callers).
+func connKey(participantSID, identity string) string {
+	if participantSID != "" {
+		return participantSID
+	}
+	return identity
+}
+
+// join records one connection under the participant ref. The roster entry
+// stays present while any of its connections is live — a stale-generation
+// secretary connection (#e1) departing must not hide the still-connected
+// current one (#e2). A join for a connection whose leave was already
+// processed is a reordered stale event and is ignored.
+func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, identity, participantSID string, at time.Time) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.activeSID(placeID, sid)
 	if !ok {
 		return CallState{}, false
 	}
-	for _, existing := range state.Participants {
-		if existing.Participant == participant {
+	key := connKey(participantSID, identity)
+	if participantSID != "" && r.leftConns[placeID][participantSID] {
+		return cloneCallState(state), false
+	}
+	for i, existing := range state.Participants {
+		if existing.Participant != participant {
+			continue
+		}
+		if existing.Connections == nil {
+			existing.Connections = map[string]string{}
+		}
+		if _, dup := existing.Connections[key]; dup {
 			return cloneCallState(state), false
 		}
+		existing.Connections[key] = identity
+		existing.Identity = identity
+		state.Participants[i] = existing
+		r.changed(placeID)
+		return cloneCallState(state), true
 	}
 	sharing, pending := r.pendingShare[placeID][participant]
 	if pending {
@@ -254,7 +307,8 @@ func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, ide
 	}
 	state.Participants = append(state.Participants, CallParticipant{
 		Participant: participant, JoinedAt: at, ScreenShare: sharing,
-		Identity: identity,
+		Identity:    identity,
+		Connections: map[string]string{key: identity},
 	})
 	sort.SliceStable(state.Participants, func(i, j int) bool {
 		if state.Participants[i].JoinedAt.Equal(state.Participants[j].JoinedAt) {
@@ -266,20 +320,72 @@ func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, ide
 	return cloneCallState(state), true
 }
 
-func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef, identity string) (CallState, bool) {
+// leave drops exactly the connection the event names. The entry is removed
+// only when no live connection remains; when the event carries no
+// participant SID, the connection is matched by identity, and a participant
+// with an untracked connection (e.g. joined before this process started)
+// still falls back to an identity match so it can depart.
+func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef, identity, participantSID string) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.activeSID(placeID, sid)
 	if !ok {
 		return CallState{}, false
 	}
+	if participantSID != "" {
+		if r.leftConns[placeID] == nil {
+			r.leftConns[placeID] = map[string]bool{}
+		}
+		r.leftConns[placeID][participantSID] = true
+	}
 	for i, existing := range state.Participants {
-		if existing.Participant == participant &&
-			(existing.Identity == "" || identity == "" || existing.Identity == identity) {
+		if existing.Participant != participant {
+			continue
+		}
+		if len(existing.Connections) == 0 {
+			// Entry recorded without connection detail (a rebuild or a
+			// snapshot older than connection tracking): keep the legacy
+			// identity match so it can still depart.
+			if existing.Identity != "" && identity != "" && existing.Identity != identity {
+				r.changed(placeID)
+				return cloneCallState(state), false
+			}
 			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
 			r.changed(placeID)
 			return cloneCallState(state), true
 		}
+		key := connKey(participantSID, identity)
+		_, tracked := existing.Connections[key]
+		if !tracked {
+			// The leaving connection is not in the set (unknown SID, or a
+			// join this process never saw). Drop the tracked connection
+			// carrying the same identity — the media for it is gone.
+			for k, id := range existing.Connections {
+				if id == identity {
+					key = k
+					tracked = true
+					break
+				}
+			}
+		}
+		if !tracked {
+			r.changed(placeID)
+			return cloneCallState(state), false
+		}
+		delete(existing.Connections, key)
+		if len(existing.Connections) == 0 {
+			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
+		} else {
+			keys := make([]string, 0, len(existing.Connections))
+			for k := range existing.Connections {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			existing.Identity = existing.Connections[keys[0]]
+			state.Participants[i] = existing
+		}
+		r.changed(placeID)
+		return cloneCallState(state), true
 	}
 	r.changed(placeID)
 	return cloneCallState(state), false
@@ -542,6 +648,7 @@ type livekitWebhookEvent struct {
 	} `json:"room"`
 	Participant struct {
 		Identity string `json:"identity"`
+		SID      string `json:"sid"`
 	} `json:"participant"`
 	Track struct {
 		Source string `json:"source"`
@@ -572,10 +679,10 @@ func (c *CallService) applyWebhook(ctx context.Context, event livekitWebhookEven
 			return
 		}
 		if event.Event == "participant_joined" {
-			state, changed = c.Registry.join(placeID, event.Room.SID, participant, event.Participant.Identity, c.now())
+			state, changed = c.Registry.join(placeID, event.Room.SID, participant, event.Participant.Identity, event.Participant.SID, c.now())
 			c.removeStaleEpochParticipant(ctx, placeID, event.Participant.Identity, participant)
 		} else {
-			state, changed = c.Registry.leave(placeID, event.Room.SID, participant, event.Participant.Identity)
+			state, changed = c.Registry.leave(placeID, event.Room.SID, participant, event.Participant.Identity, event.Participant.SID)
 		}
 	case "track_published", "track_unpublished":
 		if event.Track.Source != "SCREEN_SHARE" {
@@ -691,6 +798,7 @@ type liveKitRoom struct {
 
 type liveKitParticipant struct {
 	Identity string `json:"identity"`
+	SID      string `json:"sid"`
 	JoinedAt int64  `json:"joined_at,string"`
 	Tracks   []struct {
 		Source string `json:"source"`
@@ -876,7 +984,33 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 			if participant.JoinedAt == 0 {
 				joinedAt = startedAt
 			}
-			entry := CallParticipant{Participant: ref, JoinedAt: joinedAt, Identity: participant.Identity}
+			merged := false
+			for i, existing := range snapshot.state.Participants {
+				if existing.Participant != ref {
+					continue
+				}
+				// One roster entry per ref: a second live connection (e.g.
+				// a reclaimed secretary actor alongside its dying
+				// predecessor) joins the same entry.
+				if existing.Connections == nil {
+					existing.Connections = map[string]string{}
+				}
+				existing.Connections[connKey(participant.SID, participant.Identity)] = participant.Identity
+				existing.Identity = participant.Identity
+				for _, track := range participant.Tracks {
+					if track.Source == "SCREEN_SHARE" {
+						existing.ScreenShare = true
+					}
+				}
+				snapshot.state.Participants[i] = existing
+				merged = true
+				break
+			}
+			if merged {
+				continue
+			}
+			entry := CallParticipant{Participant: ref, JoinedAt: joinedAt, Identity: participant.Identity,
+				Connections: map[string]string{connKey(participant.SID, participant.Identity): participant.Identity}}
 			for _, track := range participant.Tracks {
 				if track.Source == "SCREEN_SHARE" {
 					entry.ScreenShare = true
@@ -948,7 +1082,7 @@ func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceI
 			}
 			// Publish the local projection immediately; participant_left
 			// delivery is idempotent and does not emit a second change.
-			if state, changed := c.Registry.leave(room.Name, room.SID, participant, entry.Identity); changed {
+			if state, changed := c.Registry.leave(room.Name, room.SID, participant, entry.Identity, entry.SID); changed {
 				c.publishCallState(ctx, state)
 			}
 		}
@@ -1008,18 +1142,24 @@ func (c *CallService) endCallSessionsForRoom(placeID, roomSID string) {
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var session CallSession
 			if err := rows.Scan(callSessionScan(&session)...); err != nil {
-				return err
-			}
-			if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "room_finished"); err != nil {
+				rows.Close()
 				return err
 			}
 			ended = append(ended, session)
 		}
-		return rows.Err()
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, session := range ended {
+			if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "room_finished"); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		log.Printf("call: end sessions for finished room %s: %v", placeID, err)
@@ -1154,6 +1294,17 @@ func (c *CallService) serveRemoveCallParticipant(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadGateway, "call_request_failed")
 		return
 	}
+	if target.Kind == KindPersonalityAgent {
+		// Revoke the durable session BEFORE removing media: the kicked
+		// runner races to report 'failed'/'evicted', and whichever durable
+		// record commits first is the cause of record. Revoking first
+		// clears the claim, so the runner's report hits ErrCallClaimLost
+		// and 'removed_by_member' survives as the observable reason.
+		if err := c.RevokePlaceCallSessions(r.Context(), target.ID, placeID, "removed_by_member"); err != nil {
+			writeStoreError(w, err)
+			return
+		}
+	}
 	removed := false
 	sid := c.Registry.roomSIDFor(placeID)
 	for _, entry := range participants {
@@ -1166,14 +1317,8 @@ func (c *CallService) serveRemoveCallParticipant(w http.ResponseWriter, r *http.
 			return
 		}
 		removed = true
-		if state, changed := c.Registry.leave(placeID, sid, target, entry.Identity); changed {
+		if state, changed := c.Registry.leave(placeID, sid, target, entry.Identity, entry.SID); changed {
 			c.publishCallState(r.Context(), state)
-		}
-	}
-	if target.Kind == KindPersonalityAgent {
-		if err := c.RevokePlaceCallSessions(r.Context(), target.ID, placeID, "removed_by_member"); err != nil {
-			writeStoreError(w, err)
-			return
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})

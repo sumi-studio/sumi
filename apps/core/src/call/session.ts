@@ -14,8 +14,8 @@ import type { RemoteTrack } from "@livekit/rtc-node";
 import type { CallSession, CallUtterance } from "../types.ts";
 import {
   CallBridgeClient,
-  CallBridgeError,
   CallClaimLostError,
+  CallUtteranceTerminalError,
 } from "./bridge-client.ts";
 import type { CallSTT, CallTTS } from "./adapters.ts";
 import { VadSegmenter } from "./adapters.ts";
@@ -240,7 +240,7 @@ export class CallSessionActor {
           },
         );
       } catch (e) {
-        if (e instanceof CallClaimLostError || e instanceof CallBridgeError) {
+        if (e instanceof CallClaimLostError) {
           this.deps.log("heartbeat ended session actor", {
             session: this.session.session_id,
             error: String(e),
@@ -248,7 +248,12 @@ export class CallSessionActor {
           this.stopped = true;
           return;
         }
-        throw e;
+        // A transient failure must not kill the actor — keep heartbeating;
+        // if the lease actually lapsed the next attempt reports claim loss.
+        this.deps.log("heartbeat failed; will retry", {
+          session: this.session.session_id,
+          error: String(e),
+        });
       }
       if (this.session.status === "ending") {
         await this.gracefulEnd("call.leave");
@@ -415,10 +420,14 @@ export class CallSessionActor {
           { runnerId: this.deps.runnerId, epoch: this.session.epoch },
         );
       } catch (e) {
-        if (e instanceof CallClaimLostError || e instanceof CallBridgeError) {
+        if (e instanceof CallClaimLostError) {
           this.stopped = true;
           return;
         }
+        this.deps.log("utterance poll failed; will retry", {
+          session: this.session.session_id,
+          error: String(e),
+        });
         continue;
       }
       for (const utterance of pending) {
@@ -449,11 +458,27 @@ export class CallSessionActor {
         { runnerId, epoch, status: "dequeued" },
       );
     } catch (e) {
-      if (e instanceof CallClaimLostError || e instanceof CallBridgeError) {
+      if (e instanceof CallClaimLostError) {
         this.stopped = true;
         return;
       }
-      throw e;
+      if (e instanceof CallUtteranceTerminalError) {
+        // Already resolved server-side (superseded epoch, expired on end)
+        // — skip it; the claim and session are unaffected.
+        this.deps.log("utterance already terminal; skipping", {
+          session: this.session.session_id,
+          utterance_id: utterance.utterance_id,
+        });
+        return;
+      }
+      // Transient failure: the utterance stays 'intended' and is offered
+      // again on the next poll.
+      this.deps.log("utterance dequeue report failed; will retry", {
+        session: this.session.session_id,
+        utterance_id: utterance.utterance_id,
+        error: String(e),
+      });
+      return;
     }
     const room = this.room;
     const local = room?.localParticipant;

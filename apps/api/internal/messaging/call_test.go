@@ -132,22 +132,74 @@ func TestCallRegistryFoldsRoomParticipantAndScreenEvents(t *testing.T) {
 	alice := Human("01900000-0000-7000-8000-0000000000aa")
 	bob := Human("01900000-0000-7000-8000-0000000000bb")
 	registry.open("place-1", testRoomSID, now)
-	registry.join("place-1", testRoomSID, alice, alice.Key(), now)
-	state, _ := registry.join("place-1", testRoomSID, bob, bob.Key(), now.Add(time.Second))
-	state, _ = registry.join("place-1", testRoomSID, bob, bob.Key(), now.Add(2*time.Second))
+	registry.join("place-1", testRoomSID, alice, alice.Key(), "", now)
+	state, _ := registry.join("place-1", testRoomSID, bob, bob.Key(), "", now.Add(time.Second))
+	state, _ = registry.join("place-1", testRoomSID, bob, bob.Key(), "", now.Add(2*time.Second))
 	if len(state.Participants) != 2 {
 		t.Fatalf("duplicate webhook created %d participants", len(state.Participants))
 	}
 	if _, changed := registry.setScreenShare("place-1", testRoomSID, bob, true); !changed {
 		t.Fatal("screen-share publication did not change state")
 	}
-	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key())
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "")
 	if !state.Active || len(state.Participants) != 1 || !state.Participants[0].ScreenShare {
 		t.Fatalf("participant fold = %+v", state)
 	}
 	state, _ = registry.close("place-1", testRoomSID)
 	if state.Active {
 		t.Fatal("finished room remained active")
+	}
+}
+
+// Two LiveKit connections of one participant share a single roster entry:
+// a dying stale-epoch secretary connection leaving must not hide the
+// still-connected current generation, and a human's reconnect keeps them
+// present until their last connection departs.
+func TestCallRegistryTracksConnectionsPerParticipant(t *testing.T) {
+	now := time.Unix(1_780_000_000, 0)
+	registry := NewCallRegistry()
+	pa := ParticipantRef{Kind: KindPersonalityAgent, ID: "01900000-0000-7000-8000-0000000000cc"}
+	alice := Human("01900000-0000-7000-8000-0000000000aa")
+	registry.open("place-1", testRoomSID, now)
+
+	// The stale e1 actor and the reclaimed e2 actor are both connected.
+	state, _ := registry.join("place-1", testRoomSID, pa, pa.Key()+"#e1", "PA_conn_e1", now)
+	state, _ = registry.join("place-1", testRoomSID, pa, pa.Key()+"#e2", "PA_conn_e2", now.Add(time.Second))
+	if len(state.Participants) != 1 || state.Participants[0].Identity != pa.Key()+"#e2" {
+		t.Fatalf("two connections produced %+v participants", state.Participants)
+	}
+	// e1's connection departs — e2 remains present.
+	state, _ = registry.leave("place-1", testRoomSID, pa, pa.Key()+"#e1", "PA_conn_e1")
+	if len(state.Participants) != 1 || state.Participants[0].Identity != pa.Key()+"#e2" {
+		t.Fatalf("stale-epoch leave removed the live participant: %+v", state.Participants)
+	}
+	// A delayed join for the already-departed connection is a reordered
+	// stale event — ignored, not resurrected.
+	state, changed := registry.join("place-1", testRoomSID, pa, pa.Key()+"#e1", "PA_conn_e1", now.Add(2*time.Second))
+	if len(state.Participants) != 1 || state.Participants[0].Identity != pa.Key()+"#e2" {
+		t.Fatalf("reordered join resurrected the dead generation: %+v", state.Participants)
+	}
+	_ = changed
+	// e2 departs — the roster entry goes.
+	state, _ = registry.leave("place-1", testRoomSID, pa, pa.Key()+"#e2", "PA_conn_e2")
+	if len(state.Participants) != 0 {
+		t.Fatalf("participant remained after its last connection left: %+v", state.Participants)
+	}
+
+	// A human's reconnect shares one entry by ref: the old connection's
+	// leave does not evict the replacement.
+	state, _ = registry.join("place-1", testRoomSID, alice, alice.Key(), "PA_h1", now)
+	state, _ = registry.join("place-1", testRoomSID, alice, alice.Key(), "PA_h2", now.Add(time.Second))
+	if len(state.Participants) != 1 {
+		t.Fatalf("human reconnect produced %d participants", len(state.Participants))
+	}
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "PA_h1")
+	if len(state.Participants) != 1 {
+		t.Fatalf("old-connection leave evicted the reconnected human")
+	}
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "PA_h2")
+	if len(state.Participants) != 0 {
+		t.Fatalf("human remained after both connections left")
 	}
 }
 
@@ -492,7 +544,7 @@ func TestCallRegistryRebuildRetriesWebhookAppliedDuringSnapshot(t *testing.T) {
 				// This is the previously unsafe interleaving: RoomService has
 				// already been read, then LiveKit delivers a newer webhook.
 				registry.open("place-1", testRoomSID, now)
-				registry.join("place-1", testRoomSID, webhookParticipant, webhookParticipant.Key(), now)
+				registry.join("place-1", testRoomSID, webhookParticipant, webhookParticipant.Key(), "", now)
 				participants["place-1"] = append(participants["place-1"], liveKitParticipant{
 					Identity: webhookParticipant.Key(), JoinedAt: now.Unix(),
 				})
@@ -529,8 +581,8 @@ func TestCallRegistryRebuildRetriesParticipantLeftDuringSnapshot(t *testing.T) {
 				}
 				firstList = false
 				registry.open("place-1", testRoomSID, now)
-				registry.join("place-1", testRoomSID, departed, departed.Key(), now)
-				registry.leave("place-1", testRoomSID, departed, departed.Key())
+				registry.join("place-1", testRoomSID, departed, departed.Key(), "", now)
+				registry.leave("place-1", testRoomSID, departed, departed.Key(), "")
 				participants["place-1"] = nil
 			},
 		},
@@ -549,7 +601,7 @@ func TestCallRegistryRebuildDiscardsListingAfterThreeWebhookRaces(t *testing.T) 
 	registry := NewCallRegistry()
 	departed := Human("01900000-0000-7000-8000-0000000000aa")
 	registry.open("place-1", testRoomSID, now)
-	registry.join("place-1", testRoomSID, departed, departed.Key(), now)
+	registry.join("place-1", testRoomSID, departed, departed.Key(), "", now)
 	calls := 0
 	service := &CallService{
 		Registry: registry,
@@ -563,7 +615,7 @@ func TestCallRegistryRebuildDiscardsListingAfterThreeWebhookRaces(t *testing.T) 
 				// Keep changing the room sequence after every stale listing. The
 				// first leave changes membership; later duplicate leaves model
 				// separate webhook deliveries during the remaining attempts.
-				registry.leave("place-1", testRoomSID, departed, departed.Key())
+				registry.leave("place-1", testRoomSID, departed, departed.Key(), "")
 			},
 		},
 	}
@@ -627,7 +679,7 @@ func TestCallServiceRemovesClosedWorkspaceMemberPublishesOnceAndIgnoresWebhookDu
 		},
 	}
 	service.Registry.open(channel.PlaceID, testRoomSID, time.Unix(1_780_000_000, 0))
-	service.Registry.join(channel.PlaceID, testRoomSID, w.humanB, w.humanB.Key(), time.Unix(1_780_000_000, 0))
+	service.Registry.join(channel.PlaceID, testRoomSID, w.humanB, w.humanB.Key(), "", time.Unix(1_780_000_000, 0))
 	subscriber := hub.subscribe(owner)
 	defer hub.unsubscribe(subscriber)
 	if err := service.RemoveWorkspaceParticipant(ctx, fixture.workspace.WorkspaceID, w.humanB); err != nil {

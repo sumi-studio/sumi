@@ -310,6 +310,36 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
 			ErrUnresolvedOperations, strings.Join(inflight, ", "))
 	}
+	// A live call session is a runner claim of the same detachable kind as
+	// a job: its media actor keeps minting tickets and speaking on this
+	// placement while the seal claims authority ended. Call sessions are
+	// messaging-local state — never carried in the bundle — so seal ends
+	// the participation here with an explicit reason rather than refusing:
+	// the secretary's transfer must not be blocked by a call it cannot
+	// leave post-seal. Non-terminal speech is recorded honestly: never
+	// started expires; mid-flight becomes unknown. The persona row lock
+	// held above serializes this sweep against concurrent call mutations —
+	// the bridge's share-locked authority check sees the retired authority
+	// after commit and refuses every later call operation.
+	if _, err := tx.Exec(ctx, `
+		UPDATE call_utterances u
+		SET status = CASE WHEN u.status = 'intended' THEN 'expired' ELSE 'unknown' END,
+		    detail = CASE WHEN jsonb_typeof(u.detail) = 'object'
+		                  THEN u.detail ELSE '{}'::jsonb END || '{"reason":"transfer_sealed"}'::jsonb,
+		    updated_at = now()
+		FROM call_sessions s
+		WHERE u.session_id = s.session_id AND s.personality_agent_id = $1
+		  AND u.status IN ('intended','dequeued','emitting')`, personaID); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE call_sessions
+		SET status='revoked', ended_at=now(), end_reason='transfer_sealed',
+		    claimed_by=NULL, claim_expires_at=NULL, updated_at=now()
+		WHERE personality_agent_id = $1
+		  AND status IN ('requested','claimed','active','ending','interrupted')`, personaID); err != nil {
+		return Receipt{}, err
+	}
 	// The model selection is human-scoped account state: it binds the
 	// persona's human, and the destination binds a different account whose
 	// connection rows cannot be assumed to exist. Snapshot it onto the

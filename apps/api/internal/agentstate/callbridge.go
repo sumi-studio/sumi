@@ -2,7 +2,27 @@ package agentstate
 
 import (
 	"context"
+	"errors"
 	"time"
+)
+
+// Sentinel errors for the call bridge surface. They are declared here so
+// the HTTP layer maps them by errors.Is — never by message text — onto a
+// wire code the runner can distinguish: a terminal utterance is not a lost
+// claim, and neither is a generic internal failure.
+var (
+	// ErrCallClaimLost: the session's claim belongs to another runner or
+	// epoch, or its lease expired. The runner must stop all media work.
+	ErrCallClaimLost = errors.New("call session claim is held by another runner or epoch")
+	// ErrCallSessionNotFound / ErrCallSessionNotLive: the session does not
+	// exist or cannot accept the requested transition.
+	ErrCallSessionNotFound = errors.New("call session not found")
+	ErrCallSessionNotLive  = errors.New("call session is not live")
+	// ErrCallUtteranceNotFound / ErrCallUtteranceTerminal: the utterance is
+	// unknown or already reached a recorded end state — the runner skips it;
+	// its claim is unaffected.
+	ErrCallUtteranceNotFound = errors.New("call utterance not found")
+	ErrCallUtteranceTerminal = errors.New("call utterance disposition is terminal")
 )
 
 // CallBridge is the persona-scoped backend a per-placement call media runner

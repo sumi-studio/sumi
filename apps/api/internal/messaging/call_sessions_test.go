@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
+	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 )
 
 // recordingRoomService fakes the RoomService boundary: the session layer's
@@ -43,6 +44,11 @@ func newCallSessionWorld(t *testing.T, ctx context.Context) (world, *CallService
 		t.Fatalf("ensure dm: %v", err)
 	}
 	coreStore := agentstate.NewStore(w.store.core.pool)
+	// The secretary's core persona exists and holds 'active' placement
+	// authority — the bridge gates every call mutation on it.
+	if _, _, err := coreStore.EnsurePersona(ctx, w.agent.ID, nil, "Test Secretary"); err != nil {
+		t.Fatalf("ensure persona: %v", err)
+	}
 	calls := &CallService{
 		Server:   &Server{Store: w.store.core},
 		LiveKit:  testLiveKit(),
@@ -397,8 +403,11 @@ func TestStaleEpochParticipantIsRemovedPrecisely(t *testing.T) {
 	defer cancel()
 	w, calls, _, dm := newCallSessionWorld(t, ctx)
 	pool := w.store.core.pool
+	// The stub fakes the removal boundary only: a registry rebuild from its
+	// empty room list would erase the webhook-built call the join needs.
 	rooms := &recordingRoomService{}
 	calls.RoomService = rooms
+	calls.rebuiltOnce = true
 
 	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
 	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
@@ -442,5 +451,407 @@ func TestStaleEpochParticipantIsRemovedPrecisely(t *testing.T) {
 	}
 	if !foundStaleSweep {
 		t.Fatalf("claim sweep did not remove prior actor: %v", rooms.removed)
+	}
+}
+
+// A call.say committed between call.join and the runner's claim is speech
+// no generation ever had a chance to play: the first claim adopts it into
+// its epoch and the runner delivers it once — it is not expired as stale,
+// and the disposition machine accepts it end to end.
+func TestCallSayBeforeClaimIsAdoptedByFirstClaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	say := applyCallEffect(t, ctx, pool, calls.CallSayEffect(), w.agent.ID,
+		map[string]any{"session_id": session.SessionID, "text": "hello before claim"})
+	utterance, _ := say["utterance"].(CallUtterance)
+	if utterance.UtteranceID == "" || utterance.SessionEpoch != 0 {
+		t.Fatalf("preclaim utterance = %+v", utterance)
+	}
+	if say["awaiting_claim"] != true {
+		t.Fatalf("preclaim say result lacks awaiting_claim: %v", say)
+	}
+
+	claimed, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4)
+	if err != nil || len(claimed) != 1 || claimed[0].Epoch != 1 {
+		t.Fatalf("claim: %v %+v", err, claimed)
+	}
+	u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
+	if u.Status != CallUtteranceIntended || u.SessionEpoch != 1 {
+		t.Fatalf("adopted utterance = %+v", u)
+	}
+	pending, err := calls.PendingCallUtterances(ctx, w.agent.ID, session.SessionID, "runner-a", 1)
+	if err != nil || len(pending) != 1 || pending[0].UtteranceID != utterance.UtteranceID {
+		t.Fatalf("pending after adoption: %v %+v", err, pending)
+	}
+	// The full disposition machine accepts the adopted utterance.
+	for _, status := range []string{CallUtteranceDequeued, CallUtteranceEmitting, CallUtteranceEmitted} {
+		if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID,
+			utterance.UtteranceID, "runner-a", 1, status, nil); err != nil {
+			t.Fatalf("disposition %s: %v", status, err)
+		}
+	}
+	u = callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
+	if u.Status != CallUtteranceEmitted {
+		t.Fatalf("final utterance = %+v", u)
+	}
+}
+
+// Speech committed while a session is interrupted carries the superseded
+// epoch: it may already have been partially heard, so the next claim records
+// it expired rather than replaying it.
+func TestCallSayOnInterruptedExpiresAtReclaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET claim_expires_at = now() - interval '1 second' WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	// A say while the session is still claimed-but-lapsed in the model's
+	// view lands under the epoch that may already have been heard.
+	say := applyCallEffect(t, ctx, pool, calls.CallSayEffect(), w.agent.ID,
+		map[string]any{"session_id": session.SessionID, "text": "said into a dead claim"})
+	utterance, _ := say["utterance"].(CallUtterance)
+	if say["awaiting_claim"] != true {
+		t.Fatalf("interrupted say lacks awaiting_claim: %v", say)
+	}
+	reclaimed, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].Epoch != 2 {
+		t.Fatalf("reclaim: %v %+v", err, reclaimed)
+	}
+	u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
+	if u.Status != CallUtteranceExpired {
+		t.Fatalf("stale-epoch utterance = %+v", u)
+	}
+	pending, err := calls.PendingCallUtterances(ctx, w.agent.ID, session.SessionID, "runner-b", 2)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("successor pending: %v %+v", err, pending)
+	}
+}
+
+// A committed call.leave must not be undone by a runner crash: when the
+// claim lapses while 'ending', the session ends durably — the next claim
+// pass does not rejoin a call the secretary deliberately left.
+func TestEndingSessionEndsOnClaimLapse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	applyCallEffect(t, ctx, pool, calls.CallLeaveEffect(), w.agent.ID,
+		map[string]any{"session_id": session.SessionID})
+	// The runner dies before observing 'ending'.
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET claim_expires_at = now() - interval '1 second' WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	claimed, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("ended-by-leave session was reclaimed: %+v", claimed)
+	}
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionEnded || row.EndReason != "claim_lapsed_after_leave" {
+		t.Fatalf("lapsed ending session = %+v", row)
+	}
+	var inputs int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_inputs WHERE persona_id=$1 AND kind='call_event'`,
+		w.agent.ID).Scan(&inputs); err != nil {
+		t.Fatalf("count call_event inputs: %v", err)
+	}
+	if inputs != 1 {
+		t.Fatalf("call_event inputs = %d, want 1", inputs)
+	}
+}
+
+// Omitted disposition detail stores a JSON object, and a later sweep merge
+// keeps the row an object — never the [null, {...}] array corruption.
+func TestUtteranceDetailStaysCoherentAcrossSweeps(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	utterance := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "detail-free")
+	if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID,
+		utterance.UtteranceID, "runner-a", 1, CallUtteranceDequeued, nil); err != nil {
+		t.Fatalf("dequeue: %v", err)
+	}
+	var raw string
+	if err := pool.QueryRow(ctx,
+		`SELECT detail::text FROM call_utterances WHERE utterance_id=$1`,
+		utterance.UtteranceID).Scan(&raw); err != nil {
+		t.Fatalf("read detail: %v", err)
+	}
+	if raw != "{}" {
+		t.Fatalf("nil detail stored as %s, want {}", raw)
+	}
+	// Lapse sweeps the mid-flight utterance; the merge must keep detail an
+	// object and the row scannable.
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET claim_expires_at = now() - interval '1 second' WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
+	if u.Status != CallUtteranceUnknown || u.Detail["reason"] == nil {
+		t.Fatalf("swept utterance = %+v", u)
+	}
+}
+
+// A delayed room_finished for a dead room generation must not end sessions
+// stamped with the current generation's SID — the durable room binding is
+// what protects them after a restart wipes the volatile registry.
+func TestStaleRoomFinishSparesCurrentGeneration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if session.RoomSID != testRoomSID {
+		t.Fatalf("join stamped room_sid %q, want %q", session.RoomSID, testRoomSID)
+	}
+	// A finish event for a room SID this session never belonged to leaves
+	// it live.
+	calls.endCallSessionsForRoom(dm.PlaceID, "RM_dead_generation")
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRequested {
+		t.Fatalf("session ended by foreign room_finished: %+v", row)
+	}
+	// The matching generation's finish still ends it.
+	calls.endCallSessionsForRoom(dm.PlaceID, testRoomSID)
+	row = callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionEnded || row.EndReason != "room_finished" {
+		t.Fatalf("session after own room_finished: %+v", row)
+	}
+}
+
+// A claim that has lapsed carries no write authority — even in the window
+// before any successor reclaims the session. Heartbeat, status, ticket, and
+// utterance reports all fail with ErrCallClaimLost.
+func TestExpiredClaimHasNoWriteAuthority(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	utterance := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "hello")
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET claim_expires_at = now() - interval '1 second' WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	if _, err := calls.HeartbeatCallSession(ctx, w.agent.ID, session.SessionID, "runner-a", 1, 30*time.Second); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("heartbeat on expired claim = %v", err)
+	}
+	if _, err := calls.CallSessionTicket(ctx, w.agent.ID, session.SessionID, "runner-a", 1); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("ticket on expired claim = %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionEnded, "bye"); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("status on expired claim = %v", err)
+	}
+	if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID, utterance.UtteranceID, "runner-a", 1, CallUtteranceEmitted, nil); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("disposition on expired claim = %v", err)
+	}
+}
+
+// Human removal revokes the durable claim before the media kick lands, so
+// the evicted runner's racing report hits a dead claim: 'removed_by_member'
+// is the recorded cause, not the runner's 'evicted' reason.
+func TestCallRemovalOutracesRunnerEvictedReport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	// The remove route revokes first; the runner's evicted report arrives
+	// after its claim is already gone.
+	if err := calls.RevokePlaceCallSessions(ctx, w.agent.ID, dm.PlaceID, "removed_by_member"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionFailed, "evicted:participant_removed"); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("evicted report on revoked claim = %v", err)
+	}
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "removed_by_member" {
+		t.Fatalf("removed session = %+v", row)
+	}
+	// Removal ends current participation only — it is not a ban: the same
+	// secretary may join a later call in the place.
+	rejoined := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if rejoined.SessionID == "" || rejoined.SessionID == session.SessionID {
+		t.Fatalf("rejoin after removal = %+v", rejoined)
+	}
+}
+
+// Seal is the placement-authority cut: live call participation is revoked
+// in the same transaction that retires the persona, mid-flight speech is
+// recorded honestly, and every call mutation is refused afterwards.
+// Portable/direct-service proof — no HTTP or live-audio destination claim.
+func TestSealRetiresLiveCallParticipation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	pending := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "never dequeued")
+	inflight := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "mid-emit")
+	for _, status := range []string{CallUtteranceDequeued, CallUtteranceEmitting} {
+		if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID, inflight.UtteranceID, "runner-a", 1, status, nil); err != nil {
+			t.Fatalf("%s: %v", status, err)
+		}
+	}
+
+	svc := portable.NewService(pool)
+	if _, err := svc.Seal(ctx, w.agent.ID, newUUIDv7(), newUUIDv7()); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "transfer_sealed" || row.ClaimedBy != "" {
+		t.Fatalf("sealed session = %+v", row)
+	}
+	if u := callUtteranceRow(t, ctx, pool, pending.UtteranceID); u.Status != CallUtteranceExpired || u.Detail["reason"] != "transfer_sealed" {
+		t.Fatalf("sealed pending utterance = %+v", u)
+	}
+	if u := callUtteranceRow(t, ctx, pool, inflight.UtteranceID); u.Status != CallUtteranceUnknown || u.Detail["reason"] != "transfer_sealed" {
+		t.Fatalf("sealed mid-flight utterance = %+v", u)
+	}
+	// The retired persona holds no call authority anywhere.
+	if _, err := calls.HeartbeatCallSession(ctx, w.agent.ID, session.SessionID, "runner-a", 1, 30*time.Second); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("heartbeat after seal = %v", err)
+	}
+	if _, err := calls.CallSessionTicket(ctx, w.agent.ID, session.SessionID, "runner-a", 1); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("ticket after seal = %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionEnded, "bye"); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("status after seal = %v", err)
+	}
+	// A successor claim pass is refused outright: the sealed persona holds
+	// no authority under which a new runner could adopt the session.
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4); err == nil || !strings.Contains(err.Error(), "authority is sealed") {
+		t.Fatalf("post-seal claim pass = %v", err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, joinErr := calls.applyCallJoin(ctx, tx, w.agent.ID, "idem-sealed",
+		map[string]any{"place_id": dm.PlaceID})
+	_ = tx.Rollback(context.Background())
+	if !errors.Is(joinErr, agentstate.ErrBadRequest) || !strings.Contains(joinErr.Error(), "authority") {
+		t.Fatalf("join on sealed persona = %v", joinErr)
+	}
+}
+
+// The seal and a call join serialize on the persona row: a join that opens
+// while the seal holds FOR NO KEY UPDATE blocks, then observes the retired
+// authority and is refused — no session can land on a retired placement.
+func TestSealSerializesInFlightCallJoin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id=$1 FOR NO KEY UPDATE`,
+		w.agent.ID); err != nil {
+		t.Fatalf("seal-side lock: %v", err)
+	}
+	type joinResult struct{ err error }
+	joinCh := make(chan joinResult, 1)
+	go func() {
+		jtx, err := pool.Begin(context.Background())
+		if err != nil {
+			joinCh <- joinResult{err}
+			return
+		}
+		defer func() { _ = jtx.Rollback(context.Background()) }()
+		_, err = calls.applyCallJoin(context.Background(), jtx, w.agent.ID, "idem-seal-race",
+			map[string]any{"place_id": dm.PlaceID})
+		joinCh <- joinResult{err}
+	}()
+	// The join must be blocked on the persona row lock, not sail through.
+	select {
+	case res := <-joinCh:
+		t.Fatalf("join did not serialize with the seal lock: %v", res.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Commit the authority cut the way Seal does.
+	if _, err := lockTx.Exec(ctx,
+		`UPDATE core_personas SET authority='sealed' WHERE persona_id=$1`,
+		w.agent.ID); err != nil {
+		t.Fatalf("seal-side update: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("seal-side commit: %v", err)
+	}
+	select {
+	case res := <-joinCh:
+		if !errors.Is(res.err, agentstate.ErrBadRequest) || !strings.Contains(res.err.Error(), "authority") {
+			t.Fatalf("racing join result = %v", res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("join stayed blocked after the seal committed")
+	}
+	var sessions int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM call_sessions WHERE personality_agent_id=$1`,
+		w.agent.ID).Scan(&sessions); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 0 {
+		t.Fatalf("racing join left %d sessions", sessions)
 	}
 }
