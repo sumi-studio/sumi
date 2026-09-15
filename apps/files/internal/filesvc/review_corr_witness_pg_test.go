@@ -227,9 +227,17 @@ func TestReviewCorrPGStaleInodeRowMisroutesDir(t *testing.T) {
 }
 
 // Directory-wholesale restore when a member has its own recorded home
-// elsewhere: the member rides with the restored container (reachable,
-// never lost) and the member's divergent row must not be laundered
-// into a false-coherent record.
+// elsewhere: the member's row is its own authority — the member must
+// reach its recorded home (finding 200 / A's F-199), not merely ride
+// inside the restored container to an unrecorded public path. The
+// member's divergent row must not be laundered into a false-coherent
+// record: coherence is honest only because the OBJECT moved to the
+// row's home, never because the row was rewritten to wherever bytes
+// landed.
+//
+// (Amended from reviewer B's original, which accepted the member
+// riding the container; root's requirement is recovery to the
+// member's own recorded home.)
 func TestReviewCorrPGRecordedDirMemberRidesWithContainer(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -270,21 +278,32 @@ func TestReviewCorrPGRecordedDirMemberRidesWithContainer(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// The container must come home whole; the member rides along and
-	// stays reachable.
-	if got, ok := authReadOpt(dir, "ws/recD/f.txt"); !ok || got != "FMEM" {
-		where := scanDirFor(t, dir, "ws", []byte("FMEM"))
-		t.Fatalf("member of restored recorded dir not reachable: "+
-			"recD/f.txt=%q present=%v, FMEM bytes at %q", got, ok, where)
+	// The container must come home whole, AND the member must reach its
+	// own recorded home — the row at otherHome/f.txt claims it, so that
+	// is where acknowledged content belongs.
+	st, serr := root.lstat("ws", "recD")
+	if serr != nil || st.Kind != "dir" {
+		t.Fatalf("recorded dir not restored to recD: %v", serr)
 	}
-	// The member's own row must not be rewritten to claim the container
-	// content — honest divergence or an eventual re-home, never a false
-	// coherent record.
-	if _, fp, found := authRow(t, s, "otherHome/f.txt"); found {
-		if live, lerr := root.lstat("ws", "otherHome/f.txt"); lerr == nil &&
-			fp3(live.Fingerprint) == fp3(fp) {
-			t.Fatalf("member row falsely coherent: row fp=%q matches live %q",
-				fp, live.Fingerprint)
+	if got, ok := authReadOpt(dir, "ws/otherHome/f.txt"); !ok || got != "FMEM" {
+		where := scanDirFor(t, dir, "ws", []byte("FMEM"))
+		t.Fatalf("member not recovered to its own recorded home: "+
+			"otherHome/f.txt=%q present=%v, FMEM bytes at %q", got, ok, where)
+	}
+	// The row is now legitimately coherent — the object moved to the
+	// row's recorded home. What must never happen is the row being
+	// REWRITTEN to wherever bytes landed: if the member had instead
+	// stayed at recD/f.txt, the row still pointing at otherHome would be
+	// honest divergence; a row rewritten to recD/f.txt would be false
+	// coherence. Assert the row still records the original member
+	// fingerprint at its recorded home.
+	if _, fp, found := authRow(t, s, "otherHome/f.txt"); !found {
+		t.Fatal("member row vanished")
+	} else {
+		live, lerr := root.lstat("ws", "otherHome/f.txt")
+		if lerr != nil || fp3(live.Fingerprint) != fp3(fp) {
+			t.Fatalf("member row not coherent with the live object: row fp=%q live=%v err=%v",
+				fp, live.Fingerprint, lerr)
 		}
 	}
 }

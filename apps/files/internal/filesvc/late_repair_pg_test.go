@@ -19,6 +19,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // lateRepairView wraps the pass-pinned production view with a hook that
@@ -1961,5 +1964,398 @@ func TestLateRepairCorrFileCrossDevOccupant(t *testing.T) {
 	}
 	if where := scanDirFor(t, dir, "ws", []byte("IMPOSTOR")); where == "" {
 		t.Fatal("foreign occupant destroyed — must be parked aside, never erased")
+	}
+}
+
+// fakeRows is a pgx.Rows test double: a scripted row set whose Scan can
+// fail mid-iteration and whose Err can report an interrupted read after
+// Next() exhausts — the two ways a partial claimant result used to
+// masquerade as the complete authority set.
+type fakeRows struct {
+	vals      [][]string
+	pos       int
+	scanErrAt int // 1-based row index whose Scan fails; 0 = never
+	scanErr   error
+	termErr   error // returned by Err() once iteration ends
+	closed    bool
+}
+
+func (f *fakeRows) Close() { f.closed = true }
+func (f *fakeRows) Err() error {
+	if f.pos >= len(f.vals) {
+		return f.termErr
+	}
+	return nil
+}
+func (f *fakeRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (f *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (f *fakeRows) Conn() *pgx.Conn                              { return nil }
+func (f *fakeRows) Values() ([]any, error)                       { return nil, errors.New("unimplemented") }
+func (f *fakeRows) RawValues() [][]byte                          { return nil }
+func (f *fakeRows) Next() bool {
+	if f.pos >= len(f.vals) {
+		return false
+	}
+	f.pos++
+	return true
+}
+func (f *fakeRows) Scan(dest ...any) error {
+	if f.scanErrAt == f.pos {
+		return f.scanErr
+	}
+	row := f.vals[f.pos-1]
+	*(dest[0].(*string)) = row[0]
+	*(dest[1].(*string)) = row[1]
+	return nil
+}
+
+// An interrupted claimant read must never be treated as the complete
+// authority set: a Scan failure mid-iteration and a rows error after
+// the last row are both propagated, not swallowed — a one-row partial
+// read is not a single authoritative claimant.
+func TestLateRepairCollectClaimsPropagatesErrors(t *testing.T) {
+	good := [][]string{{"aHome", "1:2:3:4"}, {"bHome", "5:6:7:8"}}
+	claims, err := collectClaims(&fakeRows{vals: good})
+	if err != nil || len(claims) != 2 || claims[0].path != "aHome" {
+		t.Fatalf("clean read: claims=%v err=%v", claims, err)
+	}
+	_, err = collectClaims(&fakeRows{
+		vals: good, scanErrAt: 2, scanErr: errors.New("decode boom")})
+	if err == nil {
+		t.Fatal("mid-iteration Scan error swallowed — partial claim set returned as authority")
+	}
+	_, err = collectClaims(&fakeRows{
+		vals: [][]string{{"aHome", "1:2:3:4"}}, termErr: errors.New("conn lost")})
+	if err == nil {
+		t.Fatal("rows.Err after partial iteration swallowed — partial claim set returned as authority")
+	}
+}
+
+// Ranking: multiple exact-fingerprint claimants plus one weaker fp3-only
+// claimant must resolve (or stay ambiguous) among the exact rows alone —
+// the weaker triple row must never win merely because it is the single
+// triple. Two exact claims with no separating evidence are ambiguous.
+func TestLateRepairExactRowsOutrankTriple(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "zHome")
+		}); err != nil {
+		t.Fatalf("mkdir zHome: %v", err)
+	}
+	_, dfp, _ := authRow(t, s, "zHome")
+	ino, sz, mt, _ := fpParts(dfp)
+	// A second EXACT claimant and a weaker fp3-only claimant. The
+	// parked object's live fp equals the exact rows (a found object can
+	// carry its recorded fingerprint before any rename bumps ctime).
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','bGhost',$1,$2,'')`, authMint(t, s), dfp)
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','aTriple',$1,$2,'')`, authMint(t, s),
+		ino+":"+sz+":"+mt+":999")
+	view, verr := authPinned(root, nil)(ctx)
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	defer view.Close()
+	st := FileInfo{Kind: "dir", Fingerprint: dfp}
+	home, claim, rerr := s.recordedAtObject(ctx, "ws", "ws/parked", st, view)
+	if rerr != nil {
+		t.Fatalf("claim query: %v", rerr)
+	}
+	if claim != recAmbiguous {
+		t.Fatalf("claim=%v home=%q — weaker triple or unresolved exact row selected", claim, home)
+	}
+	// Remove one exact row: the single remaining exact claimant wins;
+	// the weaker triple is still never consulted.
+	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='bGhost'`)
+	home, claim, rerr = s.recordedAtObject(ctx, "ws", "ws/parked", st, view)
+	if rerr != nil || claim != recFound || home != "zHome" {
+		t.Fatalf("single exact claimant must win: claim=%v home=%q err=%v", claim, home, rerr)
+	}
+}
+
+// Same ordering on the sweep path with realistic fingerprints: a parked
+// dir's live fp3 (ino:size:mtime — ctime always differs post-rename)
+// matches two triple claimants; a bare inode-leg row is weaker still and
+// must never be consulted while triple claims exist.
+func TestLateRepairTripleRowsOutrankInoLeg(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "zHome")
+		}); err != nil {
+		t.Fatalf("mkdir zHome: %v", err)
+	}
+	_, dfp, _ := authRow(t, s, "zHome")
+	ino, sz, mt, _ := fpParts(dfp)
+	parked := opStagePrefix + "777777-p-rk"
+	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	// Second triple claimant: same ino:size:mtime, other ctime leg.
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','bGhost',$1,$2,'')`, authMint(t, s),
+		ino+":"+sz+":"+mt+":888")
+	// Weaker inode-leg-only claimant — its fp3 cannot match.
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','aWeak',$1,$2,'')`, authMint(t, s), ino+":0:0:0")
+	s.SetReconcileView(authPinned(root, nil))
+	authSettle(t, s)
+	authSettle(t, s)
+	for _, p := range []string{"aWeak", "bGhost", "zHome"} {
+		if _, serr := root.lstat("ws", p); serr == nil {
+			t.Fatalf("dir installed at %s with unresolved triple claimants", p)
+		}
+	}
+	if alive := scanDirForInode(dir, "ws", ino); alive == "" {
+		t.Fatalf("recorded dir lost (ino %s)", ino)
+	}
+	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='bGhost'`)
+	authSettle(t, s)
+	authSettle(t, s)
+	if _, serr := root.lstat("ws", "aWeak"); serr == nil {
+		t.Fatal("weaker inode-leg claimant won over a triple claimant")
+	}
+	st, serr := root.lstat("ws", "zHome")
+	if serr != nil {
+		t.Fatalf("dir not restored to remaining triple home: %v", serr)
+	}
+	if got, _, _, _ := fpParts(st.Fingerprint); got != ino {
+		t.Fatalf("zHome holds ino %s, want %s", got, ino)
+	}
+}
+
+// Finding 200 / A's CW4 composition: a recorded dir carries a recorded
+// member whose row now claims a home outside the container, plus an
+// unknown member no row records. Finite interference resolved: the
+// container is restored at its own recorded home with its identity and
+// unknown member intact, and the recorded member reaches its own
+// recorded home — not stranded inside the container at an unrecorded
+// public path.
+func TestLateRepairMemberExternalHomeAndUnknownRides(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "ddir"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "ddir")
+		}); err != nil {
+		t.Fatalf("mkdir ddir: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir/m", "write",
+		IfVersion{Mode: "any"}, sha("MM"), authProbe(root, "ddir/m"),
+		authWriteFn(root, "ddir/m", "MM")); err != nil {
+		t.Fatalf("write ddir/m: %v", err)
+	}
+	// Unknown member: foreign bytes no row ever recorded.
+	if err := os.WriteFile(dir+"/ws/ddir/u", []byte("UNKNOWN"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, dfp, _ := authRow(t, s, "ddir")
+	dIno, _, _, _ := fpParts(dfp)
+	// The member's committed home is now mout — a rename that moved the
+	// row but never moved the bytes.
+	authExec(t, s,
+		`UPDATE file_version SET path='mout' WHERE scope='ws' AND path='ddir/m'`)
+	parked := opStagePrefix + "888888-p-cw"
+	if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/ddir", dir+"/ws/"+parked+"/ddir"); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReconcileView(authPinned(root, nil))
+	authSettle(t, s)
+	authSettle(t, s)
+	// Container restored at its own recorded home with its identity.
+	st, serr := root.lstat("ws", "ddir")
+	if serr != nil {
+		t.Fatalf("container not restored to ddir: %v", serr)
+	}
+	if got, _, _, _ := fpParts(st.Fingerprint); got != dIno {
+		t.Fatalf("container identity changed: ddir holds ino %s, want %s", got, dIno)
+	}
+	// The recorded member reached its own recorded home.
+	if got, ok := authReadOpt(dir, "ws/mout"); !ok || got != "MM" {
+		where := scanDirFor(t, dir, "ws", []byte("MM"))
+		t.Fatalf("member not at its recorded home: mout=%q present=%v, MM at %q",
+			got, ok, where)
+	}
+	// The unknown member rode the container — preserved, never routed.
+	if got, ok := authReadOpt(dir, "ws/ddir/u"); !ok || got != "UNKNOWN" {
+		t.Fatalf("unknown member lost or displaced: ddir/u=%q present=%v", got, ok)
+	}
+	// Fresh ops proceed after recovery.
+	if _, _, err := s.WithWrite(ctx, "ws", "fresh.txt", "write",
+		IfVersion{Mode: "any"}, sha("FR"), authProbe(root, "fresh.txt"),
+		authWriteFn(root, "fresh.txt", "FR")); err != nil {
+		t.Fatalf("fresh write after member recovery: %v", err)
+	}
+}
+
+// Member home occupied by foreign unrecorded bytes: the member's row
+// says out/m, and out/m holds newer foreign content no row records. The
+// recorded member wins its name (the row's subject is proven: the
+// occupant matches no row evidence); the occupant is swapped to a
+// parked enumerable name — never erased, and no row is rewritten.
+func TestLateRepairMemberHomeOccupiedPreservesBoth(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "ddir"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "ddir")
+		}); err != nil {
+		t.Fatalf("mkdir ddir: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir/m", "write",
+		IfVersion{Mode: "any"}, sha("OLD"), authProbe(root, "ddir/m"),
+		authWriteFn(root, "ddir/m", "OLD")); err != nil {
+		t.Fatalf("write ddir/m: %v", err)
+	}
+	// Foreign NEWER bytes occupy the member's claimed home — written
+	// outside the service, so no row records them.
+	if err := os.Mkdir(dir+"/ws/out", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/out/m", []byte("NEWER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s,
+		`UPDATE file_version SET path='out/m' WHERE scope='ws' AND path='ddir/m'`)
+	parked := opStagePrefix + "999999-p-oc"
+	if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/ddir", dir+"/ws/"+parked+"/ddir"); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReconcileView(authPinned(root, nil))
+	authSettle(t, s)
+	authSettle(t, s)
+	// The member's own row claims out/m — the recorded object wins the
+	// name; the foreign occupant is swapped into the member's old slot
+	// and rides the container to ddir/m — preserved, never erased.
+	if got, ok := authReadOpt(dir, "ws/out/m"); !ok || got != "OLD" {
+		t.Fatalf("member not installed at its recorded home: out/m=%q present=%v", got, ok)
+	}
+	if got, ok := authReadOpt(dir, "ws/ddir/m"); !ok || got != "NEWER" {
+		where := scanDirFor(t, dir, "ws", []byte("NEWER"))
+		t.Fatalf("foreign occupant destroyed: ddir/m=%q present=%v, NEWER at %q",
+			got, ok, where)
+	}
+	// The row is coherent because the object moved to its home, and the
+	// occupant's bytes survive at a parked enumerable name.
+	if _, fp, found := authRow(t, s, "out/m"); !found {
+		t.Fatal("member row vanished")
+	} else {
+		live, lerr := root.lstat("ws", "out/m")
+		if lerr != nil || fp3(live.Fingerprint) != fp3(fp) {
+			t.Fatalf("member row not coherent with live object: row fp=%q err=%v", fp, lerr)
+		}
+	}
+}
+
+// Missing live identity on the member route: when the member's stat
+// carries no dev:ino (a filesystem whose Sys() is not Stat_t, or an
+// injected view without device evidence), the row is still the member's
+// authority — the move revalidation cannot bind identity so it proceeds
+// on the row judgment the pass already made. The member reaches its
+// recorded home; nothing is deleted on missing evidence anywhere.
+func TestLateRepairMemberRoutesWithoutLiveIdentity(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "ddir"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "ddir")
+		}); err != nil {
+		t.Fatalf("mkdir ddir: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "ddir/m", "write",
+		IfVersion{Mode: "any"}, sha("MM"), authProbe(root, "ddir/m"),
+		authWriteFn(root, "ddir/m", "MM")); err != nil {
+		t.Fatalf("write ddir/m: %v", err)
+	}
+	authExec(t, s,
+		`UPDATE file_version SET path='mout' WHERE scope='ws' AND path='ddir/m'`)
+	parked := opStagePrefix + "121212-p-ni"
+	if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/ddir", dir+"/ws/"+parked+"/ddir"); err != nil {
+		t.Fatal(err)
+	}
+	// Strip dev:ino from the member's stat — the row must still route it.
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return sweepIDView{ReconView: v,
+			id: map[string]string{parked + "/ddir/m": "-"}}
+	}))
+	authSettle(t, s)
+	authSettle(t, s)
+	if got, ok := authReadOpt(dir, "ws/mout"); !ok || got != "MM" {
+		t.Fatalf("member not routed without live identity: mout=%q present=%v", got, ok)
+	}
+	if _, serr := root.lstat("ws", "ddir"); serr != nil {
+		t.Fatalf("container not restored: %v", serr)
 	}
 }

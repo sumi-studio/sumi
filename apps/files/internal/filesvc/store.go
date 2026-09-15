@@ -1386,23 +1386,24 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 		cancel()
 		return "", recNone, qerr
 	}
-	var claims []struct{ path, fp string }
-	for rows.Next() {
-		var c struct{ path, fp string }
-		if err := rows.Scan(&c.path, &c.fp); err == nil {
-			claims = append(claims, c)
-		}
-	}
-	rows.Close()
+	claims, cerr := collectClaims(rows)
 	cancel()
+	if cerr != nil {
+		// An interrupted or partial read must not be treated as the
+		// complete claim set — fail closed.
+		return "", recNone, cerr
+	}
 	if len(claims) == 0 {
 		return "", recNone, nil
 	}
 	if len(claims) == 1 {
 		return claims[0].path, recFound, nil
 	}
-	// Multiple claimants. Narrow to the strongest identity evidence,
-	// then let presence and member corroboration separate equals.
+	// Multiple claimants. Narrow to the strongest identity evidence —
+	// exact-fingerprint claims outrank fp3-equal claims, which outrank
+	// bare inode-leg claims — then let presence and member
+	// corroboration separate equals. A weaker tier is never consulted
+	// while stronger claims exist, and no lexical order decides.
 	var exact, triple []string
 	st3 := fp3(st.Fingerprint)
 	for _, c := range claims {
@@ -1413,20 +1414,20 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 			triple = append(triple, c.path)
 		}
 	}
-	if len(exact) == 1 {
+	var cands []string
+	switch {
+	case len(exact) == 1:
 		return exact[0], recFound, nil
-	}
-	if len(triple) == 1 {
-		return triple[0], recFound, nil
-	}
-	cands := make([]string, 0, len(claims))
-	for _, c := range claims {
-		cands = append(cands, c.path)
-	}
-	if len(exact) > 1 {
+	case len(exact) > 1:
 		cands = exact
-	} else if len(triple) > 1 {
+	case len(triple) == 1:
+		return triple[0], recFound, nil
+	case len(triple) > 1:
 		cands = triple
+	default:
+		for _, c := range claims {
+			cands = append(cands, c.path)
+		}
 	}
 	// Presence: a home that currently holds this object is satisfied
 	// already — the parked name is a surplus link to the same content.
@@ -1440,36 +1441,68 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 		// row resolves beneath a candidate binds the container to that
 		// home. Exact directory identity is then established by the
 		// membership the row recorded, not the inode alone.
-		if members, lerr := view.ListStaged(scope, rel, ""); lerr == nil {
-			corroborated := map[string]bool{}
-			for _, m := range members {
-				if strings.HasPrefix(m, opStagePrefix) || strings.HasPrefix(m, stagingPrefix) {
-					continue
-				}
-				mst, merr := view.Stat(scope, rel+"/"+m)
-				if merr != nil {
-					continue
-				}
-				mh, mf, merr := s.recordedAt(ctx, scope, fp3(mst.Fingerprint))
-				if merr != nil || !mf {
-					continue
-				}
-				if md, _ := splitRel(mh); md != "" {
-					for _, p := range cands {
-						if md == p {
-							corroborated[p] = true
-						}
-					}
-				}
+		var corroborated []string
+		for _, p := range cands {
+			if s.dirMemberCorroborates(ctx, view, scope, rel, p) {
+				corroborated = append(corroborated, p)
 			}
-			if len(corroborated) == 1 {
-				for p := range corroborated {
-					return p, recFound, nil
-				}
-			}
+		}
+		if len(corroborated) == 1 {
+			return corroborated[0], recFound, nil
 		}
 	}
 	return "", recAmbiguous, nil
+}
+
+// dirClaim is one inode-leg claimant row.
+type dirClaim struct{ path, fp string }
+
+// collectClaims drains a claimant query completely. A Scan failure or
+// a rows error after partial iteration is returned, not swallowed: an
+// incomplete claim set must never masquerade as authority — callers
+// treat the error as unverifiable and preserve the object.
+func collectClaims(rows pgx.Rows) ([]dirClaim, error) {
+	defer rows.Close()
+	var out []dirClaim
+	for rows.Next() {
+		var c dirClaim
+		if err := rows.Scan(&c.path, &c.fp); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// dirMemberCorroborates reports whether a member of the parked dir at
+// rel has a version row resolving directly beneath home — membership
+// evidence that this container is the directory the home's row
+// recorded. Each member is judged by its own stat and row, so a
+// container swapped at rel mid-pass only yields whichever members the
+// current object holds, and corroboration can never authorize
+// anything on its own beyond choosing among claimant rows.
+func (s *Store) dirMemberCorroborates(ctx context.Context, view ReconView, scope, rel, home string) bool {
+	members, lerr := view.ListStaged(scope, rel, "")
+	if lerr != nil {
+		return false
+	}
+	for _, m := range members {
+		if strings.HasPrefix(m, opStagePrefix) || strings.HasPrefix(m, stagingPrefix) {
+			continue
+		}
+		mst, merr := view.Stat(scope, rel+"/"+m)
+		if merr != nil {
+			continue
+		}
+		mh, mf, merr := s.recordedAt(ctx, scope, fp3(mst.Fingerprint))
+		if merr != nil || !mf {
+			continue
+		}
+		if md, _ := splitRel(mh); md == home {
+			return true
+		}
+	}
+	return false
 }
 
 // recordedMatch reports whether the row fingerprint records this live
@@ -1481,12 +1514,6 @@ func recordedMatch(rowFP string, st FileInfo) bool {
 		return ok1 && ok2 && ri == si
 	}
 	return fp3(rowFP) == fp3(st.Fingerprint)
-}
-
-// devLeg extracts the device leg of a "dev:ino" traversal identity.
-func devLeg(devino string) string {
-	d, _, _ := strings.Cut(devino, ":")
-	return d
 }
 
 // sameObjectAt reports whether dst is the same object as st — the
@@ -1894,11 +1921,18 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 	if destPath == "" {
 		return
 	}
+	if st.Kind == "dir" {
+		// A member's own row is its authority — independent of whether
+		// this container's restore proceeds. Members whose recorded
+		// homes lie outside the container's target subtree leave now,
+		// so a deferred container restore cannot strand them inside.
+		s.extractDivergentMembers(ctx, scope, view, rel, destPath)
+	}
 	dctx, cancel := s.dbCtx(ctx)
-	var rowFP string
+	var rowFP, rowSHA string
 	rerr := s.pool.QueryRow(dctx,
-		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
-		scope, destPath).Scan(&rowFP)
+		`SELECT fp, content_sha FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, destPath).Scan(&rowFP, &rowSHA)
 	cancel()
 	rowMatch := rerr == nil && recordedMatch(rowFP, st)
 	dst, derr := view.Stat(scope, destPath)
@@ -1909,12 +1943,15 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		// sealed rel cannot receive the displaced squatter, so drain
 		// through the unsealed base slot instead.
 		if rowMatch && !sameObjectAt(st, dst) &&
-			parkedOwnsRow(view, scope, destPath, rowFP, st, dst) {
+			s.parkedOwnsRow(ctx, view, scope, rel, destPath, rowFP, rowSHA, st, dst) {
 			// The occupant may be a live writer's fresh object whose row
 			// has not committed yet; moving it now would only churn it
 			// into this namespace. Retry once those writers settle.
 			if busy, berr := s.recordersActive(ctx, scope); berr != nil || busy {
 				return
+			}
+			if !s.moveJudged(view, scope, rel, st) {
+				return // rel changed mid-pass — re-judge next pass
 			}
 			if _, base := splitRel(rel); isSealedName(base) {
 				s.drainSealed(view, scope, parkBase, rel, destPath)
@@ -1923,18 +1960,117 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 			}
 		}
 	case absentVerdict(derr):
-		switch {
-		case rowMatch:
-			// The parked object IS the recorded content for the empty
-			// name — restore it.
-			_ = view.MoveStaged(scope, rel, destPath)
-		case errors.Is(rerr, pgx.ErrNoRows) && !tombstoned:
-			// Unresolved intent, empty name, no recorded row — restoring
-			// recovers the pre-effect shape.
+		movable := rowMatch
+		if !movable && errors.Is(rerr, pgx.ErrNoRows) && !tombstoned {
+			// Unresolved intent, empty name, no recorded row —
+			// restoring recovers the pre-effect shape.
+			movable = true
+		}
+		if movable && s.moveJudged(view, scope, rel, st) {
 			_ = view.MoveStaged(scope, rel, destPath)
 		}
 	default:
 		// unverifiable — leave parked
+	}
+	// A directory that reached its recorded home still owes each member
+	// its own judgment: the container's row proves the container's name
+	// only — members with divergent rows route to their own homes.
+	if st.Kind == "dir" {
+		if dst2, serr := view.Stat(scope, destPath); serr == nil && sameObjectAt(st, dst2) {
+			s.routeDirMembers(ctx, scope, view, destPath)
+		}
+	}
+}
+
+// moveJudged binds the mutation to the object this pass judged: the
+// staged name is re-stat'ed and must still hold that same live object
+// (dev:ino) before any move or swap. A racer swapping the staged name
+// between judgment and mutation is caught here — the pass defers and
+// re-judges rather than installing an unexamined object at a recorded
+// home. Without device evidence there is nothing to bind; the move
+// proceeds on the judgment the pass already made.
+func (s *Store) moveJudged(view ReconView, scope, rel string, st FileInfo) bool {
+	if st.DevIno == "" {
+		return true
+	}
+	cur, err := view.Stat(scope, rel)
+	return err == nil && sameObjectAt(st, cur)
+}
+
+// routeDirMembers re-judges each member of a recorded container that
+// has just reached (or already occupies) its recorded home. A member
+// whose own version row records a different home is routed there
+// through the same authority path — restoring the container must not
+// absorb members into unrecorded public paths while their rows claim
+// them elsewhere. Unrecorded and ambiguous members stay inside the
+// container, preserved; staged names inside are handed to the usual
+// orphan judgment.
+func (s *Store) routeDirMembers(ctx context.Context, scope string, view ReconView, dir string) {
+	members, lerr := view.ListStaged(scope, dir, "")
+	if lerr != nil {
+		return
+	}
+	for _, m := range members {
+		mrel := dir + "/" + m
+		if strings.HasPrefix(m, opStagePrefix) {
+			s.settleOrphanStaged(ctx, scope, view, mrel, m, map[string]struct{}{})
+			continue
+		}
+		if strings.HasPrefix(m, stagingPrefix) {
+			continue
+		}
+		mst, merr := view.Stat(scope, mrel)
+		if merr != nil {
+			continue
+		}
+		mhome, mclaim, mderr := s.recordedAtObject(ctx, scope, mrel, mst, view)
+		if mderr != nil || mclaim != recFound || mhome == mrel {
+			continue // unrecorded, ambiguous, or already home — rides
+		}
+		if pdir, _ := splitRel(mhome); pdir != "" {
+			if err := view.EnsureDir(scope, pdir); err != nil {
+				continue
+			}
+		}
+		s.restoreStagedTo(ctx, scope, orphanParkBase(mrel), view, mrel, mhome, mst, true)
+	}
+}
+
+// extractDivergentMembers moves members of the container at rel whose
+// own version rows record homes OUTSIDE the container's target
+// subtree. A member's row is its own authority: restoring the
+// container must not carry a member to an unrecorded public path while
+// its row names a different home, and a deferred container restore
+// must not strand the member inside. Members whose rows point beneath
+// destPath are left for routeDirMembers once the container lands.
+// Unrecorded and ambiguous members stay inside, preserved.
+func (s *Store) extractDivergentMembers(ctx context.Context, scope string, view ReconView, rel, destPath string) {
+	members, lerr := view.ListStaged(scope, rel, "")
+	if lerr != nil {
+		return
+	}
+	for _, m := range members {
+		if strings.HasPrefix(m, opStagePrefix) || strings.HasPrefix(m, stagingPrefix) {
+			continue
+		}
+		mrel := rel + "/" + m
+		mst, merr := view.Stat(scope, mrel)
+		if merr != nil {
+			continue
+		}
+		mhome, mclaim, mderr := s.recordedAtObject(ctx, scope, mrel, mst, view)
+		if mderr != nil || mclaim != recFound {
+			continue // unrecorded or ambiguous — rides with the container
+		}
+		if strings.HasPrefix(mhome, destPath+"/") {
+			continue // home inside the container's subtree — post-restore pass
+		}
+		if pdir, _ := splitRel(mhome); pdir != "" {
+			if err := view.EnsureDir(scope, pdir); err != nil {
+				continue
+			}
+		}
+		s.restoreStagedTo(ctx, scope, orphanParkBase(mrel), view, mrel, mhome, mst, true)
 	}
 }
 
@@ -1942,43 +2078,49 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 // destPath matched the parked object's identity evidence — but for a
 // directory that evidence is the inode leg alone, and an inode
 // collision across devices (or an fp3 coincidence for a file) can make
-// the occupant indistinguishable at the row level. When the occupant
-// fails the row's evidence outright it is an undisputed impostor and
-// the swap proceeds. When BOTH match, the containing filesystem
-// decides: the row was written for an object beneath destPath's
-// parent, so the candidate living on the parent's device is the row's
-// subject — a cross-device impostor is displaced, a local occupant is
-// the recorded object itself. When neither device nor fp3 separates
-// them, fail closed: leave the occupant and preserve the parked object
-// for a pass with better evidence (never a swap that evicts recorded
-// content on a guess).
-func parkedOwnsRow(view ReconView, scope, destPath, rowFP string, st, dst FileInfo) bool {
+// the occupant indistinguishable at the row level. The swap evicts the
+// occupant to a parked name, so it needs the parked object's claim to
+// be strictly stronger — never a heuristic that could evict the row's
+// true subject:
+//
+//  1. If the occupant fails the row's evidence outright it is an
+//     undisputed impostor — swap.
+//  2. Recorded generation: exactly one candidate still equals the
+//     row's fp3 — the object the row recorded, unchurned since commit.
+//  3. Content evidence: a file row's content_sha names the recorded
+//     bytes — a hash match beats an fp3-coincident impostor.
+//  4. Container corroboration: a member of the parked dir whose own
+//     row resolves beneath destPath binds the container to that home.
+//  5. Nothing separates them — preserve both: leave the occupant,
+//     keep the parked object enumerable for a pass with better
+//     evidence. Never evict on a guess.
+//
+// Notably there is no device-locality inference: a row carries no
+// device leg, so "the object's device" is unknowable from the row, and
+// the parent's current device does not prove which object the row
+// recorded (mount topology can change). Device evidence binds two live
+// stats (sameObjectAt); it cannot reconstruct which object a row
+// described.
+func (s *Store) parkedOwnsRow(ctx context.Context, view ReconView, scope, rel, destPath, rowFP, rowSHA string, st, dst FileInfo) bool {
 	if !recordedMatch(rowFP, dst) {
 		return true // occupant is not the row's subject at all
 	}
-	sDev, dDev := devLeg(st.DevIno), devLeg(dst.DevIno)
-	fp3Only := func() bool {
-		// The strongest remaining evidence: the candidate still at the
-		// recorded generation.
-		return fp3(rowFP) == fp3(st.Fingerprint) && fp3(rowFP) != fp3(dst.Fingerprint)
+	stGen := fp3(rowFP) == fp3(st.Fingerprint)
+	dstGen := fp3(rowFP) == fp3(dst.Fingerprint)
+	if stGen != dstGen {
+		return stGen
 	}
-	if sDev == "" || dDev == "" || sDev == dDev {
-		return fp3Only()
+	if rowSHA != "" && rowSHA != "dir" && st.Kind == "file" {
+		hs, he := view.Hash(scope, rel)
+		hd, de := view.Hash(scope, destPath)
+		if he == nil && de == nil && (hs == rowSHA) != (hd == rowSHA) {
+			return hs == rowSHA
+		}
 	}
-	pdir, _ := splitRel(destPath)
-	pst, err := view.Stat(scope, pdir)
-	if err != nil || pst.DevIno == "" {
-		return fp3Only()
+	if st.Kind == "dir" && s.dirMemberCorroborates(ctx, view, scope, rel, destPath) {
+		return true
 	}
-	pDev := devLeg(pst.DevIno)
-	switch {
-	case sDev == pDev && dDev != pDev:
-		return true // parked object is local to the row's filesystem
-	case dDev == pDev && sDev != pDev:
-		return false // the occupant is the row's subject
-	default:
-		return fp3Only()
-	}
+	return false
 }
 
 // drainSealed moves a sealed quarantine object onto its home name when
@@ -2136,7 +2278,13 @@ func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view Recon
 	}
 	if claim == recFound {
 		if dst, serr := view.Stat(scope, home); serr == nil && sameObjectAt(st, dst) {
-			return // still present at its recorded home — surplus link, leave it
+			// Still present at its recorded home — surplus link, leave
+			// it. The home container's members may still diverge from
+			// their own rows; judge them.
+			if st.Kind == "dir" {
+				s.routeDirMembers(ctx, scope, view, home)
+			}
+			return
 		}
 		s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
 		return
@@ -2185,6 +2333,9 @@ func (s *Store) settleOrphanContents(ctx context.Context, scope string, view Rec
 			// dir that is itself recorded, leaving the dir's own row
 			// stranded (an empty recorded dir has no members to find).
 			if dst, serr := view.Stat(scope, home); serr == nil && sameObjectAt(st, dst) {
+				if st.Kind == "dir" {
+					s.routeDirMembers(ctx, scope, view, home)
+				}
 				continue // already present at its recorded home — surplus link
 			}
 			if pdir, _ := splitRel(home); pdir != "" {
