@@ -147,10 +147,9 @@ if (a.state) {
     "Content-Type": "application/json",
   };
   await check("runtime-scope-read", async () => {
-    const r = await call(
-      `${state}/internal/core/personas/${a.persona}/state`,
-      { headers: auth },
-    );
+    const r = await call(`${state}/internal/core/personas/${a.persona}/state`, {
+      headers: auth,
+    });
     return expect(
       { status: r.status, body: { persona: r.body?.persona?.persona_id } },
       200,
@@ -179,7 +178,9 @@ await check("do-runtime-auth", async () => {
     "DO authenticated state read",
   );
   if (r.body?.via !== "binding")
-    throw new Error(`DO reached state via ${r.body?.via ?? "?"}, not the binding`);
+    throw new Error(
+      `DO reached state via ${r.body?.via ?? "?"}, not the binding`,
+    );
   return { status: r.status, body: { ok: r.body?.ok, via: r.body?.via } };
 });
 await check("wake-persona", async () =>

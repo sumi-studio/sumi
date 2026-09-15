@@ -319,6 +319,10 @@ export class SecretaryObject {
     } catch (e) {
       // The heartbeat still arms so this DO keeps retrying on its own
       // cadence; the drain itself would only repeat the failed start.
+      console.log(
+        `[core] persona ${persona} start failed:`,
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      );
       await this.ensureAlarm();
       return Response.json(
         { ok: false, persona, reason: startFailureReason(e) },
@@ -390,6 +394,15 @@ export class SecretaryObject {
     this.startQueue = p.then(
       () => undefined,
       () => undefined,
+    );
+    // A start that outlives its wake's gate still settles here — log the
+    // rejection so a wedged state call is visible instead of silently
+    // dropping out of the queue.
+    p.catch((e) =>
+      console.log(
+        "[core] start attempt rejected:",
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      ),
     );
     return p;
   }

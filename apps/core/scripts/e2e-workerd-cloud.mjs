@@ -288,6 +288,12 @@ function uuidv7() {
 const HUMAN = uuidv7();
 const SELECTED = uuidv7();
 const UNSELECTED = uuidv7();
+// S8: two personas whose first state call each wedges the transport —
+// STALL_H never gets response headers, STALL_B gets headers and a partial
+// body that never finishes. Both must fail at the client's deadline and
+// recover through a later wake without a workerd restart.
+const STALL_H = uuidv7();
+const STALL_B = uuidv7();
 {
   const h = await sreq("POST", "/internal/dev/humans", ADMIN, {
     human_id: HUMAN,
@@ -311,6 +317,8 @@ const UNSELECTED = uuidv7();
   for (const [id, human, name] of [
     [SELECTED, HUMAN, "cloud e2e selected"],
     [UNSELECTED, null, "cloud e2e unselected"],
+    [STALL_H, HUMAN, "cloud e2e stall-headers"],
+    [STALL_B, HUMAN, "cloud e2e stall-body"],
   ]) {
     const p = await sreq("POST", "/internal/core/personas", ADMIN, {
       persona_id: id,
@@ -362,10 +370,55 @@ const STANDIN = "sumi-cloud-e2e-vpc-standin";
 writeFileSync(
   join(OUT, "vpc-standin.mjs"),
   `// Stand-in for a Workers VPC Service: the configured target decides where
-// a request goes; the URL host only travels as a header.
+// a request goes; the URL host only travels as a header. Persona-scoped
+// paths in STALL wedge instead: "headers" never answers, "body" answers
+// and never finishes the body — the VPC blackhole shapes from review 190.
+const STALL = ${JSON.stringify({
+    [STALL_H]: { remaining: 1, kind: "headers" },
+    [STALL_B]: { remaining: 1, kind: "body" },
+  })};
 export default {
   async fetch(request, env) {
     const u = new URL(request.url);
+    const m = /\\/personas\\/([^/]+)/.exec(u.pathname);
+    const rule = m ? STALL[m[1]] : null;
+    if (rule && rule.remaining > 0) {
+      rule.remaining -= 1;
+      console.log(
+        "[standin] stall " + rule.kind + " " + u.pathname + " at " + Date.now(),
+      );
+      request.signal?.addEventListener("abort", () =>
+        console.log(
+          "[standin] upstream aborted " + rule.kind + " stall for " + m[1] +
+            " at " + Date.now(),
+        ),
+      );
+      if (rule.kind === "body") {
+        const stream = new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('{"partial"'));
+            // A live timer keeps the isolate busy so workerd dev's
+            // "would never generate a response" hang detector does not
+            // kill the subrequest for us — only the caller's abort can.
+            this.t = setTimeout(() => {}, 600_000);
+          },
+          cancel() {
+            console.log(
+              "[standin] body stream canceled for " + m[1] + " at " + Date.now(),
+            );
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // Accepted, never answered within the test: a real timer keeps the
+      // isolate schedulable so the dev runtime cannot prove a hang. Only
+      // the caller's AbortSignal (or the long timer) ends this request.
+      await new Promise((r) => setTimeout(r, 600_000));
+      return new Response("unreachable", { status: 504 });
+    }
     const target = new URL(u.pathname + u.search, env.TARGET);
     const forwarded = new Request(target, request);
     forwarded.headers.set("x-standin-original-host", u.host);
@@ -466,10 +519,16 @@ async function stopWorker() {
   await waitFor(
     "workerd process group gone",
     async () => {
-      const r = spawnSync("ps", ["-o", "pid=", "-g", String(pgid)], {
+      // Zombies linger until the container's init-less pid 1 reaps them —
+      // count only processes that can still run.
+      const r = spawnSync("ps", ["-o", "stat=", "-g", String(pgid)], {
         encoding: "utf8",
       });
-      return r.stdout.trim() === "";
+      return r.stdout
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .every((s) => s.trim().startsWith("Z"));
     },
     15_000,
   );
@@ -869,6 +928,57 @@ await startWorker();
     input_status_while_wrong: stuck?.input?.status,
     recovered_ms_after_fix: Date.now() - fixedAt,
     check_after_fix: goodCheckBody,
+  };
+}
+
+// --- S8: a wedged state call cannot hold the startup queue (review 190) --
+// The stand-in wedges each stall persona's first state call — STALL_H
+// before headers, STALL_B mid-body. The client's per-call deadline must
+// abort the hung binding request so a later wake's serialized start can
+// recover the same input — no restart, exactly one durable result.
+{
+  const startsBefore = workerStarts;
+  const logOffset = readFileSync(stateLog, "utf8").length;
+  const results = {};
+  for (const [persona, kind] of [
+    [STALL_H, "headers"],
+    [STALL_B, "body"],
+  ]) {
+    const marker = `MSG-stall-${kind}`;
+    const { inputId, at } = await submit(persona, `${marker} hello`);
+    // The wake gate bounds only its own answer: while the transport hangs,
+    // the sweep's wake is rejected 503 — the visible failure the Go side
+    // already logs and retries.
+    await waitFor(
+      `${kind}: wake rejected while the call is stalled`,
+      async () =>
+        new RegExp(
+          `persona ${persona} not woken \\(will retry\\): core host answered 503`,
+        ).test(wakeLogSince(logOffset)),
+      30_000,
+    );
+    // The deadline aborts the hung call, startSerialized frees, and the
+    // next wake (or the heartbeat the 503 armed) starts and drains.
+    await completedOnce(persona, inputId, marker, 120_000);
+    results[kind] = { recovered_ms: Date.now() - at };
+  }
+  assert(
+    workerStarts === startsBefore,
+    "recovery happened without a workerd restart",
+  );
+  const calls = modelCalls.filter((c) => c.marker?.startsWith("MSG-stall"));
+  assert(
+    calls.length === 2 && calls.every((c) => c.n === 1),
+    "each recovered input produced exactly one model call",
+    calls,
+  );
+  log(
+    `S8 state deadline: headers stall recovered in ${results.headers.recovered_ms}ms, body stall in ${results.body.recovered_ms}ms, workerd starts ${workerStarts}`,
+  );
+  summary.scenarios.state_call_deadline = {
+    results,
+    model_calls: calls,
+    worker_starts: workerStarts,
   };
 }
 

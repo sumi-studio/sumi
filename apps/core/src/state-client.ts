@@ -298,6 +298,13 @@ export interface StateClient {
   ): Promise<Job>;
 }
 
+type StateResponse = {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+};
+
 type FetchLike = (
   input: string | URL,
   init?: {
@@ -306,18 +313,51 @@ type FetchLike = (
     body?: string;
     signal?: AbortSignal;
   },
-) => Promise<{
-  ok: boolean;
-  status: number;
-  json(): Promise<unknown>;
-  text(): Promise<string>;
-}>;
+) => Promise<StateResponse>;
+
+/**
+ * Per-call deadline for a state request, covering both the response
+ * headers and the body read: the same AbortSignal governs fetch() and its
+ * pending json() read. 10s is far above a healthy call (small JSON over a
+ * LAN/binding hop, tens of ms) and matches the Go wake client's timeout —
+ * a call that has not finished by then is a wedged transport, and waiting
+ * longer only stalls everyone queued behind it on startSerialized. A
+ * timed-out call is indeterminate (the service may have committed); it is
+ * classified transient so the caller's normal retry path replays it under
+ * the server-side idempotency and generation fencing that already cover
+ * uncertain outcomes.
+ */
+export const STATE_CALL_TIMEOUT_MS = 10_000;
+
+/**
+ * The deadline's rejection shape. call() passes only its own timeout
+ * signal, so an abort here is always the deadline expiring — reported as a
+ * transient 503 rather than leaking an undifferentiated AbortError, which
+ * some callers would classify as a non-transient unknown defect.
+ */
+function callDeadlineError(
+  e: unknown,
+  method: string,
+  path: string,
+  timeoutMs: number,
+): StateError | null {
+  if (
+    e instanceof Error &&
+    (e.name === "TimeoutError" || e.name === "AbortError")
+  )
+    return new StateError(
+      503,
+      `state ${method} ${path} timed out after ${timeoutMs}ms`,
+    );
+  return null;
+}
 
 /** HTTP client for the Go agentstate service. */
 export class HttpStateClient implements StateClient {
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly fetchImpl: FetchLike;
+  private readonly timeoutMs: number;
 
   constructor(
     baseUrl: string,
@@ -326,10 +366,12 @@ export class HttpStateClient implements StateClient {
     // a detached reference to the global function.
     fetchImpl: FetchLike = (input, init) =>
       fetch(input, init) as ReturnType<FetchLike>,
+    timeoutMs = STATE_CALL_TIMEOUT_MS,
   ) {
     this.baseUrl = baseUrl;
     this.token = token;
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
   }
 
   private async call<T>(
@@ -337,18 +379,30 @@ export class HttpStateClient implements StateClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const res = await this.fetchImpl(this.baseUrl + path, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    // One signal bounds the whole request: a service that accepts but never
+    // answers, or answers headers and stalls mid-body, fails here instead
+    // of occupying a serialized start (or a drain) forever.
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    let res: StateResponse;
+    try {
+      res = await this.fetchImpl(this.baseUrl + path, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
+      });
+    } catch (e) {
+      throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
+    }
     if (res.ok) {
       try {
         return (await res.json()) as T;
       } catch (e) {
+        const timeout = callDeadlineError(e, method, path, this.timeoutMs);
+        if (timeout) throw timeout;
         // A 200 with an unreadable body is an infrastructure blip — a
         // truncated proxy/middlebox response or a service bug — not a
         // code defect. Surface it as a transient 5xx so callers back

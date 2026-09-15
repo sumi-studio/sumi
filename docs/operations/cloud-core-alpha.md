@@ -53,10 +53,38 @@ Do not put them in `wrangler.jsonc`, logs or documents.
 
 ## Preconditions
 
-- **Workers Paid plan.** On the Free plan, an invocation may make 50
-  subrequests and use 10ms of CPU. A single turn makes about a dozen state
-  calls, and an alarm drain can run for up to 14 minutes. Verify the plan
-  on the account itself — a deploy dry run does not prove entitlement.
+- **Feature availability is not the constraint.** SQLite-backed Durable
+  Objects are available on both Workers Free and Paid plans
+  (https://developers.cloudflare.com/durable-objects/platform/pricing/),
+  and Workers VPC is free on all Workers plans while in beta
+  (https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/).
+- **Verify capacity on the account's current plan.** The docs do not
+  settle every Free-plan limit for this workload. Check the actual
+  invocation limits and measured usage before deciding whether more
+  capacity is needed:
+  - Per the Workers limits page
+    (https://developers.cloudflare.com/workers/platform/limits/), a Free
+    invocation is limited to 10ms CPU and 50 external subrequests
+    (internal subrequests to bound Workers count separately, 1000); Paid
+    raises CPU to 30s default, configurable to 5min. Waiting on network
+    I/O does not consume CPU time.
+  - The Durable Objects limits page
+    (https://developers.cloudflare.com/durable-objects/platform/limits/)
+    lists "CPU per request: 30 seconds (default) / configurable to 5
+    minutes" without distinguishing plan, while its FAQ says Durable
+    Objects share the plan's per-invocation CPU limits — whether a
+    Free-plan DO invocation gets 10ms or the 30s DO default is not
+    settled by the docs.
+  - This workload: a turn makes about a dozen state calls (well under
+    the 50-subrequest cap), each small JSON over the binding; a turn or
+    alarm drain is I/O-wait dominated, and the 14-minute drain is wall
+    time inside the alarm handler's documented 15-minute wall limit.
+    The binding constraint on Free would be DO CPU per invocation and
+    daily DO request/duration quotas (100k requests, 13k GB-s/day) —
+    real usage is measurable only on the deployed account.
+  - `wrangler deploy --dry-run` reporting `default_usage_model=standard`
+    is a config-level check, not subscription entitlement: confirm the
+    plan on the account itself.
 - The API image is built from a revision that contains this route (runtime
   credential and wake sweep).
 - Setting `SUMI_CORE_STATE_TOKEN` on the API applies the core migrations. It
@@ -161,18 +189,36 @@ Checked against developers.cloudflare.com (2026-09-15):
   non-hibernating idle object is evicted after 70–140s of inactivity. The
   fetch-started drain's 25s turn budget stays under that floor; correctness
   never depends on an outgoing call holding the object.
-- `vpc_services` is a beta feature available on Free and Paid plans; the
-  configuration pages do not state whether a VPC Service binding is usable
-  **from inside a Durable Object**. The `do-runtime-auth` probe check
+- `vpc_services` is in beta and free on all Workers plans
+  (https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/);
+  the configuration pages do not state whether a VPC Service binding is
+  usable **from inside a Durable Object**. The `do-runtime-auth` probe check
   exercises exactly that path on the deployed Worker — until it has run
   against the real deployment, this remains an assumption, not a verified
   fact.
+- Every state call carries a 10-second `AbortSignal` deadline
+  (`STATE_CALL_TIMEOUT_MS` in `apps/core/src/state-client.ts`) covering
+  the request and the response body read. A call that never answers, or
+  answers headers and stalls mid-body, fails as a transient 503: the
+  serialized start frees so the next wake or alarm can recover the same
+  input, and the caller's normal retry under server-side idempotency and
+  generation fencing decides whether the mutation landed. Verified in
+  local workerd through the `SUMI_STATE` binding (e2e S8): the hung
+  subrequest rejected at the deadline and the queue freed without a
+  restart. The stand-in's upstream abort listener and body cancellation
+  callback did not fire; releasing the caller did not establish that the
+  service handler stopped. Whether the *deployed* VPC binding propagates cancellation the
+  same way — and whether a real VPC blackhole is rejected at the deadline —
+  is a live check. Local workerd additionally cancels requests it can
+  prove can never complete ("would never generate a response"), so the e2e
+  stand-in keeps a timer pending to exercise the deadline path itself.
 - `wrangler deploy --dry-run` reporting `default_usage_model=standard` is
   a config-level check, not subscription entitlement: confirm the Workers
-  Paid plan on the account separately.
+  plan and usable capacity on the account separately.
 
 Still requiring the live deployment (local workerd cannot prove them):
-VPC Service behavior inside a DO, tunnel failure shapes, DO eviction and
+VPC Service behavior inside a DO (including cancellation/timeout on a
+blackholed service), tunnel failure shapes, DO eviction and
 alarm continuity across deploys, and turns longer than the fetch drain's
 25s budget riding the alarm's 15-minute window.
 
@@ -183,7 +229,9 @@ bindings and variables in local workerd against a real Go state service and
 PostgreSQL. It swaps the VPC Service for a loopback stand-in and uses a
 scripted model. It checks conversation, a workerd kill mid-turn, workerd
 being down when a message is admitted, a state-service kill mid-turn, a
-secretary with no selected model, and approval resume:
+secretary with no selected model, approval resume, a wrong installed
+runtime secret, and a state call that wedges (before headers and mid-body)
+timing out at the deadline and recovering through a later wake:
 
 ```sh
 SUMI_TEST_DB_URL=postgres://… SUMI_E2E_PORT_BASE=11871 node apps/core/scripts/e2e-workerd-cloud.mjs

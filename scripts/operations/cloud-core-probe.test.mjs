@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import test from "node:test";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const probe = resolve(
