@@ -1757,9 +1757,23 @@ func TestLateRepairCorrDirAmbiguousThenResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Ghost row: a recycled-inode leftover claiming the same inode leg.
+	// It must be EQUAL-STRENGTH to create ambiguity — a birthless ghost
+	// now simply loses to the born row (the F-M2 repair). Seed it with
+	// the object's recorded birth so the claim is genuinely
+	// indistinguishable — the ambiguous-preserve path under test.
+	var zbirth string
+	{
+		dctx, cancel := s.dbCtx(ctx)
+		if err := s.pool.QueryRow(dctx,
+			`SELECT birth FROM file_version WHERE scope='ws' AND path='zHome'`).Scan(&zbirth); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+	}
 	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha)
-		 VALUES ('ws','aGhost',$1,$2,'')`, authMint(t, s), dIno+":9:9:9")
+		`INSERT INTO file_version (scope, path, version, fp, content_sha, birth)
+		 VALUES ('ws','aGhost',$1,$2,'',$3)`, authMint(t, s), dIno+":9:9:9", zbirth)
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
@@ -2006,6 +2020,9 @@ func (f *fakeRows) Scan(dest ...any) error {
 	row := f.vals[f.pos-1]
 	*(dest[0].(*string)) = row[0]
 	*(dest[1].(*string)) = row[1]
+	if len(row) > 2 {
+		*(dest[2].(*string)) = row[2]
+	}
 	return nil
 }
 
@@ -2119,12 +2136,26 @@ func TestLateRepairTripleRowsOutrankInoLeg(t *testing.T) {
 	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
 		t.Fatal(err)
 	}
-	// Second triple claimant: same ino:size:mtime, other ctime leg.
+	// Second strongest-tier claimant: same ino:size:mtime and the same
+	// recorded birth — indistinguishable from the real row's evidence.
+	// (A birthless or ino-only ghost now loses outright — the durable
+	// identity tier resolves it without ambiguity.)
+	var zbirth string
+	{
+		dctx, cancel := s.dbCtx(ctx)
+		if err := s.pool.QueryRow(dctx,
+			`SELECT birth FROM file_version WHERE scope='ws' AND path='zHome'`).Scan(&zbirth); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+	}
 	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha)
-		 VALUES ('ws','bGhost',$1,$2,'')`, authMint(t, s),
-		ino+":"+sz+":"+mt+":888")
-	// Weaker inode-leg-only claimant — its fp3 cannot match.
+		`INSERT INTO file_version (scope, path, version, fp, content_sha, birth)
+		 VALUES ('ws','bGhost',$1,$2,'',$3)`, authMint(t, s),
+		ino+":"+sz+":"+mt+":888", zbirth)
+	// Weaker inode-leg-only claimant — its fp3 cannot match and it has
+	// no birth leg.
 	authExec(t, s,
 		`INSERT INTO file_version (scope, path, version, fp, content_sha)
 		 VALUES ('ws','aWeak',$1,$2,'')`, authMint(t, s), ino+":0:0:0")
@@ -2133,7 +2164,7 @@ func TestLateRepairTripleRowsOutrankInoLeg(t *testing.T) {
 	authSettle(t, s)
 	for _, p := range []string{"aWeak", "bGhost", "zHome"} {
 		if _, serr := root.lstat("ws", p); serr == nil {
-			t.Fatalf("dir installed at %s with unresolved triple claimants", p)
+			t.Fatalf("dir installed at %s with unresolved strongest-tier claimants", p)
 		}
 	}
 	if alive := scanDirForInode(dir, "ws", ino); alive == "" {
@@ -2143,11 +2174,11 @@ func TestLateRepairTripleRowsOutrankInoLeg(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 	if _, serr := root.lstat("ws", "aWeak"); serr == nil {
-		t.Fatal("weaker inode-leg claimant won over a triple claimant")
+		t.Fatal("weaker inode-leg claimant won over a stronger claimant")
 	}
 	st, serr := root.lstat("ws", "zHome")
 	if serr != nil {
-		t.Fatalf("dir not restored to remaining triple home: %v", serr)
+		t.Fatalf("dir not restored to remaining strongest home: %v", serr)
 	}
 	if got, _, _, _ := fpParts(st.Fingerprint); got != ino {
 		t.Fatalf("zHome holds ino %s, want %s", got, ino)
@@ -2357,5 +2388,118 @@ func TestLateRepairMemberRoutesWithoutLiveIdentity(t *testing.T) {
 	}
 	if _, serr := root.lstat("ws", "ddir"); serr != nil {
 		t.Fatalf("container not restored: %v", serr)
+	}
+}
+
+// MW1 deterministic form: a stale row whose object is dead claims a
+// foreign dir via a shared inode leg — the inode leg is injected into
+// the stale row rather than won by allocation lottery (the defect is in
+// claim acceptance, not inode reuse). File-row kind evidence
+// (content_sha is a real sha) must exclude it from dir claims entirely.
+func TestLateRepairSoleStaleFileRowCannotClaimDir(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "aa", "write",
+		IfVersion{Mode: "any"}, sha("F"), authProbe(root, "aa"),
+		authWriteFn(root, "aa", "F")); err != nil {
+		t.Fatalf("write aa: %v", err)
+	}
+	// External delete: the row stays, never marked diverged.
+	if err := os.Remove(dir + "/ws/aa"); err != nil {
+		t.Fatal(err)
+	}
+	// Foreign unrecorded dir; the stale row's fp leg is set to its
+	// inode — the same state inode reuse produces organically.
+	if err := os.Mkdir(dir+"/ws/forg", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, ffp, _ := func() (int64, string, bool) {
+		st, serr := root.lstat("ws", "forg")
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		return 0, st.Fingerprint, true
+	}()
+	fino, _, _, _ := fpParts(ffp)
+	authExec(t, s,
+		`UPDATE file_version SET fp=$1 WHERE scope='ws' AND path='aa'`,
+		fino+":1:1:1")
+	parked := opStagePrefix + "313131-p-mw"
+	if err := os.Rename(dir+"/ws/forg", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	authSettle(t, s)
+	authSettle(t, s)
+	if st, serr := root.lstat("ws", "aa"); serr == nil && st.Kind == "dir" {
+		t.Fatal("foreign dir installed at 'aa' on a stale file row's sole ino claim")
+	}
+	if _, serr := root.lstat("ws", parked); serr != nil {
+		t.Fatal("foreign dir vanished — must stay parked and enumerable")
+	}
+}
+
+// Sole stale DIR row variant: kind-matched but the only evidence is the
+// bare inode leg — a stale row from inode reuse is indistinguishable
+// without stronger evidence, so the claim must be ambiguous (preserve),
+// never an install on a single unverified leg.
+func TestLateRepairSoleStaleDirRowInoOnlyIsAmbiguous(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "aa", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "aa"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "aa")
+		}); err != nil {
+		t.Fatalf("mkdir aa: %v", err)
+	}
+	if err := os.Remove(dir + "/ws/aa"); err != nil {
+		t.Fatal(err)
+	}
+	// Foreign unrecorded dir; stale dir row's fp rewritten to its inode
+	// leg — same ino, everything else different (a reused inode).
+	if err := os.Mkdir(dir+"/ws/forg", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st0, serr := root.lstat("ws", "forg")
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	fino, _, _, _ := fpParts(st0.Fingerprint)
+	authExec(t, s,
+		`UPDATE file_version SET fp=$1, birth='' WHERE scope='ws' AND path='aa'`,
+		fino+":1:1:1")
+	parked := opStagePrefix + "323232-p-mw"
+	if err := os.Rename(dir+"/ws/forg", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	authSettle(t, s)
+	authSettle(t, s)
+	if st, serr := root.lstat("ws", "aa"); serr == nil && st.Kind == "dir" {
+		t.Fatal("foreign dir installed at 'aa' on a sole ino-leg-only claim")
+	}
+	if _, serr := root.lstat("ws", parked); serr != nil {
+		t.Fatal("foreign dir vanished — ambiguous claims preserve")
 	}
 }

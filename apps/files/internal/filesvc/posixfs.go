@@ -549,6 +549,30 @@ type FileInfo struct {
 	// ordinary, while a bind-mounted alias keeps dev+ino and is correctly
 	// recognized as the same object.
 	DevIno string `json:"-"`
+	// Birth is the object's creation-time identity ("sec:nsec" from
+	// statx STATX_BTIME), persisted on file_version rows. Unlike fp3 it
+	// survives membership churn on directories and every rename; unlike
+	// ctime it is immutable after creation. ino+birth distinguishes an
+	// object from a later inode reuser — the durable claim a stale row
+	// cannot counterfeit without actually being this object's row.
+	// Empty when the filesystem does not report btime; such rows fall
+	// back to the weaker fingerprint tiers.
+	Birth string `json:"-"`
+}
+
+// birthAt reads the object's birth time through an open fd (O_PATH fds
+// are accepted — statx does not require read permission). Returns ""
+// when the filesystem cannot prove creation identity.
+func birthAt(f *os.File) string {
+	var stx unix.Statx_t
+	if err := unix.Statx(int(f.Fd()), "", unix.AT_EMPTY_PATH,
+		unix.STATX_BTIME, &stx); err != nil {
+		return ""
+	}
+	if stx.Mask&unix.STATX_BTIME == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", stx.Btime.Sec, stx.Btime.Nsec)
 }
 
 func fingerprint(st fs.FileInfo) string {
@@ -841,7 +865,7 @@ func (p *posixRoot) lstat(scope, path string) (FileInfo, error) {
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st)}, nil
+		DevIno: devIno(st), Birth: birthAt(f)}, nil
 }
 
 // statFrom stats beneath a pinned root fd — the reconciler's view so an
@@ -874,7 +898,7 @@ func statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st)}, nil
+		DevIno: devIno(st), Birth: birthAt(f)}, nil
 }
 
 type ListEntry struct {
@@ -983,7 +1007,7 @@ func openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, 
 	}
 	// Regular file: O_NONBLOCK has no effect on ordinary reads; the flag
 	// only mattered to make the open itself non-wedging.
-	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st), DevIno: devIno(st)}
+	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st), DevIno: devIno(st), Birth: birthAt(f)}
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			f.Close()
@@ -1962,6 +1986,7 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	// op's acknowledgement — the same false-identity class as the
 	// write/rename commit paths.
 	st, serr := pfd.Stat()
+	birth := birthAt(pfd)
 	pfd.Close()
 	syncDir(sfd)
 	if serr != nil {
@@ -1969,7 +1994,7 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st)}, true, nil
+		DevIno: devIno(st), Birth: birth}, true, nil
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.
