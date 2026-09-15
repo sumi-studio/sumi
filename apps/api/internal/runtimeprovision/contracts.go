@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -64,6 +65,8 @@ type ActivateRequest struct {
 // ActivationConfig is backend-neutral runtime boot configuration. Keeping it
 // typed prevents an API caller from injecting the root daemon's environment.
 type ActivationConfig struct {
+	ReflexModelID                  string           `json:"reflex_model_id,omitempty"`
+	ReflexReasoningEffort          string           `json:"reflex_reasoning_effort,omitempty"`
 	GatewayURL                     string           `json:"gateway_url"`
 	LocalControlBearer             string           `json:"local_control_bearer"`
 	LocalControlServerUID          uint32           `json:"local_control_server_uid"`
@@ -266,6 +269,15 @@ func (request ActivateRequest) Validate() error {
 }
 
 func (config ActivationConfig) Validate() error {
+	if config.ReflexModelID != "" && (len(config.ReflexModelID) > 256 || strings.IndexFunc(config.ReflexModelID, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0) {
+		return errors.New("reflex_model_id must be a model ID without whitespace")
+	}
+	switch config.ReflexReasoningEffort {
+	case "", "none", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		return errors.New("unsupported reflex_reasoning_effort")
+	}
+
 	if len(config.ModelBaseURL) > 2048 || strings.ContainsAny(config.ModelBaseURL, "\x00\r\n") {
 		return errors.New("invalid model base URL")
 	}
@@ -351,6 +363,8 @@ func (config ActivationConfig) Validate() error {
 
 		"model_id":                           config.ModelID,
 		"model_reasoning_effort":             config.ModelReasoningEffort,
+		"reflex_model_id":                    config.ReflexModelID,
+		"reflex_reasoning_effort":            config.ReflexReasoningEffort,
 		"model_account_scope":                config.ModelAccountScope,
 		"chatgpt_connection_id":              config.ChatGPTConnectionID,
 		"execution_reviewer_model_id":        config.ExecutionReviewerModelID,

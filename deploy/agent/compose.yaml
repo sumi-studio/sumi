@@ -107,6 +107,8 @@ services:
       # Config.Env when unset; the entrypoint does not invent a model ID.
       SUMI_MODEL_ID:
       SUMI_MODEL_REASONING_EFFORT:
+      SUMI_REFLEX_MODEL_ID:
+      SUMI_REFLEX_REASONING_EFFORT:
       SUMI_MODEL_ACCOUNT_SCOPE:
       SUMI_MODEL_BASE_URL:
       SUMI_MODEL_PUBLIC_ENDPOINT:
