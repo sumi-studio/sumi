@@ -1,4 +1,4 @@
--- 0055_call_sessions: durable call-participation sessions for the new core.
+-- 0056_call_sessions: durable call-participation sessions for the new core.
 --
 -- A call session is the authority record for one PersonalityAgent's presence
 -- in one place's LiveKit room. The secretary's durable core creates a session
