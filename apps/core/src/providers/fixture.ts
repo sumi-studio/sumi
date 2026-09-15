@@ -1,10 +1,12 @@
-import { readFileSync } from "node:fs";
 import type { ModelEvent, ModelProvider, ModelRequest } from "../provider.ts";
 
 /**
  * FIXTURE PROVIDER — scripted model for integration tests, no network.
- * Selected by SUMI_MODEL_PROVIDER=fixture; the script comes from
- * SUMI_MODEL_FIXTURE=<path>, a JSON file:
+ * Selected by SUMI_MODEL_PROVIDER=fixture; the script is JSON supplied as
+ * data — this module is bundled into workerd, so it never touches the
+ * filesystem. Hosts deliver the script via SUMI_MODEL_FIXTURE_JSON (inline
+ * JSON, works under every runtime) or SUMI_MODEL_FIXTURE=<path> (Node
+ * hosts resolve the file before constructing this provider):
  *
  *   {"rules": [
  *     {"when": {"kind": "call_started"},
@@ -40,8 +42,8 @@ export class FixtureProvider implements ModelProvider {
   readonly name = "fixture";
   private readonly rules: { kind?: string; textRe?: RegExp; calls: { tool: string; args: Record<string, unknown> }[] }[];
 
-  constructor(scriptPath: string) {
-    const parsed = JSON.parse(readFileSync(scriptPath, "utf8")) as {
+  constructor(scriptJson: string) {
+    const parsed = JSON.parse(scriptJson) as {
       rules?: FixtureRule[];
     };
     this.rules = (parsed.rules ?? []).map((r) => ({

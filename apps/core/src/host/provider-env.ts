@@ -30,6 +30,13 @@
  *   SUMI_MODEL_TIMEOUT_MS             (openai and selected connections;
  *                                      per-request wall timeout, default
  *                                      120000)
+ *   SUMI_MODEL_PROVIDER=fixture       (scripted deterministic model for
+ *                                      integration tests)
+ *   SUMI_MODEL_FIXTURE_JSON           (fixture; the script as inline JSON —
+ *                                      portable, works under workerd)
+ *   SUMI_MODEL_FIXTURE                (fixture; a script file path — only on
+ *                                      hosts that pass a file loader, i.e.
+ *                                      the Node local host)
  */
 
 import {
@@ -122,11 +129,12 @@ export function providerForPersona(
   persona: string,
   get: (name: string) => string | undefined,
   log?: (msg: string, fields?: Record<string, unknown>) => void,
+  loadFixtureScript?: (path: string) => string,
 ): ModelProvider {
   return new SelectedModelProvider({
     state,
     persona,
-    fallback: providerFromEnv(get),
+    fallback: providerFromEnv(get, loadFixtureScript),
     timeoutMs: numEnv(get, "SUMI_MODEL_TIMEOUT_MS", 120_000),
     log,
   });
@@ -284,6 +292,7 @@ function unusable(message: string): ModelError {
 
 export function providerFromEnv(
   get: (name: string) => string | undefined,
+  loadFixtureScript?: (path: string) => string,
 ): ModelProvider {
   const kind = get("SUMI_MODEL_PROVIDER") ?? "mock";
   if (kind === "openai") {
@@ -309,7 +318,17 @@ export function providerFromEnv(
   }
   if (kind === "fixture") {
     // Scripted deterministic model for integration tests; see fixture.ts.
-    return new FixtureProvider(required(get, "SUMI_MODEL_FIXTURE"));
+    // The script is data: any runtime may pass it inline, while a path needs
+    // a host that can read files — this module is bundled into workerd.
+    const inline = get("SUMI_MODEL_FIXTURE_JSON");
+    if (inline) return new FixtureProvider(inline);
+    const scriptPath = required(get, "SUMI_MODEL_FIXTURE");
+    if (!loadFixtureScript) {
+      throw new Error(
+        "SUMI_MODEL_FIXTURE is a file path; this host cannot read files — pass the script as SUMI_MODEL_FIXTURE_JSON",
+      );
+    }
+    return new FixtureProvider(loadFixtureScript(scriptPath));
   }
   if (kind !== "mock") throw new Error(`unknown SUMI_MODEL_PROVIDER ${kind}`);
   return new MockProvider();

@@ -18,6 +18,7 @@
  * Kill -9 safe at any point: nothing canonical lives in this process.
  */
 
+import { readFileSync } from "node:fs";
 import { providerForPersona } from "./provider-env.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
@@ -49,6 +50,9 @@ async function main() {
       (n) => process.env[n],
       (msg, fields) =>
         console.log(`[core] ${msg}`, fields ? JSON.stringify(fields) : ""),
+      // Node-only host: resolve a SUMI_MODEL_FIXTURE file path here so the
+      // shared provider module never imports the filesystem.
+      (p) => readFileSync(p, "utf8"),
     ),
     leaseTtlMs: leaseTtl,
     renewEveryMs: Math.max(250, Math.floor(leaseTtl / 3)),

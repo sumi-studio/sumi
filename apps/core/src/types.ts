@@ -466,7 +466,7 @@ export type JobTerminalReport = "done" | "failed" | "cancelled";
 
 /**
  * Call sessions are the durable authority record for the secretary's
- * presence in a place's LiveKit room (migration 0056). The core creates one
+ * presence in a place's LiveKit room (migration 0055). The core creates one
  * through the delegated call.join effect; a per-placement media bridge
  * claims it and drives media under that claim's epoch.
  */
