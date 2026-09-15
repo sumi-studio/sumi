@@ -260,18 +260,16 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 			}
 		}
 	}
-	// reply_to on an event means "this message answers yours" — it is bound
-	// to the parent author at append time, never a generic provenance copy.
-	// An ambient recipient's change event must not inherit it: being a reply
-	// does not make the reply address every observer.
-	var parentAuthor ParticipantRef
-	if message.ReplyTo != "" {
-		err := tx.QueryRow(ctx, `SELECT author_kind, author_id FROM messages
-			WHERE place_id = $1 AND message_id = $2`,
-			place.PlaceID, message.ReplyTo).Scan(&parentAuthor.Kind, &parentAuthor.ID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
+	// reply_to on an event means "this message answers yours". It names only
+	// the secretary an ordinary reply appended now would address: an ambient
+	// recipient's change event must not inherit it, and new content alone
+	// never readdresses a parent that was deleted, precedes the secretary's
+	// tenure, or belongs to a secretary no longer in this conversation. Those
+	// recipients still get the change through their own reason or record.
+	// A tombstone reports the deletion whatever became of the parent since.
+	addressee, _, addressed, err := s.replyAddressee(ctx, tx, place, message, members, change == AttentionChangeEdited)
+	if err != nil {
+		return err
 	}
 	for _, decision := range recipients {
 		if decision.Participant == s.Scope.Actor {
@@ -290,7 +288,7 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		event.Kind, event.PersonalityAgentID = AgentAttentionMessage, decision.Participant.ID
 		event.Change, event.Reason = change, decision.Reason
 		event.OccurredAt = changedAt
-		if parentAuthor.Kind == KindPersonalityAgent && parentAuthor == decision.Participant {
+		if addressed && addressee.Author == decision.Participant {
 			event.ReplyToMessageID = message.ReplyTo
 			// Mirror the append rule: reply attention is re-authorized
 			// against the parent only when it stands on its own (an
@@ -321,41 +319,15 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 // interpretation. It uses the same outbox as DM/mention attention and remains
 // subject to that recipient's notification settings and membership tenure.
 func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Place, message Message, members []MemberProfile, decisions []NotificationDecision) (ParticipantRef, error) {
-	if message.ReplyTo == "" {
-		return ParticipantRef{}, nil
-	}
-	parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, message.ReplyTo)
-	if err != nil {
+	parent, access, addressed, err := s.replyAddressee(ctx, tx, place, message, members, true)
+	if err != nil || !addressed {
 		return ParticipantRef{}, err
 	}
-	if parent.Deleted || parent.Author.Kind != KindPersonalityAgent || parent.Author == message.Author {
-		return ParticipantRef{}, nil
-	}
-	// Do not enroll a former participant merely because their old message is
-	// still visible. The recipient must be in this conversation now.
-	present, authorName := false, ""
+	authorName := ""
 	for _, member := range members {
-		present = present || member.Participant == parent.Author
 		if member.Participant == message.Author {
 			authorName = member.DisplayName
 		}
-	}
-	if !present {
-		return ParticipantRef{}, nil
-	}
-	settings, err := s.scopedNotificationSettingsFor(ctx, tx, place.PlaceID, []ParticipantRef{parent.Author})
-	if err != nil {
-		return ParticipantRef{}, err
-	}
-	if settings[parent.Author.Key()].level == NotifyLevelMute {
-		return ParticipantRef{}, nil
-	}
-	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, parent.Author)
-	if err != nil {
-		return ParticipantRef{}, err
-	}
-	if parent.Seq < access.VisibleFromSeq {
-		return ParticipantRef{}, nil
 	}
 	event := s.attentionEvent(place, message, message.Author, authorName)
 	event.Kind, event.PersonalityAgentID = AgentAttentionMessage, parent.Author.ID
@@ -379,6 +351,50 @@ func (s *ScopedStore) issueAgentReply(ctx context.Context, tx pgx.Tx, place Plac
 	err = s.insertAgentAttention(ctx, tx, event, message.MessageID, message.Revision,
 		access.WorkspaceMemberID, access.PlaceMemberID, message.CreatedAt)
 	return parent.Author, err
+}
+
+// replyAddressee is the one rule for which secretary a reply answers: the PA
+// author of its parent, when that secretary is in this conversation now (a
+// former participant is not re-enrolled because its old message is still
+// visible), has not muted the place, and can see the parent in its current
+// tenure. Append and edit also require a live parent; a tombstone passes
+// requireLiveParent=false because reporting a deletion never depends on it.
+func (s *ScopedStore) replyAddressee(ctx context.Context, tx pgx.Tx, place Place, message Message, members []MemberProfile, requireLiveParent bool) (Message, PlaceAccess, bool, error) {
+	if message.ReplyTo == "" {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, message.ReplyTo)
+	if errors.Is(err, ErrMessageNotFound) {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	if err != nil {
+		return Message{}, PlaceAccess{}, false, err
+	}
+	if (requireLiveParent && parent.Deleted) || parent.Author.Kind != KindPersonalityAgent || parent.Author == message.Author {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	present := false
+	for _, member := range members {
+		present = present || member.Participant == parent.Author
+	}
+	if !present {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	settings, err := s.scopedNotificationSettingsFor(ctx, tx, place.PlaceID, []ParticipantRef{parent.Author})
+	if err != nil {
+		return Message{}, PlaceAccess{}, false, err
+	}
+	if settings[parent.Author.Key()].level == NotifyLevelMute {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	access, err := s.placeAccessAfterAuthorization(ctx, tx, place, parent.Author)
+	if err != nil {
+		return Message{}, PlaceAccess{}, false, err
+	}
+	if parent.Seq < access.VisibleFromSeq {
+		return Message{}, PlaceAccess{}, false, nil
+	}
+	return parent, access, true, nil
 }
 
 // A vote is an action by the authenticated voter on the author's question.
