@@ -570,6 +570,8 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
   let parsed: {
     messages?: {
       role: string;
+      name?: string;
+      tool_call_id?: string;
       tool_calls?: { id: string; function: { name: string } }[];
     }[];
   } = {};
@@ -601,7 +603,16 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
               },
             ],
           },
-          { role: "tool", toolCallId: "c1", content: '{"ok":true}' },
+          {
+            role: "tool",
+            toolCallId: "c1",
+            // The secretary sets the canonical name on tool results; the
+            // wire must NOT carry it — tool_call_id is the linkage and
+            // some upstreams reject the extra field (observed live:
+            // omen-alpha 400s '"name" is not supported by this endpoint').
+            name: "journal.note",
+            content: '{"ok":true}',
+          },
         ],
       })) {
         /* drain */
@@ -611,13 +622,16 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
   const replayed = parsed.messages?.[0]?.tool_calls?.[0];
   assert.equal(replayed?.id, "c1");
   assert.equal(replayed?.function.name, "journal_note");
+  const toolMsg = parsed.messages?.find((m) => m.role === "tool");
+  assert.equal(toolMsg?.tool_call_id, "c1");
+  assert.equal(toolMsg?.name, undefined, "tool message leaked name field");
 });
 
 test("a configured session header carries the persona's stable identity", async () => {
-  let sessionHeader: string | undefined;
+  const seenHeaders: Record<string, string | string[] | undefined>[] = [];
   await withServer(
     (req, res) => {
-      sessionHeader = req.headers["x-opencode-session"] as string | undefined;
+      seenHeaders.push(req.headers);
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", () => sse([fin("stop"), "[DONE]"])(res));
@@ -628,9 +642,23 @@ test("a configured session header carries the persona's stable identity", async 
         apiKey: "test-key",
         model: "test-model",
         sessionHeader: "x-opencode-session",
+        // Differently-cased stale value: fetch would combine it into
+        // "stale, p" — the live identity must replace it entirely.
+        headers: { "X-OpenCode-Session": "stale" },
       });
       await collect(p);
+      // Default honest UA; a differently-cased operator override must
+      // replace it rather than combine into a comma-joined value.
+      const q = new OpenAIProvider({
+        baseUrl: base,
+        apiKey: "test-key",
+        model: "test-model",
+        headers: { "user-agent": "operator-agent/1" },
+      });
+      await collect(q);
     },
   );
-  assert.equal(sessionHeader, "p");
+  assert.equal(seenHeaders[0]!["x-opencode-session"], "p");
+  assert.equal(seenHeaders[0]!["user-agent"], "sumi-secretary/alpha");
+  assert.equal(seenHeaders[1]!["user-agent"], "operator-agent/1");
 });
