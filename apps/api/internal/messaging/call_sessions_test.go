@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -854,4 +856,222 @@ func TestSealSerializesInFlightCallJoin(t *testing.T) {
 	if sessions != 0 {
 		t.Fatalf("racing join left %d sessions", sessions)
 	}
+}
+
+// Ticket issuance linearizes with the seal: a ticket request that reaches
+// its claim check while the seal holds the persona lock waits, then sees
+// retired authority and is refused — no fresh 60-second credential can be
+// minted on a retired placement. A ticket that commits before the seal's
+// lock lands is legitimately pre-seal issuance (accepted TTL window).
+func TestTicketCannotMintAcrossSealCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// A ticket before any retirement still mints — sanity.
+	if _, err := calls.CallSessionTicket(ctx, w.agent.ID, session.SessionID, "runner-a", 1); err != nil {
+		t.Fatalf("pre-seal ticket: %v", err)
+	}
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id=$1 FOR NO KEY UPDATE`,
+		w.agent.ID); err != nil {
+		t.Fatalf("seal-side lock: %v", err)
+	}
+	type ticketResult struct {
+		ticket agentstate.CallTicket
+		err    error
+	}
+	ticketCh := make(chan ticketResult, 1)
+	go func() {
+		tk, err := calls.CallSessionTicket(context.Background(), w.agent.ID,
+			session.SessionID, "runner-a", 1)
+		ticketCh <- ticketResult{tk, err}
+	}()
+	// The request must be blocked at the persona row — it cannot read the
+	// pre-seal authority while the seal's lock is held.
+	select {
+	case res := <-ticketCh:
+		t.Fatalf("ticket did not serialize with the seal lock: %+v / %v", res.ticket, res.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// Complete the retirement exactly as Seal commits it.
+	if _, err := lockTx.Exec(ctx,
+		`UPDATE core_personas SET authority='sealed' WHERE persona_id=$1`,
+		w.agent.ID); err != nil {
+		t.Fatalf("seal-side update: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx,
+		`UPDATE call_sessions SET status='revoked', ended_at=now(), end_reason='transfer_sealed',
+		    claimed_by=NULL, claim_expires_at=NULL, updated_at=now()
+		 WHERE personality_agent_id=$1 AND status IN ('requested','claimed','active','ending','interrupted')`,
+		w.agent.ID); err != nil {
+		t.Fatalf("seal-side session revoke: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("seal-side commit: %v", err)
+	}
+	select {
+	case res := <-ticketCh:
+		if !errors.Is(res.err, ErrCallClaimLost) || res.ticket.Token != "" {
+			t.Fatalf("post-seal ticket = %+v / %v", res.ticket, res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ticket request stayed blocked after the seal committed")
+	}
+}
+
+// The same boundary holds for ordinary revocation, not just retirement: a
+// session row lock held by the remove/seal sweep serializes with issuance,
+// so a ticket cannot be minted from a claim that has already died.
+func TestTicketCannotMintAcrossRevocation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Hold the session row the way a revoke/update would.
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx,
+		`SELECT session_id FROM call_sessions WHERE session_id=$1 FOR NO KEY UPDATE`,
+		session.SessionID); err != nil {
+		t.Fatalf("revoke-side lock: %v", err)
+	}
+	type ticketResult struct {
+		ticket agentstate.CallTicket
+		err    error
+	}
+	ticketCh := make(chan ticketResult, 1)
+	go func() {
+		tk, err := calls.CallSessionTicket(context.Background(), w.agent.ID,
+			session.SessionID, "runner-a", 1)
+		ticketCh <- ticketResult{tk, err}
+	}()
+	select {
+	case res := <-ticketCh:
+		t.Fatalf("ticket did not serialize with the session row lock: %+v / %v", res.ticket, res.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// The revoke commits first; the blocked ticket then observes a dead claim.
+	if _, err := lockTx.Exec(ctx,
+		`UPDATE call_sessions SET status='revoked', ended_at=now(), end_reason='removed_by_member',
+		    claimed_by=NULL, claim_expires_at=NULL, updated_at=now() WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("revoke-side update: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("revoke-side commit: %v", err)
+	}
+	select {
+	case res := <-ticketCh:
+		if !errors.Is(res.err, ErrCallClaimLost) || res.ticket.Token != "" {
+			t.Fatalf("post-revocation ticket = %+v / %v", res.ticket, res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ticket request stayed blocked after the revoke committed")
+	}
+}
+
+// Authenticated HTTP boundary for the retirement cut: the real mounted
+// agentstate bridge routes (persona capability token) and the real mounted
+// portable seal route (admin secret) over httptest. Before the seal the
+// runner token claims and mints; after a correct admin seal the same token
+// cannot renew, mint, or report — the credential still authenticates, it
+// just carries no call authority.
+func TestSealCutsCallBridgeAuthorityOverHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+	const adminSecret = "test-admin-secret-for-call-seal"
+
+	mux := http.NewServeMux()
+	core := agentstate.NewServer(pool, adminSecret)
+	core.SetCallBridge(calls)
+	core.RegisterRoutes(mux)
+	portable.NewServer(pool, adminSecret).RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	runnerToken := core.PersonaToken(w.agent.ID)
+	post := func(path, token, body string) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("request %s: %v", path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		return res
+	}
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	res := post("/internal/core/personas/"+w.agent.ID+"/calls/claim", runnerToken,
+		`{"runner_id":"runner-a","lease_ms":30000,"limit":4}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP claim = %d", res.StatusCode)
+	}
+	_ = res.Body.Close()
+	res = post("/internal/core/personas/"+w.agent.ID+"/calls/sessions/"+session.SessionID+"/ticket",
+		runnerToken, `{"runner_id":"runner-a","epoch":1}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP ticket = %d", res.StatusCode)
+	}
+	_ = res.Body.Close()
+
+	// The admin seal route runs the real Seal service: sessions revoked.
+	transferID := newUUIDv7()
+	res = post("/internal/core/personas/"+w.agent.ID+"/transfers/"+transferID+"/seal",
+		adminSecret, `{"destination_id":"`+newUUIDv7()+`"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP seal = %d", res.StatusCode)
+	}
+	_ = res.Body.Close()
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "transfer_sealed" {
+		t.Fatalf("sealed session = %+v", row)
+	}
+
+	// The persona credential still authenticates but carries no call
+	// authority: heartbeat, ticket, and status are all 409 claim_lost.
+	for _, tc := range []struct{ path, body string }{
+		{"/internal/core/personas/" + w.agent.ID + "/calls/sessions/" + session.SessionID + "/heartbeat",
+			`{"runner_id":"runner-a","epoch":1,"lease_ms":30000}`},
+		{"/internal/core/personas/" + w.agent.ID + "/calls/sessions/" + session.SessionID + "/ticket",
+			`{"runner_id":"runner-a","epoch":1}`},
+		{"/internal/core/personas/" + w.agent.ID + "/calls/sessions/" + session.SessionID + "/status",
+			`{"runner_id":"runner-a","epoch":1,"status":"ended","reason":"bye"}`},
+	} {
+		res := post(tc.path, runnerToken, tc.body)
+		if res.StatusCode != http.StatusConflict {
+			t.Fatalf("post-seal %s = %d, want 409", tc.path, res.StatusCode)
+		}
+		_ = res.Body.Close()
+	}
+	// A fresh claim pass is refused too.
+	res = post("/internal/core/personas/"+w.agent.ID+"/calls/claim", runnerToken,
+		`{"runner_id":"runner-b","lease_ms":30000,"limit":4}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("post-seal HTTP claim = %d, want 409", res.StatusCode)
+	}
+	_ = res.Body.Close()
 }

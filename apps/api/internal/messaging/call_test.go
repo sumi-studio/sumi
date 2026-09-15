@@ -203,6 +203,41 @@ func TestCallRegistryTracksConnectionsPerParticipant(t *testing.T) {
 	}
 }
 
+// An explicit stale leave names a dead connection, not a participant: a
+// duplicate leave for the old connection must never evict the live
+// reconnect sharing the identity. The same shape arises when a snapshot
+// rebuilt with only the new connection receives a late old leave.
+func TestCallRegistryStaleExplicitLeaveKeepsReconnect(t *testing.T) {
+	now := time.Unix(1_780_000_000, 0)
+	registry := NewCallRegistry()
+	alice := Human("01900000-0000-7000-8000-0000000000aa")
+	registry.open("place-1", testRoomSID, now)
+	registry.join("place-1", testRoomSID, alice, alice.Key(), "PA_1", now)
+	registry.leave("place-1", testRoomSID, alice, alice.Key(), "PA_1")
+	state, _ := registry.join("place-1", testRoomSID, alice, alice.Key(), "PA_2", now.Add(time.Second))
+	if len(state.Participants) != 1 {
+		t.Fatalf("reconnect absent: %+v", state.Participants)
+	}
+	// The duplicate leave names PA_1, which is no longer tracked — it must
+	// not fall back to identity and delete PA_2.
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "PA_1")
+	if len(state.Participants) != 1 {
+		t.Fatalf("duplicate stale leave evicted the live connection: %+v", state.Participants)
+	}
+	// The leave naming the live connection still removes the entry.
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "PA_2")
+	if len(state.Participants) != 0 {
+		t.Fatalf("live connection's leave did not remove the entry")
+	}
+	// A leave without any SID is the synthetic/identity form: it removes
+	// the identity-matched connection and, with none left, the entry.
+	registry.join("place-1", testRoomSID, alice, alice.Key(), "PA_3", now.Add(2*time.Second))
+	state, _ = registry.leave("place-1", testRoomSID, alice, alice.Key(), "")
+	if len(state.Participants) != 0 {
+		t.Fatalf("no-SID leave did not remove the participant: %+v", state.Participants)
+	}
+}
+
 func TestCallWebhookUsesRoomSIDAsGeneration(t *testing.T) {
 	now := time.Unix(1_780_000_000, 0)
 	service := &CallService{Registry: NewCallRegistry(), Now: func() time.Time { return now }}

@@ -264,27 +264,45 @@ func (c *CallService) CallSessionTicket(ctx context.Context, personaID, sessionI
 	if !c.LiveKit.configured() {
 		return agentstate.CallTicket{}, errors.New("LiveKit is not configured")
 	}
-	session, err := c.requireCallClaim(ctx, personaID, sessionID, runnerID, epoch)
-	if err != nil {
-		return agentstate.CallTicket{}, err
-	}
-	if session.Status != CallSessionClaimed && session.Status != CallSessionActive {
-		return agentstate.CallTicket{}, fmt.Errorf("%w: status %s cannot mint a ticket", ErrCallSessionNotLive, session.Status)
-	}
-	if session.RoomSID == "" {
-		// The session predates the registry learning the room SID — stamp it
-		// now so a stale room_finished for a dead generation can't end it.
-		if sid := c.currentRoomSID(session.PlaceID); sid != "" {
-			if _, err := c.Server.Store.pool.Exec(ctx, `
-				UPDATE call_sessions SET room_sid = $2
-				WHERE session_id = $1 AND (room_sid IS NULL OR room_sid = '')`,
-				sessionID, sid); err == nil {
-				session.RoomSID = sid
+	var session CallSession
+	var token string
+	// The whole authorization-and-issuance is one transaction: persona
+	// FOR SHARE serializes with a placement seal and the session row lock
+	// with revocation, so a ticket's authority cannot be freshly extended
+	// after the session or the placement was retired. If this commit wins,
+	// the ticket was genuinely issued pre-retirement under its accepted TTL;
+	// if the seal/revoke wins, the request observes retired state and no
+	// credential is signed.
+	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
+		s, err := c.requireCallClaimInTx(ctx, tx, personaID, sessionID, runnerID, epoch, true)
+		if err != nil {
+			return err
+		}
+		session = s
+		if session.Status != CallSessionClaimed && session.Status != CallSessionActive {
+			return fmt.Errorf("%w: status %s cannot mint a ticket", ErrCallSessionNotLive, session.Status)
+		}
+		if session.RoomSID == "" {
+			// The session predates the registry learning the room SID —
+			// stamp it inside the same lock scope so a stale room_finished
+			// for a dead generation can't end it.
+			if sid := c.currentRoomSID(session.PlaceID); sid != "" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE call_sessions SET room_sid = $2
+					WHERE session_id = $1 AND (room_sid IS NULL OR room_sid = '')`,
+					sessionID, sid); err == nil {
+					session.RoomSID = sid
+				}
 			}
 		}
-	}
-	identity := callSessionIdentity(&session)
-	token, err := c.LiveKit.accessToken(session.PlaceID, identity, "", c.now(), CallBridgeTicketTTL)
+		identity := callSessionIdentity(&session)
+		tok, err := c.LiveKit.accessToken(session.PlaceID, identity, "", c.now(), CallBridgeTicketTTL)
+		if err != nil {
+			return err
+		}
+		token = tok
+		return nil
+	})
 	if err != nil {
 		return agentstate.CallTicket{}, err
 	}
@@ -292,7 +310,7 @@ func (c *CallService) CallSessionTicket(ctx context.Context, personaID, sessionI
 		URL:      c.LiveKit.URL,
 		Token:    token,
 		Room:     session.PlaceID,
-		Identity: identity,
+		Identity: callSessionIdentity(&session),
 	}, nil
 }
 
@@ -427,7 +445,7 @@ func (c *CallService) ReportUtteranceDisposition(ctx context.Context, personaID,
 	}
 	var utterance CallUtterance
 	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
-		session, err := c.requireCallClaimInTx(ctx, tx, personaID, sessionID, runnerID, epoch)
+		session, err := c.requireCallClaimInTx(ctx, tx, personaID, sessionID, runnerID, epoch, false)
 		if err != nil {
 			return err
 		}
@@ -558,14 +576,14 @@ func (c *CallService) callPersonaAuthorityInTx(ctx context.Context, tx pgx.Tx, p
 func (c *CallService) requireCallClaim(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) (CallSession, error) {
 	var session CallSession
 	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
-		s, err := c.requireCallClaimInTx(ctx, tx, personaID, sessionID, runnerID, epoch)
+		s, err := c.requireCallClaimInTx(ctx, tx, personaID, sessionID, runnerID, epoch, false)
 		session = s
 		return err
 	})
 	return session, err
 }
 
-func (c *CallService) requireCallClaimInTx(ctx context.Context, tx pgx.Tx, personaID, sessionID, runnerID string, epoch int64) (CallSession, error) {
+func (c *CallService) requireCallClaimInTx(ctx context.Context, tx pgx.Tx, personaID, sessionID, runnerID string, epoch int64, forUpdate bool) (CallSession, error) {
 	if !canonicalid.IsUUIDv7(sessionID) {
 		return CallSession{}, fmt.Errorf("%w: session id must be a uuidv7", agentstate.ErrBadRequest)
 	}
@@ -576,10 +594,17 @@ func (c *CallService) requireCallClaimInTx(ctx context.Context, tx pgx.Tx, perso
 	if !found || authority != "active" {
 		return CallSession{}, fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
 	}
+	lockClause := ""
+	if forUpdate {
+		// Issuance paths take the session row lock so a concurrent
+		// revoke/seal cannot commit between the claim check and the ticket
+		// mint in the same transaction.
+		lockClause = " FOR NO KEY UPDATE"
+	}
 	var session CallSession
 	err = tx.QueryRow(ctx, `
 		SELECT `+callSessionCols+` FROM call_sessions
-		WHERE session_id = $1 AND personality_agent_id = $2`,
+		WHERE session_id = $1 AND personality_agent_id = $2`+lockClause,
 		sessionID, personaID).Scan(callSessionScan(&session)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CallSession{}, ErrCallSessionNotFound

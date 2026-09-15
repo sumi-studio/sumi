@@ -320,11 +320,13 @@ func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, ide
 	return cloneCallState(state), true
 }
 
-// leave drops exactly the connection the event names. The entry is removed
-// only when no live connection remains; when the event carries no
-// participant SID, the connection is matched by identity, and a participant
-// with an untracked connection (e.g. joined before this process started)
-// still falls back to an identity match so it can depart.
+// leave drops exactly the connection the event names. An explicit
+// participant SID is authoritative: an unknown SID means that connection is
+// already gone, and it must never match a different live connection of the
+// same participant (a duplicate stale leave after a reconnect would
+// otherwise evict the replacement). Only a leave with no SID at all —
+// synthetic callers that never saw the connection — falls back to matching
+// by identity. The entry is removed once no live connection remains.
 func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef, identity, participantSID string) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -342,37 +344,32 @@ func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef, id
 		if existing.Participant != participant {
 			continue
 		}
-		if len(existing.Connections) == 0 {
-			// Entry recorded without connection detail (a rebuild or a
-			// snapshot older than connection tracking): keep the legacy
-			// identity match so it can still depart.
-			if existing.Identity != "" && identity != "" && existing.Identity != identity {
+		if participantSID != "" {
+			if _, ok := existing.Connections[participantSID]; !ok {
 				r.changed(placeID)
 				return cloneCallState(state), false
 			}
-			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
-			r.changed(placeID)
-			return cloneCallState(state), true
-		}
-		key := connKey(participantSID, identity)
-		_, tracked := existing.Connections[key]
-		if !tracked {
-			// The leaving connection is not in the set (unknown SID, or a
-			// join this process never saw). Drop the tracked connection
-			// carrying the same identity — the media for it is gone.
-			for k, id := range existing.Connections {
-				if id == identity {
-					key = k
-					tracked = true
-					break
+			delete(existing.Connections, participantSID)
+		} else {
+			// No connection was named: a join without a SID keyed the
+			// connection by identity; otherwise every tracked connection
+			// carrying this identity departed with it.
+			if _, ok := existing.Connections[identity]; ok {
+				delete(existing.Connections, identity)
+			} else {
+				matched := false
+				for k, id := range existing.Connections {
+					if id == identity {
+						delete(existing.Connections, k)
+						matched = true
+					}
+				}
+				if !matched {
+					r.changed(placeID)
+					return cloneCallState(state), false
 				}
 			}
 		}
-		if !tracked {
-			r.changed(placeID)
-			return cloneCallState(state), false
-		}
-		delete(existing.Connections, key)
 		if len(existing.Connections) == 0 {
 			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
 		} else {
