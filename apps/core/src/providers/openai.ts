@@ -46,6 +46,13 @@ export interface OpenAIConfig {
    * open forever (CR3-N1). Default 120_000ms.
    */
   timeoutMs?: number;
+  /**
+   * Bound on generated tokens, sent as `max_tokens` — the field every
+   * OpenAI-compatible router on this preset list accepts. When unset the
+   * field is omitted and the endpoint's own cap applies. A `max_tokens`
+   * (or `max_completion_tokens`) key in `extra` overrides it on the wire.
+   */
+  maxOutputTokens?: number;
 }
 
 /**
@@ -64,6 +71,16 @@ export class OpenAIProvider implements ModelProvider {
   ) {
     this.cfg = cfg;
     this.fetchImpl = fetchImpl;
+  }
+
+  /** The output bound the next request will actually send, if any. */
+  outputBound(): number | undefined {
+    const extra = this.cfg.extra;
+    const overridden =
+      extra !== undefined
+        ? (numOr(extra.max_tokens) ?? numOr(extra.max_completion_tokens))
+        : undefined;
+    return overridden ?? this.cfg.maxOutputTokens;
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
@@ -107,6 +124,9 @@ export class OpenAIProvider implements ModelProvider {
               model: this.cfg.model,
               stream: true,
               stream_options: { include_usage: true },
+              ...(this.cfg.maxOutputTokens
+                ? { max_tokens: this.cfg.maxOutputTokens }
+                : {}),
               messages: request.messages.map((m) => ({
                 role: m.role,
                 content: m.content,
@@ -323,4 +343,8 @@ export class OpenAIProvider implements ModelProvider {
       await readerRef?.cancel().catch(() => {});
     }
   }
+}
+
+function numOr(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
 }

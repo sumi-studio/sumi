@@ -162,6 +162,149 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/ModelConnectionSelection'
+  /api/usage:
+    get:
+      operationId: getUsageOverview
+      summary: List this Human's funding sources with budgets, totals, recent usage and parked inputs
+      description: Actor identity comes only from the signed browser session. Covers Human-owned API connections and live Sumi-provided allocations; the operator environment default appears only for personas with no Human selection. Costs are configured-rate estimates, never provider invoices.
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session.
+        '500':
+          description: Usage projection could not be read.
+        '200':
+          description: Funding sources and budget-parked inputs visible to this Human.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageOverview'
+  /api/usage/funding/{kind}/{id}/facts:
+    parameters:
+    - name: kind
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [connection, sumi]
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    get:
+      operationId: listUsageFacts
+      summary: List recorded usage facts for one owned funding source
+      description: Only funding sources owned by the authenticated Human are visible; another Human's source returns 404-equivalent denial. Each fact is one admitted provider call; redelivery never multiplies it.
+      security:
+      - sumiSession: []
+      parameters:
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 50
+      responses:
+        '401':
+          description: Missing, invalid or revoked session.
+        '403':
+          description: The funding source is not owned by this Human.
+        '404':
+          description: The funding source does not exist.
+        '200':
+          description: Usage facts, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [facts]
+                additionalProperties: false
+                properties:
+                  facts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UsageFact'
+  /api/usage/funding/{kind}/{id}/budget:
+    parameters:
+    - name: kind
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [connection, sumi]
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    put:
+      operationId: setUsageBudget
+      summary: Set an explicit spend budget and rate card on an owned funding source
+      description: Absence of a budget is uncapped, not an implicit limit. Setting or raising a budget resumes inputs parked on that source. Sumi-provided allocations are configured by the funder, not the grantee — kind 'sumi' is rejected here. Rates are clearly-labelled estimates with an explicit pricing revision, not provider prices.
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof.
+        '400':
+          description: Strict JSON or budget validation failed.
+        '403':
+          description: The funding source is not owned by this Human, or is a Sumi allocation.
+        '404':
+          description: The funding source does not exist.
+        '200':
+          description: Saved budget with its current spent/held/remaining projection.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [budget]
+                additionalProperties: false
+                properties:
+                  budget:
+                    $ref: '#/components/schemas/UsageBudget'
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UsageBudgetInput'
+    delete:
+      operationId: clearUsageBudget
+      summary: Remove the budget on an owned funding source, making it uncapped
+      description: Clearing a budget resumes inputs parked on that source.
+      security:
+      - sumiSession: []
+      responses:
+        '401':
+          description: Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof.
+        '403':
+          description: The funding source is not owned by this Human, or is a Sumi allocation.
+        '404':
+          description: The funding source does not exist.
+        '204':
+          description: Budget removed; the source is now uncapped.
+      parameters:
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Same-origin browser CSRF token matching its cookie.
   /health:
     get:
       operationId: getHealth
@@ -1887,3 +2030,247 @@ components:
           maxLength: 1024
         reject_reason:
           const: idempotency_conflict
+    UsageFundingRef:
+      type: object
+      required: [kind, id]
+      additionalProperties: false
+      description: The funding principal actually selected for a call, captured at call time; a later connection switch never rewrites it.
+      properties:
+        kind:
+          type: string
+          enum: [connection, operator, sumi]
+        id:
+          type: string
+          description: Connection UUID, 'env' for the operator default, or a grant funding id.
+        version:
+          type: string
+          description: Non-secret connection version snapshot (connection kind only).
+        model:
+          type: string
+        provider:
+          type: string
+    UsageBudget:
+      type: object
+      required: [funding_kind, funding_id, limit_minor, currency, rate_input_per_mtok, rate_output_per_mtok, pricing_revision, updated_at, spent_minor, held_minor, remaining_minor]
+      additionalProperties: false
+      description: An explicitly configured cap with its rate card. All money is integer minor units; rates are configured estimates under pricing_revision, not provider prices.
+      properties:
+        funding_kind:
+          type: string
+          enum: [connection, operator, sumi]
+        funding_id:
+          type: string
+        limit_minor:
+          type: integer
+          minimum: 0
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+        rate_input_per_mtok:
+          type: integer
+          minimum: 0
+          description: Minor units per one million input tokens.
+        rate_output_per_mtok:
+          type: integer
+          minimum: 0
+          description: Minor units per one million output tokens.
+        rate_cached_per_mtok:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Minor units per one million cached input tokens; absent bills cached at the input rate.
+        pricing_revision:
+          type: string
+          description: Caller-chosen label identifying which rate card produced these prices.
+        updated_at:
+          type: string
+          format: date-time
+        spent_minor:
+          type: integer
+          description: Priced recorded facts.
+        held_minor:
+          type: integer
+          description: Currently held admission reservations.
+        remaining_minor:
+          type: integer
+          description: limit_minor - spent_minor - held_minor.
+    UsageBudgetInput:
+      type: object
+      required: [limit_minor, currency, rate_input_per_mtok, rate_output_per_mtok, pricing_revision]
+      additionalProperties: false
+      properties:
+        limit_minor:
+          type: integer
+          minimum: 0
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+        rate_input_per_mtok:
+          type: integer
+          minimum: 0
+        rate_output_per_mtok:
+          type: integer
+          minimum: 0
+        rate_cached_per_mtok:
+          type: integer
+          minimum: 0
+          nullable: true
+        pricing_revision:
+          type: string
+          minLength: 1
+          maxLength: 200
+    UsageTotals:
+      type: object
+      required: [calls, unknown_calls, unpriced_calls, input_tokens, output_tokens, cached_tokens, costs]
+      additionalProperties: false
+      properties:
+        calls:
+          type: integer
+        unknown_calls:
+          type: integer
+          description: Calls without a complete provider usage report (status 'unknown' — no report or only some categories — or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero.
+        unpriced_calls:
+          type: integer
+          description: Reported calls with no applicable rate card.
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        cached_tokens:
+          type: integer
+        costs:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Recorded spend per currency code in minor units. A funding source can hold cost in more than one currency across rate-card edits, so totals never collapse to one number.
+    UsageFact:
+      type: object
+      required: [persona_id, fact_id, kind, phase, funding, status, input_tokens, output_tokens, cached_tokens, quantities, cost_minor, recorded_at]
+      additionalProperties: false
+      description: One admitted provider call. Retries and extra calls are distinct facts; redelivery of the same fact_id never multiplies it.
+      properties:
+        persona_id:
+          type: string
+        fact_id:
+          type: string
+        kind:
+          type: string
+          enum: [model_call]
+        phase:
+          type: string
+          enum: [turn, memory]
+        turn_id:
+          type: string
+        input_id:
+          type: string
+        round:
+          type: integer
+        funding:
+          $ref: '#/components/schemas/UsageFundingRef'
+        status:
+          type: string
+          enum: [reported, unknown, not_sent, unrecorded]
+          description: >-
+            'reported' carries complete provider token counts (input and
+            output). 'unknown' means the call was attempted but no complete
+            usage report resolved — categories the provider did report are
+            kept, and the admission estimate stays as uncertain spend until a
+            complete report for the same fact supersedes it. 'unrecorded' means the writer lost
+            the response before it could report — inspectable, estimate
+            retained. 'not_sent' means the request provably never left —
+            its reservation was released and nothing is owed.
+        input_tokens:
+          type: integer
+          nullable: true
+        output_tokens:
+          type: integer
+          nullable: true
+        cached_tokens:
+          type: integer
+          nullable: true
+        quantities:
+          type: object
+          description: Raw provider-reported quantities, preserved verbatim.
+        cost_minor:
+          type: integer
+          nullable: true
+          description: Priced under the rate card snapshotted at admission; null when unpriced.
+        currency:
+          type: string
+        cost_basis:
+          type: string
+          enum: [configured_rates, admission_estimate]
+          description: Provenance — 'configured_rates' priced provider-reported tokens; 'admission_estimate' is the reserved estimate kept for unknown/lost usage. Never a provider invoice.
+        pricing_revision:
+          type: string
+        recorded_at:
+          type: string
+          format: date-time
+    UsageSourceView:
+      type: object
+      required: [kind, id, selected, totals, recent]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [connection, sumi]
+        id:
+          type: string
+        name:
+          type: string
+        model:
+          type: string
+        preset:
+          type: string
+        selected:
+          type: boolean
+          description: Whether this Human's secretaries currently select this source.
+        grant:
+          type: boolean
+          description: True for a Sumi-provided allocation; its budget is funder-managed.
+        budget:
+          $ref: '#/components/schemas/UsageBudget'
+        totals:
+          $ref: '#/components/schemas/UsageTotals'
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageFact'
+    UsageBudgetWaitRow:
+      type: object
+      required: [persona_id, input_id, turn_id, funding_kind, funding_id, needed_minor, currency, created_at]
+      additionalProperties: false
+      description: An input parked because admission could not reserve enough budget; resumes when a budget change (a higher limit or lower rates) lets the parked call fit, when the budget is removed, or on a funding change. needed_minor is the call's admission estimate priced under the current rate card.
+      properties:
+        persona_id:
+          type: string
+        input_id:
+          type: string
+        turn_id:
+          type: string
+        funding_kind:
+          type: string
+        funding_id:
+          type: string
+        needed_minor:
+          type: integer
+        currency:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    UsageOverview:
+      type: object
+      required: [sources, waits]
+      additionalProperties: false
+      properties:
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageSourceView'
+        waits:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageBudgetWaitRow'

@@ -39,6 +39,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	"github.com/sumi-studio/sumi/apps/api/internal/usageview"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 	"golang.org/x/sys/unix"
 )
@@ -661,6 +662,22 @@ func newApplicationFromEnv() (*application, error) {
 		coreServer.SetModelConnections(modelConnections)
 		coreServer.RegisterRoutes(mux)
 		portable.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
+		// The human-facing usage/budget surface shares the core store: a
+		// changed selection or connection reopens the funding question for
+		// budget-parked inputs, so chain the resume hook into the existing
+		// model-connection change callback.
+		usageService := &usageview.Service{
+			Store:        coreServer.Store(),
+			Authenticate: chatGPTBrowserIdentity(sv, browserOrigins),
+		}
+		usageService.RegisterRoutes(mux)
+		prevChanged := modelConnectionService.Changed
+		modelConnectionService.Changed = func(human string) {
+			if prevChanged != nil {
+				prevChanged(human)
+			}
+			usageService.FundingChanged(human)
+		}
 		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")
 	}
 	mux.HandleFunc("GET /health", handler.Health)
