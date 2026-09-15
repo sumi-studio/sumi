@@ -5,7 +5,13 @@ import {
   MessageResponse,
   type MessageResponseProps,
 } from "@sumi/ui/ai-elements/message";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.mock("@streamdown/mermaid", () => ({
@@ -68,8 +74,29 @@ afterEach(() => {
 
 describe("MessageResponse", () => {
   it("keeps presentation and security overrides out of the public API", () => {
+    // 型レベル: パーサー/サニタイズ/描画を差し替えるpropsは一切露出しない。
+    // ブラックリストではなく表示系propsのPickなので、Streamdownが将来
+    // 危険なpropを増やしても既定で届かない。
     type UnsafeOverride = Extract<
-      "components" | "urlTransform" | "rehypePlugins",
+      | "components"
+      | "urlTransform"
+      | "rehypePlugins"
+      | "remarkPlugins"
+      | "remarkRehypeOptions"
+      | "skipHtml"
+      | "allowElement"
+      | "allowedElements"
+      | "disallowedElements"
+      | "unwrapDisallowed"
+      | "allowedTags"
+      | "literalTagContent"
+      | "plugins"
+      | "BlockComponent"
+      | "parseMarkdownIntoBlocksFn"
+      | "remend"
+      | "mermaid"
+      | "controls"
+      | "icons",
       keyof MessageResponseProps
     >;
     const hasUnsafeOverride: UnsafeOverride extends never ? false : true =
@@ -124,21 +151,124 @@ describe("MessageResponse", () => {
     expect(links).toContain("https://attacker.example/raw.png");
   });
 
-  it("ignores an untyped attempt to replace the image policy", () => {
+  it.each([
+    "static",
+    "streaming",
+  ] as const)("ignores untyped pipeline overrides that could re-enable fetching in %s mode", (mode) => {
+    // キャスト経由で危険propを実行時に流し込んでも、名前で明示転送する
+    // だけなのでStreamdownへ届かない。
     const unsafeProps = {
-      mode: "static",
-      children: "![pixel](https://attacker.example/pixel.png)",
+      mode,
+      isAnimating: mode === "streaming",
+      children: `![pixel](https://attacker.example/pixel.png)
+
+<iframe src="https://attacker.example/via-allowed-tags"></iframe>`,
       components: {
         img: ({ src }: { src?: string }) => <img src={src} alt="unsafe" />,
+      },
+      allowedTags: { iframe: ["src", "srcdoc"] },
+      literalTagContent: ["iframe"],
+      rehypePlugins: [],
+      remarkPlugins: [],
+      urlTransform: (url: string) => url,
+      skipHtml: false,
+      allowedElements: ["iframe", "img"],
+      plugins: {
+        math: {
+          name: "katex",
+          type: "math",
+          remarkPlugin: () => {},
+          rehypePlugin: () => (tree: { children?: unknown[] }) => {
+            tree.children?.push({
+              type: "element",
+              tagName: "iframe",
+              properties: { src: "https://attacker.example/via-plugins" },
+              children: [],
+            });
+          },
+        },
+      },
+      BlockComponent: () => (
+        <img src="https://attacker.example/via-block" alt="block" />
+      ),
+      parseMarkdownIntoBlocksFn: (markdown: string) => [markdown],
+      remend: false,
+      linkSafety: {
+        enabled: false,
+        renderModal: () => (
+          <img src="https://attacker.example/via-modal" alt="modal" />
+        ),
       },
     } as unknown as MessageResponseProps;
     const { container } = render(<MessageResponse {...unsafeProps} />);
 
-    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("img,iframe,script")).toBeNull();
     expect(container.querySelector("[data-image-link]")).toHaveAttribute(
       "href",
       "https://attacker.example/pixel.png",
     );
+  });
+
+  it("forwards narrowed linkSafety without its render-override slot", () => {
+    const onLinkCheck = vi.fn(() => true);
+    const linkSafety = {
+      enabled: false,
+      onLinkCheck,
+      renderModal: () => <img src="https://attacker.example/modal" alt="x" />,
+    } as unknown as MessageResponseProps["linkSafety"];
+    const { container } = render(
+      <MessageResponse mode="static" linkSafety={linkSafety}>
+        {"[docs](https://example.com/docs)"}
+      </MessageResponse>,
+    );
+
+    // enabled:false → モーダル確認なしの素のアンカーとして残る。
+    // renderModalは実行時に切り落とされるのでimgは絶対に出ない。
+    const anchor = container.querySelector(
+      'a[href="https://example.com/docs"]',
+    );
+    expect(anchor).not.toBeNull();
+    expect(anchor).toHaveAttribute("target", "_blank");
+    fireEvent.click(anchor as Element);
+    expect(
+      document.querySelector('[data-streamdown="link-safety-modal"]'),
+    ).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+    expect(onLinkCheck).not.toHaveBeenCalled();
+  });
+
+  it("opens the default link-safety modal when linkSafety is enabled", async () => {
+    render(
+      <MessageResponse mode="static">
+        {"[docs](https://example.com/docs)"}
+      </MessageResponse>,
+    );
+    fireEvent.click(
+      document.querySelector('[data-streamdown="link"]') as Element,
+    );
+    await waitFor(() => {
+      expect(
+        document.querySelector('[data-streamdown="link-safety-modal"]'),
+      ).not.toBeNull();
+    });
+  });
+
+  it("re-renders when any accepted presentation prop changes", () => {
+    const { container, rerender } = render(
+      <MessageResponse mode="static" dir="ltr">
+        {"本文"}
+      </MessageResponse>,
+    );
+    const ltrBlocks = container.querySelectorAll('[dir="ltr"]');
+    expect(ltrBlocks.length).toBeGreaterThan(0);
+
+    rerender(
+      <MessageResponse mode="static" dir="rtl">
+        {"本文"}
+      </MessageResponse>,
+    );
+    // memoの既定shallow比較が受け付けprops全体を見る（dirが変われば更新）。
+    expect(container.querySelector('[dir="rtl"]')).not.toBeNull();
   });
 
   it("applies syntax highlighting to a typed code fence", async () => {

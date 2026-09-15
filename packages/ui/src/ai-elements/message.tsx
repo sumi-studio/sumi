@@ -4,7 +4,11 @@ import { createMathPlugin } from "@streamdown/math";
 import { CheckIcon, CopyIcon, PencilIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes } from "react";
 import { memo, useEffect, useRef, useState } from "react";
-import { type DiagramPlugin, Streamdown } from "streamdown";
+import {
+  type DiagramPlugin,
+  type LinkSafetyConfig,
+  Streamdown,
+} from "streamdown";
 import { Button } from "../components/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/tooltip";
 import { cn } from "../lib/utils";
@@ -120,15 +124,44 @@ const streamdownControls = {
 } as const;
 
 /**
- * 画像・リンクの出所ポリシーは共有rendererが所有し、呼び出し側から
- * 差し替えられない。`components`/`rehypePlugins`/`urlTransform` を
- * 閉じるのはcompact側（compact-message-response）と同じ契約。
+ * Streamdown props that only adjust presentation of already-sanitized output.
+ * Anything not listed here — parser/sanitizer/render overrides such as
+ * `components`, `rehypePlugins`, `remarkPlugins`, `urlTransform`,
+ * `allowedTags`, `literalTagContent`, `plugins`, `BlockComponent`,
+ * `parseMarkdownIntoBlocksFn`, `remend`, `mermaid`, `controls`, `icons`,
+ * `skipHtml`, `allowElement`, `allowedElements`, `disallowedElements`,
+ * `unwrapDisallowed`, `remarkRehypeOptions` — is not part of the public API
+ * and never reaches Streamdown: props are forwarded by name, not spread.
  */
-export type MessageResponseProps = Omit<
+type StreamdownPresentationProps = Pick<
   ComponentProps<typeof Streamdown>,
-  "components" | "rehypePlugins" | "urlTransform"
-> & {
+  | "children"
+  | "mode"
+  | "dir"
+  | "isAnimating"
+  | "animated"
+  | "caret"
+  | "onAnimationStart"
+  | "onAnimationEnd"
+  | "parseIncompleteMarkdown"
+  | "normalizeHtmlIndentation"
+  | "lineNumbers"
+  | "shikiTheme"
+  | "prefix"
+  | "translations"
+>;
+
+/**
+ * 画像・リンクの出所ポリシーは共有rendererが所有する。受け付けるpropsは
+ * 表示系だけなので、呼び出し側からはサニタイズ後の出力をフェッチや
+ * アクティブ要素へ広げられない。compact側（compact-message-response）の
+ * 閉じたcomponentsマップと同じ契約。
+ */
+export type MessageResponseProps = StreamdownPresentationProps & {
+  className?: string;
   onRenderSettled?: () => void;
+  /** renderModal等の描画差し替えは受けない。有効化フラグと追加チェックのみ。 */
+  linkSafety?: Pick<LinkSafetyConfig, "enabled" | "onLinkCheck">;
 };
 
 const streamdownComponents: NonNullable<
@@ -143,7 +176,20 @@ export const MessageResponse = memo(
     children,
     className,
     onRenderSettled,
-    ...props
+    mode,
+    dir,
+    isAnimating,
+    animated,
+    caret,
+    onAnimationStart,
+    onAnimationEnd,
+    parseIncompleteMarkdown,
+    normalizeHtmlIndentation,
+    lineNumbers,
+    shikiTheme,
+    prefix,
+    translations,
+    linkSafety,
   }: MessageResponseProps) => {
     const rootRef = useRef<HTMLDivElement>(null);
 
@@ -197,22 +243,32 @@ export const MessageResponse = memo(
           controls={streamdownControls}
           plugins={streamdownPlugins}
           allowedTags={{ kbd: [], sub: [], sup: [] }}
-          {...props}
           components={streamdownComponents}
-          rehypePlugins={undefined}
-          urlTransform={undefined}
+          mode={mode}
+          dir={dir}
+          isAnimating={isAnimating}
+          animated={animated}
+          caret={caret}
+          onAnimationStart={onAnimationStart}
+          onAnimationEnd={onAnimationEnd}
+          parseIncompleteMarkdown={parseIncompleteMarkdown}
+          normalizeHtmlIndentation={normalizeHtmlIndentation}
+          lineNumbers={lineNumbers}
+          shikiTheme={shikiTheme}
+          prefix={prefix}
+          translations={translations}
+          linkSafety={
+            linkSafety && {
+              enabled: linkSafety.enabled,
+              onLinkCheck: linkSafety.onLinkCheck,
+            }
+          }
         >
           {children}
         </Streamdown>
       </div>
     );
   },
-  (previous, next) =>
-    previous.children === next.children &&
-    previous.className === next.className &&
-    previous.isAnimating === next.isAnimating &&
-    previous.mode === next.mode &&
-    previous.onRenderSettled === next.onRenderSettled,
 );
 
 MessageResponse.displayName = "MessageResponse";

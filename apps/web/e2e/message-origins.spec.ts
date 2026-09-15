@@ -142,6 +142,25 @@ test("message renderers never fetch author-controlled image URLs", async ({
         ),
     ).toContain(`${beaconOrigin}/streamed-image.png`);
 
+    // 呼び出し側がキャストで危険propを押し込んでもStreamdownへ届かない:
+    // allowedTags iframe/plugins注入/BlockComponent/components差し替えは
+    // 全部無効で、Markdown画像はリンクのまま。beaconに追加ヒットがない
+    // ことは末尾のhitsアサーションが担保する。
+    const overrideState = await page
+      .locator("#agent-override")
+      .evaluate((node) => ({
+        images: node.querySelectorAll("img").length,
+        iframes: node.querySelectorAll("iframe").length,
+        imageLinks: [...node.querySelectorAll("[data-image-link]")].map(
+          (link) => link.getAttribute("href"),
+        ),
+      }));
+    expect(overrideState.images).toBe(0);
+    expect(overrideState.iframes).toBe(0);
+    expect(overrideState.imageLinks).toContain(
+      `${beaconOrigin}/override-md.png`,
+    );
+
     // 明示リンクは開ける。人間側はtarget=_blankの素のリンク、
     // 秘書側はlinkSafetyモーダル経由でwindow.openへ届く。
     const humanDocs = page.locator(

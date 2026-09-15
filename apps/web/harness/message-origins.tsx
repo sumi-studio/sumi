@@ -6,7 +6,10 @@ import {
   Attachments,
 } from "@sumi/ui/ai-elements/attachments";
 import { CompactMessageResponse } from "@sumi/ui/ai-elements/compact-message-response";
-import { MessageResponse } from "@sumi/ui/ai-elements/message";
+import {
+  MessageResponse,
+  type MessageResponseProps,
+} from "@sumi/ui/ai-elements/message";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -33,6 +36,44 @@ const attackMarkdown = [
   `[weak](javascript:fetch("${beacon}/javascript-link"))`,
 ].join("\n");
 
+// キャスト経由で危険propを押し込む呼び出し側の試み。型を抜けて実行時に
+// 渡っても、wrapperが名前で明示転送するだけなのでStreamdownへは届かない。
+const overrideAttempt = {
+  mode: "streaming",
+  isAnimating: true,
+  children: [
+    `![override-md](${beacon}/override-md.png)`,
+    ``,
+    `<iframe src="${beacon}/via-allowed-tags" srcdoc="<p>x</p>"></iframe>`,
+  ].join("\n"),
+  allowedTags: { iframe: ["src", "srcdoc"] },
+  literalTagContent: ["iframe"],
+  components: {
+    img: ({ src }: { src?: string }) => <img src={src} alt="caller" />,
+  },
+  plugins: {
+    math: {
+      name: "katex",
+      type: "math",
+      remarkPlugin: () => {},
+      rehypePlugin: () => (tree: { children?: unknown[] }) => {
+        tree.children?.push({
+          type: "element",
+          tagName: "iframe",
+          properties: { src: `${beacon}/via-plugins` },
+          children: [],
+        });
+      },
+    },
+  },
+  BlockComponent: () => (
+    <img src={`${beacon}/via-block-component`} alt="block" />
+  ),
+  parseMarkdownIntoBlocksFn: (markdown: string) => [markdown],
+  rehypePlugins: [],
+  urlTransform: (url: string) => url,
+} as unknown as MessageResponseProps;
+
 function App() {
   const [streamed, setStreamed] = useState("stream-head");
   window.__streamAppend = (chunk: string) =>
@@ -51,6 +92,9 @@ function App() {
         <MessageResponse mode="streaming" isAnimating>
           {streamed}
         </MessageResponse>
+      </section>
+      <section id="agent-override">
+        <MessageResponse {...overrideAttempt} />
       </section>
       <section id="attachment">
         <Attachments variant="grid">
