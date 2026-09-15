@@ -1203,3 +1203,176 @@ func TestRevokeKeepsSpeechAndSessionAtomic(t *testing.T) {
 		t.Fatalf("non-terminal speech on revoked session: n=%d err=%v", n, err)
 	}
 }
+
+// Membership close is the authority boundary, not the cleanup: after the
+// real Workspace leave commits — with the post-commit cleanup NEVER run —
+// the retained live claim authorizes nothing (heartbeat, ticket, status,
+// pending, disposition all refuse), and the next claim pass reconciles the
+// record to revoked instead of rejoining.
+func TestMembershipCloseBlocksRetainedCallAuthority(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	utterance := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "queued before removal")
+	before := callSessionRow(t, ctx, pool, session.SessionID)
+
+	// The REAL membership close commits; the MembershipClosed cleanup hook
+	// is deliberately not invoked — the worst case (subsumes a RoomService
+	// failure or a failed revoke that skipped all cleanup).
+	if err := w.workspaces.Leave(ctx, dm.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("workspace leave: %v", err)
+	}
+
+	// Every bridge mutation on the retained live claim is refused.
+	if _, err := calls.HeartbeatCallSession(ctx, w.agent.ID, session.SessionID, "runner-a", 1, 30*time.Second); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("post-close heartbeat = %v, want ErrCallClaimLost", err)
+	}
+	if _, err := calls.CallSessionTicket(ctx, w.agent.ID, session.SessionID, "runner-a", 1); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("post-close ticket = %v, want ErrCallClaimLost", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionEnded, "bye"); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("post-close status = %v, want ErrCallClaimLost", err)
+	}
+	if _, err := calls.PendingCallUtterances(ctx, w.agent.ID, session.SessionID, "runner-a", 1); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("post-close pending = %v, want ErrCallClaimLost", err)
+	}
+	if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID, utterance.UtteranceID, "runner-a", 1, CallUtteranceEmitted, nil); !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("post-close disposition = %v, want ErrCallClaimLost", err)
+	}
+	// The refused heartbeat did not extend the claim.
+	after := callSessionRow(t, ctx, pool, session.SessionID)
+	if !after.ClaimExpiresAt.Equal(*before.ClaimExpiresAt) || after.ClaimedBy != "runner-a" {
+		t.Fatalf("refused heartbeat still mutated the claim: %+v", after)
+	}
+
+	// After lapse, a reclaim attempt cannot resurrect the session — the
+	// claim pass reconciles it to revoked/membership_closed instead.
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET claim_expires_at = now() - interval '1 second' WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	claimed, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4)
+	if err != nil {
+		t.Fatalf("reclaim pass: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("reclaim returned sessions after membership close: %+v", claimed)
+	}
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "membership_closed" {
+		t.Fatalf("session after reclaim pass = %+v, want revoked/membership_closed", row)
+	}
+	if u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID); u.Status != CallUtteranceExpired {
+		t.Fatalf("utterance after reconcile = %+v", u)
+	}
+
+	// No automatic rejoin: a fresh call.join is refused by the same
+	// membership predicate the join effect already enforces.
+	err = applyCallEffectErr(ctx, pool, calls.CallJoinEffect(), w.agent.ID,
+		map[string]any{"place_id": dm.PlaceID})
+	if err == nil {
+		t.Fatal("call.join succeeded after membership close")
+	}
+}
+
+// The access gate share-locks the membership row, so a claim mutation that
+// races an in-flight closure waits and then observes the withdrawn
+// membership — it can never mint/renew on a snapshot from before the close.
+func TestCallMutationSerializesWithMembershipClose(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	// Fixture-simulated in-flight close: hold the same row locks the real
+	// Leave takes, uncommitted, in the real close order — bound place tenures
+	// first, then the workspace membership.
+	closeTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin close tx: %v", err)
+	}
+	defer func() { _ = closeTx.Rollback(context.Background()) }()
+	if _, err := closeTx.Exec(ctx, `
+		UPDATE place_members SET left_at = now()
+		WHERE workspace_id = $1 AND member_kind = 'personality_agent'
+		  AND member_id = $2 AND left_at IS NULL`,
+		dm.WorkspaceID, w.agent.ID); err != nil {
+		t.Fatalf("close place tenures: %v", err)
+	}
+	if _, err := closeTx.Exec(ctx, `
+		UPDATE workspace_members SET left_at = now()
+		WHERE workspace_id = $1 AND member_kind = 'personality_agent'
+		  AND member_id = $2 AND left_at IS NULL`,
+		dm.WorkspaceID, w.agent.ID); err != nil {
+		t.Fatalf("close membership row: %v", err)
+	}
+	// A heartbeat issued during the close must block on the gate, not renew
+	// on the pre-close snapshot.
+	done := make(chan error, 1)
+	go func() {
+		_, err := calls.HeartbeatCallSession(ctx, w.agent.ID, session.SessionID, "runner-a", 1, 30*time.Second)
+		done <- err
+	}()
+	waitForWaitingBackend(t, ctx, pool)
+	select {
+	case err := <-done:
+		t.Fatalf("heartbeat returned before the close committed: %v", err)
+	default:
+	}
+	if err := closeTx.Commit(ctx); err != nil {
+		t.Fatalf("commit close: %v", err)
+	}
+	if err := <-done; !errors.Is(err, ErrCallClaimLost) {
+		t.Fatalf("heartbeat across committed close = %v, want ErrCallClaimLost", err)
+	}
+}
+
+// RemoveWorkspaceParticipant closes the durable record before media work:
+// with LiveKit entirely unavailable the revocation still lands and the
+// media failure is returned — and when the revocation itself faults, the
+// error propagates to the caller instead of being logged and dropped, while
+// the membership gate still carries the authority boundary.
+func TestRemoveWorkspaceParticipantRevokesBeforeMedia(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	utterance := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "pending at close")
+
+	// LiveKit unavailable: revocation must not depend on it.
+	calls.RoomService = nil
+	err := calls.RemoveWorkspaceParticipant(ctx, dm.WorkspaceID, w.agent)
+	if err == nil {
+		t.Fatal("RemoveWorkspaceParticipant with no RoomService returned nil")
+	}
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "membership_closed" {
+		t.Fatalf("session after media-less removal = %+v, want revoked", row)
+	}
+	if u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID); u.Status != CallUtteranceExpired {
+		t.Fatalf("utterance after media-less removal = %+v", u)
+	}
+}

@@ -1041,7 +1041,20 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 // transaction is already committed when this runs: RoomService failure must
 // never resurrect its authorization.
 func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceID string, participant ParticipantRef) error {
-	if c == nil || c.Server == nil || c.Server.Store == nil || c.RoomService == nil {
+	if c == nil || c.Server == nil || c.Server.Store == nil {
+		return errors.New("messaging store is unavailable")
+	}
+	if participant.Kind == KindPersonalityAgent {
+		// Close the durable authority record BEFORE touching media: the
+		// revocation is the honest terminal record and must not depend on
+		// LiveKit being reachable. (Even if this fails, the claim/mutation
+		// gates re-check place membership, so the retained row carries no
+		// authority — but the caller must see the failure either way.)
+		if err := c.revokeCallSessionsForWorkspace(ctx, workspaceID, participant.ID, "membership_closed"); err != nil {
+			return fmt.Errorf("revoke call sessions for closed member %s: %w", participant.Key(), err)
+		}
+	}
+	if c.RoomService == nil {
 		return errors.New("LiveKit RoomService is unavailable")
 	}
 	rooms, err := c.RoomService.ListRooms(ctx)
@@ -1082,14 +1095,6 @@ func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceI
 			if state, changed := c.Registry.leave(room.Name, room.SID, participant, entry.Identity, entry.SID); changed {
 				c.publishCallState(ctx, state)
 			}
-		}
-	}
-	if participant.Kind == KindPersonalityAgent {
-		// The authority record closes with the media: any live session this
-		// secretary holds in the workspace's rooms is revoked so a claim
-		// cannot outlive the membership that authorized it.
-		if err := c.revokeCallSessionsForWorkspace(ctx, workspaceID, participant.ID, "membership_closed"); err != nil {
-			log.Printf("call: revoke sessions for closed member %s: %v", participant.Key(), err)
 		}
 	}
 	return nil

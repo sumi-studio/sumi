@@ -535,8 +535,28 @@ func newApplicationFromEnv() (*application, error) {
 			calls := messaging.NewCallService(messagingServer, livekit)
 			messagingServer.Calls = calls
 			workspaceServer.MembershipClosed = func(ctx context.Context, workspaceID string, member participant.Ref) {
-				if err := calls.RemoveWorkspaceParticipant(ctx, workspaceID, member); err != nil {
-					log.Printf("remove LiveKit participant after Workspace membership closure: %v", err)
+				// Best-effort cleanup after the committed closure: retry a
+				// few times on a detached context so a transient store or
+				// LiveKit fault doesn't strand media, and a disconnecting
+				// client can't cancel the cleanup. Authority never depends
+				// on this succeeding — the call bridge gates re-check place
+				// membership — but a failure must stay observable.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				var err error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if err = calls.RemoveWorkspaceParticipant(cleanupCtx, workspaceID, member); err == nil {
+						return
+					}
+					log.Printf("remove call participant after Workspace membership closure (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						return
+					}
+					select {
+					case <-cleanupCtx.Done():
+						return
+					case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+					}
 				}
 			}
 			calls.RegisterRoutes(mux)

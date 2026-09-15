@@ -141,7 +141,35 @@ func (c *CallService) ClaimCallSessions(ctx context.Context, personaID, runnerID
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	revokedOnClaim := []CallSession{}
 	for _, session := range claimedSessions {
+		// Membership is the real authority: a session row may outlive the
+		// place/workspace membership that authorized it when the post-commit
+		// cleanup failed or never ran. A picked session whose place no longer
+		// admits this secretary is reconciled to 'revoked' here rather than
+		// handed to a runner — the retained record never authorizes a rejoin.
+		err := c.callSessionAccessInTx(ctx, tx, session)
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrCallClaimLost):
+			var revoked CallSession
+			if err := tx.QueryRow(ctx, `
+				UPDATE call_sessions
+				SET status='revoked', ended_at=now(),
+				    end_reason='membership_closed', updated_at=now(),
+				    claimed_by=NULL, claim_expires_at=NULL
+				WHERE session_id = $1 RETURNING `+callSessionCols,
+				session.SessionID).Scan(callSessionScan(&revoked)...); err != nil {
+				return nil, err
+			}
+			if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "session_revoked"); err != nil {
+				return nil, err
+			}
+			revokedOnClaim = append(revokedOnClaim, revoked)
+			continue
+		default:
+			return nil, err
+		}
 		if session.RoomSID == "" {
 			// Bind the session's room generation durably so a delayed
 			// room_finished for a dead generation cannot end it.
@@ -163,6 +191,9 @@ func (c *CallService) ClaimCallSessions(ctx context.Context, personaID, runnerID
 		return nil, fmt.Errorf("commit call session claim: %w", err)
 	}
 	for _, session := range endedOnLapse {
+		c.notifyCallEnded(ctx, session)
+	}
+	for _, session := range revokedOnClaim {
 		c.notifyCallEnded(ctx, session)
 	}
 	// A fresh claim supersedes every connected actor of this persona in that
@@ -236,7 +267,7 @@ func (c *CallService) HeartbeatCallSession(ctx context.Context, personaID, sessi
 		if !found || authority != "active" {
 			return fmt.Errorf("%w: persona authority is %s", ErrCallClaimLost, authority)
 		}
-		return tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE call_sessions
 			SET claim_expires_at = now() + $4::interval, updated_at = now()
 			WHERE session_id = $1 AND personality_agent_id = $2
@@ -246,6 +277,12 @@ func (c *CallService) HeartbeatCallSession(ctx context.Context, personaID, sessi
 			RETURNING `+callSessionCols,
 			sessionID, personaID, runnerID, fmt.Sprintf("%f seconds", lease.Seconds()), epoch,
 		).Scan(callSessionScan(&session)...)
+		if err != nil {
+			return err
+		}
+		// A renewal may not outlive the membership that authorized the
+		// session — refuse so the failed heartbeat rolls the extension back.
+		return c.callSessionAccessInTx(ctx, tx, session)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return agentstate.CallSession{}, ErrCallClaimLost
@@ -344,6 +381,9 @@ func (c *CallService) ReportCallSessionStatus(ctx context.Context, personaID, se
 			!callSessionLive(current.Status) || current.Status == CallSessionRequested ||
 			current.ClaimExpiresAt == nil || !current.ClaimExpiresAt.After(c.now()) {
 			return ErrCallClaimLost
+		}
+		if err := c.callSessionAccessInTx(ctx, tx, current); err != nil {
+			return err
 		}
 		switch status {
 		case CallSessionActive:
@@ -575,6 +615,68 @@ func (c *CallService) callPersonaAuthorityInTx(ctx context.Context, tx pgx.Tx, p
 	return authority, true, err
 }
 
+// callSessionAccessInTx re-runs the canonical place-membership predicate for
+// the session's secretary inside the caller's transaction and share-locks
+// the workspace-membership row it reads: a close that already committed is
+// observed, and a close still in flight is serialized — its UPDATE waits for
+// this tx, so the call mutation either commits before the closure
+// (legitimately pre-removal) or is refused. Once workspace/place membership
+// is withdrawn, no retained session row may authorize a claim, renewal,
+// ticket, or report — even if the post-commit cleanup failed or never ran.
+//
+// The predicate mirrors ScopedStore.placeAccessAfterAuthorization: channel
+// and thread access is workspace membership alone; private places
+// (dm/group_dm) additionally require a live place_members tenure.
+func (c *CallService) callSessionAccessInTx(ctx context.Context, tx pgx.Tx, session CallSession) error {
+	var kind string
+	err := tx.QueryRow(ctx,
+		`SELECT kind FROM places WHERE place_id = $1`, session.PlaceID).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: place is gone", ErrCallClaimLost)
+	}
+	if err != nil {
+		return err
+	}
+	// Share-lock the workspace membership row FIRST — the single
+	// serialization point: every close updates it (and bound place tenures)
+	// while holding its write lock, so a close either commits before this
+	// lock (observed withdrawn below) or waits for this tx (this mutation
+	// commits legitimately pre-removal). Lock order matches the close path —
+	// workspace tenure before place tenure — so no cycle is possible.
+	var member bool
+	err = tx.QueryRow(ctx, `
+		SELECT TRUE FROM workspace_members
+		WHERE workspace_id = $1 AND member_kind = $2 AND member_id = $3
+		  AND left_at IS NULL
+		FOR SHARE`,
+		session.WorkspaceID, KindPersonalityAgent, session.PersonalityAgentID,
+	).Scan(&member)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: place membership withdrawn", ErrCallClaimLost)
+	}
+	if err != nil {
+		return err
+	}
+	if kind == PlaceChannel || kind == PlaceThread {
+		// Canonical access for shared places is workspace membership alone.
+		return nil
+	}
+	// Private places (dm/group_dm) also require a live place tenure. No lock
+	// needed here: bound tenures are only ever closed while holding the
+	// workspace-membership lock this tx now shares.
+	err = tx.QueryRow(ctx, `
+		SELECT TRUE FROM place_members
+		WHERE workspace_id = $1 AND place_id = $2
+		  AND member_kind = $3 AND member_id = $4 AND left_at IS NULL`,
+		session.WorkspaceID, session.PlaceID, KindPersonalityAgent,
+		session.PersonalityAgentID,
+	).Scan(&member)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: place membership withdrawn", ErrCallClaimLost)
+	}
+	return err
+}
+
 // requireCallClaim loads the session and enforces the caller's live claim.
 func (c *CallService) requireCallClaim(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) (CallSession, error) {
 	var session CallSession
@@ -620,6 +722,9 @@ func (c *CallService) requireCallClaimInTx(ctx context.Context, tx pgx.Tx, perso
 	}
 	if session.ClaimExpiresAt == nil || session.ClaimExpiresAt.Before(c.now()) {
 		return CallSession{}, ErrCallClaimLost
+	}
+	if err := c.callSessionAccessInTx(ctx, tx, session); err != nil {
+		return CallSession{}, err
 	}
 	return session, nil
 }
