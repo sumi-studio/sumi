@@ -22,6 +22,7 @@ export const originRoutes = Object.freeze({
     "/feedback/threads",
     "/feedback/attachments",
     "/feedback/diagnostics",
+    "/me/approvals",
   ]),
   prefixes: Object.freeze([
     "/auth/",
@@ -34,6 +35,7 @@ export const originRoutes = Object.freeze({
     "/workspace-invites/",
     "/apps/",
     "/app-installations/",
+    "/me/approvals/",
   ]),
 });
 
