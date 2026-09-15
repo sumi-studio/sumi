@@ -1,0 +1,93 @@
+name: Files service
+
+on:
+  pull_request:
+    paths:
+      - apps/files/**
+      - contracts/files-api.yaml
+      - .github/workflows/files.yml
+  push:
+    branches:
+      - main
+    paths:
+      - apps/files/**
+      - contracts/files-api.yaml
+      - .github/workflows/files.yml
+
+permissions:
+  contents: read
+
+jobs:
+  filesvc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_admin
+          POSTGRES_DB: files_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d files_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    defaults:
+      run:
+        working-directory: apps/files
+
+    env:
+      FILESV_TEST_DSN: postgres://postgres:postgres_test_admin@localhost:5432/files_test?sslmode=disable
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: apps/files/go.mod
+          cache-dependency-path: apps/files/go.sum
+
+      - name: Check formatting
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -buildvcs=false ./...
+
+      - name: Test (incl. PG-backed intent/ownership suite)
+        run: go test ./...
+
+  objstore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Type-check object-store worker
+        run: corepack pnpm --filter @sumi/files-objstore check-types

@@ -1,0 +1,369 @@
+openapi: 3.1.0
+info:
+  title: Sumi Files API (fabric-cloud prototype)
+  version: 0.1.0
+  description: >-
+    Scoped file API over one canonical POSIX namespace. Implemented by
+    apps/files (filesvc). Auth is bearer token -> scope grants; each scope is
+    an isolated subtree root/<scope>/. Mutations take an If-Version header:
+    "any" (unconditional), "none" (create-only; 409 if the path exists or has
+    a service version), or an integer (CAS against the last service-minted
+    version). Versions are minted from one global monotonic sequence — a
+    version value is unique across paths and time, so a stale CAS token can
+    never match a different object that later occupies the same path (no
+    ABA across rename-overwrite or delete/recreate). Service versions are
+    cooperative among API writers; direct executor/POSIX writes bypass them
+    and are reported via external_change.
+    Durability: every mutation declares an intent row (with a pre-minted
+    version and the declaring instance's owner id) before touching the
+    filesystem, then applies version rows and the journal event after the
+    fs commit. A DB failure between fs commit and apply leaves a
+    recoverable intent, never silent divergence: the reconciler re-checks
+    the disk and rolls the DB forward or drops the intent, including after
+    a restart. A filesystem call that outlives the request deadline is
+    still settled by its own goroutine — intents are never dropped on a
+    timer guess. Errors after a possibly-committed fs mutation are
+    surfaced, never reported as success. All mutations in one scope
+    serialize, so a directory rename cannot interleave with a concurrent
+    write's row bookkeeping. Store faults (deadline, dropped connection,
+    network error) are 503 store_unavailable on every op — never
+    version:0 or external_change:false.
+    Ownership: one database serves exactly one canonical root, enforced at
+    startup by store_meta.root_id binding plus a session-scoped advisory
+    lock — at most one live writer per database. A second instance waits
+    briefly for a rolling-restart handoff, then refuses to start; a
+    different root on an occupied database is rejected outright. If the
+    lock session dies the store is deposed (mutations fail fast with 503,
+    and /healthz reports 503 so supervision sees the fenced state); it
+    resumes only if it re-acquires while still the recorded owner. The
+    re-acquire loop reads store_meta.owner directly, so a live successor
+    displacing it is detected without waiting for the lock — the
+    displaced process exits rather than lingering as a zombie. A dead
+    recorded owner can be taken over; a temporary DB loss with no
+    successor recovers in place.
+    Settlement honesty: while any intent overlapping the target paths is
+    unsettled, a conflicting mutation is refused with 503
+    pending_settlement — the outcome of the earlier filesystem work is
+    uncertain, and new rows minted inside its subtree could be stranded
+    by a late-landing rename. The refusal is path-local: disjoint
+    operations proceed normally, and intents whose destination leg is
+    empty never match unrelated paths. The error message carries the
+    blocking intent's recorded cause when the filesystem could not be
+    observed at all. Intents are only settled by the instance
+    that declared them (its fs goroutine) or — after the settle grace —
+    by the live owner. The grace is measured from intent declare time
+    and covers in-kernel/daemon-accepted completion after owner death;
+    it is a best-effort bound, not proof that a partitioned-but-alive
+    owner's syscall can never land late.
+    Every settlement path (apply AND intent/row resolution) verifies the
+    recorded store owner inside its transaction, so a displaced process
+    cannot delete rows a live successor would roll forward.
+    Verdict classes: only ENOENT and ENOTDIR count as observed absence —
+    a path addressed through a non-directory provably does not exist as
+    addressed. Every other stat failure (EACCES, EIO, ENOTCONN, a dead
+    FUSE mount) is unverifiable: the intent stays pending indefinitely
+    with its cause recorded (stalled), keeps excluding conflicting ops
+    on that path, and is never resolved by a timer. Restoring filesystem
+    observability lets the next pass settle it truthfully. A removal
+    settled by observed absence cleans the dead version rows but journals
+    NO remove event — observed absence is not a performed removal, and
+    the event log must not invent who removed the file.
+    Every filesystem observation the reconciler makes — including
+    "absent" — is bound to a single root descriptor pinned for the whole
+    pass. Under REQUIRE_MOUNT the descriptor's own mount identity is
+    verified (statx MNT_ID on the opened fd, then mountinfo + cache
+    policy read beneath the fd), so an unmount mid-pass answers
+    "unverifiable" (ENOTCONN on the dead mount) instead of "absent" on
+    the bare directory the mountpoint leaves behind — acknowledged rows
+    and pending intents are never deleted on an observation the pass
+    cannot trust.
+    fs commit vs reply: mutation syscalls report whether their commit
+    point was reached separately from the error. A publish that
+    succeeded followed by a failed trailing stat is "landed but
+    unobserved" — the intent is kept for reconciliation, never dropped
+    as a rejection; an ambiguous transport-class error is likewise kept,
+    because on FUSE a lost reply can follow an applied request. Only a
+    definitive pre-commit rejection (absent source, kind mismatch,
+    permission, conflict) drops an intent outright.
+    Rename settlement never infers that the rename happened — current
+    state cannot prove causal history (a hardlink or in-scope symlink
+    makes a destination stat identical to the source without any move).
+    The reconciler instead relocates recorded state per object: each
+    version row under the source subtree whose recorded path is
+    definitively absent AND whose exact recorded fingerprint appears at
+    the corresponding destination path is re-keyed to that destination,
+    keeping its version. The intent's own source object changes its
+    ctime by being moved, so an exact fingerprint match is impossible
+    for it: a regular file's row relocates only when inode, size and
+    mtime equal the declare-time fingerprint and the destination bytes
+    hash to the intent's recorded expected hash; a directory's own row
+    is never relocated (an inode number is not identity, and member
+    evidence does not prove a directory moved). Each relocation is
+    journaled as a `relocate` event carrying from_path — an observation
+    of current state, not a service-performed rename. Rows without
+    evidence stay where they are and surface through the ordinary
+    live-fingerprint comparison (404 at the recorded path, version 0 or
+    external_change at the destination), like any external change.
+    A `rename` event is journaled ONLY by the process that observed the
+    rename syscall itself succeed; that process retries DB persistence
+    with bounded backoff while it remains the owner, so a transient
+    store outage after a known fs commit still records the true event
+    instead of leaving inference to the reconciler.
+    Late landings: a resolved intent keeps its evidence (pre-state
+    fingerprint, expected hash, source kind, destination fingerprint)
+    as a tombstone for as long as its effect remains unproven —
+    tombstone evidence is never erased by a timer, because a filesystem
+    effect may arrive after any horizon. Tombstones are re-judged on a
+    two-tier cadence (recently resolved intents every 30s; older ones
+    hourly) — a cost bound and a worst-case detection latency, not a
+    quiescence claim.
+    Verified effects: a destructive filesystem operation never unlinks a
+    public name. An overwrite or rename-over-occupied-destination moves
+    the displaced object into the intent's private .filesv-op-<id> slot
+    by exchange; a remove moves it there by rename. The object is
+    discarded only when its identity still matches the fingerprint the
+    intent declared AND durable state proves the discard is authorized:
+    a matching fingerprint alone is not commit evidence, because a
+    delayed drain or swap can park the recorded object into the intent's
+    namespace without its effect ever landing. The reconciler deletes a
+    displaced object only when no file_version row records its
+    fingerprint — recorded content absent from its recorded home is
+    restored instead — and the intent's own roll-forward committed: its
+    file_event row exists AND its intent row is gone, both written by
+    one transaction. An event alone is not commit proof (a diverged
+    outcome journals an event while the intent is kept as a tombstone),
+    so tombstoned or uncommitted intents preserve the object. These
+    checks run while the object is captured at a sealed name, and only
+    after excluding writers that could still record it from an earlier
+    public observation: deletion waits while another instance owns the
+    store or while an operation of this instance in the same scope is
+    still settling (a request that timed out keeps settling in the
+    background). A diverged outcome is journaled once; re-judging a
+    tombstone that is already recorded or superseded by a newer version
+    writes no event and does not extend the pending_settlement window.
+    Database-read failure always fails closed toward preservation.
+    Every delete goes through the same discipline:
+    the object is captured to a per-call quarantine name
+    (.filesv-op-<id>-q-<random>), re-verified there, and unlinked only
+    on a match. Quarantine names are SEALED: they are created by the
+    deleting call, and no writer — actor or reconciler, live or retired —
+    may ever write into one once it exists (exchanges and restore moves
+    refuse sealed targets; a sealed object may only be moved out or
+    unlinked). A slot or public name verified for deletion can still be
+    written by a delayed effect, so identity is proven only at the sealed
+    name; a mismatched capture stays parked there, preserved for the
+    reconciler rather than destroyed.
+    When the displaced object is not the declared one (the intent is
+    stale: a successor already acknowledged a newer save, or the file
+    changed since declaration) the effect is undone non-destructively:
+    the displaced object is restored to its name, or — when a racing
+    writer holds the name — stays parked at the slot, hidden from
+    listings, excluded from the staging sweep, and retrievable. The
+    caller gets 409 external_change: honest rejection plus preserved
+    bytes.
+    A parked object is restored by the reconciler to an empty name when
+    it is the recorded content for that name (fingerprint match against
+    file_version.fp — the acknowledged ordering, never ctime). Over an
+    occupied name holding non-recorded content, a sealed parked object
+    is restored by draining: the squatter is parked at a fresh
+    enumerable .filesv-op-<id>-p-<random> name first (never written
+    into the sealed name, and never at the fixed base slot — a
+    permanently parked unattributable object there must not stall
+    recovery), then the recorded object moves onto the name. The
+    version row is version-guarded, so a stale intent can never roll a
+    newer acknowledged row back. Unknown foreign objects that match no
+    recorded row are never deleted to make room — they stay parked,
+    hidden, and enumerable, because the service holds no discard
+    authority over them; recorded content is recoverable regardless of
+    how many accumulate.
+    if_version:any means the caller requires no specific version — it
+    does NOT promise the overwrite is unconditional under concurrent
+    interference. The declare-time fingerprint captures exactly which
+    object the writer was allowed to displace, and only that object is
+    discarded; anything else is preserved. If the observed occupant
+    changes during the attempt — a racing writer, or a delayed effect
+    of a retired operation landing mid-flight — the service may return
+    409 external_change instead of committing. A fresh attempt retries
+    the whole check-and-publish sequence and can succeed once
+    interference has stopped; no guarantee is made while interference
+    continues. This is an observable concurrency outcome, not a change
+    to the uncontended behavior: a fresh `any` write against a stable
+    occupant still succeeds exactly as before.
+    Reserved namespace: every name segment beginning .filesv-tmp- or
+    .filesv-op- is service-internal. All public operations — write,
+    rename, mkdir, AND remove — reject any path containing such a
+    segment (400 reserved_name), nested or not, whether or not the
+    object exists. Recovery names are not user-addressable: they are
+    hidden from listings, and only the service's own recovery paths may
+    move objects out of them or delete them. Parked foreign objects may
+    therefore remain indefinitely: retained, hidden, and inspectable
+    through the recorded-intent evidence, because no safe discard
+    authority exists for bytes the service cannot attribute.
+    Dead-owner intents are settled by
+    the live reconciler after the settle grace; settlement claims the
+    intent atomically and write intents verify the landed bytes' hash, so
+    externally modified content is recorded as diverged
+    (external_change=true), never laundered into the service's version.
+    external_change is a comparison against a recorded version: a path
+    never written through the API reports version 0, not
+    external_change — the service cannot detect edits it never recorded.
+    mkdir is deliberately idempotent create-parents: mkdir over an
+    existing directory succeeds and mints a version.
+    Scope names must be real directories under the root — a scope name
+    that is a symlink is refused (400 wrong_kind), because a scope-root
+    alias would grant one scope's tokens access to another scope's files.
+    Ordinary
+    symlinks inside a scope remain supported (in-scope links resolve;
+    escaping ones are 403 escape_denied).
+    Deployment requirement: the canonical mount the service roots on MUST
+    run with zero client-side metadata caching (JuiceFS:
+    --attr-cache=0 --entry-cache=0 --dir-entry-cache=0). A nonzero attr
+    cache lets a conditional write stat a stale fingerprint and silently
+    overwrite a direct writer's edit made inside the cache window.
+    FILESV_REQUIRE_MOUNT=1 enforces this at runtime: every file op is
+    refused with 503 mount_unavailable while the root is not a mountpoint,
+    and 503 mount_policy when the mount cannot prove zero metadata
+    caching (JuiceFS /.config timeouts nonzero or unverifiable FUSE fs).
+    The check runs on every request: statx(STATX_MNT_ID) identifies the
+    mount the path actually resolves to (correct under mount stacking and
+    MOVE_MOUNT_BENEATH), the mount must be mounted at that path and at the
+    JuiceFS root "/" — subdirectory binds are refused because their .config
+    is a regular file, not daemon metadata. The /.config read is also
+    pinned to the verified mount: statx MNT_ID must match the root's, so a
+    file bind-mounted over it cannot forge zero timeouts. Requires kernel
+    >= 5.8 for STATX_MNT_ID; when the kernel cannot identify the mount the
+    gate fails closed with mount_unavailable. A known allowlist of
+    kernel-coherent local filesystems (ext4, xfs, tmpfs, ...) passes;
+    other FUSE and network filesystems are refused. REQUIRE_MOUNT=0
+    disables the gate for simple local operation.
+    Operation boundary: every path operation is resolved in-kernel beneath
+    a pinned scope directory descriptor (openat2 RESOLVE_BENEATH, Linux
+    >= 5.6). A directory<->symlink swap racing a request cannot redirect
+    it outside the scope — the kernel re-resolves every component at use
+    time and fails closed with 403 escape_denied. A swap can still change
+    which in-scope object an op targets (ordinary concurrent-modification
+    semantics), but never escapes the scope root. Paths containing ".."
+    and absolute escapes remain refused; only single-scope namespaces are
+    reachable. Caller-supplied paths are canonicalized at the API
+    boundary — "./x", "/x", and "a//b" all name the same logical path for
+    version rows, pending-intent exclusion, and filesystem resolution,
+    so spelling variants can neither split identity nor bypass
+    settlement. Reads serve regular files only: special files (fifo,
+    socket, device) stat as kind=special and read as 400 wrong_kind —
+    the open is non-blocking, so a FIFO can never wedge a handler.
+paths:
+  /v1/files/{scope}/stat:
+    get:
+      operationId: fileStat
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: kind, size, mtime_ns, version, fingerprint, external_change
+        '403': { description: No grant for scope, or path escapes scope }
+        '404': { description: Path not found }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+  /v1/files/{scope}/list:
+    get:
+      operationId: fileList
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200': { description: entries[] (name, kind, size, mtime_ns), next_cursor }
+        '400': { description: Path is not a directory }
+        '404': { description: Path not found }
+  /v1/files/{scope}/read:
+    get:
+      operationId: fileRead
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: offset, in: query, schema: { type: integer } }
+        - { name: len, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: >-
+            File bytes. X-File-Version carries the last service-minted
+            version; X-External-Change: true marks content changed outside
+            the API since that version.
+        '400': { description: wrong_kind (directory or special file) }
+        '404': { description: Path not found }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+  /v1/files/{scope}/write:
+    put:
+      operationId: fileWrite
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ "version": n }' }
+        '409': { description: version_conflict }
+        '413': { description: Body exceeds the 256 MiB service ceiling }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+  /v1/files/{scope}/rename:
+    post:
+      operationId: fileRename
+      description: >-
+        JSON body { "from": "...", "to": "...", "if_version": any|none|n }.
+        Atomic within the same scope (kernel renameat2 beneath the pinned
+        scope descriptor). A directory may rename over an EMPTY directory;
+        file-over-dir and dir-over-file are 400 wrong_kind; dir over a
+        non-empty dir is 409 dir_not_empty; if_version "none" makes the
+        destination check atomic (RENAME_NOREPLACE -> 409 external_change/
+        version_conflict). The destination is minted a fresh global-sequence
+        version (never a reused value) and descendant version rows move
+        with the subtree. A rename refused before the fs commit leaves
+        both sides untouched; one that fails after the fs commit is
+        reconciled from disk state (see Durability).
+      responses:
+        '200': { description: '{ "version": n }' }
+        '400': { description: wrong_kind on file/dir kind mismatch }
+        '404': { description: Source not found }
+        '409': { description: version_conflict | dir_not_empty | external_change }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+  /v1/files/{scope}/mkdir:
+    post:
+      operationId: fileMkdir
+      description: 'JSON body { "path": "..." }; creates parents.'
+      responses:
+        '200': { description: '{ "version": n }' }
+  /v1/files/{scope}/remove:
+    delete:
+      operationId: fileRemove
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ "removed": true }' }
+        '400': { description: reserved_name (any .filesv-tmp-/.filesv-op- path segment) }
+        '404': { description: Path not found }
+        '409': { description: version_conflict | external_change }
+        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+  /v1/files/{scope}/changes:
+    get:
+      operationId: fileChanges
+      description: >-
+        Service-minted mutation journal (seq, op, path, version, at). Only
+        API-mediated mutations are journaled; direct executor writes are not.
+        `rename` events are emitted only for renames the serving process
+        observed succeed; `relocate` events (path=new, from_path=old,
+        version=the row's existing version) are reconciler observations
+        that a recorded object's content now lives at a new path — they
+        do not claim the service performed a rename.
+      parameters:
+        - { name: scope, in: path, required: true, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 5000 } }
+      responses:
+        '200': { description: events[] ordered by seq }
+components:
+  securitySchemes:
+    bearerScope:
+      type: http
+      scheme: bearer
+security:
+  - bearerScope: []
