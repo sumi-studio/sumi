@@ -329,6 +329,7 @@ func TestUsageBudgetWaitCommitAndResume(t *testing.T) {
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(5)); err != nil {
@@ -396,6 +397,7 @@ func TestUsageBudgetWaitFitsAtCommit(t *testing.T) {
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(5)); err != nil {
@@ -440,6 +442,7 @@ func TestUsageBudgetClearResumes(t *testing.T) {
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1)); err != nil {
@@ -1097,6 +1100,7 @@ func TestUsageBudgetWaitResumesOnRateDecrease(t *testing.T) {
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	// 6 input * 1 + 2 output * 2 = 10 > 8.
@@ -1158,6 +1162,7 @@ func TestUsageBudgetWaitRepricedAtCommit(t *testing.T) {
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
 	gen := acquireWriter(t, s, pa, time.Minute)
 
 	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(8)); err != nil {
@@ -1193,5 +1198,573 @@ func TestUsageBudgetWaitRepricedAtCommit(t *testing.T) {
 	}
 	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
 		t.Fatalf("no wait row expected: %+v", waits)
+	}
+}
+
+// --- budget progress: park/change serialization and headroom restores -----
+
+// lockWaiters counts sessions blocked on a row lock — a tuple-lock wait or
+// a wait on the holder's transactionid, depending on the statement — proof
+// that a transaction is blocked mid-statement, never a sleep used as proof.
+func lockWaiters(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(DISTINCT pid) FROM pg_locks
+		WHERE locktype IN ('tuple', 'transactionid') AND NOT granted`).Scan(&n); err != nil {
+		t.Fatalf("pg_locks: %v", err)
+	}
+	return n
+}
+
+// waitForLockWaiter blocks until at least `want` sessions wait on row
+// locks — deterministic evidence a transaction is parked mid-statement.
+func waitForLockWaiter(t *testing.T, pool *pgxpool.Pool, want int, who string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if lockWaiters(t, pool) >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never blocked", who)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// selectConnection seeds the human's model selection — the state the
+// production flow implies when a call was admitted on a connection.
+func selectConnection(t *testing.T, pool *pgxpool.Pool, humanID, connID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO model_connection_selections (human_id, kind, connection_id)
+		VALUES ($1, 'api', $2::uuid)
+		ON CONFLICT (human_id) DO UPDATE SET kind = 'api', connection_id = $2::uuid`,
+		humanID, connID); err != nil {
+		t.Fatalf("select connection: %v", err)
+	}
+}
+
+// A park commit that has already read the funding's headroom must not land
+// its wait row after the concurrent condition change's resume pass already
+// finished — the affordable input would stay parked until an unrelated
+// future change (a lost wake). For every change kind the park and the
+// resume serialize: either the change's resume observes the committed wait
+// row, or the park observes the changed condition.
+//
+// The interleaving is real, not slept: the controller transaction holds
+// the input row so CommitTurn stalls just before marking the input
+// 'waiting' — past its headroom read — while the change plus its resume
+// pass run. Then the input row releases and the park lands.
+func TestUsageBudgetWaitParkSerializedAgainstChanges(t *testing.T) {
+	ctx := context.Background()
+	changes := []struct {
+		name string
+		run  func(s *Store, pool *pgxpool.Pool, human, connA, connB string) error
+	}{
+		{"limit increase", func(s *Store, pool *pgxpool.Pool, human, a, _ string) error {
+			_, err := s.SetBudget(ctx, human, "connection", a, fixtureBudget(100))
+			return err
+		}},
+		{"rate decrease", func(s *Store, pool *pgxpool.Pool, human, a, _ string) error {
+			low := fixtureBudget(8)
+			low.RateInputPerMTok, low.RateOutputPerMTok = 500_000, 1_000_000
+			_, err := s.SetBudget(ctx, human, "connection", a, low)
+			return err
+		}},
+		{"clear budget", func(s *Store, pool *pgxpool.Pool, human, a, _ string) error {
+			return s.ClearBudget(ctx, human, "connection", a)
+		}},
+		{"funding change", func(s *Store, pool *pgxpool.Pool, human, _, b string) error {
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO model_connection_selections (human_id, kind, connection_id)
+				VALUES ($1, 'api', $2::uuid)
+				ON CONFLICT (human_id) DO UPDATE SET kind = 'api', connection_id = $2::uuid`,
+				human, b); err != nil {
+				return err
+			}
+			_, err := s.ResumeWaitsForHuman(ctx, human)
+			return err
+		}},
+	}
+	for _, tc := range changes {
+		t.Run(tc.name, func(t *testing.T) {
+			s, pool := newStore(t)
+			pa, human := boundPersona(t, s, pool)
+			connA := mustConnection(t, pool, human)
+			connB := mustConnection(t, pool, human)
+			selectConnection(t, pool, human, connA)
+			gen := acquireWriter(t, s, pa, time.Minute)
+
+			// 6 input + 2 output bound = 10 needed > 8 limit.
+			if _, err := s.SetBudget(ctx, human, "connection", connA, fixtureBudget(8)); err != nil {
+				t.Fatalf("set budget: %v", err)
+			}
+			if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-race",
+				Kind: "message", Payload: map[string]any{"text": "hi"},
+				ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
+				t.Fatalf("submit: %v", err)
+			}
+			if _, err := s.LoadTurn(ctx, pa, gen, "t-race", 10); err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			res, err := s.AdmitUsage(ctx, pa, admitReq("f-race", gen, connFunding(connA), 6, 2))
+			if err != nil || res.Admitted || res.Wait == nil {
+				t.Fatalf("admit should deny: %+v err=%v", res, err)
+			}
+
+			// Hold the input row so the park commit stalls at its input
+			// UPDATE — past the point where it evaluated headroom.
+			ctl, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ctl.Rollback(ctx) }()
+			if _, err := ctl.Exec(ctx, `
+				SELECT 1 FROM core_inputs
+				WHERE persona_id = $1 AND input_id = 'in-race' FOR UPDATE`, pa); err != nil {
+				t.Fatalf("controller lock: %v", err)
+			}
+
+			commitErr := make(chan error, 1)
+			go func() {
+				_, err := s.CommitTurn(ctx, pa, "t-race", gen, CommitRequest{
+					Outcome: "await",
+					Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
+						Estimate: &res.Wait.Estimate},
+				})
+				commitErr <- err
+			}()
+			waitForLockWaiter(t, pool, 1, "park commit")
+
+			changeErr := make(chan error, 1)
+			go func() { changeErr <- tc.run(s, pool, human, connA, connB) }()
+
+			// Either the whole change completed before the park could land
+			// (the old lost-wake interleaving), or it serialized behind the
+			// in-flight commit — a second session waiting on a row lock.
+			changeEarly := false
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				select {
+				case err := <-changeErr:
+					if err != nil {
+						t.Fatalf("change: %v", err)
+					}
+					changeEarly = true
+				default:
+				}
+				if changeEarly || lockWaiters(t, pool) >= 2 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("change neither completed nor serialized with the park")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Logf("change ran fully before the park landed: %v", changeEarly)
+
+			if err := ctl.Commit(ctx); err != nil {
+				t.Fatalf("release input row: %v", err)
+			}
+			if err := <-commitErr; err != nil {
+				t.Fatalf("park commit: %v", err)
+			}
+			if !changeEarly {
+				if err := <-changeErr; err != nil {
+					t.Fatalf("change: %v", err)
+				}
+			}
+
+			got, _, err := s.GetInput(ctx, pa, "in-race")
+			if err != nil {
+				t.Fatalf("get input: %v", err)
+			}
+			if got.Status != "queued" {
+				t.Fatalf("input=%q after the change raced the park, want queued (lost wake)", got.Status)
+			}
+			waits, err := s.BudgetWaitsForHuman(ctx, human)
+			if err != nil || len(waits) != 0 {
+				t.Fatalf("a wait row must not outlive its resume: %+v err=%v", waits, err)
+			}
+			// The resumed input re-admits: the wake never authorized the
+			// call — admission decides again.
+			if _, err := s.LoadTurn(ctx, pa, gen, "t-race2", 10); err != nil {
+				t.Fatalf("reload: %v", err)
+			}
+			res2, err := s.AdmitUsage(ctx, pa, admitReq("f-race2", gen, connFunding(connA), 6, 2))
+			if err != nil {
+				t.Fatalf("re-admit: %v", err)
+			}
+			switch tc.name {
+			case "rate decrease":
+				if !res2.Admitted || res2.Reservation.ReservedMinor != 5 {
+					t.Fatalf("re-admit after rate decrease: %+v, want reserved 5", res2)
+				}
+			case "limit increase", "clear budget":
+				if !res2.Admitted {
+					t.Fatalf("re-admit after %s: %+v", tc.name, res2)
+				}
+			case "funding change":
+				// The selection moved to connB; the wait's funding is
+				// stale — a connA admit must not be replayed as if still
+				// denied/parked; a fresh attempt resolves connB instead.
+				if !res2.Admitted {
+					// connA has no budget headroom contract now — a denial
+					// here is also honest; what must not happen is a wait
+					// row on the stale funding.
+					if res2.Wait == nil || res2.Wait.Funding.ID != connA {
+						t.Fatalf("unexpected deny shape after funding change: %+v", res2)
+					}
+				}
+			}
+		})
+	}
+}
+
+// When the funding itself changed between the denial and the commit and
+// the human-scope resume already ran, the wait's funding is stale: the
+// commit requeues instead of parking on a source the next attempt would
+// not resolve.
+func TestUsageBudgetWaitStaleFundingAtCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	connA := mustConnection(t, pool, human)
+	connB := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, connA)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", connA, fixtureBudget(8)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-sf",
+		Kind: "message", Payload: map[string]any{"text": "hi"},
+		ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, gen, "t-sf", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq("f-sf", gen, connFunding(connA), 6, 2))
+	if err != nil || res.Admitted {
+		t.Fatalf("expected denial: %+v err=%v", res, err)
+	}
+	// The human switches connections — the resume pass runs before the
+	// park commit lands.
+	selectConnection(t, pool, human, connB)
+	if _, err := s.ResumeWaitsForHuman(ctx, human); err != nil {
+		t.Fatalf("human resume: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-sf", gen, CommitRequest{
+		Outcome: "await",
+		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
+			Estimate: &res.Wait.Estimate},
+	}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+	got, _, _ := s.GetInput(ctx, pa, "in-sf")
+	if got.Status != "queued" {
+		t.Fatalf("input=%q, want queued — the wait's funding is stale", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("no wait row expected on the stale funding: %+v", waits)
+	}
+}
+
+// parkEstimate is parkOnBudget with a caller-chosen estimate, so a parked
+// call can be smaller than a concurrent hold.
+func parkEstimate(t *testing.T, s *Store, pa, human string, gen int64, conn, inputID, turnID, factID string, inTok, outBound int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: inputID,
+		Kind: "message", Payload: map[string]any{"text": "hi"},
+		ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, gen, turnID, 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq(factID, gen, connFunding(conn), inTok, outBound))
+	if err != nil || res.Admitted || res.Wait == nil {
+		t.Fatalf("admit should deny: %+v err=%v", res, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, turnID, gen, CommitRequest{
+		Outcome: "await",
+		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
+			Estimate: &res.Wait.Estimate},
+	}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+}
+
+// A concurrent call that settles below its reservation frees headroom —
+// the input parked on that headroom resumes from the record alone, with
+// no human budget change. The wake only requeues: admission decides again
+// on the next attempt.
+func TestUsageSettleBelowBoundResumesBudgetWait(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(10)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	// Call A holds the whole cap (6*1 + 2*2 = 10); B needs 3*1 + 1*2 = 5.
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-a", gen, connFunding(conn), 6, 2)); err != nil {
+		t.Fatalf("admit A: %v", err)
+	}
+	parkEstimate(t, s, pa, human, gen, conn, "in-b", "t-b", "f-b", 3, 1)
+	if got, _, _ := s.GetInput(ctx, pa, "in-b"); got.Status != "waiting" {
+		t.Fatalf("in-b=%q, want waiting", got.Status)
+	}
+	// A lands below its bound: actual 3*1 + 1*2 = 5 of the reserved 10.
+	in, out := int64(3), int64(1)
+	fact, created, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-a", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &in, OutputTokens: &out, Quantities: map[string]any{},
+	})
+	if err != nil || !created || fact.CostMinor == nil || *fact.CostMinor != 5 {
+		t.Fatalf("record A: %+v created=%v err=%v", fact, created, err)
+	}
+	if got, _, _ := s.GetInput(ctx, pa, "in-b"); got.Status != "queued" {
+		t.Fatalf("in-b=%q after A settled below bound, want queued (headroom restored)", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("wait row must be gone after headroom returned: %+v", waits)
+	}
+	// Re-admission still decides — the wake authorized nothing.
+	if _, err := s.LoadTurn(ctx, pa, gen, "t-b2", 10); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq("f-b2", gen, connFunding(conn), 3, 1))
+	if err != nil || !res.Admitted || res.Reservation.ReservedMinor != 5 {
+		t.Fatalf("re-admit: %+v err=%v, want admitted reserved 5", res, err)
+	}
+	// Close t-b2 so the next park's LoadTurn starts a fresh turn. Its held
+	// reservation reconciles to an 'unrecorded' fact at the estimate —
+	// the hold becomes spend (10), so the arithmetic below is unchanged.
+	if _, err := s.CommitTurn(ctx, pa, "t-b2", gen, CommitRequest{Outcome: "complete"}); err != nil {
+		t.Fatalf("complete t-b2: %v", err)
+	}
+	// The real report for f-b2 arrives late and upgrades the 'unrecorded'
+	// fact to its actual zero usage — spend drops back to 5.
+	zero := int64(0)
+	if _, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-b2", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &zero, OutputTokens: &zero, Quantities: map[string]any{},
+	}); err != nil {
+		t.Fatalf("late record f-b2: %v", err)
+	}
+
+	// A settle that frees too little leaves the wait parked.
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-c", gen, connFunding(conn), 3, 1)); err != nil {
+		t.Fatalf("admit C: %v", err)
+	}
+	// spent 5 (f-a) + held 5 (f-c) = 10 fills the cap — park D needing 5.
+	parkEstimate(t, s, pa, human, gen, conn, "in-d", "t-d", "f-d", 3, 1)
+	if got, _, _ := s.GetInput(ctx, pa, "in-d"); got.Status != "waiting" {
+		t.Fatalf("in-d=%q, want waiting", got.Status)
+	}
+	// C reports 4 of the reserved 5 — freeing 1 leaves no room for 5.
+	in2, out1 := int64(2), int64(1)
+	if _, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-c", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &in2, OutputTokens: &out1, Quantities: map[string]any{},
+	}); err != nil {
+		t.Fatalf("record C: %v", err)
+	}
+	// spent 5+4=9 > limit-needed — the freed headroom cannot fit 5.
+	if got, _, _ := s.GetInput(ctx, pa, "in-d"); got.Status != "waiting" {
+		t.Fatalf("in-d=%q, want still waiting — not enough headroom returned", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 1 {
+		t.Fatalf("wait row should persist: %+v", waits)
+	}
+}
+
+// A 'not_sent' report releases the whole hold — the parked input resumes
+// from the record alone.
+func TestUsageNotSentReleaseResumesBudgetWait(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(10)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-ns", gen, connFunding(conn), 6, 2)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	parkEstimate(t, s, pa, human, gen, conn, "in-ns", "t-ns", "f-nsp", 3, 1)
+	if _, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-ns", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "not_sent", Quantities: map[string]any{},
+	}); err != nil {
+		t.Fatalf("not_sent record: %v", err)
+	}
+	if got, _, _ := s.GetInput(ctx, pa, "in-ns"); got.Status != "queued" {
+		t.Fatalf("in-ns=%q after the hold released, want queued", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("wait row must be gone: %+v", waits)
+	}
+}
+
+// The same invariant covers a hold already reconciled to an 'unrecorded'
+// estimate: a late 'not_sent' report retires the estimate, restores the
+// spend, and resumes the parked input. A late 'reported' below the
+// estimate restores only the difference.
+func TestUsageReconciledHoldLateRecordResumesBudgetWait(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(10)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-r", gen, connFunding(conn), 6, 2)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	// Recovery/seal-style reconciliation turns the hold into an
+	// 'unrecorded' fact — 10 estimated spent — the parked wait stays.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileRetiredReservations(ctx, tx, pa); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	parkEstimate(t, s, pa, human, gen, conn, "in-r", "t-r2", "f-rp", 3, 1)
+	if got, _, _ := s.GetInput(ctx, pa, "in-r"); got.Status != "waiting" {
+		t.Fatalf("in-r=%q, want waiting", got.Status)
+	}
+	// The report proves the request never left: the estimate comes back.
+	if _, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-r", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "not_sent", Quantities: map[string]any{},
+	}); err != nil {
+		t.Fatalf("late not_sent: %v", err)
+	}
+	if got, _, _ := s.GetInput(ctx, pa, "in-r"); got.Status != "queued" {
+		t.Fatalf("in-r=%q after the estimate was retired, want queued", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("wait row must be gone: %+v", waits)
+	}
+}
+
+// A pending approval is a second, independent wait: restoring headroom
+// deletes the budget wait row but must not run the input — the human's
+// decision still gates it.
+func TestUsageSettleResumeHonorsPendingApproval(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	selectConnection(t, pool, human, conn)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(10)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-h", gen, connFunding(conn), 6, 2)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	parkEstimate(t, s, pa, human, gen, conn, "in-h", "t-h", "f-hp", 3, 1)
+	// A pending approval on the same input — the human has not decided.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO core_tool_approvals
+			(approval_id, persona_id, input_id, call_index, operation_id,
+			 turn_id, tool, route, required_by, request, action_digest, status)
+		VALUES ('ap-h', $1, 'in-h', 0, 'op-h', 't-h', 'journal.note',
+			'normal', 'intrinsic', '{}'::jsonb, 'digest-h', 'pending')`, pa); err != nil {
+		t.Fatalf("seed approval: %v", err)
+	}
+	if _, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-h", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "not_sent", Quantities: map[string]any{},
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	// The budget wait resolved but the approval still holds the input —
+	// nothing re-ran it.
+	got, _, _ := s.GetInput(ctx, pa, "in-h")
+	if got.Status != "waiting" {
+		t.Fatalf("in-h=%q, want still waiting on the human's decision", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("budget wait row should be gone: %+v", waits)
+	}
+	var apStatus string
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM core_tool_approvals WHERE persona_id=$1 AND approval_id='ap-h'`,
+		pa).Scan(&apStatus); err != nil || apStatus != "pending" {
+		t.Fatalf("approval=%q err=%v, want untouched pending", apStatus, err)
+	}
+}
+
+// A call admitted while no rate card existed reserved nothing. A budget
+// added mid-call must not rewrite that record's cost basis: an 'unknown'
+// report stays honestly unpriced — never a fabricated zero-cost
+// 'admission_estimate' denominated in the new card's currency. A complete
+// 'reported' for the same call still prices its actual tokens under the
+// card in force at record time.
+func TestUsageUnpricedAdmitUnknownStaysUnpriced(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	// No budget at admission — unpriced holds, reserved 0.
+	for _, fid := range []string{"f-u", "f-u2"} {
+		res, err := s.AdmitUsage(ctx, pa, admitReq(fid, gen, connFunding(conn), 500, 500))
+		if err != nil || !res.Admitted || res.Reservation.ReservedMinor != 0 {
+			t.Fatalf("unpriced admit %s: %+v err=%v", fid, res, err)
+		}
+	}
+	// The cap and rate card arrive while the calls are in flight.
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
+		t.Fatalf("set budget mid-call: %v", err)
+	}
+	fact, created, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-u", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "unknown", Quantities: map[string]any{},
+	})
+	if err != nil || !created {
+		t.Fatalf("record unknown: %+v created=%v err=%v", fact, created, err)
+	}
+	if fact.CostMinor != nil || fact.Currency != nil || fact.CostBasis != nil {
+		t.Fatalf("unpriced admission must stay unpriced on unknown, got cost=%v ccy=%v basis=%v",
+			fact.CostMinor, fact.Currency, fact.CostBasis)
+	}
+	// The complete report prices the actual tokens under the card in
+	// force now — real usage, not a fabricated estimate.
+	in, out := int64(100), int64(50)
+	fact2, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-u2", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &in, OutputTokens: &out, Quantities: map[string]any{},
+	})
+	if err != nil || fact2.CostMinor == nil || *fact2.CostMinor != 200 ||
+		fact2.CostBasis == nil || *fact2.CostBasis != "configured_rates" {
+		t.Fatalf("late 'reported' under the current card: %+v err=%v", fact2, err)
 	}
 }

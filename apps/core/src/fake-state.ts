@@ -991,8 +991,12 @@ export class FakeState implements StateClient {
 
     // The call's rate card: the admission snapshot when it was admitted
     // under a configured budget (an edited or removed budget cannot
-    // rewrite this call's cost basis); else the current budget.
-    const card =
+    // rewrite this call's cost basis); else the current budget. Only the
+    // snapshot may price an 'unknown' fact's retained estimate — a call
+    // admitted while no card existed has no priced reservation, and a
+    // budget added mid-call must not turn its uncertain spend into a
+    // 0-cost 'admission_estimate' in the new currency (Go priceRecord).
+    const snap =
       res?.currency != null &&
       res.rate_input_per_mtok != null &&
       res.rate_output_per_mtok != null
@@ -1003,8 +1007,11 @@ export class FakeState implements StateClient {
             rate_cached_per_mtok: res.rate_cached_per_mtok,
             pricing_revision: res.pricing_revision ?? "",
           }
-        : (this.usageBudgets.get(`${req.funding.kind}|${req.funding.id}`) ??
-          null);
+        : null;
+    const card =
+      snap ??
+      this.usageBudgets.get(`${req.funding.kind}|${req.funding.id}`) ??
+      null;
 
     const price = (tok: number, rate: number) =>
       tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
@@ -1027,13 +1034,15 @@ export class FakeState implements StateClient {
       currency = card.currency;
       costBasis = "configured_rates";
       revision = card.pricing_revision;
-    } else if (req.status === "unknown" && res && card) {
+    } else if (req.status === "unknown" && res && snap) {
       // An attempted call whose usage never resolved keeps its estimate —
-      // uncertain spend stays spent; a later 'reported' upgrades it.
+      // uncertain spend stays spent; a later 'reported' upgrades it. The
+      // snapshot card, not the current one: only a priced admission makes
+      // the estimate spend.
       costMinor = res.reserved_minor;
-      currency = card.currency;
+      currency = snap.currency;
       costBasis = "admission_estimate";
-      revision = card.pricing_revision;
+      revision = snap.pricing_revision;
     }
 
     const content = {
@@ -1125,6 +1134,19 @@ export class FakeState implements StateClient {
       ) {
         Object.assign(existing, content);
         if (req.status === "not_sent" && res) res.status = "released";
+        // The upgrade rewrote spend — an actual below the retained
+        // estimate, or a 'not_sent' dropping it — so waits parked on this
+        // funding may fit again (Go resumeFundingWaitsTx in RecordUsage).
+        // A record under a different allowed funding can also release a
+        // reservation held on that other source; resume it too.
+        this.resumeBudgetWaits(existing.funding.kind, existing.funding.id);
+        if (
+          res &&
+          (res.funding_kind !== existing.funding.kind ||
+            res.funding_id !== existing.funding.id)
+        ) {
+          this.resumeBudgetWaits(res.funding_kind, res.funding_id);
+        }
         return { fact: existing, created: false };
       }
       throw new StateError(
@@ -1146,9 +1168,15 @@ export class FakeState implements StateClient {
     };
     this.usageFacts.set(key, fact);
     // The hold becomes the fact's recorded cost; a 'not_sent' report
-    // releases it entirely — nothing was or can be owed.
-    if (res && res.status === "held") {
-      res.status = req.status === "not_sent" ? "released" : "settled";
+    // releases it entirely — nothing was or can be owed. Either way the
+    // resolution may restore headroom a parked input fits again, so this
+    // funding's waits re-evaluate now (Go resumeFundingWaitsTx in
+    // RecordUsage) — the wake only requeues; admission decides again.
+    if (res) {
+      if (res.status === "held") {
+        res.status = req.status === "not_sent" ? "released" : "settled";
+      }
+      this.resumeBudgetWaits(res.funding_kind, res.funding_id);
     }
     return { fact, created: true };
   }

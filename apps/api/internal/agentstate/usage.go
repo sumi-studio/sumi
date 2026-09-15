@@ -582,6 +582,28 @@ func (s *Store) fundingHeadroom(ctx context.Context, db queryRower, kind, id str
 	return fundingHeadroom{budget: budget, spent: spent, held: held}, nil
 }
 
+// fundingHeadroomLocked is fundingHeadroom under the funding source's
+// budget-row lock — the serialization point admits already use. A budget
+// write (SetBudget upsert, ClearBudget delete) and a parking decision both
+// contend on this one row, so a park can never read pre-change headroom
+// and then land its wait after the change's resume pass already ran: the
+// park either sees the new card and requeues itself, or its wait row is
+// committed before the resume scans. When no budget row exists nothing is
+// locked — an uncapped source fits every estimate, so no wait can result.
+// Lock order: callers must hold no input row locks before taking this one
+// (resume paths update input rows while holding it).
+func (s *Store) fundingHeadroomLocked(ctx context.Context, tx pgx.Tx, kind, id string) (fundingHeadroom, error) {
+	budget, err := s.budgetForFundingLocked(ctx, tx, kind, id)
+	if err != nil || budget == nil {
+		return fundingHeadroom{}, err
+	}
+	spent, held, err := s.fundingSpend(ctx, tx, kind, id, budget.Currency)
+	if err != nil {
+		return fundingHeadroom{}, err
+	}
+	return fundingHeadroom{budget: budget, spent: spent, held: held}, nil
+}
+
 // fit prices an admission estimate under the rate card in force now and
 // reports whether AdmitUsage would admit it, so a lower rate card releases
 // a wait just as a higher limit does. No configured cap fits everything —
@@ -715,29 +737,37 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 
 	// Rate card for this record: the admission snapshot when the call was
 	// admitted under a configured budget; else the current budget (an
-	// unadmitted record path); else unpriced.
-	var card *rateSnapshot
+	// unadmitted record path); else unpriced. The snapshot is kept
+	// distinct from the fallback card: only the snapshot may price an
+	// 'unknown' fact's retained estimate — the reservation's reserved_minor
+	// was computed under it. A call admitted while no card existed has no
+	// priced reservation: a budget added while it was in flight must not
+	// turn its uncertain spend into a 0-cost 'admission_estimate' in the
+	// new currency — the estimate was never priced at all.
+	var snap *rateSnapshot
 	if hasRes && res.currency != nil && res.rateIn != nil && res.rateOut != nil {
-		card = &rateSnapshot{
+		snap = &rateSnapshot{
 			currency:      *res.currency,
 			inputPerMTok:  *res.rateIn,
 			outputPerMTok: *res.rateOut,
 			cachedPerMTok: res.rateCached,
 		}
 		if res.revision != nil {
-			card.revision = *res.revision
+			snap.revision = *res.revision
 		}
-	} else {
+	}
+	card := snap
+	if card == nil {
 		budget, err := s.budgetForFunding(ctx, tx, req.Funding.Kind, req.Funding.ID)
 		if err != nil {
 			return fact, false, err
 		}
 		if budget != nil {
-			snap := budget.snapshot()
-			card = &snap
+			s := budget.snapshot()
+			card = &s
 		}
 	}
-	costMinor, currency, basis, revision, err := priceRecord(req, card, hasRes, res.reserved)
+	costMinor, currency, basis, revision, err := priceRecord(req, card, snap, hasRes, res.reserved)
 	if err != nil {
 		return fact, false, err
 	}
@@ -818,6 +848,25 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 					return fact, false, err
 				}
 			}
+			// The upgrade rewrote spend — an actual below the retained
+			// estimate, or a 'not_sent' dropping it entirely — so waits
+			// parked on this funding may fit again. A record delivered
+			// under a different allowed funding can also have released a
+			// reservation held on that other source; resume it too, and
+			// take both budget locks in a canonical order so concurrent
+			// records crossing the same two sources cannot deadlock.
+			fundings := [][2]string{{existing.Funding.Kind, existing.Funding.ID}}
+			if hasRes && (res.fundingKind != existing.Funding.Kind || res.fundingID != existing.Funding.ID) {
+				fundings = append(fundings, [2]string{res.fundingKind, res.fundingID})
+				if fundings[0][0]+"/"+fundings[0][1] > fundings[1][0]+"/"+fundings[1][1] {
+					fundings[0], fundings[1] = fundings[1], fundings[0]
+				}
+			}
+			for _, f := range fundings {
+				if _, err := s.resumeFundingWaitsTx(ctx, tx, f[0], f[1]); err != nil {
+					return fact, false, err
+				}
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return fact, false, err
@@ -841,6 +890,16 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 		personaID, req.FactID, newStatus); err != nil {
 		return fact, false, err
 	}
+	// Settling below the reserved bound, or releasing the hold entirely,
+	// restores headroom: waits parked on this funding are re-evaluated in
+	// this transaction, under the same budget-row lock the park path
+	// serializes on — so a wake can neither be lost between commit and a
+	// later pass nor fire before the spend change is durable.
+	if hasRes {
+		if _, err := s.resumeFundingWaitsTx(ctx, tx, res.fundingKind, res.fundingID); err != nil {
+			return fact, false, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fact, false, err
 	}
@@ -858,7 +917,7 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 //	             Supplied partial categories are stored, not priced.
 //	not_sent   — unpriced; the reservation releases.
 //	no card    — unpriced; there is nothing honest to charge against.
-func priceRecord(req UsageRecordRequest, card *rateSnapshot, hasRes bool, reserved int64) (costMinor *int64, currency, basis, revision *string, err error) {
+func priceRecord(req UsageRecordRequest, card, snap *rateSnapshot, hasRes bool, reserved int64) (costMinor *int64, currency, basis, revision *string, err error) {
 	switch req.Status {
 	case "reported":
 		if card == nil {
@@ -873,8 +932,13 @@ func priceRecord(req UsageRecordRequest, card *rateSnapshot, hasRes bool, reserv
 		}
 		return &priced, &card.currency, ptrString("configured_rates"), &card.revision, nil
 	case "unknown":
-		if hasRes && card != nil && card.currency != "" {
-			return &reserved, &card.currency, ptrString("admission_estimate"), &card.revision, nil
+		// snap, not card: reserved_minor was priced under the admission
+		// snapshot, so only an admission that was itself priced makes the
+		// estimate spend. A cardless admission whose funding gained a
+		// budget mid-call records unpriced — the call is honestly
+		// uncertain, not a free call in the new currency.
+		if hasRes && snap != nil && snap.currency != "" {
+			return &reserved, &snap.currency, ptrString("admission_estimate"), &snap.revision, nil
 		}
 		return nil, nil, nil, nil, nil
 	case "not_sent":
@@ -1179,93 +1243,164 @@ func (s *Store) BudgetView(ctx context.Context, kind, id string) (*UsageBudget, 
 // needed amount restated under that card, and the resumed ones accumulate
 // their parked time into waited_ms like an approval wait.
 func (s *Store) ResumeWaitsForFunding(ctx context.Context, kind, id string) (int, error) {
-	// Memory chunks reshelved on a budget wait belong to the funding
-	// owner's personas — resolve the owner so they unpark too.
-	var humans []string
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	n, err := s.resumeFundingWaitsTx(ctx, tx, kind, id)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// fundingOwnerHumans resolves the humans whose personas may have memory
+// chunks reshelved on this funding source's budget wait — a connection's
+// owner or a live grant's recipient — so a resume unparks them too.
+func (s *Store) fundingOwnerHumans(ctx context.Context, db queryRower, kind, id string) ([]string, error) {
+	var q string
 	switch kind {
 	case "connection":
-		var h string
-		if err := s.pool.QueryRow(ctx,
-			`SELECT human_id FROM model_api_connections WHERE connection_id = $1::uuid`,
-			id).Scan(&h); err == nil {
-			humans = []string{h}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+		q = `SELECT human_id FROM model_api_connections WHERE connection_id = $1::uuid`
+	case "sumi":
+		q = `SELECT human_id FROM usage_funding_grants WHERE funding_id = $1 AND revoked_at IS NULL`
+	default:
+		return nil, nil
+	}
+	var h string
+	if err := db.QueryRow(ctx, q, id).Scan(&h); err == nil {
+		return []string{h}, nil
+	} else if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	} else {
+		return nil, err
+	}
+}
+
+// resumeFundingWaitsTx re-evaluates every wait parked on this funding
+// source against the headroom in force now — inside the caller's
+// transaction, under the budget-row lock the park path serializes on. A
+// settlement, release, or late fact correction that restored headroom
+// calls this so parked work becomes eligible again without a human
+// touching the budget; a budget change's own resume runs the same pass.
+// Each wait's admission estimate is priced under the card in force now:
+// fits requeue (a pending approval is a second, independent wait that
+// still holds the input), the rest stay parked with their needed amount
+// restated under that card, and memory chunks the funding owner's personas
+// reshelved on a budget wait unpark.
+func (s *Store) resumeFundingWaitsTx(ctx context.Context, tx pgx.Tx, kind, id string) (int, error) {
+	room, err := s.fundingHeadroomLocked(ctx, tx, kind, id)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT persona_id, input_id, est_input_tokens, est_output_bound
+		FROM core_budget_waits
+		WHERE funding_kind = $1 AND funding_id = $2
+		ORDER BY persona_id, input_id FOR UPDATE`, kind, id)
+	if err != nil {
+		return 0, err
+	}
+	type wait struct {
+		parkedInput
+		est UsageEstimate
+	}
+	var waits []wait
+	for rows.Next() {
+		var w wait
+		if err := rows.Scan(&w.persona, &w.input, &w.est.InputTokens, &w.est.OutputTokensBound); err != nil {
+			rows.Close()
 			return 0, err
 		}
-	case "sumi":
-		var h string
-		if err := s.pool.QueryRow(ctx,
-			`SELECT human_id FROM usage_funding_grants WHERE funding_id = $1 AND revoked_at IS NULL`,
-			id).Scan(&h); err == nil {
-			humans = []string{h}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+		waits = append(waits, w)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, w := range waits {
+		fits, needed, err := room.fit(w.est)
+		if err != nil {
+			// The current card cannot price this estimate (overflow) —
+			// admission would refuse it too, so it stays parked.
+			continue
+		}
+		if fits {
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM core_budget_waits WHERE persona_id = $1 AND input_id = $2`,
+				w.persona, w.input); err != nil {
+				return 0, err
+			}
+			// Requeue only an input still parked, and only when nothing
+			// else holds it — a pending approval is a second, independent
+			// wait.
+			tag, err := tx.Exec(ctx, `
+				UPDATE core_inputs i SET status = 'queued', claimed_generation = NULL,
+					turn_id = NULL, not_before = NULL,
+					waited_ms = i.waited_ms + COALESCE(EXTRACT(EPOCH FROM (now() - i.waiting_since)) * 1000, 0)::bigint,
+					waiting_since = NULL
+				WHERE i.persona_id = $1 AND i.input_id = $2 AND i.status = 'waiting'
+					AND NOT EXISTS (
+						SELECT 1 FROM core_tool_approvals a
+						WHERE a.persona_id = i.persona_id AND a.input_id = i.input_id
+							AND a.status = 'pending'
+					)`,
+				w.persona, w.input)
+			if err != nil {
+				return 0, err
+			}
+			if tag.RowsAffected() > 0 {
+				n++
+			}
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_budget_waits SET needed_minor = $3, currency = $4
+			WHERE persona_id = $1 AND input_id = $2`,
+			w.persona, w.input, needed, room.budget.Currency); err != nil {
 			return 0, err
 		}
 	}
-	return s.resumeWaits(ctx, humans, func(tx pgx.Tx) ([]parkedInput, error) {
-		room, err := s.fundingHeadroom(ctx, tx, kind, id)
-		if err != nil {
-			return nil, err
+	humans, err := s.fundingOwnerHumans(ctx, tx, kind, id)
+	if err != nil {
+		return 0, err
+	}
+	if len(humans) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_memory_chunks mc SET not_before = NULL
+			FROM core_personas p
+			WHERE mc.persona_id = p.persona_id AND p.human_id = ANY($1::uuidv7[])
+				AND mc.status = 'sealed' AND mc.not_before IS NOT NULL
+				AND mc.last_error LIKE 'budget-wait:%'`, humans); err != nil {
+			return 0, err
 		}
-		rows, err := tx.Query(ctx, `
-			SELECT persona_id, input_id, est_input_tokens, est_output_bound
-			FROM core_budget_waits
-			WHERE funding_kind = $1 AND funding_id = $2
-			ORDER BY persona_id, input_id FOR UPDATE`, kind, id)
-		if err != nil {
-			return nil, err
-		}
-		type wait struct {
-			parkedInput
-			est UsageEstimate
-		}
-		var waits []wait
-		for rows.Next() {
-			var w wait
-			if err := rows.Scan(&w.persona, &w.input, &w.est.InputTokens, &w.est.OutputTokensBound); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			waits = append(waits, w)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		var resuming []parkedInput
-		for _, w := range waits {
-			fits, needed, err := room.fit(w.est)
-			if err != nil {
-				// The current card cannot price this estimate (overflow) —
-				// admission would refuse it too, so it stays parked.
-				continue
-			}
-			if fits {
-				if _, err := tx.Exec(ctx,
-					`DELETE FROM core_budget_waits WHERE persona_id = $1 AND input_id = $2`,
-					w.persona, w.input); err != nil {
-					return nil, err
-				}
-				resuming = append(resuming, w.parkedInput)
-				continue
-			}
-			if _, err := tx.Exec(ctx, `
-				UPDATE core_budget_waits SET needed_minor = $3, currency = $4
-				WHERE persona_id = $1 AND input_id = $2`,
-				w.persona, w.input, needed, room.budget.Currency); err != nil {
-				return nil, err
-			}
-		}
-		return resuming, nil
-	})
+	}
+	return n, nil
 }
 
 // ResumeWaitsForHuman requeues every budget-parked input of this human's
 // personas — called when the human's model selection or a connection
 // changed, because the next attempt re-resolves funding and may spend a
-// different source entirely.
+// different source entirely. The resume first takes every writer lease of
+// the human's personas — the same row a fenced turn commit holds for its
+// whole duration — so a park that began before this resume either already
+// committed (and is found below) or waits for the lease and then lands
+// under a funding the commit re-checks for staleness. Personas without a
+// lease row have no in-flight commit to race.
 func (s *Store) ResumeWaitsForHuman(ctx context.Context, humanID string) (int, error) {
 	return s.resumeWaits(ctx, []string{humanID}, func(tx pgx.Tx) ([]parkedInput, error) {
+		if _, err := tx.Exec(ctx, `
+			SELECT 1 FROM core_writer_leases l
+			JOIN core_personas p ON p.persona_id = l.persona_id
+			WHERE p.human_id = $1
+			ORDER BY l.persona_id FOR UPDATE OF l`, humanID); err != nil {
+			return nil, err
+		}
 		rows, err := tx.Query(ctx, `
 			DELETE FROM core_budget_waits w
 			USING core_personas p
@@ -1285,6 +1420,83 @@ func (s *Store) ResumeWaitsForHuman(ctx context.Context, humanID string) (int, e
 		}
 		return resuming, rows.Err()
 	})
+}
+
+// waitFundingStale reports whether the funding a denied call parked on is
+// still the source this persona's next model attempt would spend — the
+// same selection→funding resolution the core's binding applies. A
+// human-wide resume that committed before this park cannot see the wait
+// the park is about to insert; when the selection now resolves to a
+// different usable source the input requeues to re-resolve instead of
+// waiting on a funding it will never retry. A binding that cannot run at
+// all — 'none', 'chatgpt', an unsatisfied carried intent, a vanished
+// connection — leaves the wait parked: requeueing would only error the
+// input, and the human's next selection or intent change resumes
+// human-wide anyway. A non-selection funding kind ('sumi' grants) is not
+// made stale by selection changes: its resume triggers are the grant's own
+// budget and human-wide resumes, and a missed human resume changes nothing
+// about its fit.
+func (s *Store) waitFundingStale(ctx context.Context, tx pgx.Tx, personaID string, f FundingRef) (bool, error) {
+	if f.Kind != "connection" && f.Kind != "operator" {
+		return false, nil
+	}
+	var humanID *string
+	var intentRaw []byte
+	var selFound bool
+	var selKind, selConn string
+	err := tx.QueryRow(ctx, `
+		SELECT p.human_id::text, p.model_intent,
+			s.kind IS NOT NULL, COALESCE(s.kind, ''), COALESCE(s.connection_id::text, '')
+		FROM core_personas p
+		LEFT JOIN model_connection_selections s ON s.human_id = p.human_id
+		WHERE p.persona_id = $1`, personaID).
+		Scan(&humanID, &intentRaw, &selFound, &selKind, &selConn)
+	if err != nil {
+		return false, err
+	}
+	if humanID == nil {
+		// An unbound persona's funding is caller-chosen, never
+		// selection-derived — and no human-scoped resume exists for it to
+		// miss, so there is no stale wait to correct.
+		return false, nil
+	}
+	// A carried model intent gates the selection exactly like the binding
+	// endpoint: unsatisfied means needs_rebinding — nothing spendable until
+	// the human rebinds or clears it.
+	intentKind := ""
+	if len(intentRaw) > 0 {
+		var intent struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(intentRaw, &intent); err == nil {
+			intentKind = intent.Kind
+		}
+	}
+	var cur *FundingRef
+	switch {
+	case intentKind != "" && (!selFound || selKind != intentKind):
+		// needs_rebinding — unusable.
+	case !selFound:
+		// unset — the environment default.
+		cur = &FundingRef{Kind: "operator", ID: "env"}
+	case selKind == "api":
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM model_api_connections
+				WHERE human_id = $1 AND connection_id = $2::uuid)`,
+			*humanID, selConn).Scan(&exists); err != nil {
+			return false, err
+		}
+		if exists {
+			cur = &FundingRef{Kind: "connection", ID: selConn}
+		}
+	default:
+		// none, chatgpt, or an unknown kind — unusable.
+	}
+	if cur == nil {
+		return false, nil
+	}
+	return cur.Kind != f.Kind || cur.ID != f.ID, nil
 }
 
 type parkedInput struct{ persona, input string }
