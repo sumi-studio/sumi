@@ -139,6 +139,35 @@ service は次をしてはいけない。
 **外す条件**: AttentionCandidate の発行と、本人の判断
 （interrupt / inject / defer / observe）の経路が揃ったとき。
 
+## メッセージ送信と WS 接続の admission（実装済み）
+
+rate limit は境界自身の権限として messaging service（API プロセス）に
+実装する（`apps/api/internal/messaging/admission.go`）。edge の粗い
+ingress shed は別層であり、本契約の正本ではない。
+
+- **対象と閾値**: 新規メッセージの送信試行を毎秒 4 件、burst 64 件まで
+  受け付ける。編集・削除・リアクション・投票・場の作成・upload はこの
+  bucket の対象外。WS は同じ scope で 6 接続、actor 全体で 18 接続まで。
+- **順序**: 認可と nonce replay の照合を rate bucket より先に行う。
+  現在の認可が通り、内容も一致する commit 済み send の retry は、bucket
+  が空でも同じ receipt（message_id / seq）へ届く。未 commit の同じ nonce
+  が競合する場合や、受付後に添付の結び付け等で失敗する場合は、送信試行
+  ごとに token を消費する。失敗した試行の token は返却しない。
+- **key**: `(Workspace, AppInstallation, actor)`。human と
+  personality_agent で operation・閾値・retry 意味論を変えない。
+- **REST**: 拒否は `429` + `Retry-After` + `retry_after_ms` +
+  `Cache-Control: no-store`。拒否された send は seq・message・
+  notification intent を残さない。
+- **WS**: 認証と exact scope 確認の後、upgrade 前に connection lease を
+  取り、失敗経路と close で一度だけ解放する。durable send 超過は socket
+  を閉じず `rate_limited` + `client_nonce` + `retry_after_ms` を返す。
+- **upload**: 既存の認可と nonce receipt 照合を body 読取りの前に行う。
+  認可拒否と保存済み receipt の再送応答では body を読まない。upload の
+  試行回数・受信 byte 数の rate bucket は、この変更では追加していない。
+- **制約**: in-memory・single-process。bucket/lease は restart で reset
+  される。2 つ目の API replica が必要になった時点で shared limiter を
+  再設計する。
+
 ## 未確定（本書では凍結しない）
 
 - 配送に関わる四境界の所有関係。messaging backend / notification service /

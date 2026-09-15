@@ -53,7 +53,7 @@ type WSServer struct {
 
 	upgrader      websocket.Upgrader
 	connectionsMu sync.Mutex
-	connections   map[*websocket.Conn]string
+	connections   map[*websocket.Conn]wsConnEntry
 }
 
 // NewWSServer returns the messaging WebSocket server.
@@ -67,7 +67,7 @@ func NewWSServer(store *Store, sessions agentevents.UserSessionAuthorizer, hub *
 		PongWait:     60 * time.Second,
 		PingInterval: 25 * time.Second,
 		MaxReadLimit: maxRequestBytes,
-		connections:  make(map[*websocket.Conn]string),
+		connections:  make(map[*websocket.Conn]wsConnEntry),
 	}
 	s.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
@@ -151,15 +151,25 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			callbackErr = err
 			return err
 		}
+		// The live-connection lease is taken after authentication and exact
+		// scope authorization, before the upgrade, and is released exactly
+		// once — on a refused/failed upgrade here, on socket close via
+		// removeConnection.
+		lease, leaseErr := s.Store.admission.acquireWSLease(store.Scope)
+		if leaseErr != nil {
+			callbackErr = leaseErr
+			return leaseErr
+		}
 		upgrader := s.upgrader
 		upgrader.HandshakeTimeout = s.WriteTimeout
 		upgradeAttempted = true
 		var upgradeErr error
 		conn, upgradeErr = upgrader.Upgrade(w, r, nil)
 		if upgradeErr != nil {
+			lease.release()
 			return upgradeErr
 		}
-		s.addConnection(conn, claims.BrowserSessionID())
+		s.addConnection(conn, claims.BrowserSessionID(), lease)
 		return nil
 	})
 	cancelUpgrade()
@@ -347,6 +357,20 @@ func (s *WSServer) handleSend(ctx context.Context, sub *subscriber, claims agent
 		return
 	}
 	if err != nil {
+		// A refused durable send never closes the socket: the client keeps
+		// the connection and the nonce, and resubmits the same operation
+		// after retry_after_ms. A committed replay never reaches this frame.
+		var limited *RateLimitedError
+		if errors.As(err, &limited) {
+			s.enqueueJSON(sub, struct {
+				Type         string `json:"type"`
+				Code         string `json:"code"`
+				ClientNonce  string `json:"client_nonce,omitempty"`
+				RetryAfterMS int64  `json:"retry_after_ms"`
+			}{Type: "error", Code: "rate_limited", ClientNonce: frame.ClientNonce,
+				RetryAfterMS: max(limited.RetryAfter.Milliseconds(), 1)})
+			return
+		}
 		s.enqueueError(sub, storeErrorCode(err), frame.ClientNonce)
 		return
 	}
@@ -492,19 +516,30 @@ func (s *WSServer) authorizeWrite(
 	})
 }
 
-func (s *WSServer) addConnection(conn *websocket.Conn, sessionID string) {
+// wsConnEntry tracks one live socket: its session for revocation sweeps and
+// its admission lease for the close path.
+type wsConnEntry struct {
+	sessionID string
+	lease     *wsConnLease
+}
+
+func (s *WSServer) addConnection(conn *websocket.Conn, sessionID string, lease *wsConnLease) {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	if s.connections == nil {
-		s.connections = make(map[*websocket.Conn]string)
+		s.connections = make(map[*websocket.Conn]wsConnEntry)
 	}
-	s.connections[conn] = sessionID
+	s.connections[conn] = wsConnEntry{sessionID: sessionID, lease: lease}
 }
 
 func (s *WSServer) removeConnection(conn *websocket.Conn) {
 	s.connectionsMu.Lock()
-	defer s.connectionsMu.Unlock()
+	entry, ok := s.connections[conn]
 	delete(s.connections, conn)
+	s.connectionsMu.Unlock()
+	if ok && entry.lease != nil {
+		entry.lease.release()
+	}
 }
 
 // CloseBrowserSession eagerly terminates this process's messaging sockets for
@@ -516,8 +551,8 @@ func (s *WSServer) CloseBrowserSession(sessionID string) {
 	}
 	s.connectionsMu.Lock()
 	connections := make([]*websocket.Conn, 0)
-	for conn, registeredSessionID := range s.connections {
-		if registeredSessionID == sessionID {
+	for conn, entry := range s.connections {
+		if entry.sessionID == sessionID {
 			connections = append(connections, conn)
 		}
 	}
