@@ -47,6 +47,16 @@ type CallParticipant struct {
 	Participant ParticipantRef
 	JoinedAt    time.Time
 	ScreenShare bool
+	// Identity is the raw LiveKit identity of the most recently confirmed
+	// live connection, including any claim-epoch tag.
+	Identity string
+	// Connections tracks each live connection under this participant ref,
+	// keyed by the LiveKit participant SID (falling back to identity when a
+	// caller supplies none). A secretary's reclaimed actor (#e1 then #e2)
+	// and a human's reconnect both hold distinct connections; the roster
+	// entry is present exactly while at least one is live, so a stale
+	// connection's departure cannot drop the current generation's entry.
+	Connections map[string]string
 }
 
 type CallState struct {
@@ -67,6 +77,11 @@ type CallRegistry struct {
 	roomSID      map[string]string
 	finishedSIDs map[string]map[string]struct{}
 	pendingShare map[string]map[ParticipantRef]bool
+	// leftConns tombstones participant SIDs whose participant_left was
+	// processed, so a reordered delayed participant_joined for that same
+	// dead connection cannot re-add it to the roster. Cleared per room
+	// generation.
+	leftConns map[string]map[string]bool
 }
 
 func NewCallRegistry() *CallRegistry {
@@ -74,6 +89,7 @@ func NewCallRegistry() *CallRegistry {
 		rooms: map[string]*CallState{}, roomSequence: map[string]uint64{},
 		roomSID:      map[string]string{},
 		finishedSIDs: map[string]map[string]struct{}{}, pendingShare: map[string]map[ParticipantRef]bool{},
+		leftConns: map[string]map[string]bool{},
 	}
 }
 
@@ -151,6 +167,14 @@ func (r *CallRegistry) snapshotSequence() uint64 {
 	return r.sequence
 }
 
+// roomSIDFor returns the active room SID for a place, or "" when the
+// projection holds none — used to scope a removal to the live generation.
+func (r *CallRegistry) roomSIDFor(placeID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.roomSID[placeID]
+}
+
 func (r *CallRegistry) roomSnapshotSequence(placeID string) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -163,7 +187,16 @@ func (r *CallRegistry) changed(placeID string) {
 }
 
 func cloneCallState(state *CallState) CallState {
-	participants := append([]CallParticipant(nil), state.Participants...)
+	participants := make([]CallParticipant, len(state.Participants))
+	for i, p := range state.Participants {
+		participants[i] = p
+		if p.Connections != nil {
+			participants[i].Connections = make(map[string]string, len(p.Connections))
+			for k, v := range p.Connections {
+				participants[i].Connections[k] = v
+			}
+		}
+	}
 	return CallState{
 		PlaceID: state.PlaceID, Active: state.Active, StartedAt: state.StartedAt,
 		Participants: participants,
@@ -205,6 +238,7 @@ func (r *CallRegistry) open(placeID, sid string, at time.Time) (CallState, bool)
 	r.rooms[placeID] = state
 	r.roomSID[placeID] = sid
 	delete(r.pendingShare, placeID)
+	delete(r.leftConns, placeID)
 	r.changed(placeID)
 	return cloneCallState(state), true
 }
@@ -217,23 +251,55 @@ func (r *CallRegistry) close(placeID, sid string) (CallState, bool) {
 	}
 	delete(r.rooms, placeID)
 	delete(r.pendingShare, placeID)
+	delete(r.leftConns, placeID)
 	r.roomSID[placeID] = sid
 	r.retire(placeID, sid)
 	r.changed(placeID)
 	return CallState{PlaceID: placeID}, true
 }
 
-func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, at time.Time) (CallState, bool) {
+// connKey identifies one LiveKit connection within a participant entry. The
+// participant SID is unique per connection; an identity is reused by a
+// reconnecting participant, so it is only the fallback when no SID is
+// available (synthetic callers).
+func connKey(participantSID, identity string) string {
+	if participantSID != "" {
+		return participantSID
+	}
+	return identity
+}
+
+// join records one connection under the participant ref. The roster entry
+// stays present while any of its connections is live — a stale-generation
+// secretary connection (#e1) departing must not hide the still-connected
+// current one (#e2). A join for a connection whose leave was already
+// processed is a reordered stale event and is ignored.
+func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, identity, participantSID string, at time.Time) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.activeSID(placeID, sid)
 	if !ok {
 		return CallState{}, false
 	}
-	for _, existing := range state.Participants {
-		if existing.Participant == participant {
+	key := connKey(participantSID, identity)
+	if participantSID != "" && r.leftConns[placeID][participantSID] {
+		return cloneCallState(state), false
+	}
+	for i, existing := range state.Participants {
+		if existing.Participant != participant {
+			continue
+		}
+		if existing.Connections == nil {
+			existing.Connections = map[string]string{}
+		}
+		if _, dup := existing.Connections[key]; dup {
 			return cloneCallState(state), false
 		}
+		existing.Connections[key] = identity
+		existing.Identity = identity
+		state.Participants[i] = existing
+		r.changed(placeID)
+		return cloneCallState(state), true
 	}
 	sharing, pending := r.pendingShare[placeID][participant]
 	if pending {
@@ -241,6 +307,8 @@ func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, at 
 	}
 	state.Participants = append(state.Participants, CallParticipant{
 		Participant: participant, JoinedAt: at, ScreenShare: sharing,
+		Identity:    identity,
+		Connections: map[string]string{key: identity},
 	})
 	sort.SliceStable(state.Participants, func(i, j int) bool {
 		if state.Participants[i].JoinedAt.Equal(state.Participants[j].JoinedAt) {
@@ -252,19 +320,69 @@ func (r *CallRegistry) join(placeID, sid string, participant ParticipantRef, at 
 	return cloneCallState(state), true
 }
 
-func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef) (CallState, bool) {
+// leave drops exactly the connection the event names. An explicit
+// participant SID is authoritative: an unknown SID means that connection is
+// already gone, and it must never match a different live connection of the
+// same participant (a duplicate stale leave after a reconnect would
+// otherwise evict the replacement). Only a leave with no SID at all —
+// synthetic callers that never saw the connection — falls back to matching
+// by identity. The entry is removed once no live connection remains.
+func (r *CallRegistry) leave(placeID, sid string, participant ParticipantRef, identity, participantSID string) (CallState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.activeSID(placeID, sid)
 	if !ok {
 		return CallState{}, false
 	}
-	for i, existing := range state.Participants {
-		if existing.Participant == participant {
-			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
-			r.changed(placeID)
-			return cloneCallState(state), true
+	if participantSID != "" {
+		if r.leftConns[placeID] == nil {
+			r.leftConns[placeID] = map[string]bool{}
 		}
+		r.leftConns[placeID][participantSID] = true
+	}
+	for i, existing := range state.Participants {
+		if existing.Participant != participant {
+			continue
+		}
+		if participantSID != "" {
+			if _, ok := existing.Connections[participantSID]; !ok {
+				r.changed(placeID)
+				return cloneCallState(state), false
+			}
+			delete(existing.Connections, participantSID)
+		} else {
+			// No connection was named: a join without a SID keyed the
+			// connection by identity; otherwise every tracked connection
+			// carrying this identity departed with it.
+			if _, ok := existing.Connections[identity]; ok {
+				delete(existing.Connections, identity)
+			} else {
+				matched := false
+				for k, id := range existing.Connections {
+					if id == identity {
+						delete(existing.Connections, k)
+						matched = true
+					}
+				}
+				if !matched {
+					r.changed(placeID)
+					return cloneCallState(state), false
+				}
+			}
+		}
+		if len(existing.Connections) == 0 {
+			state.Participants = append(state.Participants[:i], state.Participants[i+1:]...)
+		} else {
+			keys := make([]string, 0, len(existing.Connections))
+			for k := range existing.Connections {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			existing.Identity = existing.Connections[keys[0]]
+			state.Participants[i] = existing
+		}
+		r.changed(placeID)
+		return cloneCallState(state), true
 	}
 	r.changed(placeID)
 	return cloneCallState(state), false
@@ -337,6 +455,9 @@ type CallService struct {
 	Registry    *CallRegistry
 	RoomService liveKitRoomService
 	Now         func() time.Time
+	// Hooks reach the durable core: call_started admission on room_started
+	// and call_event records on terminal sessions. Nil without a core store.
+	Hooks *CallHooks
 
 	rebuildMu   sync.Mutex
 	rebuiltOnce bool
@@ -360,6 +481,7 @@ func (c *CallService) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /messaging/places/{place_id}/call/token", c.serveCallToken)
 	mux.HandleFunc("GET /messaging/calls", c.serveCalls)
 	mux.HandleFunc("POST /messaging/livekit/webhook", c.serveWebhook)
+	mux.HandleFunc("POST /messaging/places/{place_id}/call/participants/remove", c.serveRemoveCallParticipant)
 }
 
 // withCallAdmission holds Workspace membership, exact installation epoch, and
@@ -523,6 +645,7 @@ type livekitWebhookEvent struct {
 	} `json:"room"`
 	Participant struct {
 		Identity string `json:"identity"`
+		SID      string `json:"sid"`
 	} `json:"participant"`
 	Track struct {
 		Source string `json:"source"`
@@ -539,17 +662,24 @@ func (c *CallService) applyWebhook(ctx context.Context, event livekitWebhookEven
 	switch event.Event {
 	case "room_started":
 		state, changed = c.Registry.open(placeID, event.Room.SID, c.now())
+		if changed {
+			go c.notifyCallStarted(placeID, event.Room.SID)
+		}
 	case "room_finished":
 		state, changed = c.Registry.close(placeID, event.Room.SID)
+		if changed {
+			c.endCallSessionsForRoom(placeID, event.Room.SID)
+		}
 	case "participant_joined", "participant_left":
 		participant, err := participantFromIdentity(event.Participant.Identity)
 		if err != nil {
 			return
 		}
 		if event.Event == "participant_joined" {
-			state, changed = c.Registry.join(placeID, event.Room.SID, participant, c.now())
+			state, changed = c.Registry.join(placeID, event.Room.SID, participant, event.Participant.Identity, event.Participant.SID, c.now())
+			c.removeStaleEpochParticipant(ctx, placeID, event.Participant.Identity, participant)
 		} else {
-			state, changed = c.Registry.leave(placeID, event.Room.SID, participant)
+			state, changed = c.Registry.leave(placeID, event.Room.SID, participant, event.Participant.Identity, event.Participant.SID)
 		}
 	case "track_published", "track_unpublished":
 		if event.Track.Source != "SCREEN_SHARE" {
@@ -615,16 +745,37 @@ func (s *Store) callDeliveryScope(ctx context.Context, placeID string) (Place, S
 	}, nil
 }
 
+// participantFromIdentity parses a LiveKit participant identity into its
+// participant ref. Bridge-joined secretaries carry a claim-epoch tag
+// (personality_agent:<id>#e<epoch>) so a stale-generation actor is
+// distinguishable and precisely removable; the tag is not part of the ref.
 func participantFromIdentity(identity string) (ParticipantRef, error) {
 	kind, id, found := strings.Cut(identity, ":")
 	if !found {
 		return ParticipantRef{}, errors.New("identity is not a participant key")
+	}
+	if cut := strings.Index(id, "#"); cut >= 0 {
+		id = id[:cut]
 	}
 	ref := ParticipantRef{Kind: ParticipantKind(kind), ID: id}
 	if err := ref.Validate(); err != nil {
 		return ParticipantRef{}, err
 	}
 	return ref, nil
+}
+
+// callIdentityEpoch returns the claim-epoch tag of a bridge identity, or -1
+// when the identity carries none (human participants and foreign clients).
+func callIdentityEpoch(identity string) int64 {
+	cut := strings.Index(identity, "#e")
+	if cut < 0 {
+		return -1
+	}
+	var epoch int64
+	if _, err := fmt.Sscanf(identity[cut+2:], "%d", &epoch); err != nil {
+		return -1
+	}
+	return epoch
 }
 
 // liveKitRoomService is intentionally small: room reconciliation is the only
@@ -644,6 +795,7 @@ type liveKitRoom struct {
 
 type liveKitParticipant struct {
 	Identity string `json:"identity"`
+	SID      string `json:"sid"`
 	JoinedAt int64  `json:"joined_at,string"`
 	Tracks   []struct {
 		Source string `json:"source"`
@@ -829,7 +981,33 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 			if participant.JoinedAt == 0 {
 				joinedAt = startedAt
 			}
-			entry := CallParticipant{Participant: ref, JoinedAt: joinedAt}
+			merged := false
+			for i, existing := range snapshot.state.Participants {
+				if existing.Participant != ref {
+					continue
+				}
+				// One roster entry per ref: a second live connection (e.g.
+				// a reclaimed secretary actor alongside its dying
+				// predecessor) joins the same entry.
+				if existing.Connections == nil {
+					existing.Connections = map[string]string{}
+				}
+				existing.Connections[connKey(participant.SID, participant.Identity)] = participant.Identity
+				existing.Identity = participant.Identity
+				for _, track := range participant.Tracks {
+					if track.Source == "SCREEN_SHARE" {
+						existing.ScreenShare = true
+					}
+				}
+				snapshot.state.Participants[i] = existing
+				merged = true
+				break
+			}
+			if merged {
+				continue
+			}
+			entry := CallParticipant{Participant: ref, JoinedAt: joinedAt, Identity: participant.Identity,
+				Connections: map[string]string{connKey(participant.SID, participant.Identity): participant.Identity}}
 			for _, track := range participant.Tracks {
 				if track.Source == "SCREEN_SHARE" {
 					entry.ScreenShare = true
@@ -863,7 +1041,20 @@ func (c *CallService) snapshotRoom(ctx context.Context, room liveKitRoom) (callR
 // transaction is already committed when this runs: RoomService failure must
 // never resurrect its authorization.
 func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceID string, participant ParticipantRef) error {
-	if c == nil || c.Server == nil || c.Server.Store == nil || c.RoomService == nil {
+	if c == nil || c.Server == nil || c.Server.Store == nil {
+		return errors.New("messaging store is unavailable")
+	}
+	if participant.Kind == KindPersonalityAgent {
+		// Close the durable authority record BEFORE touching media: the
+		// revocation is the honest terminal record and must not depend on
+		// LiveKit being reachable. (Even if this fails, the claim/mutation
+		// gates re-check place membership, so the retained row carries no
+		// authority — but the caller must see the failure either way.)
+		if err := c.revokeCallSessionsForWorkspace(ctx, workspaceID, participant.ID, "membership_closed"); err != nil {
+			return fmt.Errorf("revoke call sessions for closed member %s: %w", participant.Key(), err)
+		}
+	}
+	if c.RoomService == nil {
 		return errors.New("LiveKit RoomService is unavailable")
 	}
 	rooms, err := c.RoomService.ListRooms(ctx)
@@ -889,26 +1080,250 @@ func (c *CallService) RemoveWorkspaceParticipant(ctx context.Context, workspaceI
 		if err != nil {
 			return fmt.Errorf("list LiveKit participants in room %s: %w", room.Name, err)
 		}
-		found := false
 		for _, entry := range participants {
-			if entry.Identity == participant.Key() {
-				found = true
-				break
+			ref, err := participantFromIdentity(entry.Identity)
+			if err != nil || ref != participant {
+				continue
 			}
-		}
-		if !found {
-			continue
-		}
-		if err := c.RoomService.RemoveParticipant(ctx, room.Name, participant.Key()); err != nil {
-			return fmt.Errorf("remove LiveKit participant from room %s: %w", room.Name, err)
-		}
-		// Publish the local projection immediately; participant_left delivery is
-		// idempotent and therefore does not emit a second state change.
-		if state, changed := c.Registry.leave(room.Name, room.SID, participant); changed {
-			c.publishCallState(ctx, state)
+			// Remove by raw identity so an epoch-tagged secretary actor is
+			// matched by exactly the connection LiveKit reported.
+			if err := c.RoomService.RemoveParticipant(ctx, room.Name, entry.Identity); err != nil {
+				return fmt.Errorf("remove LiveKit participant from room %s: %w", room.Name, err)
+			}
+			// Publish the local projection immediately; participant_left
+			// delivery is idempotent and does not emit a second change.
+			if state, changed := c.Registry.leave(room.Name, room.SID, participant, entry.Identity, entry.SID); changed {
+				c.publishCallState(ctx, state)
+			}
 		}
 	}
 	return nil
+}
+
+// snapshotCallsFor returns the volatile registry projection for one place.
+func (c *CallService) snapshotCallsFor(placeID string) *CallState {
+	if c == nil || c.Registry == nil {
+		return nil
+	}
+	state, ok := c.Registry.snapshot(placeID)
+	if !ok {
+		return nil
+	}
+	return &state
+}
+
+// rebuildRegistryOnce populates the volatile projection from RoomService on
+// first use; webhook deltas keep it current afterwards.
+func (c *CallService) rebuildRegistryOnce(ctx context.Context) {
+	if c == nil || c.RoomService == nil {
+		return
+	}
+	if err := c.rebuildRegistry(ctx); err != nil {
+		log.Printf("call: registry rebuild: %v", err)
+	}
+}
+
+// endCallSessionsForRoom terminally ends every live session bound to a room
+// that LiveKit reports finished. The room is already gone, so sessions end
+// directly rather than waiting on a claim holder.
+func (c *CallService) endCallSessionsForRoom(placeID, roomSID string) {
+	if c == nil || c.Server == nil || c.Server.Store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var ended []CallSession
+	err := withCallTx(ctx, c.Server.Store.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE call_sessions
+			SET status='ended', ended_at=now(), end_reason='room_finished',
+			    updated_at=now(), claimed_by=NULL, claim_expires_at=NULL
+			WHERE place_id = $1 AND (room_sid IS NULL OR room_sid = '' OR room_sid = $2)
+			  AND status IN ('requested','claimed','active','ending','interrupted')
+			RETURNING `+callSessionCols, placeID, roomSID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var session CallSession
+			if err := rows.Scan(callSessionScan(&session)...); err != nil {
+				rows.Close()
+				return err
+			}
+			ended = append(ended, session)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, session := range ended {
+			if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "room_finished"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("call: end sessions for finished room %s: %v", placeID, err)
+		return
+	}
+	for _, session := range ended {
+		c.notifyCallEnded(ctx, session)
+	}
+}
+
+// removeStaleEpochParticipant evicts an epoch-tagged secretary join whose tag
+// does not match the session's current epoch. This is the recovery path for
+// a stale ticket or zombie runner: it is observational, not instantaneous —
+// the actor may have published briefly before this removal lands.
+func (c *CallService) removeStaleEpochParticipant(ctx context.Context, placeID, identity string, ref ParticipantRef) {
+	if ref.Kind != KindPersonalityAgent || c == nil || c.Server == nil || c.Server.Store == nil {
+		return
+	}
+	epoch := callIdentityEpoch(identity)
+	if epoch < 0 {
+		// An untagged secretary identity did not come through a claim; there
+		// is no durable session authorizing it, so it is always stale.
+		if c.RoomService == nil {
+			return
+		}
+		var live bool
+		err := c.Server.Store.pool.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM call_sessions
+				WHERE personality_agent_id = $1 AND place_id = $2
+				  AND status IN ('requested','claimed','active','ending','interrupted'))`,
+			ref.ID, placeID).Scan(&live)
+		if err != nil || live {
+			return
+		}
+		c.RemoveStaleCallParticipant(ctx, placeID, identity)
+		return
+	}
+	var current int64
+	err := c.Server.Store.pool.QueryRow(ctx, `
+		SELECT epoch FROM call_sessions
+		WHERE personality_agent_id = $1 AND place_id = $2
+		  AND status IN ('requested','claimed','active','ending','interrupted')
+		LIMIT 1`, ref.ID, placeID).Scan(&current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No live session authorizes any epoch of this secretary here.
+		c.RemoveStaleCallParticipant(ctx, placeID, identity)
+		return
+	}
+	if err != nil {
+		log.Printf("call: stale-epoch check %s in %s: %v", identity, placeID, err)
+		return
+	}
+	if epoch != current {
+		c.RemoveStaleCallParticipant(ctx, placeID, identity)
+	}
+}
+
+// revokeCallSessionsForWorkspace revokes a secretary's live sessions in the
+// workspace whose membership closed.
+func (c *CallService) revokeCallSessionsForWorkspace(ctx context.Context, workspaceID, personaID, reason string) error {
+	rows, err := c.Server.Store.pool.Query(ctx, `
+		SELECT place_id::text FROM call_sessions
+		WHERE personality_agent_id = $1 AND workspace_id = $2
+		  AND status IN ('requested','claimed','active','ending','interrupted')`,
+		personaID, workspaceID)
+	if err != nil {
+		return err
+	}
+	placeIDs := []string{}
+	for rows.Next() {
+		var placeID string
+		if err := rows.Scan(&placeID); err != nil {
+			rows.Close()
+			return err
+		}
+		placeIDs = append(placeIDs, placeID)
+	}
+	rows.Close()
+	for _, placeID := range placeIDs {
+		if err := c.RevokePlaceCallSessions(ctx, personaID, placeID, reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// serveRemoveCallParticipant lets any active place member remove a call
+// participant — the same trust a member holds to end their own call. For a
+// secretary target the durable session is revoked as well as the media.
+func (c *CallService) serveRemoveCallParticipant(w http.ResponseWriter, r *http.Request) {
+	if c.RoomService == nil {
+		writeError(w, http.StatusServiceUnavailable, "call_request_failed")
+		return
+	}
+	_, claims, ok := c.Server.viewer(w, r)
+	if !ok {
+		return
+	}
+	store := scopedStoreForRequest(r)
+	var request struct {
+		Participant struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id"`
+		} `json:"participant"`
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxCallWebhookBytes))
+	if err != nil || len(body) == 0 || json.Unmarshal(body, &request) != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	target := ParticipantRef{Kind: ParticipantKind(request.Participant.Kind), ID: request.Participant.ID}
+	if err := target.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	done, err := c.Server.mutate(w, r, claims, func() error {
+		return store.withCallAdmission(r.Context(), r.PathValue("place_id"), func(place Place, _ string) error {
+			return nil
+		})
+	})
+	if !done {
+		return
+	}
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	placeID := r.PathValue("place_id")
+	participants, err := c.RoomService.ListParticipants(r.Context(), placeID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "call_request_failed")
+		return
+	}
+	if target.Kind == KindPersonalityAgent {
+		// Revoke the durable session BEFORE removing media: the kicked
+		// runner races to report 'failed'/'evicted', and whichever durable
+		// record commits first is the cause of record. Revoking first
+		// clears the claim, so the runner's report hits ErrCallClaimLost
+		// and 'removed_by_member' survives as the observable reason.
+		if err := c.RevokePlaceCallSessions(r.Context(), target.ID, placeID, "removed_by_member"); err != nil {
+			writeStoreError(w, err)
+			return
+		}
+	}
+	removed := false
+	sid := c.Registry.roomSIDFor(placeID)
+	for _, entry := range participants {
+		ref, err := participantFromIdentity(entry.Identity)
+		if err != nil || ref != target {
+			continue
+		}
+		if err := c.RoomService.RemoveParticipant(r.Context(), placeID, entry.Identity); err != nil {
+			writeError(w, http.StatusBadGateway, "call_request_failed")
+			return
+		}
+		removed = true
+		if state, changed := c.Registry.leave(placeID, sid, target, entry.Identity, entry.SID); changed {
+			c.publishCallState(r.Context(), state)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})
 }
 
 type livekitVideoGrant struct {

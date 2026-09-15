@@ -20,7 +20,11 @@
  * A selection that cannot be honored is a non-retryable model failure the
  * user can see, never a silent fallback to a different model.
  *
- *   SUMI_MODEL_PROVIDER=mock|openai   (default mock)
+ *   SUMI_MODEL_PROVIDER=mock|openai|none   (default mock; none = an
+ *                                      unselected persona has no model and
+ *                                      its requests fail visibly — the Cloud
+ *                                      setting, where no operator model may
+ *                                      answer for a user)
  *   SUMI_MODEL_BASE_URL / _API_KEY / _MODEL   (openai)
  *   SUMI_MODEL_HEADERS_JSON           (openai; static extra request headers
  *                                      as a JSON object, e.g. a provider
@@ -30,6 +34,13 @@
  *   SUMI_MODEL_TIMEOUT_MS             (openai and selected connections;
  *                                      per-request wall timeout, default
  *                                      120000)
+ *   SUMI_MODEL_PROVIDER=fixture       (scripted deterministic model for
+ *                                      integration tests)
+ *   SUMI_MODEL_FIXTURE_JSON           (fixture; the script as inline JSON —
+ *                                      portable, works under workerd)
+ *   SUMI_MODEL_FIXTURE                (fixture; a script file path — only on
+ *                                      hosts that pass a file loader, i.e.
+ *                                      the Node local host)
  */
 
 import {
@@ -39,6 +50,7 @@ import {
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
+import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
 import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
@@ -127,11 +139,12 @@ export function providerForPersona(
   persona: string,
   get: (name: string) => string | undefined,
   log?: (msg: string, fields?: Record<string, unknown>) => void,
+  loadFixtureScript?: (path: string) => string,
 ): ModelProvider {
   return new SelectedModelProvider({
     state,
     persona,
-    fallback: providerFromEnv(get),
+    fallback: providerFromEnv(get, loadFixtureScript),
     timeoutMs: numEnv(get, "SUMI_MODEL_TIMEOUT_MS", 120_000),
     log,
   });
@@ -372,6 +385,9 @@ export class SelectedModelProvider implements ModelProvider {
     }
     switch (binding.selection) {
       case "unset":
+        if (this.opts.fallback instanceof NoSelectionProvider) {
+          throw unusable(NO_SELECTION_MESSAGE);
+        }
         return {
           provider: this.opts.fallback,
           identity: { selection: "unset", provider: this.opts.fallback.name },
@@ -460,6 +476,22 @@ function unusable(message: string): ModelError {
   return new ModelError(message, { retryable: false, unavailable: true });
 }
 
+const NO_SELECTION_MESSAGE =
+  "no model connection is selected for this secretary; choose a connection to let the secretary answer";
+
+/** SUMI_MODEL_PROVIDER=none: the env default is "no model". */
+export class NoSelectionProvider implements ModelProvider {
+  readonly name = "none";
+
+  stream(_request: ModelRequest): AsyncIterable<ModelEvent> {
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: () => Promise.reject(unusable(NO_SELECTION_MESSAGE)),
+      }),
+    };
+  }
+}
+
 /**
  * The funding principal for the resolved binding — the identity recorded
  * on the usage fact and charged at admission. 'unset' (no selection)
@@ -482,6 +514,7 @@ function fundingRef(identity: BindingIdentity): FundingRef {
 
 export function providerFromEnv(
   get: (name: string) => string | undefined,
+  loadFixtureScript?: (path: string) => string,
 ): ModelProvider {
   const kind = get("SUMI_MODEL_PROVIDER") ?? "mock";
   if (kind === "openai") {
@@ -505,6 +538,21 @@ export function providerFromEnv(
       timeoutMs: numEnv(get, "SUMI_MODEL_TIMEOUT_MS", 120_000),
     });
   }
+  if (kind === "fixture") {
+    // Scripted deterministic model for integration tests; see fixture.ts.
+    // The script is data: any runtime may pass it inline, while a path needs
+    // a host that can read files — this module is bundled into workerd.
+    const inline = get("SUMI_MODEL_FIXTURE_JSON");
+    if (inline) return new FixtureProvider(inline);
+    const scriptPath = required(get, "SUMI_MODEL_FIXTURE");
+    if (!loadFixtureScript) {
+      throw new Error(
+        "SUMI_MODEL_FIXTURE is a file path; this host cannot read files — pass the script as SUMI_MODEL_FIXTURE_JSON",
+      );
+    }
+    return new FixtureProvider(loadFixtureScript(scriptPath));
+  }
+  if (kind === "none") return new NoSelectionProvider();
   if (kind !== "mock") throw new Error(`unknown SUMI_MODEL_PROVIDER ${kind}`);
   return new MockProvider();
 }

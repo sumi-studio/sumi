@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -34,11 +36,20 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 //     token for one persona can never authenticate for another, and nothing
 //     per-persona needs storing. The real multi-user binding (koseki identity
 //     → persona) lands with the auth-flow milestone; this proves the shape.
+//
+// A Cloud core host serves every persona from one Worker, so it holds an
+// optional third credential, the runtime token (SUMI_CORE_RUNTIME_TOKEN): it
+// authorizes the persona-scoped routes of any persona — exactly what holding
+// every persona token would — and none of the admin-only routes (persona
+// creation, human binding, approval decisions, transfers). The runtime that
+// parks a gated call can therefore never decide it.
 type Server struct {
-	store   *Store
-	secret  []byte
-	maxBody int64
-	conns   *modelconnections.Store
+	store      *Store
+	secret     []byte
+	runtime    []byte
+	maxBody    int64
+	conns      *modelconnections.Store
+	callBridge CallBridge
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
@@ -79,7 +90,24 @@ func (s *Server) authorized(r *http.Request, personaID string) bool {
 	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
 		return true
 	}
+	if len(s.runtime) > 0 && subtle.ConstantTimeCompare([]byte(token), s.runtime) == 1 {
+		return true
+	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.PersonaToken(personaID))) == 1
+}
+
+// SetRuntimeToken enables the runtime credential. It must be long and
+// distinct from the admin secret: equal values would silently grant the
+// runtime admin routes.
+func (s *Server) SetRuntimeToken(token string) error {
+	if len(token) < minRuntimeSecretLen {
+		return fmt.Errorf("%s must be at least %d characters", RuntimeTokenEnv, minRuntimeSecretLen)
+	}
+	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
+		return fmt.Errorf("%s must differ from the admin state token", RuntimeTokenEnv)
+	}
+	s.runtime = []byte(token)
+	return nil
 }
 
 func bearerToken(header string) (string, bool) {
@@ -154,6 +182,14 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/cancel", s.cancelJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/heartbeat", s.heartbeatJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/complete", s.completeJob)
+	// Call sessions: persona-token scoped like jobs — the media bridge's claim
+	// is its own authority, deliberately not writer-generation gated.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/claim", s.claimCallSessions)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/heartbeat", s.heartbeatCallSession)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/ticket", s.callSessionTicket)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/status", s.reportCallSessionStatus)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/calls/sessions/{session}/utterances", s.pendingCallUtterances)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/utterances/{utterance}/disposition", s.reportCallUtterance)
 }
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -229,6 +265,7 @@ func storeError(w http.ResponseWriter, err error) {
 		// retry; report them as 400, not a transient-looking 500.
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
+		log.Printf("agentstate internal error: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
 }

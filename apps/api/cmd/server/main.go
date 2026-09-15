@@ -103,6 +103,7 @@ func run(ctx context.Context) (runErr error) {
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
+	app.startCoreWaker()
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startChatGPTActivation()
@@ -256,6 +257,7 @@ type application struct {
 	deliverFeedbackAttention   func(context.Context) error
 	cleanupFeedbackAttachments func(context.Context) error
 	attentionWorkers           sync.WaitGroup
+	coreWaker                  *agentstate.RuntimeWaker
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -536,8 +538,28 @@ func newApplicationFromEnv() (*application, error) {
 			calls := messaging.NewCallService(messagingServer, livekit)
 			messagingServer.Calls = calls
 			workspaceServer.MembershipClosed = func(ctx context.Context, workspaceID string, member participant.Ref) {
-				if err := calls.RemoveWorkspaceParticipant(ctx, workspaceID, member); err != nil {
-					log.Printf("remove LiveKit participant after Workspace membership closure: %v", err)
+				// Best-effort cleanup after the committed closure: retry a
+				// few times on a detached context so a transient store or
+				// LiveKit fault doesn't strand media, and a disconnecting
+				// client can't cancel the cleanup. Authority never depends
+				// on this succeeding — the call bridge gates re-check place
+				// membership — but a failure must stay observable.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				var err error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if err = calls.RemoveWorkspaceParticipant(cleanupCtx, workspaceID, member); err == nil {
+						return
+					}
+					log.Printf("remove call participant after Workspace membership closure (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						return
+					}
+					select {
+					case <-cleanupCtx.Done():
+						return
+					case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+					}
 				}
 			}
 			calls.RegisterRoutes(mux)
@@ -653,6 +675,7 @@ func newApplicationFromEnv() (*application, error) {
 	// control-plane database exists. Developer/operator credential scope; see
 	// internal/agentstate for the authorization model.
 	var coreServer *agentstate.Server
+	var coreWaker *agentstate.RuntimeWaker
 	if coreToken := strings.TrimSpace(os.Getenv("SUMI_CORE_STATE_TOKEN")); coreToken != "" && database != nil {
 		if len(coreToken) < 16 {
 			closeOnError()
@@ -660,6 +683,24 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		coreServer = agentstate.NewServer(database.Pool, coreToken)
 		coreServer.SetModelConnections(modelConnections)
+		// A Cloud core host (Durable Objects) authenticates with one runtime
+		// credential and is woken from here; a Local host needs neither.
+		if runtimeToken := strings.TrimSpace(os.Getenv(agentstate.RuntimeTokenEnv)); runtimeToken != "" {
+			if err := coreServer.SetRuntimeToken(runtimeToken); err != nil {
+				closeOnError()
+				return nil, err
+			}
+			log.Print("core state accepts the runtime credential for persona-scoped routes")
+		}
+		waker, err := agentstate.RuntimeWakerFromEnv(coreServer.Store(), os.Getenv)
+		if err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if waker != nil {
+			coreWaker = waker
+			log.Printf("core wake: sweeping for personas awaiting a runtime; waking %s", waker.Target())
+		}
 		coreServer.RegisterRoutes(mux)
 		portable.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
 		// The human-facing usage/budget surface shares the core store: a
@@ -718,6 +759,28 @@ func newApplicationFromEnv() (*application, error) {
 		coreApprovals.RegisterRoutes(mux)
 		coreServer.Store().ApprovalsChanged = coreApprovals.NotifyChanged
 		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
+		if calls := messagingServer.Calls; calls != nil {
+			// The secretary's call surface: delegated effects commit session
+			// and utterance intent atomically with the operation record, and
+			// the persona-scoped bridge routes let a per-placement media
+			// runner claim sessions, mint short tickets, and report status
+			// and playback dispositions under its own claim authority.
+			calls.Hooks = &messaging.CallHooks{Core: coreServer.Store()}
+			for tool, effect := range map[string]agentstate.ToolEffect{
+				messaging.CallJoinTool:  calls.CallJoinEffect(),
+				messaging.CallLeaveTool: calls.CallLeaveEffect(),
+				messaging.CallSayTool:   calls.CallSayEffect(),
+				messaging.CallStateTool: calls.CallStateEffect(),
+			} {
+				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+					stopBackground()
+					closeOnError()
+					return nil, fmt.Errorf("register core call effect %s: %w", tool, err)
+				}
+			}
+			coreServer.SetCallBridge(calls)
+			log.Print("call sessions ready (call.join/leave/say/state effects + media bridge routes)")
+		}
 	case messagingServer != nil && spawnManager != nil:
 		delivery := &messaging.AgentAttentionGateway{
 			Gateway: runtime, Spawner: spawnManager,
@@ -743,6 +806,7 @@ func newApplicationFromEnv() (*application, error) {
 		chatGPTLogin:               chatGPTLogin,
 		chatGPTActivation:          chatGPTActivation,
 		deliverAttention:           deliverAttention,
+		coreWaker:                  coreWaker,
 		publicMux:                  mux,
 		localMux:                   localMux,
 		localListener:              localListener,
