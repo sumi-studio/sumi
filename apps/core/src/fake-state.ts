@@ -2277,7 +2277,11 @@ export class FakeState implements StateClient {
     this.modelBindings.set(persona, binding);
   }
 
+  /** Selection lookups served — tests assert a shelved tick does not probe. */
+  modelBindingCalls = 0;
+
   modelBinding(persona: string): Promise<ModelBinding> {
+    this.modelBindingCalls++;
     // An explicit test binding overrides, as before. Otherwise a carried
     // model_intent mirrors the Go gate: the persona may not fall back to
     // 'unset' — it reports needs_rebinding until the test binds a human

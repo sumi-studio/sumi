@@ -92,6 +92,15 @@ export interface SecretaryConfig {
    * once it starts one. Default 10 minutes.
    */
   memoryPreparationTimeoutMs?: number;
+  /**
+   * How long pending memory work is shelved after the model layer reports
+   * itself unavailable (no usable binding, missing credential, a selection
+   * lookup outage). While shelved, steps neither claim nor probe — a
+   * pending chunk cannot spin claim/probe/release inside the host's tick.
+   * After it expires the next step probes again, so a rebound or repaired
+   * binding resumes the work on an ordinary wake. Default 30s.
+   */
+  memoryUnavailablePauseMs?: number;
   idgen: () => string;
   log?: (msg: string, fields?: Record<string, unknown>) => void;
 }
@@ -136,6 +145,18 @@ function activeAgeMs(input: Input): number {
  * provider calls for one decision before the honest recorded failure.
  */
 const MAX_SEND_VIEW_RECOVERIES = 2;
+
+/**
+ * Default shelf for pending memory work while the model layer is
+ * unavailable — long enough that an unbound persona's host rests on its
+ * ordinary cadence (workerd heartbeat, local poll) instead of re-probing
+ * every tick, short enough that a repaired binding resumes promptly on
+ * the next wake. Uses the runtime's performance clock. In Node this is
+ * independent of wall-clock adjustments; Workers exposes the last I/O time
+ * through both performance.now() and Date.now(), so no independent-clock
+ * guarantee is made there.
+ */
+const DEFAULT_MEMORY_UNAVAILABLE_PAUSE_MS = 30_000;
 
 /**
  * One continuing secretary life. Boot = acquire writer lease + recover
@@ -190,6 +211,13 @@ export class Secretary {
   private memoryAbort: AbortController | null = null;
   /** The memory shape seen by the latest maintenance step. */
   private memoryShape: MemoryStatus | null = null;
+  /**
+   * performance.now() deadline until which memory preparation is shelved
+   * after the model layer reported itself unavailable. In-process only:
+   * a restart simply re-probes once and re-shelves if the binding is
+   * still unusable — one probe per restart, not a hot loop.
+   */
+  private memoryModelPausedUntil = 0;
   private readonly log: (msg: string, fields?: Record<string, unknown>) => void;
   private readonly cfg: SecretaryConfig;
 
@@ -263,7 +291,15 @@ export class Secretary {
       // interruption and prepares it again once its short pacing passes.
       const mem = await state.memoryMaintain(personaId, gen);
       this.memoryShape = mem;
-      if (opts.startMemory !== false && !this.memoryTask && mem.claimable > 0) {
+      // While the model layer is shelved as unavailable, pending chunks
+      // wait untouched: no claim, no probe — the host rests on its
+      // ordinary cadence until the shelf expires and a step re-probes.
+      if (
+        opts.startMemory !== false &&
+        !this.memoryTask &&
+        mem.claimable > 0 &&
+        performance.now() >= this.memoryModelPausedUntil
+      ) {
         this.memoryAbort = new AbortController();
         this.memoryTask = this.prepareMemory(
           gen,
@@ -543,9 +579,15 @@ export class Secretary {
    */
   memoryWakeAt(): number | null {
     if (this.memoryTask || !this.memoryShape) return null;
-    if (this.memoryShape.claimable > 0) return Date.now();
+    // A shelved-as-unavailable model layer pushes any memory wake out to
+    // the shelf's end, expressed on the wall clock the host arms against.
+    // Until then the host's ordinary heartbeat carries the re-probe.
+    const paused =
+      Date.now() +
+      Math.max(0, this.memoryModelPausedUntil - performance.now());
+    if (this.memoryShape.claimable > 0) return Math.max(Date.now(), paused);
     const next = this.memoryShape.next_claimable_at;
-    return next ? Date.parse(next) : null;
+    return next ? Math.max(Date.parse(next), paused) : null;
   }
 
   /**
@@ -643,7 +685,7 @@ export class Secretary {
   private async prepareMemory(gen: number, signal: AbortSignal): Promise<void> {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
-      await runMemoryPreparation({
+      const result = await runMemoryPreparation({
         personaId: this.cfg.personaId,
         generation: gen,
         state: this.cfg.state,
@@ -655,6 +697,15 @@ export class Secretary {
         timeoutMs: this.memoryTimeoutMs,
         log: (msg, fields) => this.log(msg, fields),
       });
+      if (result === "unavailable") {
+        this.memoryModelPausedUntil =
+          performance.now() +
+          (this.cfg.memoryUnavailablePauseMs ??
+            DEFAULT_MEMORY_UNAVAILABLE_PAUSE_MS);
+      } else if (result === "worked") {
+        // A chunk was claimed and answered: the binding is usable.
+        this.memoryModelPausedUntil = 0;
+      }
     } catch (e) {
       // A fenced branch stops silently — the next generation's recovery
       // reseals its chunk. Other errors inside preparation are already

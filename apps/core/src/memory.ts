@@ -682,6 +682,15 @@ async function* untilAborted(
 }
 
 /**
+ * How one preparation pass ended for scheduling purposes: "unavailable" when
+ * the model layer could not produce a request at all (a pause, not a
+ * verdict — the host should re-check on an ordinary cadence, not spin),
+ * "worked" when a chunk was claimed and its outcome recorded either way,
+ * "idle" when nothing was claimed or the run was interrupted first.
+ */
+export type MemoryPreparationResult = "idle" | "unavailable" | "worked";
+
+/**
  * One preparation branch: claim the oldest sealable chunk, consult the model
  * with the parent's context, then record the verdict. Completing never
  * changes the sent context — application is the state service's separate,
@@ -698,11 +707,11 @@ async function* untilAborted(
  */
 export async function runMemoryPreparation(
   deps: MemoryPreparationDeps,
-): Promise<void> {
+): Promise<MemoryPreparationResult> {
   const { personaId, generation, state, provider } = deps;
   const log = deps.log ?? (() => {});
   // A stopped or fenced writer claims nothing and spends no model call.
-  if (deps.signal?.aborted) return;
+  if (deps.signal?.aborted) return "idle";
   // Binding preflight: an unusable selection (post-transfer
   // needs_rebinding, "none", a missing credential, a selection lookup
   // outage) pauses the work instead of letting a claim reach the model
@@ -717,7 +726,7 @@ export async function runMemoryPreparation(
         log("memory preparation paused: model unavailable", {
           reason: e.message.slice(0, 4 * 1024),
         });
-        return;
+        return "unavailable";
       }
     }
   }
@@ -727,8 +736,8 @@ export async function runMemoryPreparation(
     deps.contextLimit,
   );
   const chunk = claimed.chunk;
-  if (!chunk) return;
-  if (deps.signal?.aborted) return;
+  if (!chunk) return "idle";
+  if (deps.signal?.aborted) return "idle";
 
   const timeoutMs = deps.timeoutMs ?? DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS;
   const call = new AbortController();
@@ -770,7 +779,7 @@ export async function runMemoryPreparation(
     // Host stop or fence loss: not a model failure. The claim stays
     // unresolved and the next claim or generation counts an interruption.
     log("memory preparation interrupted", { chunk_seq: chunk.chunk_seq });
-    return;
+    return "idle";
   }
   const fail = (error: string, retryable: boolean) =>
     recordMemoryOutcome(deps, chunk.chunk_seq, {
@@ -780,7 +789,7 @@ export async function runMemoryPreparation(
     });
   if (timedOut) {
     await fail(`preparation did not finish within ${timeoutMs}ms`, true);
-    return;
+    return "worked";
   }
   if (streamError !== null) {
     const e = streamError;
@@ -795,7 +804,9 @@ export async function runMemoryPreparation(
         reason: `budget-wait: ${e.message.slice(0, 4 * 1024)}`,
         delayMs: BUDGET_WAIT_RESHELVE_MS,
       });
-      return;
+      // Budget retry timing belongs to the durable shelf, so do not add
+      // the separate model-unavailable in-process pause.
+      return "idle";
     }
     // An unusable binding refused before any request was evaluated — a
     // placement condition, not a verdict on the chunk (a transferred
@@ -807,7 +818,7 @@ export async function runMemoryPreparation(
         kind: "unavailable",
         reason: `model: ${e.message.slice(0, 4 * 1024)}`,
       });
-      return;
+      return "unavailable";
     }
     // A capacity refusal is deterministic even when the provider framed it
     // retryable: the preparation sends the identical target again, which
@@ -820,7 +831,7 @@ export async function runMemoryPreparation(
       `model: ${(e instanceof Error ? e.message : String(e)).slice(0, 4 * 1024)}`,
       retryable,
     );
-    return;
+    return "worked";
   }
   if (toolCalls > 0) {
     // Tools are offered for an identical prefix but never run here; an
@@ -829,7 +840,7 @@ export async function runMemoryPreparation(
       `preparation output attempted ${toolCalls} tool call(s); tools are not executed in memory preparation`,
       true,
     );
-    return;
+    return "worked";
   }
   // Same classification as the previous runtime's compactor: a response
   // that did not finish normally, or finished empty, is incomplete and
@@ -839,7 +850,7 @@ export async function runMemoryPreparation(
       "incomplete preparation response: stream ended without completion",
       true,
     );
-    return;
+    return "worked";
   }
   const finish = usage.finish_reason;
   if (typeof finish === "string" && finish !== "stop") {
@@ -847,19 +858,19 @@ export async function runMemoryPreparation(
       `incomplete preparation response: finish_reason=${finish}`,
       true,
     );
-    return;
+    return "worked";
   }
   const trimmed = text.trim();
   if (trimmed === "KEEP_UNCHANGED") {
     await recordMemoryOutcome(deps, chunk.chunk_seq, { kind: "kept" });
-    return;
+    return "worked";
   }
   if (!trimmed) {
     await fail(
       "incomplete preparation response: empty replacement output",
       true,
     );
-    return;
+    return "worked";
   }
   // PG text cannot hold NUL — strip it rather than let an un-storable
   // candidate loop at the persistence boundary.
@@ -868,4 +879,5 @@ export async function runMemoryPreparation(
     kind: "prepared",
     replacement,
   });
+  return "worked";
 }
