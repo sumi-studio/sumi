@@ -48,7 +48,7 @@ afterEach(() => {
 it.each([
   "google.com",
   "github.com",
-  "email_link",
+  "email_code",
 ] as const)("binds invitation at %s startup and keeps it through confirmation", async (provider) => {
   capture();
   const mock = responses(proof, confirmation, terminal);

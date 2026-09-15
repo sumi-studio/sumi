@@ -29,10 +29,12 @@ import {
 import {
   type AuthIntent,
   confirmAuthFlow,
+  type EmailChallengeStatus,
   resolveAuthFlow,
 } from "./auth-flow-client";
 import {
   isExpiredFlow,
+  loadPendingEmailFlow,
   type PendingRedirectAuthFlow,
   type RecoverableProvider,
 } from "./auth-flow-state";
@@ -49,11 +51,22 @@ import {
   isSameEmailCredentialCollision,
 } from "./credential-recovery";
 import {
-  beginEmailLinkAuth,
-  completeEmailLinkAuth,
-  hasEmailLinkCallback,
-  rejectEmailLinkAuth,
-} from "./email-link-auth";
+  type ActiveEmailCodeFlow,
+  abandonEmailCodeFlow,
+  beginEmailCodeAuth,
+  clearPendingEmailLink,
+  completeEmailLink as completeEmailLinkProof,
+  type EmailLinkInspection,
+  type EmailProof,
+  ensureEmailCompletionSession,
+  finishEmailProof,
+  inspectEmailLink as inspectPendingEmailLink,
+  loadActiveEmailCodeFlow,
+  pendingEmailLink,
+  readEmailCodeStatus,
+  resendEmailCode as requestEmailCodeResend,
+  verifyEmailCode,
+} from "./email-code-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
@@ -139,6 +152,14 @@ export interface AuthUser {
   photoURL: string | null;
 }
 
+export interface EmailCodeView {
+  email: string;
+  intent: AuthIntent;
+  /** A provider collision waits for this email proof before linking. */
+  recovery: boolean;
+  challenge: EmailChallengeStatus | null;
+}
+
 export interface AuthContextValue {
   configured: boolean;
   loading: boolean;
@@ -150,15 +171,24 @@ export interface AuthContextValue {
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
   outcomeNotice: AuthOutcomeNotice | null;
-  emailLinkCallbackPending: boolean;
+  emailCode: EmailCodeView | null;
+  emailLinkPending: boolean;
   credentialRecoveryEmailSent: boolean;
   redirectSignInPending: boolean;
   redirectSignInError: unknown;
   dismissRedirectSignInError: () => void;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
-  sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
-  completeEmailLink: () => Promise<void>;
-  rejectEmailLink: () => void;
+  startEmailCode: (email: string, intent: AuthIntent) => Promise<void>;
+  submitEmailCode: (code: string) => Promise<void>;
+  resendEmailCode: () => Promise<void>;
+  refreshEmailCode: () => Promise<void>;
+  cancelEmailCode: () => void;
+  inspectEmailLink: () => Promise<EmailLinkInspection>;
+  continueEmailLink: (
+    inspection: EmailLinkInspection,
+    adopt: boolean,
+  ) => Promise<void>;
+  dismissEmailLink: () => void;
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
@@ -193,8 +223,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [outcomeNotice, setOutcomeNotice] = useState<AuthOutcomeNotice | null>(
     null,
   );
-  const [emailLinkCallbackPending, setEmailLinkCallbackPending] = useState(() =>
-    hasEmailLinkCallback(),
+  const [emailCodeFlow, setEmailCodeFlow] =
+    useState<ActiveEmailCodeFlow | null>(() => loadActiveEmailCodeFlow());
+  const [emailChallenge, setEmailChallenge] =
+    useState<EmailChallengeStatus | null>(null);
+  const [emailLinkPending, setEmailLinkPending] = useState(
+    () => pendingEmailLink() !== null,
   );
   const [credentialRecoveryEmailSent, setCredentialRecoveryEmailSent] =
     useState(false);
@@ -537,12 +571,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           isSameEmailCredentialCollision(error) &&
           isCurrentGeneration(generation)
         ) {
-          await beginSameEmailCredentialRecovery(
+          const started = await beginSameEmailCredentialRecovery(
             error,
             flow.provider,
             flow.intent,
           );
           if (isCurrentGeneration(generation)) {
+            setEmailCodeFlow(started.active);
+            setEmailChallenge(started.challenge);
             setCredentialRecoveryEmailSent(true);
           }
           return;
@@ -700,7 +736,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setRedirectSignInError(null);
   }, []);
 
-  const sendEmailLink = useCallback(
+  const startEmailCode = useCallback(
     async (email: string, intent: AuthIntent) => {
       if (preissuedSessionMode || !authOriginAllowed) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
@@ -709,7 +745,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setCredentialRecoveryEmailSent(false);
       signInPending.current = true;
       try {
-        await beginEmailLinkAuth(email, intent);
+        const started = await beginEmailCodeAuth(email, intent);
+        setEmailCodeFlow(started.active);
+        setEmailChallenge(started.challenge);
       } finally {
         signInPending.current = false;
       }
@@ -717,121 +755,259 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [nextGeneration],
   );
 
-  const completeEmailLink = useCallback(async () => {
-    if (preissuedSessionMode || !authOriginAllowed) {
-      throw new AuthAPIError("Authentication is unavailable.", 0);
-    }
-    const generation = nextGeneration();
-    signInPending.current = true;
-    try {
-      const completed = await completeEmailLinkAuth();
-      await serializeSessionMutation(async () => {
-        if (!isCurrentGeneration(generation)) return;
-        let recoveryOutcome:
-          | "provider_linked"
-          | "provider_already_linked"
-          | null = null;
-        if (completed.flow.credentialRecovery) {
-          if (completed.result.outcome !== "signed_in") {
-            throw new AuthAPIError(
-              "Provider recovery requires an existing Sumi account.",
-              0,
-            );
-          }
-          recoveryOutcome = await completeSameEmailCredentialRecovery({
-            recovery: completed.flow.credentialRecovery,
-            user: completed.firebaseUser,
-          });
-        }
-        if (completed.result.outcome === "confirmation_required") {
-          const pending: PendingAuthConfirmation = {
-            flowId: completed.result.flowId,
-            nonce: completed.flow.nonce,
-            intent: completed.flow.intent,
-            provider: "email_link",
-            expiresAt: completed.result.expiresAt,
-            action: completed.result.nextAction,
-            firebaseUID: completed.firebaseUser.uid,
-            account: {
-              displayName: completed.firebaseUser.displayName,
-              email: completed.firebaseUser.email,
-            },
-          };
-          savePendingConfirmation(pending);
-          setConfirmation(pending);
-          setEmailLinkCallbackPending(false);
-          return;
-        }
-        const nextSession = await verifyCommittedSumiSession();
-        if (
-          completed.result.outcome !== "signed_in" &&
-          completed.result.outcome !== "account_created"
-        ) {
-          throw new AuthAPIError("Invalid authentication flow response.", 0);
-        }
-        const recoveryIntent =
-          completed.flow.credentialRecovery?.requestedIntent ??
-          completed.flow.intent;
-        publishOutcomeNotice({
-          firebaseUID: completed.firebaseUser.uid,
-          humanId: nextSession.user.id,
-          outcome:
-            recoveryOutcome === "provider_linked"
-              ? "provider_linked"
-              : completed.result.outcome,
-          intent: recoveryIntent,
-          intentTransition:
-            completed.flow.credentialRecovery && recoveryIntent === "sign_up"
-              ? "recovery_proved"
-              : "none",
-          receiptId: completed.result.flowId,
-        });
-        flushSync(() => {
-          bindDirectChatAuthority(nextSession.authorityBindingId);
-          serverSession.current = nextSession;
-          if (!isCurrentGeneration(generation)) return;
-          setSession(nextSession);
-          setSessionState("authenticated");
-          setEmailLinkCallbackPending(false);
-          setCredentialRecoveryEmailSent(false);
-        });
-      });
-    } catch (error) {
-      if (isCurrentGeneration(generation)) {
-        let logoutCompleted = true;
-        try {
-          await logoutSumiSession();
-        } catch {
-          logoutCompleted = false;
-        }
-        let authorityCleared = true;
-        flushSync(() => {
-          authorityCleared = clearDirectChatAuthority();
-          serverSession.current = { authenticated: false };
-          setSession({ authenticated: false });
-          setSessionState(
-            logoutCompleted && authorityCleared
-              ? "unauthenticated"
-              : "unavailable",
-          );
-        });
+  const forgetEmailCodeFlow = useCallback((active: ActiveEmailCodeFlow) => {
+    abandonEmailCodeFlow(active);
+    setEmailCodeFlow((current) =>
+      current?.state === active.state ? null : current,
+    );
+    setEmailChallenge(null);
+    setCredentialRecoveryEmailSent(false);
+  }, []);
+
+  /**
+   * A flow that finished or moved elsewhere cannot be retried here. Another
+   * tab of this browser may already hold its session.
+   */
+  const settleEndedEmailFlow = useCallback(
+    (active: ActiveEmailCodeFlow, error: unknown) => {
+      if (!(error instanceof AuthAPIError)) return;
+      if (
+        error.message === "continued_in_other_browser" ||
+        error.message === "flow_consumed" ||
+        error.message === "flow_expired" ||
+        error.message === "invalid_flow"
+      ) {
+        forgetEmailCodeFlow(active);
       }
-      await signOutFirebaseBestEffort();
+      if (error.message === "flow_consumed") {
+        void refreshSession({ background: true });
+      }
+    },
+    [forgetEmailCodeFlow, refreshSession],
+  );
+
+  /**
+   * Mailbox proof errors leave the session untouched. After a proof, the
+   * Firebase exchange and flow resolution share the provider compensation:
+   * a failure there is retried with the same flow authority.
+   */
+  const completeEmailProof = useCallback(
+    async (obtainProof: () => Promise<EmailProof>) => {
+      if (preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError("Authentication is unavailable.", 0);
+      }
+      const generation = nextGeneration();
+      signInPending.current = true;
+      try {
+        const proof = await obtainProof();
+        try {
+          const completed = await finishEmailProof(proof);
+          await serializeSessionMutation(async () => {
+            if (!isCurrentGeneration(generation)) return;
+            let recoveryOutcome:
+              | "provider_linked"
+              | "provider_already_linked"
+              | null = null;
+            if (completed.flow.credentialRecovery) {
+              if (completed.result.outcome !== "signed_in") {
+                throw new AuthAPIError(
+                  "Provider recovery requires an existing Sumi account.",
+                  0,
+                );
+              }
+              recoveryOutcome = await completeSameEmailCredentialRecovery({
+                recovery: completed.flow.credentialRecovery,
+                user: completed.firebaseUser,
+              });
+            }
+            if (completed.result.outcome === "confirmation_required") {
+              const pending: PendingAuthConfirmation = {
+                flowId: completed.result.flowId,
+                nonce: completed.flow.nonce,
+                intent: completed.flow.intent,
+                provider: "email_code",
+                expiresAt: completed.result.expiresAt,
+                action: completed.result.nextAction,
+                firebaseUID: completed.firebaseUser.uid,
+                account: {
+                  displayName: completed.firebaseUser.displayName,
+                  email: completed.firebaseUser.email,
+                },
+              };
+              savePendingConfirmation(pending);
+              setConfirmation(pending);
+              setEmailCodeFlow(null);
+              setEmailChallenge(null);
+              setEmailLinkPending(false);
+              return;
+            }
+            const nextSession = await verifyCommittedSumiSession();
+            if (
+              completed.result.outcome !== "signed_in" &&
+              completed.result.outcome !== "account_created"
+            ) {
+              throw new AuthAPIError(
+                "Invalid authentication flow response.",
+                0,
+              );
+            }
+            const recoveryIntent =
+              completed.flow.credentialRecovery?.requestedIntent ??
+              completed.flow.intent;
+            publishOutcomeNotice({
+              firebaseUID: completed.firebaseUser.uid,
+              humanId: nextSession.user.id,
+              outcome:
+                recoveryOutcome === "provider_linked"
+                  ? "provider_linked"
+                  : completed.result.outcome,
+              intent: recoveryIntent,
+              intentTransition:
+                completed.flow.credentialRecovery &&
+                recoveryIntent === "sign_up"
+                  ? "recovery_proved"
+                  : "none",
+              receiptId: completed.result.flowId,
+            });
+            flushSync(() => {
+              bindDirectChatAuthority(nextSession.authorityBindingId);
+              serverSession.current = nextSession;
+              if (!isCurrentGeneration(generation)) return;
+              setSession(nextSession);
+              setSessionState("authenticated");
+              setEmailCodeFlow(null);
+              setEmailChallenge(null);
+              setEmailLinkPending(false);
+              setCredentialRecoveryEmailSent(false);
+            });
+          });
+        } catch (error) {
+          if (isCurrentGeneration(generation)) {
+            let logoutCompleted = true;
+            try {
+              await logoutSumiSession();
+            } catch {
+              logoutCompleted = false;
+            }
+            let authorityCleared = true;
+            flushSync(() => {
+              authorityCleared = clearDirectChatAuthority();
+              serverSession.current = { authenticated: false };
+              setSession({ authenticated: false });
+              setSessionState(
+                logoutCompleted && authorityCleared
+                  ? "unauthenticated"
+                  : "unavailable",
+              );
+            });
+          }
+          await signOutFirebaseBestEffort();
+          throw error;
+        }
+      } finally {
+        signInPending.current = false;
+      }
+    },
+    [
+      isCurrentGeneration,
+      nextGeneration,
+      publishOutcomeNotice,
+      serializeSessionMutation,
+    ],
+  );
+
+  const submitEmailCode = useCallback(
+    async (code: string) => {
+      const active = emailCodeFlow;
+      if (!active) {
+        throw new AuthAPIError("invalid_flow", 400);
+      }
+      try {
+        await completeEmailProof(() => verifyEmailCode(active, code));
+      } catch (error) {
+        settleEndedEmailFlow(active, error);
+        throw error;
+      }
+    },
+    [completeEmailProof, emailCodeFlow, settleEndedEmailFlow],
+  );
+
+  const resendEmailCode = useCallback(async () => {
+    const active = emailCodeFlow;
+    if (!active) throw new AuthAPIError("invalid_flow", 400);
+    try {
+      setEmailChallenge(await requestEmailCodeResend(active.flow));
+    } catch (error) {
+      settleEndedEmailFlow(active, error);
       throw error;
-    } finally {
-      signInPending.current = false;
+    }
+  }, [emailCodeFlow, settleEndedEmailFlow]);
+
+  const emailCompletionRecoveries = useRef(new Set<string>());
+
+  const refreshEmailCode = useCallback(async () => {
+    const active = emailCodeFlow;
+    if (!active) return;
+    try {
+      const status = await readEmailCodeStatus(active.flow);
+      setEmailChallenge(status);
+      if (status.flowStatus !== "completed" || signInPending.current) return;
+      // A flow settled by another tab of this browser left its session here.
+      if (loadPendingEmailFlow(active.state) === null) {
+        forgetEmailCodeFlow(active);
+        void refreshSession({ background: true });
+        return;
+      }
+      // Still stored and completed: this browser may have lost the completion
+      // response. Recover it once through the server's replay; later polls
+      // leave the session alone, and a manual retry after the window reports
+      // flow_consumed, which ends the flow.
+      if (emailCompletionRecoveries.current.has(active.state)) return;
+      emailCompletionRecoveries.current.add(active.state);
+      if ((await refreshSession({ background: true })) === "authenticated") {
+        forgetEmailCodeFlow(active);
+        return;
+      }
+      await completeEmailProof(() => verifyEmailCode(active, ""));
+    } catch (error) {
+      settleEndedEmailFlow(active, error);
+      throw error;
     }
   }, [
-    isCurrentGeneration,
-    nextGeneration,
-    publishOutcomeNotice,
-    serializeSessionMutation,
+    completeEmailProof,
+    emailCodeFlow,
+    forgetEmailCodeFlow,
+    refreshSession,
+    settleEndedEmailFlow,
   ]);
 
-  const rejectEmailLink = useCallback(() => {
-    rejectEmailLinkAuth();
-    setEmailLinkCallbackPending(false);
-    setCredentialRecoveryEmailSent(false);
+  const cancelEmailCode = useCallback(() => {
+    nextGeneration();
+    if (emailCodeFlow) forgetEmailCodeFlow(emailCodeFlow);
+  }, [emailCodeFlow, forgetEmailCodeFlow, nextGeneration]);
+
+  const inspectEmailLink = useCallback(async () => {
+    const link = pendingEmailLink();
+    if (!link) throw new AuthAPIError("link_invalid", 404);
+    return inspectPendingEmailLink(link);
+  }, []);
+
+  const continueEmailLink = useCallback(
+    async (inspection: EmailLinkInspection, adopt: boolean) => {
+      const link = pendingEmailLink();
+      if (!link) throw new AuthAPIError("link_invalid", 404);
+      await completeEmailProof(() =>
+        completeEmailLinkProof(link, inspection, adopt),
+      );
+    },
+    [completeEmailProof],
+  );
+
+  const dismissEmailLink = useCallback(() => {
+    clearPendingEmailLink();
+    setEmailLinkPending(false);
+    // A proof finished in this tab may have been saved as the active flow.
+    setEmailCodeFlow(loadActiveEmailCodeFlow());
   }, []);
 
   const confirmIntentTransition = useCallback(async () => {
@@ -852,29 +1028,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           0,
         );
       }
-      const idToken = await getIdToken(firebaseUser, true);
-      const refreshed = await resolveAuthFlow({
+      const request = {
         flowId: pending.flowId,
         nonce: pending.nonce,
-        idToken,
-      });
+        idToken: await getIdToken(firebaseUser, true),
+      };
+      const refreshed = await resolveAuthFlow(request);
+      let confirmed: Awaited<ReturnType<typeof confirmAuthFlow>>;
       if (
-        refreshed.outcome !== "confirmation_required" ||
-        refreshed.nextAction !== pending.action ||
-        auth.currentUser?.uid !== pending.firebaseUID
+        pending.provider === "email_code" &&
+        auth.currentUser?.uid === pending.firebaseUID &&
+        (refreshed.outcome === "signed_in" ||
+          refreshed.outcome === "account_created")
       ) {
-        clearPendingConfirmation();
-        setConfirmation(null);
-        throw new AuthAPIError(
-          "Authentication confirmation is no longer valid.",
-          0,
-        );
+        // The email confirmation committed earlier but its session was lost;
+        // this resolve replayed the same completion.
+        confirmed = refreshed;
+      } else {
+        if (
+          refreshed.outcome !== "confirmation_required" ||
+          refreshed.nextAction !== pending.action ||
+          auth.currentUser?.uid !== pending.firebaseUID
+        ) {
+          clearPendingConfirmation();
+          setConfirmation(null);
+          throw new AuthAPIError(
+            "Authentication confirmation is no longer valid.",
+            0,
+          );
+        }
+        confirmed = await confirmAuthFlow({
+          flowId: pending.flowId,
+          nonce: pending.nonce,
+          action: pending.action,
+        });
       }
-      const confirmed = await confirmAuthFlow({
-        flowId: pending.flowId,
-        nonce: pending.nonce,
-        action: pending.action,
-      });
       if (
         !isCurrentGeneration(generation) ||
         auth.currentUser?.uid !== pending.firebaseUID
@@ -908,6 +1096,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
         });
         throw new SumiSessionCompensatedError(identityError);
+      }
+      if (pending.provider === "email_code") {
+        await ensureEmailCompletionSession(request, confirmed);
       }
       const nextSession = await verifyCommittedSumiSession();
       publishOutcomeNotice({
@@ -1159,6 +1350,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [session, sessionState]);
 
+  const emailCode = useMemo<EmailCodeView | null>(
+    () =>
+      emailCodeFlow
+        ? {
+            email: emailCodeFlow.flow.email,
+            intent: emailCodeFlow.flow.intent,
+            recovery: emailCodeFlow.flow.credentialRecovery !== undefined,
+            challenge: emailChallenge,
+          }
+        : null,
+    [emailChallenge, emailCodeFlow],
+  );
+
   const authorityBindingId =
     sessionState === "authenticated" && session.authenticated
       ? session.authorityBindingId
@@ -1177,15 +1381,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       confirmation,
       outcomeNotice,
-      emailLinkCallbackPending,
+      emailCode,
+      emailLinkPending,
       credentialRecoveryEmailSent,
       redirectSignInPending,
       redirectSignInError,
       dismissRedirectSignInError,
       signIn,
-      sendEmailLink,
-      completeEmailLink,
-      rejectEmailLink,
+      startEmailCode,
+      submitEmailCode,
+      resendEmailCode,
+      refreshEmailCode,
+      cancelEmailCode,
+      inspectEmailLink,
+      continueEmailLink,
+      dismissEmailLink,
       confirmIntentTransition,
       cancelIntentTransition,
       dismissOutcomeNotice,
@@ -1198,21 +1408,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authorityBindingId,
       cancelIntentTransition,
       confirmation,
-      completeEmailLink,
+      cancelEmailCode,
       confirmIntentTransition,
+      continueEmailLink,
+      dismissEmailLink,
+      emailCode,
+      emailLinkPending,
+      inspectEmailLink,
       logout,
-      emailLinkCallbackPending,
+      refreshEmailCode,
+      resendEmailCode,
+      startEmailCode,
+      submitEmailCode,
       credentialRecoveryEmailSent,
       dismissOutcomeNotice,
       dismissRedirectSignInError,
       redirectSignInError,
       redirectSignInPending,
-      rejectEmailLink,
       refreshSession,
       session.authenticated,
       sessionState,
       sessionSuspended,
-      sendEmailLink,
       signIn,
       outcomeNotice,
       user,

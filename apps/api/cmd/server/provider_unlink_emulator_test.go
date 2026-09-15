@@ -102,7 +102,7 @@ func TestFirebaseEmulatorUnlinkGuardRequiresLiveEmailFamilyAndSumiProof(t *testi
 	client := firebaseProviderEmulatorClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	uid := firebaseEmulatorID(t, "unlink-guard")
 	email := createFirebaseEmulatorUser(t, client, uid, map[string]string{
 		"google.com": "google-subject", "github.com": "github-subject", "facebook.com": "unsupported-subject",
@@ -164,7 +164,7 @@ func TestFirebaseEmulatorUnlinkReconcilesRemoteAppliedDatabaseLost(t *testing.T)
 	client := firebaseProviderEmulatorClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	uid := firebaseEmulatorID(t, "unlink-reconcile")
 	createFirebaseEmulatorUser(t, client, uid, map[string]string{
 		"google.com": "google-subject", "github.com": "github-subject",
@@ -222,7 +222,7 @@ func TestFirebaseEmulatorLinkNonceReplayCannotEscapePendingUnlinkFence(t *testin
 	client := firebaseProviderEmulatorClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	uid := firebaseEmulatorID(t, "link-replay-fence")
 	createFirebaseEmulatorUser(t, client, uid, map[string]string{
 		"google.com": "google-subject", "github.com": "github-subject",
@@ -291,7 +291,7 @@ func TestFirebaseEmulatorConcurrentUnlinksNeverRemoveLastSupportedMethod(t *test
 	client := firebaseProviderEmulatorClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := koseki.New(pool)
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
 	uid := firebaseEmulatorID(t, "unlink-race")
 	createFirebaseEmulatorUser(t, client, uid, map[string]string{
 		"google.com": "google-subject", "github.com": "github-subject",

@@ -26,7 +26,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const retainedAuth = useRef<AuthContextValue | null>(null);
   const {
     sessionSuspended,
-    emailLinkCallbackPending,
+    emailLinkPending,
     loading,
     redirectSignInPending,
     sessionState,
@@ -71,7 +71,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
       retainedAuth.current = canUseDirectChat ? auth : null;
   }, [auth, canUseDirectChat, sessionSuspended]);
 
-  if (emailLinkCallbackPending) {
+  if (emailLinkPending) {
     return <LoginScreen />;
   }
   const ready = canUseDirectChat && sessionScopeReady && identityMatches;

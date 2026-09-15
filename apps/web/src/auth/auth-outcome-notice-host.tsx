@@ -9,11 +9,11 @@ export function AuthOutcomeNoticeHost() {
   const {
     canUseDirectChat,
     dismissOutcomeNotice,
-    emailLinkCallbackPending,
+    emailLinkPending,
     outcomeNotice,
   } = useAuth();
   const visibleNotice =
-    canUseDirectChat && !emailLinkCallbackPending ? outcomeNotice : null;
+    canUseDirectChat && !emailLinkPending ? outcomeNotice : null;
 
   return (
     <div role="status" aria-live="polite" aria-atomic="true">

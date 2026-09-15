@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -18,12 +20,14 @@ type StartBrowserAuthFlowRequest struct {
 }
 
 type BrowserAuthFlowResult struct {
-	FlowID       string            `json:"flow_id,omitempty"`
-	Outcome      string            `json:"outcome"`
-	NextAction   string            `json:"next_action,omitempty"`
-	Continuation string            `json:"continuation,omitempty"`
-	ExpiresAt    time.Time         `json:"expires_at,omitempty"`
-	Claims       UserSessionClaims `json:"-"`
+	FlowID       string    `json:"flow_id,omitempty"`
+	Outcome      string    `json:"outcome"`
+	NextAction   string    `json:"next_action,omitempty"`
+	Continuation string    `json:"continuation,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	// EmailChallenge describes the first emailed code of an email flow.
+	EmailChallenge *EmailChallengeResult `json:"email_challenge,omitempty"`
+	Claims         UserSessionClaims     `json:"-"`
 }
 
 type ResolveBrowserAuthFlowRequest struct {
@@ -348,7 +352,51 @@ func decodeAuthJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 
 func writeFlowError(w http.ResponseWriter, err error) {
 	status, code := http.StatusBadRequest, "invalid_flow"
+	body := map[string]any{}
+	var mismatch *BrowserEmailCodeMismatchError
+	var limited *BrowserEmailSendLimitedError
 	switch {
+	case errors.As(err, &mismatch):
+		status, code = http.StatusUnprocessableEntity, "code_mismatch"
+		if mismatch.AttemptsRemaining >= 0 {
+			body["attempts_remaining"] = mismatch.AttemptsRemaining
+		}
+	case errors.As(err, &limited):
+		status, code = http.StatusTooManyRequests, "email_send_limited"
+		body["retry_at"] = limited.RetryAt.UTC()
+		seconds := int(math.Ceil(time.Until(limited.RetryAt).Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	case errors.Is(err, ErrBrowserEmailCodeLocked):
+		status, code = http.StatusConflict, "code_locked"
+	case errors.Is(err, ErrBrowserEmailSuperseded):
+		status, code = http.StatusConflict, "email_superseded"
+	case errors.Is(err, ErrBrowserEmailExpired):
+		status, code = http.StatusGone, "email_expired"
+	case errors.Is(err, ErrBrowserEmailConsumed):
+		status, code = http.StatusConflict, "email_consumed"
+	case errors.Is(err, ErrBrowserEmailLinkInvalid):
+		status, code = http.StatusNotFound, "link_invalid"
+	case errors.Is(err, ErrBrowserEmailAdoptionRequired):
+		status, code = http.StatusConflict, "link_adoption_required"
+	case errors.Is(err, ErrBrowserEmailContinuedElsewhere):
+		status, code = http.StatusConflict, "continued_in_other_browser"
+	case errors.Is(err, ErrBrowserEmailUnverifiedAccount):
+		status, code = http.StatusConflict, "email_unverified_account"
+		var unverified *BrowserEmailUnverifiedAccountError
+		if errors.As(err, &unverified) {
+			providers := unverified.SignInProviders
+			if providers == nil {
+				providers = []string{}
+			}
+			body["sign_in_providers"] = providers
+		}
+	case errors.Is(err, ErrBrowserEmailUnavailable):
+		status, code = http.StatusServiceUnavailable, "email_unavailable"
+	case errors.Is(err, ErrBrowserSessionActive):
+		status, code = http.StatusConflict, "session_active"
 	case errors.Is(err, ErrBrowserEnrollmentInvite):
 		status, code = http.StatusForbidden, "invitation_required"
 	case errors.Is(err, ErrBrowserAuthFlowExpired):
@@ -366,5 +414,6 @@ func writeFlowError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrBrowserAuthProviderUnavailable):
 		status, code = http.StatusServiceUnavailable, "provider_unavailable"
 	}
-	writeBrowserAuthJSON(w, status, map[string]string{"error": code})
+	body["error"] = code
+	writeBrowserAuthJSON(w, status, body)
 }

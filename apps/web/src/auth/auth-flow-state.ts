@@ -2,6 +2,9 @@ import type { AuthFlowProvider, AuthIntent } from "./auth-flow-client";
 
 const emailFlowPrefix = "sumi.auth.email-flow.v1.";
 const consumedEmailFlowPrefix = "sumi.auth.email-flow-consumed.v1.";
+// Names the email flow whose code form is open, so a reopened PWA and a link
+// opened in this browser find the same flow authority.
+const activeEmailFlowKey = "sumi.auth.email-flow-active.v1";
 // The provider redirect returns into the same tab. A per-tab receipt keeps
 // the flow nonce out of persistent storage and out of every other tab.
 const redirectFlowKey = "sumi.auth.redirect-flow.v1";
@@ -9,7 +12,6 @@ const credentialCleanupTimers = new Map<
   string,
   ReturnType<typeof globalThis.setTimeout>
 >();
-export const emailFlowStateParameter = "sumi_auth_state";
 
 export interface PendingAuthFlow {
   flowId: string;
@@ -20,9 +22,9 @@ export interface PendingAuthFlow {
 }
 
 export interface PendingEmailAuthFlow extends PendingAuthFlow {
-  provider: "email_link";
+  provider: "email_code";
   email: string;
-  stage: "link_sent" | "firebase_complete";
+  stage: "code_sent";
   workspaceInviteCode?: string;
   credentialRecovery?: PendingCredentialRecovery;
 }
@@ -77,18 +79,32 @@ export function createEmailFlowState(): string {
     .replace(/=+$/, "");
 }
 
-export function emailFlowContinuation(state: string): string {
-  return `/?${emailFlowStateParameter}=${encodeURIComponent(state)}`;
+export function saveActiveEmailFlowState(state: string): void {
+  if (!isEmailFlowState(state)) return;
+  try {
+    localStorage.setItem(activeEmailFlowKey, state);
+  } catch {
+    // The open form keeps its flow in memory for this page lifetime.
+  }
 }
 
-export function emailFlowStateFromLocation(): string | null {
+export function loadActiveEmailFlowState(): string | null {
   try {
-    const state = new URL(globalThis.location.href).searchParams.get(
-      emailFlowStateParameter,
-    );
-    return state && /^[A-Za-z0-9_-]{24}$/.test(state) ? state : null;
+    const state = localStorage.getItem(activeEmailFlowKey);
+    return state && isEmailFlowState(state) ? state : null;
   } catch {
     return null;
+  }
+}
+
+/** Clears the pointer only while it still names the expected flow. */
+export function clearActiveEmailFlowState(expected: string): void {
+  try {
+    if (localStorage.getItem(activeEmailFlowKey) === expected) {
+      localStorage.removeItem(activeEmailFlowKey);
+    }
+  } catch {
+    // A stale pointer resolves to no flow once its record expires.
   }
 }
 
@@ -211,39 +227,16 @@ export function consumePendingCredentialRecovery(
   }
 }
 
-export function clearEmailFlowLocation(): void {
-  try {
-    const url = new URL(globalThis.location.href);
-    url.searchParams.delete(emailFlowStateParameter);
-    for (const parameter of [
-      "apiKey",
-      "oobCode",
-      "mode",
-      "lang",
-      "continueUrl",
-    ]) {
-      url.searchParams.delete(parameter);
-    }
-    history.replaceState(
-      history.state,
-      "",
-      `${url.pathname}${url.search}${url.hash}`,
-    );
-  } catch {
-    // Authentication state remains valid even if the browser blocks history cleanup.
-  }
-}
-
 function isPendingEmailFlow(value: unknown): value is PendingEmailAuthFlow {
   return (
     isPendingFlow(value) &&
-    value.provider === "email_link" &&
+    value.provider === "email_code" &&
     "email" in value &&
     typeof value.email === "string" &&
     value.email.length > 0 &&
     value.email.length <= 320 &&
     "stage" in value &&
-    (value.stage === "link_sent" || value.stage === "firebase_complete") &&
+    value.stage === "code_sent" &&
     (!("workspaceInviteCode" in value) ||
       (typeof value.workspaceInviteCode === "string" &&
         /^[A-Za-z0-9_-]{16,256}$/.test(value.workspaceInviteCode))) &&
@@ -574,7 +567,7 @@ function isPendingFlow(value: unknown): value is PendingAuthFlow {
     "intent" in value &&
     (value.intent === "sign_in" || value.intent === "sign_up") &&
     "provider" in value &&
-    (value.provider === "email_link" ||
+    (value.provider === "email_code" ||
       value.provider === "google.com" ||
       value.provider === "github.com") &&
     "expiresAt" in value &&

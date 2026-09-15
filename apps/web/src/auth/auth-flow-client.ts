@@ -9,7 +9,7 @@ import {
 } from "./session-client";
 
 export type AuthIntent = "sign_in" | "sign_up";
-export type AuthFlowProvider = "email_link" | "google.com" | "github.com";
+export type AuthFlowProvider = "email_code" | "google.com" | "github.com";
 export type AuthConfirmationAction = "create_account" | "sign_in";
 
 export type AuthFlowResult =
@@ -17,6 +17,7 @@ export type AuthFlowResult =
       flowId: string;
       outcome: "proof_required";
       expiresAt: string;
+      emailChallenge?: EmailChallengeStatus;
     }
   | {
       flowId: string;
@@ -31,6 +32,18 @@ export type AuthFlowResult =
       continuation: string;
       expiresAt: string;
     };
+
+/** Sumi email proof state; never contains the code or link token. */
+export interface EmailChallengeStatus {
+  flowId: string;
+  flowStatus: string;
+  email: string;
+  flowExpiresAt: string;
+  challengeExpiresAt: string;
+  attemptsRemaining: number;
+  delivery: "" | "pending" | "sent" | "failed" | "cancelled";
+  resendAvailableAt: string;
+}
 
 export interface StartAuthFlowRequest {
   intent: AuthIntent;
@@ -73,7 +86,7 @@ export async function startAuthFlow(
     continuation: request.continuation,
     nonce: request.nonce,
   };
-  if (request.provider === "email_link") {
+  if (request.provider === "email_code") {
     body.email = request.email ?? "";
   }
   const invitation = readEnrollmentInvitation();
@@ -217,7 +230,12 @@ function parseAuthFlowResult(value: unknown): AuthFlowResult {
   const continuation = optionalString(value.continuation, 2_048);
 
   if (outcome === "proof_required" && expiresAt) {
-    return { flowId, outcome, expiresAt };
+    if (value.email_challenge === undefined) {
+      return { flowId, outcome, expiresAt };
+    }
+    const emailChallenge = parseEmailChallenge(value.email_challenge);
+    if (emailChallenge.flowId !== flowId) invalidResponse();
+    return { flowId, outcome, expiresAt, emailChallenge };
   }
   if (outcome === "confirmation_required") {
     const nextAction = value.next_action;
@@ -237,6 +255,35 @@ function parseAuthFlowResult(value: unknown): AuthFlowResult {
     return { flowId, outcome, continuation, expiresAt };
   }
   return invalidResponse();
+}
+
+export function parseEmailChallenge(value: unknown): EmailChallengeStatus {
+  if (!isObject(value)) invalidResponse();
+  const attempts = value.attempts_remaining;
+  const delivery = value.delivery;
+  if (
+    typeof attempts !== "number" ||
+    !Number.isInteger(attempts) ||
+    attempts < 0 ||
+    attempts > 5 ||
+    (delivery !== "" &&
+      delivery !== "pending" &&
+      delivery !== "sent" &&
+      delivery !== "failed" &&
+      delivery !== "cancelled")
+  ) {
+    invalidResponse();
+  }
+  return {
+    flowId: requiredString(value.flow_id, 256),
+    flowStatus: requiredString(value.flow_status, 64),
+    email: requiredString(value.email, 320),
+    flowExpiresAt: requiredString(value.flow_expires_at, 64),
+    challengeExpiresAt: requiredString(value.challenge_expires_at, 64),
+    attemptsRemaining: attempts,
+    delivery,
+    resendAvailableAt: requiredString(value.resend_available_at, 64),
+  };
 }
 
 function requiredString(value: unknown, maxLength: number): string {

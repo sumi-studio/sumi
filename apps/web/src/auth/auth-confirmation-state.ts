@@ -65,7 +65,7 @@ function isPendingConfirmation(
     "intent" in value &&
     (value.intent === "sign_in" || value.intent === "sign_up") &&
     "provider" in value &&
-    (value.provider === "email_link" ||
+    (value.provider === "email_code" ||
       value.provider === "google.com" ||
       value.provider === "github.com") &&
     "expiresAt" in value &&

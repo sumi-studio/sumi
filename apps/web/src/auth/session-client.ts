@@ -37,13 +37,26 @@ export type SumiSessionStatus =
       user: SumiSessionUser;
     };
 
+export interface AuthAPIErrorDetails {
+  attemptsRemaining?: number;
+  retryAt?: string;
+  /** Providers still linked to an account that email cannot sign in to. */
+  signInProviders?: Array<"google.com" | "github.com">;
+}
+
 export class AuthAPIError extends Error {
   readonly status: number;
+  readonly details: AuthAPIErrorDetails;
 
-  constructor(message: string, status: number) {
+  constructor(
+    message: string,
+    status: number,
+    details: AuthAPIErrorDetails = {},
+  ) {
     super(message);
     this.name = "AuthAPIError";
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -109,7 +122,7 @@ export async function fetchCSRFToken(
 
 export async function postAuthJSON(
   path: `/auth/${string}`,
-  body: Record<string, string>,
+  body: Record<string, string | boolean>,
 ): Promise<unknown> {
   const csrfToken = await fetchCSRFToken();
   const response = await fetch(path, {
@@ -318,16 +331,38 @@ function authRequestSignal(): AbortSignal {
 
 async function authAPIError(response: Response): Promise<AuthAPIError> {
   let message = "Authentication request failed.";
+  const details: AuthAPIErrorDetails = {};
   try {
     const text = await readAuthResponseText(response);
     const body: unknown = JSON.parse(text);
     if (isObject(body) && typeof body.error === "string" && body.error) {
       message = body.error;
     }
+    if (
+      isObject(body) &&
+      Number.isInteger(body.attempts_remaining) &&
+      (body.attempts_remaining as number) >= 0
+    ) {
+      details.attemptsRemaining = body.attempts_remaining as number;
+    }
+    if (
+      isObject(body) &&
+      typeof body.retry_at === "string" &&
+      body.retry_at.length <= 64 &&
+      Number.isFinite(Date.parse(body.retry_at))
+    ) {
+      details.retryAt = body.retry_at;
+    }
+    if (isObject(body) && Array.isArray(body.sign_in_providers)) {
+      details.signInProviders = body.sign_in_providers.filter(
+        (provider: unknown): provider is "google.com" | "github.com" =>
+          provider === "google.com" || provider === "github.com",
+      );
+    }
   } catch {
     // The status remains the useful, non-sensitive failure signal.
   }
-  return new AuthAPIError(message, response.status);
+  return new AuthAPIError(message, response.status, details);
 }
 
 async function readAuthJSON(response: Response): Promise<unknown> {

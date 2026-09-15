@@ -184,6 +184,7 @@ type BrowserAuthServer struct {
 	Connections           BrowserSessionConnectionCloser
 	PushDevices           BrowserPushDevices
 	Flows                 BrowserAuthFlowController
+	EmailFlows            BrowserEmailAuthController
 	Profiles              HumanProfileReader
 	random                io.Reader
 	sessionMu             sync.Mutex
@@ -236,6 +237,13 @@ func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /auth/providers/operations/complete", s.serveCompleteProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/fail", s.serveFailProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/status", s.serveProviderOperationStatus)
+		if s.EmailFlows != nil {
+			mux.HandleFunc("POST /auth/email/verify", s.serveVerifyEmailCode)
+			mux.HandleFunc("POST /auth/email/resend", s.serveResendEmailCode)
+			mux.HandleFunc("POST /auth/email/status", s.serveEmailFlowStatus)
+			mux.HandleFunc("POST /auth/email/link/inspect", s.serveInspectEmailLink)
+			mux.HandleFunc("POST /auth/email/link/complete", s.serveCompleteEmailLink)
+		}
 	}
 	mux.HandleFunc("GET /auth/session", s.serveSessionStatus)
 	mux.HandleFunc("POST /auth/logout", s.serveLogout)
