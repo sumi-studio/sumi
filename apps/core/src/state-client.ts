@@ -96,6 +96,7 @@ export interface StateClient {
       kind: string;
       phase: string;
       turnId?: string;
+      inputId?: string;
       round?: number;
       funding: FundingRef;
       estimate: UsageEstimate;
@@ -119,7 +120,7 @@ export interface StateClient {
       inputId?: string;
       round?: number;
       funding: FundingRef;
-      status: "reported" | "unknown";
+      status: "reported" | "unknown" | "not_sent";
       inputTokens?: number | null;
       outputTokens?: number | null;
       cachedTokens?: number | null;
@@ -265,11 +266,12 @@ export interface StateClient {
   ): Promise<MemoryChunk>;
   /**
    * Return a claimed chunk to the shelf when no model request could be
-   * made — the selected binding is unavailable, or budget admission
-   * denied the call. Records no verdict and spends neither attempts nor
-   * interruptions; not_before applies a short pacing (delayMs, or the
-   * service default) so a persistent condition is not re-claimed every
-   * tick. A funding or model-selection change clears the pacing early.
+   * evaluated — an unbound selection, a missing credential, a
+   * binding-lookup outage, or a denied budget admission. Records no
+   * verdict and spends no attempts or interruptions; the chunk waits out
+   * a short pacing (delayMs, or the service default), then proceeds once
+   * a usable binding exists. A funding or model-selection change clears
+   * budget pacing early.
    */
   reshelveMemoryChunk(
     persona: string,
@@ -480,6 +482,7 @@ export class HttpStateClient implements StateClient {
       kind: string;
       phase: string;
       turnId?: string;
+      inputId?: string;
       round?: number;
       funding: FundingRef;
       estimate: UsageEstimate;
@@ -494,6 +497,7 @@ export class HttpStateClient implements StateClient {
         kind: req.kind,
         phase: req.phase,
         turn_id: req.turnId,
+        input_id: req.inputId,
         round: req.round ?? 0,
         funding: req.funding,
         estimate: req.estimate,
@@ -510,7 +514,7 @@ export class HttpStateClient implements StateClient {
       inputId?: string;
       round?: number;
       funding: FundingRef;
-      status: "reported" | "unknown";
+      status: "reported" | "unknown" | "not_sent";
       inputTokens?: number | null;
       outputTokens?: number | null;
       cachedTokens?: number | null;
@@ -621,18 +625,14 @@ export class HttpStateClient implements StateClient {
       operation: Operation;
       approval: Approval | null;
       fresh: boolean;
-    }>(
-      "POST",
-      `/internal/core/personas/${persona}/operations/claim`,
-      {
-        generation,
-        operation_id: op.operationId,
-        turn_id: op.turnId,
-        tool: op.tool,
-        call_index: op.callIndex,
-        request: op.request,
-      },
-    );
+    }>("POST", `/internal/core/personas/${persona}/operations/claim`, {
+      generation,
+      operation_id: op.operationId,
+      turn_id: op.turnId,
+      tool: op.tool,
+      call_index: op.callIndex,
+      request: op.request,
+    });
   }
   async listApprovals(persona: string, approvalId?: string) {
     if (approvalId) {

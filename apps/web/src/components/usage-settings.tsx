@@ -203,8 +203,13 @@ function SourceCard({
         <div>
           <dt className="text-muted-foreground text-xs">概算コスト</dt>
           <dd>
-            {t.costMinor > 0 && t.currency
-              ? `${majorOf(t.costMinor, t.currency)} ${t.currency}`
+            {Object.keys(t.costs).length > 0
+              ? Object.entries(t.costs)
+                  .map(
+                    ([currency, minor]) =>
+                      `${majorOf(minor, currency)} ${currency}`,
+                  )
+                  .join(" / ")
               : "—"}
           </dd>
         </div>
@@ -233,7 +238,7 @@ function SourceCard({
       {t.unknownCalls > 0 && (
         <p className="mt-2 text-muted-foreground text-xs">
           {t.unknownCalls}
-          回の呼び出しはプロバイダーが利用量を報告しなかったため、集計に含まれません。
+          回の呼び出しは利用量を確認できなかったため、事前の見積もりで計上しています。
         </p>
       )}
       {source.grant && (
@@ -264,10 +269,14 @@ function SourceCard({
                 </span>
                 <span>
                   {f.status === "unknown"
-                    ? "利用量の報告なし"
-                    : f.costMinor !== undefined && f.currency
-                      ? `${majorOf(f.costMinor, f.currency)} ${f.currency}`
-                      : `${(f.inputTokens ?? 0).toLocaleString("ja-JP")}+${(f.outputTokens ?? 0).toLocaleString("ja-JP")}トークン`}
+                    ? "利用量未確認（概算で計上）"
+                    : f.status === "unrecorded"
+                      ? "結果の記録なし（概算で計上）"
+                      : f.status === "not_sent"
+                        ? "未送信"
+                        : f.costMinor !== undefined && f.currency
+                          ? `${majorOf(f.costMinor, f.currency)} ${f.currency}`
+                          : `${(f.inputTokens ?? 0).toLocaleString("ja-JP")}+${(f.outputTokens ?? 0).toLocaleString("ja-JP")}トークン`}
                 </span>
               </li>
             ))}
@@ -413,7 +422,7 @@ function BudgetForm({
         />
       </label>
       <p className="text-muted-foreground text-xs leading-relaxed">
-        単価はプロバイダーの料金表から自分で転記する概算です。上限に達すると新しい呼び出しは止まり、上限を上げるか外すと再開します。
+        単価はプロバイダーの料金表から自分で転記する概算です。上限はこの概算と事前の見積もりで判定され、達すると新しい呼び出しは止まります。実際の請求額とは異なる場合があります。
       </p>
       {localError && (
         <p role="alert" className="text-sm">

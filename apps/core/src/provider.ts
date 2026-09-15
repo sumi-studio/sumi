@@ -59,12 +59,6 @@ export interface ModelRequest {
   /** The input a 'turn' call serves — recorded on its usage fact. */
   inputId?: string;
   /**
-   * The configured maximum output tokens for this call, when one exists.
-   * Metering uses it to say honestly whether admission bounded the call's
-   * spend (bounded) or only further admits (unbounded).
-   */
-  outputTokensBound?: number;
-  /**
    * Which model consultation this is within the turn: 0 is the initial
    * decision; each round whose tool calls have been durably executed is
    * fed back as messages and consulted as the next round.
@@ -87,6 +81,17 @@ export interface ModelProvider {
    * without a selection layer omit it entirely (always assumed usable).
    */
   probe?(): Promise<void>;
+  /**
+   * The maximum output tokens this provider will actually send on the
+   * wire for the next request, when one is configured — the value the
+   * request will carry (e.g. chat `max_tokens`, Responses
+   * `max_output_tokens`, Anthropic `max_tokens`), including adapter
+   * defaults the protocol requires. `undefined` means no wire bound:
+   * metering then admits the call as honestly unbounded rather than
+   * claiming a cap that was never sent. Providers without a configured
+   * bound omit this method.
+   */
+  outputBound?(): number | undefined;
 }
 
 /**
@@ -104,11 +109,11 @@ export interface ModelProvider {
  * temporary working view. It is classified from the provider's own
  * status/code/message, never from a configured context window.
  *
- * `unavailable` marks a failure of the call's *plumbing*, not its content:
- * the model layer could not produce a request at all (no usable binding,
- * missing credential, a selection lookup outage). Nothing about the work
- * was evaluated, so callers that budget per-request verdicts (memory
- * chunk attempts) must treat it as a pause, not a failure.
+ * `unavailable` marks a failure before any model was consulted — an
+ * unusable selection, a failed binding lookup, a missing credential. It
+ * is distinguishable from a genuine evaluated-model failure so callers
+ * that spend budget on model work (memory preparation attempts) can
+ * pause instead of burning an attempt on a configuration gap.
  */
 export class ModelError extends Error {
   readonly retryable: boolean;

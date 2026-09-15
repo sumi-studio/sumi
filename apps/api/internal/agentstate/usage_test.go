@@ -129,7 +129,9 @@ func TestUsageRecordIdempotentAndConflicting(t *testing.T) {
 }
 
 // A call whose provider usage never resolved records 'unknown' — visible
-// in the ledger, never silently zero, and not priced by the rate card.
+// in the ledger, never silently zero — and keeps its admission estimate
+// as explicitly estimated spend: an attempted call may have consumed
+// money, so its hold must not silently restore the allowance.
 func TestUsageUnknownFact(t *testing.T) {
 	s, pool := newStore(t)
 	ctx := context.Background()
@@ -139,6 +141,7 @@ func TestUsageUnknownFact(t *testing.T) {
 	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
 		t.Fatalf("set budget: %v", err)
 	}
+	// 500*1 + 500*2 = 1500 estimated.
 	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-lost", gen, connFunding(conn), 500, 500)); err != nil {
 		t.Fatalf("admit: %v", err)
 	}
@@ -150,12 +153,56 @@ func TestUsageUnknownFact(t *testing.T) {
 	if err != nil || !created || fact.Status != "unknown" {
 		t.Fatalf("record unknown: %+v created=%v err=%v", fact, created, err)
 	}
-	if fact.CostMinor != nil || fact.InputTokens != nil {
-		t.Fatalf("unknown fact must carry no tokens and no fabricated cost: %+v", fact)
+	if fact.InputTokens != nil {
+		t.Fatalf("unknown fact carries no reported tokens: %+v", fact)
+	}
+	if fact.CostMinor == nil || *fact.CostMinor != 1500 ||
+		fact.CostBasis == nil || *fact.CostBasis != "admission_estimate" {
+		t.Fatalf("unknown fact must retain the estimate as uncertain spend: %+v", fact)
+	}
+	// The estimate counts against the cap — repeated unknown calls cannot
+	// cycle the same allowance.
+	spent, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+	if spent != 1500 || held != 0 {
+		t.Fatalf("spent=%d held=%d, want 1500/0", spent, held)
 	}
 	facts, _ := s.ListUsageFacts(ctx, pa, 10)
 	if len(facts) != 1 || facts[0].Status != "unknown" {
 		t.Fatalf("unknown fact inspectable: %+v", facts)
+	}
+}
+
+// A call the core knows was never produced releases its reservation —
+// 'not_sent' is the only path that frees held spend without a report.
+func TestUsageNotSentReleases(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-ns", gen, connFunding(conn), 500, 500)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	fact, created, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-ns", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "not_sent",
+		Quantities: map[string]any{},
+	})
+	if err != nil || !created || fact.Status != "not_sent" || fact.CostMinor != nil {
+		t.Fatalf("not_sent record: %+v created=%v err=%v", fact, created, err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx,
+		`SELECT status FROM usage_reservations WHERE persona_id=$1 AND fact_id='f-ns'`,
+		pa).Scan(&status); err != nil || status != "released" {
+		t.Fatalf("reservation=%q err=%v, want released", status, err)
+	}
+	spent, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+	if spent != 0 || held != 0 {
+		t.Fatalf("spent=%d held=%d after not_sent, want 0/0", spent, held)
 	}
 }
 
@@ -268,7 +315,7 @@ func TestUsageConcurrentAdmitsCannotOverspend(t *testing.T) {
 		t.Fatalf("admitted=%d denied=%d, want 3/%d", admitted, denied, contenders-3)
 	}
 	// Held reservations account for exactly the admitted spend.
-	_, held, err := s.fundingSpend(ctx, s.pool, "connection", conn)
+	_, held, err := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
 	if err != nil || held != 30 {
 		t.Fatalf("held=%d err=%v, want 30", held, err)
 	}
@@ -450,17 +497,18 @@ func TestUsageRecordSurvivesFenceLoss(t *testing.T) {
 	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-fence2", gen1, connFunding(conn), 10, 10)); !errors.Is(err, ErrGenerationFence) {
 		t.Fatalf("old-gen admit err=%v, want ErrGenerationFence", err)
 	}
-	// …but it can still record the spend that already happened.
+	// …but it can still record the spend that already happened. Recovery
+	// already reconciled the lost record into an 'unrecorded' fact; this
+	// late report upgrades it to the provider's actual quantities.
 	in, out := int64(10), int64(4)
-	fact, created, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+	fact, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
 		FactID: "f-fence", Kind: "model_call", Phase: "turn",
 		Funding: connFunding(conn), Status: "reported",
 		InputTokens: &in, OutputTokens: &out, Quantities: map[string]any{},
 	})
-	if err != nil || !created {
-		t.Fatalf("unfenced record: %+v created=%v err=%v", fact, created, err)
+	if err != nil || fact.Status != "reported" {
+		t.Fatalf("unfenced late record: %+v err=%v", fact, err)
 	}
-	// Recovery settled the old generation's reservation against the fact.
 	var status string
 	if err := pool.QueryRow(ctx,
 		`SELECT status FROM usage_reservations WHERE persona_id=$1 AND fact_id='f-fence'`,
@@ -469,20 +517,21 @@ func TestUsageRecordSurvivesFenceLoss(t *testing.T) {
 	}
 }
 
-// An admitted call whose record never lands cannot hold budget headroom
-// forever: turn commit releases this turn's orphans, generation recovery
-// releases a dead writer's.
-func TestUsageOrphanedReservationRelease(t *testing.T) {
+// An admitted call whose record never lands is not released back to the
+// allowance — a lost response does not prove the request never left. Turn
+// commit and generation recovery reconcile the hold into an inspectable
+// 'unrecorded' fact carrying the admission estimate as uncertain spend.
+func TestUsageOrphanedReservationReconciled(t *testing.T) {
 	s, pool := newStore(t)
 	ctx := context.Background()
 	pa, human := boundPersona(t, s, pool)
 	conn := mustConnection(t, pool, human)
 	gen := acquireWriter(t, s, pa, 200*time.Millisecond)
-	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(100)); err != nil {
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
 		t.Fatalf("set budget: %v", err)
 	}
 
-	// Commit-turn release: admitted under turn t-orphan, never recorded.
+	// Commit-turn reconcile: admitted under turn t-orphan, never recorded.
 	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-o",
 		Kind: "message", Payload: map[string]any{"text": "hi"},
 		ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
@@ -503,16 +552,42 @@ func TestUsageOrphanedReservationRelease(t *testing.T) {
 	var status string
 	if err := pool.QueryRow(ctx,
 		`SELECT status FROM usage_reservations WHERE persona_id=$1 AND fact_id='f-orphan'`,
-		pa).Scan(&status); err != nil || status != "released" {
-		t.Fatalf("orphan reservation=%q err=%v, want released", status, err)
+		pa).Scan(&status); err != nil || status != "settled" {
+		t.Fatalf("orphan reservation=%q err=%v, want settled", status, err)
 	}
-	_, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn)
-	if held != 0 {
-		t.Fatalf("held=%d after release, want 0", held)
+	// The hold became an inspectable 'unrecorded' fact (6*1 + 2*2 = 10)
+	// rather than fresh allowance.
+	facts, _ := s.ListUsageFacts(ctx, pa, 10)
+	if len(facts) != 1 || facts[0].Status != "unrecorded" ||
+		facts[0].CostMinor == nil || *facts[0].CostMinor != 10 ||
+		facts[0].CostBasis == nil || *facts[0].CostBasis != "admission_estimate" {
+		t.Fatalf("orphan should be an unrecorded estimated fact: %+v", facts)
+	}
+	spent, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+	if spent != 10 || held != 0 {
+		t.Fatalf("spent=%d held=%d after reconcile, want 10/0", spent, held)
 	}
 
-	// Recovery release: a dead generation's held reservation frees when
-	// the next writer recovers.
+	// A late real report upgrades the unrecorded fact to actual spend.
+	in, out := int64(6), int64(1)
+	fact, _, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-orphan", Kind: "model_call", Phase: "turn", TurnID: "t-orphan",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &in, OutputTokens: &out, Quantities: map[string]any{},
+	})
+	if err != nil || fact.Status != "reported" {
+		t.Fatalf("late report upgrade: %+v err=%v", fact, err)
+	}
+	if fact.CostMinor == nil || *fact.CostMinor != 8 { // 6*1 + 1*2
+		t.Fatalf("upgraded cost=%v, want 8 under the admission card", fact.CostMinor)
+	}
+	spent, _, _ = s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+	if spent != 8 {
+		t.Fatalf("spent=%d after late report, want 8", spent)
+	}
+
+	// Recovery reconcile: a dead generation's held reservation becomes an
+	// 'unrecorded' fact too — never silently released.
 	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-dead", gen, connFunding(conn), 6, 2)); err != nil {
 		t.Fatalf("admit f-dead: %v", err)
 	}
@@ -521,11 +596,81 @@ func TestUsageOrphanedReservationRelease(t *testing.T) {
 	if _, err := s.Recover(ctx, pa, gen2); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	var released string
+	var dead string
 	if err := pool.QueryRow(ctx,
 		`SELECT status FROM usage_reservations WHERE persona_id=$1 AND fact_id='f-dead'`,
-		pa).Scan(&released); err != nil || released != "released" {
-		t.Fatalf("dead-gen reservation=%q err=%v, want released", released, err)
+		pa).Scan(&dead); err != nil || dead != "settled" {
+		t.Fatalf("dead-gen reservation=%q err=%v, want settled", dead, err)
+	}
+	facts, _ = s.ListUsageFacts(ctx, pa, 10)
+	found := false
+	for _, f := range facts {
+		if f.FactID == "f-dead" {
+			found = true
+			if f.Status != "unrecorded" || f.CostMinor == nil || *f.CostMinor != 10 {
+				t.Fatalf("dead-gen fact: %+v, want unrecorded estimate 10", f)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("dead-gen call must be inspectable as an unrecorded fact")
+	}
+}
+
+// A rate or currency change mid-call cannot rewrite the cost basis of a
+// call already admitted — the reservation snapshots the card that priced
+// it — and spend sums never cross currencies.
+func TestUsageSnapshotPricingAndCurrency(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-snap", gen, connFunding(conn), 100, 100)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	// The owner edits the card mid-call: new currency, new rates.
+	jpy := fixtureBudget(5_000)
+	jpy.Currency = "JPY"
+	jpy.RateInputPerMTok = 9_000_000
+	jpy.PricingRevision = "fixture-rates-v2"
+	if _, err := s.SetBudget(ctx, human, "connection", conn, jpy); err != nil {
+		t.Fatalf("edit budget: %v", err)
+	}
+	in, out := int64(100), int64(50)
+	fact, created, err := s.RecordUsage(ctx, pa, UsageRecordRequest{
+		FactID: "f-snap", Kind: "model_call", Phase: "turn",
+		Funding: connFunding(conn), Status: "reported",
+		InputTokens: &in, OutputTokens: &out, Quantities: map[string]any{},
+	})
+	if err != nil || !created {
+		t.Fatalf("record: %+v err=%v", fact, err)
+	}
+	// Priced under the admission card (USD fixture v1): 100*1 + 50*2 = 200.
+	if fact.CostMinor == nil || *fact.CostMinor != 200 ||
+		fact.Currency == nil || *fact.Currency != "USD" ||
+		fact.PricingRevision == nil || *fact.PricingRevision != "fixture-rates-v1" {
+		t.Fatalf("snapshot pricing broken: %+v", fact)
+	}
+	// The JPY budget counts only JPY spend — the USD fact is not
+	// reinterpreted as yen.
+	view, err := s.BudgetView(ctx, "connection", conn)
+	if err != nil || view == nil {
+		t.Fatalf("budget view: %+v err=%v", view, err)
+	}
+	if view.SpentMinor != 0 || view.Currency != "JPY" {
+		t.Fatalf("JPY budget must not count USD spend: %+v", view)
+	}
+	// Totals keep both currencies dimensioned, never one integer.
+	views, err := s.UsageForHuman(ctx, human, 10)
+	if err != nil || len(views) != 1 {
+		t.Fatalf("usage view: %d err=%v", len(views), err)
+	}
+	if views[0].Totals.Costs["USD"] != 200 {
+		t.Fatalf("totals costs: %+v", views[0].Totals.Costs)
 	}
 }
 
@@ -635,7 +780,7 @@ func TestUsageAdmitReplay(t *testing.T) {
 	if err != nil || !r2.Admitted || r2.Reservation.ReservedMinor != r1.Reservation.ReservedMinor {
 		t.Fatalf("replayed admit must return the same hold: %+v err=%v", r2, err)
 	}
-	_, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn)
+	_, held, _ := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
 	if held != r1.Reservation.ReservedMinor {
 		t.Fatalf("held=%d, want single reservation %d", held, r1.Reservation.ReservedMinor)
 	}

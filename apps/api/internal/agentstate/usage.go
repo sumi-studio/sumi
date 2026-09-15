@@ -14,11 +14,15 @@
 //
 // The funding identity recorded on the fact is the one selected at call
 // time — switching connections never reattributes earlier calls. Token
-// categories stay distinct; a call whose usage never arrived is recorded
-// 'unknown', not silently zero. Money is integer minor units with an
-// explicit currency; configured rates are the owner's declared estimate
-// (pricing_revision carries provenance), never presented as a provider
-// bill.
+// categories stay distinct and non-overlapping; a call whose usage never
+// arrived is recorded 'unknown', not silently zero, and retains its
+// admission estimate as explicitly estimated spend so uncertain spend
+// cannot restore the budget it may have consumed. Money is integer minor
+// units dimensioned by currency — spend sums never cross currencies;
+// configured rates are the owner's declared estimate (pricing_revision
+// carries provenance), snapshotted at admission so a mid-call rate or
+// currency change cannot rewrite that call's cost basis, and never
+// presented as a provider bill.
 package agentstate
 
 import (
@@ -26,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -75,6 +80,7 @@ type UsageAdmitRequest struct {
 	Kind       string        `json:"kind"`
 	Phase      string        `json:"phase"`
 	TurnID     string        `json:"turn_id,omitempty"`
+	InputID    string        `json:"input_id,omitempty"`
 	Round      int           `json:"round"`
 	Funding    FundingRef    `json:"funding"`
 	Estimate   UsageEstimate `json:"estimate"`
@@ -124,7 +130,9 @@ type UsageRecordRequest struct {
 	Funding FundingRef `json:"funding"`
 	// Status 'reported' carries the provider's own usage fields;
 	// 'unknown' means the call was attempted but no usage report
-	// resolved — recorded, never silently zero.
+	// resolved — recorded, never silently zero; 'not_sent' asserts no
+	// request was produced after admission (the reservation releases —
+	// nothing was or can be owed).
 	Status       string         `json:"status"`
 	InputTokens  *int64         `json:"input_tokens"`
 	OutputTokens *int64         `json:"output_tokens"`
@@ -170,16 +178,17 @@ type UsageBudget struct {
 	RemainingMinor    int64     `json:"remaining_minor"`
 }
 
-// UsageTotals aggregates a funding source's ledger for display.
+// UsageTotals aggregates a funding source's ledger for display. Costs are
+// per-currency — facts recorded under different rate-card currencies are
+// never summed into one integer.
 type UsageTotals struct {
-	Calls         int64  `json:"calls"`
-	UnknownCalls  int64  `json:"unknown_calls"`
-	UnpricedCalls int64  `json:"unpriced_calls"`
-	InputTokens   int64  `json:"input_tokens"`
-	OutputTokens  int64  `json:"output_tokens"`
-	CachedTokens  int64  `json:"cached_tokens"`
-	CostMinor     int64  `json:"cost_minor"`
-	Currency      string `json:"currency,omitempty"`
+	Calls         int64            `json:"calls"`
+	UnknownCalls  int64            `json:"unknown_calls"`
+	UnpricedCalls int64            `json:"unpriced_calls"`
+	InputTokens   int64            `json:"input_tokens"`
+	OutputTokens  int64            `json:"output_tokens"`
+	CachedTokens  int64            `json:"cached_tokens"`
+	Costs         map[string]int64 `json:"costs"`
 }
 
 // BudgetWaitRow is a parked input's budget-wait record.
@@ -196,46 +205,107 @@ type BudgetWaitRow struct {
 
 const tokensPerMTok = int64(1_000_000)
 
-// priceTokens prices one token category at minor units per million tokens,
-// rounding up so a nonzero cost is never rounded to zero.
-func priceTokens(tokens, ratePerMTok int64) int64 {
-	if tokens <= 0 || ratePerMTok <= 0 {
-		return 0
+// rateSnapshot is the rate card that priced a call — snapshotted onto the
+// reservation at admission so a mid-call rate/currency/budget change
+// cannot rewrite that call's cost basis.
+type rateSnapshot struct {
+	currency      string
+	inputPerMTok  int64
+	outputPerMTok int64
+	cachedPerMTok *int64
+	revision      string
+}
+
+func (b *UsageBudget) snapshot() rateSnapshot {
+	return rateSnapshot{
+		currency:      b.Currency,
+		inputPerMTok:  b.RateInputPerMTok,
+		outputPerMTok: b.RateOutputPerMTok,
+		cachedPerMTok: b.RateCachedPerMTok,
+		revision:      b.PricingRevision,
 	}
-	return (tokens*ratePerMTok + tokensPerMTok - 1) / tokensPerMTok
+}
+
+// priceTokens prices one token category at minor units per million tokens,
+// rounding up so a nonzero cost is never rounded to zero. Arithmetic is
+// overflow-checked — an absurd quantity is an error, never a wrapped sum.
+func priceTokens(tokens, ratePerMTok int64) (int64, error) {
+	if tokens < 0 || ratePerMTok < 0 {
+		return 0, fmt.Errorf("%w: negative token quantity or rate", ErrBadRequest)
+	}
+	if tokens == 0 || ratePerMTok == 0 {
+		return 0, nil
+	}
+	if tokens > (math.MaxInt64-(tokensPerMTok-1))/ratePerMTok {
+		return 0, fmt.Errorf("%w: token/rate product overflows minor units", ErrBadRequest)
+	}
+	return (tokens*ratePerMTok + tokensPerMTok - 1) / tokensPerMTok, nil
+}
+
+// addMinor sums minor units with an overflow check.
+func addMinor(a, b int64) (int64, error) {
+	if a > math.MaxInt64-b {
+		return 0, fmt.Errorf("%w: cost sum overflows minor units", ErrBadRequest)
+	}
+	return a + b, nil
 }
 
 // priceEstimate prices an admission estimate against the rate card.
-func priceEstimate(est UsageEstimate, b *UsageBudget) (int64, bool) {
-	needed := priceTokens(est.InputTokens, b.RateInputPerMTok)
+func priceEstimate(est UsageEstimate, card rateSnapshot) (int64, bool, error) {
+	needed, err := priceTokens(est.InputTokens, card.inputPerMTok)
+	if err != nil {
+		return 0, false, err
+	}
 	bounded := est.OutputTokensBound != nil
 	if bounded {
-		needed += priceTokens(*est.OutputTokensBound, b.RateOutputPerMTok)
+		out, err := priceTokens(*est.OutputTokensBound, card.outputPerMTok)
+		if err != nil {
+			return 0, false, err
+		}
+		if needed, err = addMinor(needed, out); err != nil {
+			return 0, false, err
+		}
 	}
-	return needed, bounded
+	return needed, bounded, nil
 }
 
-// priceReported prices reported usage. Cached input bills at the cached
-// rate when one is configured, else at the input rate. Returns (0,false)
-// when the fact is not priceable — never a fabricated zero-cost bill.
-func priceReported(req UsageRecordRequest, b *UsageBudget) (int64, bool) {
+// priceReported prices reported usage additively over the normalized
+// (non-overlapping) categories: input_tokens excludes cached_tokens, so
+// nothing is subtracted and cache tokens are never double-counted. Cached
+// input bills at the cached rate when one is configured, else the input
+// rate. Returns ok=false when the fact is not priceable — never a
+// fabricated zero-cost bill.
+func priceReported(req UsageRecordRequest, card rateSnapshot) (int64, bool, error) {
 	if req.Status != "reported" || req.InputTokens == nil || req.OutputTokens == nil {
-		return 0, false
+		return 0, false, nil
 	}
 	cached := int64(0)
 	if req.CachedTokens != nil {
 		cached = *req.CachedTokens
-		if cached > *req.InputTokens {
-			cached = *req.InputTokens
-		}
 	}
-	cachedRate := b.RateInputPerMTok
-	if b.RateCachedPerMTok != nil {
-		cachedRate = *b.RateCachedPerMTok
+	cachedRate := card.inputPerMTok
+	if card.cachedPerMTok != nil {
+		cachedRate = *card.cachedPerMTok
 	}
-	return priceTokens(*req.InputTokens-cached, b.RateInputPerMTok) +
-		priceTokens(cached, cachedRate) +
-		priceTokens(*req.OutputTokens, b.RateOutputPerMTok), true
+	cost, err := priceTokens(*req.InputTokens, card.inputPerMTok)
+	if err != nil {
+		return 0, false, err
+	}
+	c, err := priceTokens(cached, cachedRate)
+	if err != nil {
+		return 0, false, err
+	}
+	if cost, err = addMinor(cost, c); err != nil {
+		return 0, false, err
+	}
+	o, err := priceTokens(*req.OutputTokens, card.outputPerMTok)
+	if err != nil {
+		return 0, false, err
+	}
+	if cost, err = addMinor(cost, o); err != nil {
+		return 0, false, err
+	}
+	return cost, true, nil
 }
 
 // budgetForFunding reads the configured cap, if any, for one funding source.
@@ -280,20 +350,22 @@ func (s *Store) budgetForFundingLocked(ctx context.Context, tx pgx.Tx, kind, id 
 }
 
 // fundingSpend returns (spent, held) minor units against one funding
-// source: settled facts' recorded cost plus in-flight reservations.
-func (s *Store) fundingSpend(ctx context.Context, db queryRower, kind, id string) (int64, int64, error) {
+// source in one currency: settled facts' recorded cost plus in-flight
+// reservations. Spend is currency-dimensioned — a rate-card currency
+// change never reinterprets earlier facts as the new unit. Both sums are
+// read in one statement so a settlement committing between them cannot be
+// missed (read-committed statement snapshot).
+func (s *Store) fundingSpend(ctx context.Context, db queryRower, kind, id, currency string) (int64, int64, error) {
 	var spent, held int64
-	if err := db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(cost_minor), 0) FROM usage_facts
-		WHERE funding_kind = $1 AND funding_id = $2`, kind, id).Scan(&spent); err != nil {
-		return 0, 0, err
-	}
-	if err := db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(reserved_minor), 0) FROM usage_reservations
-		WHERE funding_kind = $1 AND funding_id = $2 AND status = 'held'`, kind, id).Scan(&held); err != nil {
-		return 0, 0, err
-	}
-	return spent, held, nil
+	err := db.QueryRow(ctx, `
+		SELECT
+			(SELECT COALESCE(SUM(cost_minor), 0) FROM usage_facts
+				WHERE funding_kind = $1 AND funding_id = $2 AND currency = $3),
+			(SELECT COALESCE(SUM(reserved_minor), 0) FROM usage_reservations
+				WHERE funding_kind = $1 AND funding_id = $2 AND status = 'held'
+					AND currency = $3)`,
+		kind, id, currency).Scan(&spent, &held)
+	return spent, held, err
 }
 
 // fundingAllowed verifies the persona may spend this funding source:
@@ -394,19 +466,23 @@ func (s *Store) AdmitUsage(ctx context.Context, personaID string, req UsageAdmit
 		return res, err
 	}
 	var needed, reserved int64
-	var currency string
+	var card *rateSnapshot
 	bounded := req.Estimate.OutputTokensBound != nil
 	if budget != nil {
+		snap := budget.snapshot()
+		card = &snap
 		var b bool
-		needed, b = priceEstimate(req.Estimate, budget)
-		bounded = b
-		reserved = needed
-		currency = budget.Currency
-		spent, held, err := s.fundingSpend(ctx, tx, req.Funding.Kind, req.Funding.ID)
+		needed, b, err = priceEstimate(req.Estimate, *card)
 		if err != nil {
 			return res, err
 		}
-		if spent+held+needed > budget.LimitMinor {
+		bounded = b
+		reserved = needed
+		spent, held, err := s.fundingSpend(ctx, tx, req.Funding.Kind, req.Funding.ID, budget.Currency)
+		if err != nil {
+			return res, err
+		}
+		if needed > budget.LimitMinor || spent+held > budget.LimitMinor-needed {
 			res.Admitted = false
 			res.Wait = &BudgetWait{
 				Funding:         req.Funding,
@@ -425,20 +501,39 @@ func (s *Store) AdmitUsage(ctx context.Context, personaID string, req UsageAdmit
 			return res, nil
 		}
 	}
+	var cardInput, cardOutput, cardCached, estBound, estInput any
+	var cardRevision string
+	if card != nil {
+		cardInput, cardOutput, cardRevision = card.inputPerMTok, card.outputPerMTok, card.revision
+		if card.cachedPerMTok != nil {
+			cardCached = *card.cachedPerMTok
+		}
+	}
+	if req.Estimate.OutputTokensBound != nil {
+		estBound = *req.Estimate.OutputTokensBound
+	}
+	estInput = req.Estimate.InputTokens
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO usage_reservations
-			(persona_id, fact_id, funding_kind, funding_id, reserved_minor,
-			 currency, bounded, generation, turn_id, phase, status)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, NULLIF($9, ''), $10, 'held')`,
-		personaID, req.FactID, req.Funding.Kind, req.Funding.ID, reserved,
-		currency, bounded, req.Generation, req.TurnID, req.Phase); err != nil {
+			(persona_id, fact_id, kind, phase, turn_id, input_id, round,
+			 funding_kind, funding_id, funding, reserved_minor, currency,
+			 bounded, est_input_tokens, est_output_bound,
+			 rate_input_per_mtok, rate_output_per_mtok, rate_cached_per_mtok,
+			 pricing_revision, generation, status)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7,
+			$8, $9, $10, $11, NULLIF($12, ''), $13, $14, $15,
+			$16, $17, $18, NULLIF($19, ''), $20, 'held')`,
+		personaID, req.FactID, req.Kind, req.Phase, req.TurnID, req.InputID, req.Round,
+		req.Funding.Kind, req.Funding.ID, fundingSnapshot(req.Funding), reserved,
+		cardCurrency(card), bounded, estInput, estBound,
+		cardInput, cardOutput, cardCached, cardRevision, req.Generation); err != nil {
 		return res, dataErr(err)
 	}
 	res.Admitted = true
 	res.Reservation = &UsageReservation{
 		FactID:        req.FactID,
 		ReservedMinor: reserved,
-		Currency:      currency,
+		Currency:      cardCurrency(card),
 		Bounded:       bounded,
 		Status:        "held",
 	}
@@ -446,6 +541,13 @@ func (s *Store) AdmitUsage(ctx context.Context, personaID string, req UsageAdmit
 		return res, err
 	}
 	return res, nil
+}
+
+func cardCurrency(card *rateSnapshot) string {
+	if card == nil {
+		return ""
+	}
+	return card.currency
 }
 
 // budgetFits reports whether needed minor units fit the funding source's
@@ -459,11 +561,11 @@ func (s *Store) budgetFits(ctx context.Context, db queryRower, kind, id string, 
 	if budget == nil {
 		return true, nil
 	}
-	spent, held, err := s.fundingSpend(ctx, db, kind, id)
+	spent, held, err := s.fundingSpend(ctx, db, kind, id, budget.Currency)
 	if err != nil {
 		return false, err
 	}
-	return spent+held+needed <= budget.LimitMinor, nil
+	return needed <= budget.LimitMinor && spent+held <= budget.LimitMinor-needed, nil
 }
 
 var factCols = `persona_id, fact_id, kind, phase, turn_id, input_id, round,
@@ -520,8 +622,8 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 	if req.FactID == "" || req.Kind == "" || req.Phase == "" {
 		return fact, false, fmt.Errorf("%w: fact_id, kind and phase are required", ErrBadRequest)
 	}
-	if req.Status != "reported" && req.Status != "unknown" {
-		return fact, false, fmt.Errorf("%w: status must be reported or unknown", ErrBadRequest)
+	if req.Status != "reported" && req.Status != "unknown" && req.Status != "not_sent" {
+		return fact, false, fmt.Errorf("%w: status must be reported, unknown or not_sent", ErrBadRequest)
 	}
 	if hasNUL(req.Quantities) {
 		return fact, false, fmt.Errorf("%w: quantities cannot contain NUL", ErrBadRequest)
@@ -532,40 +634,76 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Funding authority: a matching reservation (any status) proves the
-	// call was admitted under this funding when it was selected — it
-	// stays attributable even if the connection was since deleted. With
-	// no reservation the funding must validate as the persona's own now,
-	// so a persona cannot attribute fabricated spend to another human's
-	// funding source.
-	var reserved bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM usage_reservations
-			WHERE persona_id = $1 AND fact_id = $2
-			  AND funding_kind = $3 AND funding_id = $4
-		)`, personaID, req.FactID, req.Funding.Kind, req.Funding.ID).Scan(&reserved); err != nil {
+	// The reservation row carries the admission-time pricing snapshot —
+	// lock it so settlement and a concurrent record of the same fact_id
+	// serialize, and so the fact is priced under the card that admitted
+	// the call even if the budget was edited or removed mid-call.
+	var res struct {
+		fundingKind, fundingID string
+		reserved               int64
+		currency               *string
+		rateIn, rateOut        *int64
+		rateCached             *int64
+		revision               *string
+	}
+	var hasRes bool
+	err = tx.QueryRow(ctx, `
+		SELECT funding_kind, funding_id, reserved_minor, currency,
+			rate_input_per_mtok, rate_output_per_mtok, rate_cached_per_mtok,
+			pricing_revision
+		FROM usage_reservations
+		WHERE persona_id = $1 AND fact_id = $2 FOR UPDATE`,
+		personaID, req.FactID).Scan(
+		&res.fundingKind, &res.fundingID, &res.reserved, &res.currency,
+		&res.rateIn, &res.rateOut, &res.rateCached, &res.revision)
+	switch {
+	case err == nil:
+		hasRes = true
+	case errors.Is(err, pgx.ErrNoRows):
+	default:
 		return fact, false, err
 	}
+
+	// Funding authority: a matching reservation proves the call was
+	// admitted under this funding when it was selected — it stays
+	// attributable even if the connection was since deleted. With no
+	// reservation the funding must validate as the persona's own now, so
+	// a persona cannot attribute fabricated spend to another human's
+	// funding source.
+	reserved := hasRes && res.fundingKind == req.Funding.Kind && res.fundingID == req.Funding.ID
 	if !reserved {
 		if err := s.fundingAllowed(ctx, tx, personaID, req.Funding); err != nil {
 			return fact, false, err
 		}
 	}
 
-	budget, err := s.budgetForFunding(ctx, tx, req.Funding.Kind, req.Funding.ID)
+	// Rate card for this record: the admission snapshot when the call was
+	// admitted under a configured budget; else the current budget (an
+	// unadmitted record path); else unpriced.
+	var card *rateSnapshot
+	if hasRes && res.currency != nil && res.rateIn != nil && res.rateOut != nil {
+		card = &rateSnapshot{
+			currency:      *res.currency,
+			inputPerMTok:  *res.rateIn,
+			outputPerMTok: *res.rateOut,
+			cachedPerMTok: res.rateCached,
+		}
+		if res.revision != nil {
+			card.revision = *res.revision
+		}
+	} else {
+		budget, err := s.budgetForFunding(ctx, tx, req.Funding.Kind, req.Funding.ID)
+		if err != nil {
+			return fact, false, err
+		}
+		if budget != nil {
+			snap := budget.snapshot()
+			card = &snap
+		}
+	}
+	costMinor, currency, basis, revision, err := priceRecord(req, card, hasRes, res.reserved)
 	if err != nil {
 		return fact, false, err
-	}
-	var costMinor *int64
-	var currency, basis, revision *string
-	if budget != nil {
-		if priced, ok := priceReported(req, budget); ok {
-			costMinor = &priced
-			currency = &budget.Currency
-			basis = ptrString("configured_rates")
-			revision = &budget.PricingRevision
-		}
 	}
 	if req.Quantities == nil {
 		req.Quantities = map[string]any{}
@@ -591,10 +729,45 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 		if err != nil {
 			return fact, false, err
 		}
-		if !factMatches(*existing, req) {
+		if !sameCallIdentity(*existing, req) {
 			return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
 		}
-		fact = *existing
+		// Upgrade lattice: 'unrecorded' and 'unknown' facts can still be
+		// superseded by the call's real report — the admission estimate is
+		// replaced by actual priced spend, or cleared when the reporter
+		// asserts the request never left. 'reported' and 'not_sent' are
+		// terminal: only an identical payload replays.
+		switch existing.Status {
+		case "reported", "not_sent":
+			if !factMatches(*existing, req) {
+				return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
+			}
+			fact = *existing
+		case "unknown":
+			if factMatches(*existing, req) {
+				fact = *existing
+				break
+			}
+			fallthrough
+		case "unrecorded":
+			if req.Status != "reported" && req.Status != "unknown" && req.Status != "not_sent" {
+				return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
+			}
+			fact, err = scanFact(tx.QueryRow(ctx, `
+				UPDATE usage_facts SET
+					status = $3, input_tokens = $4, output_tokens = $5,
+					cached_tokens = $6, quantities = $7,
+					cost_minor = $8, currency = $9, cost_basis = $10,
+					pricing_revision = $11
+				WHERE persona_id = $1 AND fact_id = $2
+				RETURNING `+factCols,
+				personaID, req.FactID, req.Status,
+				req.InputTokens, req.OutputTokens, req.CachedTokens, req.Quantities,
+				costMinor, currency, basis, revision))
+			if err != nil {
+				return fact, false, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return fact, false, err
 		}
@@ -603,12 +776,18 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 		return fact, false, dataErr(err)
 	}
 	// The reservation for this call settles — its hold becomes the fact's
-	// recorded cost. An already-released orphan stays released (recovery
-	// freed it); the fact still counts in spent either way.
+	// recorded cost. A 'not_sent' report releases the hold entirely: the
+	// core asserts no request was produced. An already-reconciled
+	// reservation (its 'unrecorded' fact just got upgraded by this late
+	// report) stays settled — the fact now carries the actual spend.
+	newStatus := "settled"
+	if req.Status == "not_sent" {
+		newStatus = "released"
+	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE usage_reservations SET status = 'settled', settled_at = now()
+		UPDATE usage_reservations SET status = $3, settled_at = now()
 		WHERE persona_id = $1 AND fact_id = $2 AND status = 'held'`,
-		personaID, req.FactID); err != nil {
+		personaID, req.FactID, newStatus); err != nil {
 		return fact, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -617,7 +796,62 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 	return fact, true, nil
 }
 
+// priceRecord derives the fact's cost fields from the rate card and the
+// call's admission state:
+//
+//	reported   — priced under the card ('configured_rates').
+//	unknown    — the admission estimate is retained as uncertain spend
+//	             ('admission_estimate') when a priced reservation exists:
+//	             an attempted call whose usage never resolved does not
+//	             restore budget it may already have consumed.
+//	not_sent   — unpriced; the reservation releases.
+//	no card    — unpriced; there is nothing honest to charge against.
+func priceRecord(req UsageRecordRequest, card *rateSnapshot, hasRes bool, reserved int64) (costMinor *int64, currency, basis, revision *string, err error) {
+	switch req.Status {
+	case "reported":
+		if card == nil {
+			return nil, nil, nil, nil, nil
+		}
+		priced, ok, err := priceReported(req, *card)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		if !ok {
+			return nil, nil, nil, nil, nil
+		}
+		return &priced, &card.currency, ptrString("configured_rates"), &card.revision, nil
+	case "unknown":
+		if hasRes && card != nil && card.currency != "" {
+			return &reserved, &card.currency, ptrString("admission_estimate"), &card.revision, nil
+		}
+		return nil, nil, nil, nil, nil
+	case "not_sent":
+		return nil, nil, nil, nil, nil
+	}
+	return nil, nil, nil, nil, nil
+}
+
 func ptrString(s string) *string { return &s }
+
+// sameCallIdentity reports whether the stored fact and the request
+// describe the same logical call — the identity fields a reporter may
+// never change (status/tokens can still upgrade under the lattice).
+func sameCallIdentity(f UsageFact, req UsageRecordRequest) bool {
+	var turnID, inputID string
+	var round int
+	if f.TurnID != nil {
+		turnID = *f.TurnID
+	}
+	if f.InputID != nil {
+		inputID = *f.InputID
+	}
+	if f.Round != nil {
+		round = *f.Round
+	}
+	return f.Kind == req.Kind && f.Phase == req.Phase &&
+		turnID == req.TurnID && inputID == req.InputID && round == req.Round &&
+		f.Funding.Kind == req.Funding.Kind && f.Funding.ID == req.Funding.ID
+}
 
 // factMatches compares a redelivery to the stored fact on the fields a
 // caller could not legitimately change — identical means same fact.
@@ -863,7 +1097,7 @@ func (s *Store) BudgetView(ctx context.Context, kind, id string) (*UsageBudget, 
 	if err != nil || b == nil {
 		return b, err
 	}
-	spent, held, err := s.fundingSpend(ctx, s.pool, kind, id)
+	spent, held, err := s.fundingSpend(ctx, s.pool, kind, id, b.Currency)
 	if err != nil {
 		return nil, err
 	}
@@ -883,7 +1117,7 @@ func (s *Store) ResumeWaitsForFunding(ctx context.Context, kind, id string) (int
 		return 0, err
 	}
 	if budget != nil {
-		spent, held, err := s.fundingSpend(ctx, s.pool, kind, id)
+		spent, held, err := s.fundingSpend(ctx, s.pool, kind, id, budget.Currency)
 		if err != nil {
 			return 0, err
 		}
@@ -1129,19 +1363,39 @@ func (s *Store) usageTotals(ctx context.Context, kind, id string) (UsageTotals, 
 	var t UsageTotals
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*),
-			COUNT(*) FILTER (WHERE status = 'unknown'),
+			COUNT(*) FILTER (WHERE status IN ('unknown','unrecorded')),
 			COUNT(*) FILTER (WHERE cost_minor IS NULL),
 			COALESCE(SUM(input_tokens), 0),
 			COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(cached_tokens), 0),
-			COALESCE(SUM(cost_minor), 0),
-			COALESCE((ARRAY_AGG(currency ORDER BY recorded_at DESC)
-				FILTER (WHERE currency IS NOT NULL))[1], '')
+			COALESCE(SUM(cached_tokens), 0)
 		FROM usage_facts WHERE funding_kind = $1 AND funding_id = $2`,
 		kind, id).Scan(&t.Calls, &t.UnknownCalls, &t.UnpricedCalls,
-		&t.InputTokens, &t.OutputTokens, &t.CachedTokens,
-		&t.CostMinor, &t.Currency)
-	return t, err
+		&t.InputTokens, &t.OutputTokens, &t.CachedTokens)
+	if err != nil {
+		return t, err
+	}
+	// Spend is currency-dimensioned: facts recorded under different
+	// rate-card currencies are reported per currency, never summed into
+	// one integer.
+	rows, err := s.pool.Query(ctx, `
+		SELECT currency, SUM(cost_minor) FROM usage_facts
+		WHERE funding_kind = $1 AND funding_id = $2
+			AND cost_minor IS NOT NULL AND currency IS NOT NULL
+		GROUP BY currency`, kind, id)
+	if err != nil {
+		return t, err
+	}
+	defer rows.Close()
+	t.Costs = map[string]int64{}
+	for rows.Next() {
+		var ccy string
+		var sum int64
+		if err := rows.Scan(&ccy, &sum); err != nil {
+			return t, err
+		}
+		t.Costs[ccy] = sum
+	}
+	return t, rows.Err()
 }
 
 // recentFactsForFunding lists recent facts for one owned funding source.
@@ -1173,29 +1427,52 @@ func (s *Store) FactsForFunding(ctx context.Context, humanID, kind, id string, l
 	return s.recentFactsForFunding(ctx, kind, id, clampLimit(limit, 50, 200))
 }
 
-// releaseOrphanedReservations frees holds whose facts never landed. A held
-// reservation with no usage_facts row is an admit whose record call died
-// (or whose call never ran); settling one whose fact exists is just
-// bookkeeping repair. Called inside the turn-commit transaction for the
-// committing turn, and at recovery for dead generations.
-func releaseOrphanedReservations(ctx context.Context, tx pgx.Tx, personaID string, turnID string, belowGeneration *int64) error {
-	query := `
-		UPDATE usage_reservations r SET
-			status = CASE WHEN EXISTS (
-					SELECT 1 FROM usage_facts f
-					WHERE f.persona_id = r.persona_id AND f.fact_id = r.fact_id
-				) THEN 'settled' ELSE 'released' END,
-			settled_at = now()
-		WHERE r.persona_id = $1 AND r.status = 'held'`
+// reconcileHeldReservations resolves holds whose facts never landed. A
+// held reservation with no usage_facts row is an admit whose provider call
+// may already have consumed money or still be running remotely — a lost
+// response does not prove the request never left. It is NOT released back
+// to the allowance: reconciliation writes an inspectable 'unrecorded' fact
+// carrying the admission estimate as 'admission_estimate' spend (no cost
+// when the call was admitted under no configured budget), then settles the
+// hold. A later real report for the same fact_id upgrades the row under
+// the record lattice. A call the core knows was never sent reports
+// 'not_sent' and releases instead — this path cannot make that claim.
+// Called inside the turn-commit transaction for the committing turn, and
+// at recovery for dead generations.
+func reconcileHeldReservations(ctx context.Context, tx pgx.Tx, personaID string, turnID string, belowGeneration *int64) error {
+	where := `r.persona_id = $1 AND r.status = 'held'`
 	args := []any{personaID}
 	if turnID != "" {
 		args = append(args, turnID)
-		query += ` AND r.turn_id = $2`
+		where += fmt.Sprintf(" AND r.turn_id = $%d", len(args))
 	}
 	if belowGeneration != nil {
 		args = append(args, *belowGeneration)
-		query += fmt.Sprintf(" AND r.generation < $%d", len(args))
+		where += fmt.Sprintf(" AND r.generation < $%d", len(args))
 	}
-	_, err := tx.Exec(ctx, query, args...)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO usage_facts
+			(persona_id, fact_id, kind, phase, turn_id, input_id, round,
+			 funding_kind, funding_id, funding, status,
+			 cost_minor, currency, cost_basis, pricing_revision)
+		SELECT r.persona_id, r.fact_id, r.kind, r.phase, r.turn_id,
+			r.input_id, r.round, r.funding_kind, r.funding_id, r.funding,
+			'unrecorded',
+			CASE WHEN r.currency IS NOT NULL THEN r.reserved_minor END,
+			r.currency,
+			CASE WHEN r.currency IS NOT NULL THEN 'admission_estimate' END,
+			r.pricing_revision
+		FROM usage_reservations r
+		WHERE `+where+`
+			AND NOT EXISTS (
+				SELECT 1 FROM usage_facts f
+				WHERE f.persona_id = r.persona_id AND f.fact_id = r.fact_id
+			)
+		ON CONFLICT (persona_id, fact_id) DO NOTHING`, args...); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE usage_reservations r SET status = 'settled', settled_at = now()
+		WHERE `+where, args...)
 	return err
 }

@@ -224,6 +224,8 @@ async function main() {
       SUMI_DB_URL: DB_URL,
       SUMI_CORE_STATE_TOKEN: ADMIN,
       SUMI_STATE_LISTEN: `127.0.0.1:${PORT}`,
+      // Arms the connection store so a seeded api_key reaches the binding.
+      SUMI_MODEL_CONNECTION_KEY: Buffer.alloc(32, 7).toString("base64"),
     },
     stdio: ["ignore", svcOut, svcOut],
   });
@@ -263,10 +265,10 @@ async function main() {
   // 1 unit per input token, 2 per output token; no cached rate configured,
   // so cached input bills at the input rate:
   // (1000-400)*1 + 400*1 + 200*2 = 1400 units per reported call.
-  const setBudget = (limit) =>
+  const setBudget = (limit, kind = "operator", id = "env") =>
     req("PUT", "/internal/dev/usage-budgets", ADMIN, {
-      funding_kind: "operator",
-      funding_id: "env",
+      funding_kind: kind,
+      funding_id: id,
       limit_minor: limit,
       currency: "USD",
       rate_input_per_mtok: 1_000_000,
@@ -338,10 +340,12 @@ async function main() {
       f.funding,
     );
     assert.equal(f.status, "reported");
-    assert.equal(f.input_tokens, 1000);
+    // Normalized non-overlapping categories: the wire's prompt_tokens
+    // (1000) INCLUDES the cached subset (400) — input records 600.
+    assert.equal(f.input_tokens, 600);
     assert.equal(f.output_tokens, 200);
     assert.equal(f.cached_tokens, 400);
-    // (1000-400)*1 + 400*1 + 200*2 = 1400 units — cached priced at the
+    // 600*1 + 400*1 + 200*2 = 1400 units — cached priced at the
     // input rate (no cached rate configured).
     assert.equal(f.cost_minor, 1400, "priced by fixture rates");
     assert.equal(f.currency, "USD");
@@ -365,7 +369,7 @@ async function main() {
     round: f1.round ?? 0,
     funding: f1.funding,
     status: "reported",
-    input_tokens: 1000,
+    input_tokens: 600,
     output_tokens: 200,
     cached_tokens: 400,
     quantities: {},
@@ -444,22 +448,117 @@ async function main() {
     "parked input resumes after budget increase",
   );
   assert.equal(await inputStatus(blockedId), "done");
+  // The resumed call records exactly one fact, on its own input — a
+  // memory-phase fact may land concurrently, so match the call, not a
+  // count.
   await waitFor(
-    async () => (await facts()).length === fs.length + 1,
-    "the resumed call records exactly one more fact",
+    async () =>
+      (await facts()).filter((f) => f.input_id === blockedId).length === 1,
+    "the resumed call records its one fact",
   );
   log("resumed without duplication");
 
   // --- 6: a call with no usage report records 'unknown' ---------------------
+  // Under a configured card the unresolvable call keeps its admission
+  // estimate as uncertain spend — 'admission_estimate', inspectable,
+  // never silently zero and never releasing the hold back as allowance.
   writeFileSync(join(DIR, "drop-usage"), "");
   await say("usage mystery four");
   fs = await facts();
   const unknown = fs.at(-1);
   assert.equal(unknown.status, "unknown", "unreported usage is inspectable");
   assert.equal(unknown.input_tokens, null);
-  assert.equal(unknown.cost_minor, null, "unknown is never billed as zero");
+  assert.equal(unknown.cost_basis, "admission_estimate");
+  assert.ok(unknown.cost_minor > 0, "the reserved estimate stays spent");
   assert.ok(providerRequests() > before, "the call really ran");
   rmSync(join(DIR, "drop-usage"));
+
+  // --- 7: a selected connection funds the call that selected it -------------
+  // A human-owned api connection — the fact attributes to the connection
+  // chosen at call time, not the operator fallback.
+  const human = uuidv7();
+  let r = await req("POST", "/internal/dev/humans", ADMIN, { human_id: human });
+  check(r.status === 201, `seed human ${r.status}`, r.text);
+  const connIds = [];
+  for (const name of ["fixture-conn-1", "fixture-conn-2"]) {
+    r = await req("POST", "/internal/dev/model-connections", ADMIN, {
+      human_id: human,
+      name,
+      preset: "openai-chat",
+      base_url: `http://127.0.0.1:${stubPort}`,
+      model: "fixture-model",
+      api_key: `fixture-key-${name}`,
+    });
+    check(r.status === 201, `seed connection ${r.status}`, r.text);
+    connIds.push(r.json.connection_id);
+    b = await setBudget(1_000_000, "connection", r.json.connection_id);
+    check(b.status === 200, `seed conn budget ${b.status}`, b.text);
+  }
+  const [conn1, conn2] = connIds;
+  const select = (id) =>
+    req("POST", "/internal/dev/model-selections", ADMIN, {
+      human_id: human,
+      kind: "api",
+      connection_id: id,
+    });
+  r = await select(conn1);
+  check(r.status === 200, `select conn1 ${r.status}`, r.text);
+  r = await req("POST", `${P}/bind`, ADMIN, { human_id: human });
+  check(r.status === 200, `bind persona ${r.status}`, r.text);
+
+  await say("usage conn one");
+  fs = await facts();
+  const connFact = fs.at(-1);
+  assert.equal(connFact.funding.kind, "connection", "connection funding");
+  assert.equal(connFact.funding.id, conn1);
+  assert.equal(connFact.cost_minor, 1400);
+  assert.equal(connFact.currency, "USD");
+
+  // --- 8: a connection switch attributes the next call, never rewrites the old
+  r = await select(conn2);
+  check(r.status === 200, `select conn2 ${r.status}`, r.text);
+  await say("usage conn two");
+  fs = await facts();
+  const conn2Fact = fs.at(-1);
+  assert.equal(conn2Fact.funding.id, conn2, "new call attributes to conn-2");
+  assert.equal(
+    fs.find((f) => f.fact_id === connFact.fact_id)?.funding.id,
+    conn1,
+    "the earlier fact keeps its call-time funding",
+  );
+
+  // --- 9: denied on conn-2 → switching the selection resumes on conn-1 ------
+  b = await setBudget(1, "connection", conn2);
+  check(b.status === 200, `tighten conn2 ${b.status}`, b.text);
+  const switchedId = `in-${randomUUID()}`;
+  r = await req("POST", `${P}/inputs`, ptoken, {
+    input_id: switchedId,
+    kind: "message",
+    payload: { text: "usage switched five" },
+    actor_kind: "human",
+    actor_id: "e2e",
+    source_surface: "e2e",
+  });
+  check(r.status < 300, `submit switched ${r.status}`, r.text);
+  await waitFor(
+    async () =>
+      (await outboxFor(switchedId)).some((o) => o.kind === "budget_wait"),
+    "budget_wait on conn-2",
+  );
+  assert.equal(await inputStatus(switchedId), "waiting");
+  // The funding change — not a budget raise — resumes the wait: the next
+  // attempt admits under conn-1.
+  r = await select(conn1);
+  check(r.status === 200, `reselect conn1 ${r.status}`, r.text);
+  await waitFor(
+    async () =>
+      (await outboxFor(switchedId)).some((o) => o.kind === "turn_completed"),
+    "parked input resumes after the funding change",
+  );
+  fs = await facts();
+  const resumed = fs.at(-1);
+  assert.equal(resumed.funding.kind, "connection");
+  assert.equal(resumed.funding.id, conn1, "resumed call ran on conn-1");
 
   // --- summary ---------------------------------------------------------------
   const summary = {
@@ -480,7 +579,7 @@ async function main() {
   await once(child, "exit");
   svc.kill("SIGTERM");
   log(
-    "PASS — usage facts, idempotent record, budget deny/park/resume, unknown usage on real PG + Go + Node",
+    "PASS — usage facts, idempotent record, budget deny/park/resume, unknown usage, connection funding + switch, funding-change resume on real PG + Go + Node",
   );
   process.exit(0);
 }

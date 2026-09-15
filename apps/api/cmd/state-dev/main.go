@@ -118,13 +118,15 @@ func main() {
 			return
 		}
 		var b struct {
-			HumanID      string `json:"human_id"`
-			ConnectionID string `json:"connection_id"`
-			Name         string `json:"name"`
-			Preset       string `json:"preset"`
-			BaseURL      string `json:"base_url"`
-			Model        string `json:"model"`
-			APIKey       string `json:"api_key"`
+			HumanID         string            `json:"human_id"`
+			ConnectionID    string            `json:"connection_id"`
+			Name            string            `json:"name"`
+			Preset          string            `json:"preset"`
+			BaseURL         string            `json:"base_url"`
+			Model           string            `json:"model"`
+			APIKey          string            `json:"api_key"`
+			ExtraHeaders    map[string]string `json:"extra_headers"`
+			MaxOutputTokens *int              `json:"max_output_tokens"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&b); err != nil || !uuidv7Re.MatchString(b.HumanID) {
 			http.Error(w, `{"error":"human_id must be a uuidv7"}`, http.StatusBadRequest)
@@ -135,7 +137,8 @@ func main() {
 			key = &b.APIKey
 		}
 		c, err := conns.SaveUnchecked(r.Context(), b.HumanID, b.ConnectionID, modelconnections.Input{
-			Name: b.Name, Preset: b.Preset, BaseURL: b.BaseURL, Model: b.Model, APIKey: key,
+			Name: b.Name, Preset: b.Preset, BaseURL: b.BaseURL, Model: b.Model, APIKey: key, ExtraHeaders: b.ExtraHeaders,
+			MaxOutputTokens: b.MaxOutputTokens,
 		})
 		if err != nil {
 			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
@@ -163,6 +166,14 @@ func main() {
 			Kind: b.Kind, ConnectionID: b.ConnectionID,
 		}); err != nil {
 			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+			return
+		}
+		// Mirror the production wiring (modelConnectionService.Changed →
+		// usageService.FundingChanged): a selection change re-resolves
+		// funding, so this human's budget-parked inputs resume — the next
+		// attempt may admit under a different source.
+		if _, err := coreState.Store().ResumeWaitsForHuman(r.Context(), b.HumanID); err != nil {
+			http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

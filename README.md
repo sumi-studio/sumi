@@ -97,6 +97,9 @@ provider 接続、分離 tool executor を実装している。設計判断は
 provider credential の設定は
 [Real local stack](docs/local-development.md) を参照。
 
+Cloud アカウント無しで新しいコアを単体インストールして動かす場合は
+[Local host](docs/local-host.md) (`deploy/local-host/sumi-local`) を参照。
+
 ```sh
 make setup     # pnpm install
 make dev-check # Firebase/provider/identity 設定を検証

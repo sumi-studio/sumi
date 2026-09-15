@@ -533,18 +533,50 @@ func chunkRow(t *testing.T, p placement, personaID string, chunkSeq int64) agent
 	t.Helper()
 	var c agentstate.MemoryChunk
 	err := p.pool.QueryRow(context.Background(), `
-		SELECT persona_id, chunk_seq, layer, first_seq, last_seq, est_tokens,
+		SELECT persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
 			status, replacement, replacement_est_tokens, attempts, interruptions, last_error,
 			claimed_generation, claimed_at, not_before, created_at, prepared_at, applied_at
 		FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2`,
-		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.FirstSeq, &c.LastSeq,
-		&c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
+		personaID, chunkSeq).Scan(&c.PersonaID, &c.ChunkSeq, &c.Layer, &c.Sources, &c.FirstSeq,
+		&c.LastSeq, &c.EstTokens, &c.Status, &c.Replacement, &c.ReplacementEstTokens, &c.Attempts,
 		&c.Interruptions, &c.LastError, &c.ClaimedGeneration, &c.ClaimedAt,
 		&c.NotBefore, &c.CreatedAt, &c.PreparedAt, &c.AppliedAt)
 	if err != nil {
 		t.Fatalf("chunk %d: %v", chunkSeq, err)
 	}
 	return c
+}
+
+// mutRow rewrites the data object of every row of table whose data
+// matches; rebundle then recomputes the content digest, so a crafted row
+// reaches the import integrity checks instead of failing at the digest.
+func mutRow(t *testing.T, table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
+	t.Helper()
+	return func(line string) string {
+		var rec map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return line
+		}
+		var name string
+		if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
+			return line
+		}
+		var data map[string]any
+		if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
+			return line
+		}
+		mutate(data)
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec["data"] = raw
+		out, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out) + "\n"
+	}
 }
 
 // rebundle rewrites row lines in an exported bundle and recomputes the
@@ -629,29 +661,17 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "provider timeout", true))
 	claimSeq(t, local, pid, gen, 4) // chunk 3 is backed off; 4 is next
 	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 4, "Day four, compressed.", false))
-	// The first-attempt backoff is ~200ms, but the comparison is on the
-	// database clock — which can step under a loaded host (a claimed_at
-	// earlier than created_at has been observed). Wait on the row's own
-	// predicate rather than a fixed client-side sleep.
-	{
-		deadline := time.Now().Add(15 * time.Second)
-		for {
-			var ready bool
-			if err := local.pool.QueryRow(ctx, `
-				SELECT not_before IS NULL OR not_before <= now()
-				FROM core_memory_chunks
-				WHERE persona_id = $1 AND chunk_seq = 3 AND status = 'sealed'`,
-				pid).Scan(&ready); err != nil {
-				t.Fatal(err)
-			}
-			if ready {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("chunk 3 backoff never elapsed: %+v", chunkRow(t, local, pid, 3))
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
+	// Chunk 3's backoff must be on the row; then push its deadline into
+	// the past directly — not_before is wall-clock and a host clock step
+	// (observed on this WSL2 host) can regress now() below a recorded
+	// deadline, which is a clock artifact, not the eligibility contract.
+	if c := chunkRow(t, local, pid, 3); c.NotBefore == nil {
+		t.Fatalf("chunk 3 lost its first-attempt backoff: %+v", c)
+	}
+	if _, err := local.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 3`, pid); err != nil {
+		t.Fatal(err)
 	}
 	claimSeq(t, local, pid, gen, 3)
 	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
@@ -739,10 +759,17 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatalf("failed verdict changed on the destination: %+v", c)
 	}
 
-	// Chunk 5's carried backoff may still be running; once claimable the
-	// destination's writer prepares it under its own generation.
-	if c := chunkRow(t, cloud, pid, 5); c.NotBefore != nil && c.NotBefore.After(time.Now()) {
-		time.Sleep(time.Until(*c.NotBefore) + 50*time.Millisecond)
+	// Chunk 5's carried interruption pacing must still be on the row;
+	// then push its deadline into the past directly rather than sleeping —
+	// not_before is wall-clock and a host clock step could keep the claim
+	// deferred, which is a clock artifact, not the contract under test.
+	if c := chunkRow(t, cloud, pid, 5); c.NotBefore == nil {
+		t.Fatalf("chunk 5 lost its carried interruption pacing: %+v", c)
+	}
+	if _, err := cloud.pool.Exec(ctx,
+		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
+		 WHERE persona_id = $1 AND chunk_seq = 5`, pid); err != nil {
+		t.Fatal(err)
 	}
 	claimSeq(t, cloud, pid, dgen, 5)
 	must(cloud.state.CompleteMemoryChunk(ctx, pid, dgen, 5, "Day five, compressed.", false))
@@ -771,6 +798,392 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	}
 	if staged.ContentSHA256 != exported.ContentSHA256 {
 		t.Fatal("staged receipt does not match the export")
+	}
+}
+
+// Upper-layer memory carries its full provenance: the superseded source
+// rows (accepted decisions, texts and ranges durable), the applied L2 block
+// at its sources' position, and an unfinished upper-layer preparation whose
+// live claim cannot cross — the cut returns it to 'sealed' so the
+// destination's own writer reclaims it.
+func TestTransferCarriesUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+
+	// Four small exchanges = seqs 1..8, then chunk rows in the shapes the
+	// upper pipeline writes: two L1 sources superseded by an applied L2
+	// block, two applied L1 fragments, and one L2 reintegration target
+	// still claimed when the cut lands.
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("u-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ut-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ut-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens,
+			 claimed_generation, claimed_at)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, NULL, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, NULL, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60, NULL, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, NULL, NULL),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50, NULL, NULL),
+			($1, 6, 2, '{3,4}', 5, 8, 120, 'preparing', NULL, NULL, $2, now())`,
+		pid, gen); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+
+	cloudID := placementID(t, cloud)
+	must(local.svc.Seal(ctx, pid, "move-upper", cloudID))
+	// The preparing L2 target's claim was dead placement-local execution:
+	// the cut returned it to 'sealed' for the destination to reclaim.
+	if c := chunkRow(t, local, pid, 6); c.Status != "sealed" || c.ClaimedGeneration != nil {
+		t.Fatalf("preparing L2 target after seal: %+v", c)
+	}
+	bundle, _ := exportBytes(t, local, pid, "move-upper")
+
+	humanID := newID(t)
+	if _, err := cloud.pool.Exec(ctx, `INSERT INTO humans (human_id) VALUES ($1)`, humanID); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), &humanID, false); err != nil || !created {
+		t.Fatalf("import: created=%v err=%v", created, err)
+	}
+	// Rows — including sources, superseded verdicts and the normalized
+	// sealed target — arrive byte for byte.
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-upper"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+
+	// The destination renders the applied L2 block at its earliest source's
+	// journal position and never the superseded coverage raw.
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-1", 50))
+	if len(load.Memory) != 3 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Layer != 2 ||
+		load.Memory[0].Text != "L2: days one and two" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		if e.Seq <= 4 {
+			t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+		}
+	}
+
+	// The carried sealed L2 target is ordinary work for the destination's
+	// writer: claiming it resolves the carried sources to their fragments.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 6 || claimed.Chunk.Layer != 2 {
+		t.Fatalf("destination upper claim: %+v", claimed.Chunk)
+	}
+	if len(claimed.TargetFragments) != 2 || len(claimed.TargetEvents) != 0 ||
+		claimed.TargetFragments[0].Text != "L1 of days three" {
+		t.Fatalf("carried sources unresolved: %+v", claimed.TargetFragments)
+	}
+}
+
+// An upper-layer row can pass the shape checks and still be a state the
+// honest pipeline cannot emit: an applied target whose sources were never
+// superseded (the range would render twice), or a source list with
+// correct endpoints but an interior hole (journal coverage consumed by
+// nothing). The seed below is the legitimate counterpart — an applied L2
+// block over superseded L1s, a failed earlier attempt whose sources a
+// later target consumed, and a sealed in-flight target over an applied
+// source — and it must keep crossing.
+func TestImportRefusesContradictoryUpperMemory(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("c-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ct-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ct-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	// A real history: an earlier consolidation over {1,2} failed
+	// terminally, a later attempt reintegrated {1,2,3} into the applied
+	// L2 block, and chunk 7 is a sealed reintegration target whose source
+	// is still applied. Every row is a state the pipeline itself writes.
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens, attempts, last_error)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60, 0, NULL),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60, 0, NULL),
+			($1, 3, 1, NULL, 5, 6, 300, 'superseded', 'L1 of days three', 60, 0, NULL),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60, 0, NULL),
+			($1, 5, 2, '{1,2,3}', 1, 6, 180, 'applied', 'L2: days one through three', 70, 0, NULL),
+			($1, 6, 2, '{1,2}', 1, 4, 120, 'failed', NULL, NULL, 3, 'provider refused'),
+			($1, 7, 2, '{4}', 7, 8, 120, 'sealed', NULL, NULL, 0, NULL)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-contra", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-contra")
+
+	chunk := func(seq int64) func(map[string]any) bool {
+		return func(d map[string]any) bool {
+			v, ok := d["chunk_seq"].(float64)
+			return ok && int64(v) == seq
+		}
+	}
+	cases := map[string]struct {
+		fn   func(string) string
+		want string
+	}{
+		// The applied L2 target's sources are still applied — the same
+		// journal range would render as both L1 fragments and the L2 block.
+		"applied target over a live source": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "applied" }), "memory_chunk_sources_invalid"},
+		// Sources {1,3} keep the target's endpoints right ([1,6]) but leave
+		// [3,4] — chunk 2's range — inside the claimed span yet named by no
+		// source.
+		"source list with an interior gap": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 3} }), "memory_chunk_sources_invalid"},
+		// Overlapping instead of gapped: widening chunk 1 to [1,4] makes
+		// the sources cover [1,6] twice over [3,4] with the target bounds
+		// unchanged.
+		"overlapping source ranges": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["last_seq"] = 4 }), "memory_chunk_sources_invalid"},
+		// The sources tile the range but are listed out of order — the
+		// settled-tuple dedup compares arrays order-sensitively, so this
+		// tuple would not match the canonical one it was settled as.
+		"reordered settled source tuple": {mutRow(t, "core_memory_chunks", chunk(6),
+			func(d map[string]any) { d["sources"] = []any{2, 1} }), "memory_chunk_sources_invalid"},
+		// A source is only ever consumed while applied and only ever
+		// retired as superseded: a sealed or failed source is a state the
+		// pipeline cannot produce.
+		"source still sealed": {mutRow(t, "core_memory_chunks", chunk(1),
+			func(d map[string]any) { d["status"] = "sealed" }), "memory_chunk_sources_invalid"},
+		// One source listed twice inflates the reference list without
+		// resolving to two chunks.
+		"repeated source reference": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 1} }), "memory_chunk_sources_invalid"},
+		// A target cannot consume across layers: {1,6} mixes an L1 source
+		// with the failed L2 row.
+		"cross-layer source": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["sources"] = []any{1, 6} }), "memory_chunk_sources_invalid"},
+		// Chunk 5 demoted to 'failed' leaves chunks 1-3 superseded with no
+		// applied ancestor anywhere — their journal range renders as
+		// nothing on the destination.
+		"superseded coverage no applied ancestor": {mutRow(t, "core_memory_chunks", chunk(5),
+			func(d map[string]any) { d["status"] = "failed" }), "memory_chunk_superseded_uncovered"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := rebundle(t, bundle, tc.fn)
+			_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+			if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("import err = %v, want ErrIntegrity mentioning %q", err, tc.want)
+			}
+			if _, err := cloud.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
+				t.Fatalf("a refused bundle left a persona behind: %v", err)
+			}
+		})
+	}
+
+	// The legitimate history still crosses: the failed target keeps its
+	// provenance over sources another target consumed, the sealed target
+	// keeps its applied source, and the destination activates and renders
+	// the applied upper block without double-rendering.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
+		t.Fatalf("legitimate upper history import: created=%v err=%v", created, err)
+	}
+	if !bytes.Equal(rowLines(t, local, pid), rowLines(t, cloud, pid)) {
+		t.Fatal("destination rows differ from source rows")
+	}
+	must(cloud.svc.Activate(ctx, pid, "move-contra"))
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+	load := must(cloud.state.LoadTurn(ctx, pid, dgen, "ct-d1", 50))
+	if len(load.Memory) != 2 ||
+		load.Memory[0].ChunkSeq != 5 || load.Memory[0].Text != "L2: days one through three" ||
+		load.Memory[1].ChunkSeq != 4 || load.Memory[1].Text != "L1 of days four" {
+		t.Fatalf("destination memory view: %+v", load.Memory)
+	}
+	for _, e := range load.Context {
+		t.Fatalf("superseded coverage seq %d rendered raw on the destination", e.Seq)
+	}
+	// The sealed reintegration target is claimable at the destination and
+	// resolves its still-applied source fragment.
+	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 7 ||
+		len(claimed.TargetFragments) != 1 || claimed.TargetFragments[0].Text != "L1 of days four" {
+		t.Fatalf("destination claim on carried sealed target: %+v", claimed.Chunk)
+	}
+}
+
+// addChunkRow appends one crafted core_memory_chunks row after the table's
+// last row (preserving the row order the importer requires) and recomputes
+// the trailer's row count and content digest, so the row reaches import
+// verification instead of failing at the digest.
+func addChunkRow(t *testing.T, bundle []byte, data map[string]any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(
+		`{"record":"row","section":"core","table":"core_memory_chunks","data":%s}`+"\n",
+		raw)
+	sc := bufio.NewScanner(bytes.NewReader(bundle))
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text()+"\n")
+	}
+	lastTableLine := -1
+	for i, l := range lines {
+		if strings.Contains(l, `"table":"core_memory_chunks"`) {
+			lastTableLine = i
+		}
+	}
+	if lastTableLine < 0 {
+		t.Fatal("bundle carries no core_memory_chunks rows to extend")
+	}
+	var tr Trailer
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &tr); err != nil || tr.Record != "trailer" {
+		t.Fatal("last bundle line is not a trailer")
+	}
+	var out bytes.Buffer
+	h := sha256.New()
+	for i, l := range lines[:len(lines)-1] {
+		out.WriteString(l)
+		h.Write([]byte(l))
+		if i == lastTableLine {
+			out.WriteString(line)
+			h.Write([]byte(line))
+		}
+	}
+	tr.Rows["core_memory_chunks"]++
+	tr.ContentSHA256 = hex.EncodeToString(h.Sum(nil))
+	tl, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Write(append(tl, '\n'))
+	return out.Bytes()
+}
+
+// Coverage the pipeline cannot emit: chunk ranges tile disjointly — an L1
+// range is allocated once and stays covered even by a failed verdict, and
+// applying a target supersedes exactly its sources. A second L1 row over
+// already-covered seqs, or two applied rows sharing a seq (the range would
+// render twice), can only come from a crafted bundle.
+func TestImportRefusesOverlappingCoverage(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "Moving secretary")))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	for i := 1; i <= 4; i++ {
+		in := fmt.Sprintf("o-%d", i)
+		submit(t, local, pid, in, fmt.Sprintf("topic %d", i))
+		must(local.state.LoadTurn(ctx, pid, gen, fmt.Sprintf("ot-%d", i), 50))
+		must(local.state.CommitTurn(ctx, pid, fmt.Sprintf("ot-%d", i), gen, agentstate.CommitRequest{
+			Outcome: "complete",
+			Events: []agentstate.EventInput{
+				{Kind: "input_received", Payload: map[string]any{
+					"input_id": in, "kind": "message", "text": fmt.Sprintf("topic %d", i),
+					"actor_kind": "human", "source_surface": "test", "attempt": 1,
+				}},
+				{Kind: "assistant_message", Payload: map[string]any{"text": fmt.Sprintf("answer %d", i)}},
+			},
+			Output: map[string]any{"text": "ok"},
+		}))
+	}
+	if _, err := local.pool.Exec(ctx, `
+		INSERT INTO core_memory_chunks
+			(persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
+			 status, replacement, replacement_est_tokens)
+		VALUES
+			($1, 1, 1, NULL, 1, 2, 300, 'superseded', 'L1 of days one', 60),
+			($1, 2, 1, NULL, 3, 4, 300, 'superseded', 'L1 of days two', 60),
+			($1, 3, 1, NULL, 5, 6, 300, 'applied', 'L1 of days three', 60),
+			($1, 4, 1, NULL, 7, 8, 300, 'applied', 'L1 of days four', 60),
+			($1, 5, 2, '{1,2}', 1, 4, 120, 'applied', 'L2: days one and two', 50)`,
+		pid); err != nil {
+		t.Fatalf("seed upper state: %v", err)
+	}
+	must(local.svc.Seal(ctx, pid, "move-overlap", placementID(t, cloud)))
+	bundle, _ := exportBytes(t, local, pid, "move-overlap")
+
+	ghost := func(status string) map[string]any {
+		return map[string]any{
+			"persona_id": pid, "chunk_seq": 9, "layer": 1, "sources": nil,
+			"first_seq": 2, "last_seq": 3, "est_tokens": 100,
+			"status": status, "replacement": nil, "replacement_est_tokens": nil,
+			"attempts": 0, "interruptions": 0, "last_error": nil,
+			"claimed_generation": nil, "claimed_at": nil, "not_before": nil,
+			"created_at":  "2026-09-15T00:00:00Z",
+			"prepared_at": nil, "applied_at": nil,
+		}
+	}
+
+	// A sealed L1 over already-covered seqs is pipeline-impossible — the
+	// destination's own pipeline would claim, prepare and apply it into a
+	// real applied overlap.
+	t.Run("sealed L1 over covered range", func(t *testing.T) {
+		bad := addChunkRow(t, bundle, ghost("sealed"))
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_l1_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_l1_overlap", err)
+		}
+	})
+
+	// An applied L1 inside an applied L2 target's coverage double-renders
+	// the range in every sent view.
+	t.Run("applied L1 inside applied coverage", func(t *testing.T) {
+		g := ghost("applied")
+		g["replacement"] = "ghost fragment"
+		g["replacement_est_tokens"] = 30
+		g["prepared_at"] = "2026-09-15T00:00:00Z"
+		g["applied_at"] = "2026-09-15T00:00:00Z"
+		bad := addChunkRow(t, bundle, g)
+		_, _, err := cloud.svc.Import(ctx, bytes.NewReader(bad), nil, false)
+		if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "memory_chunk_applied_overlap") {
+			t.Fatalf("import err = %v, want ErrIntegrity mentioning memory_chunk_applied_overlap", err)
+		}
+	})
+
+	// The clean bundle still imports: disjoint coverage with a legitimate
+	// applied target over superseded sources.
+	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
+		t.Fatalf("legitimate history import: created=%v err=%v", created, err)
 	}
 }
 
@@ -824,37 +1237,9 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	must(local.svc.Seal(ctx, pid, "move-badmem", placementID(t, cloud)))
 	bundle, _ := exportBytes(t, local, pid, "move-badmem")
 
-	// mutRow rewrites the data object of every row of table whose data
-	// matches; rebundle then recomputes the content digest. Every case below
-	// is therefore a crafted/recomputed-digest bundle — state an honest
-	// store cannot emit — which is exactly the class verifyCut exists for.
-	mutRow := func(table string, match func(map[string]any) bool, mutate func(map[string]any)) func(string) string {
-		return func(line string) string {
-			var rec map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(line), &rec); err != nil {
-				return line
-			}
-			var name string
-			if err := json.Unmarshal(rec["table"], &name); err != nil || name != table {
-				return line
-			}
-			var data map[string]any
-			if err := json.Unmarshal(rec["data"], &data); err != nil || !match(data) {
-				return line
-			}
-			mutate(data)
-			raw, err := json.Marshal(data)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rec["data"] = raw
-			out, err := json.Marshal(rec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return string(out) + "\n"
-		}
-	}
+	// Every case below is a crafted/recomputed-digest bundle — state an
+	// honest store cannot emit — which is exactly the class verifyCut
+	// exists for.
 	chunkRow := func(d map[string]any) bool { return d["chunk_seq"] != nil }
 	inputRow := func(id string) func(map[string]any) bool {
 		return func(d map[string]any) bool { return d["input_id"] == id }
@@ -892,34 +1277,49 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 		// applies it. kept is checked separately: keep-unchanged stores both
 		// NULL, non-shrinking keeps both set — one without the other is not a
 		// row the store writes.
-		"applied without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"applied without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "applied")), "memory_chunk_missing_payload"},
-		"prepared without replacement": {mutRow("core_memory_chunks", chunkRow,
+		"prepared without replacement": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("status", "prepared")), "memory_chunk_missing_payload"},
-		"kept text without estimate": {mutRow("core_memory_chunks", chunkRow, func(d map[string]any) {
+		"kept text without estimate": {mutRow(t, "core_memory_chunks", chunkRow, func(d map[string]any) {
 			d["status"] = "kept"
 			d["replacement"] = "condensed"
 		}), "memory_chunk_missing_payload"},
 		// f71/F2: negative sequence/counter values corrupt ordering and the
 		// live-raw accounting while staging cleanly.
-		"negative chunk_seq": {mutRow("core_memory_chunks", chunkRow,
+		"negative chunk_seq": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("chunk_seq", -7)), "memory_chunk_negative_values"},
-		"negative est_tokens": {mutRow("core_memory_chunks", chunkRow,
+		"negative est_tokens": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("est_tokens", -900000)), "memory_chunk_negative_values"},
-		"layer zero": {mutRow("core_memory_chunks", chunkRow,
+		"layer zero": {mutRow(t, "core_memory_chunks", chunkRow,
 			set("layer", 0)), "memory_chunk_negative_values"},
+		// Upper-layer provenance: a layer-1 row never carries sources; a
+		// layer-2 target's sources must all resolve to carried chunks whose
+		// span is exactly the target's range.
+		"layer-1 row carrying sources": {mutRow(t, "core_memory_chunks", chunkRow,
+			set("sources", []any{1})), "memory_chunk_sources_invalid"},
+		"upper target with a dangling source": {mutRow(t, "core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{999}
+			}), "memory_chunk_sources_invalid"},
+		"upper target with an empty source set": {mutRow(t, "core_memory_chunks", chunkRow,
+			func(d map[string]any) {
+				d["layer"] = 2
+				d["sources"] = []any{}
+			}), "memory_chunk_sources_invalid"},
 		// F-B2: received_seq that dangles, names the wrong kind, or names
 		// another input's event would make the destination skip journaling
 		// this input's input_received — its original record silently lost.
-		"received_seq another input's event": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq another input's event": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 1)), "input_received_seq_mismatch"},
-		"received_seq wrong kind": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq wrong kind": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", 2)), "input_received_seq_mismatch"},
-		"received_seq dangling on queued input": {mutRow("core_inputs", inputRow("m-3"),
+		"received_seq dangling on queued input": {mutRow(t, "core_inputs", inputRow("m-3"),
 			set("received_seq", 99)), "input_received_seq_mismatch"},
 		// The reverse link: m-2's input_received exists in the journal, so a
 		// missing marker would let the destination journal it a second time.
-		"received_seq marker removed": {mutRow("core_inputs", inputRow("m-2"),
+		"received_seq marker removed": {mutRow(t, "core_inputs", inputRow("m-2"),
 			set("received_seq", nil)), "input_received_seq_not_linked"},
 	}
 	for name, tc := range cases {
@@ -940,17 +1340,21 @@ func TestImportRefusesMalformedMemoryChunks(t *testing.T) {
 	if _, created, err := cloud.svc.Import(ctx, bytes.NewReader(bundle), nil, false); err != nil || !created {
 		t.Fatalf("clean import after refusals: created=%v err=%v", created, err)
 	}
-	// Bounds are floors, not a layer policy: a future consolidation layer and
-	// the queued input's NULL marker must still cross. Re-address the mutated
-	// bundle to a second placement since the first already holds this
-	// transfer under the clean digest.
+	// Bounds are floors, not a layer policy: the queued input's NULL marker
+	// must still cross (the clean import above proves it). But an upper-layer
+	// row now has a contract — consolidation is real: a layer-2 chunk
+	// without resolvable sources is malformed, not "future work". Re-address
+	// the mutated bundle to a second placement since the first already holds
+	// this transfer under the clean digest.
 	cloud2 := newPlacement(t)
-	higherLayer := rebundle(t, bundle, func(line string) string {
+	sourceless := rebundle(t, bundle, func(line string) string {
 		line = strings.Replace(line, placementID(t, cloud), placementID(t, cloud2), 1)
-		return mutRow("core_memory_chunks", chunkRow, set("layer", 2))(line)
+		return mutRow(t, "core_memory_chunks", chunkRow, set("layer", 2))(line)
 	})
-	if _, created, err := cloud2.svc.Import(ctx, bytes.NewReader(higherLayer), nil, false); err != nil || !created {
-		t.Fatalf("layer-2 chunk refused: created=%v err=%v", created, err)
+	if _, _, err := cloud2.svc.Import(ctx, bytes.NewReader(sourceless), nil, false); err == nil ||
+		!errors.Is(err, ErrIntegrity) ||
+		!strings.Contains(err.Error(), "memory_chunk_sources_invalid") {
+		t.Fatalf("sourceless layer-2 chunk: %v, want memory_chunk_sources_invalid", err)
 	}
 }
 
@@ -3383,5 +3787,87 @@ func TestImportRejectsMalformedIntentAndDebris(t *testing.T) {
 	if againAppr["prior_decision"] != "approve_once" ||
 		againAppr["prior_decided_by_id"] != srcHuman || againAppr["status"] != "pending" {
 		t.Fatalf("second move lost re-pend provenance: %v", againAppr)
+	}
+}
+
+// A budget-parked input is 'waiting' on placement-local backpressure — the
+// funding it waits on is account state that never travels — so seal
+// requeues it: carrying the wait would strand the input at the destination
+// (no pending approval exists to resume it) or fail the cut's own
+// verification.
+func TestSealRequeuesBudgetWaitedInput(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "secretary")))
+	submit(t, local, pid, "in-1", "run the numbers")
+	// A cap the admission cannot fit parks the turn: the input waits.
+	connID := uuid.NewString()
+	must(local.state.SetBudgetAdmin(ctx, "connection", connID, agentstate.UsageBudget{
+		LimitMinor: 50, Currency: "USD",
+		RateInputPerMTok: 250, RateOutputPerMTok: 1000,
+		PricingRevision: "test",
+	}))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	load := must(local.state.LoadTurn(ctx, pid, gen, "turn-1", 50))
+	if load.Input == nil || load.Input.InputID != "in-1" {
+		t.Fatalf("turn-1 claimed %+v", load.Input)
+	}
+	if _, err := local.state.CommitTurn(ctx, pid, "turn-1", gen, agentstate.CommitRequest{
+		Outcome: "await",
+		Wait: &agentstate.CommitWait{
+			Kind: "budget", NeededMinor: 100, Currency: "USD",
+			Funding: agentstate.FundingRef{Kind: "connection", ID: connID},
+		},
+	}); err != nil {
+		t.Fatalf("budget park: %v", err)
+	}
+	var status string
+	if err := local.pool.QueryRow(ctx,
+		`SELECT status FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-1'`, pid).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "waiting" {
+		t.Fatalf("parked input status %s, want waiting", status)
+	}
+
+	// The seal must not fail the cut on the wait, and the carried input
+	// must arrive resumable — 'queued', not stranded on a funding row the
+	// destination does not have.
+	if _, err := local.svc.Seal(ctx, pid, "move-wait", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with a budget wait: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT status FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-1'`, pid).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("sealed input status %s, want queued", status)
+	}
+	var waits int
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_budget_waits WHERE persona_id = $1`, pid).Scan(&waits); err != nil {
+		t.Fatal(err)
+	}
+	if waits != 0 {
+		t.Fatalf("%d budget waits survived the seal", waits)
+	}
+
+	bundle, _ := exportBytes(t, local, pid, "move-wait")
+	if bytes.Contains(bundle, []byte("core_budget_waits")) {
+		t.Fatal("budget wait rows traveled in the bundle")
+	}
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+	must(cloud.svc.Activate(ctx, pid, "move-wait"))
+	// The destination's writer claims the requeued input under its own
+	// funding — a fresh denial there parks it again; it is never stranded.
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+	dload := must(cloud.state.LoadTurn(ctx, pid, dgen, "d-turn-1", 50))
+	if dload.Input == nil || dload.Input.InputID != "in-1" {
+		t.Fatalf("destination claimed %+v, want in-1", dload.Input)
 	}
 }

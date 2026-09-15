@@ -24,8 +24,10 @@ export interface UsageTotals {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
-  costMinor: number;
-  currency?: string;
+  /** Recorded spend per currency code (minor units) — a funding source can
+   *  legitimately accumulate cost in more than one currency across rate-card
+   *  edits, so the totals never collapse to a single number. */
+  costs: Record<string, number>;
 }
 
 export interface UsageFact {
@@ -35,7 +37,7 @@ export interface UsageFact {
   fundingKind: string;
   fundingId: string;
   model?: string;
-  status: "reported" | "unknown";
+  status: "reported" | "unknown" | "unrecorded" | "not_sent";
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
@@ -125,6 +127,10 @@ function optText(value: unknown): string | undefined {
 
 function totals(value: unknown): UsageTotals {
   const row = record(value);
+  const costs: Record<string, number> = {};
+  for (const [currency, minor] of Object.entries(record(row.costs))) {
+    costs[currency] = num(minor);
+  }
   return {
     calls: num(row.calls),
     unknownCalls: num(row.unknown_calls),
@@ -132,8 +138,7 @@ function totals(value: unknown): UsageTotals {
     inputTokens: num(row.input_tokens),
     outputTokens: num(row.output_tokens),
     cachedTokens: num(row.cached_tokens),
-    costMinor: num(row.cost_minor),
-    currency: optText(row.currency),
+    costs,
   };
 }
 
@@ -160,7 +165,12 @@ function budget(value: unknown): UsageBudget {
 function fact(value: unknown): UsageFact {
   const row = record(value);
   const funding = record(row.funding);
-  if (row.status !== "reported" && row.status !== "unknown") {
+  if (
+    row.status !== "reported" &&
+    row.status !== "unknown" &&
+    row.status !== "unrecorded" &&
+    row.status !== "not_sent"
+  ) {
     throw new Error(CHECK_FAILED);
   }
   return {

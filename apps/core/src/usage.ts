@@ -53,20 +53,22 @@ export function estRequestInputTokens(
 }
 
 /**
- * The admission estimate for one metered request. output_tokens_bound is
- * carried only when the caller actually limited output — an unbounded
- * call admits with bounded=false so the reservation honestly bounds
- * admission, not the external bill.
+ * The admission estimate for one metered request. `outputBound` is the
+ * maximum output the resolved provider will actually send on the wire
+ * (its `outputBound()`); a call whose adapter sends no cap admits with
+ * bounded=false so the reservation honestly bounds admission, not the
+ * external bill. The input estimate is a size estimate, not a proven
+ * upper bound — legitimate provider reports may exceed it.
  */
-export function requestEstimate(request: ModelRequest): UsageEstimate {
+export function requestEstimate(
+  request: ModelRequest,
+  outputBound?: number,
+): UsageEstimate {
   const est: UsageEstimate = {
     input_tokens: estRequestInputTokens(request.messages, request.tools),
   };
-  if (
-    typeof request.outputTokensBound === "number" &&
-    request.outputTokensBound > 0
-  ) {
-    est.output_tokens_bound = request.outputTokensBound;
+  if (typeof outputBound === "number" && outputBound > 0) {
+    est.output_tokens_bound = outputBound;
   }
   return est;
 }
@@ -75,25 +77,52 @@ const num = (v: unknown): number | null =>
   typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
 
 /**
- * Extract the provider-reported token categories from a chat-completions
- * usage report. Categories the provider did not report stay null — never
- * zero — so a partial report is distinguishable from an empty one. The
- * raw report rides along separately in quantities for provenance.
+ * Normalize a provider usage report into the ledger's non-overlapping
+ * categories — input_tokens EXCLUDES cached_tokens on every wire, so the
+ * stored categories never double-count and pricing is additive:
+ *
+ *   chat completions — prompt_tokens INCLUDES the cached subset reported
+ *     at prompt_tokens_details.cached_tokens; subtract it.
+ *   Responses        — same convention under input_tokens /
+ *     input_tokens_details.cached_tokens.
+ *   Anthropic        — input_tokens EXCLUDES cache_read_input_tokens and
+ *     cache_creation_input_tokens (additive categories). Cache-read is
+ *     the normalized cached category; cache-write input folds into
+ *     input_tokens and prices at the input rate.
+ *
+ * Categories the provider did not report stay null — never zero — so a
+ * partial report is distinguishable from an empty one. The raw report
+ * rides along separately in quantities for provenance.
  */
 export function reportedTokens(usage: Record<string, unknown>): {
   input: number | null;
   output: number | null;
   cached: number | null;
 } {
-  const details = usage.prompt_tokens_details;
+  const cacheRead = num(usage.cache_read_input_tokens);
+  const cacheWrite = num(usage.cache_creation_input_tokens);
+  if (cacheRead !== null || cacheWrite !== null) {
+    const base = num(usage.input_tokens);
+    return {
+      input:
+        base === null && cacheWrite === null
+          ? null
+          : (base ?? 0) + (cacheWrite ?? 0),
+      output: num(usage.output_tokens),
+      cached: cacheRead,
+    };
+  }
+  const details = usage.prompt_tokens_details ?? usage.input_tokens_details;
   const cachedDetail =
     details !== null && typeof details === "object"
       ? num((details as Record<string, unknown>).cached_tokens)
       : null;
+  const cached = cachedDetail ?? num(usage.cached_tokens);
+  const rawInput = num(usage.prompt_tokens ?? usage.input_tokens);
   return {
-    input: num(usage.prompt_tokens ?? usage.input_tokens),
+    input: rawInput === null ? null : Math.max(0, rawInput - (cached ?? 0)),
     output: num(usage.completion_tokens ?? usage.output_tokens),
-    cached: cachedDetail ?? num(usage.cached_tokens),
+    cached,
   };
 }
 

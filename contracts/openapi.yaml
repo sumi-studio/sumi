@@ -1311,11 +1311,29 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only
+            the anthropic and openai-responses presets send a bound — it is
+            rejected on other presets rather than stored inert. Model IDs are
+            free text and providers reject a bound above the model's cap with
+            a 400 — set this when the selected model's output cap is below the
+            core's default. Absent means the protocol default (Anthropic sends
+            the core's default budget of 16384; Responses omits the field so
+            the model's own cap applies).
     ModelAPIConnectionCreate:
       type: object
       additionalProperties: false
@@ -1347,11 +1365,27 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only
+            the anthropic and openai-responses presets send a bound — it is
+            rejected on other presets rather than stored inert. Set it when the
+            selected model's output cap is below the core's default. Non-secret
+            metadata returned in list responses; omitting it stores NULL (the
+            protocol default), like other plain fields.
         apiKey:
           type: string
           minLength: 1
@@ -1360,6 +1394,22 @@ components:
           description: Stored encrypted on this Sumi server. Never returned. Required
             for creation and when changing baseUrl; omitted during edits to retain the
             existing key.
+        extraHeaders:
+          $ref: "#/components/schemas/ModelAPIExtraHeaders"
+    ModelAPIExtraHeaders:
+      type: object
+      maxProperties: 16
+      additionalProperties:
+        type: string
+        maxLength: 1024
+      writeOnly: true
+      description: 'Per-connection request headers sent only to this connection''s
+        endpoint (for example a gateway routing header). Sealed encrypted together
+        with the API key and never returned. Header names must be RFC 7230 tokens
+        (max 128 chars) and may not replace the request''s own authentication,
+        protocol-version, or transport headers (for example Authorization, x-api-key,
+        Content-Type, Host). Setting or clearing headers requires apiKey in the same
+        request; omit the field to retain the stored headers.'
     ModelAPIConnectionUpdate:
       type: object
       additionalProperties: false
@@ -1390,11 +1440,27 @@ components:
           format: uri
           maxLength: 2048
           description: Public HTTPS API base URL without user info, query or fragment.
-            Runtime transport checks every DNS destination and disallows redirects.
+            The runtime sends requests only to this literal URL and refuses to
+            follow redirects (any 3xx fails deterministically rather than
+            forwarding credentials to another destination). Validation covers
+            the literal URL only — DNS is not resolved or pinned, and which
+            networks the resolved address may reach is deployment egress
+            policy, not enforced by this field.
         model:
           type: string
           minLength: 1
           maxLength: 128
+        maxOutputTokens:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Requested bound on generated tokens for this connection
+            (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only
+            the anthropic and openai-responses presets send a bound — it is
+            rejected on other presets rather than stored inert. Set it when the
+            selected model's output cap is below the core's default. Non-secret
+            metadata returned in list responses; omitting it stores NULL (the
+            protocol default), like other plain fields.
         apiKey:
           type: string
           minLength: 1
@@ -1403,6 +1469,8 @@ components:
           description: Stored encrypted on this Sumi server. Never returned. Required
             for creation and when changing baseUrl; omitted during edits to retain the
             existing key.
+        extraHeaders:
+          $ref: "#/components/schemas/ModelAPIExtraHeaders"
     ModelConnectionSelection:
       oneOf:
       - type: object
@@ -2055,14 +2123,14 @@ components:
           maxLength: 200
     UsageTotals:
       type: object
-      required: [calls, unknown_calls, unpriced_calls, input_tokens, output_tokens, cached_tokens, cost_minor]
+      required: [calls, unknown_calls, unpriced_calls, input_tokens, output_tokens, cached_tokens, costs]
       additionalProperties: false
       properties:
         calls:
           type: integer
         unknown_calls:
           type: integer
-          description: Calls whose provider never reported usage; never billed as zero.
+          description: Calls whose provider never reported usage (status 'unknown' or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero.
         unpriced_calls:
           type: integer
           description: Reported calls with no applicable rate card.
@@ -2072,10 +2140,11 @@ components:
           type: integer
         cached_tokens:
           type: integer
-        cost_minor:
-          type: integer
-        currency:
-          type: string
+        costs:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Recorded spend per currency code in minor units. A funding source can hold cost in more than one currency across rate-card edits, so totals never collapse to one number.
     UsageFact:
       type: object
       required: [persona_id, fact_id, kind, phase, funding, status, input_tokens, output_tokens, cached_tokens, quantities, cost_minor, recorded_at]
@@ -2102,8 +2171,14 @@ components:
           $ref: '#/components/schemas/UsageFundingRef'
         status:
           type: string
-          enum: [reported, unknown]
-          description: "'reported' carries provider token counts; 'unknown' means the provider gave none — inspectable, never zero-billed."
+          enum: [reported, unknown, not_sent, unrecorded]
+          description: >-
+            'reported' carries provider token counts. 'unknown' means the call
+            was attempted but usage never resolved — it keeps the admission
+            estimate as uncertain spend. 'unrecorded' means the writer lost
+            the response before it could report — inspectable, estimate
+            retained. 'not_sent' means the request provably never left —
+            its reservation was released and nothing is owed.
         input_tokens:
           type: integer
           nullable: true
@@ -2119,13 +2194,13 @@ components:
         cost_minor:
           type: integer
           nullable: true
-          description: Priced under the configured rate card; null when unpriced or unknown.
+          description: Priced under the rate card snapshotted at admission; null when unpriced.
         currency:
           type: string
         cost_basis:
           type: string
-          enum: [configured_rates]
-          description: Provenance — configured estimates, never a provider invoice.
+          enum: [configured_rates, admission_estimate]
+          description: Provenance — 'configured_rates' priced provider-reported tokens; 'admission_estimate' is the reserved estimate kept for unknown/lost usage. Never a provider invoice.
         pricing_revision:
           type: string
         recorded_at:

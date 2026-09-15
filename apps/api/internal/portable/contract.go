@@ -227,6 +227,9 @@ const (
 	// source holding the jsonb literal null there cannot be represented and
 	// is refused at seal.
 	colJSONNull
+	// colBigintList is a nullable bigint[] column: a JSON null is SQL NULL,
+	// a JSON array of integers becomes the Postgres array.
+	colBigintList
 )
 
 type column struct {
@@ -334,6 +337,7 @@ var coreTables = []table{
 	// fenced source writer (verifyCut refuses a bundle that claims one).
 	{name: "core_memory_chunks", orderBy: `chunk_seq`, cols: []column{
 		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"layer", colInt},
+		{"sources", colBigintList},
 		{"first_seq", colBigint}, {"last_seq", colBigint}, {"est_tokens", colBigint},
 		{"status", colText}, {"replacement", colText}, {"replacement_est_tokens", colBigint},
 		{"attempts", colInt}, {"interruptions", colInt}, {"last_error", colText},
@@ -350,4 +354,17 @@ var coreTables = []table{
 var placementLocalTables = map[string]string{
 	"core_writer_leases": "live execution authority; the generation travels as cut.generation_high_water",
 	"core_jobs":          "runner-owned execution authority; seal refuses while a job is non-terminal, so job records stay with the placement that ran them",
+	// Usage accounting is placement-local: a fact records spend incurred
+	// under this placement's funding principals, and those principals —
+	// connections, the operator fallback, grants — are human-scoped account
+	// state that never travels (NotIncluded 'usage', 'connections'). A held
+	// reservation is live admission state: the fenced-writer reconcile at
+	// the destination produces its own 'unrecorded' fact if the record was
+	// lost. A budget wait is placement-local backpressure, not a human
+	// decision: seal requeues its parked input so the destination re-admits
+	// it under its own funding instead of carrying a wait that could never
+	// resume.
+	"usage_facts":        "accounting history for spend under this placement's funding principals; usage/budget records are not core state",
+	"usage_reservations": "live admission holds; reconcile locally on lease loss",
+	"core_budget_waits":  "placement-local resume index for budget-parked inputs; seal requeues the input — funding does not travel",
 }

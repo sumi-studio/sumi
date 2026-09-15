@@ -208,6 +208,19 @@ export interface ModelBinding {
     base_url: string;
     model: string;
     version: string;
+    /**
+     * Per-connection extra request headers, present only when the
+     * credential store is armed — they are sealed with the credential and
+     * sent only to this connection's endpoint. Never logged or echoed
+     * into state/events.
+     */
+    extra_headers?: Record<string, string>;
+    /**
+     * The connection's requested bound on generated tokens (Anthropic
+     * max_tokens / Responses max_output_tokens). Absent = protocol
+     * default.
+     */
+    max_output_tokens?: number;
   };
   api_key?: string;
   credential_available?: boolean;
@@ -286,11 +299,14 @@ export interface OmittedRange {
   last_time: string;
 }
 
-/** One sealed journal range and its L1 replacement lifecycle. */
+/** One sealed journal range and its replacement lifecycle. Layer-2 chunks
+ * are consolidation targets: `sources` names the accepted fragments they
+ * consume, in order (null for ordinary L0→L1 chunks). */
 export interface MemoryChunk {
   persona_id: string;
   chunk_seq: number;
   layer: number;
+  sources: number[] | null;
   first_seq: number;
   last_seq: number;
   est_tokens: number;
@@ -300,7 +316,8 @@ export interface MemoryChunk {
     | "prepared"
     | "applied"
     | "kept"
-    | "failed";
+    | "failed"
+    | "superseded";
   replacement: string | null;
   replacement_est_tokens: number | null;
   /** Recorded preparation failures (the only thing that spends the budget). */
@@ -347,6 +364,8 @@ export interface MemoryStatus {
   applied: number;
   kept: number;
   failed: number;
+  /** Sources replaced by an applied upper-layer block (kept durable). */
+  superseded: number;
   /** Chunks a claim could take now (sealed past backoff, or orphaned). */
   claimable: number;
   /** Earliest time a chunk becomes claimable; null when none waits. */
@@ -361,13 +380,15 @@ export interface MemoryStatus {
 }
 
 /**
- * A chunk claimed for asynchronous L1 preparation, with everything the
- * branch needs: the covered events verbatim and the rendered parent
- * context at claim time.
+ * A chunk claimed for asynchronous preparation, with everything the branch
+ * needs: for a layer-1 target the covered events verbatim, for an
+ * upper-layer target the selected source fragments' accepted texts with
+ * their locators — plus the rendered parent context at claim time.
  */
 export interface ClaimedMemoryChunk {
   chunk: MemoryChunk | null;
   target_events: Event[];
+  target_fragments: MemoryBlock[];
   context: RenderedContext;
 }
 
@@ -467,9 +488,14 @@ export interface UsageAdmitResult {
 /**
  * One ledger row: one logical provider call. status 'reported' carries
  * the provider's own usage fields; 'unknown' means the call was attempted
- * but no usage report resolved — recorded, never silently zero. Token
- * columns are null for unreported categories; cost_minor is null when the
- * fact could not be priced (no rate card, or no token report).
+ * but no usage report resolved — its admission estimate stays spent under
+ * cost_basis 'admission_estimate'; 'not_sent' asserts no request was
+ * produced after admission (its reservation released); 'unrecorded' is a
+ * reconciliation placeholder for an admitted call whose record never
+ * landed, carrying the estimate as uncertain spend until a late report
+ * upgrades it. Normalized token columns never overlap — input_tokens
+ * excludes cached_tokens on every protocol. cost_minor is null when the
+ * fact could not be priced (no rate card, or a provably-unsent call).
  */
 export interface UsageFact {
   persona_id: string;
@@ -480,7 +506,7 @@ export interface UsageFact {
   input_id?: string;
   round?: number;
   funding: FundingRef;
-  status: "reported" | "unknown";
+  status: "reported" | "unknown" | "not_sent" | "unrecorded";
   input_tokens: number | null;
   output_tokens: number | null;
   cached_tokens: number | null;

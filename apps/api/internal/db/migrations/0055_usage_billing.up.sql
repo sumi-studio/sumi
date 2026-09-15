@@ -50,20 +50,42 @@ CREATE TABLE usage_budgets (
 
 -- usage_reservations: spend held by an admitted call before its fact
 -- lands. 'held' rows count against the budget until the call's fact
--- settles them or turn commit / generation recovery releases the orphan.
+-- settles them; a call whose record never arrives is NOT released back to
+-- the allowance — turn commit / generation recovery writes an inspectable
+-- 'unrecorded' fact carrying the estimate as explicitly estimated spend.
+-- Only a fact reporting 'not_sent' (the core asserts no request was
+-- produced) releases the hold.
+--
+-- The row also snapshots the admission-time pricing provenance (rate card,
+-- currency, revision) and the call's identity (kind/input/round/funding):
+-- the fact is priced under the card that admitted the call, so a mid-call
+-- rate, currency or budget change cannot rewrite that call's cost basis,
+-- and a lost record can still be reconstructed as an 'unrecorded' fact.
 CREATE TABLE usage_reservations (
     persona_id     uuidv7 NOT NULL REFERENCES core_personas(persona_id) ON DELETE CASCADE,
     fact_id        text   NOT NULL,
+    kind           text   NOT NULL,
+    phase          text   NOT NULL,
+    turn_id        text,
+    input_id       text,
+    round          int,
     funding_kind   text   NOT NULL,
     funding_id     text   NOT NULL,
+    funding        jsonb  NOT NULL,
     reserved_minor bigint NOT NULL CHECK (reserved_minor >= 0),
     currency       text,
     -- bounded=false: the call's output was not limited at admission, so
     -- the reservation bounds admission, not the call's external bill.
     bounded        boolean NOT NULL DEFAULT false,
+    -- Admission-time estimate and the rate card that priced it. NULL rate
+    -- columns mean the call was admitted under no configured budget.
+    est_input_tokens     bigint,
+    est_output_bound     bigint,
+    rate_input_per_mtok  bigint,
+    rate_output_per_mtok bigint,
+    rate_cached_per_mtok bigint,
+    pricing_revision     text,
     generation     bigint NOT NULL,
-    turn_id        text,
-    phase          text   NOT NULL,
     status         text   NOT NULL CHECK (status IN ('held','settled','released')),
     created_at     timestamptz NOT NULL DEFAULT now(),
     settled_at     timestamptz,
@@ -72,12 +94,32 @@ CREATE TABLE usage_reservations (
 CREATE INDEX usage_reservations_held
     ON usage_reservations (funding_kind, funding_id) WHERE status = 'held';
 
--- usage_facts: the immutable ledger of recorded work. One row per logical
--- provider call — a redelivery of the same fact_id replays the stored row;
--- a genuinely additional call carries a different fact_id. Token columns
--- are NULL when the provider did not report that category; quantities
--- keeps the raw provider report for provenance. cost_minor is NULL when
--- the fact could not be priced (no rate card, or no token report).
+-- usage_facts: the ledger of recorded work. One row per logical provider
+-- call — a redelivery of the same fact_id replays the stored row; a
+-- genuinely additional call carries a different fact_id. Token columns are
+-- NULL when the provider did not report that category; quantities keeps
+-- the raw provider report for provenance. cost_minor is NULL when the fact
+-- could not be priced (no rate card, or a provably-unsent call).
+--
+-- status:
+--   reported   — the provider's own usage report resolved. cost_minor is
+--                priced under the admission-snapshot rate card.
+--   unknown    — the call was attempted but no usage report resolved. The
+--                admission estimate is retained as cost_minor with
+--                cost_basis 'admission_estimate' — uncertain spend stays
+--                spent; a later 'reported' redelivery for the same fact_id
+--                upgrades the row to the provider's actual quantities.
+--   not_sent   — the core asserts no request was produced after admission.
+--                The reservation is released; nothing was or can be owed.
+--   unrecorded — admitted, then the record never landed (lost response,
+--                dead writer). Written by reservation reconciliation with
+--                the estimate retained as 'admission_estimate' spend.
+--
+-- Normalized token columns never overlap: input_tokens excludes
+-- cached_tokens regardless of the provider's wire convention (chat/
+-- responses report input including the cached subset; Anthropic reports
+-- cache read/write additively — cache-write input is folded into
+-- input_tokens and priced at the input rate).
 CREATE TABLE usage_facts (
     persona_id    uuidv7 NOT NULL REFERENCES core_personas(persona_id) ON DELETE CASCADE,
     fact_id       text   NOT NULL,
@@ -91,7 +133,7 @@ CREATE TABLE usage_facts (
     -- Non-secret snapshot of the selected funding identity at call time:
     -- connection version/model/preset, or the env fallback provider name.
     funding       jsonb  NOT NULL,
-    status        text   NOT NULL CHECK (status IN ('reported','unknown')),
+    status        text   NOT NULL CHECK (status IN ('reported','unknown','not_sent','unrecorded')),
     input_tokens  bigint,
     output_tokens bigint,
     cached_tokens bigint,

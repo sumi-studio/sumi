@@ -40,8 +40,7 @@ it("reads owned funding sources, keeps unknown usage distinct, and sends CSRF on
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 3,
-            cost_minor: 300,
-            currency: "USD",
+            costs: { USD: 300 },
           },
           recent: [
             {
@@ -72,7 +71,7 @@ it("reads owned funding sources, keeps unknown usage distinct, and sends CSRF on
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
-            cost_minor: 0,
+            costs: {},
           },
           recent: [],
         },

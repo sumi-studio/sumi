@@ -384,6 +384,33 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		WHERE persona_id = $1 AND status = 'preparing'`, personaID); err != nil {
 		return Receipt{}, err
 	}
+	// A budget-parked input is 'waiting' on placement-local backpressure,
+	// not on a human decision: the funding row and rate card it waits for
+	// are account state that never travels, so carrying the wait would
+	// strand the input at the destination (no pending approval exists to
+	// resume it) — or fail this seal's own cut verification. Requeue the
+	// input instead: the destination re-admits it under its own funding,
+	// and a fresh denial parks it there. A parked input has not run, so
+	// requeueing repeats no effect; an input still waiting on a pending
+	// approval keeps that wait. On abort the input simply runs again and
+	// re-parks if the budget still denies it — the wait row is a derived
+	// resume index, not authority.
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_inputs i SET status = 'queued', claimed_generation = NULL,
+			turn_id = NULL, waiting_since = NULL
+		FROM core_budget_waits w
+		WHERE w.persona_id = $1 AND w.input_id = i.input_id
+			AND i.persona_id = w.persona_id AND i.status = 'waiting'
+			AND NOT EXISTS (
+				SELECT 1 FROM core_tool_approvals a
+				WHERE a.persona_id = i.persona_id AND a.input_id = i.input_id
+				  AND a.status = 'pending')`, personaID); err != nil {
+		return Receipt{}, err
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM core_budget_waits WHERE persona_id = $1`, personaID); err != nil {
+		return Receipt{}, err
+	}
 	violations, err := verifyCut(ctx, tx, personaID)
 	if err != nil {
 		return Receipt{}, err

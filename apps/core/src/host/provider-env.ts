@@ -7,9 +7,10 @@
  * from the state service for every model call, so a changed selection or a
  * rotated key applies from the next consultation without a restart:
  *
- *   api      → exactly that connection's base_url / model / api_key, when
- *              its preset speaks chat completions (the wire this core
- *              implements). Anything else fails the request.
+ *   api      → exactly that connection's base_url / model / api_key /
+ *              extra_headers, on the wire its preset declares (chat
+ *              completions, OpenAI Responses, or Anthropic Messages).
+ *              Any other preset fails the request.
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
  *   chatgpt  → not implemented by this core: the request fails.
@@ -37,21 +38,26 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
-import { StateError, type StateClient } from "../state-client.ts";
-import type { FundingRef, ModelBinding } from "../types.ts";
+import { AnthropicProvider } from "../providers/anthropic.ts";
+import { MockProvider } from "../providers/mock.ts";
+import { OpenAIProvider } from "../providers/openai.ts";
+import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
+import { type StateClient, StateError } from "../state-client.ts";
+import type {
+  FundingRef,
+  ModelBinding,
+  UsageAdmitResult,
+} from "../types.ts";
 import {
   BudgetWaitError,
   newFactId,
   reportedTokens,
   requestEstimate,
 } from "../usage.ts";
-import { MockProvider } from "../providers/mock.ts";
-import { OpenAIProvider } from "../providers/openai.ts";
 
 /**
  * Connection presets whose wire protocol is OpenAI chat completions — the
  * same set the Rust agent maps to ApiProtocol::OpenAiChatCompletions.
- * openai-responses and anthropic use other wires this core does not speak.
  */
 export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "openai-chat",
@@ -59,6 +65,23 @@ export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "glm-5.2",
   "umans",
   "umans-kimi-k2.7",
+  "opencode-go",
+  "opencode-zen-go",
+]);
+
+/** Presets on the OpenAI Responses wire (POST {base}/responses). */
+export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
+  "openai-responses",
+]);
+
+/** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
+export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
+
+/**
+ * Presets served by the OpenCode Go endpoint — the legacy agent sent
+ * `x-opencode-session` with the PA's stable session id on this wire.
+ */
+export const OPENCODE_PRESETS: ReadonlySet<string> = new Set([
   "opencode-go",
   "opencode-zen-go",
 ]);
@@ -109,11 +132,11 @@ export class SelectedModelProvider implements ModelProvider {
   }
 
   /**
-   * Preflight for callers that hold durable work before consulting the
-   * model (memory preparation claims a chunk): resolves the binding
-   * without sending a request so an unusable selection is a pause, not a
-   * spent attempt. The stream still re-resolves — the binding can change
-   * between this check and the call.
+   * Binding preflight: resolves the selection exactly as the next call
+   * would, without sending a request. Throws the same `ModelError` the
+   * call would raise — callers that gate work on a usable model (memory
+   * preparation) can pause instead of spending it. The stream still
+   * re-resolves — the binding can change between this check and the call.
    */
   async probe(): Promise<void> {
     await this.resolve();
@@ -130,21 +153,19 @@ export class SelectedModelProvider implements ModelProvider {
    */
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const { provider, identity } = await this.resolve();
-    const { state, persona } = this.opts;
     if (request.generation === undefined) {
       throw new Error("a metered call requires the writer generation");
     }
     const factId = newFactId(request);
     const funding = fundingRef(identity);
-    const admission = await state.admitUsage(persona, request.generation, {
+    // The estimate prices the provider's real wire bound — an output cap
+    // the adapter does not send cannot count as a bound on the bill.
+    const admission = await this.admit(
       factId,
-      kind: "model_call",
-      phase: request.phase ?? "turn",
-      turnId: request.turnId,
-      round: request.round,
+      request,
       funding,
-      estimate: requestEstimate(request),
-    });
+      requestEstimate(request, provider.outputBound?.()),
+    );
     if (!admission.admitted) {
       throw new BudgetWaitError(
         admission.wait ?? {
@@ -162,6 +183,9 @@ export class SelectedModelProvider implements ModelProvider {
     }
     let usage: Record<string, unknown> | null = null;
     let streamError: unknown = null;
+    // The provider asserts no request was produced only via an
+    // 'unavailable' error — every other outcome may have sent bytes.
+    let notSent = false;
     try {
       for await (const ev of provider.stream(request)) {
         if (ev.type !== "done") {
@@ -175,35 +199,86 @@ export class SelectedModelProvider implements ModelProvider {
       }
     } catch (e) {
       streamError = e;
+      notSent = e instanceof ModelError && e.unavailable === true;
+    } finally {
+      // finally, not a post-loop statement: a consumer early-return or a
+      // caller abort also lands the fact — recording cannot silently
+      // disappear with the held reservation.
+      await this.record(factId, request, funding, usage, notSent);
     }
-    await this.record(factId, request, funding, usage);
     if (streamError !== null) throw streamError;
+  }
+
+  /**
+   * Admit one call, replaying the SAME fact id across transient retries —
+   * the state service replays a held reservation, so a lost admit
+   * response never double-reserves. A definitive denial is a verdict, not
+   * a failure; a contract violation or a dead-writer fence is not
+   * retryable.
+   */
+  private async admit(
+    factId: string,
+    request: ModelRequest,
+    funding: FundingRef,
+    estimate: ReturnType<typeof requestEstimate>,
+  ): Promise<UsageAdmitResult> {
+    const { state, persona } = this.opts;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await state.admitUsage(persona, request.generation ?? 0, {
+          factId,
+          kind: "model_call",
+          phase: request.phase ?? "turn",
+          turnId: request.turnId,
+          inputId: request.inputId,
+          round: request.round,
+          funding,
+          estimate,
+        });
+      } catch (e) {
+        const transient =
+          !(e instanceof StateError) || e.status === 429 || e.status >= 500;
+        if (!transient || attempt === 2) {
+          throw new ModelError(`usage admission failed: ${e}`, {
+            retryable: transient,
+          });
+        }
+        await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+      }
+    }
+    throw new ModelError("usage admission failed", { retryable: true });
   }
 
   /**
    * Persist the call's usage fact. Recording is not writer-fenced — the
    * spend already happened — so this still lands after a fence loss or an
-   * aborted stream. A call whose usage never resolved records 'unknown',
-   * never silently zero. A recording failure must not fail the turn:
-   * retrying the turn would spend again, so after bounded retries the gap
-   * is logged and the held reservation reconciles at turn commit or
-   * generation recovery instead.
+   * aborted stream. A call whose usage never resolved records 'unknown'
+   * (the admission estimate stays spent), never silently zero; a call the
+   * provider asserts was never produced records 'not_sent' and releases
+   * its hold. A recording failure must not fail the turn: retrying the
+   * turn would spend again, so after bounded retries the gap is logged
+   * and the held reservation reconciles into an inspectable 'unrecorded'
+   * fact at turn commit or generation recovery — the durable record of
+   * the call survives even when this report does not.
    */
   private async record(
     factId: string,
     request: ModelRequest,
     funding: FundingRef,
     usage: Record<string, unknown> | null,
+    notSent: boolean,
   ): Promise<void> {
     const { state, persona, log } = this.opts;
-    const tokens = usage === null
-      ? { input: null, output: null, cached: null }
-      : reportedTokens(usage);
+    const tokens =
+      usage === null
+        ? { input: null, output: null, cached: null }
+        : reportedTokens(usage);
     // 'reported' only when the provider's report carried at least one
     // token category; a done event without recognizable usage — or a call
     // that ended before its report — is 'unknown', not a zero bill.
     const reported =
       tokens.input !== null || tokens.output !== null || tokens.cached !== null;
+    const status = notSent ? "not_sent" : reported ? "reported" : "unknown";
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await state.recordUsage(persona, {
@@ -214,7 +289,7 @@ export class SelectedModelProvider implements ModelProvider {
           inputId: request.inputId,
           round: request.round,
           funding,
-          status: reported ? "reported" : "unknown",
+          status,
           inputTokens: tokens.input,
           outputTokens: tokens.output,
           cachedTokens: tokens.cached,
@@ -222,6 +297,16 @@ export class SelectedModelProvider implements ModelProvider {
         });
         return;
       } catch (e) {
+        // A contract conflict (409) is authoritative — the fact is
+        // recorded or genuinely different; retrying cannot help either way.
+        if (e instanceof StateError && e.status === 409) {
+          log?.("usage fact conflicted with a recorded fact", {
+            fact_id: factId,
+            turn_id: request.turnId,
+            error: String(e),
+          });
+          return;
+        }
         if (attempt === 2) {
           log?.("usage fact could not be recorded", {
             fact_id: factId,
@@ -249,10 +334,14 @@ export class SelectedModelProvider implements ModelProvider {
       // lookup failure retries like any provider outage.
       const msg = e instanceof Error ? e.message : String(e);
       const definite =
-        e instanceof StateError && e.status >= 400 && e.status < 500 &&
+        e instanceof StateError &&
+        e.status >= 400 &&
+        e.status < 500 &&
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
+        // The model was never consulted — this is an availability gap,
+        // not an evaluated-model failure.
         unavailable: true,
       });
     }
@@ -292,7 +381,11 @@ export class SelectedModelProvider implements ModelProvider {
         binding.reason ?? "the selected API connection no longer exists",
       );
     }
-    if (!CHAT_COMPLETIONS_PRESETS.has(c.preset)) {
+    if (
+      !CHAT_COMPLETIONS_PRESETS.has(c.preset) &&
+      !RESPONSES_PRESETS.has(c.preset) &&
+      !ANTHROPIC_PRESETS.has(c.preset)
+    ) {
       throw unusable(
         `the selected connection ${c.name} uses preset ${c.preset}, whose protocol this core does not implement`,
       );
@@ -302,6 +395,30 @@ export class SelectedModelProvider implements ModelProvider {
         `the selected connection ${c.name} has no usable credential (${binding.reason ?? "unavailable"}); re-enter its API key`,
       );
     }
+    // Per-connection extra headers travel with the binding (sealed with
+    // the credential on the server) and reach only this connection's
+    // endpoint.
+    const headers = c.extra_headers;
+    const shared = {
+      baseUrl: c.base_url,
+      apiKey: binding.api_key,
+      model: c.model,
+      headers,
+      timeoutMs: this.opts.timeoutMs,
+      maxOutputTokens: c.max_output_tokens,
+    };
+    const provider: ModelProvider = RESPONSES_PRESETS.has(c.preset)
+      ? new OpenAIResponsesProvider(shared)
+      : ANTHROPIC_PRESETS.has(c.preset)
+        ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
+        : new OpenAIProvider({
+            ...shared,
+            // OpenCode Go routes on a per-session header; the legacy agent
+            // supplied the PA's stable id — personaId is that identity here.
+            sessionHeader: OPENCODE_PRESETS.has(c.preset)
+              ? "x-opencode-session"
+              : undefined,
+          });
     const identity: BindingIdentity = {
       selection: "api",
       connection_id: c.id,
@@ -310,15 +427,7 @@ export class SelectedModelProvider implements ModelProvider {
       version: c.version,
     };
     this.opts.log?.("model bound to selected connection", identity);
-    return {
-      provider: new OpenAIProvider({
-        baseUrl: c.base_url,
-        apiKey: binding.api_key,
-        model: c.model,
-        timeoutMs: this.opts.timeoutMs,
-      }),
-      identity,
-    };
+    return { provider, identity };
   }
 }
 
@@ -351,8 +460,17 @@ export function providerFromEnv(
 ): ModelProvider {
   const kind = get("SUMI_MODEL_PROVIDER") ?? "mock";
   if (kind === "openai") {
+    const baseUrl = required(get, "SUMI_MODEL_BASE_URL");
+    // The connection path's URL is validated by the Go store; the env
+    // path has no such boundary, so an unparseable base URL must fail
+    // here at boot — not as a per-request fetch defect.
+    try {
+      new URL(baseUrl);
+    } catch {
+      throw new Error(`SUMI_MODEL_BASE_URL is not a URL: ${baseUrl}`);
+    }
     return new OpenAIProvider({
-      baseUrl: required(get, "SUMI_MODEL_BASE_URL"),
+      baseUrl,
       apiKey: required(get, "SUMI_MODEL_API_KEY"),
       model: required(get, "SUMI_MODEL_MODEL"),
       headers: jsonObj(get, "SUMI_MODEL_HEADERS_JSON") as

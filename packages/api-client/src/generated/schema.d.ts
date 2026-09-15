@@ -619,10 +619,12 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Model IDs are free text and providers reject a bound above the model's cap with a 400 — set this when the selected model's output cap is below the core's default. Absent means the protocol default (Anthropic sends the core's default budget of 16384; Responses omits the field so the model's own cap applies). */
+            maxOutputTokens?: number;
         };
         ModelAPIConnectionCreate: {
             name: string;
@@ -630,12 +632,19 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores NULL (the protocol default), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
+        };
+        /** @description Per-connection request headers sent only to this connection's endpoint (for example a gateway routing header). Sealed encrypted together with the API key and never returned. Header names must be RFC 7230 tokens (max 128 chars) and may not replace the request's own authentication, protocol-version, or transport headers (for example Authorization, x-api-key, Content-Type, Host). Setting or clearing headers requires apiKey in the same request; omit the field to retain the stored headers. */
+        ModelAPIExtraHeaders: {
+            [key: string]: string;
         };
         ModelAPIConnectionUpdate: {
             name: string;
@@ -643,12 +652,15 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores NULL (the protocol default), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey?: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
         };
         ModelConnectionSelection: {
             /** @enum {string} */
@@ -1020,15 +1032,17 @@ export interface components {
         };
         UsageTotals: {
             calls: number;
-            /** @description Calls whose provider never reported usage; never billed as zero. */
+            /** @description Calls whose provider never reported usage (status 'unknown' or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero. */
             unknown_calls: number;
             /** @description Reported calls with no applicable rate card. */
             unpriced_calls: number;
             input_tokens: number;
             output_tokens: number;
             cached_tokens: number;
-            cost_minor: number;
-            currency?: string;
+            /** @description Recorded spend per currency code in minor units. A funding source can hold cost in more than one currency across rate-card edits, so totals never collapse to one number. */
+            costs: {
+                [key: string]: number;
+            };
         };
         /** @description One admitted provider call. Retries and extra calls are distinct facts; redelivery of the same fact_id never multiplies it. */
         UsageFact: {
@@ -1043,23 +1057,23 @@ export interface components {
             round?: number;
             funding: components["schemas"]["UsageFundingRef"];
             /**
-             * @description 'reported' carries provider token counts; 'unknown' means the provider gave none — inspectable, never zero-billed.
+             * @description 'reported' carries provider token counts. 'unknown' means the call was attempted but usage never resolved — it keeps the admission estimate as uncertain spend. 'unrecorded' means the writer lost the response before it could report — inspectable, estimate retained. 'not_sent' means the request provably never left — its reservation was released and nothing is owed.
              * @enum {string}
              */
-            status: "reported" | "unknown";
+            status: "reported" | "unknown" | "not_sent" | "unrecorded";
             input_tokens: number | null;
             output_tokens: number | null;
             cached_tokens: number | null;
             /** @description Raw provider-reported quantities, preserved verbatim. */
             quantities: Record<string, never>;
-            /** @description Priced under the configured rate card; null when unpriced or unknown. */
+            /** @description Priced under the rate card snapshotted at admission; null when unpriced. */
             cost_minor: number | null;
             currency?: string;
             /**
-             * @description Provenance — configured estimates, never a provider invoice.
+             * @description Provenance — 'configured_rates' priced provider-reported tokens; 'admission_estimate' is the reserved estimate kept for unknown/lost usage. Never a provider invoice.
              * @enum {string}
              */
-            cost_basis?: "configured_rates";
+            cost_basis?: "configured_rates" | "admission_estimate";
             pricing_revision?: string;
             /** Format: date-time */
             recorded_at: string;

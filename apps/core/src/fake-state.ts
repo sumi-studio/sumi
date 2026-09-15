@@ -18,11 +18,11 @@ import type {
   ModelBinding,
   OmittedMemory,
   Operation,
-  RenderedContext,
   OutboxEntry,
   PersonaState,
   PlanCall,
   RecoverResult,
+  RenderedContext,
   Schedule,
   Turn,
   TurnPlan,
@@ -104,18 +104,27 @@ const L0_LIVE_LIMIT_TOKENS = 40_000;
 const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 /** Claims ending without a recorded outcome before a chunk is marked failed. */
 const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
+/** Go memoryReshelvePacing: shelf delay after an unavailable model layer. */
+const MEMORY_RESHELVE_PACING_MS = 200;
 /** Estimated tokens of applied memory blocks admitted into one context. */
 const MEMORY_SEND_CAP_TOKENS = 25_000;
+/** Applied L1 beyond this triggers an L1→L2 consolidation target. */
+const L1_LIMIT_TOKENS = 15_000;
+/** One L1→L2 target consumes until at most this much applied L1 remains. */
+const L1_DROP_TO_TOKENS = 11_000;
+/** Applied L2 beyond this triggers L2-internal reintegration. */
+const L2_LIMIT_TOKENS = 10_000;
 /** Journal records one conversation_history search call scans. */
 const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
 const L0_SEND_CAP_TOKENS = 60_000;
 const CONTEXT_MAX_EVENTS = 5_000;
-/** Pacing for a chunk reshelved without a verdict (Go memoryReshelvePacing). */
-const MEMORY_RESHELVE_PACING_MS = 200;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
-function estEventTokens(kind: string, payload: Record<string, unknown>): number {
+function estEventTokens(
+  kind: string,
+  payload: Record<string, unknown>,
+): number {
   return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
 }
 function estTextTokens(text: string): number {
@@ -198,7 +207,7 @@ export const TOOL_AUTHORITY: Record<
   "job.status": { requiresApproval: false, elevatedOnly: false },
   "job.cancel": { requiresApproval: false, elevatedOnly: false },
   "message.send": { requiresApproval: false, elevatedOnly: true },
-  "conversation_history": { requiresApproval: false, elevatedOnly: false },
+  conversation_history: { requiresApproval: false, elevatedOnly: false },
 };
 
 // Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
@@ -287,7 +296,11 @@ function actionDigest(tool: string, route: string, request: Json): string {
   );
 }
 
-function approvalId(persona: string, inputId: string, callIndex: number): string {
+function approvalId(
+  persona: string,
+  inputId: string,
+  callIndex: number,
+): string {
   return `appr-${fakeDigest(`${persona}\x00${inputId}\x00${callIndex}`)}`;
 }
 
@@ -307,7 +320,10 @@ export class FakeState implements StateClient {
       authority: string;
       transfer_id: string | null;
       /** Carried non-secret model intent (Go core_personas.model_intent). */
-      model_intent: { kind: string; connection?: Record<string, unknown> } | null;
+      model_intent: {
+        kind: string;
+        connection?: Record<string, unknown>;
+      } | null;
     }
   >();
   /** Live or expired lease row per persona — release never deletes (Go B1 fix). */
@@ -344,19 +360,32 @@ export class FakeState implements StateClient {
       pricing_revision: string;
     }
   >();
-  /** Admission holds — key: persona|fact_id (usage_reservations). */
+  /** Admission holds — key: persona|fact_id (usage_reservations). The row
+   *  snapshots the call's identity and the rate card that priced it, so a
+   *  lost record reconciles into an 'unrecorded' fact and a mid-call rate
+   *  edit cannot rewrite that call's cost basis (Go parity). */
   usageReservations = new Map<
     string,
     {
       fact_id: string;
+      kind: string;
+      phase: string;
+      turn_id: string | null;
+      input_id: string | null;
+      round: number;
       funding_kind: string;
       funding_id: string;
+      funding: FundingRef;
       reserved_minor: number;
       currency: string | null;
       bounded: boolean;
+      est_input_tokens: number | null;
+      est_output_bound: number | null;
+      rate_input_per_mtok: number | null;
+      rate_output_per_mtok: number | null;
+      rate_cached_per_mtok: number | null;
+      pricing_revision: string | null;
       generation: number;
-      turn_id: string | null;
-      phase: string;
       status: "held" | "settled" | "released";
     }
   >();
@@ -382,8 +411,6 @@ export class FakeState implements StateClient {
    *  core_events and core_outbox, so a second persona starts at 1. */
   private seq = new Map<string, number>();
   private outboxSeq = new Map<string, number>();
-  /** Next chunk_seq per persona — matches MAX(chunk_seq) WHERE persona_id. */
-  private chunkSeq = new Map<string, number>();
   /** Registered delegated effects — Go Store.RegisterEffect parity. A tool
    *  here is claimable; its applier runs where Go would run Apply in-tx. */
   private registeredEffects = new Map<
@@ -399,6 +426,19 @@ export class FakeState implements StateClient {
     const next = (map.get(persona) ?? 0) + 1;
     map.set(persona, next);
     return next;
+  }
+
+  /** Go allocates MAX(chunk_seq)+1 per persona, so rows seeded directly —
+   *  or carried in a future transfer — still get the next free seq. */
+  private nextChunkSeq(persona: string) {
+    return (
+      Math.max(
+        0,
+        ...this.memoryChunks
+          .filter((c) => c.persona_id === persona)
+          .map((c) => c.chunk_seq),
+      ) + 1
+    );
   }
 
   private mustHold(persona: string, generation: number) {
@@ -604,14 +644,15 @@ export class FakeState implements StateClient {
     // Memory chunks a fenced generation was preparing count an interruption.
     this.interruptPreparing(persona, generation);
     // Held reservations from dead generations reconcile the same way Go
-    // Recover does: the fact landed → settled; it never did → released.
+    // Recover does: the fact landed → settled; it never did → an
+    // inspectable 'unrecorded' fact carrying the estimate, not a release.
     for (const [k, r] of this.usageReservations) {
       if (
         k.startsWith(`${persona}|`) &&
         r.generation < generation &&
         r.status === "held"
       ) {
-        r.status = this.usageFacts.has(k) ? "settled" : "released";
+        this.reconcileHeldReservation(k, r);
       }
     }
     return {
@@ -689,7 +730,7 @@ export class FakeState implements StateClient {
     const budget = this.usageBudgets.get(`${kind}|${id}`);
     let fitsNeeded = -1;
     if (budget) {
-      const { spent, held } = this.fundingSpend(kind, id);
+      const { spent, held } = this.fundingSpend(kind, id, budget.currency);
       fitsNeeded = budget.limit_minor - spent - held;
     }
     for (const [key, w] of [...this.budgetWaits]) {
@@ -743,11 +784,18 @@ export class FakeState implements StateClient {
     input.not_before = null;
   }
 
-  private fundingSpend(kind: string, id: string) {
+  /** Go fundingSpend: currency-dimensioned — spend in one currency never
+   *  counts toward a cap denominated in another. */
+  private fundingSpend(kind: string, id: string, currency: string) {
     let spent = 0;
     let held = 0;
     for (const f of this.usageFacts.values()) {
-      if (f.funding.kind === kind && f.funding.id === id && f.cost_minor) {
+      if (
+        f.funding.kind === kind &&
+        f.funding.id === id &&
+        f.currency === currency &&
+        f.cost_minor
+      ) {
         spent += f.cost_minor;
       }
     }
@@ -755,6 +803,7 @@ export class FakeState implements StateClient {
       if (
         r.funding_kind === kind &&
         r.funding_id === id &&
+        r.currency === currency &&
         r.status === "held"
       ) {
         held += r.reserved_minor;
@@ -771,6 +820,7 @@ export class FakeState implements StateClient {
       kind: string;
       phase: string;
       turnId?: string;
+      inputId?: string;
       round?: number;
       funding: FundingRef;
       estimate: UsageEstimate;
@@ -823,7 +873,6 @@ export class FakeState implements StateClient {
     );
     let needed = 0;
     let bounded = req.estimate.output_tokens_bound !== undefined;
-    let currency = "";
     if (budget) {
       const price = (tok: number, rate: number) =>
         tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
@@ -835,12 +884,12 @@ export class FakeState implements StateClient {
               budget.rate_output_per_mtok,
             )
           : 0);
-      currency = budget.currency;
       const { spent, held } = this.fundingSpend(
         req.funding.kind,
         req.funding.id,
+        budget.currency,
       );
-      if (spent + held + needed > budget.limit_minor) {
+      if (needed > budget.limit_minor || spent + held > budget.limit_minor - needed) {
         return {
           admitted: false,
           wait: {
@@ -857,16 +906,28 @@ export class FakeState implements StateClient {
         };
       }
     }
+    // Snapshot the rate card that priced this admission — the fact is
+    // priced under it even if the budget is edited or removed mid-call.
     this.usageReservations.set(key, {
       fact_id: req.factId,
+      kind: req.kind,
+      phase: req.phase,
+      turn_id: req.turnId ?? null,
+      input_id: req.inputId ?? null,
+      round: req.round ?? 0,
       funding_kind: req.funding.kind,
       funding_id: req.funding.id,
+      funding: req.funding,
       reserved_minor: needed,
-      currency: currency || null,
+      currency: budget?.currency ?? null,
       bounded,
+      est_input_tokens: req.estimate.input_tokens,
+      est_output_bound: req.estimate.output_tokens_bound ?? null,
+      rate_input_per_mtok: budget?.rate_input_per_mtok ?? null,
+      rate_output_per_mtok: budget?.rate_output_per_mtok ?? null,
+      rate_cached_per_mtok: budget?.rate_cached_per_mtok ?? null,
+      pricing_revision: budget?.pricing_revision ?? null,
       generation,
-      turn_id: req.turnId ?? null,
-      phase: req.phase,
       status: "held",
     });
     return {
@@ -874,7 +935,7 @@ export class FakeState implements StateClient {
       reservation: {
         fact_id: req.factId,
         reserved_minor: needed,
-        currency: currency || undefined,
+        currency: budget?.currency,
         bounded,
         status: "held",
       },
@@ -891,7 +952,7 @@ export class FakeState implements StateClient {
       inputId?: string;
       round?: number;
       funding: FundingRef;
-      status: "reported" | "unknown";
+      status: "reported" | "unknown" | "not_sent";
       inputTokens?: number | null;
       outputTokens?: number | null;
       cachedTokens?: number | null;
@@ -902,56 +963,121 @@ export class FakeState implements StateClient {
     if (!req.factId || !req.kind || !req.phase) {
       throw new StateError(400, "fact_id, kind and phase are required");
     }
-    if (req.status !== "reported" && req.status !== "unknown") {
-      throw new StateError(400, "status must be reported or unknown");
+    if (
+      req.status !== "reported" &&
+      req.status !== "unknown" &&
+      req.status !== "not_sent"
+    ) {
+      throw new StateError(
+        400,
+        "status must be reported, unknown or not_sent",
+      );
     }
     const key = `${persona}|${req.factId}`;
-    const existing = this.usageFacts.get(key);
-    if (existing) {
-      const same =
-        existing.kind === req.kind &&
-        existing.phase === req.phase &&
-        (existing.turn_id ?? "") === (req.turnId ?? "") &&
-        (existing.input_id ?? "") === (req.inputId ?? "") &&
-        (existing.round ?? 0) === (req.round ?? 0) &&
-        existing.funding.kind === req.funding.kind &&
-        existing.funding.id === req.funding.id &&
-        existing.status === req.status &&
-        (existing.input_tokens ?? 0) === (req.inputTokens ?? 0) &&
-        (existing.output_tokens ?? 0) === (req.outputTokens ?? 0) &&
-        (existing.cached_tokens ?? 0) === (req.cachedTokens ?? 0);
-      if (!same) {
-        throw new StateError(
-          409,
-          `fact_id ${req.factId} recorded with different content`,
-        );
-      }
-      return { fact: existing, created: false };
-    }
-    const budget = this.usageBudgets.get(
-      `${req.funding.kind}|${req.funding.id}`,
-    );
+    const res = this.usageReservations.get(key);
+
+    // The call's rate card: the admission snapshot when it was admitted
+    // under a configured budget (an edited or removed budget cannot
+    // rewrite this call's cost basis); else the current budget.
+    const card =
+      res?.currency != null &&
+      res.rate_input_per_mtok != null &&
+      res.rate_output_per_mtok != null
+        ? {
+            currency: res.currency,
+            rate_input_per_mtok: res.rate_input_per_mtok,
+            rate_output_per_mtok: res.rate_output_per_mtok,
+            rate_cached_per_mtok: res.rate_cached_per_mtok,
+            pricing_revision: res.pricing_revision ?? "",
+          }
+        : (this.usageBudgets.get(`${req.funding.kind}|${req.funding.id}`) ??
+          null);
+
+    const price = (tok: number, rate: number) =>
+      tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
     let costMinor: number | null = null;
     let currency: string | undefined;
     let costBasis: string | undefined;
     let revision: string | undefined;
     if (
-      budget &&
       req.status === "reported" &&
+      card &&
       req.inputTokens != null &&
       req.outputTokens != null
     ) {
-      const price = (tok: number, rate: number) =>
-        tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
-      const cached = Math.min(req.cachedTokens ?? 0, req.inputTokens);
-      const cachedRate = budget.rate_cached_per_mtok ?? budget.rate_input_per_mtok;
+      // Normalized categories are non-overlapping — additive pricing.
+      const cachedRate =
+        card.rate_cached_per_mtok ?? card.rate_input_per_mtok;
       costMinor =
-        price(req.inputTokens - cached, budget.rate_input_per_mtok) +
-        price(cached, cachedRate) +
-        price(req.outputTokens, budget.rate_output_per_mtok);
-      currency = budget.currency;
+        price(req.inputTokens, card.rate_input_per_mtok) +
+        price(req.cachedTokens ?? 0, cachedRate) +
+        price(req.outputTokens, card.rate_output_per_mtok);
+      currency = card.currency;
       costBasis = "configured_rates";
-      revision = budget.pricing_revision;
+      revision = card.pricing_revision;
+    } else if (req.status === "unknown" && res && card) {
+      // An attempted call whose usage never resolved keeps its estimate —
+      // uncertain spend stays spent; a later 'reported' upgrades it.
+      costMinor = res.reserved_minor;
+      currency = card.currency;
+      costBasis = "admission_estimate";
+      revision = card.pricing_revision;
+    }
+
+    const content = {
+      status: req.status,
+      input_tokens: req.inputTokens ?? null,
+      output_tokens: req.outputTokens ?? null,
+      cached_tokens: req.cachedTokens ?? null,
+      quantities: req.quantities ?? {},
+      cost_minor: costMinor,
+      currency,
+      cost_basis: costBasis,
+      pricing_revision: revision,
+    };
+    const sameIdentity = (f: UsageFact) =>
+      f.kind === req.kind &&
+      f.phase === req.phase &&
+      (f.turn_id ?? "") === (req.turnId ?? "") &&
+      (f.input_id ?? "") === (req.inputId ?? "") &&
+      (f.round ?? 0) === (req.round ?? 0) &&
+      f.funding.kind === req.funding.kind &&
+      f.funding.id === req.funding.id;
+    const sameFact = (f: UsageFact) =>
+      sameIdentity(f) &&
+      f.status === req.status &&
+      (f.input_tokens ?? 0) === (req.inputTokens ?? 0) &&
+      (f.output_tokens ?? 0) === (req.outputTokens ?? 0) &&
+      (f.cached_tokens ?? 0) === (req.cachedTokens ?? 0);
+
+    const existing = this.usageFacts.get(key);
+    if (existing) {
+      if (!sameIdentity(existing)) {
+        throw new StateError(
+          409,
+          `fact_id ${req.factId} recorded with different content`,
+        );
+      }
+      // Upgrade lattice (Go RecordUsage): 'reported'/'not_sent' are
+      // terminal — identical replay or conflict. 'unknown'/'unrecorded'
+      // can still be superseded by the call's real report.
+      if (
+        existing.status === "reported" ||
+        existing.status === "not_sent"
+      ) {
+        if (!sameFact(existing)) {
+          throw new StateError(
+            409,
+            `fact_id ${req.factId} recorded with different content`,
+          );
+        }
+        return { fact: existing, created: false };
+      }
+      if (sameFact(existing)) {
+        return { fact: existing, created: false };
+      }
+      Object.assign(existing, content);
+      return { fact: existing, created: false };
     }
     const fact: UsageFact = {
       persona_id: persona,
@@ -962,20 +1088,15 @@ export class FakeState implements StateClient {
       input_id: req.inputId,
       round: req.round,
       funding: req.funding,
-      status: req.status,
-      input_tokens: req.inputTokens ?? null,
-      output_tokens: req.outputTokens ?? null,
-      cached_tokens: req.cachedTokens ?? null,
-      quantities: req.quantities ?? {},
-      cost_minor: costMinor,
-      currency,
-      cost_basis: costBasis,
-      pricing_revision: revision,
+      ...content,
       recorded_at: new Date().toISOString(),
     };
     this.usageFacts.set(key, fact);
-    const res = this.usageReservations.get(key);
-    if (res && res.status === "held") res.status = "settled";
+    // The hold becomes the fact's recorded cost; a 'not_sent' report
+    // releases it entirely — nothing was or can be owed.
+    if (res && res.status === "held") {
+      res.status = req.status === "not_sent" ? "released" : "settled";
+    }
     return { fact, created: true };
   }
 
@@ -1088,13 +1209,19 @@ export class FakeState implements StateClient {
     limit: number,
     excludeInputId = "",
   ): RenderedContext {
-    const applied = this.memoryChunks.filter(
-      (c) => c.persona_id === persona && c.status === "applied",
+    // Applied and superseded chunks both cover their ranges: a superseded
+    // source's records are represented by the applied upper-layer block
+    // that consumed it, so they no longer render raw.
+    const covering = this.memoryChunks.filter(
+      (c) =>
+        c.persona_id === persona &&
+        (c.status === "applied" || c.status === "superseded"),
     );
+    const applied = covering.filter((c) => c.status === "applied");
     const uncovered = this.eventLog.filter(
       (e) =>
         e.persona_id === persona &&
-        !applied.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
+        !covering.some((c) => e.seq >= c.first_seq && e.seq <= c.last_seq) &&
         !(
           excludeInputId !== "" &&
           this.turns.get(e.turn_id)?.input_id === excludeInputId
@@ -1136,7 +1263,7 @@ export class FakeState implements StateClient {
       this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
         ?.created_at ?? "";
     const blocks = applied
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .sort((a, b) => a.first_seq - b.first_seq)
       .map((c) => ({
         chunk_seq: c.chunk_seq,
         layer: c.layer,
@@ -1280,9 +1407,7 @@ export class FakeState implements StateClient {
         );
       }
       if (
-        !this.inputs.some(
-          (i) => i.persona_id === persona && i.input_id === id,
-        )
+        !this.inputs.some((i) => i.persona_id === persona && i.input_id === id)
       ) {
         throw new StateError(400, `input_received names absent input ${id}`);
       }
@@ -1357,6 +1482,7 @@ export class FakeState implements StateClient {
         const { spent, held } = this.fundingSpend(
           w.funding.kind,
           w.funding.id,
+          budget?.currency ?? "",
         );
         const fits = !budget ||
           spent + held + w.needed_minor <= budget.limit_minor;
@@ -1399,7 +1525,9 @@ export class FakeState implements StateClient {
       // approval is still pending; a decision that already landed requeues
       // it directly.
       const pending = [...this.approvals.values()].filter(
-        (a) => a.persona_id === persona && a.input_id === input.input_id &&
+        (a) =>
+          a.persona_id === persona &&
+          a.input_id === input.input_id &&
           a.status === "pending",
       );
       if (pending.length === 0) {
@@ -1466,19 +1594,56 @@ export class FakeState implements StateClient {
     }
     turn.finished_at = new Date().toISOString();
     this.commits.set(turnId, req);
-    // Go releaseOrphanedReservations at turn commit: this turn's held
-    // reservations settle when their fact landed and release when it
-    // never did, so a lost provider call cannot hold budget forever.
+    // Go reconcileHeldReservations at turn commit: this turn's held
+    // reservations settle when their fact landed; a call whose record
+    // never arrived keeps its estimate as an 'unrecorded' fact — a lost
+    // response does not prove the request never left.
     for (const [k, r] of this.usageReservations) {
       if (
         k.startsWith(`${persona}|`) &&
         r.turn_id === turnId &&
         r.status === "held"
       ) {
-        r.status = this.usageFacts.has(k) ? "settled" : "released";
+        this.reconcileHeldReservation(k, r);
       }
     }
     return turn;
+  }
+
+  /**
+   * Reconcile one held reservation (Go reconcileHeldReservations): if the
+   * fact exists the hold just settles; otherwise an 'unrecorded' fact
+   * carries the admission estimate as 'admission_estimate' spend so
+   * possibly-sent money cannot silently restore the allowance.
+   */
+  private reconcileHeldReservation(
+    key: string,
+    r: (typeof this.usageReservations extends Map<string, infer V> ? V : never),
+  ) {
+    if (!this.usageFacts.has(key)) {
+      const persona = key.slice(0, key.indexOf("|"));
+      this.usageFacts.set(key, {
+        persona_id: persona,
+        fact_id: r.fact_id,
+        kind: r.kind,
+        phase: r.phase,
+        turn_id: r.turn_id ?? undefined,
+        input_id: r.input_id ?? undefined,
+        round: r.round,
+        funding: r.funding,
+        status: "unrecorded",
+        input_tokens: null,
+        output_tokens: null,
+        cached_tokens: null,
+        quantities: {},
+        cost_minor: r.currency !== null ? r.reserved_minor : null,
+        currency: r.currency ?? undefined,
+        cost_basis: r.currency !== null ? "admission_estimate" : undefined,
+        pricing_revision: r.pricing_revision ?? undefined,
+        recorded_at: new Date().toISOString(),
+      });
+    }
+    r.status = "settled";
   }
 
   async events(
@@ -1501,7 +1666,11 @@ export class FakeState implements StateClient {
       callIndex: number;
       request: Record<string, unknown>;
     },
-  ): Promise<{ operation: Operation; approval: Approval | null; fresh: boolean }> {
+  ): Promise<{
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  }> {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish. Go's claimableTool is
@@ -1569,7 +1738,13 @@ export class FakeState implements StateClient {
         return { operation: existing, approval: null, fresh: true };
       }
       if (existing.status === "awaiting_approval") {
-        return this.claimGated(persona, turn.input_id, op.callIndex, existing, false);
+        return this.claimGated(
+          persona,
+          turn.input_id,
+          op.callIndex,
+          existing,
+          false,
+        );
       }
       // A replayed job.* receipt carries the job's state now next to the
       // original result (Go withCurrentJobTx); the stored receipt stays.
@@ -1675,7 +1850,13 @@ export class FakeState implements StateClient {
       return { operation, approval: null, fresh: true };
     }
     try {
-      this.applyInternal(persona, turn.input_id, op.callIndex, op.turnId, operation);
+      this.applyInternal(
+        persona,
+        turn.input_id,
+        op.callIndex,
+        op.turnId,
+        operation,
+      );
     } catch (e) {
       // Go's claim transaction rolls back on an execution error — the
       // row must not survive as a replayable receipt (review f42).
@@ -1745,7 +1926,10 @@ export class FakeState implements StateClient {
   ): { operation: Operation; approval: Approval | null; fresh: boolean } {
     const appr = this.approvalFor(persona, inputId, callIndex);
     if (!appr) {
-      throw new StateError(500, `approval record missing for ${op.operation_id}`);
+      throw new StateError(
+        500,
+        `approval record missing for ${op.operation_id}`,
+      );
     }
     if (appr.status === "pending") {
       return { operation: op, approval: appr, fresh: freshInsert };
@@ -1938,7 +2122,10 @@ export class FakeState implements StateClient {
     operation.completed_at = new Date().toISOString();
   }
 
-  async listApprovals(persona: string, approvalId?: string): Promise<Approval[]> {
+  async listApprovals(
+    persona: string,
+    approvalId?: string,
+  ): Promise<Approval[]> {
     const all = [...this.approvals.values()].filter(
       (a) => a.persona_id === persona,
     );
@@ -1961,7 +2148,10 @@ export class FakeState implements StateClient {
     approvalId: string,
     decision: ApprovalDecision,
   ): Promise<Approval> {
-    if (decision.decision !== "approve_once" && decision.decision !== "deny_once") {
+    if (
+      decision.decision !== "approve_once" &&
+      decision.decision !== "deny_once"
+    ) {
       throw new StateError(400, "decision must be approve_once or deny_once");
     }
     // Go F3: decision_id is the command's idempotent identity — an empty
@@ -2131,7 +2321,7 @@ export class FakeState implements StateClient {
     if (operation !== "search" && operation !== "read") {
       throw bad("operation must be search or read");
     }
-    if (operation === "search" !== (query !== undefined)) {
+    if ((operation === "search") !== (query !== undefined)) {
       throw bad("search requires query and read must not carry one");
     }
     if (query === "") throw bad("search query must not be empty");
@@ -2142,13 +2332,18 @@ export class FakeState implements StateClient {
       throw bad("content_offset is only valid with read + seq");
     }
     const locators = [seq, chunkSeq, fromSeq].filter((v) => v !== null).length;
-    if (locators > 1) throw bad("seq, chunk_seq and from_seq are alternative locators");
+    if (locators > 1)
+      throw bad("seq, chunk_seq and from_seq are alternative locators");
     // chunk_seq + after_seq continues a page within that chunk's range.
     if (seq !== null && afterSeq !== null) {
       throw bad("seq cannot combine with after_seq");
     }
     const all = this.eventLog.filter((e) => e.persona_id === persona);
-    const details = (messages: Json[], nextAfterSeq: number | null, nextRead: Json | null): Json => ({
+    const details = (
+      messages: Json[],
+      nextAfterSeq: number | null,
+      nextRead: Json | null,
+    ): Json => ({
       operation,
       scope: "your_conversation_history",
       messages,
@@ -2261,7 +2456,9 @@ export class FakeState implements StateClient {
       const totalChars = runes.length;
       const offset = contentOffset ?? 0;
       if (offset > totalChars) {
-        throw bad(`content_offset ${offset} beyond record length ${totalChars}`);
+        throw bad(
+          `content_offset ${offset} beyond record length ${totalChars}`,
+        );
       }
       if (
         i >= limit ||
@@ -2324,7 +2521,7 @@ export class FakeState implements StateClient {
     this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
-    let covered = Math.max(0, ...mine().map((c) => c.last_seq));
+    const covered = Math.max(0, ...mine().map((c) => c.last_seq));
     // Seal walk: accumulate the unsealed tail; cut a chunk just before each
     // input_received once the window reaches the minimum and no tool call
     // in it is still waiting for its result. Past the forced limit, one
@@ -2356,12 +2553,12 @@ export class FakeState implements StateClient {
         }
       }
       if (cut) {
-        const nextChunkSeq = (this.chunkSeq.get(persona) ?? 0) + 1;
-        this.chunkSeq.set(persona, nextChunkSeq);
+        const nextChunkSeq = this.nextChunkSeq(persona);
         this.memoryChunks.push({
           persona_id: persona,
           chunk_seq: nextChunkSeq,
           layer: 1,
+          sources: null,
           first_seq: windowStart,
           last_seq: window[window.length - 1]?.seq ?? windowStart,
           est_tokens: windowEst,
@@ -2393,20 +2590,145 @@ export class FakeState implements StateClient {
       }
       prevKind = e.kind;
     }
-    // Live raw = every not-yet-applied chunk plus the unsealed tail.
+    // Live raw = every not-yet-applied layer-1 chunk plus the unsealed
+    // tail. Upper-layer rows and superseded sources never count: their
+    // ranges are represented by applied replacements, not raw events.
     let live =
       windowEst +
       mine()
-        .filter((c) => c.status !== "applied")
+        .filter(
+          (c) =>
+            c.layer === 1 &&
+            c.status !== "applied" &&
+            c.status !== "superseded",
+        )
         .reduce((s, c) => s + c.est_tokens, 0);
     if (live > L0_LIVE_LIMIT_TOKENS) {
       for (const c of mine()
-        .filter((c) => c.status === "prepared")
+        .filter((c) => c.layer === 1 && c.status === "prepared")
         .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
         if (live <= L0_LIVE_LIMIT_TOKENS) break;
         c.status = "applied";
         c.applied_at = new Date().toISOString();
         live -= c.est_tokens;
+      }
+    }
+    // A prepared upper-layer target applies once the layer it consumes is
+    // still over its own limit; its sources become 'superseded' in the same
+    // step so their ranges are represented by the target, not dropped.
+    const appliedTokens = (layer: number) =>
+      mine()
+        .filter((c) => c.layer === layer && c.status === "applied")
+        .reduce((s, c) => s + (c.replacement_est_tokens ?? 0), 0);
+    for (const target of mine()
+      .filter((c) => c.layer >= 2 && c.status === "prepared")
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)) {
+      const srcs = (target.sources ?? []).map((seq) =>
+        mine().find((s) => s.chunk_seq === seq),
+      );
+      const srcLayer = srcs[0]?.layer ?? 0;
+      const stale =
+        srcs.length !== (target.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied" || s.layer !== srcLayer) ||
+        (srcLayer !== 1 && srcLayer !== 2);
+      if (stale) {
+        target.status = "failed";
+        target.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        continue;
+      }
+      const limit = srcLayer === 1 ? L1_LIMIT_TOKENS : L2_LIMIT_TOKENS;
+      if (appliedTokens(srcLayer) <= limit) continue;
+      for (const s of srcs) {
+        if (s) s.status = "superseded";
+      }
+      target.status = "applied";
+      target.applied_at = new Date().toISOString();
+    }
+    // Create the next upper-layer target: one in flight at a time. L1→L2
+    // consumes the oldest contiguous applied L1 run until the remainder
+    // drops to L1_DROP_TO; L2 reintegration takes the whole contiguous
+    // applied L2 run. A 'kept' target's exact source tuple is never
+    // re-selected.
+    const busy = mine().some(
+      (c) =>
+        c.layer >= 2 &&
+        (c.status === "sealed" ||
+          c.status === "preparing" ||
+          c.status === "prepared"),
+    );
+    if (!busy) {
+      for (const sel of [
+        {
+          srcLayer: 1,
+          limit: L1_LIMIT_TOKENS,
+          dropTo: L1_DROP_TO_TOKENS,
+          whole: false,
+        },
+        {
+          srcLayer: 2,
+          limit: L2_LIMIT_TOKENS,
+          dropTo: L2_LIMIT_TOKENS,
+          whole: true,
+        },
+      ]) {
+        const total = appliedTokens(sel.srcLayer);
+        if (total <= sel.limit) continue;
+        const frags = mine()
+          .filter((c) => c.layer === sel.srcLayer && c.status === "applied")
+          .sort((a, b) => a.first_seq - b.first_seq);
+        for (let i = 0; i < frags.length; ) {
+          const group = [frags[i] as MemoryChunk];
+          let consumed = group[0]?.replacement_est_tokens ?? 0;
+          i++;
+          while (
+            i < frags.length &&
+            (frags[i] as MemoryChunk).first_seq ===
+              (group[group.length - 1] as MemoryChunk).last_seq + 1 &&
+            (sel.whole || consumed < total - sel.dropTo)
+          ) {
+            const f = frags[i] as MemoryChunk;
+            group.push(f);
+            consumed += f.replacement_est_tokens ?? 0;
+            i++;
+          }
+          const srcSeqs = group.map((f) => f.chunk_seq);
+          // A 'kept' or 'failed' verdict settles its exact source tuple —
+          // resealing it would relitigate the answer or burn a fresh
+          // attempt budget forever. A different grouping may still run.
+          const dup = mine().some(
+            (c) =>
+              c.layer >= 2 &&
+              (c.status === "kept" || c.status === "failed") &&
+              c.sources !== null &&
+              c.sources.length === srcSeqs.length &&
+              c.sources.every((s, j) => s === srcSeqs[j]),
+          );
+          if (dup) continue;
+          const nextChunkSeq = this.nextChunkSeq(persona);
+          this.memoryChunks.push({
+            persona_id: persona,
+            chunk_seq: nextChunkSeq,
+            layer: 2,
+            sources: srcSeqs,
+            first_seq: (group[0] as MemoryChunk).first_seq,
+            last_seq: (group[group.length - 1] as MemoryChunk).last_seq,
+            est_tokens: consumed,
+            status: "sealed",
+            replacement: null,
+            replacement_est_tokens: null,
+            attempts: 0,
+            interruptions: 0,
+            last_error: null,
+            claimed_generation: null,
+            claimed_at: null,
+            not_before: null,
+            created_at: new Date().toISOString(),
+            prepared_at: null,
+            applied_at: null,
+          });
+          return this.memoryStatus(persona);
+        }
       }
     }
     return this.memoryStatus(persona);
@@ -2428,17 +2750,22 @@ export class FakeState implements StateClient {
         : c.status === "sealed"
           ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
           : null;
-    const ready = mine
-      .map(readyAt)
-      .filter((t): t is number => t !== null);
+    const ready = mine.map(readyAt).filter((t): t is number => t !== null);
     const appliedBlocks = mine
       .filter((c) => c.status === "applied")
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)
-      .map((c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock);
+      .sort((a, b) => a.first_seq - b.first_seq)
+      .map(
+        (c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock,
+      );
     return {
       live_raw_tokens:
         mine
-          .filter((c) => c.status !== "applied")
+          .filter(
+            (c) =>
+              c.layer === 1 &&
+              c.status !== "applied" &&
+              c.status !== "superseded",
+          )
           .reduce((s, c) => s + c.est_tokens, 0) + tail,
       applied_tokens: mine
         .filter((c) => c.status === "applied")
@@ -2449,6 +2776,7 @@ export class FakeState implements StateClient {
       applied: count("applied"),
       kept: count("kept"),
       failed: count("failed"),
+      superseded: count("superseded"),
       claimable: ready.filter((t) => t <= now).length,
       next_claimable_at: ready.length
         ? new Date(Math.min(...ready)).toISOString()
@@ -2472,11 +2800,14 @@ export class FakeState implements StateClient {
     const empty = () => ({
       chunk: null,
       target_events: [],
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     });
-    // Every 'preparing' chunk is an orphan from the caller's view (one branch
-    // at a time): its claim ended without an outcome, so it counts an
-    // interruption — not an attempt — and waits out a short pacing.
+    // Every 'preparing' chunk is an orphan from the caller's view: its claim
+    // ended without an outcome, so it counts an interruption — not an
+    // attempt — and waits out a short pacing. (FakeState is single-threaded;
+    // the real store relies on pacing and generation fencing to converge
+    // concurrent claims, not on strict single-flight.)
     this.interruptPreparing(persona, null);
     const c = mine
       .filter(
@@ -2490,6 +2821,47 @@ export class FakeState implements StateClient {
     c.claimed_generation = generation;
     c.claimed_at = new Date().toISOString();
     c.not_before = null;
+    if (c.layer >= 2) {
+      // An upper-layer target prepares from its selected sources' accepted
+      // texts, not raw events. A stale target (a source no longer applied)
+      // is marked failed without spending attempts — the honest answer for
+      // a carried row or one whose sources another target consumed.
+      const at = (seq: number) =>
+        this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
+          ?.created_at ?? "";
+      const srcs = (c.sources ?? []).map((seq) =>
+        this.memoryChunks.find(
+          (s) => s.persona_id === persona && s.chunk_seq === seq,
+        ),
+      );
+      const stale =
+        srcs.length !== (c.sources ?? []).length ||
+        srcs.some((s) => s?.status !== "applied");
+      if (stale) {
+        c.status = "failed";
+        c.claimed_generation = null;
+        c.claimed_at = null;
+        c.last_error =
+          "upper-layer target is stale: its selected sources are no longer applied";
+        return empty();
+      }
+      const fragments = (srcs as MemoryChunk[]).map((s) => ({
+        chunk_seq: s.chunk_seq,
+        layer: s.layer,
+        first_seq: s.first_seq,
+        last_seq: s.last_seq,
+        first_time: at(s.first_seq),
+        last_time: at(s.last_seq),
+        text: s.replacement ?? "",
+        est_tokens: s.replacement_est_tokens ?? 0,
+      }));
+      return {
+        chunk: c,
+        target_events: [],
+        target_fragments: fragments,
+        context: this.renderedContext(persona, contextLimit),
+      };
+    }
     return {
       chunk: c,
       target_events: this.eventLog.filter(
@@ -2498,6 +2870,7 @@ export class FakeState implements StateClient {
           e.seq >= c.first_seq &&
           e.seq <= c.last_seq,
       ),
+      target_fragments: [],
       context: this.renderedContext(persona, contextLimit),
     };
   }
@@ -2603,11 +2976,12 @@ export class FakeState implements StateClient {
   }
 
   /**
-   * Go ReshelveMemoryChunk: no model request could be made — the binding
-   * was unavailable or budget admission denied the call — so the claim
-   * records no verdict and spends neither attempts nor interruptions; a
-   * short pacing keeps a persistent condition from claiming every tick,
-   * and a 'budget-wait:' reason is cleared early by a funding change.
+   * Go ReshelveMemoryChunk: no model request could be evaluated — the
+   * binding was unavailable or budget admission denied the call — so the
+   * claim records no verdict and spends neither attempts nor
+   * interruptions; a short pacing keeps a persistent condition from
+   * claiming every tick, and a 'budget-wait:' reason is cleared early by
+   * a funding change.
    */
   async reshelveMemoryChunk(
     persona: string,
@@ -2690,7 +3064,8 @@ export class FakeState implements StateClient {
       payload: {
         input_id: input.input_id,
         kind: input.kind,
-        text: typeof input.payload.text === "string" ? input.payload.text : null,
+        text:
+          typeof input.payload.text === "string" ? input.payload.text : null,
         actor_kind: input.actor_kind,
         source_surface: input.source_surface,
         attempt: turn.attempt,

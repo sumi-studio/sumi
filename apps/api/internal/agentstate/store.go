@@ -1463,7 +1463,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	// A held reservation from this turn with no recorded fact is an admit
 	// whose record call never landed — release its hold rather than let it
 	// suppress budget headroom until the next writer generation.
-	if err := releaseOrphanedReservations(ctx, tx, personaID, turnID, nil); err != nil {
+	if err := reconcileHeldReservations(ctx, tx, personaID, turnID, nil); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1636,7 +1636,7 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	// recorded are orphaned: their calls either resolved (fact exists —
 	// settle the bookkeeping) or were lost with the process (release the
 	// hold so the configured budget is not consumed by ghosts).
-	if err := releaseOrphanedReservations(ctx, tx, personaID, "", &generation); err != nil {
+	if err := reconcileHeldReservations(ctx, tx, personaID, "", &generation); err != nil {
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -116,7 +116,13 @@ evidence, so no lost response, retry or partition creates two writers:
   render — `applied`/`prepared` must carry replacement text and its estimate
   (a `kept` verdict carries both or neither), and sequence, token and counter
   columns only ever carry non-negative values (`chunk_seq`/`layer` start at
-  1; higher layers are future consolidation, not corruption). On the destination the memory
+  1). Upper-layer rows travel with their provenance: a layer-2 target's
+  `sources` must resolve to carried same-persona chunks in one layer, and
+  the target's range is exactly its sources' span — a dangling, mixed-layer,
+  or range-overreaching `sources` is refused at import, as is a layer-1 row
+  carrying `sources`. `superseded` sources cross too, so a moved secretary
+  keeps the accepted fragment text an applied upper block replaced rather
+  than losing it. On the destination the memory
   lifecycle continues ordinarily: `sealed` ranges (including a normalized
   one) wait for their pacing and are claimed by the destination's writer, a
   `prepared` candidate applies when live raw exceeds the limit, and the
