@@ -114,6 +114,64 @@ func TestListHumanApprovalsScopesToBoundHuman(t *testing.T) {
 	}
 }
 
+// A persona sealed for transfer takes no new decisions here, so its parked
+// grant must stop presenting as actionable — while a row the human already
+// decided stays in history. The durable pending row itself is untouched: it
+// travels with the persona's portable state to the destination.
+func TestListHumanApprovalsSealedPersona(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	human := mustHuman(t, pool)
+	pa, paSealed := pid(t), pid(t)
+	send := PlanCall{Tool: "message.send", Route: "elevated",
+		Request: map[string]any{"text": "hello"}}
+
+	a := parkHumanApproval(t, s, pool, human, pa, send)
+	sealed := parkHumanApproval(t, s, pool, human, paSealed, send)
+
+	// One row resolves before the seal: history survives it.
+	if _, err := s.ResolveApproval(ctx, pa, a.ApprovalID, ApprovalDecision{
+		Decision: "deny_once", DecisionID: "d-1",
+		DecidedByKind: "human", DecidedByID: human,
+	}); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`,
+		paSealed); err != nil {
+		t.Fatalf("seal fixture: %v", err)
+	}
+
+	got, err := s.ListHumanApprovals(ctx, human)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 || got[0].ApprovalID != a.ApprovalID || got[0].Status != "denied" {
+		t.Fatalf("post-seal inbox = %+v, want only the resolved row", got)
+	}
+	for _, row := range got {
+		if row.Status == "pending" {
+			t.Fatalf("sealed persona's grant still listed actionable: %+v", row)
+		}
+	}
+
+	// A stale card's decision is refused; the pending row is preserved for
+	// the destination, not mutated here.
+	if _, err := s.ResolveApproval(ctx, paSealed, sealed.ApprovalID, ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d-2",
+		DecidedByKind: "human", DecidedByID: human,
+	}); !errors.Is(err, ErrPersonaInactive) {
+		t.Fatalf("sealed decision err = %v, want ErrPersonaInactive", err)
+	}
+	current, err := s.ApprovalByID(ctx, sealed.ApprovalID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if current.Status != "pending" || current.Decision != nil {
+		t.Fatalf("sealed approval mutated: %+v", current)
+	}
+}
+
 func TestApprovalByIDAndPersonaHuman(t *testing.T) {
 	s, pool := newStore(t)
 	ctx := context.Background()

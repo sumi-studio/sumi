@@ -59,6 +59,12 @@ export interface CoreApproval {
 
 export interface ApprovalListResponse {
   approvals: CoreApproval[];
+  /**
+   * The session human the rows belong to, echoed by the server so the client
+   * projection can prove its data describes the currently signed-in account —
+   * not a stale snapshot a previous login left behind.
+   */
+  human?: string;
 }
 
 /** A browser decision never names its decider — the session does. */

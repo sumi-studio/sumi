@@ -17,20 +17,29 @@ import type { ApprovalDecision, CoreApproval } from "./model";
  * response replays the recorded decision on the server instead of minting a
  * conflicting command.
  *
- * Two fences keep asynchronous continuations honest:
+ * Three fences keep asynchronous continuations honest:
  * - inboxEpoch bounds every continuation to the account/session lifetime
  *   that issued it. reset() — run when the inbox unmounts on logout or the
  *   signed-in human changes — invalidates in-flight refreshes and decisions,
  *   so a late response can never write another person's rows or errors.
- * - commitVersion orders commits inside one lifetime: a refresh only writes
- *   its snapshot if nothing newer (a decision result or another refresh)
- *   committed since it was issued, so a pre-decision snapshot cannot
- *   resurrect a resolved card or erase newer state.
+ * - refreshSeq keeps the newest issued refresh authoritative: when several
+ *   are in flight (poll + focus + live nudge) only the last issued may
+ *   commit, whichever response arrives first.
+ * - commitVersion blocks a snapshot issued before an intervening decision
+ *   commit, so a pre-decision response cannot resurrect a resolved card.
+ *
+ * `owner` tags the loaded data with the session human the server said it
+ * belongs to. Components render rows only while owner matches their
+ * accountID, so an account switch can never commit another person's
+ * approvals into the DOM — even for the single render before the sync
+ * effect's cleanup runs.
  */
 export type ApprovalsStatus = "idle" | "loading" | "ready" | "error";
 
 interface ApprovalsState {
   status: ApprovalsStatus;
+  /** Session human the loaded rows describe; null until a refresh lands. */
+  owner: string | null;
   pending: CoreApproval[];
   resolved: CoreApproval[];
   /** approval_id -> decision currently in flight. */
@@ -48,6 +57,7 @@ const decisionIDs = new Map<string, string>();
 
 let inboxEpoch = 0;
 let commitVersion = 0;
+let refreshSeq = 0;
 
 function sortResolved(approvals: CoreApproval[]): CoreApproval[] {
   return [...approvals].sort((a, b) =>
@@ -57,6 +67,7 @@ function sortResolved(approvals: CoreApproval[]): CoreApproval[] {
 
 export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   status: "idle",
+  owner: null,
   pending: [],
   resolved: [],
   deciding: {},
@@ -65,18 +76,21 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   async refresh() {
     const epoch = inboxEpoch;
     const version = commitVersion;
+    const seq = ++refreshSeq;
+    const current = () =>
+      epoch === inboxEpoch && seq === refreshSeq && version === commitVersion;
     // A first (or post-error) load is honestly "loading", never "empty".
     if (get().status !== "ready") set({ status: "loading" });
-    let approvals: CoreApproval[];
+    let body: Awaited<ReturnType<typeof listCoreApprovals>>;
     try {
-      approvals = await listCoreApprovals();
+      body = await listCoreApprovals();
     } catch (error) {
-      if (epoch !== inboxEpoch || version !== commitVersion) return;
+      if (!current()) return;
       // A dead session is not a transient blip — clear the inbox so a stale
       // pending card is never left looking decidable.
       if (error instanceof ApprovalsAPIError && error.status === 401) {
         commitVersion++;
-        set({ status: "error", pending: [], resolved: [] });
+        set({ status: "error", owner: null, pending: [], resolved: [] });
         return;
       }
       // A transient failure keeps last-known-good data; only a load with
@@ -87,8 +101,9 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
       }));
       return;
     }
-    if (epoch !== inboxEpoch || version !== commitVersion) return;
+    if (!current()) return;
     commitVersion++;
+    const approvals = body.approvals;
     const pending = approvals.filter((a) => a.status === "pending");
     const live = new Set(pending.map((a) => a.approval_id));
     for (const id of [...decisionIDs.keys()]) {
@@ -96,6 +111,9 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
     }
     set({
       status: "ready",
+      // The server told us whose inbox this is; renders that no longer
+      // belong to that human must never see these rows.
+      owner: body.human ?? null,
       pending,
       resolved: sortResolved(approvals.filter((a) => a.status !== "pending")),
       deciding: Object.fromEntries(
@@ -168,6 +186,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
     decisionIDs.clear();
     set({
       status: "idle",
+      owner: null,
       pending: [],
       resolved: [],
       deciding: {},

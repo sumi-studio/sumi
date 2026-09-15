@@ -122,12 +122,18 @@ func (s *Store) humanApprovals(ctx context.Context, humanID string, resolved boo
 		WHERE p.human_id = $1 AND `
 	args := []any{humanID}
 	if resolved {
+		// Resolved rows are history: they stay listed whatever the persona's
+		// authority has since become.
 		q += `a.status <> 'pending' ORDER BY a.decided_at DESC NULLS LAST, a.approval_id`
 		if limit > 0 {
 			q += fmt.Sprintf(" LIMIT %d", limit)
 		}
 	} else {
-		q += `a.status = 'pending' ORDER BY a.created_at, a.approval_id`
+		// The pending queue is actionable-only: a persona whose authority is
+		// sealed/staged/transferred can take no new decision here (ResolveApproval
+		// refuses it), so listing its parked rows as decidable would be a lie.
+		// The grant itself travels with the persona's portable state.
+		q += `a.status = 'pending' AND p.authority = 'active' ORDER BY a.created_at, a.approval_id`
 	}
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -206,6 +212,63 @@ func (s *Store) ListHumanApprovals(ctx context.Context, humanID string) ([]Human
 		})
 	}
 	return out, nil
+}
+
+// HumanApprovalByID returns the same enriched projection ListHumanApprovals
+// emits, for one approval the human owns. The decision endpoint returns this
+// shape so a resolved card keeps its secretary name and input provenance
+// without waiting for a refresh.
+func (s *Store) HumanApprovalByID(ctx context.Context, humanID, approvalID string) (*HumanApproval, error) {
+	var row humanApprovalRow
+	var kind, actorKind, actorID, surface, threadID *string
+	var payload map[string]any
+	var occurredAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT `+approvalColsA+`,
+			p.display_name,
+			i.kind, i.payload, i.actor_kind, i.actor_id, i.source_surface,
+			i.thread_id, i.occurred_at
+		FROM core_tool_approvals a
+		JOIN core_personas p ON p.persona_id = a.persona_id
+		LEFT JOIN core_inputs i ON i.persona_id = a.persona_id AND i.input_id = a.input_id
+		WHERE p.human_id = $1 AND a.approval_id = $2`,
+		humanID, approvalID).Scan(
+		&row.approval.ApprovalID, &row.approval.PersonaID, &row.approval.InputID,
+		&row.approval.CallIndex, &row.approval.OperationID, &row.approval.TurnID,
+		&row.approval.Tool, &row.approval.Route, &row.approval.RequiredBy,
+		&row.approval.Request, &row.approval.ActionDigest, &row.approval.Status,
+		&row.approval.Decision, &row.approval.DecisionID,
+		&row.approval.DecidedByKind, &row.approval.DecidedByID,
+		&row.approval.Provenance, &row.approval.DecidedAt, &row.approval.ConsumedAt,
+		&row.approval.PriorDecision, &row.approval.PriorDecidedByKind,
+		&row.approval.PriorDecidedByID, &row.approval.PriorDecidedAt,
+		&row.approval.CreatedAt,
+		&row.secretaryName,
+		&kind, &payload, &actorKind, &actorID, &surface, &threadID, &occurredAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if kind != nil {
+		row.input = &Input{
+			InputID:       row.approval.InputID,
+			Kind:          *kind,
+			Payload:       payload,
+			ActorKind:     strv(actorKind),
+			ActorID:       strv(actorID),
+			SourceSurface: strv(surface),
+			ThreadID:      strv(threadID),
+			OccurredAt:    occurredAt,
+		}
+	}
+	return &HumanApproval{
+		ToolApproval:  row.approval,
+		SecretaryName: row.secretaryName,
+		Input:         inputContext(row.input),
+	}, nil
 }
 
 // ApprovalByID returns one approval record addressed by its globally unique

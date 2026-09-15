@@ -57,12 +57,24 @@ function useApprovalsSync(accountID: string) {
   }, [accountID, refresh, reset]);
 }
 
+const NO_APPROVALS: CoreApproval[] = [];
+
 /** Rail entry point for the session human's secretary approval inbox. */
 export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
   useApprovalsSync(accountID);
   const status = useCoreApprovals((state) => state.status);
-  const pending = useCoreApprovals((state) => state.pending);
-  const resolved = useCoreApprovals((state) => state.resolved);
+  const owner = useCoreApprovals((state) => state.owner);
+  const allPending = useCoreApprovals((state) => state.pending);
+  const allResolved = useCoreApprovals((state) => state.resolved);
+  // Rows render only while the store's data provably belongs to this account:
+  // a server-tagged owner that predates the switch must not reach the DOM for
+  // even the single commit before the sync effect's cleanup runs.
+  const owned = owner === accountID;
+  const pending = owned ? allPending : NO_APPROVALS;
+  const resolved = owned ? allResolved : NO_APPROVALS;
+  // An unowned status from the previous account's lifetime is not this
+  // account's truth — report loading until this account's own read lands.
+  const visibleStatus = owned || owner === null ? status : ("loading" as const);
   const pendingCount = pending.length;
 
   return (
@@ -78,7 +90,7 @@ export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
                   aria-label={
                     pendingCount > 0
                       ? `承認待ち ${pendingCount} 件`
-                      : status === "ready"
+                      : visibleStatus === "ready"
                         ? "承認待ちはありません"
                         : "承認"
                   }
@@ -106,9 +118,9 @@ export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
         <p className="px-2 py-1 font-medium text-muted-foreground text-xs">
           承認
         </p>
-        {status !== "ready" && pending.length === 0 ? (
+        {visibleStatus !== "ready" && pending.length === 0 ? (
           <p className="px-2 py-3 text-muted-foreground text-sm">
-            {status === "error"
+            {visibleStatus === "error"
               ? "承認の一覧を読み込めませんでした。"
               : "読み込み中…"}
           </p>
@@ -219,6 +231,12 @@ function decisionErrorText(code: string): string {
     case "approval_conflict":
     case "approval_not_pending":
       return "この承認はすでに処理されました。";
+    case "persona_inactive":
+      // Terminal: the persona's authority is mid-transfer — the grant travels
+      // with it, and this placement can never take the decision.
+      return "この承認は秘書の移行中のためここでは操作できません。";
+    case "approval_not_found":
+      return "この承認は見つかりませんでした。";
     case "forbidden":
       return "この承認を操作する権限がありません。";
     case "unauthorized":

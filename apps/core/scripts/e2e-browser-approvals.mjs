@@ -238,6 +238,8 @@ let inboxA = await inbox(cookieA);
 assert(inboxA.status === 200, `inbox ${inboxA.status}: ${inboxA.text}`);
 assert(inboxA.cacheControl === "no-store",
   `private inbox must not be cacheable (got ${inboxA.cacheControl})`);
+assert(inboxA.json.human === HUMAN_A,
+  `inbox must echo its session human (got ${inboxA.json.human})`);
 let rowsA = inboxA.json.approvals.filter((a) => a.input_id === inA);
 assert(rowsA.length === 1 && rowsA[0].status === "pending" &&
   rowsA[0].tool === "message.send" && rowsA[0].secretary_name === "E2E Secretary" &&
@@ -277,6 +279,9 @@ assert(approved.cacheControl === "no-store",
 assert(approved.status === 200 && approved.json.approval.status === "approved" &&
   approved.json.approval.decided_by_id === HUMAN_A,
   `approve: ${approved.status} ${approved.text}`);
+assert(approved.json.approval.secretary_name === "E2E Secretary" &&
+  approved.json.approval.input?.input_id === inA,
+  `decision response must keep the enriched projection: ${approved.text}`);
 assert((await decide(cookieA, approvalA, "approve_once", "d-1")).status === 200,
   "identical replay must succeed");
 assert((await decide(cookieA, approvalA, "deny_once", "d-2")).status === 409,
@@ -313,6 +318,41 @@ assert(doneB?.payload.output.tool_results[0]?.result?.error === "denied",
 assert((await decide(cookieA, rowB.approval_id, "approve_once", "d-2")).status === 409,
   "approval after denial must be rejected");
 log("  denial preserved; resumed request carries the refusal");
+
+// --- scenario C: a persona sealed for transfer is not actionable here ------
+log("scenario C: sealed persona's pending grant leaves the actionable inbox");
+const SEALED = "e2e sealed approval: 通知して";
+const inC = await submit(`!elevated message.send {"text":"${SEALED}"}`);
+once("park for seal");
+inboxA = await inbox(cookieA);
+const [rowC] = inboxA.json.approvals.filter((a) => a.input_id === inC);
+assert(rowC?.status === "pending", "seal scenario did not park");
+
+// The real transfer step: seal this persona toward a destination placement.
+const transferID = uuidv7();
+const destination = uuidv7();
+const sealed = await req("POST",
+  `${P}/transfers/${transferID}/seal`, { token: ADMIN },
+  { destination_id: destination });
+assert(sealed.status === 200, `seal ${sealed.status}: ${sealed.text}`);
+
+// The durable grant survives pending (it travels with the persona), but this
+// placement no longer lists it as actionable and refuses the decision.
+inboxA = await inbox(cookieA);
+assert(!inboxA.json.approvals.some(
+  (a) => a.approval_id === rowC.approval_id && a.status === "pending"),
+  "sealed persona's grant must leave the actionable inbox");
+const staleDecision = await decide(cookieA, rowC.approval_id, "approve_once", "d-seal");
+assert(staleDecision.status === 409 && staleDecision.json.error === "persona_inactive",
+  `sealed decision must be a terminal 409 persona_inactive: ${staleDecision.status} ${staleDecision.text}`);
+const stored = await req("GET",
+  `${P}/approvals/${rowC.approval_id}`, { token: ptoken });
+assert(stored.status === 200 && stored.json.approval?.status === "pending" &&
+  stored.json.approval?.decision === null,
+  `sealed approval must stay pending for the destination: ${stored.status} ${stored.text}`);
+assert((await messagesWith(SEALED)).length === 0,
+  "refused sealed approval must produce no side effect");
+log("  sealed grant is preserved for the destination and refused here");
 
 svc.kill("SIGKILL");
 log("PASS — browser approval surface verified on real server + PG + Node core (fixtures: e2e session issuer, mock provider)");

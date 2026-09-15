@@ -32,7 +32,7 @@ async function readError(response: Response): Promise<ApprovalsAPIError> {
 /** The session human's whole approval inbox: pending first, then recent. */
 export async function listCoreApprovals(
   signal?: AbortSignal,
-): Promise<CoreApproval[]> {
+): Promise<ApprovalListResponse> {
   const response = await fetch("/me/approvals", {
     credentials: "include",
     cache: "no-store",
@@ -43,7 +43,10 @@ export async function listCoreApprovals(
   });
   if (!response.ok) throw await readError(response);
   const body = (await response.json()) as ApprovalListResponse;
-  return Array.isArray(body.approvals) ? body.approvals : [];
+  return {
+    human: typeof body.human === "string" ? body.human : undefined,
+    approvals: Array.isArray(body.approvals) ? body.approvals : [],
+  };
 }
 
 /**

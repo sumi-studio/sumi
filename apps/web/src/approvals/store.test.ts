@@ -54,6 +54,7 @@ describe("core approvals store", () => {
   it("partitions the durable inbox into pending and resolved", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
+        human: "h-1",
         approvals: [
           approval(),
           approval({
@@ -70,6 +71,7 @@ describe("core approvals store", () => {
     await useCoreApprovals.getState().refresh();
     const state = useCoreApprovals.getState();
     expect(state.status).toBe("ready");
+    expect(state.owner).toBe("h-1");
     expect(state.pending.map((a) => a.approval_id)).toEqual(["a-1"]);
     expect(state.resolved.map((a) => a.approval_id)).toEqual(["a-2"]);
     expect(fetchMock).toHaveBeenCalledWith(
@@ -81,7 +83,9 @@ describe("core approvals store", () => {
   it("clears the inbox on 401 rather than leaving stale cards", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockResolvedValueOnce(jsonResponse(401, { error: "invalid_session" }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -101,7 +105,9 @@ describe("core approvals store", () => {
     });
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockResolvedValueOnce(jsonResponse(200, { approval: resolved }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -126,7 +132,9 @@ describe("core approvals store", () => {
   it("retries a lost response with the same decision_id", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockRejectedValueOnce(new TypeError("network down"))
       .mockResolvedValueOnce(
         jsonResponse(200, {
@@ -158,7 +166,9 @@ describe("core approvals store", () => {
     let release!: (value: Response) => void;
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockImplementationOnce(
         () => new Promise<Response>((resolve) => (release = resolve)),
       );
@@ -179,7 +189,9 @@ describe("core approvals store", () => {
     const decideResp = deferred<Response>();
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockImplementationOnce(() => decideResp.promise)
       .mockImplementationOnce(() => staleList.promise);
     vi.stubGlobal("fetch", fetchMock);
@@ -206,7 +218,9 @@ describe("core approvals store", () => {
     expect(useCoreApprovals.getState().resolved[0].status).toBe("approved");
 
     // The older snapshot must not regress the committed decision.
-    staleList.resolve(jsonResponse(200, { approvals: [approval()] }));
+    staleList.resolve(
+      jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+    );
     await lateRefresh;
     const s = useCoreApprovals.getState();
     expect(s.pending).toHaveLength(0);
@@ -219,7 +233,9 @@ describe("core approvals store", () => {
     const fetchMock = vi
       .fn()
       .mockImplementationOnce(() => first.promise)
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }));
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      );
     vi.stubGlobal("fetch", fetchMock);
 
     const inflightOld = useCoreApprovals.getState().refresh();
@@ -227,10 +243,52 @@ describe("core approvals store", () => {
     expect(useCoreApprovals.getState().pending).toHaveLength(1);
 
     // The earlier-issued response arrives last; the newer inbox stands.
-    first.resolve(jsonResponse(200, { approvals: [] }));
+    first.resolve(jsonResponse(200, { human: "h-1", approvals: [] }));
     await inflightOld;
     expect(useCoreApprovals.getState().pending).toHaveLength(1);
     expect(useCoreApprovals.getState().status).toBe("ready");
+  });
+
+  it("prefers the later-issued refresh when completions invert", async () => {
+    // R1 issues, then a nudge issues R2 — but the older R1 response lands
+    // first. R2's snapshot is newer and must still win.
+    const old = deferred<Response>();
+    const fresh = deferred<Response>();
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => old.promise)
+      .mockImplementationOnce(() => fresh.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const r1 = useCoreApprovals.getState().refresh();
+    const r2 = useCoreApprovals.getState().refresh();
+
+    old.resolve(jsonResponse(200, { human: "h-1", approvals: [approval()] }));
+    await r1;
+    expect(useCoreApprovals.getState().pending).toHaveLength(0);
+
+    fresh.resolve(jsonResponse(200, { human: "h-1", approvals: [] }));
+    await r2;
+    const s = useCoreApprovals.getState();
+    expect(s.status).toBe("ready");
+    expect(s.owner).toBe("h-1");
+    expect(s.pending).toHaveLength(0);
+  });
+
+  it("a reset drops the owner tag so another account inherits nothing", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    await useCoreApprovals.getState().refresh();
+    expect(useCoreApprovals.getState().owner).toBe("h-1");
+
+    useCoreApprovals.getState().reset();
+    const s = useCoreApprovals.getState();
+    expect(s.owner).toBeNull();
+    expect(s.status).toBe("idle");
   });
 
   it("reports a failed first load as error, not as a truthful empty", async () => {
@@ -249,10 +307,13 @@ describe("core approvals store", () => {
   it("converges on the server record after a conflict", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+      )
       .mockResolvedValueOnce(jsonResponse(409, { error: "approval_conflict" }))
       .mockResolvedValueOnce(
         jsonResponse(200, {
+          human: "h-1",
           approvals: [
             approval({
               status: "denied",

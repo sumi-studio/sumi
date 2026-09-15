@@ -9,6 +9,7 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CoreApprovalsInbox } from "./inbox";
 import type { CoreApproval } from "./model";
@@ -107,13 +108,15 @@ describe("approval inbox across logout/login", () => {
     expect(during.status).toBe("loading");
 
     await act(async () => {
-      bRefresh.resolve(jsonResponse(200, { approvals: [] }));
+      bRefresh.resolve(jsonResponse(200, { human: "human-b", approvals: [] }));
     });
     expect(useCoreApprovals.getState().status).toBe("ready");
 
     // A's slow response lands last — fenced to A's ended lifetime.
     await act(async () => {
-      aRefresh.resolve(jsonResponse(200, { approvals: [approval()] }));
+      aRefresh.resolve(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      );
     });
     const s = useCoreApprovals.getState();
     expect(s.pending).toHaveLength(0);
@@ -123,7 +126,9 @@ describe("approval inbox across logout/login", () => {
   it("failed first refresh under B surfaces an error, not A's rows or a fake empty", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      )
       .mockResolvedValueOnce(jsonResponse(503, { error: "unavailable" }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -153,9 +158,13 @@ describe("approval inbox across logout/login", () => {
     const decideResp = deferred<Response>();
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      )
       .mockImplementationOnce(() => decideResp.promise) // POST /decision
-      .mockResolvedValueOnce(jsonResponse(200, { approvals: [] })); // B's inbox
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-b", approvals: [] }),
+      ); // B's inbox
     vi.stubGlobal("fetch", fetchMock);
 
     const view = render(<Rail user={{ id: "human-a" }} />);
@@ -194,6 +203,57 @@ describe("approval inbox across logout/login", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3); // no converge-refresh spawned
   });
 
+  it("commits none of A's DOM under B — not even the first commit before cleanup", async () => {
+    // A's inbox is fully loaded and its popover is open when the session's
+    // human changes in place. A layout-effect probe records every committed
+    // DOM — including the commit React publishes before the sync effect's
+    // passive cleanup can run — so this witnesses what B could actually see.
+    const bRefresh = deferred<Response>();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      )
+      .mockImplementationOnce(() => bRefresh.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const commits: { user: string | null; dom: string }[] = [];
+    function Observed({ user }: { user: { id: string } | null }) {
+      useLayoutEffect(() => {
+        commits.push({
+          user: user?.id ?? null,
+          dom: document.body.textContent ?? "",
+        });
+      });
+      return <Rail user={user} />;
+    }
+
+    const view = render(<Observed user={{ id: "human-a" }} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "承認待ち 1 件" }));
+    expect(await screen.findByText(/A-secretary/)).toBeInTheDocument();
+
+    commits.length = 0;
+    await act(async () => {
+      view.rerender(<Observed user={{ id: "human-b" }} />);
+    });
+
+    const bCommits = commits.filter((c) => c.user === "human-b");
+    expect(bCommits.length).toBeGreaterThan(0);
+    for (const commit of bCommits) {
+      expect(commit.dom).not.toContain("A-secretary");
+      expect(commit.dom).not.toContain("account A private approval text");
+    }
+
+    // B's own refresh then commits honestly: empty inbox, owned by B.
+    await act(async () => {
+      bRefresh.resolve(jsonResponse(200, { human: "human-b", approvals: [] }));
+    });
+    expect(useCoreApprovals.getState().owner).toBe("human-b");
+    expect(await screen.findByText("承認待ちはありません")).toBeInTheDocument();
+    expect(screen.queryByText(/A-secretary/)).not.toBeInTheDocument();
+  });
+
   it("account replacement while mounted drops the prior account's state", async () => {
     const aRefresh = deferred<Response>();
     const fetchMock = vi
@@ -201,6 +261,7 @@ describe("approval inbox across logout/login", () => {
       .mockImplementationOnce(() => aRefresh.promise)
       .mockResolvedValueOnce(
         jsonResponse(200, {
+          human: "human-b",
           approvals: [
             approval({ approval_id: "b-1", secretary_name: "B-secretary" }),
           ],
@@ -218,7 +279,9 @@ describe("approval inbox across logout/login", () => {
     expect(s.pending.map((a) => a.approval_id)).toEqual(["b-1"]);
 
     await act(async () => {
-      aRefresh.resolve(jsonResponse(200, { approvals: [approval()] }));
+      aRefresh.resolve(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      );
     });
     expect(
       useCoreApprovals.getState().pending.map((a) => a.approval_id),

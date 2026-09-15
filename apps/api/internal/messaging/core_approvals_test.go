@@ -174,6 +174,9 @@ func TestCoreApprovalsInboxRequiresSession(t *testing.T) {
 
 	resp = approvalRequest(t, cw.ts, http.MethodGet, "/me/approvals", cw.humanA.ID, "")
 	body = readJSON(t, resp)
+	if body["human"] != cw.humanA.ID {
+		t.Fatalf("inbox owner echo = %v, want %v", body["human"], cw.humanA.ID)
+	}
 	list, _ := body["approvals"].([]any)
 	if len(list) != 1 {
 		t.Fatalf("humanA inbox = %v", body)
@@ -231,7 +234,8 @@ func TestCoreApprovalDecisionAuthority(t *testing.T) {
 		_ = readJSON(t, resp)
 	}
 
-	// The bound human approves once.
+	// The bound human approves once; the response is the same enriched
+	// projection the inbox lists, not a bare grant.
 	resp = approvalRequest(t, cw.ts, http.MethodPost, path, cw.humanA.ID,
 		`{"decision":"approve_once","decision_id":"d-1"}`)
 	body := readJSON(t, resp)
@@ -241,6 +245,14 @@ func TestCoreApprovalDecisionAuthority(t *testing.T) {
 	got, _ := body["approval"].(map[string]any)
 	if got["status"] != "approved" || got["decided_by_id"] != cw.humanA.ID {
 		t.Fatalf("approved row = %v", got)
+	}
+	if got["secretary_name"] != "Kuro" {
+		t.Fatalf("decision response lost the enrichment: %v", got)
+	}
+	input, _ := got["input"].(map[string]any)
+	place, _ := input["place"].(map[string]any)
+	if input["text"] != "みんなにお知らせして" || place["id"] != DefaultGeneralChannelID {
+		t.Fatalf("decision response lost input provenance: %v", input)
 	}
 
 	// Identical replay returns the stored decision — no double execution.
@@ -266,7 +278,61 @@ func TestCoreApprovalDecisionAuthority(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown approval status = %d", resp.StatusCode)
 	}
-	_ = readJSON(t, resp)
+	if body := readJSON(t, resp); body["error"] != "approval_not_found" {
+		t.Fatalf("unknown approval error = %v", body)
+	}
+}
+
+// A persona sealed for transfer keeps its durable pending row — it travels
+// with the persona — but this placement can no longer decide it: the inbox
+// stops listing it as actionable and a stale card's decision is refused with
+// a terminal persona_inactive, never a retryable generic error.
+func TestCoreApprovalsSealedPersona(t *testing.T) {
+	ctx := context.Background()
+	cw := newCoreApprovalWorld(t, ctx)
+	a := cw.parkAgentApproval(t, ctx)
+
+	resp := approvalRequest(t, cw.ts, http.MethodGet, "/me/approvals", cw.humanA.ID, "")
+	body := readJSON(t, resp)
+	if list, _ := body["approvals"].([]any); len(list) != 1 {
+		t.Fatalf("pre-seal inbox = %v", body)
+	}
+
+	// The real seal path is covered end-to-end by e2e-browser-approvals; here
+	// the authority column — the contract ResolveApproval and the list both
+	// read — moves directly.
+	if _, err := cw.store.core.pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed', transfer_id = $2
+		 WHERE persona_id = $1`, cw.agent.ID, "0198f0f4-9b72-7000-8000-0000000000ff"); err != nil {
+		t.Fatalf("seal fixture: %v", err)
+	}
+
+	// The parked grant no longer presents as an actionable pending card.
+	resp = approvalRequest(t, cw.ts, http.MethodGet, "/me/approvals", cw.humanA.ID, "")
+	body = readJSON(t, resp)
+	for _, row := range body["approvals"].([]any) {
+		if m, _ := row.(map[string]any); m["status"] == "pending" {
+			t.Fatalf("sealed persona's approval still listed actionable: %v", m)
+		}
+	}
+
+	// A stale card already on screen converges to a terminal refusal.
+	resp = approvalRequest(t, cw.ts, http.MethodPost,
+		"/me/approvals/"+a.ApprovalID+"/decision", cw.humanA.ID,
+		`{"decision":"approve_once","decision_id":"d-seal"}`)
+	body = readJSON(t, resp)
+	if resp.StatusCode != http.StatusConflict || body["error"] != "persona_inactive" {
+		t.Fatalf("sealed decision = %d %v", resp.StatusCode, body)
+	}
+
+	// The portable pending decision itself is preserved, undecided.
+	current, err := cw.core.ApprovalByID(ctx, a.ApprovalID)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if current.Status != "pending" || current.Decision != nil {
+		t.Fatalf("sealed approval mutated: %+v", current)
+	}
 }
 
 // Private approval responses must not sit in shared caches, and a decision

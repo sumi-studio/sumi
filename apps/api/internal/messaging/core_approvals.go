@@ -85,7 +85,13 @@ func (s *CoreApprovalsServer) serveList(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "list approvals")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"approvals": approvals})
+	// `human` echoes the session human the rows belong to: the client tags its
+	// projection with it so data loaded under one account can never be
+	// rendered under another, even for a single committed render.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"approvals": approvals,
+		"human":     claims.UserID,
+	})
 }
 
 // approvalDecisionBody is the whole browser decision vocabulary: which
@@ -112,19 +118,15 @@ func (s *CoreApprovalsServer) serveDecision(w http.ResponseWriter, r *http.Reque
 		s.writeCoreError(w, err)
 		return
 	}
-	var resolved *agentstate.ToolApproval
 	called := false
 	err = s.Sessions.AuthorizeSession(r.Context(), claims, func() error {
 		called = true
-		a, resolveErr := s.Core.ResolveApproval(r.Context(), record.PersonaID, approvalID, agentstate.ApprovalDecision{
+		_, resolveErr := s.Core.ResolveApproval(r.Context(), record.PersonaID, approvalID, agentstate.ApprovalDecision{
 			Decision:      body.Decision,
 			DecisionID:    body.DecisionID,
 			DecidedByKind: "human",
 			DecidedByID:   claims.UserID,
 		})
-		if resolveErr == nil {
-			resolved = a
-		}
 		return resolveErr
 	})
 	if !called {
@@ -135,22 +137,37 @@ func (s *CoreApprovalsServer) serveDecision(w http.ResponseWriter, r *http.Reque
 		s.writeCoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"approval": resolved})
+	// Answer with the same enriched projection the inbox list returns, so the
+	// just-resolved card keeps its secretary name and input provenance instead
+	// of degrading to the bare grant until the next refresh.
+	enriched, err := s.Core.HumanApprovalByID(r.Context(), claims.UserID, approvalID)
+	if err != nil {
+		s.writeCoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approval": enriched})
 }
 
+// writeCoreError maps the core decision refusal to a stable wire code the
+// client can render without parsing Go error text.
 func (s *CoreApprovalsServer) writeCoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, agentstate.ErrApprovalNotFound):
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, "approval_not_found")
 	case errors.Is(err, agentstate.ErrApprovalForbidden):
-		writeError(w, http.StatusForbidden, err.Error())
-	case errors.Is(err, agentstate.ErrApprovalConflict),
-		errors.Is(err, agentstate.ErrPersonaInactive),
-		errors.Is(err, agentstate.ErrPersonaNotFound):
-		writeError(w, http.StatusConflict, err.Error())
+		writeError(w, http.StatusForbidden, "forbidden")
+	case errors.Is(err, agentstate.ErrPersonaInactive):
+		// The persona's authority moved (seal/stage/transfer): this placement
+		// can never take the decision, so the refusal is terminal, not a
+		// retryable conflict — the parked grant travels with the persona.
+		writeError(w, http.StatusConflict, "persona_inactive")
+	case errors.Is(err, agentstate.ErrApprovalConflict):
+		writeError(w, http.StatusConflict, "approval_conflict")
+	case errors.Is(err, agentstate.ErrPersonaNotFound):
+		writeError(w, http.StatusConflict, "persona_not_found")
 	case errors.Is(err, agentstate.ErrBadRequest),
 		errors.Is(err, agentstate.ErrApprovalDecidedBy):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_decision")
 	default:
 		writeError(w, http.StatusInternalServerError, "approval decision")
 	}
