@@ -538,8 +538,28 @@ func newApplicationFromEnv() (*application, error) {
 			calls := messaging.NewCallService(messagingServer, livekit)
 			messagingServer.Calls = calls
 			workspaceServer.MembershipClosed = func(ctx context.Context, workspaceID string, member participant.Ref) {
-				if err := calls.RemoveWorkspaceParticipant(ctx, workspaceID, member); err != nil {
-					log.Printf("remove LiveKit participant after Workspace membership closure: %v", err)
+				// Best-effort cleanup after the committed closure: retry a
+				// few times on a detached context so a transient store or
+				// LiveKit fault doesn't strand media, and a disconnecting
+				// client can't cancel the cleanup. Authority never depends
+				// on this succeeding — the call bridge gates re-check place
+				// membership — but a failure must stay observable.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				var err error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if err = calls.RemoveWorkspaceParticipant(cleanupCtx, workspaceID, member); err == nil {
+						return
+					}
+					log.Printf("remove call participant after Workspace membership closure (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						return
+					}
+					select {
+					case <-cleanupCtx.Done():
+						return
+					case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+					}
 				}
 			}
 			calls.RegisterRoutes(mux)
@@ -739,6 +759,28 @@ func newApplicationFromEnv() (*application, error) {
 		coreApprovals.RegisterRoutes(mux)
 		coreServer.Store().ApprovalsChanged = coreApprovals.NotifyChanged
 		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
+		if calls := messagingServer.Calls; calls != nil {
+			// The secretary's call surface: delegated effects commit session
+			// and utterance intent atomically with the operation record, and
+			// the persona-scoped bridge routes let a per-placement media
+			// runner claim sessions, mint short tickets, and report status
+			// and playback dispositions under its own claim authority.
+			calls.Hooks = &messaging.CallHooks{Core: coreServer.Store()}
+			for tool, effect := range map[string]agentstate.ToolEffect{
+				messaging.CallJoinTool:  calls.CallJoinEffect(),
+				messaging.CallLeaveTool: calls.CallLeaveEffect(),
+				messaging.CallSayTool:   calls.CallSayEffect(),
+				messaging.CallStateTool: calls.CallStateEffect(),
+			} {
+				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+					stopBackground()
+					closeOnError()
+					return nil, fmt.Errorf("register core call effect %s: %w", tool, err)
+				}
+			}
+			coreServer.SetCallBridge(calls)
+			log.Print("call sessions ready (call.join/leave/say/state effects + media bridge routes)")
+		}
 	case messagingServer != nil && spawnManager != nil:
 		delivery := &messaging.AgentAttentionGateway{
 			Gateway: runtime, Spawner: spawnManager,

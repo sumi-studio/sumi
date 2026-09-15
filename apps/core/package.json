@@ -19,12 +19,16 @@
     "test:e2e:portable:memory": "node scripts/e2e-portable-memory.mjs",
     "dev:local": "node src/host/local.ts",
     "dev:job-runner": "node src/host/job-runner.ts",
-    "dev:worker": "wrangler dev --config wrangler.jsonc"
+    "dev:worker": "wrangler dev --config wrangler.jsonc",
+    "dev:call-runner": "node src/host/call-runner.ts"
   },
   "devDependencies": {
     "@sumi/typescript-config": "workspace:*",
     "@types/node": "^24.13.2",
     "typescript": "~6.0.3",
     "wrangler": "4.120.1"
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "0.13.23"
   }
 }

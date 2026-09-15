@@ -572,3 +572,73 @@ export interface SubprocessJobRequest {
 
 /** Terminal statuses a runner may report to completeJob. */
 export type JobTerminalReport = "done" | "failed" | "cancelled";
+
+/**
+ * Call sessions are the durable authority record for the secretary's
+ * presence in a place's LiveKit room (migration 0055). The core creates one
+ * through the delegated call.join effect; a per-placement media bridge
+ * claims it and drives media under that claim's epoch.
+ */
+export type CallSessionStatus =
+  | "requested"
+  | "claimed"
+  | "active"
+  | "ending"
+  | "ended"
+  | "interrupted"
+  | "revoked"
+  | "failed";
+
+export interface CallSession {
+  session_id: string;
+  workspace_id: string;
+  place_id: string;
+  personality_agent_id: string;
+  room_sid?: string;
+  status: CallSessionStatus;
+  epoch: number;
+  claimed_by?: string;
+  claim_expires_at?: string;
+  requested_by: string;
+  created_at: string;
+  updated_at: string;
+  ended_at?: string;
+  end_reason?: string;
+}
+
+/**
+ * The secretary's committed speech for one session. Status records what is
+ * known about playback — 'emitted' means the bridge finished rendering the
+ * audio, never that a listener heard it. A claim epoch bump marks every
+ * non-terminal utterance from earlier epochs 'unknown': committed intent is
+ * durable but never auto-replayed.
+ */
+export type CallUtteranceStatus =
+  | "intended"
+  | "dequeued"
+  | "emitting"
+  | "emitted"
+  | "interrupted"
+  | "expired"
+  | "failed"
+  | "unknown";
+
+export interface CallUtterance {
+  utterance_id: string;
+  session_id: string;
+  session_epoch: number;
+  seq: number;
+  text: string;
+  status: CallUtteranceStatus;
+  detail?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Short-lived LiveKit credential for one session epoch. */
+export interface CallTicket {
+  url: string;
+  token: string;
+  room: string;
+  identity: string;
+}
