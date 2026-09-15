@@ -1,4 +1,4 @@
-import { Check, Copy, Image as ImageIcon } from "lucide-react";
+import { Check, Copy } from "lucide-react";
 import {
   Children,
   type ClipboardEvent,
@@ -25,10 +25,10 @@ import {
   remarkMath,
 } from "./compact-message-math";
 import { remarkSafeSingleDollar } from "./compact-message-math-syntax";
+import { MarkdownImageLink, markdownLinkClass } from "./markdown-image-link";
 import "katex/dist/katex.min.css";
 
-const LINK_CLASS =
-  "break-all text-primary underline decoration-primary/40 underline-offset-2 hover:decoration-primary";
+const LINK_CLASS = markdownLinkClass;
 
 function elementForNode(node: Node | null): Element | null {
   if (node instanceof Element) return node;
@@ -263,33 +263,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
  * screen-by-screen basis.
  */
 const COMPONENTS: Components = {
-  // Markdown images never become <img>. Rendering one would fetch an arbitrary
-  // author-controlled URL as soon as a reader opened the conversation.
-  img: ({ src, alt, title }) => {
-    const href = typeof src === "string" && src !== "" ? src : undefined;
-    const label = alt?.trim() || href || "画像";
-    if (!href) {
-      return (
-        <span className="inline-flex items-baseline gap-1 text-muted-foreground">
-          <ImageIcon className="size-3 self-center" aria-hidden="true" />
-          {label}
-        </span>
-      );
-    }
-    return (
-      <a
-        href={href}
-        target="_blank"
-        rel="noreferrer noopener"
-        title={title ?? href}
-        data-image-link=""
-        className={`inline-flex items-baseline gap-1 ${LINK_CLASS}`}
-      >
-        <ImageIcon className="size-3 self-center" aria-hidden="true" />
-        {label}
-      </a>
-    );
-  },
+  img: MarkdownImageLink,
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   code: ({ children }) => (
     <code className="rounded bg-muted px-1 py-px font-mono text-[12.5px]">

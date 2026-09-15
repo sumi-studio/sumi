@@ -41,8 +41,14 @@ type AgentAttentionEvent struct {
 	Actor              AgentAttentionActor `json:"actor"`
 	Place              AgentAttentionPlace `json:"place"`
 	MessageID          string              `json:"message_id"`
-	// ReplyRequired is an outbox-only authorization condition. DM/mention
-	// delivery does not depend on the continued existence of the parent.
+	// ReplyRequired is an outbox-only authorization condition on an original
+	// reply event, which has no other basis to reach its recipient: delivery
+	// suppresses it when the parent stops standing before admission.
+	// DM/mention delivery does not depend on the continued existence of the
+	// parent. A change event never sets it — the update rides on the
+	// recipient's existing view, so delivery re-authorizes its reply_to and
+	// retires the designation instead of suppressing the correction (see
+	// authorizeAttentionSource).
 	ReplyRequired    bool   `json:"reply_required,omitempty"`
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	// Change marks a mutation of an already-posted message (edited/deleted);
@@ -171,8 +177,10 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 // their view stale would let them keep answering a message that no longer
 // exists, or never learn their own message was removed. An edit additionally
 // reaches members its new content selects for the first time: a mention added
-// by an edit is a real call for attention, and the new reason refines a
-// recorded recipient's stale one. A deletion has no new content to select on.
+// by an edit is a real call for attention, and a recorded recipient's reason
+// is re-derived from the current selection rather than replayed — an edit
+// that removed what selected them leaves no reason behind. A deletion has no
+// new content to select on.
 func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, place Place, message Message, change string, changedAt time.Time) error {
 	recipients := map[string]NotificationDecision{}
 	rows, err := tx.Query(ctx, `
@@ -198,8 +206,10 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 	// Intents are only the recorded selection at append. Reply attention,
 	// poll-vote reports, reminders and mentions added by an earlier edit all
 	// landed delivery rows without an intent — every secretary the message
-	// already reached through a supported path keeps its view current. A
-	// suppressed row was proven undeliverable here, so it earns no attempt.
+	// may have reached through a supported path stays a candidate. Whether a
+	// view was actually established is decided at delivery
+	// (authorizeAttentionSource): a still-pending row makes the change wait
+	// for its outcome, a suppressed one was proven undeliverable here.
 	rows, err = tx.Query(ctx, `
 		SELECT DISTINCT ON (personality_agent_id)
 		       personality_agent_id, COALESCE(payload->>'reason','')
@@ -254,9 +264,22 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		if err != nil {
 			return err
 		}
+		selected := make(map[string]bool, len(decisions))
 		for _, decision := range decisions {
 			if decision.Participant.Kind == KindPersonalityAgent {
 				recipients[decision.Participant.Key()] = decision
+				selected[decision.Participant.Key()] = true
+			}
+		}
+		// A recorded reason names how the original view reached the
+		// recipient, not what this update asks of them: an edit that dropped
+		// the mention or keyword — or a mute applied since — must not keep
+		// demanding attention on the old basis. Only current selection is a
+		// live reason on a change event.
+		for key, decision := range recipients {
+			if !selected[key] && decision.Reason != "" {
+				decision.Reason = ""
+				recipients[key] = decision
 			}
 		}
 	}
@@ -289,13 +312,12 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		event.Change, event.Reason = change, decision.Reason
 		event.OccurredAt = changedAt
 		if addressed && addressee.Author == decision.Participant {
+			// The designation is what the parent justifies at issue time;
+			// delivery re-checks it against the parent as it stands then
+			// (authorizeAttentionSource) — a parent deleted or moved outside
+			// the recipient's tenure meanwhile retires the designation
+			// without suppressing the correction itself.
 			event.ReplyToMessageID = message.ReplyTo
-			// Mirror the append rule: reply attention is re-authorized
-			// against the parent only when it stands on its own (an
-			// independent notification reason already survives the
-			// parent's disappearance). A tombstone never depends on the
-			// parent still being there.
-			event.ReplyRequired = change == AttentionChangeEdited && decision.Reason == ""
 		}
 		if change == AttentionChangeDeleted {
 			event.Content = ""
@@ -651,6 +673,18 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	// Match ordinary source mutation lock order. Source locks remain held through
 	// Admit, so revocation either wins before admission or follows a lawful receipt.
 	sourceErr := scoped.authorizeAttentionSource(ctx, tx, item)
+	event := item.event
+	downgraded := false
+	if errors.Is(sourceErr, errReplyDesignationGone) {
+		// The frozen row keeps what was issued; the admitted input carries
+		// the designation the parent still justifies — none. The correction
+		// itself stays authorized by the recipient's existing view, and
+		// re-deriving the same effective event on every attempt keeps a
+		// retry after a lost receipt a deduplication, not a conflict.
+		event.ReplyToMessageID, event.ReplyRequired = "", false
+		sourceErr = nil
+		downgraded = true
+	}
 	if sourceErr != nil && !attentionSourceUnavailable(sourceErr) {
 		return "", sourceErr
 	}
@@ -667,7 +701,14 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		return "", nil
 	}
 	key := "attention:" + item.event.PersonalityAgentID + ":" + item.event.EventID
-	receipt, found, err := delivery.Lookup(ctx, key, item.event)
+	receipt, found, err := delivery.Lookup(ctx, key, event)
+	if errors.Is(err, errAttentionInputConflict) && downgraded {
+		// The stored input may carry the designation held at its own lawful
+		// admission — the parent dying afterwards does not unmake it. Both
+		// variants are this event's content; only a match on neither is a
+		// real conflict.
+		receipt, found, err = delivery.Lookup(ctx, key, item.event)
+	}
 	if err != nil {
 		if reason, terminal := terminalDeliveryReason(err); terminal {
 			return suppressAttention(ctx, tx, item.event.EventID, reason)
@@ -680,12 +721,16 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
 	}
 	if sourceErr != nil {
-		return suppressAttention(ctx, tx, item.event.EventID, "source_unavailable")
+		reason := "source_unavailable"
+		if errors.Is(sourceErr, errNoEstablishedView) {
+			reason = "no_prior_view"
+		}
+		return suppressAttention(ctx, tx, item.event.EventID, reason)
 	}
 	if !mayAdmit {
 		return "ready", tx.Commit(ctx)
 	}
-	receipt, err = delivery.Admit(ctx, key, item.event)
+	receipt, err = delivery.Admit(ctx, key, event)
 	if err != nil {
 		if reason, terminal := terminalDeliveryReason(err); terminal {
 			return suppressAttention(ctx, tx, item.event.EventID, reason)
@@ -694,6 +739,25 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	}
 	return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
 }
+
+// errReplyDesignationGone is a delivery-time fact about the event's reply
+// designation, not a failure of the delivery's own authorization: the parent
+// an edit names was deleted or fell outside the recipient's tenure after the
+// event was issued. The update itself still stands on the recipient's
+// existing view, so it is delivered without the designation.
+var errReplyDesignationGone = errors.New("reply designation no longer stands")
+
+// errNoEstablishedView marks a change event with no basis: the recipient has
+// no reason selecting them now, is not the author, and no earlier delivery
+// for this message actually reached them. A correction reports against a
+// view that does not exist — there is nothing to update.
+var errNoEstablishedView = errors.New("recipient has no established view of the message")
+
+// errPriorDeliveryPending leaves the basis undecided: an earlier delivery row
+// for this recipient and message is still in flight. The change event retries
+// and resolves with that row's outcome — admitted establishes the view,
+// suppression retires it.
+var errPriorDeliveryPending = errors.New("prior delivery for this message is still pending")
 
 func commitAttentionReceipt(ctx context.Context, tx pgx.Tx, eventID string, receipt AgentAttentionReceipt) (string, error) {
 	if receipt.CommandID == "" || receipt.Seq == 0 || receipt.Seq > 9007199254740991 {
@@ -743,12 +807,63 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 	if message.Seq < access.VisibleFromSeq {
 		return ErrMessageNotFound
 	}
-	if item.event.ReplyRequired {
-		parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, item.event.ReplyToMessageID)
+	if item.event.Change != "" && item.event.Reason == "" && message.Author != s.Scope.Actor {
+		// A change event updates a view the recipient already holds; it is
+		// not a first contact. The basis is a delivery row that actually
+		// reached them — admitted, or its durable input when the receipt
+		// acknowledgement was lost — or the recipient's own engagement
+		// (a reply-later mark or poll vote proves the message was seen).
+		// An in-flight earlier delivery leaves the question undecided:
+		// retry until that row resolves rather than decide on it. A
+		// suppressed or absent original means there is no view to correct.
+		var established, pending bool
+		err := tx.QueryRow(ctx, `
+			SELECT
+			  EXISTS (SELECT 1 FROM agent_attention_deliveries d
+			          WHERE d.message_id=$1 AND d.personality_agent_id=$2 AND d.event_id<>$3
+			            AND (d.admitted_at IS NOT NULL
+			                 OR d.source_kind IN ('reply_later_due','messaging_poll_vote')
+			                 OR EXISTS (SELECT 1 FROM core_inputs ci
+			                            WHERE ci.persona_id=$2 AND ci.input_id='messaging:'||d.event_id::text))),
+			  EXISTS (SELECT 1 FROM agent_attention_deliveries d
+			          WHERE d.message_id=$1 AND d.personality_agent_id=$2 AND d.event_id<>$3
+			            AND d.admitted_at IS NULL AND d.suppressed_at IS NULL
+			            AND d.available_at < $4
+			            AND d.source_kind IN ('messaging_message','messaging_mention'))`,
+			item.event.MessageID, item.event.PersonalityAgentID, item.event.EventID,
+			item.event.OccurredAt).Scan(&established, &pending)
 		if err != nil {
 			return err
 		}
-		if parent.Deleted || parent.Seq < access.VisibleFromSeq || parent.Author != s.Scope.Actor || message.ReplyTo != parent.MessageID {
+		if !established {
+			if pending {
+				return errPriorDeliveryPending
+			}
+			return errNoEstablishedView
+		}
+	}
+	if item.event.ReplyRequired ||
+		(item.event.Change == AttentionChangeEdited && item.event.ReplyToMessageID != "") {
+		// The reply designation is re-authorized against the parent as it
+		// stands now, under the same locks a mutation takes. An original
+		// reply has no other basis to reach this recipient, so it
+		// suppresses when the parent stops standing. An edit already has
+		// the recipient's view, so the same failure only retires the
+		// designation — the correction still delivers as an ordinary
+		// update. A tombstone's reply_to is provenance for the deletion it
+		// reports and is never re-checked.
+		parentGone := true
+		parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, item.event.ReplyToMessageID)
+		if err == nil {
+			parentGone = parent.Deleted || parent.Seq < access.VisibleFromSeq ||
+				parent.Author != s.Scope.Actor || message.ReplyTo != parent.MessageID
+		} else if !errors.Is(err, ErrMessageNotFound) {
+			return err
+		}
+		if parentGone {
+			if item.event.Change == AttentionChangeEdited {
+				return errReplyDesignationGone
+			}
 			return ErrMessageNotFound
 		}
 	}
@@ -786,6 +901,7 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 func attentionSourceUnavailable(err error) bool {
 	return errors.Is(err, ErrPlaceNotFound) || errors.Is(err, ErrMessageNotFound) ||
 		errors.Is(err, ErrMarkerNotFound) || errors.Is(err, ErrPollNotFound) || errors.Is(err, ErrMessageDeleted) ||
+		errors.Is(err, errNoEstablishedView) ||
 		errors.Is(err, applicationapps.ErrInstallationNotFound) ||
 		errors.Is(err, applicationapps.ErrAppDisabled) || errors.Is(err, applicationapps.ErrAuthorityEpochStale)
 }
