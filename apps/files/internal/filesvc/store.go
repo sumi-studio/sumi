@@ -1336,39 +1336,140 @@ func (s *Store) recordedAt(ctx context.Context, scope, st3 string) (string, bool
 	return home, true, nil
 }
 
+// recClaim is the outcome of resolving which version row records a
+// parked object.
+type recClaim int
+
+const (
+	recNone      recClaim = iota // no row claims this object
+	recFound                     // one defensible home
+	recAmbiguous                 // multiple claims evidence cannot separate — preserve
+)
+
 // recordedAtObject routes a parked object to the home a version row
 // records for it. Files match on fp3 — ino:size:mtime is the content
 // generation a file row acknowledges. Directories match on the inode
-// leg alone: a dir's size and mtime churn with every member create or
+// leg: a dir's size and mtime churn with every member create or
 // unlink, so the fp3 recorded at commit diverges from the same live
-// dir; the inode is the directory's object identity. The residual is
-// documented: the row does not persist dev, so an inode match across a
-// mount boundary inside one scope could misroute — same class as the
-// fp3 reuse caveat.
-func (s *Store) recordedAtObject(ctx context.Context, scope string, st FileInfo) (string, bool, error) {
+// dir; the inode is the directory's object identity.
+//
+// Inode claims are not unique across objects forever: ext4 recycles a
+// freed inode and a mounted filesystem brings its own inode space, so
+// several rows may claim one live inode — a ghost row for a dead
+// object beside the true row. When more than one row matches, rank the
+// evidence instead of picking a lexical winner: an exact-fingerprint
+// row recorded this object's current generation; an fp3-equal row
+// recorded a generation with no membership churn; a home that still
+// holds this very object (dev:ino) is already satisfied; and a member
+// whose own row resolves beneath a candidate corroborates that
+// candidate as the container's home. What remains genuinely
+// unresolvable is recAmbiguous — callers preserve rather than install
+// content at a home no evidence supports.
+func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st FileInfo, view ReconView) (string, recClaim, error) {
 	if st.Kind != "dir" {
-		return s.recordedAt(ctx, scope, fp3(st.Fingerprint))
+		home, found, err := s.recordedAt(ctx, scope, fp3(st.Fingerprint))
+		if err != nil || !found {
+			return "", recNone, err
+		}
+		return home, recFound, nil
 	}
 	ino, _, _, ok := fpParts(st.Fingerprint)
 	if !ok || s.pool == nil {
-		return "", false, nil // unidentifiable — preserve
+		return "", recNone, nil // unidentifiable — preserve
 	}
 	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	var home string
-	// 'ino:%:%:%' pins the inode leg of a 4-field fingerprint; the
-	// 2-field fallback form cannot produce a false match.
-	err := s.pool.QueryRow(dctx,
-		`SELECT path FROM file_version
+	rows, qerr := s.pool.Query(dctx,
+		`SELECT path, fp FROM file_version
 		  WHERE scope=$1 AND fp LIKE $2 || ':%:%:%'
-		  ORDER BY path LIMIT 1`, scope, ino).Scan(&home)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		  ORDER BY path`, scope, ino)
+	if qerr != nil {
+		cancel()
+		return "", recNone, qerr
 	}
-	if err != nil {
-		return "", false, err
+	var claims []struct{ path, fp string }
+	for rows.Next() {
+		var c struct{ path, fp string }
+		if err := rows.Scan(&c.path, &c.fp); err == nil {
+			claims = append(claims, c)
+		}
 	}
-	return home, true, nil
+	rows.Close()
+	cancel()
+	if len(claims) == 0 {
+		return "", recNone, nil
+	}
+	if len(claims) == 1 {
+		return claims[0].path, recFound, nil
+	}
+	// Multiple claimants. Narrow to the strongest identity evidence,
+	// then let presence and member corroboration separate equals.
+	var exact, triple []string
+	st3 := fp3(st.Fingerprint)
+	for _, c := range claims {
+		switch {
+		case c.fp == st.Fingerprint:
+			exact = append(exact, c.path)
+		case fp3(c.fp) == st3:
+			triple = append(triple, c.path)
+		}
+	}
+	if len(exact) == 1 {
+		return exact[0], recFound, nil
+	}
+	if len(triple) == 1 {
+		return triple[0], recFound, nil
+	}
+	cands := make([]string, 0, len(claims))
+	for _, c := range claims {
+		cands = append(cands, c.path)
+	}
+	if len(exact) > 1 {
+		cands = exact
+	} else if len(triple) > 1 {
+		cands = triple
+	}
+	// Presence: a home that currently holds this object is satisfied
+	// already — the parked name is a surplus link to the same content.
+	if view != nil {
+		for _, p := range cands {
+			if dst, err := view.Stat(scope, p); err == nil && sameObjectAt(st, dst) {
+				return p, recFound, nil
+			}
+		}
+		// Member corroboration: a member of the parked dir whose own
+		// row resolves beneath a candidate binds the container to that
+		// home. Exact directory identity is then established by the
+		// membership the row recorded, not the inode alone.
+		if members, lerr := view.ListStaged(scope, rel, ""); lerr == nil {
+			corroborated := map[string]bool{}
+			for _, m := range members {
+				if strings.HasPrefix(m, opStagePrefix) || strings.HasPrefix(m, stagingPrefix) {
+					continue
+				}
+				mst, merr := view.Stat(scope, rel+"/"+m)
+				if merr != nil {
+					continue
+				}
+				mh, mf, merr := s.recordedAt(ctx, scope, fp3(mst.Fingerprint))
+				if merr != nil || !mf {
+					continue
+				}
+				if md, _ := splitRel(mh); md != "" {
+					for _, p := range cands {
+						if md == p {
+							corroborated[p] = true
+						}
+					}
+				}
+			}
+			if len(corroborated) == 1 {
+				for p := range corroborated {
+					return p, recFound, nil
+				}
+			}
+		}
+	}
+	return "", recAmbiguous, nil
 }
 
 // recordedMatch reports whether the row fingerprint records this live
@@ -1382,11 +1483,24 @@ func recordedMatch(rowFP string, st FileInfo) bool {
 	return fp3(rowFP) == fp3(st.Fingerprint)
 }
 
+// devLeg extracts the device leg of a "dev:ino" traversal identity.
+func devLeg(devino string) string {
+	d, _, _ := strings.Cut(devino, ":")
+	return d
+}
+
 // sameObjectAt reports whether dst is the same object as st — the
-// "still at its recorded home" check. Dirs compare by inode; files by
-// content-generation triple.
+// "still at its recorded home" check. The comparison is the complete
+// live object identity dev:ino: an inode number alone is per-filesystem,
+// so a foreign-device object with a colliding inode is correctly NOT
+// the same. Missing device evidence fails closed — without dev:ino the
+// stats cannot prove the same live object — and callers on
+// delete-authorizing paths treat "not proven same" as "keep". Restore
+// paths still converge: a genuinely-at-home occupant is protected from
+// a swap by parkedOwnsRow's fingerprint evidence.
 func sameObjectAt(st, dst FileInfo) bool {
-	return st.Kind == dst.Kind && recordedMatch(dst.Fingerprint, st)
+	return st.Kind == dst.Kind && st.DevIno != "" &&
+		st.DevIno == dst.DevIno
 }
 
 // intentApplied reports whether this intent's effect committed and was
@@ -1519,9 +1633,11 @@ func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 	// Decision-time screen: still recorded and absent from its recorded
 	// home means this object is recorded content parked here by a
 	// delayed effect — restore it, never delete.
-	if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
-		return // row set unverifiable — preserve
-	} else if found {
+	home, claim, derr := s.recordedAtObject(ctx, it.scope, rel, st, view)
+	if derr != nil || claim == recAmbiguous {
+		return // row set unverifiable or ambiguous — preserve
+	}
+	if claim == recFound {
 		dst, serr := view.Stat(it.scope, home)
 		if serr != nil || !sameObjectAt(st, dst) {
 			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
@@ -1539,16 +1655,25 @@ func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 			if derr != nil || busy {
 				return true, derr
 			}
-			home, found, derr := s.recordedAtObject(ctx, it.scope, captured)
+			home, claim, derr := s.recordedAtObject(ctx, it.scope, rel, captured, view)
 			if derr != nil {
 				return true, derr
 			}
-			if found {
+			if claim == recAmbiguous {
+				// The row evidence cannot separate which home records
+				// this object — no proof the captured object is a
+				// surplus link, so the unlink is not authorized.
+				return true, nil
+			}
+			if claim == recFound {
 				// Deletion is safe only when the recorded home still
 				// holds the object — the staged name is then a surplus
-				// link (e.g. an exclusive-create linkat leftover).
-				// Otherwise it is displaced recorded content: preserve
-				// it for the next pass's restore.
+				// link (e.g. an exclusive-create linkat leftover). The
+				// comparison binds dev:ino when both stats carry it, so
+				// a foreign-device object with a colliding inode does
+				// not satisfy "still at home". Otherwise it is displaced
+				// recorded content: preserve it for the next pass's
+				// restore.
 				dst, serr := view.Stat(it.scope, home)
 				if serr != nil || !sameObjectAt(captured, dst) {
 					return true, nil
@@ -1625,9 +1750,11 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// content belongs, so route it home (its home may be this
 		// intent's own path: restoreStaged swaps only when the row
 		// records this very object there, never a bare name).
-		if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
-			return // row set unverifiable — preserve, never misplace
-		} else if found {
+		home, claim, derr := s.recordedAtObject(ctx, it.scope, rel, st, view)
+		if derr != nil || claim == recAmbiguous {
+			return // row set unverifiable or ambiguous — preserve, never misplace
+		}
+		if claim == recFound {
 			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
 			return
 		}
@@ -1699,9 +1826,11 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// Recorded content parked under a remove intent belongs at its
 		// recorded home — which need not be this intent's path.
 		dest := it.path
-		if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
-			return
-		} else if found {
+		home, claim, derr := s.recordedAtObject(ctx, it.scope, rel, st, view)
+		if derr != nil || claim == recAmbiguous {
+			return // unverifiable or ambiguous — preserve
+		}
+		if claim == recFound {
 			dest = home
 		}
 		s.restoreStaged(ctx, it, view, rel, dest, st, tombstoned)
@@ -1719,7 +1848,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// content captured during commit). Restore it to whichever name
 		// the version rows say it belongs to.
 		s.restoreStaged(ctx, it, view, rel,
-			s.stagedHome(ctx, it, st), st, tombstoned)
+			s.stagedHome(ctx, it, rel, st, view), st, tombstoned)
 	}
 }
 
@@ -1730,10 +1859,12 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 // destination when it matches the destination's recorded fingerprint,
 // else the source name — the object was captured there, so restoring
 // the source name recovers the pre-effect shape.
-func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
-	if home, found, err := s.recordedAtObject(ctx, it.scope, st); err != nil {
-		return "" // row set unverifiable — leave parked
-	} else if found {
+func (s *Store) stagedHome(ctx context.Context, it intent, rel string, st FileInfo, view ReconView) string {
+	home, claim, err := s.recordedAtObject(ctx, it.scope, rel, st, view)
+	if err != nil || claim == recAmbiguous {
+		return "" // row set unverifiable or ambiguous — leave parked
+	}
+	if claim == recFound {
 		return home
 	}
 	dctx, cancel := s.dbCtx(ctx)
@@ -1777,7 +1908,8 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		// overwrite a name merely because something sits parked. A
 		// sealed rel cannot receive the displaced squatter, so drain
 		// through the unsealed base slot instead.
-		if rowMatch && !sameObjectAt(st, dst) {
+		if rowMatch && !sameObjectAt(st, dst) &&
+			parkedOwnsRow(view, scope, destPath, rowFP, st, dst) {
 			// The occupant may be a live writer's fresh object whose row
 			// has not committed yet; moving it now would only churn it
 			// into this namespace. Retry once those writers settle.
@@ -1803,6 +1935,49 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		}
 	default:
 		// unverifiable — leave parked
+	}
+}
+
+// parkedOwnsRow arbitrates an occupied-home restore. The row at
+// destPath matched the parked object's identity evidence — but for a
+// directory that evidence is the inode leg alone, and an inode
+// collision across devices (or an fp3 coincidence for a file) can make
+// the occupant indistinguishable at the row level. When the occupant
+// fails the row's evidence outright it is an undisputed impostor and
+// the swap proceeds. When BOTH match, the containing filesystem
+// decides: the row was written for an object beneath destPath's
+// parent, so the candidate living on the parent's device is the row's
+// subject — a cross-device impostor is displaced, a local occupant is
+// the recorded object itself. When neither device nor fp3 separates
+// them, fail closed: leave the occupant and preserve the parked object
+// for a pass with better evidence (never a swap that evicts recorded
+// content on a guess).
+func parkedOwnsRow(view ReconView, scope, destPath, rowFP string, st, dst FileInfo) bool {
+	if !recordedMatch(rowFP, dst) {
+		return true // occupant is not the row's subject at all
+	}
+	sDev, dDev := devLeg(st.DevIno), devLeg(dst.DevIno)
+	fp3Only := func() bool {
+		// The strongest remaining evidence: the candidate still at the
+		// recorded generation.
+		return fp3(rowFP) == fp3(st.Fingerprint) && fp3(rowFP) != fp3(dst.Fingerprint)
+	}
+	if sDev == "" || dDev == "" || sDev == dDev {
+		return fp3Only()
+	}
+	pdir, _ := splitRel(destPath)
+	pst, err := view.Stat(scope, pdir)
+	if err != nil || pst.DevIno == "" {
+		return fp3Only()
+	}
+	pDev := devLeg(pst.DevIno)
+	switch {
+	case sDev == pDev && dDev != pDev:
+		return true // parked object is local to the row's filesystem
+	case dDev == pDev && sDev != pDev:
+		return false // the occupant is the row's subject
+	default:
+		return fp3Only()
 	}
 }
 
@@ -1955,11 +2130,11 @@ func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view Recon
 	if err != nil {
 		return
 	}
-	home, found, derr := s.recordedAtObject(ctx, scope, st)
-	if derr != nil {
-		return // unverifiable — preserve
+	home, claim, derr := s.recordedAtObject(ctx, scope, rel, st, view)
+	if derr != nil || claim == recAmbiguous {
+		return // unverifiable or ambiguous — preserve whole
 	}
-	if found {
+	if claim == recFound {
 		if dst, serr := view.Stat(scope, home); serr == nil && sameObjectAt(st, dst) {
 			return // still present at its recorded home — surplus link, leave it
 		}
@@ -1999,11 +2174,11 @@ func (s *Store) settleOrphanContents(ctx context.Context, scope string, view Rec
 		if serr != nil {
 			continue
 		}
-		home, found, derr := s.recordedAtObject(ctx, scope, st)
-		if derr != nil {
-			continue // unverifiable — preserve
+		home, claim, derr := s.recordedAtObject(ctx, scope, rel, st, view)
+		if derr != nil || claim == recAmbiguous {
+			continue // unverifiable or ambiguous — preserve
 		}
-		if found {
+		if claim == recFound {
 			// A recorded object — file OR directory — is restored whole
 			// to its recorded home. Judge the container before touching
 			// its contents: descending first would move members out of a

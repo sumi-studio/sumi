@@ -1707,3 +1707,259 @@ func TestLateRepairSweepKeyPathFallback(t *testing.T) {
 		t.Fatalf("path-fallback sweep stranded recorded member: %q present=%v", got, ok)
 	}
 }
+
+// Directory-authority variants: multiple inode claims must not be
+// resolved lexically — evidence ranks, and a genuinely unresolvable
+// claim preserves the object until better evidence arrives.
+//
+// An EMPTY churned dir is the worst case: its fp3 has diverged from
+// its own row (membership churn), it has no members to corroborate,
+// and no candidate home holds it. Two rows claim the inode (its own +
+// a ghost row left by inode reuse). The sweep must preserve the parked
+// dir rather than install it at either home; when the ghost row is
+// later removed the same sweep recovers it to the real row's home.
+func TestLateRepairCorrDirAmbiguousThenResolves(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "zHome")
+		}); err != nil {
+		t.Fatalf("mkdir zHome: %v", err)
+	}
+	_, dfp, _ := authRow(t, s, "zHome")
+	dIno, _, _, _ := fpParts(dfp)
+	// Churn the dir's membership outside the service: its live fp3 no
+	// longer equals the row's, so neither row can be confirmed by
+	// generation evidence alone.
+	if err := os.WriteFile(dir+"/ws/zHome/.tmp-churn", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir + "/ws/zHome/.tmp-churn"); err != nil {
+		t.Fatal(err)
+	}
+	parked := opStagePrefix + "555555-p-amb" // intent id never existed
+	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	// Ghost row: a recycled-inode leftover claiming the same inode leg.
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','aGhost',$1,$2,'')`, authMint(t, s), dIno+":9:9:9")
+	s.SetReconcileView(authPinned(root, nil))
+	authSettle(t, s)
+	authSettle(t, s)
+	// Ambiguous: the dir must be preserved at its parked name and NOT
+	// installed at either claimant's path.
+	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
+		t.Fatal("ambiguous dir installed at ghost home aGhost")
+	}
+	if _, serr := root.lstat("ws", "zHome"); serr == nil {
+		t.Fatal("ambiguous dir installed at zHome on inode leg alone")
+	}
+	if alive := scanDirForInode(dir, "ws", dIno); alive == "" {
+		t.Fatalf("ambiguous recorded dir LOST (ino %s): neither home nor parked", dIno)
+	}
+	// Evidence resolves when the ghost row is removed — the remaining
+	// single claimant routes the object home. Not stranded forever.
+	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='aGhost'`)
+	authSettle(t, s)
+	authSettle(t, s)
+	st, serr := root.lstat("ws", "zHome")
+	if serr != nil {
+		t.Fatalf("recorded dir not restored after ambiguity resolved: %v", serr)
+	}
+	if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
+		t.Fatalf("zHome holds ino %s, want %s", ino, dIno)
+	}
+}
+
+// Member corroboration: a churned recorded dir (fp3 no longer matches
+// its row) carrying a recorded member resolves a multi-row inode claim
+// through the member's own row — the container lands at the home the
+// membership evidence supports, not the lexical or ghost claimant.
+func TestLateRepairCorrDirMemberCorroboratesHome(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "zHome")
+		}); err != nil {
+		t.Fatalf("mkdir zHome: %v", err)
+	}
+	// Writing a member churns the dir's size/mtime — its row's fp3 no
+	// longer matches the live dir, so only the inode leg + membership
+	// identify it.
+	if _, _, err := s.WithWrite(ctx, "ws", "zHome/f.txt", "write",
+		IfVersion{Mode: "any"}, sha("MC"), authProbe(root, "zHome/f.txt"),
+		authWriteFn(root, "zHome/f.txt", "MC")); err != nil {
+		t.Fatalf("write zHome/f.txt: %v", err)
+	}
+	_, dfp, _ := authRow(t, s, "zHome")
+	dIno, _, _, _ := fpParts(dfp)
+	parked := opStagePrefix + "666666-p-co"
+	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha)
+		 VALUES ('ws','aGhost',$1,$2,'')`, authMint(t, s), dIno+":9:9:9")
+	s.SetReconcileView(authPinned(root, nil))
+	authSettle(t, s)
+	authSettle(t, s)
+	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
+		t.Fatal("dir installed at ghost home aGhost despite member evidence")
+	}
+	if got, ok := authReadOpt(dir, "ws/zHome/f.txt"); !ok || got != "MC" {
+		t.Fatalf("corroborated dir not restored with member: zHome/f.txt=%q present=%v",
+			got, ok)
+	}
+	st, serr := root.lstat("ws", "zHome")
+	if serr != nil {
+		t.Fatalf("zHome absent after corroborated restore: %v", serr)
+	}
+	if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
+		t.Fatalf("zHome holds ino %s, want %s", ino, dIno)
+	}
+}
+
+// Missing live-identity evidence fails closed on the deletion path:
+// the impostor at the recorded home presents the recorded dir's exact
+// fingerprint but NO dev:ino — the veto must not declare the captured
+// object a surplus link on fingerprint alone.
+func TestLateRepairCorrVetoMissingDevInoKeeps(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "homeD", "mkdir",
+		IfVersion{Mode: "any"}, "dir", authProbe(root, "homeD"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.mkdir("ws", "homeD")
+		}); err != nil {
+		t.Fatalf("mkdir homeD: %v", err)
+	}
+	_, dfp, _ := authRow(t, s, "homeD")
+	dIno, _, _, _ := fpParts(dfp)
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "wp",
+		version: authMint(t, s), preFP: "0:0:0:0", dstFP: dfp,
+		expectSHA: sha("W"), at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-mi"
+	if err := os.Rename(dir+"/ws/homeD", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/wp", []byte("W"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir+"/ws/homeD", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The occupant presents the row's EXACT fingerprint but no live
+	// device identity — the strongest possible row-level forgery.
+	vf := authPinned(root, func(v ReconView) ReconView {
+		return sweepIDView{ReconView: v,
+			fp: map[string]string{"homeD": dfp},
+			id: map[string]string{"homeD": "-"}}
+	})
+	view, err := vf(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	s.reconcileOne(ctx, it, view, false)
+	if alive := scanDirForInode(dir, "ws", dIno); alive == "" {
+		t.Fatalf("recorded dir (ino %s) destroyed on missing-identity evidence", dIno)
+	}
+}
+
+// File variant of the cross-device veto: an occupant file reporting
+// the recorded file's full fingerprint on a foreign device must not
+// satisfy "still at home" — the recorded file survives, and the
+// restore swap puts the recorded bytes back at their home while the
+// impostor is parked aside.
+func TestLateRepairCorrFileCrossDevOccupant(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "homeF", "write",
+		IfVersion{Mode: "any"}, sha("HF"), authProbe(root, "homeF"),
+		authWriteFn(root, "homeF", "HF")); err != nil {
+		t.Fatalf("write homeF: %v", err)
+	}
+	_, ffp, _ := authRow(t, s, "homeF")
+	fIno, _, _, _ := fpParts(ffp)
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "wp",
+		version: authMint(t, s), preFP: "0:0:0:0", dstFP: ffp,
+		expectSHA: sha("W"), at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-fx"
+	if err := os.Rename(dir+"/ws/homeF", dir+"/ws/"+parked); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/wp", []byte("W"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A foreign-device file sits at homeF reporting the recorded
+	// file's exact fingerprint — fp legs identical, dev:ino differs.
+	if err := os.WriteFile(dir+"/ws/homeF", []byte("IMPOSTOR"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vf := authPinned(root, func(v ReconView) ReconView {
+		return sweepIDView{ReconView: v,
+			fp: map[string]string{"homeF": ffp},
+			id: map[string]string{"homeF": "7777:" + fIno}}
+	})
+	view, err := vf(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	s.reconcileOne(ctx, it, view, false)
+	if got, ok := authReadOpt(dir, "ws/homeF"); !ok || got != "HF" {
+		t.Fatalf("recorded file not restored over fp-identical cross-dev occupant: "+
+			"homeF=%q present=%v", got, ok)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("IMPOSTOR")); where == "" {
+		t.Fatal("foreign occupant destroyed — must be parked aside, never erased")
+	}
+}
