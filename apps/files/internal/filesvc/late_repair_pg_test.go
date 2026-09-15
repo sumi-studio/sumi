@@ -231,13 +231,13 @@ func TestLateRepairParkedRecordedObjectNotMisplaced(t *testing.T) {
 	s.Reconcile(ctx)
 	authSettle(t, s)
 
-	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "L-content" {
-		where := scanDirFor(t, dir, "ws", []byte("L-content"))
-		_, fpH, _ := authRow(t, s, "h.txt")
-		_, fpR, _ := authRow(t, s, "r.txt")
-		t.Fatalf("recorded content misplaced, not restored home: "+
-			"L-bytes at %q (want h.txt), row(h.txt)=%q, row(r.txt)=%q",
-			where, fpH, fpR)
+	// The intent row is dead to this name (the record was never
+	// journaled for it) — no operation-bound home exists, so the object
+	// surfaces visibly with a fresh row rather than being routed on the
+	// stale h.txt row's say-so.
+	surfaced := authSurfaced(t, s, dir, "ws", []byte("L-content"))
+	if surfaced == "r.txt" || surfaced == "h.txt" {
+		t.Fatalf("recorded content moved onto a recorded path on row evidence: %q", surfaced)
 	}
 	if got, ok := authReadOpt(dir, "ws/r.txt"); ok {
 		t.Fatalf("r.txt = %q — foreign recorded content moved onto the intent's path", got)
@@ -291,20 +291,14 @@ func TestLateRepairPostRemovalDepositRestored(t *testing.T) {
 		t.Fatalf("late deposit: %v", err)
 	}
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/a.txt"); !ok || got != "A" {
-		where := scanDirFor(t, dir, "ws", []byte("A"))
-		_, fp, found := authRow(t, s, "a.txt")
-		t.Fatalf("acknowledged object stranded at dead namespace: a.txt=%q "+
-			"(present=%v), A bytes at %q, row(a.txt)=%q found=%v",
-			got, ok, where, fp, found)
-	}
-	if _, fp, found := authRow(t, s, "a.txt"); !found || fp3(fp) != fp3(fpA) {
-		t.Fatalf("row(a.txt) = %q found=%v, want %s", fp, found, fpA)
-	}
-	// A fresh operation on the recovered path succeeds.
-	if _, _, err := s.WithWrite(ctx, "ws", "a.txt", "write",
-		IfVersion{Mode: "any"}, sha("A2"), authProbe(root, "a.txt"),
-		authWriteFn(root, "a.txt", "A2")); err != nil {
+	// The intent row was deleted before the deposit landed — no
+	// provenance survives, so A surfaces visibly with a fresh row.
+	surfaced := authSurfaced(t, s, dir, "ws", []byte("A"))
+	_ = fpA
+	// A fresh operation on the recovered object succeeds.
+	if _, _, err := s.WithWrite(ctx, "ws", surfaced, "write",
+		IfVersion{Mode: "any"}, sha("A2"), authProbe(root, surfaced),
+		authWriteFn(root, surfaced, "A2")); err != nil {
 		t.Fatalf("fresh write after recovery: %v", err)
 	}
 }
@@ -345,11 +339,10 @@ func TestLateRepairParkedRecordedUnderRemoveIntent(t *testing.T) {
 
 	authSettle(t, s)
 
-	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "L-content" {
-		where := scanDirFor(t, dir, "ws", []byte("L-content"))
-		t.Fatalf("recorded content parked under a remove intent not restored: "+
-			"h.txt=%q, bytes at %q", got, where)
-	}
+	// The remove intent never journaled this name — the deposit is an
+	// unattributable occupant: surfaced visibly, never restored on the
+	// stale h.txt row's claim and never deleted.
+	authSurfaced(t, s, dir, "ws", []byte("L-content"))
 }
 
 // An orphan at a sealed (-q-) name holds recorded content while a
@@ -629,12 +622,11 @@ func TestLateRepairRelocateStaleRowDoesNotRevert(t *testing.T) {
 		t.Fatalf("acknowledged write silently reverted: B=%q, "+
 			"new-W bytes at %q, row(B)=(%d,%q)", got, where, vB, fpB)
 	}
-	// And the recorded member returns to its recorded home A.
-	if got, ok := authReadOpt(dir, "ws/A"); !ok || got != "member-M" {
-		where := scanDirFor(t, dir, "ws", []byte("member-M"))
-		t.Fatalf("member not recovered home: A=%q present=%v, bytes at %q",
-			got, ok, where)
-	}
+	// And the recorded member survives visibly: the deposit landed under
+	// the dead rename's namespace after its row resolved — no journaled
+	// provenance — so it surfaces rather than being routed to A on the
+	// stale row's claim.
+	authSurfaced(t, s, dir, "ws", []byte("member-M"))
 	// A fresh operation proceeds after finite interference.
 	if _, _, err := s.WithWrite(ctx, "ws", "B", "write",
 		IfVersion{Mode: "any"}, sha("fresh"), authProbe(root, "B"),
@@ -1265,15 +1257,33 @@ func TestLateRepairOrphanDeepSweepRestores(t *testing.T) {
 			}
 			s := newPGStore(t, dsn, dir)
 			s.SetReconcileView(authPinned(root, nil))
-			lateDeepOrphanSetup(t, s, root, dir, parents)
+			parked := lateDeepOrphanSetup(t, s, root, dir, parents)
 			authSettle(t, s)
-			if got, ok := authReadOpt(dir, "ws/hdeep.txt"); !ok || got != "DEEP" {
-				where := scanDirFor(t, dir, "ws", []byte("DEEP"))
-				t.Fatalf("recorded object parked at parent depth %d not restored: "+
-					"hdeep.txt=%q present=%v, bytes at %q", parents, got, ok, where)
+			// The deposit outlived its intent row — no provenance — so
+			// the object surfaces visibly IN PLACE (beneath its parked
+			// parent), with a fresh row and recover event.
+			pdir := filepath.Dir(parked)
+			ents, err := os.ReadDir(dir + "/ws/" + pdir)
+			if err != nil {
+				t.Fatalf("read parked parent: %v", err)
 			}
-			if _, fp, found := authRow(t, s, "hdeep.txt"); !found || fp == "" {
-				t.Fatalf("row(hdeep.txt) = %q found=%v", fp, found)
+			var surf string
+			for _, e := range ents {
+				if e.IsDir() || !strings.HasPrefix(e.Name(), "recovered-o") {
+					continue
+				}
+				b, rerr := os.ReadFile(dir + "/ws/" + pdir + "/" + e.Name())
+				if rerr == nil && sha(string(b)) == sha("DEEP") {
+					surf = e.Name()
+				}
+			}
+			if surf == "" {
+				t.Fatalf("recorded object parked at parent depth %d not surfaced: "+
+					"entries=%v", parents, ents)
+			}
+			rel := pdir + "/" + surf
+			if _, _, found := authRow(t, s, rel); !found {
+				t.Fatalf("surfaced object at %q has no version row", rel)
 			}
 		})
 	}
@@ -1364,27 +1374,31 @@ func TestLateRepairOrphanedDirRestoresRecordedMembers(t *testing.T) {
 	}
 	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/dirO/f.txt"); !ok || got != "MEMBER" {
-		pgot, _ := authReadOpt(dir, "ws/"+parked+"/f.txt")
-		_, fp, found := authRow(t, s, "dirO/f.txt")
-		t.Fatalf("recorded member stranded inside unrecorded parked dir: "+
-			"dirO/f.txt=%q present=%v, bytes inside parked dir=%q, row=%q found=%v",
-			got, ok, pgot, fp, found)
+	// The parked container has no journaled provenance: it surfaces
+	// whole at a visible name — members ride inside, each minted an
+	// ordinary row so they stay readable/deletable API objects.
+	cont := scanDirForFile(t, dir, "ws", "extra.bin")
+	if cont == "" || strings.Contains(cont, opStagePrefix) {
+		t.Fatalf("container not surfaced visibly: extra.bin at %q", cont)
 	}
-	if got, ok := authReadOpt(dir, "ws/dirO/sub/g.txt"); !ok || got != "NESTED" {
-		t.Fatalf("nested recorded member not restored: dirO/sub/g.txt=%q present=%v", got, ok)
+	cdir := filepath.Dir(cont)
+	if got, ok := authReadOpt(dir, "ws/"+cdir+"/f.txt"); !ok || got != "MEMBER" {
+		t.Fatalf("recorded member not readable inside surfaced container: %q ok=%v", got, ok)
 	}
-	// Unrecorded residue rides the container to its visible surfaced
-	// name — preserved, never installed at the recorded member's names.
-	if got, ok := authReadOpt(dir, "ws/"+parked+"/extra.bin"); ok && got == "EXTRA" {
+	if got, ok := authReadOpt(dir, "ws/"+cdir+"/sub/g.txt"); !ok || got != "NESTED" {
+		t.Fatalf("nested recorded member not readable inside surfaced container: %q ok=%v", got, ok)
+	}
+	if _, _, found := authRow(t, s, cdir+"/f.txt"); !found {
+		t.Fatalf("surfaced member %q has no version row", cdir+"/f.txt")
+	}
+	if _, _, found := authRow(t, s, cdir+"/sub/g.txt"); !found {
+		t.Fatalf("surfaced nested member %q has no version row", cdir+"/sub/g.txt")
+	}
+	if fileExists(dir + "/ws/" + parked) {
 		t.Fatal("container left hidden at its private name")
 	}
 	if _, ok := authReadOpt(dir, "ws/dirO/extra.bin"); ok {
 		t.Fatal("unrecorded member was installed at a public recorded name")
-	}
-	if where := scanDirForFile(t, dir, "ws", "extra.bin"); where == "" ||
-		strings.Contains(where, opStagePrefix) {
-		t.Fatalf("unrecorded member destroyed or hidden: extra.bin at %q", where)
 	}
 }
 
@@ -1497,23 +1511,30 @@ func TestLateRepairOrphanedDirRestoresRecordedDir(t *testing.T) {
 			}
 			authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
 			authSettle(t, s)
-			// The recorded dir object itself must sit at its recorded
-			// home — the same INODE the row acknowledges (fp3's size/mtime
-			// legs churn with member writes, so compare object identity).
-			live := durFP(t, root, "ws", "recD")
+			// No journaled provenance survives — the container surfaces
+			// whole and the recorded dir object rides inside it with its
+			// identity intact (same inode the row acknowledged).
+			cont := scanDirForFile(t, dir, "ws", "recD")
+			if cont == "" || strings.Contains(cont, opStagePrefix) {
+				t.Fatalf("container not surfaced visibly: recD at %q", cont)
+			}
+			live := durFP(t, root, "ws", cont)
 			liveIno, _, _, lok := fpParts(live)
 			rowIno, _, _, rok := fpParts(recDFP)
 			if !lok || !rok || liveIno != rowIno {
-				t.Fatalf("recorded dir not restored to its own home: "+
+				t.Fatalf("surfaced recD is not the recorded object: "+
 					"live fp=%q row fp=%q (inodes %q vs %q)",
 					live, recDFP, liveIno, rowIno)
 			}
-			if _, err := os.Stat(dir + "/ws/" + parked + "/recD"); err == nil {
-				t.Fatal("recorded dir still parked inside container")
+			if _, _, found := authRow(t, s, cont); !found {
+				t.Fatalf("surfaced dir %q has no version row", cont)
+			}
+			if fileExists(dir + "/ws/" + parked) {
+				t.Fatal("container left hidden at its private name")
 			}
 			if nonempty {
-				if got, ok := authReadOpt(dir, "ws/recD/inner.txt"); !ok || got != "IN" {
-					t.Fatalf("member of restored dir missing: %q present=%v", got, ok)
+				if got, ok := authReadOpt(dir, "ws/"+cont+"/inner.txt"); !ok || got != "IN" {
+					t.Fatalf("member of surfaced dir missing: %q present=%v", got, ok)
 				}
 			}
 		})
@@ -1594,13 +1615,24 @@ func TestLateRepairSweepKeyCrossDevice(t *testing.T) {
 			id: map[string]string{parked + "/a": "9:5", parked + "/b": "7:5"}}
 	}))
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/b/f.txt"); !ok || got != "F" {
-		t.Fatalf("recorded member of second same-ino dir stranded: "+
-			"b/f.txt=%q present=%v (b was skipped as a false revisit)", got, ok)
+	// The container surfaces whole — both recorded members must be
+	// reachable inside it regardless of the walk's dedup key.
+	cont := scanDirForFile(t, dir, "ws", "f.txt")
+	if cont == "" || strings.Contains(cont, opStagePrefix) {
+		t.Fatalf("container not surfaced: f.txt at %q", cont)
 	}
-	if got, ok := authReadOpt(dir, "ws/a/g.txt"); !ok || got != "G" {
-		t.Fatalf("recorded member of first same-ino dir stranded: "+
-			"a/g.txt=%q present=%v (a was skipped as a false revisit)", got, ok)
+	croot := strings.TrimSuffix(cont, "/b/f.txt")
+	if croot == cont {
+		croot = filepath.Dir(filepath.Dir(cont))
+	}
+	if got, ok := authReadOpt(dir, "ws/"+croot+"/b/f.txt"); !ok || got != "F" {
+		t.Fatalf("recorded member of second same-ino dir stranded: %q ok=%v", got, ok)
+	}
+	if got, ok := authReadOpt(dir, "ws/"+croot+"/a/g.txt"); !ok || got != "G" {
+		t.Fatalf("recorded member of first same-ino dir stranded: %q ok=%v", got, ok)
+	}
+	if _, _, found := authRow(t, s, croot+"/b/f.txt"); !found {
+		t.Fatalf("surfaced member %q has no version row", croot+"/b/f.txt")
 	}
 }
 
@@ -1728,10 +1760,17 @@ func TestLateRepairSweepKeyPathFallback(t *testing.T) {
 			id: map[string]string{parked + "/a": "-", parked + "/b": "-"}}
 	}))
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/b/f.txt"); !ok || got != "F" {
+	// Path-keyed walk or not, the container surfaces whole — both
+	// recorded members must be reachable inside it.
+	cont := scanDirForFile(t, dir, "ws", "f.txt")
+	if cont == "" || strings.Contains(cont, opStagePrefix) {
+		t.Fatalf("container not surfaced: f.txt at %q", cont)
+	}
+	croot := filepath.Dir(filepath.Dir(cont))
+	if got, ok := authReadOpt(dir, "ws/"+croot+"/b/f.txt"); !ok || got != "F" {
 		t.Fatalf("path-fallback sweep stranded recorded member: %q present=%v", got, ok)
 	}
-	if got, ok := authReadOpt(dir, "ws/a/g.txt"); !ok || got != "G" {
+	if got, ok := authReadOpt(dir, "ws/"+croot+"/a/g.txt"); !ok || got != "G" {
 		t.Fatalf("path-fallback sweep stranded recorded member: %q present=%v", got, ok)
 	}
 }
@@ -1871,16 +1910,21 @@ func TestLateRepairCorrDirMemberCorroboratesHome(t *testing.T) {
 	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
 		t.Fatal("dir installed at ghost home aGhost despite member evidence")
 	}
-	if got, ok := authReadOpt(dir, "ws/zHome/f.txt"); !ok || got != "MC" {
-		t.Fatalf("corroborated dir not restored with member: zHome/f.txt=%q present=%v",
-			got, ok)
+	if _, serr := root.lstat("ws", "zHome"); serr == nil {
+		t.Fatal("dir installed at its stale row's path on row evidence")
 	}
-	st, serr := root.lstat("ws", "zHome")
-	if serr != nil {
-		t.Fatalf("zHome absent after corroborated restore: %v", serr)
+	// No journaled provenance — the dir surfaces whole at a visible
+	// name, member riding inside with its own row.
+	surfaced := scanDirForInode(dir, "ws", dIno)
+	if surfaced == "" || strings.Contains(surfaced, opStagePrefix) {
+		t.Fatalf("recorded dir not surfaced visibly (ino %s): %q", dIno, surfaced)
 	}
-	if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
-		t.Fatalf("zHome holds ino %s, want %s", ino, dIno)
+	rel := strings.TrimPrefix(surfaced, dir+"/ws/")
+	if got, ok := authReadOpt(dir, "ws/"+rel+"/f.txt"); !ok || got != "MC" {
+		t.Fatalf("member not readable inside surfaced dir: %q ok=%v", got, ok)
+	}
+	if _, _, found := authRow(t, s, rel); !found {
+		t.Fatalf("surfaced dir %q has no version row", rel)
 	}
 }
 
@@ -2054,23 +2098,26 @@ func TestLateRepairMemberExternalHomeAndUnknownRides(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// Container restored at its own recorded home with its identity.
-	st, serr := root.lstat("ws", "ddir")
-	if serr != nil {
-		t.Fatalf("container not restored to ddir: %v", serr)
+	// No journaled provenance — the container surfaces whole at a
+	// visible name with its identity and members intact. Nothing moves
+	// a member to the stale 'mout' row's claim.
+	cont := scanDirForInode(dir, "ws", dIno)
+	if cont == "" || strings.Contains(cont, opStagePrefix) {
+		t.Fatalf("container not surfaced visibly (ino %s): %q", dIno, cont)
 	}
-	if got, _, _, _ := fpParts(st.Fingerprint); got != dIno {
-		t.Fatalf("container identity changed: ddir holds ino %s, want %s", got, dIno)
-	}
-	// The recorded member reached its own recorded home.
-	if got, ok := authReadOpt(dir, "ws/mout"); !ok || got != "MM" {
-		where := scanDirFor(t, dir, "ws", []byte("MM"))
-		t.Fatalf("member not at its recorded home: mout=%q present=%v, MM at %q",
-			got, ok, where)
+	crel := strings.TrimPrefix(cont, dir+"/ws/")
+	if got, ok := authReadOpt(dir, "ws/"+crel+"/m"); !ok || got != "MM" {
+		t.Fatalf("recorded member not readable inside surfaced container: %q ok=%v", got, ok)
 	}
 	// The unknown member rode the container — preserved, never routed.
-	if got, ok := authReadOpt(dir, "ws/ddir/u"); !ok || got != "UNKNOWN" {
-		t.Fatalf("unknown member lost or displaced: ddir/u=%q present=%v", got, ok)
+	if got, ok := authReadOpt(dir, "ws/"+crel+"/u"); !ok || got != "UNKNOWN" {
+		t.Fatalf("unknown member lost or displaced: %q present=%v", got, ok)
+	}
+	if fileExists(dir + "/ws/mout") {
+		t.Fatal("member extracted to its stale row's path")
+	}
+	if _, _, found := authRow(t, s, crel+"/m"); !found {
+		t.Fatalf("surfaced member %q has no version row", crel+"/m")
 	}
 	// Fresh ops proceed after recovery.
 	if _, _, err := s.WithWrite(ctx, "ws", "fresh.txt", "write",
@@ -2131,16 +2178,15 @@ func TestLateRepairMemberHomeOccupiedPreservesBoth(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 	// The foreign occupant's public name is never disturbed on row
-	// evidence — out/m keeps NEWER. The recorded member cannot be
-	// installed over it, so it rides the restored container to ddir/m:
-	// preserved, readable, and honestly diverged from its out/m row.
+	// evidence — out/m keeps NEWER. The recorded member rides inside the
+	// surfaced container — preserved and readable, honestly diverged
+	// from its out/m row.
 	if got, ok := authReadOpt(dir, "ws/out/m"); !ok || got != "NEWER" {
 		t.Fatalf("foreign occupant evicted by row evidence: out/m=%q present=%v", got, ok)
 	}
-	if got, ok := authReadOpt(dir, "ws/ddir/m"); !ok || got != "OLD" {
-		where := scanDirFor(t, dir, "ws", []byte("OLD"))
-		t.Fatalf("recorded member lost: ddir/m=%q present=%v, OLD at %q",
-			got, ok, where)
+	oldAt := scanTreeFor(t, dir, "ws", []byte("OLD"))
+	if oldAt == "" || strings.Contains(oldAt, opStagePrefix) {
+		t.Fatalf("recorded member destroyed or left private: OLD at %q", oldAt)
 	}
 	// The out/m row still records the member object — diverged from the
 	// live occupant, which reads report as external_change.
@@ -2202,11 +2248,17 @@ func TestLateRepairMemberRoutesWithoutLiveIdentity(t *testing.T) {
 	}))
 	authSettle(t, s)
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/mout"); !ok || got != "MM" {
-		t.Fatalf("member not routed without live identity: mout=%q present=%v", got, ok)
+	// No provenance — the container surfaces whole; the member rides
+	// inside it, never routed to the stale 'mout' row's claim.
+	mAt := scanDirForFile(t, dir, "ws", "m")
+	if mAt == "" || strings.Contains(mAt, opStagePrefix) {
+		t.Fatalf("member destroyed or left private: %q", mAt)
 	}
-	if _, serr := root.lstat("ws", "ddir"); serr != nil {
-		t.Fatalf("container not restored: %v", serr)
+	if got, ok := authReadOpt(dir, "ws/"+mAt); !ok || got != "MM" {
+		t.Fatalf("member not readable at surfaced container: %q ok=%v", got, ok)
+	}
+	if fileExists(dir + "/ws/mout") {
+		t.Fatal("member extracted to its stale row's path")
 	}
 }
 
@@ -2451,23 +2503,23 @@ func TestLateRepairPlacedThenUserMovedNotReverted(t *testing.T) {
 		authWriteFn(root, "a.txt", "A")); err != nil {
 		t.Fatalf("write a.txt: %v", err)
 	}
-	// Park then let the sweep restore — a journaled placement at a.txt.
+	// Park then let the sweep surface it — a journaled placement at a
+	// visible recovered name.
 	parked := parkUnderDeadIntent(t, s, dir, "a.txt", "u")
 	authSettle(t, s)
-	if !fileExists(dir + "/ws/a.txt") {
-		t.Fatalf("restore did not return a.txt (parked=%s)", parked)
-	}
+	surfaced := authSurfaced(t, s, dir, "ws", []byte("A"))
+	_ = parked
 	// Ordinary user move AFTER the journaled placement.
-	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/c.txt"); err != nil {
+	if err := os.Rename(dir+"/ws/"+surfaced, dir+"/ws/c.txt"); err != nil {
 		t.Fatal(err)
 	}
 	authSettle(t, s)
 	authSettle(t, s)
 	if got, ok := authReadOpt(dir, "ws/c.txt"); !ok || got != "A" {
-		t.Fatalf("user move of journaled object reverted: c.txt=%q ok=%v", got, ok)
+		t.Fatalf("user move of surfaced object reverted: c.txt=%q ok=%v", got, ok)
 	}
-	if fileExists(dir + "/ws/a.txt") {
-		t.Fatal("user move reverted: a.txt resurrected")
+	if fileExists(dir + "/ws/" + surfaced) {
+		t.Fatal("user move reverted: surfaced name resurrected")
 	}
 }
 
@@ -2542,47 +2594,35 @@ func TestLateRepairUnreadableCandidateNotElected(t *testing.T) {
 		t.Fatal(err)
 	}
 	parked := parkUnderDeadIntent(t, s, dir, "dd", "u")
-	pst, serr := root.lstat("ws", parked)
-	if serr != nil {
-		t.Fatal(serr)
-	}
-	pv, perr := root.pin(false)
-	if perr != nil {
-		t.Fatal(perr)
-	}
-	defer pv.Close()
-	left := 1
-	fv := flakyStatView{ReconView: pv, path: "blkH",
-		err: ErrUnavailable, left: &left}
-	// Claim-level discrimination: with blkH unverifiable at judgment
-	// time it is not a homeless path — the only electable claimant is
-	// openH, which is verifiably absent. Electing blkH is the defect.
-	home, free, found := s.recordedHome(ctx, intent{scope: "ws"}, fv, pst, parked)
-	if found && home == "blkH" {
-		t.Fatal("unverifiable candidate elected — blkH was never proven absent")
-	}
-	if !found || !free || home != "openH" {
-		t.Fatalf("verifiable absent claimant not elected: home=%q free=%v found=%v", home, free, found)
-	}
-	// End-state: the foreign occupant at blkH survives every pass; the
-	// recorded member is extracted to ITS recorded home (blkH/m.txt,
-	// verifiably absent — NOREPLACE can never evict the foreign dir's
-	// contents), and the container lands at openH.
+	// Under the names-journal protocol there is no recorded-home routing:
+	// the parked container has no journaled provenance, so it surfaces
+	// whole under a visible name. The foreign occupant at blkH must
+	// survive every pass; the recorded member m stays inside the
+	// surfaced container (no member is moved to a guessed historical
+	// home — blkH/m.txt is never created over a foreign dir).
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
 	if got, ok := authReadOpt(dir, "ws/blkH/foreign.txt"); !ok || got != "F" {
-		t.Fatalf("foreign dir evicted via unverifiable candidate: %q ok=%v", got, ok)
+		t.Fatalf("foreign dir evicted: %q ok=%v", got, ok)
 	}
-	if got, ok := authReadOpt(dir, "ws/blkH/m.txt"); !ok || got != "M" {
-		t.Fatalf("recorded member not at its recorded home: blkH/m.txt=%q ok=%v",
-			got, ok)
+	if fileExists(dir + "/ws/blkH/m.txt") {
+		t.Fatal("member extracted to blkH/m.txt — a guessed historical home over a foreign dir")
 	}
-	st2, serr := root.lstat("ws", "openH")
-	if serr != nil {
-		t.Fatalf("container not restored to openH: %v", serr)
+	if fileExists(dir + "/ws/" + parked) {
+		t.Fatalf("container left hidden at private name %s", parked)
 	}
-	if ino, _, _, _ := fpParts(st2.Fingerprint); ino != pino {
-		t.Fatalf("openH holds ino %s, want %s", ino, pino)
+	// The container surfaced whole: find it by inode and read the member.
+	surfaced := scanDirForInode(dir, "ws", pino)
+	if surfaced == "" || strings.Contains(surfaced, opStagePrefix) {
+		t.Fatalf("container not surfaced visibly (ino %s): %q", pino, surfaced)
+	}
+	if got, ok := authReadOpt(dir, "ws/"+strings.TrimPrefix(surfaced, dir+"/ws/")+"/m.txt"); !ok || got != "M" {
+		t.Fatalf("member not readable inside surfaced container: %q ok=%v", got, ok)
+	}
+	// And it carries an ordinary version row.
+	rel := strings.TrimPrefix(surfaced, dir+"/ws/")
+	if v, _, _ := s.ObservedVersion(ctx, "ws", rel); v == 0 {
+		t.Fatalf("surfaced container %q has no version row", rel)
 	}
 }

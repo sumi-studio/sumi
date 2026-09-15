@@ -511,6 +511,40 @@ func (g *gatedView) MoveStaged(scope, from, to string) error {
 	return g.hold(func() error { return g.ReconView.MoveStaged(scope, from, to) })
 }
 
+// scanTreeFor walks dir/scope recursively and returns the
+// scope-relative path of the entry holding exactly want bytes, or "".
+func scanTreeFor(t *testing.T, dir, scope string, want []byte) string {
+	t.Helper()
+	var found string
+	base := filepath.Join(dir, scope)
+	var walk func(d string)
+	walk = func(d string) {
+		if found != "" {
+			return
+		}
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return
+		}
+		for _, e := range ents {
+			p := d + "/" + e.Name()
+			if e.IsDir() {
+				walk(p)
+				continue
+			}
+			b, err := os.ReadFile(p)
+			if err == nil && sha(string(b)) == sha(string(want)) {
+				if rel, rerr := filepath.Rel(base, p); rerr == nil {
+					found = rel
+				}
+				return
+			}
+		}
+	}
+	walk(base)
+	return found
+}
+
 // scanDirFor returns the name of the directory entry under dir/scope
 // holding exactly want bytes, or "".
 func scanDirFor(t *testing.T, dir, scope string, want []byte) string {

@@ -93,11 +93,11 @@ func TestAuthPGApplyCommitsBetweenVetoReads(t *testing.T) {
 	if hookErr != nil {
 		t.Fatal(hookErr)
 	}
+	authSettle(t, s)
 	where := scanDirFor(t, dir, "ws", []byte("T"))
 	if where == "" {
 		t.Fatal("object unlinked while its apply was committing")
 	}
-	authSettle(t, s)
 	// The row must describe the object wherever it ended up: restored
 	// to its recorded home s.txt (the home was free), or re-keyed onto
 	// a visible recovered-* surface name.

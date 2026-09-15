@@ -25,6 +25,7 @@ package filesvc
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -216,18 +217,24 @@ func TestReviewCorrPGStaleInodeRowMisroutesDir(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// Required: acknowledged dir lands at the row that recorded THIS
-	// object — not at a stale row's path.
+	// Required: historical rows never elect a home — not the dir's own
+	// row and never a stale claimant's. The acknowledged dir surfaces at
+	// a visible non-private name with a fresh truthful row; the ghost
+	// row's path is never populated by it.
 	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
-		if _, serr2 := root.lstat("ws", "zHome"); serr2 != nil {
-			t.Fatalf("recorded dir misrouted to stale home aGhost (ino-leg " +
-				"collision on a ghost row); its recorded home zHome is absent")
-		}
+		t.Fatalf("recorded dir misrouted to stale home aGhost (ino-leg " +
+			"collision on a ghost row)")
 	}
-	if st, serr := root.lstat("ws", "zHome"); serr != nil {
-		t.Fatalf("recorded dir not at its recorded home zHome: %v", serr)
-	} else if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
-		t.Fatalf("zHome holds ino %s, want recorded dir ino %s", ino, dIno)
+	alive := scanDirForInode(dir, "ws", dIno)
+	if alive == "" || strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("recorded dir vanished or left private: alive=%q", alive)
+	}
+	rel, rerr := filepath.Rel(dir+"/ws", alive)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if _, _, found := authRow(t, s, rel); !found {
+		t.Fatalf("surfaced dir %q has no version row", rel)
 	}
 }
 
@@ -283,33 +290,19 @@ func TestReviewCorrPGRecordedDirMemberRidesWithContainer(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// The container must come home whole, AND the member must reach its
-	// own recorded home — the row at otherHome/f.txt claims it, so that
-	// is where acknowledged content belongs.
-	st, serr := root.lstat("ws", "recD")
-	if serr != nil || st.Kind != "dir" {
-		t.Fatalf("recorded dir not restored to recD: %v", serr)
+	// No journaled provenance survives for the parked container: it
+	// surfaces whole at a visible name and the member rides inside it.
+	// The stale row at otherHome/f.txt is never used to move the member
+	// out — row evidence cannot elect a home.
+	mAt := scanTreeFor(t, dir, "ws", []byte("FMEM"))
+	if mAt == "" || strings.Contains(mAt, opStagePrefix) {
+		t.Fatalf("member destroyed or left private: FMEM at %q", mAt)
 	}
-	if got, ok := authReadOpt(dir, "ws/otherHome/f.txt"); !ok || got != "FMEM" {
-		where := scanDirFor(t, dir, "ws", []byte("FMEM"))
-		t.Fatalf("member not recovered to its own recorded home: "+
-			"otherHome/f.txt=%q present=%v, FMEM bytes at %q", got, ok, where)
+	if fileExists(dir + "/ws/otherHome/f.txt") {
+		t.Fatalf("member extracted to its stale row's path otherHome/f.txt")
 	}
-	// The row is now legitimately coherent — the object moved to the
-	// row's recorded home. What must never happen is the row being
-	// REWRITTEN to wherever bytes landed: if the member had instead
-	// stayed at recD/f.txt, the row still pointing at otherHome would be
-	// honest divergence; a row rewritten to recD/f.txt would be false
-	// coherence. Assert the row still records the original member
-	// fingerprint at its recorded home.
-	if _, fp, found := authRow(t, s, "otherHome/f.txt"); !found {
-		t.Fatal("member row vanished")
-	} else {
-		live, lerr := root.lstat("ws", "otherHome/f.txt")
-		if lerr != nil || fp3(live.Fingerprint) != fp3(fp) {
-			t.Fatalf("member row not coherent with the live object: row fp=%q live=%v err=%v",
-				fp, live.Fingerprint, lerr)
-		}
+	if _, _, found := authRow(t, s, mAt); !found {
+		t.Fatalf("surfaced member %q has no version row", mAt)
 	}
 }
 
@@ -337,9 +330,9 @@ func TestReviewCorrPGFreshWriteAfterOrphanRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/fr.txt"); !ok || got != "OLD" {
-		t.Fatalf("orphaned recorded object not restored: fr.txt=%q present=%v", got, ok)
-	}
+	// The orphan surfaces visibly — no historical row elects its home —
+	// and a normal write then proceeds on the now-free public path.
+	authSurfaced(t, s, dir, "ws", []byte("OLD"))
 	if _, _, err := s.WithWrite(ctx, "ws", "fr.txt", "write",
 		IfVersion{Mode: "any"}, sha("NEW"), authProbe(root, "fr.txt"),
 		authWriteFn(root, "fr.txt", "NEW")); err != nil {

@@ -257,18 +257,18 @@ func TestCorrCrossDeviceInoStrand(t *testing.T) {
 
 	if _, err := os.Stat(dir + "/ws/" + parked); err == nil {
 		_, fp, found := authRow(t, s, "mntB/xd")
-		t.Fatalf("DEFECT: recorded dir X stranded at %q — row(mntB/xd) records "+
-			"fp=%q found=%v but the sweep judged it 'still at home' against the "+
-			"cross-device collider at %s", parked, fp, found, collider)
+		t.Fatalf("DEFECT: recorded dir X stranded at private name %q — "+
+			"row(mntB/xd) records fp=%q found=%v, collider at %s",
+			parked, fp, found, collider)
 	}
-	if _, err := os.Stat(dir + "/ws/mntB/xd"); err != nil {
-		where := ""
-		if treeHasIno(t, dir, "ws", xino) {
-			where = "elsewhere in scope"
-		}
-		t.Fatalf("X neither parked nor at home — moved to %s", where)
+	// Correct outcome under the authority model: the intent is gone, so
+	// no operation-bound provenance exists — X surfaces visibly at a
+	// public name (never misrouted by the cross-device inode collider
+	// nor destroyed). Its own recorded row is not routing authority.
+	alive := scanDirForInode(dir, "ws", xino)
+	if alive == "" || strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("dir vanished or left private: alive=%q", alive)
 	}
-	// Correct outcome: X back at its recorded home.
 }
 
 // CW3 — single device, no mounts: a STALE row (its object externally
@@ -315,22 +315,21 @@ func TestCorrStaleRowInoMisroute(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 
-	if st, err := os.Stat(dir + "/ws/zz"); err == nil && st.IsDir() {
-		if inoOf(t, root, "ws", "zz") == zino {
-			return // correct: recorded object restored to its recorded home
-		}
-		t.Fatalf("zz restored but holds a different dir object (ino %s)", inoOf(t, root, "ws", "zz"))
+	// Historical rows are not authority — even the dir's own row does
+	// not elect a home. The dir surfaces visibly at a recovered name;
+	// the stale claimant never receives it.
+	if st, err := os.Stat(dir + "/ws/aa"); err == nil && st.IsDir() &&
+		inoOf(t, root, "ws", "aa") == zino {
+		_, zrow, _ := authRow(t, s, "zz")
+		t.Fatalf("DEFECT: recorded dir misrouted to stale file row's path "+
+			"'aa' — its recorded home 'zz' is empty while row(zz)=%q still "+
+			"records it; nothing re-judges a public path", zrow)
 	}
-	if st, err := os.Stat(dir + "/ws/aa"); err == nil && st.IsDir() {
-		if inoOf(t, root, "ws", "aa") == zino {
-			_, zrow, _ := authRow(t, s, "zz")
-			t.Fatalf("DEFECT: recorded dir misrouted to stale file row's path "+
-				"'aa' — its recorded home 'zz' is empty while row(zz)=%q still "+
-				"records it; nothing re-judges a public path", zrow)
-		}
+	alive := scanDirForInode(dir, "ws", zino)
+	if alive == "" || strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("dir vanished or left private: zz=%v alive=%q",
+			fileExists(dir+"/ws/zz"), alive)
 	}
-	t.Fatalf("parked dir vanished: parked=%v aa=%v zz=%v",
-		fileExists(dir+"/ws/"+parked), fileExists(dir+"/ws/aa"), fileExists(dir+"/ws/zz"))
 }
 
 func fileExists(p string) bool {
@@ -391,22 +390,22 @@ func TestCorrWholesaleRestoreMemberElsewhere(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 
-	// The recorded dir must be restored. Where did m end up?
-	if st, err := os.Stat(dir + "/ws/ddir"); err != nil || !st.IsDir() {
-		t.Fatalf("recorded dir not restored to ddir")
+	// No journaled provenance — the container surfaces whole with m
+	// still inside. The stale 'mout' row never extracts the member.
+	mAt := scanDirForFile(t, dir, "ws", "m")
+	if mAt == "" || strings.Contains(mAt, opStagePrefix) {
+		t.Fatalf("member destroyed or left private: %q", mAt)
 	}
-	if _, ok := authReadOpt(dir, "ws/mout"); ok {
-		t.Log("member m restored to its own recorded home mout — best outcome")
-		return
+	if got, ok := authReadOpt(dir, "ws/"+mAt); !ok || got != "M" {
+		t.Fatalf("member lost inside surfaced container: %s=%q ok=%v",
+			mAt, got, ok)
 	}
-	got, ok := authReadOpt(dir, "ws/ddir/m")
-	_, mrow, mfound := authRow(t, s, "mout")
-	t.Logf("after wholesale restore: ddir/m=%q present=%v row(mout)=%q found=%v",
-		got, ok, mrow, mfound)
-	if ok && mfound {
-		t.Logf("RESIDUAL: member m rode inside the restored dir to ddir/m; " +
-			"row(mout) still records it and no pass re-judges a public path — " +
-			"mout stays empty while ddir/m reports external_change")
+	if fileExists(dir + "/ws/mout") {
+		t.Fatalf("DEFECT: member extracted to 'mout' — the stale row's " +
+			"claim must never move an object out of a surfaced container")
+	}
+	if _, _, found := authRow(t, s, mAt); !found {
+		t.Fatalf("surfaced member %s has no version row", mAt)
 	}
 }
 
@@ -635,8 +634,10 @@ func TestCorrDeepSweepRestores(t *testing.T) {
 	}
 	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/"+rel); !ok || got != "DEEP" {
-		where := scanDirFor(t, dir, "ws", []byte("DEEP"))
-		t.Fatalf("depth-40 parked recorded object not restored: %q present=%v at %q", got, ok, where)
+	// No depth bound and no stale-row routing: the object surfaces at a
+	// visible recovered name beneath its parked parent.
+	where := scanTreeFor(t, dir, "ws", []byte("DEEP"))
+	if where == "" || strings.Contains(where, opStagePrefix) {
+		t.Fatalf("depth-40 parked recorded object lost or left private: %q", where)
 	}
 }

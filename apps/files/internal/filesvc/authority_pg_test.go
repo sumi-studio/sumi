@@ -150,6 +150,38 @@ func authRow(t *testing.T, s *Store, path string) (int64, string, bool) {
 	return v, fp, true
 }
 
+// authSurfaced asserts the recovery contract for an object with no
+// operation-bound home: it sits at a visible non-private name beneath
+// scopeDir, is readable, and a fresh version row + recover event record
+// it. Returns the scope-relative surfaced path.
+func authSurfaced(t *testing.T, s *Store, dir, scopeDir string, want []byte) string {
+	t.Helper()
+	base := scanDirFor(t, dir, scopeDir, want)
+	if base == "" {
+		t.Fatalf("preserved object not found beneath %s", scopeDir)
+	}
+	if strings.HasPrefix(base, opStagePrefix) {
+		t.Fatalf("object still parked at private name %q — must surface visibly", base)
+	}
+	rel := base
+	if scopeDir != "ws" {
+		rel = strings.TrimPrefix(scopeDir, "ws/") + "/" + base
+	}
+	if _, _, found := authRow(t, s, rel); !found {
+		t.Fatalf("no row records the surfaced object at %q", rel)
+	}
+	var ev int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT 1 FROM file_event WHERE scope='ws' AND path=$1 AND op='recover'`,
+		rel).Scan(&ev); err != nil {
+		t.Fatalf("no recover event for surfaced object at %q", rel)
+	}
+	if got, ok := authReadOpt(dir, "ws/"+rel); !ok || sha(got) != sha(string(want)) {
+		t.Fatalf("surfaced object %q unreadable: %q present=%v", rel, got, ok)
+	}
+	return rel
+}
+
 func authExec(t *testing.T, s *Store, sql string, args ...any) {
 	t.Helper()
 	if _, err := s.pool.Exec(context.Background(), sql, args...); err != nil {

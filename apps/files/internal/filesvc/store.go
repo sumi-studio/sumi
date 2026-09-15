@@ -567,10 +567,12 @@ type intent struct {
 type nameRec struct {
 	Name string   `json:"name"`           // base name (carries the reserved .filesv-op- prefix)
 	Dir  string   `json:"dir,omitempty"`  // scope-relative parent dir ("" = the op's parent dir)
-	Act  string   `json:"act,omitempty"`  // last recorded act: put|xch|cap|mv
+	Act  string   `json:"act,omitempty"`  // last recorded act: put|xch|cap|und
 	Src  string   `json:"src,omitempty"`  // public path the act sourced from ("" = create)
 	Res  string   `json:"res,omitempty"`  // act outcome: ok|noeff ("" = act declared, result unrecorded)
-	Obs  []string `json:"obs,omitempty"`  // observed identities (fp3[:oid]) of objects seen at this name
+	Obs  []string `json:"obs,omitempty"`  // act-bound identities (fp3[:oid]) — observed by the act's own syscall window, usable as provenance
+	Seen []string `json:"seen,omitempty"` // reconciler observations of this name's occupant — continuity evidence, never provenance
+	Home string   `json:"home,omitempty"` // journaled settlement destination — committed before the move so a crash retries bookkeeping
 	Done bool     `json:"done,omitempty"` // drained: nothing remains attributable here
 	Tomb string   `json:"tomb,omitempty"` // non-empty: unknown-outcome tombstone — evidence kept
 }
@@ -648,8 +650,37 @@ func (nj *nameJournal) done(i int) { nj.patchBool(i, "done", true) }
 // record is preserved as late-effect evidence.
 func (nj *nameJournal) tomb(i int, cause string) { nj.patch(i, "tomb", cause) }
 
-// obs appends an observed object identity to names[i].obs.
+// home commits the settlement destination of names[i] BEFORE the move —
+// the same declare-before-populate ordering as acts: a crash between the
+// move and the row write retries through finishSettlement rather than
+// losing the record. Unlike the other patches this one is required —
+// the caller must not move the object if the destination is unjournaled.
+func (nj *nameJournal) home(i int, target string) error {
+	if nj == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), nj.s.dbTimeout)
+	defer cancel()
+	_, err := nj.s.pool.Exec(ctx,
+		`UPDATE file_op SET names = jsonb_set(names, $2::text[], to_jsonb($3::text))
+		 WHERE id = $1`, nj.id, []string{strconv.Itoa(i), "home"}, target)
+	return err
+}
+
+// obs appends an act-bound object identity to names[i].obs — evidence
+// the act's own syscall window produced, usable as provenance later.
 func (nj *nameJournal) obs(i int, ident string) {
+	nj.appendIdent(i, "obs", ident)
+}
+
+// seen appends a reconciler observation to names[i].seen — continuity
+// evidence only: it says which object the pass found at the name, never
+// what put it there, so it is excluded from provenance matching.
+func (nj *nameJournal) seen(i int, ident string) {
+	nj.appendIdent(i, "seen", ident)
+}
+
+func (nj *nameJournal) appendIdent(i int, key, ident string) {
 	if nj == nil {
 		return
 	}
@@ -657,11 +688,11 @@ func (nj *nameJournal) obs(i int, ident string) {
 	defer cancel()
 	_, err := nj.s.pool.Exec(ctx,
 		`UPDATE file_op SET names = jsonb_set(names, $2::text[],
-		    COALESCE(names->$3->'obs', '[]'::jsonb) || to_jsonb($4::text))
+		    COALESCE(names->$3->$4, '[]'::jsonb) || to_jsonb($5::text))
 		 WHERE id = $1`, nj.id,
-		[]string{strconv.Itoa(i), "obs"}, strconv.Itoa(i), ident)
+		[]string{strconv.Itoa(i), key}, strconv.Itoa(i), key, ident)
 	if err != nil {
-		log.Printf("filesvc: name journal obs op=%d [%d]: %v", nj.id, i, err)
+		log.Printf("filesvc: name journal %s op=%d [%d]: %v", key, nj.id, i, err)
 	}
 }
 
@@ -1117,6 +1148,12 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 	// no journal entry is never touched by anyone.
 	if op == "write" || op == "remove" || op == "rename" {
 		rec := nameRec{Name: opStagePrefix + fmt.Sprintf("o%d-a0-%s", it.id, randHex(6))}
+		if op == "write" {
+			// The slot's first act is the body populate: declared here
+			// so a crash between create and any result journal reads
+			// the occupant as this op's authored body by provenance.
+			rec.Act = "put"
+		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE file_op SET names = $2 WHERE id = $1`,
 			it.id, mustJSON([]nameRec{rec})); err != nil {
@@ -1474,17 +1511,6 @@ func (s *Store) markStalled(ctx context.Context, it intent, cause error) {
 	}
 }
 
-// recordedMatch reports whether the row fingerprint records this live
-// object — fp3 for files, inode identity for directories.
-func recordedMatch(rowFP string, st FileInfo) bool {
-	if st.Kind == "dir" {
-		ri, _, _, ok1 := fpParts(rowFP)
-		si, _, _, ok2 := fpParts(st.Fingerprint)
-		return ok1 && ok2 && ri == si
-	}
-	return fp3(rowFP) == fp3(st.Fingerprint)
-}
-
 // sameObjectAt reports whether dst is the same object as st — the
 // "still at its recorded home" check. The comparison is the complete
 // live object identity dev:ino: an inode number alone is per-filesystem,
@@ -1632,105 +1658,283 @@ func nameRel(it intent, rec nameRec) string {
 	return rec.Name
 }
 
-// nameContent classifies the object found at a journaled private name
-// against the intent's declared identities. Bound durable identity is
-// always judged first — when the filesystem proves the object is (or is
-// not) a declared object, content evidence is only a fallback.
-type nameContent int
+// objClass is the operation-bound meaning of the object held at a
+// journaled private name — what the intent's declared acts say the
+// occupant IS. Home authority comes only from a journaled act's public
+// source path or the intent's own declared paths: never from an
+// arbitrary older row, never from content or inode similarity alone.
+type objClass int
 
 const (
-	ncUnknown       nameContent = iota // no declared identity matches — foreign residue
-	ncAuthored                         // bytes this op authored (staged body) — sha proof
-	ncCaptured                         // the op's declared source object (pre_oid / pre_fp)
-	ncDisplaced                        // the declared displaced destination object (dst_oid bound)
-	ncDisplacedWeak                    // displaced by weak evidence only (fp3+sha, oid unbound)
+	ocUnknown   objClass = iota // no provenance — surface only, never discard
+	ocAuthored                  // the op's own staged body — home is the op's path
+	ocFromPath                  // captured out of a public path by a journaled cap act
+	ocDisplaced                 // exchanged out of a public path by a journaled xch act
 )
 
-func (s *Store) classifyName(it intent, view ReconView, rel string, st FileInfo, rec nameRec) nameContent {
-	// After a declared exchange the name can hold the displaced object,
-	// not our staged body — and while its result is unrecorded a late
-	// landing makes that ambiguous. Content equal to what we authored
-	// is then NOT authorship proof: it is at best a displaced object
-	// with equal bytes, which no content evidence may condemn.
-	authoredOK := rec.Act != "xch" || rec.Res == "noeff"
-	// Bound identity first — it can PROVE foreign-ness too.
-	if st.Oid != "" {
-		if it.dstOid != "" && st.Oid == it.dstOid {
-			return ncDisplaced
-		}
-		if it.preOid != "" && st.Oid == it.preOid {
-			return ncCaptured
-		}
-		// A bound identity matching no declared object is definitely
-		// not one of them — unless it is our own staged body, which
-		// carries a fresh oid: for a write intent the content hash is
-		// the authorship proof.
-		if authoredOK && it.op == "write" && it.expectSHA != "" && st.Kind == "file" {
-			if h, err := view.Hash(it.scope, rel); err == nil && h == it.expectSHA {
-				return ncAuthored
-			}
-		}
-		return ncUnknown
-	}
-	// Unbound object — weaker evidence only.
-	if authoredOK && it.op == "write" && it.expectSHA != "" && st.Kind == "file" {
-		if h, err := view.Hash(it.scope, rel); err == nil && h == it.expectSHA {
-			return ncAuthored
-		}
-	}
-	// Displaced before captured: for write/remove intents declare aliases
-	// pre_fp to dst_fp (the occupant IS the displaced object), and the
-	// displaced reading is the one with discard semantics.
-	if it.dstFP != "" && fp3(st.Fingerprint) == fp3(it.dstFP) {
-		if it.dstSHA == "" || st.Kind != "file" {
-			return ncDisplacedWeak
-		}
-		if h, err := view.Hash(it.scope, rel); err == nil && h == it.dstSHA {
-			return ncDisplacedWeak
-		}
-	}
-	if it.op == "rename" && it.preFP != "" && fp3(st.Fingerprint) == fp3(it.preFP) {
-		// Could be the declared source. For a file, confirm by content
-		// when evidence exists; a dir's fp3 is ino:size:mtime — weaker,
-		// but a moved dir keeps all three.
-		if it.srcKind != "file" || it.expectSHA == "" {
-			return ncCaptured
-		}
-		if h, err := view.Hash(it.scope, rel); err == nil && h == it.expectSHA {
-			return ncCaptured
-		}
-	}
-	return ncUnknown
+type objMeaning struct {
+	cls      objClass
+	home     string // the authorized public destination; "" → surface only
+	declared bool   // the occupant matches the intent's declared evidence for its role
+	bound    bool   // that match rests on a bound durable oid
 }
 
-// opEffectLanded reports whether the intent's filesystem effect provably
-// committed — judged on the public paths, never on the private name.
-func (s *Store) opEffectLanded(it intent, view ReconView) bool {
-	switch it.op {
-	case "write":
-		if it.expectSHA == "" {
-			return false
+// privateRel reports whether rel names private storage — its base name
+// carries the op-stage prefix.
+func privateRel(rel string) bool {
+	_, base := splitRel(rel)
+	return strings.HasPrefix(base, opStagePrefix)
+}
+
+// findNameRec returns the index of the journal record owning rel, or -1.
+func findNameRec(names []nameRec, it intent, rel string) int {
+	for j := range names {
+		if nameRel(it, names[j]) == rel {
+			return j
 		}
-		h, err := view.Hash(it.scope, it.path)
-		return err == nil && h == it.expectSHA
-	case "rename":
-		st, err := view.Stat(it.scope, it.toPath)
-		if err != nil {
-			return false
+	}
+	return -1
+}
+
+// obsParts splits a journaled observation "fp|oid".
+func obsParts(obs string) (fp, oid string) {
+	fp, oid, _ = strings.Cut(obs, "|")
+	return fp, oid
+}
+
+// lastObs returns the most recent act-bound identity — provenance
+// evidence recorded inside the act's own syscall window.
+func lastObs(rec nameRec) (fp, oid string) {
+	if len(rec.Obs) == 0 {
+		return "", ""
+	}
+	return obsParts(rec.Obs[len(rec.Obs)-1])
+}
+
+// lastSeen returns the most recent reconciler observation — continuity
+// evidence for the settled object, never provenance.
+func lastSeen(rec nameRec) (fp, oid string) {
+	if len(rec.Seen) == 0 {
+		return "", ""
+	}
+	return obsParts(rec.Seen[len(rec.Seen)-1])
+}
+
+// provMeaning resolves what the captured object IS from the journal's
+// declared acts alone. A settlement capture's src is itself a private
+// name — the chain resolves through the record that owns it until a
+// public path, an authored populate, or an ambiguous outcome is reached.
+// Depth is bounded by the journal size; a broken or cyclic chain is
+// unknown, never a guess.
+func (s *Store) provMeaning(it intent, names []nameRec, prov nameRec, st FileInfo, sha string) objMeaning {
+	cur := prov
+	for depth := 0; depth <= len(names); depth++ {
+		switch cur.Act {
+		case "put":
+			if it.op == "write" {
+				return objMeaning{ocAuthored, it.path, true, true}
+			}
+			return objMeaning{}
+		case "cap":
+			if cur.Src == "" {
+				return objMeaning{}
+			}
+			if !privateRel(cur.Src) {
+				// A cap act populated this name from a public path:
+				// the occupant is that path's former object — its
+				// authorized home is where it was taken from.
+				return objMeaning{ocFromPath, cur.Src, true, true}
+			}
+			j := findNameRec(names, it, cur.Src)
+			if j < 0 {
+				return objMeaning{}
+			}
+			cur = names[j]
+		case "xch":
+			if cur.Res == "ok" {
+				// The exchange provably populated the name with the
+				// object it displaced from its public source — but the
+				// occupant is only the DECLARED displaced object when
+				// its identity matches the declared dst evidence; a
+				// later deposit at the name is unknown instead.
+				return s.occupantOrUnknown(&it, cur, st, sha,
+					ocDisplaced, cur.Src, it.dstOid, it.dstFP, it.dstSHA)
+			}
+			if cur.Res == "noeff" {
+				// The exchange provably never ran — the occupant is
+				// whatever the previous act placed: the captured
+				// source (rename) or the staged body (write).
+				if it.op == "rename" {
+					return objMeaning{ocFromPath, it.path, true, true}
+				}
+				return objMeaning{ocAuthored, it.path, true, true}
+			}
+			// Result unrecorded while the name is occupied: the
+			// exchange may have landed late. Disambiguate only against
+			// the intent's declared identities.
+			return ambiguousMeaning(it, cur, st, sha)
+		case "und":
+			if cur.Res == "ok" {
+				// The undo completed only with our own object verified
+				// at the slot — re-verify against the declared identity
+				// so a later deposit at the name reads unknown.
+				if it.op == "rename" {
+					return s.occupantOrUnknown(&it, cur, st, sha,
+						ocFromPath, it.path, it.preOid, it.preFP, it.expectSHA)
+				}
+				ofp, ooid := lastObs(cur)
+				return s.occupantOrUnknown(&it, cur, st, sha,
+					ocAuthored, it.path, ooid, ofp, it.expectSHA)
+			}
+			return ambiguousMeaning(it, cur, st, sha)
+		default:
+			// No act recorded — the name was declared but its populate
+			// syscall was never journaled (post-declare crash). The
+			// occupant may still match the intent's own declared
+			// identities: that is operation-bound evidence (only this
+			// intent could populate its unguessable name), so a match
+			// returns it home; anything else stays unknown.
+			if it.op != "recover" {
+				return ambiguousMeaning(it, cur, st, sha)
+			}
+			return objMeaning{} // a recover intent declares no objects
 		}
-		if it.srcKind == "file" && it.expectSHA != "" {
-			h, herr := view.Hash(it.scope, it.toPath)
-			return herr == nil && h == it.expectSHA
+	}
+	return objMeaning{}
+}
+
+// ambiguousMeaning judges the occupant of a name whose xch/und act left
+// no recorded result: the exchange may have landed late, never run, or
+// been followed by a partial undo. The only evidence consulted is the
+// intent's own declared identities — pre/dst oid+fp+sha and the
+// journaled authored-body observation. A bound oid match is definitive;
+// declared fp/sha matches are weaker (bound=false, never enough for
+// discard); matching nothing — or matching two declared objects — is
+// unknown.
+func ambiguousMeaning(it intent, rec nameRec, st FileInfo, sha string) objMeaning {
+	displacedHome := it.path
+	if it.op == "rename" && it.toPath != "" {
+		displacedHome = it.toPath
+	}
+	if st.Oid != "" {
+		switch {
+		case it.dstOid != "" && st.Oid == it.dstOid:
+			return objMeaning{ocDisplaced, displacedHome, true, true}
+		case it.op == "rename" && it.preOid != "" && st.Oid == it.preOid:
+			return objMeaning{ocFromPath, it.path, true, true}
+		case it.op == "write" && obsOidMatch(rec, st.Oid):
+			return objMeaning{ocAuthored, it.path, true, true}
 		}
-		return it.preFP != "" && fp3(st.Fingerprint) == fp3(it.preFP)
-	case "remove":
-		_, err := view.Stat(it.scope, it.path)
-		return absentVerdict(err)
-	case "mkdir":
-		st, err := view.Stat(it.scope, it.path)
-		return err == nil && st.Kind == "dir"
+		return objMeaning{} // bound proof it is none of the declared objects
+	}
+	// Unbound object: declared fp3 + content evidence only.
+	mDst := it.dstFP != "" && fp3(st.Fingerprint) == fp3(it.dstFP) &&
+		(it.dstSHA == "" || st.Kind != "file" || sha == it.dstSHA)
+	mPre := it.op == "rename" && it.preFP != "" &&
+		fp3(st.Fingerprint) == fp3(it.preFP) &&
+		(it.srcKind != "file" || it.expectSHA == "" || sha == it.expectSHA)
+	mObs := it.op == "write" && obsFPMatch(rec, st.Fingerprint) &&
+		(it.expectSHA == "" || sha == it.expectSHA)
+	switch {
+	case mDst && !mPre && !mObs:
+		return objMeaning{ocDisplaced, displacedHome, true, false}
+	case mPre && !mDst && !mObs:
+		return objMeaning{ocFromPath, it.path, true, false}
+	case mObs && !mDst && !mPre:
+		return objMeaning{ocAuthored, it.path, true, false}
+	}
+	return objMeaning{} // ambiguous or foreign — unknown
+}
+
+// occupantOrUnknown applies a settled act's provenance while checking
+// the live occupant against the declared identity for its role: a
+// bound-oid match proves the declared object; a bound disagreement
+// proves the occupant is NOT that object and the journal's reading is
+// stale — the live occupant is unknown. Without bound identity a
+// declared fp+sha match is the weak tier; anything else is unknown. A
+// role with no declared identity (an empty dst) trusts the act alone.
+func (s *Store) occupantOrUnknown(it *intent, rec nameRec, st FileInfo, sha string,
+	cls objClass, home, oid, fp, refSHA string) objMeaning {
+	if boundMismatch(oid, st.Oid) {
+		return objMeaning{ocUnknown, "", false, true}
+	}
+	if oid != "" && st.Oid != "" {
+		if st.Oid == oid {
+			return objMeaning{cls, home, true, true}
+		}
+		return objMeaning{ocUnknown, "", false, false}
+	}
+	if fp != "" && fp3(st.Fingerprint) == fp3(fp) &&
+		(refSHA == "" || st.Kind != "file" || sha == refSHA) {
+		return objMeaning{cls, home, true, false}
+	}
+	if oid == "" && fp == "" {
+		// No declared identity exists for this role (e.g. the dst was
+		// empty at declare): the act's provenance stands alone — the
+		// occupant is whatever our syscall placed there.
+		return objMeaning{cls, home, true, true}
+	}
+	return objMeaning{ocUnknown, "", false, false}
+}
+
+func boundMismatch(declared, live string) bool {
+	return declared != "" && live != "" && declared != live
+}
+
+// obsOidMatch reports whether a journaled observation carries oid.
+func obsOidMatch(rec nameRec, oid string) bool {
+	for _, o := range rec.Obs {
+		if _, ooid := obsParts(o); ooid != "" && ooid == oid {
+			return true
+		}
 	}
 	return false
+}
+
+// obsFPMatch reports whether a journaled observation carries this fp3.
+func obsFPMatch(rec nameRec, fp string) bool {
+	for _, o := range rec.Obs {
+		if ofp, _ := obsParts(o); ofp != "" && fp3(ofp) == fp3(fp) {
+			return true
+		}
+	}
+	return false
+}
+
+// opCommitted reports whether the intent's apply committed its event —
+// the DB's own commit record, never a filesystem observation. A
+// tombstoned intent can still be committed (diverged applyKeep writes
+// the event and retains the row); an uncommitted tombstone has none.
+func (s *Store) opCommitted(ctx context.Context, it intent) bool {
+	if s.pool == nil {
+		return false
+	}
+	evPath := it.path
+	if it.op == "rename" {
+		evPath = it.toPath
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var n int
+	err := s.pool.QueryRow(dctx,
+		`SELECT 1 FROM file_event
+		  WHERE scope=$1 AND path=$2 AND op=$3 AND version=$4 LIMIT 1`,
+		it.scope, evPath, it.op, it.version).Scan(&n)
+	return err == nil
+}
+
+// rowSHAAt returns the recorded content hash at path ("" when absent).
+func (s *Store) rowSHAAt(ctx context.Context, it intent, path string) string {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var sha string
+	if err := s.pool.QueryRow(dctx,
+		`SELECT coalesce(content_sha,'') FROM file_version
+		  WHERE scope=$1 AND path=$2`,
+		it.scope, path).Scan(&sha); err != nil {
+		return ""
+	}
+	return sha
 }
 
 // settleNames executes one intent's private-name journal beneath the
@@ -1748,27 +1952,30 @@ func (s *Store) opEffectLanded(it intent, view ReconView) bool {
 //     result stays tombstoned, and every name is re-stat'd each pass so
 //     a late-arriving deposit is re-judged rather than skipped forever.
 //
-// Disposition after classification:
-//
-//   - authored bytes already acknowledged at the public path: discard
-//     (private-name provenance — we created the object under our own
-//     journaled name; the content is provably acknowledged elsewhere).
-//   - authored/captured content whose op did not land: restore to its
-//     origin if free, else surface at a visible sibling name.
-//   - the declared displaced object: discard ONLY on bound-oid proof
-//     plus a committed effect plus nlink==1 (a hardlinked object is
-//     shared — never deleted for one name's reconciliation). Weak
-//     evidence (fp3/sha on an unbound object) can restore or surface,
-//     never delete — content similarity is not discard authority.
-//   - unknown/foreign content: surfaced visibly — preserved, readable,
-//     deletable — never destroyed. A recorded row that provably
-//     describes it (bound oid, or fp3+sha with the recorded path
-//     absent) re-keys onto the surface name or its free recorded home.
+// Disposition is provenance-first: a journaled act/result says what the
+// occupant IS and which public path may receive it; unknown objects are
+// only ever surfaced visibly. Discard requires the concrete chain —
+// declared act + observed result + committed event + bound identity —
+// never a content match or a currently-absent path. A settlement target
+// is journaled (rec.Home) BEFORE the move so a post-move/pre-PG crash
+// retries the row bookkeeping instead of losing it.
 func (s *Store) settleNames(ctx context.Context, it intent, view ReconView, tombstoned bool) {
 	names := it.names
 	for i := 0; i < len(names); i++ {
 		rec := names[i]
 		if rec.Done {
+			continue
+		}
+		if rec.Name == "" {
+			// A non-record (a JSON null element from a 'null' names
+			// concat) is not a name — it holds nothing.
+			it.journal.done(i)
+			continue
+		}
+		if rec.Home != "" {
+			// A settlement destination was committed before the move —
+			// finish the interrupted move or its row bookkeeping.
+			s.finishSettlement(ctx, &it, &names, i, view, rec)
 			continue
 		}
 		rel := nameRel(it, rec)
@@ -1789,7 +1996,8 @@ func (s *Store) settleNames(ctx context.Context, it intent, view ReconView, tomb
 		// The name is populated. A tombstone only recorded an empty
 		// name at an earlier pass — a late effect arrived and must be
 		// judged now.
-		it.journal.obs(i, obsIdent(st))
+		it.journal.seen(i, obsIdent(st))
+		names[i].Seen = append(names[i].Seen, obsIdent(st))
 		fi, frel, fst, ok := s.captureName(ctx, &it, &names, view, rec, rel)
 		if !ok {
 			continue
@@ -1811,7 +2019,9 @@ func (s *Store) appendName(ctx context.Context, it *intent, names *[]nameRec, re
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	if _, err := s.pool.Exec(dctx,
-		`UPDATE file_op SET names = names || $2::jsonb WHERE id=$1`,
+		`UPDATE file_op SET names =
+		    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
+		    || $2::jsonb WHERE id=$1`,
 		it.id, mustJSON([]nameRec{rec})); err != nil {
 		log.Printf("reconcile: op %d journal append: %v", it.id, err)
 		return 0, false
@@ -1847,7 +2057,8 @@ func (s *Store) captureName(ctx context.Context, it *intent, names *[]nameRec, v
 			if serr != nil {
 				return fi, frel, FileInfo{}, false
 			}
-			it.journal.obs(fi, obsIdent(st))
+			it.journal.seen(fi, obsIdent(st))
+			(*names)[fi].Seen = append((*names)[fi].Seen, obsIdent(st))
 			return fi, frel, st, true
 		case errors.Is(err, ErrNotFound), errors.Is(err, ErrNotDir):
 			// The name emptied between stat and capture — nothing to
@@ -1866,521 +2077,588 @@ func (s *Store) captureName(ctx context.Context, it *intent, names *[]nameRec, v
 
 // judgeName disposes of the object captured at fresh name rel (record
 // index i). prov is the record that originally owned the name the
-// object sat at — its declared act and observed result describe what
-// the op meant that name to hold, which is what makes a matching
-// identity operation-bound rather than a coincidence.
+// object sat at — its journaled act/result is the only provenance.
+// Disposal is established by the concrete operation-bound chain:
+//
+//   - ocAuthored: discard only when the write's event committed AND the
+//     recorded row at the op's path carries these exact bytes — both
+//     DB facts, so a foreign equal-content object never matches.
+//   - ocFromPath: for a remove intent whose event committed, the
+//     captured object IS the deleted one — the journaled cap took it
+//     off the removed path; no identity match is needed. Anything else
+//     returns home (the act's public source) or surfaces beside it.
+//   - ocDisplaced: a committed op makes its declared home the product's
+//     place — discard needs the recorded row there carrying the op's own
+//     product (expectSHA) plus a sole-link file; otherwise the object
+//     surfaces. Under an uncommitted op the object returns to its
+//     declared home only when the row there already claims it
+//     (rowClaimsObject) — rollback that makes a recorded claim truthful;
+//     an unrecorded or weak-only object surfaces instead of being
+//     installed where a late effect could destroy it.
+//   - ocUnknown: surfaced visibly under a fresh truthful identity —
+//     never moved to a public path on a guess, never destroyed.
 func (s *Store) judgeName(ctx context.Context, it *intent, names *[]nameRec, view ReconView, i int, rel string, st FileInfo, prov nameRec) {
-	cls := s.classifyName(*it, view, rel, st, prov)
-	if st.Kind == "dir" && cls != ncAuthored {
-		// Before the container itself is disposed, extract any member
-		// whose recorded home is free and is NOT where riding the
-		// container would put it — recorded membership changes survive
-		// even when the container object is unknown.
-		ride, rideFree, _ := s.recordedHome(ctx, *it, view, st, rel)
-		if !rideFree {
-			// The container will surface under a name that cannot be
-			// known yet — no member can ride it home, so every recorded
-			// member is judged for extraction on its own.
-			ride = ""
-		}
-		seen := map[string]struct{}{}
-		markSeen(seen, st, rel)
-		s.extractRecordedMembers(ctx, it, names, view, rel, ride, 0, seen)
-	}
-	switch cls {
-	case ncAuthored:
-		// Our own staged body. If the write's content is already
-		// acknowledged at the path, this is a redundant authored copy —
-		// discarding it is operation-bound disposal, not ambiguous
-		// recovery.
-		if s.opEffectLanded(*it, view) {
-			if err := view.RemoveName(it.scope, rel); err == nil {
-				it.journal.done(i)
-			}
-			return
-		}
-		// Not landed: return the authored bytes to their origin or
-		// surface them visibly.
-		s.restoreOrSurface(ctx, *it, view, i, rel, it.path, st, true, false)
-	case ncCaptured:
-		// The declared source object, captured but never landed at its
-		// destination — its own row (if one provably describes it) is
-		// the better home; otherwise restore to the op's source path.
-		origin, rowHome := it.path, true
-		if home, _, ok := s.recordedHome(ctx, *it, view, st, rel); ok {
-			origin = home
-		}
-		s.restoreOrSurface(ctx, *it, view, i, rel, origin, st, false, rowHome)
-	case ncDisplaced:
-		// Bound-oid proof: this IS the declared displaced object.
-		// Discard requires the whole chain: the act was declared, its
-		// result was observed, the op's effect is committed, and the
-		// object is not shared or a directory. Content similarity alone
-		// never authorizes destroying a displaced object. For a remove
-		// the journaled capture IS the committed effect — the object was
-		// taken off its path by the act itself.
-		landed := it.op == "remove" || s.opEffectLanded(*it, view)
-		if prov.Act != "" && prov.Res == "ok" && landed &&
-			st.Nlink <= 1 && st.Kind == "file" {
-			if err := view.RemoveName(it.scope, rel); err == nil {
-				it.journal.done(i)
-			}
-			return
-		}
-		// Not committed (or a shared/dir object): its own row is the
-		// better home when one provably describes it; otherwise restore
-		// to the op's displaced origin — never destroy.
-		origin, rowHome := it.path, it.op == "rename"
-		if it.op == "rename" {
-			origin = it.toPath
-		}
-		if home, _, ok := s.recordedHome(ctx, *it, view, st, rel); ok {
-			origin, rowHome = home, true
-		}
-		s.restoreOrSurface(ctx, *it, view, i, rel, origin, st, false, rowHome)
-	case ncDisplacedWeak:
-		origin := it.path
-		if it.op == "rename" {
-			origin = it.toPath
-		}
-		if it.op == "remove" && prov.Act != "" && prov.Res == "ok" &&
-			st.Nlink <= 1 && st.Kind == "file" {
-			// A remove's whole purpose was deleting the declared object:
-			// the journaled capture is the operation-bound proof that
-			// THIS object was taken from the path the user removed.
-			// Weak identity suffices — the alternative is resurrecting
-			// a file the user deleted.
-			if err := view.RemoveName(it.scope, rel); err == nil {
-				it.journal.done(i)
-				return
-			}
-		}
-		// Weak displaced evidence on a write/rename can restore or
-		// surface, never delete — its own row is the better home when
-		// one provably describes it.
-		rowHome := it.op == "rename"
-		if home, _, ok := s.recordedHome(ctx, *it, view, st, rel); ok {
-			origin, rowHome = home, true
-		}
-		s.restoreOrSurface(ctx, *it, view, i, rel, origin, st, false, rowHome)
-	default:
-		// Unknown/foreign content under our name — it arrived through a
-		// recorded act whose declared identity does not match, or at a
-		// name with no act at all (an orphan sweep record). When a
-		// version row provably describes this object — bound oid, or
-		// fp3+sha with the recorded path absent — it is restored to that
-		// recorded home or surfaced with the row re-keyed; otherwise it
-		// is surfaced under a fresh row. It is never moved onto a
-		// public path on a guess and never destroyed.
-		if home, _, ok := s.recordedHome(ctx, *it, view, st, rel); ok {
-			s.restoreOrSurface(ctx, *it, view, i, rel, home, st, false, true)
-			return
-		}
-		s.restoreOrSurface(ctx, *it, view, i, rel, "", st, false, false)
-	}
-}
-
-// recordedHome finds the version row that provably describes the object
-// at rel — the object's recorded path. Evidence is ranked: a bound
-// durable identity outranks everything; a file needs fp3 and
-// content_sha together; a dir matches on fp3 alone (member churn moves
-// its size/mtime legs; the inode leg survives a rename). Returns the
-// recorded path, whether that path is currently free (observed absent),
-// and whether a unique claimant exists at all. A free path is a home
-// the object can be restored to; an occupied one is still the right
-// sibling base for surfacing — the occupant is never evicted. Any
-// ambiguity (two live candidates) yields no path — the object surfaces
-// under a fresh name instead.
-func (s *Store) recordedHome(ctx context.Context, it intent, view ReconView, st FileInfo, rel string) (string, bool, bool) {
 	sha := ""
 	if st.Kind == "file" {
-		h, err := view.Hash(it.scope, rel)
-		if err != nil {
-			return "", false, false // content unverifiable — cannot claim a home
+		h, herr := view.Hash(it.scope, rel)
+		if herr != nil {
+			return // content unverifiable — retry next pass
 		}
 		sha = h
 	}
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	rows, err := s.pool.Query(dctx,
-		`SELECT path, fp, oid FROM file_version WHERE scope=$1 AND
-		 ($2::text <> '' AND oid = $2 OR $3::text <> '' AND content_sha = $3 OR content_sha = 'dir')`,
-		it.scope, st.Oid, sha)
-	if err != nil {
-		return "", false, false
-	}
-	defer rows.Close()
-	type cand struct {
-		path, fp, oid string
-		strong        bool
-	}
-	var cands []cand
-	for rows.Next() {
-		var c cand
-		if rows.Scan(&c.path, &c.fp, &c.oid) != nil {
-			continue
-		}
-		if c.oid != "" && st.Oid != "" && c.oid != st.Oid {
-			// Both sides carry a bound durable identity and they
-			// disagree — affirmative evidence the row recorded a
-			// different object (e.g. a stale row over a reused inode),
-			// not a weak claim to fall back on.
-			continue
-		}
-		switch {
-		case st.Oid != "" && c.oid == st.Oid:
-			c.strong = true
-		case st.Kind == "file":
-			// A file row must agree on content AND fp3.
-			if sha == "" || fp3(c.fp) != fp3(st.Fingerprint) {
-				continue
-			}
-		default:
-			// Dir/other: oid unbound — the inode leg is the only
-			// identity that survives a move.
-			ino, _, _, ok := fpParts(st.Fingerprint)
-			rino, _, _, rok := fpParts(c.fp)
-			if !ok || !rok || ino != rino {
-				continue
-			}
-		}
-		cands = append(cands, c)
-	}
-	// Bound-oid candidates dominate: if any exist only they are homes.
-	hasStrong := false
-	for _, c := range cands {
-		if c.strong {
-			hasStrong = true
-		}
-	}
-	free := ""
-	freeN := 0
-	occupied := ""
-	for _, c := range cands {
-		if hasStrong && !c.strong {
-			continue
-		}
-		_, serr := view.Stat(it.scope, c.path)
-		switch {
-		case absentVerdict(serr):
-			free, freeN = c.path, freeN+1
-		case occupied == "":
-			// Occupied — or unverifiable, which conservatively is not
-			// free either. Still the right sibling base for surfacing.
-			occupied = c.path
-		}
-	}
-	if freeN == 1 {
-		return free, true, true
-	}
-	if freeN == 0 && occupied != "" {
-		return occupied, false, true
-	}
-	return "", false, false // zero claimants, or several free — ambiguous
-}
-
-// extractRecordedMembers walks the members of a captured directory
-// before the container is disposed: a member whose version row provably
-// describes it and whose recorded home is free is moved there directly
-// — recorded membership changes survive even when the container object
-// itself is unknown or homeless. ride is the path the container will
-// occupy ("" when it will surface under a fresh name — then no member
-// can reach its recorded home by riding). A member whose recorded home
-// equals its ride target is left in place: moving the container already
-// returns it. A member dir with its own free recorded home has ITS
-// members extracted first (against that home), then moves whole.
-// Members never evict a public occupant — MoveStaged is NOREPLACE, and
-// recordedHome only reports paths observed absent. Depth-bounded and
-// deduplicated by object identity so a cyclic structure terminates.
-func (s *Store) extractRecordedMembers(ctx context.Context, it *intent, names *[]nameRec, view ReconView, rel, ride string, depth int, seen map[string]struct{}) {
-	if depth > 256 {
-		return
-	}
-	members, err := view.ListDir(it.scope, rel)
-	if err != nil {
-		return
-	}
-	for _, m := range members {
-		if strings.HasPrefix(m, opStagePrefix) {
-			continue // nested private names belong to their own records
-		}
-		mrel := rel + "/" + m
-		st, serr := view.Stat(it.scope, mrel)
-		if serr != nil {
-			continue // unverifiable — leave it riding the container
-		}
-		// rideTo is where the member ends up if left riding the
-		// container; "" when the container's own destination is unknown
-		// (it will surface under a fresh name) — then no member can ride
-		// home and every recorded member must be extracted.
-		rideTo := ""
-		if ride != "" {
-			rideTo = ride + "/" + m
-		}
-		home, free, _ := s.recordedHome(ctx, *it, view, st, mrel)
-		if st.Kind == "dir" {
-			if !markSeen(seen, st, mrel) {
-				continue // cyclic alias — already walked
-			}
-			if free {
-				if rideTo != "" && home == rideTo {
-					continue // rides home — nothing to extract
-				}
-				// Extract inner members that cannot ride to this home,
-				// then move the dir whole.
-				s.extractRecordedMembers(ctx, it, names, view, mrel, home, depth+1, seen)
-			} else {
-				s.extractRecordedMembers(ctx, it, names, view, mrel, rideTo, depth+1, seen)
-				continue
-			}
-		}
-		if !free || (rideTo != "" && home == rideTo) {
-			continue
-		}
-		mi, mok := s.appendName(ctx, it, names,
-			nameRec{Name: mrel, Act: "mv", Src: mrel})
-		if !mok {
-			continue
-		}
-		if d, _ := splitRel(home); d != "" {
-			_ = view.EnsureDir(it.scope, d)
-		}
-		if merr := view.MoveStaged(it.scope, mrel, home); merr == nil {
-			it.journal.res(mi, "ok")
-			it.journal.done(mi)
-			s.restoredRow(ctx, *it, view, home, mrel)
-		} else {
-			// Home filled between check and move, or the move is
-			// unverifiable — the member rides the container instead.
-			it.journal.res(mi, "noeff")
-			it.journal.done(mi)
-		}
-	}
-}
-
-// restoreOrSurface returns the object at private name rel to origin when
-// the name is free (NOREPLACE — a live occupant always wins), else moves
-// it to a visible sibling name and records a readable row + event so
-// people and secretaries can read and delete it. authored=true marks
-// content the op authored itself (a write body) — surfaced with a fresh
-// version row; captured/displaced content keeps its recorded version row
-// when one describes it.
-func (s *Store) restoreOrSurface(ctx context.Context, it intent, view ReconView, i int, rel, origin string, st FileInfo, authored, rowHome bool) {
-	if origin != "" {
-		ost, serr := view.Stat(it.scope, origin)
-		switch {
-		case absentVerdict(serr):
-			// Origin is free — restore home. Recreate a missing parent
-			// chain first.
-			if d, _ := splitRel(origin); d != "" {
-				_ = view.EnsureDir(it.scope, d)
-			}
-			if err := view.MoveStaged(it.scope, rel, origin); err == nil {
-				it.journal.done(i)
-				log.Printf("reconcile: restored %s -> %s (op %d)", rel, origin, it.id)
-				if rowHome {
-					s.restoredRow(ctx, it, view, origin, rel)
-				}
-				return
-			} else if !errors.Is(err, ErrConflict) {
-				return // unverifiable move — retry next pass
-			}
-			// Occupied between stat and move — fall through to surface.
-		case serr != nil:
-			return // origin unverifiable — retry next pass
-		case sameObjectAt(st, ost):
-			// The origin's occupant IS this object — it is already home
-			// (e.g. another link of a multiply-linked file, or a dir
-			// that never left). The private name is a duplicate link;
-			// removing it is operation-bound disposal of our own name.
+	m := s.provMeaning(*it, *names, prov, st, sha)
+	switch m.cls {
+	case ocAuthored:
+		if st.Kind == "file" && st.Nlink <= 1 && it.expectSHA != "" &&
+			s.opCommitted(ctx, *it) &&
+			s.rowSHAAt(ctx, *it, it.path) == it.expectSHA {
+			// The committed row at the op's path records these exact
+			// bytes — the staged copy is redundant. Both the commit and
+			// the content evidence are DB facts: an equal-content
+			// foreign object can never match this chain.
 			if err := view.RemoveName(it.scope, rel); err == nil {
 				it.journal.done(i)
 			}
 			return
 		}
-		// Occupied by a different object — the occupant is never
-		// evicted; fall through to surface at a visible sibling.
+		// Not discardable: the authored body belongs at the op's path
+		// only when the recorded row already claims these exact bytes —
+		// otherwise the write never observably committed them and the
+		// object surfaces under its own identity.
+		if s.rowClaimsObject(ctx, *it, m.home, st) {
+			s.settleObject(ctx, it, names, i, view, rel, st, m.home, true)
+		} else {
+			s.settleObject(ctx, it, names, i, view, rel, st, "", false)
+		}
+	case ocFromPath:
+		if it.op == "remove" && m.home == it.path && s.opCommitted(ctx, *it) {
+			// The remove committed: the journaled cap took this object
+			// off the removed path — deletion is the authorized act.
+			if err := view.RemoveName(it.scope, rel); err == nil {
+				it.journal.done(i)
+				return
+			} else if !errors.Is(err, ErrNotEmpty) {
+				return // unverifiable — retry next pass
+			}
+			// A dir that gained members diverged from the committed
+			// removal — keep it.
+		}
+		// Return to the act's public source only when the recorded row
+		// there already claims this object — otherwise the capture's
+		// declared origin is stale and the object surfaces visibly.
+		if s.rowClaimsObject(ctx, *it, m.home, st) {
+			s.settleObject(ctx, it, names, i, view, rel, st, m.home, true)
+		} else {
+			s.settleObject(ctx, it, names, i, view, rel, st, "", false)
+		}
+	case ocDisplaced:
+		if s.opCommitted(ctx, *it) {
+			// The op committed: its declared home is the product's
+			// place, not the displaced object's. Discard is authorized
+			// only when the recorded row at that path carries the op's
+			// own product — the displacement is then observably final.
+			// A committed op whose product is not the recorded state
+			// makes the displaced reading stale: surface the object.
+			product := it.expectSHA != "" &&
+				s.rowSHAAt(ctx, *it, m.home) == it.expectSHA
+			if m.declared && product && st.Kind == "file" && st.Nlink <= 1 {
+				if err := view.RemoveName(it.scope, rel); err == nil {
+					it.journal.done(i)
+				}
+				return
+			}
+			s.settleObject(ctx, it, names, i, view, rel, st, "", false)
+			return
+		}
+		// Uncommitted op: the displaced object belongs back at the
+		// declared path it was exchanged out of — but only when the
+		// recorded row there already claims this object (a rollback
+		// that makes a recorded claim truthful). An unrecorded or
+		// weak-matched object is surfaced: installing it at the op's
+		// path would let a later-landing effect destroy unattributable
+		// content.
+		if s.rowClaimsObject(ctx, *it, m.home, st) {
+			s.settleObject(ctx, it, names, i, view, rel, st, m.home, true)
+		} else {
+			s.settleObject(ctx, it, names, i, view, rel, st, "", false)
+		}
+	default:
+		s.settleObject(ctx, it, names, i, view, rel, st, "", false)
 	}
-	// Surface at a visible sibling of the origin (or of the private
-	// name's own directory when no origin is known).
-	dir, base := splitRel(origin)
-	if origin == "" {
-		dir, _ = splitRel(rel)
-		base = ""
+}
+
+// settleObject moves the judged object to its destination — the
+// authorized home when it is free, else a visible surface name — and
+// records its row. The destination is committed to rec.Home BEFORE the
+// move so a post-move/pre-PG crash retries through finishSettlement
+// instead of losing the row. An occupied authorized home is never
+// evicted; the object surfaces beside it.
+func (s *Store) settleObject(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rel string, st FileInfo, home string, homeOK bool) {
+	rec := (*names)[i]
+	target := home
+	switch {
+	case target == "":
+		target = s.surfaceTarget(*it, rec, rel)
+	default:
+		ost, serr := view.Stat(it.scope, home)
+		switch {
+		case absentVerdict(serr):
+		case serr != nil:
+			return // home unverifiable — retry next pass
+		case sameObjectAt(st, ost):
+			// The home's occupant IS this object (a hardlink sibling —
+			// the private name is a duplicate link). Removing our name
+			// is operation-bound disposal, not recovery.
+			if err := view.RemoveName(it.scope, rel); err == nil {
+				it.journal.done(i)
+			}
+			return
+		default:
+			target = s.surfaceTarget(*it, rec, home)
+			homeOK = false
+		}
 	}
+	if err := it.journal.home(i, target); err != nil {
+		return // destination not journaled — retry next pass
+	}
+	if d, _ := splitRel(target); d != "" {
+		_ = view.EnsureDir(it.scope, d)
+	}
+	landed, err := s.moveSettled(ctx, it, names, i, view, rel, st, target)
+	if err != nil {
+		return // the journaled home retries next pass
+	}
+	s.settleRow(ctx, *it, view, rec, landed, homeOK && landed == home)
+	it.journal.done(i)
+}
+
+// moveSettled lands the object at target via NOREPLACE, rotating to a
+// fresh surface sibling (journaled each time) when the destination is
+// occupied by a different object. Returns the final destination.
+func (s *Store) moveSettled(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rel string, st FileInfo, target string) (string, error) {
+	for try := 0; try < 4; try++ {
+		err := view.MoveStaged(it.scope, rel, target)
+		switch {
+		case err == nil:
+			return target, nil
+		case errors.Is(err, ErrConflict):
+			if ost, serr := view.Stat(it.scope, target); serr == nil && sameObjectAt(st, ost) {
+				return target, nil // the object is already there
+			}
+			target = s.surfaceTarget(*it, (*names)[i], target)
+			if jerr := it.journal.home(i, target); jerr != nil {
+				return "", jerr
+			}
+		default:
+			return "", err
+		}
+	}
+	return "", ErrConflict
+}
+
+// finishSettlement completes a record whose destination was journaled
+// before the move: either the occupant is still parked (re-land the
+// journaled move) or the name vacated (write the row if the
+// destination still holds the settled object — verified against the
+// journaled observation, never assumed from same-path presence).
+func (s *Store) finishSettlement(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rec nameRec) {
+	rel := nameRel(*it, rec)
+	st, serr := view.Stat(it.scope, rel)
+	switch {
+	case serr == nil:
+		it.journal.seen(i, obsIdent(st))
+		(*names)[i].Seen = append((*names)[i].Seen, obsIdent(st))
+		rec.Seen = (*names)[i].Seen
+		if d, _ := splitRel(rec.Home); d != "" {
+			_ = view.EnsureDir(it.scope, d)
+		}
+		landed, merr := s.moveSettled(ctx, it, names, i, view, rel, st, rec.Home)
+		if merr != nil {
+			return
+		}
+		s.settleRow(ctx, *it, view, rec, landed, landed == s.authorizedHome(*it, *names, rec))
+		it.journal.done(i)
+	case absentVerdict(serr):
+		// The move landed; the object may since have been displaced by
+		// ordinary ops. Write its row only when the destination still
+		// holds the object the journal observed.
+		live, lerr := view.Stat(it.scope, rec.Home)
+		if lerr != nil {
+			it.journal.done(i) // gone by ordinary means — nothing to record
+			return
+		}
+		if sameSettledObject(rec, live) {
+			s.settleRow(ctx, *it, view, rec, rec.Home, rec.Home == s.authorizedHome(*it, *names, rec))
+		}
+		it.journal.done(i)
+	default:
+		// unverifiable this pass — retry later
+	}
+}
+
+// authorizedHome re-derives where this record's occupant may return to,
+// from the journaled act chain and its observed identity — deterministic
+// given the journal, so a retried pass computes the same authority.
+func (s *Store) authorizedHome(it intent, names []nameRec, rec nameRec) string {
+	ofp, ooid := lastSeen(rec)
+	// The journal stores the fp3 triple; append a ctime leg so fp3()
+	// comparisons against full fingerprints reduce to the recorded legs.
+	st := FileInfo{Fingerprint: ofp + ":0", Oid: ooid}
+	return s.provMeaning(it, names, rec, st, "").home
+}
+
+// sameSettledObject reports whether live is the object the journal
+// observed at this name — bound identity when both sides carry it,
+// fp3 otherwise. No observation means no certification at all.
+func sameSettledObject(rec nameRec, live FileInfo) bool {
+	ofp, ooid := lastSeen(rec)
+	if ofp == "" {
+		return false
+	}
+	if ooid != "" && live.Oid != "" {
+		return ooid == live.Oid
+	}
+	return ofp == fp3(live.Fingerprint) // journal obs already stores the fp3 triple
+}
+
+// surfaceTarget names a visible destination: beside the authorized home
+// when one is occupied, else in the directory the private name was
+// found in. The random leg keeps concurrent passes collision-free;
+// MoveStaged's NOREPLACE makes any residual collision a retry.
+func (s *Store) surfaceTarget(it intent, rec nameRec, base string) string {
+	dir, b := splitRel(base)
 	stem := "recovered-o" + strconv.FormatInt(it.id, 10)
-	if base != "" && !strings.HasPrefix(base, opStagePrefix) {
-		stem = base + "." + stem
+	if b != "" && !strings.HasPrefix(b, opStagePrefix) {
+		stem = b + "." + stem
 	}
-	for k := 0; k < 8; k++ {
-		cand := stem
-		if k > 0 {
-			cand += "-" + strconv.Itoa(k)
-		}
-		target := cand
-		if dir != "" {
-			target = dir + "/" + cand
-		}
-		if err := view.MoveStaged(it.scope, rel, target); err == nil {
-			it.journal.done(i)
-			s.surfacedRow(ctx, it, view, origin, target, rel, authored)
-			return
-		} else if !errors.Is(err, ErrConflict) {
-			return
-		}
+	cand := stem + "-" + randHex(3)
+	if dir != "" {
+		return dir + "/" + cand
 	}
-	// No surface name available — leave parked under the owned name.
+	return cand
 }
 
-// restoredRow refreshes the version row at origin after the object was
-// moved back: the move changed its fp (ctime leg) but the row's version
-// and history are preserved — the recorded object is home, so the row
-// stays truthful and a 'recover' event journals the observation.
-// Best-effort: a failed write leaves correct bytes with a stale fp,
-// which ordinary reads reconcile via live-fingerprint comparison.
-func (s *Store) restoredRow(ctx context.Context, it intent, view ReconView, origin, rel string) {
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	live, lerr := view.Stat(it.scope, origin)
-	if lerr != nil {
-		return
-	}
-	tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
-	if err != nil {
-		return
-	}
-	defer tx.Rollback(dctx)
-	if err := s.checkOwnerTx(dctx, tx); err != nil {
-		return
-	}
-	var ver int64
-	if err := tx.QueryRow(dctx,
-		`UPDATE file_version SET fp=$3, oid=$4, updated=now()
-		 WHERE scope=$1 AND path=$2 RETURNING version`,
-		it.scope, origin, live.Fingerprint, live.Oid).Scan(&ver); err != nil {
-		return // no row (or raced) — nothing to refresh
-	}
-	if _, err := tx.Exec(dctx,
-		`INSERT INTO file_event (scope, path, from_path, op, version)
-		 VALUES ($1,$2,$3,'recover',$4)`,
-		it.scope, origin, rel, ver); err != nil {
-		return
-	}
-	if err := tx.Commit(dctx); err != nil {
-		log.Printf("reconcile: restored %s row commit: %v", origin, err)
-	}
-}
-
-// surfacedRow records a surfaced object so it is readable and deletable
-// through the API: when a version row still describes the surfaced
-// object at its (now occupied or empty) origin, the row is re-keyed to
-// the surface name preserving its version; otherwise a fresh version is
-// minted. Either way a 'recover' event is journaled. Best-effort: a
-// failure leaves the object visible at the surface name and re-tries
-// next pass is not needed — the row write is retried by marking the
-// name not-done is WRONG (object is gone); so this does its own tx and
-// a failed write only loses the journal entry, never the bytes.
-func (s *Store) surfacedRow(ctx context.Context, it intent, view ReconView, origin, target, rel string, authored bool) {
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
-	if err != nil {
-		log.Printf("reconcile: surfaced %s without row: %v", target, err)
-		return
-	}
-	defer tx.Rollback(dctx)
-	if err := s.checkOwnerTx(dctx, tx); err != nil {
-		return
-	}
-	live, lerr := view.Stat(it.scope, target)
-	if lerr != nil {
-		return // surfaced object vanished before its row — leave it
+// settleRow records the landed object — in one tx — so it is an
+// ordinary readable/deletable API object. At an authorized home the
+// existing row is refreshed ONLY when it is the originally declared
+// pair: the row's fp equals the intent's declared fp for that path AND
+// the live object matches the declared identity — otherwise a fresh
+// version supersedes the stale row. At a surface a fresh version is
+// minted; no arbitrary historical row is ever re-keyed. The recover
+// event is deduplicated so a retried pass cannot double-journal.
+func (s *Store) settleRow(ctx context.Context, it intent, view ReconView, rec nameRec, target string, home bool) {
+	live, serr := view.Stat(it.scope, target)
+	if serr != nil || !sameSettledObject(rec, live) {
+		return // not the settled object — nothing truthful to write
 	}
 	sha := ""
 	switch live.Kind {
 	case "file":
-		sha, _ = view.Hash(it.scope, target)
+		if h, herr := view.Hash(it.scope, target); herr == nil {
+			sha = h
+		}
 	case "dir":
 		sha = "dir"
 	}
-	// Find the row that already records this object: fp3 and content
-	// must both agree (sha where the row carries one), and the row's
-	// recorded path must be absent — a row still satisfied by a live
-	// path is not this object's home. This is bookkeeping, not object
-	// authority: the surfaced object never moves on row evidence.
-	if !authored && sha != "" {
-		var ver int64
-		var oldPath, rowFP string
-		rows, qerr := tx.Query(dctx,
-			`SELECT path, version, fp FROM file_version
-			 WHERE scope=$1 AND content_sha=$2 FOR UPDATE`,
-			it.scope, sha)
-		type cand struct {
-			path, fp string
-			ver      int64
-		}
-		var cands []cand
-		if qerr == nil {
-			for rows.Next() {
-				var c cand
-				if rows.Scan(&c.path, &c.ver, &c.fp) == nil {
-					cands = append(cands, c)
-				}
-			}
-			rows.Close()
-		}
-		for _, c := range cands {
-			if fp3(c.fp) != fp3(live.Fingerprint) {
-				continue
-			}
-			if _, serr := view.Stat(it.scope, c.path); !absentVerdict(serr) {
-				continue // recorded path still occupied — not this row
-			}
-			ver, oldPath, rowFP = c.ver, c.path, c.fp
-			break
-		}
-		_ = rowFP
-		if oldPath != "" {
-			if _, err := tx.Exec(dctx,
-				`UPDATE file_version SET path=$3, fp=$4, updated=now()
-				 WHERE scope=$1 AND path=$2 AND version=$5`,
-				it.scope, oldPath, target, live.Fingerprint, ver); err != nil {
-				return
-			}
-			if _, err := tx.Exec(dctx,
-				`INSERT INTO file_event (scope, path, from_path, op, version)
-				 VALUES ($1,$2,$3,'recover',$4)`,
-				it.scope, target, oldPath, ver); err != nil {
-				return
-			}
-			if err := tx.Commit(dctx); err != nil {
-				log.Printf("reconcile: surfaced %s row commit: %v", target, err)
-			}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(dctx)
+	if err := s.checkOwnerTx(dctx, tx); err != nil {
+		return
+	}
+	var ver int64
+	wrote := false
+	if home {
+		ver, wrote = s.homeRowTx(dctx, tx, it, target, live, sha)
+	} else {
+		ver, wrote = s.surfaceRowTx(dctx, tx, it, target, live, sha)
+	}
+	if !wrote {
+		return
+	}
+	var ev int
+	err = tx.QueryRow(dctx,
+		`SELECT 1 FROM file_event
+		  WHERE scope=$1 AND path=$2 AND op='recover' AND version=$3`,
+		it.scope, target, ver).Scan(&ev)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, err = tx.Exec(dctx,
+			`INSERT INTO file_event (scope, path, from_path, op, version)
+			 VALUES ($1,$2,$3,'recover',$4)`,
+			it.scope, target, nameRel(it, rec), ver); err != nil {
 			return
 		}
 	}
-	// No row describes this object: mint a fresh version so the surfaced
-	// object is an ordinary readable/deletable file.
-	var ver int64
-	if err := tx.QueryRow(dctx,
-		`SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
+	if err := tx.Commit(dctx); err != nil {
+		log.Printf("reconcile: settled %s row commit: %v", target, err)
 		return
 	}
-	if _, err := tx.Exec(dctx,
+	if !home {
+		// The object now holds a fresh truthful row at its surface
+		// name — a row that provably describes THIS object but claims
+		// an absent path is falsified evidence: drop it so the stale
+		// claim cannot shadow the surfaced recovery.
+		s.dropStaleClaims(ctx, it, view, target, live, sha)
+		if live.Kind == "dir" {
+			s.mintMemberRows(ctx, it, view, target)
+		}
+	}
+}
+
+// dropStaleClaims removes version rows that provably describe the
+// settled object — bound oid equality, or fp3+content match — while the
+// path they claim is absent on the filesystem. The delete is guarded by
+// the row's own fp so a row rewritten since our read is left alone.
+// Only ever applied to rows describing the object we hold — never used
+// to elect a home.
+func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, keep string, live FileInfo, sha string) {
+	if s.pool == nil {
+		return
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(dctx,
+		`SELECT path, fp, coalesce(oid,'') FROM file_version
+		  WHERE scope=$1 AND path<>$2 AND content_sha=$3`,
+		it.scope, keep, sha)
+	if err != nil {
+		return
+	}
+	type claim struct{ path, fp, oid string }
+	var cands []claim
+	for rows.Next() {
+		var c claim
+		if rows.Scan(&c.path, &c.fp, &c.oid) == nil {
+			cands = append(cands, c)
+		}
+	}
+	rows.Close()
+	for _, c := range cands {
+		match := false
+		if live.Oid != "" && c.oid != "" {
+			match = c.oid == live.Oid
+		} else if c.fp != "" {
+			match = fp3(c.fp) == fp3(live.Fingerprint)
+		}
+		if !match {
+			continue
+		}
+		if _, serr := view.Stat(it.scope, c.path); !absentVerdict(serr) {
+			continue // present or unverifiable — the claim may still stand
+		}
+		if _, err := s.pool.Exec(dctx,
+			`DELETE FROM file_version WHERE scope=$1 AND path=$2 AND fp=$3`,
+			it.scope, c.path, c.fp); err != nil {
+			log.Printf("reconcile: drop stale claim %s: %v", c.path, err)
+		}
+	}
+}
+
+// rowClaimsObject reports whether the version row at path provably
+// records the object st — bound oid equality when both sides carry it,
+// else fp3 (dirs compare the inode leg only: a move changes dir mtime).
+// Corroboration only — never an elector on its own.
+func (s *Store) rowClaimsObject(ctx context.Context, it intent, path string, st FileInfo) bool {
+	if s.pool == nil || path == "" {
+		return false
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var rowFP, rowOid string
+	if err := s.pool.QueryRow(dctx,
+		`SELECT fp, coalesce(oid,'') FROM file_version
+		 WHERE scope=$1 AND path=$2`,
+		it.scope, path).Scan(&rowFP, &rowOid); err != nil {
+		return false
+	}
+	if rowOid != "" && st.Oid != "" {
+		return rowOid == st.Oid
+	}
+	if st.Kind == "dir" {
+		lino, _, _, lok := fpParts(st.Fingerprint)
+		rino, _, _, rok := fpParts(rowFP)
+		return lok && rok && lino == rino
+	}
+	return fp3(rowFP) == fp3(st.Fingerprint)
+}
+
+// declaredObject returns the declare-time evidence (fp, oid, sha) for
+// the object the intent declared at path — the only pair a home row may
+// be checked against. "" when the intent declared nothing there.
+func declaredObject(it intent, path string) (fp, oid, sha string) {
+	switch {
+	case it.op == "rename" && path == it.path:
+		return it.preFP, it.preOid, it.expectSHA
+	case path == it.path:
+		return it.preFP, it.preOid, it.dstSHA
+	case it.toPath != "" && path == it.toPath:
+		return it.dstFP, it.dstOid, it.dstSHA
+	}
+	return "", "", ""
+}
+
+// homeRowTx writes the row for an object returned to an authorized
+// home. The existing row is refreshed in place — same version, live fp
+// — only when it is the declared pair: row.fp equals the intent's
+// declared fp AND the restored object provably IS the declared object
+// (bound oid equality, or declared fp3+sha when identity is unbound).
+// That is recorded-vs-recorded evidence, not a later same-path
+// observation certifying an old version. Anything else mints a fresh
+// version superseding the stale row.
+func (s *Store) homeRowTx(ctx context.Context, tx pgx.Tx, it intent, target string, live FileInfo, sha string) (int64, bool) {
+	var ver int64
+	var rowFP, rowOid, rowSHA string
+	err := tx.QueryRow(ctx,
+		`SELECT version, fp, coalesce(oid,''), coalesce(content_sha,'')
+		 FROM file_version WHERE scope=$1 AND path=$2 FOR UPDATE`,
+		it.scope, target).Scan(&ver, &rowFP, &rowOid, &rowSHA)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return 0, false
+	}
+	dfp, doid, dsha := declaredObject(it, target)
+	pair := err == nil && dfp != "" && rowFP == dfp &&
+		rowSHA == sha && (rowOid == "" || rowOid == live.Oid)
+	if pair {
+		if doid != "" {
+			pair = live.Oid == doid
+		} else {
+			pair = fp3(live.Fingerprint) == fp3(dfp) &&
+				(dsha == "" || sha == dsha)
+		}
+	}
+	if pair {
+		if _, err := tx.Exec(ctx,
+			`UPDATE file_version SET fp=$3, updated=now()
+			 WHERE scope=$1 AND path=$2`,
+			it.scope, target, live.Fingerprint); err != nil {
+			return 0, false
+		}
+		return ver, true
+	}
+	if err := tx.QueryRow(ctx,
+		`SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
+		return 0, false
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO file_version (scope, path, version, fp, content_sha, oid)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (scope, path) DO UPDATE
+		 SET version=EXCLUDED.version, fp=EXCLUDED.fp,
+		     content_sha=EXCLUDED.content_sha, oid=EXCLUDED.oid, updated=now()`,
+		it.scope, target, ver, live.Fingerprint, sha, live.Oid); err != nil {
+		return 0, false
+	}
+	return ver, true
+}
+
+// surfaceRowTx mints a fresh version row for a surfaced object —
+// truthful new identity, never a re-keyed historical row. An existing
+// row at the surface name belongs to someone else's write; it is left
+// untouched and suppresses the event.
+func (s *Store) surfaceRowTx(ctx context.Context, tx pgx.Tx, it intent, target string, live FileInfo, sha string) (int64, bool) {
+	var ver int64
+	if err := tx.QueryRow(ctx,
+		`SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
+		return 0, false
+	}
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO file_version (scope, path, version, fp, content_sha, oid)
 		 VALUES ($1,$2,$3,$4,$5,$6)
 		 ON CONFLICT (scope, path) DO NOTHING`,
-		it.scope, target, ver, live.Fingerprint, sha, live.Oid); err != nil {
-		return
+		it.scope, target, ver, live.Fingerprint, sha, live.Oid)
+	if err != nil || tag.RowsAffected() == 0 {
+		return 0, false
 	}
-	if _, err := tx.Exec(dctx,
-		`INSERT INTO file_event (scope, path, from_path, op, version)
-		 VALUES ($1,$2,$3,'recover',$4)`,
-		it.scope, target, rel, ver); err != nil {
-		return
+	return ver, true
+}
+
+// mintMemberRows gives every member of a surfaced directory a fresh
+// version row so its contents stay ordinary readable/deletable API
+// objects — minted only where no row exists, bounded in depth and
+// deduplicated by object identity. A member never moves: the container
+// carries it, and its recorded path (if any) keeps its own stale row.
+func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, root string) {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	type member struct {
+		rel, sha string
+		st       FileInfo
 	}
-	if err := tx.Commit(dctx); err != nil {
-		log.Printf("reconcile: surfaced %s row commit: %v", target, err)
+	var members []member
+	seen := map[string]struct{}{}
+	var walk func(rel string, depth int)
+	walk = func(rel string, depth int) {
+		if depth > 256 {
+			return
+		}
+		ents, err := view.ListDir(it.scope, rel)
+		if err != nil {
+			return
+		}
+		for _, m := range ents {
+			mrel := rel + "/" + m
+			st, serr := view.Stat(it.scope, mrel)
+			if serr != nil {
+				continue
+			}
+			msha := "dir"
+			if st.Kind == "file" {
+				h, herr := view.Hash(it.scope, mrel)
+				if herr != nil {
+					continue
+				}
+				msha = h
+			}
+			if st.Kind == "dir" {
+				if !markSeen(seen, st, mrel) {
+					continue
+				}
+				walk(mrel, depth+1)
+			}
+			members = append(members, member{mrel, msha, st})
+		}
+	}
+	walk(root, 0)
+	for _, m := range members {
+		tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
+		if err != nil {
+			return
+		}
+		if err := s.checkOwnerTx(dctx, tx); err != nil {
+			tx.Rollback(dctx)
+			return
+		}
+		var ver int64
+		if err := tx.QueryRow(dctx,
+			`SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
+			tx.Rollback(dctx)
+			return
+		}
+		tag, err := tx.Exec(dctx,
+			`INSERT INTO file_version (scope, path, version, fp, content_sha, oid)
+			 VALUES ($1,$2,$3,$4,$5,$6)
+			 ON CONFLICT (scope, path) DO NOTHING`,
+			it.scope, m.rel, ver, m.st.Fingerprint, m.sha, m.st.Oid)
+		if err != nil {
+			tx.Rollback(dctx)
+			continue
+		}
+		if tag.RowsAffected() == 1 {
+			if _, err := tx.Exec(dctx,
+				`INSERT INTO file_event (scope, path, from_path, op, version)
+				 VALUES ($1,$2,$3,'recover',$4)`,
+				it.scope, m.rel, root, ver); err != nil {
+				tx.Rollback(dctx)
+				continue
+			}
+		}
+		if err := tx.Commit(dctx); err != nil {
+			log.Printf("reconcile: member row %s: %v", m.rel, err)
+		}
 	}
 }
 
@@ -2391,10 +2669,12 @@ func (s *Store) surfacedRow(ctx context.Context, it intent, view ReconView, orig
 // dedicated 'recover' intent is created so the object's settlement is
 // itself journaled — the executor surfaces it visibly, never destroys
 // it.
-func (s *Store) sweepOrphanNames(ctx context.Context, view ReconView) {
+func (s *Store) sweepOrphanNames(ctx context.Context, view ReconView) []int64 {
+	var reattach []int64
 	for _, scope := range s.knownScopes(ctx) {
-		s.sweepScopeNames(ctx, scope, view)
+		reattach = append(reattach, s.sweepScopeNames(ctx, scope, view)...)
 	}
+	return reattach
 }
 
 // knownScopes lists every scope with recorded state — version rows or
@@ -2422,8 +2702,9 @@ func (s *Store) knownScopes(ctx context.Context) []string {
 // sweepScopeNames walks one scope's directories for orphan private
 // names. Depth-bounded and dedup'd by object identity so a cyclic
 // structure cannot spin the walk.
-func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconView) {
+func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconView) []int64 {
 	seen := map[string]struct{}{}
+	var reattach []int64
 	var walk func(dir string)
 	walk = func(dir string) {
 		st, err := view.Stat(scope, dir)
@@ -2441,7 +2722,9 @@ func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconVie
 			if !strings.HasPrefix(name, opStagePrefix) {
 				continue // only private recovery names are owned names
 			}
-			s.attachOrphanName(ctx, scope, view, dir, name)
+			if id := s.attachOrphanName(ctx, scope, view, dir, name); id > 0 {
+				reattach = append(reattach, id)
+			}
 		}
 		if depth := strings.Count(dir, "/"); depth < 256 {
 			// Recurse into subdirectories discovered by listing all
@@ -2459,6 +2742,7 @@ func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconVie
 		}
 	}
 	walk("")
+	return reattach
 }
 
 // attachOrphanName decides whether a discovered private name is owned:
@@ -2466,7 +2750,7 @@ func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconVie
 // owner, a 'recover' intent is created — its own journal records the
 // inherited name, so a later takeover can never reissue into a name it
 // did not declare.
-func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconView, dir, name string) {
+func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconView, dir, name string) int64 {
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	// An intent that journals this name owns it. Containment matches on
@@ -2479,7 +2763,7 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 		 WHERE scope=$1 AND names @> $2::jsonb`,
 		scope, mustJSON([]map[string]string{{"name": name}}))
 	if qerr != nil {
-		return
+		return 0
 	}
 	owned := false
 	for rows.Next() {
@@ -2500,7 +2784,38 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	}
 	rows.Close()
 	if owned {
-		return // owned — the intent's own executor settles it
+		return 0 // owned — the intent's own executor settles it
+	}
+	// A private name carries the id of the intent whose fs layer minted
+	// it — stageBase and its derived names all embed it. A surviving
+	// intent with that id authored the name even when its record was
+	// lost (journal rows predate the names protocol, or the intent
+	// resolved before the sweep discovered the name), so the name
+	// attaches there: its own journal gains the record BEFORE the name
+	// can be settled, keeping declare-before-settle ordering. A resolved
+	// intent's record is re-judged by the tombstone scan.
+	if iid, ok := stageNameID(name); ok {
+		var exists, resolved bool
+		if err := s.pool.QueryRow(dctx,
+			`SELECT true, resolved_at IS NOT NULL FROM file_op
+			  WHERE id=$1 AND scope=$2 AND root=$3`,
+			iid, scope, s.rootID).Scan(&exists, &resolved); err == nil && exists {
+			if _, err := s.pool.Exec(dctx,
+				`UPDATE file_op SET names =
+				    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
+				    || $2::jsonb
+				  WHERE id=$1`,
+				iid, mustJSON([]nameRec{{Name: name, Dir: dir}})); err == nil {
+				log.Printf("reconcile: private name %s/%s re-attached to intent %d", dir, name, iid)
+				if resolved {
+					// Its tombstone scan already ran (or just resolved)
+					// this pass — the caller re-judges it now so the
+					// record is not stranded until the next scan cadence.
+					return iid
+				}
+				return 0
+			}
+		}
 	}
 	// Orphan: create a recover intent. The journal records the inherited
 	// name BEFORE the intent is visible to the executor — the same
@@ -2509,7 +2824,7 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	// resolves done rather than tombstoning forever.
 	var id, ver int64
 	if err := s.pool.QueryRow(dctx, `SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
-		return
+		return 0
 	}
 	rec := nameRec{Name: name, Dir: dir}
 	err := s.pool.QueryRow(dctx,
@@ -2518,9 +2833,28 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 		s.rootID, s.owner, scope, dir, ver, mustJSON([]nameRec{rec})).Scan(&id)
 	if err != nil {
 		log.Printf("reconcile: orphan %s/%s recover intent: %v", dir, name, err)
-		return
+		return 0
 	}
 	log.Printf("reconcile: orphan private name %s/%s -> recover intent %d", dir, name, id)
+	return 0
+}
+
+// stageNameID extracts the intent id embedded in a private stage name:
+// .filesv-op-<id> and its derived "-seg-suffix" forms all carry it.
+func stageNameID(name string) (int64, bool) {
+	if !strings.HasPrefix(name, opStagePrefix) {
+		return 0, false
+	}
+	rest := name[len(opStagePrefix):]
+	digits := rest
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		digits = rest[:i]
+	}
+	if digits == "" {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(digits, 10, 64)
+	return id, err == nil && id > 0
 }
 
 func (s *Store) kickReconcile() {
@@ -2820,7 +3154,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 	// itself may be arbitrarily delayed.
 	if now2 := time.Now().UnixNano(); now2-s.lastStageSweep.Load() >= stageSweepInterval.Nanoseconds() {
 		s.lastStageSweep.Store(now2)
-		s.sweepOrphanNames(ctx, view)
+		reattached := s.sweepOrphanNames(ctx, view)
 		// Recover intents the sweep just created are owned by us and not
 		// inflight — settle them in this pass rather than leaving orphan
 		// content parked until the next sweep cadence.
@@ -2830,6 +3164,20 @@ func (s *Store) Reconcile(ctx context.Context) int {
 			}
 			if s.reconcileOne(ctx, it, view, false) {
 				settled++
+			}
+		}
+		// Resolved intents that gained records this pass are re-judged
+		// now — their hot tombstone scan already ran (or they resolved
+		// in the pending loop above), so waiting for the next cadence
+		// would strand a just-arrived delayed effect.
+		for _, id := range reattached {
+			if s.deposed.Load() {
+				break
+			}
+			for _, it := range load(`id=$2`, s.rootID, id) {
+				if s.reconcileOne(ctx, it, view, true) {
+					settled++
+				}
 			}
 		}
 	}

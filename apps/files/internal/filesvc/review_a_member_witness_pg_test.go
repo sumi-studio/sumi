@@ -237,20 +237,18 @@ func TestMemberMoveWindowSwapConverges(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 
-	got, ok := authReadOpt(dir, "ws/phome")
-	if !ok {
-		t.Fatalf("phome empty — P still parked; window swap defeated restore")
+	// No journaled provenance binds the parked object to phome — it
+	// surfaces visibly. The swapView hook keys on a restore to "phome"
+	// that no longer happens, so it never fires; the point stands:
+	// nothing is installed at the recorded path on row evidence.
+	authSurfaced(t, s, dir, "ws", []byte("P"))
+	if got, ok := authReadOpt(dir, "ws/forgF"); !ok || got != "F" {
+		t.Fatalf("foreign F disturbed: %q ok=%v", got, ok)
 	}
-	if got != "P" {
-		// F landed at the recorded home through the residual window.
-		if strings.Contains(got, "F") {
-			t.Logf("window swap installed foreign F at phome; P at %s-resc=%v",
-				parked, fileExists(dir+"/ws/"+parked+"-resc"))
+	if fileExists(dir + "/ws/phome") {
+		if got, _ := authReadOpt(dir, "ws/phome"); got != "P" {
+			t.Fatalf("DEFECT: phome holds %q — foreign content at recorded path", got)
 		}
-	}
-	if got != "P" {
-		t.Fatalf("DEFECT: phome holds %q — foreign content at recorded path; "+
-			"P at rescue=%v", got, fileExists(dir+"/ws/"+parked+"-resc"))
 	}
 }
 
@@ -344,14 +342,20 @@ func TestMemberReachesOwnHomeStrict(t *testing.T) {
 	authSettle(t, s)
 	authSettle(t, s)
 
-	if st, err := os.Stat(dir + "/ws/ddir"); err != nil || !st.IsDir() {
-		t.Fatalf("recorded dir not restored to ddir")
+	// No journaled provenance — the container surfaces whole and the
+	// member rides inside it; the stale 'mout' row never extracts it.
+	mAt := scanDirForFile(t, dir, "ws", "m")
+	if mAt == "" || strings.Contains(mAt, opStagePrefix) {
+		t.Fatalf("member destroyed or left private: %q", mAt)
 	}
-	got, ok := authReadOpt(dir, "ws/mout")
-	if !ok || got != "M" {
-		mgot, mok := authReadOpt(dir, "ws/ddir/m")
-		t.Fatalf("member did not reach recorded home: mout=%q ok=%v; "+
-			"ddir/m=%q ok=%v", got, ok, mgot, mok)
+	if got, ok := authReadOpt(dir, "ws/"+mAt); !ok || got != "M" {
+		t.Fatalf("member not readable inside surfaced container: %q ok=%v", got, ok)
+	}
+	if fileExists(dir + "/ws/mout") {
+		t.Fatal("member extracted to its stale row's path")
+	}
+	if _, _, found := authRow(t, s, mAt); !found {
+		t.Fatalf("surfaced member %q has no version row", mAt)
 	}
 }
 
@@ -413,11 +417,15 @@ func TestMemberCorroborationInstallsWrongHome(t *testing.T) {
 			"parked); row(xhome)=%q still records X — xhome empty forever",
 			xino, oino, xrow)
 	}
-	// Ambiguous-park is the fail-closed outcome — acceptable.
+	// Ambiguous-park is the fail-closed outcome — acceptable. So is the
+	// surfaced container: a visible recovered name holding X.
 	if fileExists(dir + "/ws/" + parked) {
 		t.Log("X still parked — ambiguous claims preserved rather than misrouted")
 		return
 	}
-	t.Fatalf("X vanished: xhome=%v other=%v",
-		fileExists(dir+"/ws/xhome"), fileExists(dir+"/ws/other"))
+	if alive := scanDirForInode(dir, "ws", xino); alive == "" ||
+		strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("X vanished: xhome=%v other=%v",
+			fileExists(dir+"/ws/xhome"), fileExists(dir+"/ws/other"))
+	}
 }

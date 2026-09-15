@@ -721,15 +721,15 @@ func devIno(st fs.FileInfo) string {
 	return fmt.Sprintf("%d:%d", s.Dev, s.Ino)
 }
 
-// fp3 is the fingerprint's identity triple (ino:size:mtime). ctime is
-// excluded: every rename relink updates it, so an object that was moved
-// by an effect can never match a declare-time fp on all four fields.
+// fp3 reduces a fingerprint to its stable ino:size:mtime triple —
+// ctime shifts on relink, so it is never part of identity. The function
+// is idempotent: journaled observations store fp3 already.
 func fp3(fp string) string {
-	i := strings.LastIndex(fp, ":")
-	if i < 0 {
-		return fp
+	parts := strings.Split(fp, ":")
+	if len(parts) > 3 {
+		parts = parts[:3]
 	}
-	return fp[:i]
+	return strings.Join(parts, ":")
 }
 
 // fp3at lstats a name beneath dfd and returns its identity triple and
@@ -1482,6 +1482,10 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		tf.Close()
 		return fail(mapPathErr(err))
 	}
+	// The authored body's durable identity from its open fd — journaled
+	// so a later pass can tell our body from a late-exchanged occupant
+	// without content matching.
+	bodyOid, _, _ := p.fileIdentity(tf)
 	if err := tf.Close(); err != nil {
 		return fail(mapPathErr(err))
 	}
@@ -1490,7 +1494,10 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	it.njRes("ok")
 	// Our object's identity before any exchange — ctime shifts on relink,
 	// so identity is the ino:size:mtime triple only.
-	our3, _, _, ourErr := fp3at(pfd, tmp)
+	our3, _, ourCtime, ourErr := fp3at(pfd, tmp)
+	if ourErr == nil {
+		it.njObs(fmt.Sprintf("%s:%d|%s", our3, ourCtime, bodyOid))
+	}
 	// commitInfo returns the committed object's observed identity only
 	// when the name provably still holds the object this op published
 	// (fp3 == our3). A late stat that observes a different writer's
@@ -1547,6 +1554,12 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// outcome-unknown, never "definitively absent".
 	it.njAct("xch", name)
 	err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_EXCHANGE)
+	if p.faultHook != nil {
+		// Kill boundary: the exchange may have committed while its
+		// result journal has not — a successor must read res="" +
+		// occupied as outcome-unknown, never "definitively absent".
+		p.faultHook("write.postXch")
+	}
 	switch {
 	case errors.Is(err, unix.ENOENT):
 		it.njRes("noeff")
@@ -1589,8 +1602,15 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	if p.faultHook != nil {
 		p.faultHook("write.preUndo")
 	}
+	// Declare the undo before its exchanges can repopulate the slot:
+	// res re-opens first so every crash window reads outcome-unknown.
+	it.njRes("")
+	it.njAct("und", name)
 	uerr := undoDisplaced(pfd, pfd, tmp, name,
 		func(t3 string) bool { return t3 == our3 })
+	if uerr == nil {
+		it.njRes("ok") // the slot provably holds our staged body again
+	}
 	if p.faultHook != nil {
 		p.faultHook("write.postUndo")
 	}
@@ -1803,6 +1823,11 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	it.njAct("xch", relTo)
 	err = unix.Renameat2(int(srcPfd.Fd()), stage,
 		int(dstPfd.Fd()), dstName, unix.RENAME_EXCHANGE)
+	if p.faultHook != nil {
+		// Kill boundary: the exchange may have committed while its
+		// result journal has not.
+		p.faultHook("rename.postXch")
+	}
 	if err != nil {
 		it.njRes("noeff")
 		switch {
@@ -1864,8 +1889,15 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// Undo: exchange the private name back with the destination (the
 	// foreign object returns to its name, ours to the private name),
 	// then restore the source to `from`. Never unlinks foreign bytes.
+	// Declared before it can repopulate the slot: res re-opens first so
+	// every crash window reads outcome-unknown.
+	it.njRes("")
+	it.njAct("und", relTo)
 	uerr := undoDisplaced(srcPfd, dstPfd, stage, dstName,
 		func(t3 string) bool { return t3 == src3 })
+	if uerr == nil {
+		it.njRes("ok") // the slot provably holds our source again
+	}
 	if uerr == nil {
 		// Our source is back under the private name — return it home.
 		return restoreSrc(fail)
