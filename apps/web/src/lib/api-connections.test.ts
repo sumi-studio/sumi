@@ -1,5 +1,84 @@
 import { expect, it, vi } from "vitest";
-import { createAPIConnectionsClient } from "./api-connections";
+import {
+  APIConnectionError,
+  createAPIConnectionsClient,
+} from "./api-connections";
+
+async function saveFailure(response: Response) {
+  const client = createAPIConnectionsClient(async (path) =>
+    path === "/auth/csrf"
+      ? Response.json({ csrf_token: "a".repeat(43) })
+      : response,
+  );
+  return client
+    .save(
+      {
+        name: "n",
+        preset: "openai-chat",
+        baseUrl: "https://x.example",
+        model: "m",
+      },
+      undefined,
+      new AbortController().signal,
+    )
+    .then(
+      () => expect.unreachable(),
+      (error: unknown) => error,
+    );
+}
+
+it("shows the API's input-validation reason for a 400", async () => {
+  const error = await saveFailure(
+    Response.json(
+      {
+        error: {
+          message: "接続の入力内容を確認してください。",
+          detail:
+            'extra header "Authorization" is reserved by the request itself',
+        },
+      },
+      { status: 400 },
+    ),
+  );
+  expect(error).toBeInstanceOf(APIConnectionError);
+  expect((error as APIConnectionError).message).toBe(
+    '接続を変更できませんでした。入力内容を確認してください。 extra header "Authorization" is reserved by the request itself',
+  );
+});
+
+it("never carries a diagnostic body into the displayable message", async () => {
+  const diagnostic = "dial tcp 10.0.0.7:5432: connection refused";
+  const cases = [
+    Response.json(
+      { error: { message: diagnostic, detail: diagnostic } },
+      { status: 503 },
+    ),
+    Response.json({ error: { detail: diagnostic } }, { status: 502 }),
+    new Response(`<html>${diagnostic}</html>`, { status: 400 }),
+    Response.json(
+      { error: { detail: { nested: diagnostic } } },
+      { status: 400 },
+    ),
+    Response.json(
+      { error: { detail: `${diagnostic}\n${"x".repeat(20)}` } },
+      { status: 400 },
+    ),
+    Response.json(
+      { error: { detail: diagnostic.repeat(20) } },
+      { status: 400 },
+    ),
+    Response.json({ error: diagnostic }, { status: 401 }),
+  ];
+  for (const response of cases) {
+    const error = await saveFailure(response);
+    expect(error).toBeInstanceOf(APIConnectionError);
+    expect((error as APIConnectionError).message).not.toContain("dial tcp");
+    expect((error as APIConnectionError).status).toBe(response.status);
+  }
+  expect(
+    ((await saveFailure(new Response(null, { status: 404 }))) as Error).message,
+  ).toBe("接続が見つかりません。状態を更新してください。");
+});
 
 it("uses session-bound BYOK routes, explicit none and write-only credential submission", async () => {
   const connection = {

@@ -50,26 +50,26 @@ async function collect(p: OpenAIProvider): Promise<ModelEvent[]> {
   return out;
 }
 
-const sse = (lines: string[]) =>
-  (res: http.ServerResponse) => {
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    res.end(lines.map((l) => `data: ${l}\n\n`).join(""));
-  };
+const sse = (lines: string[]) => (res: http.ServerResponse) => {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end(lines.map((l) => `data: ${l}\n\n`).join(""));
+};
 
 const chunk = (obj: unknown) => JSON.stringify(obj);
-const text = (s: string) =>
-  chunk({ choices: [{ delta: { content: s } }] });
+const text = (s: string) => chunk({ choices: [{ delta: { content: s } }] });
 const fin = (reason: string) =>
   chunk({ choices: [{ delta: {}, finish_reason: reason }] });
 
 test("clean stream: text, finish_reason in usage, done", async () => {
   await withServer(
-    (_req, res) =>
-      sse([text("hello"), fin("stop"), "[DONE]"])(res),
+    (_req, res) => sse([text("hello"), fin("stop"), "[DONE]"])(res),
     async (base) => {
       const evs = await collect(provider(base));
       assert.equal(
-        evs.filter((e) => e.type === "text").map((e) => e.delta).join(""),
+        evs
+          .filter((e) => e.type === "text")
+          .map((e) => e.delta)
+          .join(""),
         "hello",
       );
       const done = evs.find((e) => e.type === "done")!;
@@ -102,7 +102,11 @@ test("in-band permanent error chunk is non-retryable (F2)", async () => {
     (_req, res) =>
       sse([
         chunk({
-          error: { message: "invalid model", code: 400, type: "invalid_request_error" },
+          error: {
+            message: "invalid model",
+            code: 400,
+            type: "invalid_request_error",
+          },
         }),
         "[DONE]",
       ])(res),
@@ -118,7 +122,7 @@ test("in-band permanent error chunk is non-retryable (F2)", async () => {
 
 test("EOF without [DONE] or finish_reason is an incomplete-stream failure (F2)", async () => {
   await withServer(
-    (_req, res) => sse([text("half a reply") ])(res),
+    (_req, res) => sse([text("half a reply")])(res),
     async (base) => {
       await assert.rejects(collect(provider(base)), (e: unknown) => {
         assert.ok(e instanceof ModelError);
@@ -404,9 +408,7 @@ test("non-capacity errors are never classified as context refusal", async () => 
   await withServer(
     (_req, res) => {
       res.writeHead(500);
-      res.end(
-        JSON.stringify({ error: { message: "token limit exceeded" } }),
-      );
+      res.end(JSON.stringify({ error: { message: "token limit exceeded" } }));
     },
     async (base) => {
       await assert.rejects(collect(provider(base)), (e: unknown) => {
@@ -424,16 +426,14 @@ test('an "error": null chunk is not an error — stream completes (NF1)', async 
     (_req, res) =>
       // LiteLLM and some OpenAI-compatible routers serialize a null
       // error field on ordinary chunks.
-      sse([
-        chunk({ error: null }),
-        text("hello"),
-        fin("stop"),
-        "[DONE]",
-      ])(res),
+      sse([chunk({ error: null }), text("hello"), fin("stop"), "[DONE]"])(res),
     async (base) => {
       const evs = await collect(provider(base));
       assert.equal(
-        evs.filter((e) => e.type === "text").map((e) => e.delta).join(""),
+        evs
+          .filter((e) => e.type === "text")
+          .map((e) => e.delta)
+          .join(""),
         "hello",
       );
       assert.ok(evs.some((e) => e.type === "done"));
@@ -457,7 +457,11 @@ const toolCallChunk = (args: string) =>
       {
         delta: {
           tool_calls: [
-            { index: 0, id: "c1", function: { name: "journal_note", arguments: args } },
+            {
+              index: 0,
+              id: "c1",
+              function: { name: "journal_note", arguments: args },
+            },
           ],
         },
       },
@@ -471,10 +475,13 @@ test("tools are offered inside the {route, input} envelope and the chosen route 
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", () => {
-        offered = (JSON.parse(body) as { tools: { function: { parameters: unknown } }[] })
-          .tools[0]?.function.parameters;
+        offered = (
+          JSON.parse(body) as { tools: { function: { parameters: unknown } }[] }
+        ).tools[0]?.function.parameters;
         sse([
-          toolCallChunk(JSON.stringify({ route: "elevated", input: { text: "x" } })),
+          toolCallChunk(
+            JSON.stringify({ route: "elevated", input: { text: "x" } }),
+          ),
           fin("tool_calls"),
           "[DONE]",
         ])(res);
@@ -482,7 +489,10 @@ test("tools are offered inside the {route, input} envelope and the chosen route 
     },
     async (base) => {
       const out: ModelEvent[] = [];
-      for await (const ev of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+      for await (const ev of provider(base).stream({
+        ...REQ,
+        tools: [NOTE_TOOL],
+      })) {
         out.push(ev);
       }
       assert.deepEqual(offered, {
@@ -490,14 +500,20 @@ test("tools are offered inside the {route, input} envelope and the chosen route 
         additionalProperties: false,
         required: ["route", "input"],
         properties: {
-          route: (offered as { properties: { route: unknown } }).properties.route,
+          route: (offered as { properties: { route: unknown } }).properties
+            .route,
           input: NOTE_TOOL.parameters,
         },
       });
       const call = out.find((e) => e.type === "tool_call");
       assert.deepEqual(call, {
         type: "tool_call",
-        call: { id: "c1", name: "journal.note", route: "elevated", arguments: { text: "x" } },
+        call: {
+          id: "c1",
+          name: "journal.note",
+          route: "elevated",
+          arguments: { text: "x" },
+        },
       });
     },
   );
@@ -512,19 +528,109 @@ test("a call without a valid route is malformed, never treated as normal", async
   ]) {
     await withServer(
       (_req, res) =>
-        sse([toolCallChunk(JSON.stringify(args)), fin("tool_calls"), "[DONE]"])(res),
+        sse([toolCallChunk(JSON.stringify(args)), fin("tool_calls"), "[DONE]"])(
+          res,
+        ),
       async (base) => {
         await assert.rejects(
           (async () => {
-            for await (const _ of provider(base).stream({ ...REQ, tools: [NOTE_TOOL] })) {
+            for await (const _ of provider(base).stream({
+              ...REQ,
+              tools: [NOTE_TOOL],
+            })) {
               /* drain */
             }
           })(),
           (e: unknown) =>
-            e instanceof ModelError && e.retryable && /malformed call envelope/.test(e.message),
+            e instanceof ModelError &&
+            e.retryable &&
+            /malformed call envelope/.test(e.message),
           JSON.stringify(args),
         );
       },
     );
   }
+});
+
+test("a reserved extra header fails the call, never the credential", async () => {
+  const p = new OpenAIProvider({
+    baseUrl: "http://127.0.0.1:1",
+    apiKey: "test-key",
+    model: "test-model",
+    headers: { Authorization: "Bearer spoof" },
+  });
+  await assert.rejects(
+    collect(p),
+    (e: unknown) =>
+      e instanceof ModelError && !e.retryable && /reserved/.test(e.message),
+  );
+});
+
+test("a replayed call keeps a valid wire name after the tool leaves the advertised set", async () => {
+  let parsed: {
+    messages?: {
+      role: string;
+      tool_calls?: { id: string; function: { name: string } }[];
+    }[];
+  } = {};
+  await withServer(
+    (req, res) => {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        parsed = JSON.parse(body) as typeof parsed;
+        sse([fin("stop"), "[DONE]"])(res);
+      });
+    },
+    async (base) => {
+      // journal.note ran in an earlier generation; this consultation no
+      // longer advertises it. The replayed canonical name must still
+      // become the wire-legal form, not the raw dotted name.
+      for await (const _ of provider(base).stream({
+        ...REQ,
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              {
+                id: "c1",
+                name: "journal.note",
+                route: "normal",
+                arguments: { text: "x" },
+              },
+            ],
+          },
+          { role: "tool", toolCallId: "c1", content: '{"ok":true}' },
+        ],
+      })) {
+        /* drain */
+      }
+    },
+  );
+  const replayed = parsed.messages?.[0]?.tool_calls?.[0];
+  assert.equal(replayed?.id, "c1");
+  assert.equal(replayed?.function.name, "journal_note");
+});
+
+test("a configured session header carries the persona's stable identity", async () => {
+  let sessionHeader: string | undefined;
+  await withServer(
+    (req, res) => {
+      sessionHeader = req.headers["x-opencode-session"] as string | undefined;
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => sse([fin("stop"), "[DONE]"])(res));
+    },
+    async (base) => {
+      const p = new OpenAIProvider({
+        baseUrl: base,
+        apiKey: "test-key",
+        model: "test-model",
+        sessionHeader: "x-opencode-session",
+      });
+      await collect(p);
+    },
+  );
+  assert.equal(sessionHeader, "p");
 });
