@@ -1920,8 +1920,29 @@ func writeThreadCreateError(w http.ResponseWriter, err error) bool {
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {
+	var limited *RateLimitedError
+	if errors.As(err, &limited) {
+		writeRateLimited(w, limited.RetryAfter)
+		return
+	}
 	status, code := storeErrorResponse(err)
 	writeError(w, status, code)
+}
+
+// writeRateLimited is the one 429 shape for Messaging admission: Retry-After,
+// Cache-Control: no-store, and a retry_after_ms the client can wait on
+// verbatim. The refused operation consumed nothing durable.
+func writeRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
+	ms := retryAfter.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt((ms+999)/1000, 10))
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"error":          "rate_limited",
+		"retry_after_ms": ms,
+	})
 }
 
 // storeErrorResponse is shared by REST responses and WebSocket error frames.
@@ -1947,6 +1968,8 @@ func storeErrorResponse(err error) (int, string) {
 		return http.StatusConflict, "edit_conflict"
 	case errors.Is(err, ErrIdempotencyConflict):
 		return http.StatusConflict, "idempotency_conflict"
+	case errors.As(err, new(*RateLimitedError)):
+		return http.StatusTooManyRequests, "rate_limited"
 	case errors.Is(err, ErrAttachmentNotFound):
 		return http.StatusNotFound, "not_found"
 	case errors.Is(err, ErrAttachmentTooLarge):

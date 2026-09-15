@@ -139,6 +139,29 @@ service は次をしてはいけない。
 **外す条件**: AttentionCandidate の発行と、本人の判断
 （interrupt / inject / defer / observe）の経路が揃ったとき。
 
+## operation admission（実装済み）
+
+rate limit は境界自身の権限として messaging service（API プロセス）に
+実装する（`apps/api/internal/messaging/admission.go`）。edge の粗い
+ingress shed は別層であり、本契約の正本ではない。
+
+- **順序**: nonce replay の照合を rate bucket より先に行う。commit 済み
+  send の retry は bucket が空でも同じ receipt（message_id / seq）へ届く。
+  新しい durable mutation だけが token を消費する。
+- **key**: `(Workspace, AppInstallation, actor)`。human と
+  personality_agent で operation・閾値・retry 意味論を変えない。
+- **REST**: 拒否は `429` + `Retry-After` + `retry_after_ms` +
+  `Cache-Control: no-store`。拒否された send は seq・message・
+  notification intent を残さない。
+- **WS**: 認証と exact scope 確認の後、upgrade 前に connection lease を
+  取り、失敗経路と close で一度だけ解放する。durable send 超過は socket
+  を閉じず `rate_limited` + `client_nonce` + `retry_after_ms` を返す。
+- **upload**: 認可と nonce receipt 照合を body 読取りの前に行う。拒否は
+  body を 1 byte も読まない。
+- **制約**: in-memory・single-process。bucket/lease は restart で reset
+  される。2 つ目の API replica が必要になった時点で shared limiter を
+  再設計する。
+
 ## 未確定（本書では凍結しない）
 
 - 配送に関わる四境界の所有関係。messaging backend / notification service /
