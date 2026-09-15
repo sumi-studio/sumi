@@ -80,6 +80,30 @@ export const OPENCODE_PRESETS: ReadonlySet<string> = new Set([
   "opencode-zen-go",
 ]);
 
+/**
+ * Whether the connection should send `x-opencode-session` with the
+ * persona's stable identity: the opencode-* presets always do, and any
+ * protocol preset pointed at an opencode.ai host needs it too — the Go
+ * gateway requires the header on chat, responses AND messages alike.
+ * Hostname match, not URL-prefix guessing; the base URL is already
+ * shape-validated upstream.
+ */
+export function opencodeSessionHeader(
+  preset: string,
+  baseUrl: string,
+): string | undefined {
+  if (OPENCODE_PRESETS.has(preset)) return "x-opencode-session";
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    if (host === "opencode.ai" || host.endsWith(".opencode.ai")) {
+      return "x-opencode-session";
+    }
+  } catch {
+    /* unparseable base URL fails at the store/binding boundary */
+  }
+  return undefined;
+}
+
 /** Non-secret identity of the connection a consultation actually used. */
 export type BindingIdentity =
   | { selection: "unset"; provider: string }
@@ -228,6 +252,12 @@ export class SelectedModelProvider implements ModelProvider {
     // the credential on the server) and reach only this connection's
     // endpoint.
     const headers = c.extra_headers;
+    // OpenCode Go requires x-opencode-session on every protocol endpoint
+    // (chat, responses and messages all answer 400 MissingSessionID
+    // without it — verified live). The header carries the persona's
+    // stable identity per request; it is sent whenever the connection
+    // targets OpenCode, whichever protocol preset was selected.
+    const sessionHeader = opencodeSessionHeader(c.preset, c.base_url);
     const shared = {
       baseUrl: c.base_url,
       apiKey: binding.api_key,
@@ -235,19 +265,13 @@ export class SelectedModelProvider implements ModelProvider {
       headers,
       timeoutMs: this.opts.timeoutMs,
       maxOutputTokens: c.max_output_tokens,
+      sessionHeader,
     };
     const provider: ModelProvider = RESPONSES_PRESETS.has(c.preset)
       ? new OpenAIResponsesProvider(shared)
       : ANTHROPIC_PRESETS.has(c.preset)
         ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
-        : new OpenAIProvider({
-            ...shared,
-            // OpenCode Go routes on a per-session header; the legacy agent
-            // supplied the PA's stable id — personaId is that identity here.
-            sessionHeader: OPENCODE_PRESETS.has(c.preset)
-              ? "x-opencode-session"
-              : undefined,
-          });
+        : new OpenAIProvider(shared);
     const identity: BindingIdentity = {
       selection: "api",
       connection_id: c.id,

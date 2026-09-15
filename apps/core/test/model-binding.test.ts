@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
-import { SelectedModelProvider } from "../src/host/provider-env.ts";
+import {
+  opencodeSessionHeader,
+  SelectedModelProvider,
+} from "../src/host/provider-env.ts";
 import {
   ModelError,
   type ModelEvent,
@@ -331,6 +334,37 @@ test("the connection's output bound reaches its wire; OpenCode carries the sessi
     await collect(p);
     assert.equal(seen.at(-1)!.sessionHeader, undefined);
   });
+});
+
+test("the OpenCode session header is chosen by preset or endpoint host", () => {
+  // The Go gateway 400s (MissingSessionID) on every protocol without
+  // x-opencode-session — verified live. Generic presets pointed at
+  // opencode.ai get the per-persona header on any protocol; non-OpenCode
+  // endpoints on generic presets never do.
+  assert.equal(
+    opencodeSessionHeader("openai-responses", "https://opencode.ai/zen/go/v1"),
+    "x-opencode-session",
+  );
+  assert.equal(
+    opencodeSessionHeader("anthropic", "https://opencode.ai/zen/go/v1"),
+    "x-opencode-session",
+  );
+  assert.equal(
+    opencodeSessionHeader("openai-chat", "https://api.openai.com/v1"),
+    undefined,
+  );
+  assert.equal(
+    opencodeSessionHeader("anthropic", "https://api.anthropic.com"),
+    undefined,
+  );
+  assert.equal(
+    opencodeSessionHeader("openai-responses", "http://127.0.0.1:8080"),
+    undefined,
+  );
+  assert.equal(
+    opencodeSessionHeader("opencode-go", "https://anything.example/v1"),
+    "x-opencode-session",
+  );
 });
 
 test("no selection uses the operator default; a lookup outage retries rather than guessing", async () => {

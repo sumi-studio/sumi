@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
+import { SelectedModelProvider } from "../src/host/provider-env.ts";
 import {
   MissingPersonaTokenError,
   SecretaryObject,
@@ -11,9 +12,8 @@ import type {
   ModelRequest,
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
-import { SelectedModelProvider } from "../src/host/provider-env.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import { StateError, type StateClient } from "../src/state-client.ts";
+import { type StateClient, StateError } from "../src/state-client.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000002";
 
@@ -91,10 +91,7 @@ test("duplicate wake is coalesced into one serialized drain — no self-fencing 
   assert.equal(r1.status, 200);
   await sleep(50); // drain 1 is mid-turn now
   const r2 = await obj.fetch(wakeReq());
-  assert.equal(
-    ((await r2.json()) as { coalesced?: boolean }).coalesced,
-    true,
-  );
+  assert.equal(((await r2.json()) as { coalesced?: boolean }).coalesced, true);
   await settle(ctx);
 
   // The input completed exactly once — no interrupted turn, no stranded
@@ -102,11 +99,13 @@ test("duplicate wake is coalesced into one serialized drain — no self-fencing 
   const outbox = await state.outbox(PERSONA, 0);
   assert.equal(outbox.length, 1);
   assert.equal(
-    [...state.turns.values()].filter((t) => t.status === "interrupted")
-      .length,
+    [...state.turns.values()].filter((t) => t.status === "interrupted").length,
     0,
   );
-  assert.equal(state.inputs.find((i) => i.input_id === "in-dup")!.status, "done");
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-dup")!.status,
+    "done",
+  );
   assert.ok(ctx.alarmAt() !== null, "fetch armed the heartbeat alarm");
 });
 
@@ -306,8 +305,15 @@ test("alarm drain keeps a branch alive past the turn budget and shelves its resu
   assert.equal(c.attempts, 0);
   assert.equal(c.interruptions, 0);
   assert.equal(provider.branchRequests, 1);
-  assert.ok(took >= 1_500, `the alarm held the branch to completion: ${took}ms`);
-  assert.equal(state.leases.get(PERSONA)!.expires_at < new Date().toISOString(), true, "lease released after the drain");
+  assert.ok(
+    took >= 1_500,
+    `the alarm held the branch to completion: ${took}ms`,
+  );
+  assert.equal(
+    state.leases.get(PERSONA)!.expires_at < new Date().toISOString(),
+    true,
+    "lease released after the drain",
+  );
 });
 
 test("alarm drain records a hanging branch as a retryable timeout and re-arms for the retry", async () => {
@@ -318,7 +324,15 @@ test("alarm drain records a hanging branch as a retryable timeout and re-arms fo
   const ctx = fakeCtx();
   const env = {
     ...fakeEnv,
-    SUMI_ALARM_DRAIN_LIFETIME_MS: "3000",
+    // One attempt per drain, deterministically: the drain starts a
+    // branch only when timeout+margin still fits the remaining lifetime
+    // (margin = lifetime/10), and a recorded timeout reshelves with a
+    // ~200ms backoff. 2000ms lifetime leaves no room for a second
+    // attempt — after the ~1000ms timeout, startMemory can never hold
+    // again — so attempts===1 is a real guarantee here, not a timing
+    // accident (a 3000ms lifetime legitimately admits a second attempt
+    // at ~1.2s, which is valid product behavior, not a defect).
+    SUMI_ALARM_DRAIN_LIFETIME_MS: "2000",
     SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "1000",
   };
   const obj = new TestObject(ctx as never, env as never, state, provider);
@@ -335,6 +349,19 @@ test("alarm drain records a hanging branch as a retryable timeout and re-arms fo
     armedIn > 0 && armedIn <= 1_500,
     `re-armed for the retry, not the 30s heartbeat: ${armedIn}ms`,
   );
+
+  // The retry the alarm was armed for: once the reshelve backoff has
+  // passed and the provider stops hanging, the next alarm claims the
+  // same chunk and completes it — attempts stays at the one recorded
+  // failure (success does not spend attempts).
+  provider.branchHangs = false;
+  await sleep(1_400); // past not_before (~timeout + 200ms backoff)
+  await obj.alarm();
+  const retried = state.memoryChunks[0]!;
+  assert.equal(retried.status, "prepared", JSON.stringify(retried));
+  assert.equal(retried.attempts, 1);
+  assert.equal(retried.interruptions, 0);
+  assert.equal(provider.branchRequests, 2, "the retry ran exactly once");
 });
 
 /**

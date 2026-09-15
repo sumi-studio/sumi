@@ -566,6 +566,40 @@ test("per-connection extra headers reach only this endpoint", async () => {
   );
 });
 
+test("a configured session header carries the persona's stable identity", async () => {
+  await withServer(
+    (_req, res) => sse([completed()])(res),
+    async (base, seen) => {
+      // A differently-cased stale value in extra headers must not
+      // combine — fetch would send "stale, p" and break routing.
+      await collect(
+        provider(base, {
+          sessionHeader: "x-opencode-session",
+          headers: { "X-OpenCode-Session": "stale" },
+        }),
+      );
+      // personaId "p" — the live per-persona identity, single value.
+      assert.equal(seen[0]!.req.headers["x-opencode-session"], "p");
+    },
+  );
+});
+
+test("the honest Sumi User-Agent is the default and stays overridable", async () => {
+  await withServer(
+    (_req, res) => sse([completed()])(res),
+    async (base, seen) => {
+      await collect(provider(base));
+      assert.equal(seen[0]!.req.headers["user-agent"], "sumi-secretary/alpha");
+      // Lowercase override: without case-insensitive replacement the
+      // wire would carry "sumi-secretary/alpha, operator-agent/1".
+      await collect(
+        provider(base, { headers: { "user-agent": "operator-agent/1" } }),
+      );
+      assert.equal(seen[1]!.req.headers["user-agent"], "operator-agent/1");
+    },
+  );
+});
+
 test("unparseable tool arguments fail the call", async () => {
   await withServer(
     (_req, res) =>

@@ -9,6 +9,15 @@
 import { ModelError, type ToolCall, type ToolSpec } from "../provider.ts";
 
 /**
+ * Honest client identity sent on every provider request. Providers and
+ * gateways (OpenCode Go's docs ask for it explicitly) want to identify
+ * the calling coding agent; undici otherwise sends the generic
+ * `User-Agent: node`. A connection's configured extra headers can still
+ * override this — adapter order puts it before `cfg.headers`.
+ */
+export const SUMI_USER_AGENT = "sumi-secretary/alpha";
+
+/**
  * Compose the caller's abort signal with a per-request wall-clock
  * deadline covering connect through the final streamed event — a stalled
  * provider must not hold a turn open forever (CR3-N1). `done` releases
@@ -506,6 +515,40 @@ export function assertExtraHeaders(
       );
     }
   }
+}
+
+/**
+ * Build the request header record with case-insensitive precedence.
+ * `fetch`'s Headers normalizes names but COMBINES differently-cased
+ * duplicates into a single comma-joined value — a plain object literal
+ * `{ "User-Agent": a, "user-agent": b }` would send
+ * `user-agent: a, b`. That silently defeats both an operator's UA
+ * override and the live session identity, so every layer is applied
+ * through case-insensitive replacement:
+ *
+ *   base     — adapter-owned fields (credentials, content-type,
+ *              anthropic-version) and the default honest UA;
+ *   extra    — per-connection configured headers; may override the
+ *              default UA (reserved names already rejected by
+ *              assertExtraHeaders);
+ *   session  — the live per-request persona identity; always wins.
+ */
+export function requestHeaders(
+  base: Record<string, string>,
+  extra: Record<string, string> | undefined,
+  session?: { header: string; value: string },
+): Record<string, string> {
+  const out = { ...base };
+  const set = (name: string, value: string) => {
+    const lower = name.toLowerCase();
+    for (const k of Object.keys(out)) {
+      if (k.toLowerCase() === lower) delete out[k];
+    }
+    out[name] = value;
+  };
+  for (const [k, v] of Object.entries(extra ?? {})) set(k, v);
+  if (session) set(session.header, session.value);
+  return out;
 }
 
 /** Parse a Retry-After header (delay-seconds or HTTP-date) into ms. */
