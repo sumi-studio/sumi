@@ -34,7 +34,7 @@ func fixture(t *testing.T) *Store {
 }
 func input() Input {
 	k := "test-secret"
-	return Input{"My API", "openai-chat", "https://provider.example/v1", "model", &k}
+	return Input{Name: "My API", Preset: "openai-chat", BaseURL: "https://provider.example/v1", Model: "model", APIKey: &k}
 }
 func TestIsolationSelectionRotationAndDelete(t *testing.T) {
 	s := fixture(t)
@@ -183,6 +183,131 @@ func TestCanonicalUUIDAndDisplayOnlyChange(t *testing.T) {
 	}
 }
 
+func TestExtraHeadersSealedWithCredential(t *testing.T) {
+	s := fixture(t)
+	ctx := context.Background()
+	in := input()
+	in.ExtraHeaders = map[string]string{"X-Gateway-Session": "gw-1", "X-Tenant": "blue"}
+	a, err := s.Save(ctx, owner, "", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Values live inside the ciphertext: nothing readable at rest.
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, "SELECT credential_ciphertext FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", owner, a.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"test-secret", "gw-1", "X-Gateway-Session", "blue"} {
+		if bytes.Contains(raw, []byte(leak)) {
+			t.Fatalf("ciphertext leaks %q", leak)
+		}
+	}
+	access, err := s.Resolve(ctx, owner, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access.APIKey != "test-secret" || access.ExtraHeaders["X-Gateway-Session"] != "gw-1" || access.ExtraHeaders["X-Tenant"] != "blue" {
+		t.Fatalf("resolve %+v", access)
+	}
+	// Headers are credential material: changing them requires the key.
+	in.APIKey = nil
+	in.ExtraHeaders = map[string]string{"X-Tenant": "red"}
+	if _, err = s.Save(ctx, owner, a.ID, in); !errors.Is(err, ErrInvalid) {
+		t.Fatal("headers without key accepted", err)
+	}
+	// Resubmitting the key replaces both key and headers.
+	key := "test-secret-2"
+	in.APIKey = &key
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, err = s.Resolve(ctx, owner, a.ID)
+	if err != nil || access.APIKey != key || len(access.ExtraHeaders) != 1 || access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatalf("rotated resolve %+v", access)
+	}
+	// An update without the headers field keeps them.
+	in.ExtraHeaders = nil
+	in.APIKey = nil
+	in.Name = "renamed"
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatal("keyless edit dropped stored headers")
+	}
+	// Rotating the key alone — the UI's default rotation flow sends no
+	// headers field — must also keep the stored set (F1).
+	key3 := "test-secret-3"
+	in.APIKey = &key3
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if access.APIKey != key3 || access.ExtraHeaders["X-Tenant"] != "red" {
+		t.Fatalf("key rotation dropped stored headers: %+v", access)
+	}
+	// Clearing headers explicitly requires the key.
+	in.APIKey = &key
+	in.ExtraHeaders = map[string]string{}
+	if _, err = s.Save(ctx, owner, a.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, _ = s.Resolve(ctx, owner, a.ID)
+	if len(access.ExtraHeaders) != 0 {
+		t.Fatal("explicit clear did not clear")
+	}
+}
+
+func TestHeaderValidation(t *testing.T) {
+	key := "k"
+	ok := input()
+	ok.ExtraHeaders = map[string]string{"X-Gateway-Session": "gw-1"}
+	if err := Validate(ok); err != nil {
+		t.Fatal(err)
+	}
+	bad := []map[string]string{
+		{"Authorization": "x"},
+		{"x-api-key": "x"},
+		{"Content-Type": "x"},
+		{"Host": "x"},
+		{"Cookie": "x"},
+		{"bad name": "x"},
+		{"": "x"},
+		{"X-Ok": "line\nbreak"},
+		{"X-Ok": strings.Repeat("v", 1025)},
+		{strings.Repeat("n", 129): "x"},
+		// Beyond Latin-1 fetch cannot put the value on the wire: reject at
+		// write instead of deterministically failing every request.
+		{"X-Ok": "値"},
+		{"X-Ok": "emoji🎉"},
+	}
+	for _, h := range bad {
+		in := input()
+		in.ExtraHeaders = h
+		if err := Validate(in); err == nil {
+			t.Errorf("accepted headers %v", h)
+		}
+	}
+	// Headers without a key cannot be sealed — rejected on create and update.
+	in := input()
+	in.APIKey = nil
+	in.ExtraHeaders = map[string]string{"X-Ok": "v"}
+	if err := Validate(in); err == nil {
+		t.Error("headers without key accepted")
+	}
+	many := map[string]string{}
+	for i := 0; i < 17; i++ {
+		many[string(rune('a'+i))] = "v"
+	}
+	in = input()
+	in.APIKey = &key
+	in.ExtraHeaders = many
+	if err := Validate(in); err == nil {
+		t.Error("17 headers accepted")
+	}
+}
+
 func TestMissingEncryptionKeyPreservesSelectionsAndRejectsCredentials(t *testing.T) {
 	store := fixture(t)
 	ctx := context.Background()
@@ -214,5 +339,64 @@ func TestMissingEncryptionKeyPreservesSelectionsAndRejectsCredentials(t *testing
 	}
 	if _, err := store.Resolve(ctx, owner, connection.ID); err != nil {
 		t.Fatal("restored original key no longer decrypts", err)
+	}
+}
+
+func TestMaxOutputTokensPersistsAsConnectionMetadata(t *testing.T) {
+	s := fixture(t)
+	ctx := context.Background()
+	in := input()
+	in.Preset = "anthropic" // a bound is only meaningful on bound-sending presets
+	bound := 8192
+	in.MaxOutputTokens = &bound
+	c, err := s.Save(ctx, owner, "", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxOutputTokens == nil || *c.MaxOutputTokens != 8192 {
+		t.Fatalf("saved connection %+v", c)
+	}
+	list, err := s.List(ctx, owner)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list %v %+v", err, list)
+	}
+	if list[0].MaxOutputTokens == nil || *list[0].MaxOutputTokens != 8192 {
+		t.Fatalf("list omitted the bound: %+v", list[0])
+	}
+	meta, err := s.Describe(ctx, owner, c.ID)
+	if err != nil || meta.Connection.MaxOutputTokens == nil || *meta.Connection.MaxOutputTokens != 8192 {
+		t.Fatalf("describe %+v %v", meta, err)
+	}
+	// Non-secret metadata: present on the readable row, not inside the
+	// sealed credential payload.
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, "SELECT credential_ciphertext FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", owner, c.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("8192")) {
+		t.Fatal("output bound leaked into the credential payload")
+	}
+	// A plain metadata update replaces the bound (unset clears to default).
+	in.MaxOutputTokens = nil
+	if _, err = s.Save(ctx, owner, c.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	access, err := s.Resolve(ctx, owner, c.ID)
+	if err != nil || access.Connection.MaxOutputTokens != nil {
+		t.Fatalf("cleared bound still present: %+v", access.Connection)
+	}
+	for _, v := range []int{0, -5, 1_000_001} {
+		in.MaxOutputTokens = &v
+		if _, err = s.Save(ctx, owner, c.ID, in); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("accepted bound %d: %v", v, err)
+		}
+	}
+	// On a chat-completions preset no adapter sends an output bound — a
+	// saved value would be a silently ineffective setting, so it is
+	// refused at the write boundary rather than stored.
+	in.MaxOutputTokens = &bound
+	in.Preset = "openai-chat"
+	if _, err = s.Save(ctx, owner, c.ID, in); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("accepted a bound on a chat preset: %v", err)
 	}
 }
