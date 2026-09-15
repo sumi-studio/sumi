@@ -36,7 +36,17 @@
  * not spin claim/probe/release at the 1s floor.
  *
  * Env bindings (worker config):
- *   SUMI_STATE_URL    — base URL of the Go state service
+ *   SUMI_STATE_URL    — base URL of the Go state service (with SUMI_STATE,
+ *                       the path base and Host header only)
+ *   SUMI_STATE        — optional fetcher (a Workers VPC Service binding in
+ *                       Cloud) that carries every state request; absent, the
+ *                       global fetch reaches SUMI_STATE_URL directly
+ *   SUMI_CORE_RUNTIME_TOKEN — state credential for any persona's scoped
+ *                       routes; a SUMI_PERSONA_TOKEN_<id> binding still wins
+ *   SUMI_CORE_WAKE_TOKEN — bearer required on /personas/:id/wake and
+ *                       /health/state. Without it those routes answer 503,
+ *                       except SUMI_CORE_WAKE_OPEN=loopback-dev on a loopback
+ *                       host (local wrangler dev)
  *   SUMI_MODEL_*      — provider config (same as local host)
  *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
  *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
@@ -55,10 +65,10 @@
  * own secret store, never in DO storage.
  */
 
-import { providerForPersona } from "./provider-env.ts";
 import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory.ts";
 import { Secretary } from "../secretary.ts";
 import { HttpStateClient } from "../state-client.ts";
+import { providerForPersona } from "./provider-env.ts";
 
 /** Minimal structural types — avoids a workers-types hard dependency. */
 interface DOStorage {
@@ -73,8 +83,16 @@ interface AlarmState {
   storage: DOStorage;
 }
 
+interface FetcherLike {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
 interface EnvLike {
   SUMI_STATE_URL: string;
+  SUMI_STATE?: FetcherLike;
+  SUMI_CORE_RUNTIME_TOKEN?: string;
+  SUMI_CORE_WAKE_TOKEN?: string;
+  SUMI_CORE_WAKE_OPEN?: string;
   SUMI_MODEL_PROVIDER?: string;
   SUMI_HEARTBEAT_MS?: string;
   SECRETARY: {
@@ -120,8 +138,10 @@ export class MissingPersonaTokenError extends Error {
 
 function envToken(env: EnvLike, persona: string): string {
   const v = env[`SUMI_PERSONA_TOKEN_${persona.replace(/-/g, "_")}`];
-  if (typeof v !== "string" || !v) throw new MissingPersonaTokenError(persona);
-  return v;
+  if (typeof v === "string" && v) return v;
+  const runtime = env.SUMI_CORE_RUNTIME_TOKEN;
+  if (typeof runtime === "string" && runtime) return runtime;
+  throw new MissingPersonaTokenError(persona);
 }
 
 export class SecretaryObject {
@@ -191,9 +211,11 @@ export class SecretaryObject {
 
   /** Build the per-persona secretary; overridable for tests. */
   protected newSecretary(personaId: string): Secretary {
+    const binding = this.env.SUMI_STATE;
     const state = new HttpStateClient(
       this.env.SUMI_STATE_URL,
       envToken(this.env, personaId),
+      binding ? (input, init) => binding.fetch(String(input), init) : undefined,
     );
     // The persona's selected model connection is authoritative — resolved
     // through the state service for every model call, with env config only
@@ -426,19 +448,108 @@ export class SecretaryObject {
   }
 }
 
+const UUIDV7 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** Compare secrets through fixed-length digests, without early exit. */
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const xa = new Uint8Array(x);
+  const ya = new Uint8Array(y);
+  let diff = 0;
+  for (let i = 0; i < xa.length; i++) diff |= (xa[i] ?? 0) ^ (ya[i] ?? 0);
+  return diff === 0;
+}
+
+/**
+ * Null when the caller may use a protected route. Waking creates or
+ * resumes a Durable Object that spends model and state calls, so it is
+ * never open on a public hostname.
+ */
+export async function wakeRefusal(
+  request: Request,
+  env: EnvLike,
+): Promise<Response | null> {
+  const token =
+    typeof env.SUMI_CORE_WAKE_TOKEN === "string"
+      ? env.SUMI_CORE_WAKE_TOKEN
+      : "";
+  if (!token) {
+    if (
+      env.SUMI_CORE_WAKE_OPEN === "loopback-dev" &&
+      LOOPBACK_HOSTS.has(new URL(request.url).hostname)
+    ) {
+      return null;
+    }
+    return Response.json({ error: "wake is not configured" }, { status: 503 });
+  }
+  const header = request.headers.get("Authorization") ?? "";
+  const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!presented || !(await sameSecret(presented, token))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return null;
+}
+
+/**
+ * Reachability of the state service along the same path the secretaries
+ * use (the SUMI_STATE binding when present). 503 when it cannot answer.
+ */
+async function stateHealth(env: EnvLike): Promise<Response> {
+  const started = Date.now();
+  const via = env.SUMI_STATE ? "binding" : "fetch";
+  const target = `${env.SUMI_STATE_URL.replace(/\/+$/, "")}/health`;
+  try {
+    const init = { signal: AbortSignal.timeout(5_000) };
+    const res = env.SUMI_STATE
+      ? await env.SUMI_STATE.fetch(target, init)
+      : await fetch(target, init);
+    await res.body?.cancel();
+    return Response.json(
+      { ok: res.ok, via, state_status: res.status, ms: Date.now() - started },
+      { status: res.ok ? 200 : 503 },
+    );
+  } catch (e) {
+    return Response.json(
+      {
+        ok: false,
+        via,
+        error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+        ms: Date.now() - started,
+      },
+      { status: 503 },
+    );
+  }
+}
+
 /** Worker entry: POST /personas/:id/wake triggers the DO for that persona. */
 export default {
   async fetch(request: Request, env: EnvLike): Promise<Response> {
     const url = new URL(request.url);
     const m = /^\/personas\/([^/]+)\/wake$/.exec(url.pathname);
     if (request.method === "POST" && m) {
+      const refused = await wakeRefusal(request, env);
+      if (refused) return refused;
       const persona = m[1];
-      if (!persona)
-        return Response.json({ error: "persona required" }, { status: 400 });
+      if (!persona || !UUIDV7.test(persona))
+        return Response.json(
+          { error: "persona must be a uuidv7" },
+          { status: 400 },
+        );
       const id = env.SECRETARY.idFromName(persona);
       return env.SECRETARY.get(id).fetch(request);
     }
     if (url.pathname === "/health") return Response.json({ ok: true });
+    if (request.method === "GET" && url.pathname === "/health/state") {
+      const refused = await wakeRefusal(request, env);
+      if (refused) return refused;
+      return stateHealth(env);
+    }
     return Response.json({ error: "not found" }, { status: 404 });
   },
 };

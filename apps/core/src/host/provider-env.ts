@@ -20,7 +20,11 @@
  * A selection that cannot be honored is a non-retryable model failure the
  * user can see, never a silent fallback to a different model.
  *
- *   SUMI_MODEL_PROVIDER=mock|openai   (default mock)
+ *   SUMI_MODEL_PROVIDER=mock|openai|none   (default mock; none = an
+ *                                      unselected persona has no model and
+ *                                      its requests fail visibly — the Cloud
+ *                                      setting, where no operator model may
+ *                                      answer for a user)
  *   SUMI_MODEL_BASE_URL / _API_KEY / _MODEL   (openai)
  *   SUMI_MODEL_HEADERS_JSON           (openai; static extra request headers
  *                                      as a JSON object, e.g. a provider
@@ -169,6 +173,9 @@ export class SelectedModelProvider implements ModelProvider {
     }
     switch (binding.selection) {
       case "unset":
+        if (this.opts.fallback instanceof NoSelectionProvider) {
+          throw unusable(NO_SELECTION_MESSAGE);
+        }
         return {
           provider: this.opts.fallback,
           identity: { selection: "unset", provider: this.opts.fallback.name },
@@ -257,6 +264,22 @@ function unusable(message: string): ModelError {
   return new ModelError(message, { retryable: false, unavailable: true });
 }
 
+const NO_SELECTION_MESSAGE =
+  "no model connection is selected for this secretary; choose a connection to let the secretary answer";
+
+/** SUMI_MODEL_PROVIDER=none: the env default is "no model". */
+export class NoSelectionProvider implements ModelProvider {
+  readonly name = "none";
+
+  stream(_request: ModelRequest): AsyncIterable<ModelEvent> {
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: () => Promise.reject(unusable(NO_SELECTION_MESSAGE)),
+      }),
+    };
+  }
+}
+
 export function providerFromEnv(
   get: (name: string) => string | undefined,
 ): ModelProvider {
@@ -282,6 +305,7 @@ export function providerFromEnv(
       timeoutMs: numEnv(get, "SUMI_MODEL_TIMEOUT_MS", 120_000),
     });
   }
+  if (kind === "none") return new NoSelectionProvider();
   if (kind !== "mock") throw new Error(`unknown SUMI_MODEL_PROVIDER ${kind}`);
   return new MockProvider();
 }

@@ -102,6 +102,7 @@ func run(ctx context.Context) (runErr error) {
 
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
+	app.startCoreWaker()
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startChatGPTActivation()
@@ -255,6 +256,7 @@ type application struct {
 	deliverFeedbackAttention   func(context.Context) error
 	cleanupFeedbackAttachments func(context.Context) error
 	attentionWorkers           sync.WaitGroup
+	coreWaker                  *agentstate.RuntimeWaker
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -652,6 +654,7 @@ func newApplicationFromEnv() (*application, error) {
 	// control-plane database exists. Developer/operator credential scope; see
 	// internal/agentstate for the authorization model.
 	var coreServer *agentstate.Server
+	var coreWaker *agentstate.RuntimeWaker
 	if coreToken := strings.TrimSpace(os.Getenv("SUMI_CORE_STATE_TOKEN")); coreToken != "" && database != nil {
 		if len(coreToken) < 16 {
 			closeOnError()
@@ -659,6 +662,24 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		coreServer = agentstate.NewServer(database.Pool, coreToken)
 		coreServer.SetModelConnections(modelConnections)
+		// A Cloud core host (Durable Objects) authenticates with one runtime
+		// credential and is woken from here; a Local host needs neither.
+		if runtimeToken := strings.TrimSpace(os.Getenv(agentstate.RuntimeTokenEnv)); runtimeToken != "" {
+			if err := coreServer.SetRuntimeToken(runtimeToken); err != nil {
+				closeOnError()
+				return nil, err
+			}
+			log.Print("core state accepts the runtime credential for persona-scoped routes")
+		}
+		waker, err := agentstate.RuntimeWakerFromEnv(coreServer.Store(), os.Getenv)
+		if err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if waker != nil {
+			coreWaker = waker
+			log.Printf("core wake: sweeping for personas awaiting a runtime; waking %s", waker.Target())
+		}
 		coreServer.RegisterRoutes(mux)
 		portable.NewServer(database.Pool, coreToken).RegisterRoutes(mux)
 		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")
@@ -726,6 +747,7 @@ func newApplicationFromEnv() (*application, error) {
 		chatGPTLogin:               chatGPTLogin,
 		chatGPTActivation:          chatGPTActivation,
 		deliverAttention:           deliverAttention,
+		coreWaker:                  coreWaker,
 		publicMux:                  mux,
 		localMux:                   localMux,
 		localListener:              localListener,
