@@ -42,11 +42,21 @@ export async function listCoreApprovals(
       : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw await readError(response);
-  const body = (await response.json()) as ApprovalListResponse;
-  return {
-    human: typeof body.human === "string" ? body.human : undefined,
-    approvals: Array.isArray(body.approvals) ? body.approvals : [],
-  };
+  // A 200 that cannot say whose inbox it is, or carries no list, is not an
+  // inbox: reporting it as an honest empty would hide real pending requests.
+  const body = (await response.json().catch(() => null)) as {
+    human?: unknown;
+    approvals?: unknown;
+  } | null;
+  if (
+    !body ||
+    typeof body.human !== "string" ||
+    body.human === "" ||
+    !Array.isArray(body.approvals)
+  ) {
+    throw new ApprovalsAPIError("invalid_response", response.status);
+  }
+  return { human: body.human, approvals: body.approvals as CoreApproval[] };
 }
 
 /**

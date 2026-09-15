@@ -62,9 +62,10 @@ export interface ApprovalListResponse {
   /**
    * The session human the rows belong to, echoed by the server so the client
    * projection can prove its data describes the currently signed-in account —
-   * not a stale snapshot a previous login left behind.
+   * not a stale snapshot a previous login left behind. A response without it
+   * is rejected as malformed rather than read as an empty inbox.
    */
-  human?: string;
+  human: string;
 }
 
 /** A browser decision never names its decider — the session does. */

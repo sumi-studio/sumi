@@ -22,9 +22,30 @@ import { Link } from "@tanstack/react-router";
 import { ShieldCheck } from "lucide-react";
 import { useEffect } from "react";
 import type { CoreApproval } from "./model";
-import { useCoreApprovals } from "./store";
+import { type DecisionNotice, useCoreApprovals } from "./store";
 
 const POLL_INTERVAL_MS = 30_000;
+
+/**
+ * What happened to a click whose card has since left the inbox. Every text
+ * states only what this placement knows: the operation was not accepted here.
+ * None claims the decision took effect or that a transfer completed.
+ */
+function decisionNoticeText(code: string): string {
+  switch (code) {
+    case "persona_inactive":
+      return "秘書が別の場所へ移る手続きに入っているため、今回の操作はここでは受け付けられませんでした。依頼の記録は秘書のデータとともに保持されています。";
+    case "approval_conflict":
+    case "approval_not_pending":
+      return "この依頼はすでに別の操作で処理されていたため、今回の操作はここでは受け付けられませんでした。";
+    case "approval_not_found":
+      return "この依頼が見つからなかったため、今回の操作はここでは受け付けられませんでした。";
+    case "forbidden":
+      return "この依頼を操作する権限がないため、今回の操作はここでは受け付けられませんでした。";
+    default:
+      return "この依頼は一覧から外れました。今回の操作の結果はここでは確認できません。";
+  }
+}
 
 /**
  * Keeps the durable approval inbox converged for one signed-in human:
@@ -58,6 +79,7 @@ function useApprovalsSync(accountID: string) {
 }
 
 const NO_APPROVALS: CoreApproval[] = [];
+const NO_NOTICES: DecisionNotice[] = [];
 
 /** Rail entry point for the session human's secretary approval inbox. */
 export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
@@ -66,19 +88,34 @@ export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
   const owner = useCoreApprovals((state) => state.owner);
   const allPending = useCoreApprovals((state) => state.pending);
   const allResolved = useCoreApprovals((state) => state.resolved);
+  const allNotices = useCoreApprovals((state) => state.notices);
+  const dismissNotices = useCoreApprovals((state) => state.dismissNotices);
   // Rows render only while the store's data provably belongs to this account:
   // a server-tagged owner that predates the switch must not reach the DOM for
   // even the single commit before the sync effect's cleanup runs.
   const owned = owner === accountID;
   const pending = owned ? allPending : NO_APPROVALS;
   const resolved = owned ? allResolved : NO_APPROVALS;
-  // An unowned status from the previous account's lifetime is not this
-  // account's truth — report loading until this account's own read lands.
-  const visibleStatus = owned || owner === null ? status : ("loading" as const);
+  const notices = owned
+    ? allNotices.filter((notice) => notice.owner === accountID)
+    : NO_NOTICES;
+  // Only this account's own read can be "ready". Anything unowned is either
+  // still unknown (loading) or an honest failure — never a confirmed empty.
+  const visibleStatus = owned
+    ? status
+    : owner === null && status === "error"
+      ? status
+      : ("loading" as const);
   const pendingCount = pending.length;
 
   return (
-    <Popover>
+    <Popover
+      onOpenChange={(open) => {
+        // A notice explains one click the person already saw answered;
+        // closing the inbox is acknowledging it.
+        if (!open) dismissNotices();
+      }}
+    >
       <Tooltip>
         <TooltipTrigger
           render={
@@ -118,6 +155,22 @@ export function CoreApprovalsInbox({ accountID }: { accountID: string }) {
         <p className="px-2 py-1 font-medium text-muted-foreground text-xs">
           承認
         </p>
+        {notices.length > 0 ? (
+          <div className="flex flex-col gap-2 px-1 pb-2">
+            {notices.map((notice) => (
+              <div
+                key={notice.approval.approval_id}
+                role="status"
+                className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-sm"
+              >
+                <p className="font-medium">{approvalTitle(notice.approval)}</p>
+                <p className="mt-1 text-muted-foreground">
+                  {decisionNoticeText(notice.code)}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {visibleStatus !== "ready" && pending.length === 0 ? (
           <p className="px-2 py-3 text-muted-foreground text-sm">
             {visibleStatus === "error"

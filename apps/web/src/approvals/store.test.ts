@@ -333,5 +333,202 @@ describe("core approvals store", () => {
     // Another tab's denial wins; the durable record is the truth this tab shows.
     expect(state.pending).toHaveLength(0);
     expect(state.resolved[0].status).toBe("denied");
+    // The card is still listed (as resolved), so it carries its own error —
+    // no separate notice.
+    expect(state.decisionErrors["a-1"]).toBe("approval_conflict");
+    expect(state.notices).toEqual([]);
+  });
+});
+
+describe("malformed inbox responses", () => {
+  beforeEach(() => {
+    useCoreApprovals.getState().reset();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["no human", { approvals: [approval()] }],
+    ["empty human", { human: "", approvals: [approval()] }],
+    ["non-string human", { human: 7, approvals: [] }],
+    ["no approvals list", { human: "h-1" }],
+    ["non-array approvals", { human: "h-1", approvals: {} }],
+  ])("a 200 with %s is a load error, not an empty inbox", async (_, body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(200, body)));
+
+    await useCoreApprovals.getState().refresh();
+    const s = useCoreApprovals.getState();
+    expect(s.status).toBe("error");
+    expect(s.owner).toBeNull();
+    expect(s.pending).toHaveLength(0);
+  });
+
+  it("a malformed refresh while ready keeps the owned last-known-good inbox", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+        )
+        .mockResolvedValueOnce(jsonResponse(200, { approvals: [] })),
+    );
+
+    await useCoreApprovals.getState().refresh();
+    await useCoreApprovals.getState().refresh();
+    const s = useCoreApprovals.getState();
+    expect(s.status).toBe("ready");
+    expect(s.owner).toBe("h-1");
+    expect(s.pending.map((a) => a.approval_id)).toEqual(["a-1"]);
+  });
+});
+
+describe("notices for failed decisions whose card left the inbox", () => {
+  beforeEach(() => {
+    useCoreApprovals.getState().reset();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function loadAndFail(code: string, status: number, after: unknown) {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+        )
+        .mockResolvedValueOnce(jsonResponse(status, { error: code }))
+        .mockResolvedValueOnce(jsonResponse(200, after)),
+    );
+    await useCoreApprovals.getState().refresh();
+    const pending = useCoreApprovals.getState().pending[0];
+    await useCoreApprovals.getState().decide(pending, "approve_once");
+  }
+
+  it("records an owner-tagged notice when the converge refresh removes the card", async () => {
+    await loadAndFail("persona_inactive", 409, { human: "h-1", approvals: [] });
+    const s = useCoreApprovals.getState();
+    expect(s.pending).toHaveLength(0);
+    expect(s.decisionErrors).toEqual({});
+    expect(s.notices).toHaveLength(1);
+    expect(s.notices[0]).toMatchObject({
+      code: "persona_inactive",
+      owner: "h-1",
+      approval: { approval_id: "a-1", secretary_name: "Kuro" },
+    });
+
+    useCoreApprovals.getState().dismissNotices();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+  });
+
+  it("a snapshot for a different human creates no notice", async () => {
+    await loadAndFail("approval_not_found", 404, {
+      human: "h-2",
+      approvals: [],
+    });
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+  });
+
+  it("drops the notice once the approval is actionable again", async () => {
+    await loadAndFail("persona_inactive", 409, { human: "h-1", approvals: [] });
+    expect(useCoreApprovals.getState().notices).toHaveLength(1);
+
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+        ),
+    );
+    await useCoreApprovals.getState().refresh();
+    const s = useCoreApprovals.getState();
+    expect(s.notices).toEqual([]);
+    expect(s.pending.map((a) => a.approval_id)).toEqual(["a-1"]);
+  });
+
+  it("still explains a failure whose card an earlier refresh already removed", async () => {
+    const decision = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+        )
+        .mockImplementationOnce(() => decision.promise)
+        // A poll lands while the decision is in flight: the card is gone.
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [] }),
+        )
+        // The decision's converge refresh.
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [] }),
+        ),
+    );
+    await useCoreApprovals.getState().refresh();
+    const pending = useCoreApprovals.getState().pending[0];
+    const deciding = useCoreApprovals.getState().decide(pending, "deny_once");
+    await useCoreApprovals.getState().refresh();
+    expect(useCoreApprovals.getState().pending).toHaveLength(0);
+
+    decision.resolve(jsonResponse(409, { error: "persona_inactive" }));
+    await deciding;
+    const s = useCoreApprovals.getState();
+    expect(s.notices.map((n) => [n.approval.approval_id, n.code])).toEqual([
+      ["a-1", "persona_inactive"],
+    ]);
+  });
+
+  it("a successful retry leaves no notice behind", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [approval()] }),
+        )
+        .mockRejectedValueOnce(new TypeError("network down"))
+        .mockResolvedValueOnce(
+          jsonResponse(200, {
+            approval: approval({
+              status: "approved",
+              decision: "approve_once",
+              decided_at: "2026-09-15T05:00:00Z",
+            }),
+          }),
+        )
+        .mockResolvedValueOnce(
+          jsonResponse(200, { human: "h-1", approvals: [] }),
+        ),
+    );
+    await useCoreApprovals.getState().refresh();
+    const pending = useCoreApprovals.getState().pending[0];
+    await useCoreApprovals.getState().decide(pending, "approve_once");
+    await useCoreApprovals.getState().decide(pending, "approve_once");
+    // The approved row later ages out of the listed history entirely.
+    await useCoreApprovals.getState().refresh();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+  });
+
+  it("a dead session and a reset both drop notices", async () => {
+    await loadAndFail("persona_inactive", 409, { human: "h-1", approvals: [] });
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(jsonResponse(401, { error: "invalid_session" })),
+    );
+    await useCoreApprovals.getState().refresh();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+
+    useCoreApprovals.getState().reset();
+    await loadAndFail("persona_inactive", 409, { human: "h-1", approvals: [] });
+    expect(useCoreApprovals.getState().notices).toHaveLength(1);
+    useCoreApprovals.getState().reset();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
   });
 });

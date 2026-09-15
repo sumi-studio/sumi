@@ -288,3 +288,207 @@ describe("approval inbox across logout/login", () => {
     ).toEqual(["b-1"]);
   });
 });
+
+describe("settled explanations and malformed inbox reads", () => {
+  beforeEach(() => {
+    useCoreApprovals.getState().reset();
+  });
+  afterEach(() => {
+    cleanup();
+    useCoreApprovals.getState().reset();
+    vi.unstubAllGlobals();
+  });
+
+  /** A's inbox open, approve clicked on a card whose secretary was sealed. */
+  async function sealedClick() {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      )
+      .mockResolvedValueOnce(jsonResponse(409, { error: "persona_inactive" }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [] }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("keeps a legible, non-committal explanation after the card disappears", async () => {
+    await sealedClick();
+    render(<Rail user={{ id: "human-a" }} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "承認待ち 1 件" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "今回のみ許可" }),
+    );
+    await flush();
+    await flush();
+
+    // Settled: the card is gone, but the person is told what happened to it.
+    const notice = await screen.findByRole("status");
+    expect(notice).toHaveTextContent("A-secretary: message.send");
+    expect(notice).toHaveTextContent(
+      "今回の操作はここでは受け付けられませんでした",
+    );
+    expect(notice).toHaveTextContent("移る手続きに入っている");
+    // It must not claim the decision took effect or that the move finished.
+    expect(notice).not.toHaveTextContent("許可しました");
+    expect(notice).not.toHaveTextContent("完了");
+    expect(notice).not.toHaveTextContent("移行先");
+    expect(
+      screen.queryByRole("button", { name: "今回のみ許可" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("承認待ちはありません")).toBeInTheDocument();
+
+    // Closing the inbox acknowledges it; reopening shows no stale notice.
+    fireEvent.click(
+      screen.getByRole("button", { name: "承認待ちはありません" }),
+    );
+    await flush();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "承認待ちはありません" }),
+    );
+    expect(await screen.findByText("承認待ちはありません")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("a notice never reaches another account's DOM, including the first commit", async () => {
+    await sealedClick();
+    const commits: { user: string | null; html: string }[] = [];
+    function Observed({ user }: { user: { id: string } | null }) {
+      useLayoutEffect(() => {
+        commits.push({ user: user?.id ?? null, html: document.body.innerHTML });
+      });
+      return <Rail user={user} />;
+    }
+    const view = render(<Observed user={{ id: "human-a" }} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "承認待ち 1 件" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "今回のみ許可" }),
+    );
+    await flush();
+    await flush();
+    expect(await screen.findByRole("status")).toHaveTextContent("A-secretary");
+
+    const bRefresh = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementationOnce(() => bRefresh.promise),
+    );
+    commits.length = 0;
+    // Synchronous: the first commit under B precedes the reset cleanup.
+    view.rerender(<Observed user={{ id: "human-b" }} />);
+    expect(useCoreApprovals.getState().notices).toHaveLength(0);
+    await flush();
+    await act(async () => {
+      bRefresh.resolve(jsonResponse(200, { human: "human-b", approvals: [] }));
+    });
+    const bCommits = commits.filter((c) => c.user === "human-b");
+    expect(bCommits.length).toBeGreaterThan(0);
+    for (const commit of bCommits) {
+      expect(commit.html).not.toContain("A-secretary");
+      expect(commit.html).not.toContain("account A private approval text");
+      expect(commit.html).not.toContain("受け付けられませんでした");
+    }
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("an account switch before the store resets hides A's notice in B's first commit", async () => {
+    await sealedClick();
+    let firstB: string | null = null;
+    let noticesInStore = -1;
+    function Probe({ user }: { user: { id: string } }) {
+      useLayoutEffect(() => {
+        if (user.id === "human-b" && firstB === null) {
+          firstB = document.body.innerHTML;
+          noticesInStore = useCoreApprovals.getState().notices.length;
+        }
+      });
+      return <Rail user={user} />;
+    }
+    const view = render(<Probe user={{ id: "human-a" }} />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "承認待ち 1 件" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "今回のみ許可" }),
+    );
+    await flush();
+    await flush();
+    expect(useCoreApprovals.getState().notices).toHaveLength(1);
+    expect(document.body.innerHTML).toContain("受け付けられませんでした");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => new Promise(() => {})),
+    );
+    view.rerender(<Probe user={{ id: "human-b" }} />);
+    // The notice is still in the store at that commit; the render gate hides it.
+    expect(noticesInStore).toBe(1);
+    expect(firstB).not.toBeNull();
+    expect(firstB).not.toContain("A-secretary");
+    expect(firstB).not.toContain("受け付けられませんでした");
+  });
+
+  it("a late decision failure from the previous account creates no notice", async () => {
+    const decideResp = deferred<Response>();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-a", approvals: [approval()] }),
+      )
+      .mockImplementationOnce(() => decideResp.promise)
+      .mockResolvedValueOnce(
+        jsonResponse(200, { human: "human-b", approvals: [] }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const view = render(<Rail user={{ id: "human-a" }} />);
+    await flush();
+    const pending = useCoreApprovals.getState().pending[0];
+    let deciding!: Promise<void>;
+    await act(async () => {
+      deciding = useCoreApprovals.getState().decide(pending, "approve_once");
+    });
+    view.rerender(<Rail user={null} />);
+    view.rerender(<Rail user={{ id: "human-b" }} />);
+    await flush();
+
+    await act(async () => {
+      decideResp.resolve(jsonResponse(409, { error: "persona_inactive" }));
+    });
+    await deciding;
+    await flush();
+    expect(useCoreApprovals.getState().notices).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    fireEvent.click(
+      screen.getByRole("button", { name: "承認待ちはありません" }),
+    );
+    expect(await screen.findByText("承認待ちはありません")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("a 200 list without its human reads as a load failure, never as empty", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(jsonResponse(200, { approvals: [approval()] })),
+    );
+    render(<Rail user={{ id: "human-a" }} />);
+    await flush();
+
+    const button = screen.getByRole("button", { name: "承認" });
+    expect(button).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "承認待ちはありません" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(button);
+    expect(
+      await screen.findByText("承認の一覧を読み込めませんでした。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("承認待ちはありません")).not.toBeInTheDocument();
+    expect(screen.queryByText(/A-secretary/)).not.toBeInTheDocument();
+  });
+});

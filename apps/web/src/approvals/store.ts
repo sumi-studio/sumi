@@ -33,8 +33,25 @@ import type { ApprovalDecision, CoreApproval } from "./model";
  * accountID, so an account switch can never commit another person's
  * approvals into the DOM — even for the single render before the sync
  * effect's cleanup runs.
+ *
+ * A failed decision's error normally renders on its card. When a refresh then
+ * removes that card entirely (the secretary was sealed for transfer, the
+ * approval is gone or belongs elsewhere), the failure becomes an inbox-level
+ * `notice` so the person still learns their click was not taken. Notices are
+ * owner-tagged like rows, dropped by reset(), and dismissed when the inbox
+ * closes.
  */
 export type ApprovalsStatus = "idle" | "loading" | "ready" | "error";
+
+/** A decision that failed on a card which has since left the inbox. */
+export interface DecisionNotice {
+  /** The card as the person last saw it. */
+  approval: CoreApproval;
+  /** The decision error code the server (or network) returned. */
+  code: string;
+  /** Session human whose inbox showed the card. */
+  owner: string;
+}
 
 interface ApprovalsState {
   status: ApprovalsStatus;
@@ -46,14 +63,23 @@ interface ApprovalsState {
   deciding: Record<string, ApprovalDecision>;
   /** approval_id -> user-facing decision error code. */
   decisionErrors: Record<string, string>;
+  notices: DecisionNotice[];
   refresh: () => Promise<void>;
   decide: (approval: CoreApproval, decision: ApprovalDecision) => Promise<void>;
+  dismissNotices: () => void;
   reset: () => void;
 }
 
 // decisionIDs pins one idempotency id per approval for the life of an
 // unanswered decision: a lost response's retry must carry the identical id.
 const decisionIDs = new Map<string, string>();
+
+// failedDecisions keeps the card a failed decision was made on, and whose
+// inbox it was, until a refresh shows where that approval went.
+const failedDecisions = new Map<
+  string,
+  { approval: CoreApproval; owner: string }
+>();
 
 let inboxEpoch = 0;
 let commitVersion = 0;
@@ -72,6 +98,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
   resolved: [],
   deciding: {},
   decisionErrors: {},
+  notices: [],
 
   async refresh() {
     const epoch = inboxEpoch;
@@ -90,7 +117,15 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
       // pending card is never left looking decidable.
       if (error instanceof ApprovalsAPIError && error.status === 401) {
         commitVersion++;
-        set({ status: "error", owner: null, pending: [], resolved: [] });
+        failedDecisions.clear();
+        set({
+          status: "error",
+          owner: null,
+          pending: [],
+          resolved: [],
+          decisionErrors: {},
+          notices: [],
+        });
         return;
       }
       // A transient failure keeps last-known-good data; only a load with
@@ -103,22 +138,52 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
     }
     if (!current()) return;
     commitVersion++;
+    const human = body.human;
     const approvals = body.approvals;
     const pending = approvals.filter((a) => a.status === "pending");
     const live = new Set(pending.map((a) => a.approval_id));
+    const listed = new Set(approvals.map((a) => a.approval_id));
     for (const id of [...decisionIDs.keys()]) {
       if (!live.has(id)) decisionIDs.delete(id);
     }
+    const previous = get();
+    // A failed decision whose card this snapshot no longer lists at all
+    // becomes a notice; a still-listed card keeps showing its own error.
+    const vanished: DecisionNotice[] = [];
+    for (const [id, failure] of [...failedDecisions]) {
+      if (live.has(id)) continue;
+      failedDecisions.delete(id);
+      const code = previous.decisionErrors[id];
+      if (listed.has(id) || !code || failure.owner !== human) continue;
+      vanished.push({ approval: failure.approval, code, owner: failure.owner });
+    }
+    const replaced = new Set(vanished.map((n) => n.approval.approval_id));
     set({
       status: "ready",
       // The server told us whose inbox this is; renders that no longer
       // belong to that human must never see these rows.
-      owner: body.human ?? null,
+      owner: human,
       pending,
       resolved: sortResolved(approvals.filter((a) => a.status !== "pending")),
       deciding: Object.fromEntries(
-        Object.entries(get().deciding).filter(([id]) => live.has(id)),
+        Object.entries(previous.deciding).filter(([id]) => live.has(id)),
       ),
+      decisionErrors: Object.fromEntries(
+        Object.entries(previous.decisionErrors).filter(([id]) =>
+          listed.has(id),
+        ),
+      ),
+      // A notice is stale once its approval is actionable again or belongs
+      // to someone else's inbox.
+      notices: [
+        ...previous.notices.filter(
+          (n) =>
+            n.owner === human &&
+            !live.has(n.approval.approval_id) &&
+            !replaced.has(n.approval.approval_id),
+        ),
+        ...vanished,
+      ],
     });
   },
 
@@ -127,6 +192,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
     const state = get();
     if (state.deciding[approval.approval_id]) return;
     if (approval.status !== "pending") return;
+    const owner = state.owner;
     let decisionId = decisionIDs.get(approval.approval_id);
     if (!decisionId) {
       decisionId = crypto.randomUUID();
@@ -145,6 +211,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
       if (epoch !== inboxEpoch) return;
       commitVersion++;
       decisionIDs.delete(approval.approval_id);
+      failedDecisions.delete(approval.approval_id);
       set((s) => ({
         pending: s.pending.filter(
           (a) => a.approval_id !== approval.approval_id,
@@ -161,6 +228,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
       const code =
         error instanceof ApprovalsAPIError ? error.code : "network_error";
       const status = error instanceof ApprovalsAPIError ? error.status : 0;
+      if (owner) failedDecisions.set(approval.approval_id, { approval, owner });
       set((s) => ({
         deciding: omitKey(s.deciding, approval.approval_id),
         decisionErrors: {
@@ -180,10 +248,15 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
     }
   },
 
+  dismissNotices() {
+    if (get().notices.length > 0) set({ notices: [] });
+  },
+
   reset() {
     inboxEpoch++;
     commitVersion++;
     decisionIDs.clear();
+    failedDecisions.clear();
     set({
       status: "idle",
       owner: null,
@@ -191,6 +264,7 @@ export const useCoreApprovals = create<ApprovalsState>((set, get) => ({
       resolved: [],
       deciding: {},
       decisionErrors: {},
+      notices: [],
     });
   },
 }));
