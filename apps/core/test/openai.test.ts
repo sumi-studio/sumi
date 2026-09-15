@@ -628,10 +628,10 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
 });
 
 test("a configured session header carries the persona's stable identity", async () => {
-  let sessionHeader: string | undefined;
+  const seenHeaders: Record<string, string | string[] | undefined>[] = [];
   await withServer(
     (req, res) => {
-      sessionHeader = req.headers["x-opencode-session"] as string | undefined;
+      seenHeaders.push(req.headers);
       let body = "";
       req.on("data", (d) => (body += d));
       req.on("end", () => sse([fin("stop"), "[DONE]"])(res));
@@ -642,9 +642,23 @@ test("a configured session header carries the persona's stable identity", async 
         apiKey: "test-key",
         model: "test-model",
         sessionHeader: "x-opencode-session",
+        // Differently-cased stale value: fetch would combine it into
+        // "stale, p" — the live identity must replace it entirely.
+        headers: { "X-OpenCode-Session": "stale" },
       });
       await collect(p);
+      // Default honest UA; a differently-cased operator override must
+      // replace it rather than combine into a comma-joined value.
+      const q = new OpenAIProvider({
+        baseUrl: base,
+        apiKey: "test-key",
+        model: "test-model",
+        headers: { "user-agent": "operator-agent/1" },
+      });
+      await collect(q);
     },
   );
-  assert.equal(sessionHeader, "p");
+  assert.equal(seenHeaders[0]!["x-opencode-session"], "p");
+  assert.equal(seenHeaders[0]!["user-agent"], "sumi-secretary/alpha");
+  assert.equal(seenHeaders[1]!["user-agent"], "operator-agent/1");
 });

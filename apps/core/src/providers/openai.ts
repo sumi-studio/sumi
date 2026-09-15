@@ -14,7 +14,9 @@ import {
   parseCallEnvelope,
   redirectRefusal,
   requestDeadline,
+  requestHeaders,
   routeEnvelope,
+  SUMI_USER_AGENT,
   sanitizeToolName,
   toolNameMaps,
 } from "./shared.ts";
@@ -86,14 +88,17 @@ export class OpenAIProvider implements ModelProvider {
           `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`,
           {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${this.cfg.apiKey}`,
-              "Content-Type": "application/json",
-              ...this.cfg.headers,
-              ...(this.cfg.sessionHeader
-                ? { [this.cfg.sessionHeader]: request.personaId }
-                : {}),
-            },
+            headers: requestHeaders(
+              {
+                Authorization: `Bearer ${this.cfg.apiKey}`,
+                "Content-Type": "application/json",
+                "User-Agent": SUMI_USER_AGENT,
+              },
+              this.cfg.headers,
+              this.cfg.sessionHeader
+                ? { header: this.cfg.sessionHeader, value: request.personaId }
+                : undefined,
+            ),
             signal: deadline.signal,
             // Never follow a redirect: this request carries credentials
             // and fetch forwards x-api-key/extra headers cross-origin.
