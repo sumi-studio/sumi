@@ -8,6 +8,7 @@ import type {
   ModelRequest,
 } from "../src/provider.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
+import { StateError } from "../src/state-client.ts";
 import { BudgetWaitError } from "../src/usage.ts";
 
 /**
@@ -545,4 +546,158 @@ test("usage: the estimate carries the provider's real wire bound", async () => {
   assert.equal(res.est_output_bound, 42);
   // Reserved = est_input + 42 * output rate, not a fabricated generic cap.
   assert.ok(res.reserved_minor >= 42 * 2);
+});
+
+test("usage: a record that keeps failing neither fails nor reruns the paid turn; commit reconciles it as 'unrecorded'", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA, "test", HUMAN);
+  state.setUsageBudget("operator", "env", {
+    limit_minor: 1_000_000,
+    currency: "USD",
+    ...RATES,
+  });
+  const scripted = new Scripted();
+  const provider = new SelectedModelProvider({
+    state,
+    persona: PERSONA,
+    fallback: scripted,
+    timeoutMs: 5_000,
+  });
+  let recordAttempts = 0;
+  state.recordUsage = async () => {
+    recordAttempts++;
+    throw new StateError(503, "state service unavailable");
+  };
+  const s = new Secretary(secretaryCfg(state, provider));
+  await s.start();
+  state.addInput(PERSONA, "in-norecord", "hello");
+  assert.equal(await s.step(), "turn");
+  const input = state.inputs.find((i) => i.input_id === "in-norecord")!;
+  assert.equal(input.status, "done", "the paid answer is kept");
+  assert.equal(scripted.requests, 1, "no paid rerun");
+  assert.equal(recordAttempts, 3, "recording retries are bounded");
+  const facts = await state.listUsageFacts(PERSONA);
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0]!.status, "unrecorded");
+  assert.equal(facts[0]!.cost_basis, "admission_estimate");
+  assert.ok(facts[0]!.cost_minor! > 0, "the possible spend stays counted");
+  assert.equal([...state.usageReservations.values()][0]!.status, "settled");
+  await s.stop();
+});
+
+test("usage: a partial provider report stays 'unknown' with its categories until a complete report supersedes it", async () => {
+  const state = new FakeState();
+  const provider = new Scripted();
+  provider.usage = { prompt_tokens: 100 }; // no completion_tokens
+  const { p, generation } = await metered(state, provider);
+  state.setUsageBudget("operator", "env", {
+    limit_minor: 1_000_000,
+    currency: "USD",
+    ...RATES,
+  });
+  for await (const _ of p.stream(REQ(generation))) {
+    // drain
+  }
+  const res = [...state.usageReservations.values()][0]!;
+  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  assert.equal(fact.status, "unknown");
+  assert.equal(fact.input_tokens, 100, "supplied category kept");
+  assert.equal(fact.output_tokens, null, "missing category is not zero");
+  assert.equal(fact.cost_minor, res.reserved_minor);
+  assert.equal(fact.cost_basis, "admission_estimate");
+
+  const same = {
+    factId: fact.fact_id,
+    kind: fact.kind,
+    phase: fact.phase,
+    turnId: fact.turn_id,
+    inputId: fact.input_id,
+    round: fact.round,
+    funding: fact.funding,
+    quantities: {},
+  };
+  await assert.rejects(
+    state.recordUsage(PERSONA, { ...same, status: "reported", inputTokens: 100 }),
+    (e) => e instanceof StateError && e.status === 400,
+  );
+  // Explicit zero output is a complete report.
+  const full = await state.recordUsage(PERSONA, {
+    ...same,
+    status: "reported",
+    inputTokens: 100,
+    outputTokens: 0,
+  });
+  assert.equal(full.created, false);
+  assert.equal(full.fact.status, "reported");
+  assert.equal(full.fact.cost_minor, 100);
+  await assert.rejects(
+    state.recordUsage(PERSONA, {
+      ...same,
+      status: "reported",
+      inputTokens: 100,
+      outputTokens: 1,
+    }),
+    (e) => e instanceof StateError && e.status === 409,
+  );
+});
+
+test("usage: a later-round budget denial resumes the same input without repeating round 0's effect", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA, "test", HUMAN);
+  const rounds: number[] = [];
+  const tooling: ModelProvider = {
+    name: "tooling",
+    async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      rounds.push(req.round ?? 0);
+      if (req.round === 0) {
+        yield {
+          type: "tool_call",
+          call: {
+            id: "call-note-0",
+            name: "journal.note",
+            route: "normal",
+            arguments: { text: "noted once" },
+          },
+        };
+      } else {
+        yield { type: "text", delta: "done" };
+      }
+      yield { type: "done", usage: { prompt_tokens: 100, completion_tokens: 20 } };
+    },
+  };
+  const provider = new SelectedModelProvider({
+    state,
+    persona: PERSONA,
+    fallback: tooling,
+    timeoutMs: 5_000,
+  });
+  // Any call under a million input tokens prices at 1 minor unit (rounded
+  // up) and output is free: a limit of 1 admits round 0 and denies round 1.
+  const onePerCall = {
+    currency: "USD",
+    rate_input_per_mtok: 1,
+    rate_output_per_mtok: 0,
+    pricing_revision: "fixture-one-unit",
+  };
+  state.setUsageBudget("operator", "env", { limit_minor: 1, ...onePerCall });
+  const s = new Secretary(secretaryCfg(state, provider));
+  await s.start();
+  state.addInput(PERSONA, "in-rounds", "note this");
+  const notes = () =>
+    state.eventLog.filter((e) => e.persona_id === PERSONA && e.kind === "note")
+      .length;
+
+  assert.equal(await s.step(), "turn");
+  const input = state.inputs.find((i) => i.input_id === "in-rounds")!;
+  assert.equal(input.status, "waiting");
+  assert.deepEqual(rounds, [0], "round 1 was denied before any request");
+  assert.equal(notes(), 1, "round 0 applied its effect before the denial");
+
+  state.setUsageBudget("operator", "env", { limit_minor: 1_000, ...onePerCall });
+  assert.equal(input.status, "queued");
+  assert.equal(await s.step(), "turn");
+  assert.equal(input.status, "done");
+  assert.deepEqual(rounds, [0, 1], "round 0 replays from its plan");
+  assert.equal(notes(), 1, "the resumed input reused round 0's receipt");
+  await s.stop();
 });

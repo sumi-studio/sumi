@@ -1043,12 +1043,37 @@ export class FakeState implements StateClient {
       (f.round ?? 0) === (req.round ?? 0) &&
       f.funding.kind === req.funding.kind &&
       f.funding.id === req.funding.id;
+    // Unreported (null) and explicit zero are different reports (Go
+    // sameTokens / suppliedAgree).
+    const tok = (v: number | null | undefined) => v ?? null;
     const sameFact = (f: UsageFact) =>
       sameIdentity(f) &&
       f.status === req.status &&
-      (f.input_tokens ?? 0) === (req.inputTokens ?? 0) &&
-      (f.output_tokens ?? 0) === (req.outputTokens ?? 0) &&
-      (f.cached_tokens ?? 0) === (req.cachedTokens ?? 0);
+      f.input_tokens === tok(req.inputTokens) &&
+      f.output_tokens === tok(req.outputTokens) &&
+      f.cached_tokens === tok(req.cachedTokens);
+    const suppliedAgree = (f: UsageFact) =>
+      (req.inputTokens == null || f.input_tokens === req.inputTokens) &&
+      (req.outputTokens == null || f.output_tokens === req.outputTokens) &&
+      (req.cachedTokens == null || f.cached_tokens === req.cachedTokens);
+
+    // Go validateRecordTokens.
+    const supplied = [req.inputTokens, req.outputTokens, req.cachedTokens];
+    if (supplied.some((v) => v != null && v < 0)) {
+      throw new StateError(400, "token quantities cannot be negative");
+    }
+    if (
+      req.status === "reported" &&
+      (req.inputTokens == null || req.outputTokens == null)
+    ) {
+      throw new StateError(
+        400,
+        "a 'reported' fact needs input_tokens and output_tokens; record an incomplete report as 'unknown'",
+      );
+    }
+    if (req.status === "not_sent" && supplied.some((v) => v != null)) {
+      throw new StateError(400, "a 'not_sent' fact cannot carry token usage");
+    }
 
     const existing = this.usageFacts.get(key);
     if (existing) {
@@ -1058,26 +1083,29 @@ export class FakeState implements StateClient {
           `fact_id ${req.factId} recorded with different content`,
         );
       }
-      // Upgrade lattice (Go RecordUsage): 'reported'/'not_sent' are
-      // terminal — identical replay or conflict. 'unknown'/'unrecorded'
-      // can still be superseded by the call's real report.
+      // Supersession lattice (Go RecordUsage): unrecorded → any report;
+      // unknown → reported; reported/not_sent terminal. A stale 'unknown'
+      // agreeing with a stored 'reported' replays the stronger fact.
       if (
-        existing.status === "reported" ||
-        existing.status === "not_sent"
+        sameFact(existing) ||
+        (existing.status === "reported" &&
+          req.status === "unknown" &&
+          suppliedAgree(existing))
       ) {
-        if (!sameFact(existing)) {
-          throw new StateError(
-            409,
-            `fact_id ${req.factId} recorded with different content`,
-          );
-        }
         return { fact: existing, created: false };
       }
-      if (sameFact(existing)) {
+      if (
+        existing.status === "unrecorded" ||
+        (existing.status === "unknown" && req.status === "reported")
+      ) {
+        Object.assign(existing, content);
+        if (req.status === "not_sent" && res) res.status = "released";
         return { fact: existing, created: false };
       }
-      Object.assign(existing, content);
-      return { fact: existing, created: false };
+      throw new StateError(
+        409,
+        `fact_id ${req.factId} recorded with different content`,
+      );
     }
     const fact: UsageFact = {
       persona_id: persona,

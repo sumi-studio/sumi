@@ -128,11 +128,13 @@ type UsageRecordRequest struct {
 	InputID string     `json:"input_id,omitempty"`
 	Round   int        `json:"round"`
 	Funding FundingRef `json:"funding"`
-	// Status 'reported' carries the provider's own usage fields;
-	// 'unknown' means the call was attempted but no usage report
-	// resolved — recorded, never silently zero; 'not_sent' asserts no
-	// request was produced after admission (the reservation releases —
-	// nothing was or can be owed).
+	// Status 'reported' carries the provider's complete usage (input and
+	// output both present; cached optional); 'unknown' means the call was
+	// attempted but no complete usage report resolved — any categories the
+	// provider did supply are kept, the admission estimate stays spent, and
+	// a later complete 'reported' for the same fact supersedes it; never
+	// silently zero. 'not_sent' asserts no request was produced after
+	// admission (the reservation releases — nothing was or can be owed).
 	Status       string         `json:"status"`
 	InputTokens  *int64         `json:"input_tokens"`
 	OutputTokens *int64         `json:"output_tokens"`
@@ -628,6 +630,9 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 	if hasNUL(req.Quantities) {
 		return fact, false, fmt.Errorf("%w: quantities cannot contain NUL", ErrBadRequest)
 	}
+	if err := validateRecordTokens(req); err != nil {
+		return fact, false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fact, false, err
@@ -732,27 +737,32 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 		if !sameCallIdentity(*existing, req) {
 			return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
 		}
-		// Upgrade lattice: 'unrecorded' and 'unknown' facts can still be
-		// superseded by the call's real report — the admission estimate is
-		// replaced by actual priced spend, or cleared when the reporter
-		// asserts the request never left. 'reported' and 'not_sent' are
-		// terminal: only an identical payload replays.
-		switch existing.Status {
-		case "reported", "not_sent":
-			if !factMatches(*existing, req) {
-				return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
-			}
-			fact = *existing
-		case "unknown":
-			if factMatches(*existing, req) {
-				fact = *existing
-				break
-			}
-			fallthrough
-		case "unrecorded":
-			if req.Status != "reported" && req.Status != "unknown" && req.Status != "not_sent" {
-				return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
-			}
+		// Supersession lattice, one direction only:
+		//
+		//	unrecorded → reported | unknown | not_sent  (the caller's own
+		//	             first report lands after reconciliation)
+		//	unknown    → reported  (a complete report replaces the estimate)
+		//	reported, not_sent     terminal
+		//
+		// An identical payload always replays. An 'unknown' report whose
+		// supplied categories all agree with a stored 'reported' fact is a
+		// stale redelivery of the weaker report and replays the stronger
+		// fact. Anything else under a known fact_id conflicts: an 'unknown'
+		// call cannot become 'not_sent' (it asserted the request may have
+		// left), and two different incomplete reports are two stories.
+		upgrade := false
+		switch {
+		case factMatches(*existing, req):
+		case existing.Status == "reported" && req.Status == "unknown" && suppliedAgree(*existing, req):
+		case existing.Status == "unrecorded":
+			upgrade = true
+		case existing.Status == "unknown" && req.Status == "reported":
+			upgrade = true
+		default:
+			return fact, false, fmt.Errorf("%w: fact_id %s recorded with different content", ErrUsageFactConflict, req.FactID)
+		}
+		fact = *existing
+		if upgrade {
 			fact, err = scanFact(tx.QueryRow(ctx, `
 				UPDATE usage_facts SET
 					status = $3, input_tokens = $4, output_tokens = $5,
@@ -766,6 +776,16 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 				costMinor, currency, basis, revision))
 			if err != nil {
 				return fact, false, err
+			}
+			// Reconciliation settled the hold as possible spend; the
+			// caller's report now proves the request never left.
+			if req.Status == "not_sent" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE usage_reservations SET status = 'released', settled_at = now()
+					WHERE persona_id = $1 AND fact_id = $2`,
+					personaID, req.FactID); err != nil {
+					return fact, false, err
+				}
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -802,8 +822,9 @@ func (s *Store) RecordUsage(ctx context.Context, personaID string, req UsageReco
 //	reported   — priced under the card ('configured_rates').
 //	unknown    — the admission estimate is retained as uncertain spend
 //	             ('admission_estimate') when a priced reservation exists:
-//	             an attempted call whose usage never resolved does not
-//	             restore budget it may already have consumed.
+//	             an attempted call whose usage never resolved completely
+//	             does not restore budget it may already have consumed.
+//	             Supplied partial categories are stored, not priced.
 //	not_sent   — unpriced; the reservation releases.
 //	no card    — unpriced; there is nothing honest to charge against.
 func priceRecord(req UsageRecordRequest, card *rateSnapshot, hasRes bool, reserved int64) (costMinor *int64, currency, basis, revision *string, err error) {
@@ -854,44 +875,58 @@ func sameCallIdentity(f UsageFact, req UsageRecordRequest) bool {
 }
 
 // factMatches compares a redelivery to the stored fact on the fields a
-// caller could not legitimately change — identical means same fact.
+// caller could not legitimately change — identical means same fact. An
+// unreported category (nil) and an explicit zero are different reports.
 func factMatches(f UsageFact, req UsageRecordRequest) bool {
-	var turnID, inputID string
-	var round int
-	if f.TurnID != nil {
-		turnID = *f.TurnID
+	return sameCallIdentity(f, req) && f.Status == req.Status &&
+		sameTokens(f.InputTokens, req.InputTokens) &&
+		sameTokens(f.OutputTokens, req.OutputTokens) &&
+		sameTokens(f.CachedTokens, req.CachedTokens)
+}
+
+// suppliedAgree reports whether every category the request supplies equals
+// the stored value — the request may omit categories, never contradict one.
+func suppliedAgree(f UsageFact, req UsageRecordRequest) bool {
+	agree := func(stored, supplied *int64) bool {
+		return supplied == nil || sameTokens(stored, supplied)
 	}
-	if f.InputID != nil {
-		inputID = *f.InputID
+	return agree(f.InputTokens, req.InputTokens) &&
+		agree(f.OutputTokens, req.OutputTokens) &&
+		agree(f.CachedTokens, req.CachedTokens)
+}
+
+func sameTokens(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
-	if f.Round != nil {
-		round = *f.Round
+	return *a == *b
+}
+
+// validateRecordTokens enforces what each status may claim about token
+// categories. 'reported' is final priced usage, so it needs both input and
+// output — a report missing either is incomplete and must be recorded
+// 'unknown' with the categories it did supply (the estimate stays spent
+// and a complete report can still supersede it); pricing a missing
+// category as zero would fabricate a cheaper bill. 'not_sent' asserts no
+// request left, so it cannot carry provider usage. Explicit zero is a valid
+// quantity for any category.
+func validateRecordTokens(req UsageRecordRequest) error {
+	for _, v := range []*int64{req.InputTokens, req.OutputTokens, req.CachedTokens} {
+		if v != nil && *v < 0 {
+			return fmt.Errorf("%w: token quantities cannot be negative", ErrBadRequest)
+		}
 	}
-	var inTok, outTok, cachedTok int64
-	if f.InputTokens != nil {
-		inTok = *f.InputTokens
+	switch req.Status {
+	case "reported":
+		if req.InputTokens == nil || req.OutputTokens == nil {
+			return fmt.Errorf("%w: a 'reported' fact needs input_tokens and output_tokens; record an incomplete report as 'unknown'", ErrBadRequest)
+		}
+	case "not_sent":
+		if req.InputTokens != nil || req.OutputTokens != nil || req.CachedTokens != nil {
+			return fmt.Errorf("%w: a 'not_sent' fact cannot carry token usage", ErrBadRequest)
+		}
 	}
-	if f.OutputTokens != nil {
-		outTok = *f.OutputTokens
-	}
-	if f.CachedTokens != nil {
-		cachedTok = *f.CachedTokens
-	}
-	reqIn, reqOut, reqCached := int64(0), int64(0), int64(0)
-	if req.InputTokens != nil {
-		reqIn = *req.InputTokens
-	}
-	if req.OutputTokens != nil {
-		reqOut = *req.OutputTokens
-	}
-	if req.CachedTokens != nil {
-		reqCached = *req.CachedTokens
-	}
-	return f.Kind == req.Kind && f.Phase == req.Phase &&
-		turnID == req.TurnID && inputID == req.InputID && round == req.Round &&
-		f.Funding.Kind == req.Funding.Kind && f.Funding.ID == req.Funding.ID &&
-		f.Status == req.Status &&
-		inTok == reqIn && outTok == reqOut && cachedTok == reqCached
+	return nil
 }
 
 func (s *Store) usageFact(ctx context.Context, db queryRower, personaID, factID string) (*UsageFact, error) {
@@ -1437,8 +1472,9 @@ func (s *Store) FactsForFunding(ctx context.Context, humanID, kind, id string, l
 // hold. A later real report for the same fact_id upgrades the row under
 // the record lattice. A call the core knows was never sent reports
 // 'not_sent' and releases instead — this path cannot make that claim.
-// Called inside the turn-commit transaction for the committing turn, and
-// at recovery for dead generations.
+// Called inside the turn-commit transaction for the committing turn, at
+// recovery for dead generations, and at transfer seal for every hold
+// (ReconcileRetiredReservations).
 func reconcileHeldReservations(ctx context.Context, tx pgx.Tx, personaID string, turnID string, belowGeneration *int64) error {
 	where := `r.persona_id = $1 AND r.status = 'held'`
 	args := []any{personaID}
@@ -1449,6 +1485,15 @@ func reconcileHeldReservations(ctx context.Context, tx pgx.Tx, personaID string,
 	if belowGeneration != nil {
 		args = append(args, *belowGeneration)
 		where += fmt.Sprintf(" AND r.generation < $%d", len(args))
+	}
+	// Lock the holds before touching facts — the same order RecordUsage
+	// takes (reservation row, then fact) — so a record racing this
+	// reconcile waits for it or lands first, instead of deadlocking on the
+	// fact's primary key.
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM usage_reservations r WHERE `+where+`
+		ORDER BY r.fact_id FOR UPDATE`, args...); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO usage_facts
@@ -1475,4 +1520,17 @@ func reconcileHeldReservations(ctx context.Context, tx pgx.Tx, personaID string,
 		UPDATE usage_reservations r SET status = 'settled', settled_at = now()
 		WHERE `+where, args...)
 	return err
+}
+
+// ReconcileRetiredReservations settles every hold the persona still has on
+// this placement into inspectable accounting, inside the caller's
+// transaction. Transfer seal calls it after fencing the writer: from then
+// on no writer generation of this persona runs here again, so neither
+// turn commit nor recovery would ever reconcile a hold whose record was
+// lost. The possible spend stays counted ('unrecorded' at the admission
+// estimate — never a refund), and a late record from the fenced core still
+// lands once through the RecordUsage lattice. The caller must hold the
+// persona's writer fence; this does not check authority.
+func ReconcileRetiredReservations(ctx context.Context, tx pgx.Tx, personaID string) error {
+	return reconcileHeldReservations(ctx, tx, personaID, "", nil)
 }

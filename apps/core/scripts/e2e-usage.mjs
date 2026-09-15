@@ -156,7 +156,8 @@ async function main() {
   // --- scripted provider: one request → SSE text + usage report -----------
   // Fixture usage, not a real bill: 1000 prompt (400 cached) + 200 output.
   // A `drop-usage` file in DIR makes the stream omit the usage chunk —
-  // the fact then records 'unknown'.
+  // the fact then records 'unknown'. A `partial-usage` file sends a usage
+  // chunk without completion_tokens.
   const providerLog = join(DIR, "provider-requests.jsonl");
   const stub = createServer((reqIn, res) => {
     if (reqIn.method !== "POST" || !reqIn.url.endsWith("/chat/completions")) {
@@ -180,11 +181,16 @@ async function main() {
       const text = isMemory ? "KEEP_UNCHANGED" : `ack ${last.slice(0, 40)}`;
       const usage = existsSync(join(DIR, "drop-usage"))
         ? null
-        : {
-            prompt_tokens: 1000,
-            completion_tokens: 200,
-            prompt_tokens_details: { cached_tokens: 400 },
-          };
+        : existsSync(join(DIR, "partial-usage"))
+          ? {
+              prompt_tokens: 1000,
+              prompt_tokens_details: { cached_tokens: 400 },
+            }
+          : {
+              prompt_tokens: 1000,
+              completion_tokens: 200,
+              prompt_tokens_details: { cached_tokens: 400 },
+            };
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.end(
         [
@@ -472,6 +478,74 @@ async function main() {
   assert.ok(unknown.cost_minor > 0, "the reserved estimate stays spent");
   assert.ok(providerRequests() > before, "the call really ran");
   rmSync(join(DIR, "drop-usage"));
+
+  // --- 6b: a partial usage report stays uncertain until completed ---------
+  // The provider reports input but no output. The real wrapper records
+  // 'unknown' with the supplied categories and keeps the admission
+  // estimate; the HTTP boundary refuses the same partial report as
+  // 'reported'; the complete report for the SAME fact supersedes the
+  // estimate once.
+  writeFileSync(join(DIR, "partial-usage"), "");
+  const partialId = await say("usage partial five");
+  rmSync(join(DIR, "partial-usage"));
+  fs = await facts();
+  const partial = fs.find(
+    (f) => f.input_id === partialId && f.phase === "turn",
+  );
+  check(partial, "partial-usage fact recorded", fs);
+  assert.equal(partial.status, "unknown", "a partial report is not final");
+  assert.equal(partial.input_tokens, 600);
+  assert.equal(partial.cached_tokens, 400);
+  assert.equal(partial.output_tokens, null, "missing output is not zero");
+  assert.equal(partial.cost_basis, "admission_estimate");
+  assert.ok(partial.cost_minor > 0, "the estimate stays spent");
+  const recordPartial = (body) =>
+    req("POST", `${P}/usage/record`, ptoken, {
+      fact_id: partial.fact_id,
+      kind: partial.kind,
+      phase: partial.phase,
+      turn_id: partial.turn_id,
+      input_id: partial.input_id,
+      round: partial.round ?? 0,
+      funding: partial.funding,
+      quantities: {},
+      ...body,
+    });
+  let pr = await recordPartial({
+    status: "reported",
+    input_tokens: 600,
+    cached_tokens: 400,
+  });
+  check(pr.status === 400, `partial 'reported' refused ${pr.status}`, pr.text);
+  const complete = {
+    status: "reported",
+    input_tokens: 600,
+    output_tokens: 200,
+    cached_tokens: 400,
+  };
+  pr = await recordPartial(complete);
+  check(
+    pr.status === 200 &&
+      pr.json.created === false &&
+      pr.json.fact.status === "reported" &&
+      pr.json.fact.cost_minor === 1400 &&
+      pr.json.fact.cost_basis === "configured_rates",
+    "the complete report supersedes the estimate",
+    pr.text,
+  );
+  pr = await recordPartial(complete);
+  check(pr.status === 200 && pr.json.created === false, "complete report replays", pr.text);
+  pr = await recordPartial({ ...complete, output_tokens: 201 });
+  check(pr.status === 409, `a different report conflicts ${pr.status}`, pr.text);
+  const settled = (await facts()).filter((f) => f.fact_id === partial.fact_id);
+  check(
+    settled.length === 1 &&
+      settled[0].status === "reported" &&
+      settled[0].cost_minor === 1400,
+    "one fact carrying only the actual cost",
+    settled,
+  );
+  log("partial usage: estimate", partial.cost_minor, "→ reported 1400");
 
   // --- 7: a selected connection funds the call that selected it -------------
   // A human-owned api connection — the fact attributes to the connection

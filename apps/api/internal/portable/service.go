@@ -17,6 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 )
 
 var (
@@ -390,14 +392,21 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 	// strand the input at the destination (no pending approval exists to
 	// resume it) — or fail this seal's own cut verification. Requeue the
 	// input instead: the destination re-admits it under its own funding,
-	// and a fresh denial parks it there. A parked input has not run, so
-	// requeueing repeats no effect; an input still waiting on a pending
-	// approval keeps that wait. On abort the input simply runs again and
-	// re-parks if the budget still denies it — the wait row is a derived
-	// resume index, not authority.
+	// and a fresh denial parks it there. The input may already have run
+	// earlier rounds — a later round's admission can be denied after that
+	// round's predecessors applied tool effects — but its recorded plan and
+	// operation receipts are keyed by input and travel in the cut, so the
+	// resuming attempt replays those rounds from their receipts and repeats
+	// no effect. An input still waiting on a pending approval keeps that
+	// wait. The parked span accrues into waited_ms exactly as an ordinary
+	// budget resume does. On abort the input simply runs again and re-parks
+	// if the budget still denies it — the wait row is a derived resume
+	// index, not authority.
 	if _, err := tx.Exec(ctx, `
 		UPDATE core_inputs i SET status = 'queued', claimed_generation = NULL,
-			turn_id = NULL, waiting_since = NULL
+			turn_id = NULL, not_before = NULL,
+			waited_ms = i.waited_ms + COALESCE(EXTRACT(EPOCH FROM (now() - i.waiting_since)) * 1000, 0)::bigint,
+			waiting_since = NULL
 		FROM core_budget_waits w
 		WHERE w.persona_id = $1 AND w.input_id = i.input_id
 			AND i.persona_id = w.persona_id AND i.status = 'waiting'
@@ -410,6 +419,13 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM core_budget_waits WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
+	}
+	// Usage holds are placement-local accounting and the fence above ends
+	// every writer generation of this persona here, so no turn commit or
+	// recovery will ever reconcile them. Settle them now as the source's
+	// own uncertain spend; a fenced core's late record still lands once.
+	if err := agentstate.ReconcileRetiredReservations(ctx, tx, personaID); err != nil {
+		return Receipt{}, fmt.Errorf("reconcile usage holds: %w", err)
 	}
 	violations, err := verifyCut(ctx, tx, personaID)
 	if err != nil {

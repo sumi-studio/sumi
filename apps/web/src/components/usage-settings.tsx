@@ -238,7 +238,7 @@ function SourceCard({
       {t.unknownCalls > 0 && (
         <p className="mt-2 text-muted-foreground text-xs">
           {t.unknownCalls}
-          回の呼び出しは利用量を確認できなかったため、事前の見積もりで計上しています。
+          回の呼び出しは利用量を確認できなかった（または一部しか報告されなかった）ため、事前の見積もりで計上しています。
         </p>
       )}
       {source.grant && (
@@ -269,7 +269,10 @@ function SourceCard({
                 </span>
                 <span>
                   {f.status === "unknown"
-                    ? "利用量未確認（概算で計上）"
+                    ? f.inputTokens !== undefined ||
+                      f.outputTokens !== undefined
+                      ? "利用量の一部のみ報告（概算で計上）"
+                      : "利用量未確認（概算で計上）"
                     : f.status === "unrecorded"
                       ? "結果の記録なし（概算で計上）"
                       : f.status === "not_sent"
@@ -422,7 +425,7 @@ function BudgetForm({
         />
       </label>
       <p className="text-muted-foreground text-xs leading-relaxed">
-        単価はプロバイダーの料金表から自分で転記する概算です。上限はこの概算と事前の見積もりで判定され、達すると新しい呼び出しは止まります。実際の請求額とは異なる場合があります。
+        単価はプロバイダーの料金表から自分で転記する概算です。上限はこの概算と事前の見積もりで判定され、達すると新しい呼び出しは止まります。実際の請求額とは異なる場合があります。使用額は通貨ごとに数えるため、通貨を変えると、それまで別の通貨で計上した分は新しい上限に含まれません（履歴には元の通貨のまま残ります）。
       </p>
       {localError && (
         <p role="alert" className="text-sm">

@@ -1032,7 +1032,7 @@ export interface components {
         };
         UsageTotals: {
             calls: number;
-            /** @description Calls whose provider never reported usage (status 'unknown' or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero. */
+            /** @description Calls without a complete provider usage report (status 'unknown' — no report or only some categories — or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero. */
             unknown_calls: number;
             /** @description Reported calls with no applicable rate card. */
             unpriced_calls: number;
@@ -1057,7 +1057,7 @@ export interface components {
             round?: number;
             funding: components["schemas"]["UsageFundingRef"];
             /**
-             * @description 'reported' carries provider token counts. 'unknown' means the call was attempted but usage never resolved — it keeps the admission estimate as uncertain spend. 'unrecorded' means the writer lost the response before it could report — inspectable, estimate retained. 'not_sent' means the request provably never left — its reservation was released and nothing is owed.
+             * @description 'reported' carries complete provider token counts (input and output). 'unknown' means the call was attempted but no complete usage report resolved — categories the provider did report are kept, and the admission estimate stays as uncertain spend until a complete report for the same fact supersedes it. 'unrecorded' means the writer lost the response before it could report — inspectable, estimate retained. 'not_sent' means the request provably never left — its reservation was released and nothing is owed.
              * @enum {string}
              */
             status: "reported" | "unknown" | "not_sent" | "unrecorded";

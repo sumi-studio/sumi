@@ -273,12 +273,20 @@ export class SelectedModelProvider implements ModelProvider {
       usage === null
         ? { input: null, output: null, cached: null }
         : reportedTokens(usage);
-    // 'reported' only when the provider's report carried at least one
-    // token category; a done event without recognizable usage — or a call
-    // that ended before its report — is 'unknown', not a zero bill.
-    const reported =
-      tokens.input !== null || tokens.output !== null || tokens.cached !== null;
-    const status = notSent ? "not_sent" : reported ? "reported" : "unknown";
+    // 'reported' only when the report is complete enough to price: input
+    // and output both present (cached is an optional subset). A partial
+    // report — or none at all — is 'unknown': the categories it did carry
+    // are kept, the admission estimate stays spent, and a missing category
+    // is never priced as zero. The state service refuses a partial
+    // 'reported' too. A call that produced usage was sent, whatever error
+    // followed.
+    const reported = tokens.input !== null && tokens.output !== null;
+    const status =
+      notSent && usage === null
+        ? "not_sent"
+        : reported
+          ? "reported"
+          : "unknown";
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await state.recordUsage(persona, {

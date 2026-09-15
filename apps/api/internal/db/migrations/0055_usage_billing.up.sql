@@ -104,11 +104,13 @@ CREATE INDEX usage_reservations_held
 -- status:
 --   reported   — the provider's own usage report resolved. cost_minor is
 --                priced under the admission-snapshot rate card.
---   unknown    — the call was attempted but no usage report resolved. The
---                admission estimate is retained as cost_minor with
+--   unknown    — the call was attempted but no complete usage report
+--                resolved. Categories the provider did report are kept;
+--                the admission estimate is retained as cost_minor with
 --                cost_basis 'admission_estimate' — uncertain spend stays
---                spent; a later 'reported' redelivery for the same fact_id
+--                spent; a later complete 'reported' for the same fact_id
 --                upgrades the row to the provider's actual quantities.
+--                'reported' requires both input and output tokens.
 --   not_sent   — the core asserts no request was produced after admission.
 --                The reservation is released; nothing was or can be owed.
 --   unrecorded — admitted, then the record never landed (lost response,

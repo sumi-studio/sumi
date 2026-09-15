@@ -791,3 +791,114 @@ func TestUsageAdmitReplay(t *testing.T) {
 		t.Fatalf("conflicting admit err=%v, want ErrUsageFactConflict", err)
 	}
 }
+
+// A partial provider report never becomes final priced usage: the state
+// service refuses 'reported' without both input and output, an 'unknown'
+// fact keeps the supplied categories and the admission estimate, and the
+// complete report for the same fact supersedes the estimate once — spend
+// moves from estimate to actual, never counting both.
+func TestUsagePartialReportSupersededByCompleteReport(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(1_000_000)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	// 500*1 + 500*2 = 1500 estimated.
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-part", gen, connFunding(conn), 500, 500)); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	i64 := func(v int64) *int64 { return &v }
+	spend := func(wantSpent, wantHeld int64) {
+		t.Helper()
+		spent, held, err := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+		if err != nil || spent != wantSpent || held != wantHeld {
+			t.Fatalf("spent=%d held=%d err=%v, want %d/%d", spent, held, err, wantSpent, wantHeld)
+		}
+	}
+	base := UsageRecordRequest{
+		FactID: "f-part", Kind: "model_call", Phase: "turn", TurnID: "t",
+		Funding: connFunding(conn), Quantities: map[string]any{"prompt_tokens": 600},
+	}
+
+	partial := base
+	partial.Status = "reported"
+	partial.InputTokens = i64(600)
+	if _, _, err := s.RecordUsage(ctx, pa, partial); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("partial 'reported' err=%v, want ErrBadRequest", err)
+	}
+	spend(0, 1500)
+
+	partial.Status = "unknown"
+	fact, created, err := s.RecordUsage(ctx, pa, partial)
+	if err != nil || !created {
+		t.Fatalf("record partial unknown: created=%v err=%v", created, err)
+	}
+	if fact.Status != "unknown" || fact.InputTokens == nil || *fact.InputTokens != 600 ||
+		fact.OutputTokens != nil || fact.Quantities["prompt_tokens"] == nil ||
+		fact.CostMinor == nil || *fact.CostMinor != 1500 ||
+		fact.CostBasis == nil || *fact.CostBasis != "admission_estimate" {
+		t.Fatalf("partial fact must keep supplied input, null output and the estimate: %+v", fact)
+	}
+	spend(1500, 0)
+	if _, created, err := s.RecordUsage(ctx, pa, partial); err != nil || created {
+		t.Fatalf("partial redelivery: created=%v err=%v", created, err)
+	}
+	// An explicit zero output is a different report from an absent one, and
+	// a call reported as attempted cannot turn into never-sent.
+	zeroOut := partial
+	zeroOut.OutputTokens = i64(0)
+	notSent := base
+	notSent.Status = "not_sent"
+	notSent.Quantities = nil
+	for name, r := range map[string]UsageRecordRequest{"explicit zero": zeroOut, "not_sent": notSent} {
+		if _, _, err := s.RecordUsage(ctx, pa, r); !errors.Is(err, ErrUsageFactConflict) {
+			t.Fatalf("%s after partial unknown: err=%v, want conflict", name, err)
+		}
+	}
+	spend(1500, 0)
+
+	// The complete report — explicit zero output is valid — supersedes.
+	full := base
+	full.Status = "reported"
+	full.InputTokens, full.OutputTokens = i64(600), i64(0)
+	fact, created, err = s.RecordUsage(ctx, pa, full)
+	if err != nil || created || fact.Status != "reported" ||
+		fact.OutputTokens == nil || *fact.OutputTokens != 0 ||
+		fact.CostMinor == nil || *fact.CostMinor != 600 ||
+		fact.CostBasis == nil || *fact.CostBasis != "configured_rates" {
+		t.Fatalf("complete report: %+v created=%v err=%v", fact, created, err)
+	}
+	spend(600, 0)
+	// Redelivery of either report replays the final fact; a contradicting
+	// report conflicts. Nothing moves spend again.
+	for _, r := range []UsageRecordRequest{full, partial} {
+		got, created, err := s.RecordUsage(ctx, pa, r)
+		if err != nil || created || got.Status != "reported" || *got.CostMinor != 600 {
+			t.Fatalf("redelivery %s: %+v created=%v err=%v", r.Status, got, created, err)
+		}
+	}
+	contradict := partial
+	contradict.InputTokens = i64(601)
+	if _, _, err := s.RecordUsage(ctx, pa, contradict); !errors.Is(err, ErrUsageFactConflict) {
+		t.Fatalf("contradicting partial err=%v, want conflict", err)
+	}
+	spend(600, 0)
+	if facts, _ := s.ListUsageFacts(ctx, pa, 10); len(facts) != 1 {
+		t.Fatalf("%d facts, want exactly one for the call", len(facts))
+	}
+
+	// Malformed claims are refused before any state is touched.
+	bad := base
+	bad.FactID, bad.Status = "f-bad", "not_sent"
+	bad.InputTokens = i64(1)
+	if _, _, err := s.RecordUsage(ctx, pa, bad); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("not_sent with tokens err=%v, want ErrBadRequest", err)
+	}
+	bad.Status, bad.InputTokens, bad.OutputTokens = "reported", i64(-1), i64(1)
+	if _, _, err := s.RecordUsage(ctx, pa, bad); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("negative tokens err=%v, want ErrBadRequest", err)
+	}
+}

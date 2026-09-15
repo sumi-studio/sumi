@@ -2130,7 +2130,7 @@ components:
           type: integer
         unknown_calls:
           type: integer
-          description: Calls whose provider never reported usage (status 'unknown' or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero.
+          description: Calls without a complete provider usage report (status 'unknown' — no report or only some categories — or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero.
         unpriced_calls:
           type: integer
           description: Reported calls with no applicable rate card.
@@ -2173,9 +2173,11 @@ components:
           type: string
           enum: [reported, unknown, not_sent, unrecorded]
           description: >-
-            'reported' carries provider token counts. 'unknown' means the call
-            was attempted but usage never resolved — it keeps the admission
-            estimate as uncertain spend. 'unrecorded' means the writer lost
+            'reported' carries complete provider token counts (input and
+            output). 'unknown' means the call was attempted but no complete
+            usage report resolved — categories the provider did report are
+            kept, and the admission estimate stays as uncertain spend until a
+            complete report for the same fact supersedes it. 'unrecorded' means the writer lost
             the response before it could report — inspectable, estimate
             retained. 'not_sent' means the request provably never left —
             its reservation was released and nothing is owed.
