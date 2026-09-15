@@ -541,6 +541,14 @@ type FileInfo struct {
 	// Fingerprint identifies the observed content generation cheaply:
 	// ino+size+mtime_ns+ctime_ns. It detects executor-direct change.
 	Fingerprint string `json:"fingerprint"`
+	// DevIno is a transient traversal identity ("dev:ino") for pass-local
+	// loop guards — never persisted. Fingerprint deliberately excludes
+	// dev for FUSE remount continuity, but a traversal key must include
+	// it: inode numbers are unique only within one filesystem, so two
+	// distinct objects on different filesystems sharing an inode is
+	// ordinary, while a bind-mounted alias keeps dev+ino and is correctly
+	// recognized as the same object.
+	DevIno string `json:"-"`
 }
 
 func fingerprint(st fs.FileInfo) string {
@@ -552,6 +560,17 @@ func fingerprint(st fs.FileInfo) string {
 	// remounted, which would flag every file as externally changed.
 	return fmt.Sprintf("%d:%d:%d:%d", s.Ino, s.Size,
 		s.Mtim.Nsec+s.Mtim.Sec*1e9, s.Ctim.Nsec+s.Ctim.Sec*1e9)
+}
+
+// devIno is the traversal-key counterpart of fingerprint: dev+ino through
+// the same pinned stat. It is deliberately NOT persisted — only valid
+// within one pass, where remounts cannot renumber dev mid-walk.
+func devIno(st fs.FileInfo) string {
+	s, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", s.Dev, s.Ino)
 }
 
 // fp3 is the fingerprint's identity triple (ino:size:mtime). ctime is
@@ -821,7 +840,8 @@ func (p *posixRoot) lstat(scope, path string) (FileInfo, error) {
 		return FileInfo{}, mapPathErr(err)
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
-		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, nil
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
+		DevIno: devIno(st)}, nil
 }
 
 // statFrom stats beneath a pinned root fd — the reconciler's view so an
@@ -853,7 +873,8 @@ func statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
 		return FileInfo{}, mapPathErr(err)
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
-		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, nil
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
+		DevIno: devIno(st)}, nil
 }
 
 type ListEntry struct {
@@ -962,7 +983,7 @@ func openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, 
 	}
 	// Regular file: O_NONBLOCK has no effect on ordinary reads; the flag
 	// only mattered to make the open itself non-wedging.
-	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}
+	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st), DevIno: devIno(st)}
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			f.Close()
@@ -1947,7 +1968,8 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 		return FileInfo{}, true, mapPathErr(serr)
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
-		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st)}, true, nil
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
+		DevIno: devIno(st)}, true, nil
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.

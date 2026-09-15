@@ -1417,3 +1417,293 @@ func TestLateRepairMkdirJournalsBoundIdentity(t *testing.T) {
 			"name the object this op committed, divergent or not", fp)
 	}
 }
+
+// 196 — a parked directory that is itself RECORDED: judge the member's
+// own row before deciding to descend. An empty recorded dir has no leaf
+// files to find, and a nonempty one must be restored whole — not have
+// its children moved out into a fresh same-named dir while the recorded
+// object stays parked.
+func TestLateRepairOrphanedDirRestoresRecordedDir(t *testing.T) {
+	for _, nonempty := range []bool{false, true} {
+		name := "empty"
+		if nonempty {
+			name = "nonempty"
+		}
+		t.Run(name, func(t *testing.T) {
+			dsn := pgDSN(t)
+			resetTables(t, dsn)
+			dir := t.TempDir()
+			root, err := newRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			s := newPGStore(t, dsn, dir)
+			s.SetReconcileView(authPinned(root, nil))
+			if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Record a real directory through the production mkdir op.
+			if _, _, err := s.WithWrite(ctx, "ws", "recD", "mkdir",
+				IfVersion{Mode: "any"}, "dir", authProbe(root, "recD"),
+				func(it intent) (FileInfo, bool, error) {
+					return root.mkdir("ws", "recD")
+				}); err != nil {
+				t.Fatalf("mkdir recD: %v", err)
+			}
+			_, recDFP, found := authRow(t, s, "recD")
+			if !found || recDFP == "" {
+				t.Fatalf("mkdir produced no usable row: fp=%q found=%v", recDFP, found)
+			}
+			if nonempty {
+				if _, _, err := s.WithWrite(ctx, "ws", "recD/inner.txt", "write",
+					IfVersion{Mode: "any"}, sha("IN"), authProbe(root, "recD/inner.txt"),
+					authWriteFn(root, "recD/inner.txt", "IN")); err != nil {
+					t.Fatalf("write recD/inner.txt: %v", err)
+				}
+			}
+			// A delayed drain deposits the recorded dir inside an
+			// unrecorded container under a dead intent's namespace.
+			it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "dead.txt",
+				version: authMint(t, s), preFP: "0:0:0:0", at: time.Now().Add(-time.Hour)}
+			it.id = insertIntent(t, s, it)
+			parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-rc"
+			if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(dir+"/ws/recD", dir+"/ws/"+parked+"/recD"); err != nil {
+				t.Fatal(err)
+			}
+			authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+			authSettle(t, s)
+			// The recorded dir object itself must sit at its recorded
+			// home — the same INODE the row acknowledges (fp3's size/mtime
+			// legs churn with member writes, so compare object identity).
+			live := durFP(t, root, "ws", "recD")
+			liveIno, _, _, lok := fpParts(live)
+			rowIno, _, _, rok := fpParts(recDFP)
+			if !lok || !rok || liveIno != rowIno {
+				t.Fatalf("recorded dir not restored to its own home: "+
+					"live fp=%q row fp=%q (inodes %q vs %q)",
+					live, recDFP, liveIno, rowIno)
+			}
+			if _, err := os.Stat(dir + "/ws/" + parked + "/recD"); err == nil {
+				t.Fatal("recorded dir still parked inside container")
+			}
+			if nonempty {
+				if got, ok := authReadOpt(dir, "ws/recD/inner.txt"); !ok || got != "IN" {
+					t.Fatalf("member of restored dir missing: %q present=%v", got, ok)
+				}
+			}
+		})
+	}
+}
+
+// sweepIDView injects a fabricated traversal identity (and fingerprint)
+// at chosen paths — the only way to exercise same-ino-different-dev or
+// alias behaviour on a fixture without mount privileges.
+type sweepIDView struct {
+	ReconView
+	fp map[string]string
+	id map[string]string // "-" clears the real dev:ino
+}
+
+func (v sweepIDView) Stat(scope, path string) (FileInfo, error) {
+	st, err := v.ReconView.Stat(scope, path)
+	if err != nil {
+		return st, err
+	}
+	if f, ok := v.fp[path]; ok {
+		st.Fingerprint = f
+	}
+	if id, ok := v.id[path]; ok {
+		if id == "-" {
+			st.DevIno = ""
+		} else {
+			st.DevIno = id
+		}
+	}
+	return st, nil
+}
+
+// 197 — the sweep's loop key must distinguish different objects and
+// recognize genuine revisits. Two directories with the SAME inode on
+// different devices are distinct objects; both must be walked.
+func TestLateRepairSweepKeyCrossDevice(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	// Recorded member in BOTH dirs — readdir order decides which is
+	// walked first, so either false-skip must strand something.
+	if _, _, err := s.WithWrite(ctx, "ws", "a/g.txt", "write",
+		IfVersion{Mode: "any"}, sha("G"), authProbe(root, "a/g.txt"),
+		authWriteFn(root, "a/g.txt", "G")); err != nil {
+		t.Fatalf("write a/g.txt: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "b/f.txt", "write",
+		IfVersion{Mode: "any"}, sha("F"), authProbe(root, "b/f.txt"),
+		authWriteFn(root, "b/f.txt", "F")); err != nil {
+		t.Fatalf("write b/f.txt: %v", err)
+	}
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "dead.txt",
+		version: authMint(t, s), preFP: "0:0:0:0", at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-id"
+	if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/a", dir+"/ws/"+parked+"/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/b", dir+"/ws/"+parked+"/b"); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+	// a and b report the same inode on DIFFERENT devices — distinct
+	// objects that an inode-only key would collapse.
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return sweepIDView{ReconView: v,
+			fp: map[string]string{parked + "/a": "5:0:0:0", parked + "/b": "5:0:0:0"},
+			id: map[string]string{parked + "/a": "9:5", parked + "/b": "7:5"}}
+	}))
+	authSettle(t, s)
+	if got, ok := authReadOpt(dir, "ws/b/f.txt"); !ok || got != "F" {
+		t.Fatalf("recorded member of second same-ino dir stranded: "+
+			"b/f.txt=%q present=%v (b was skipped as a false revisit)", got, ok)
+	}
+	if got, ok := authReadOpt(dir, "ws/a/g.txt"); !ok || got != "G" {
+		t.Fatalf("recorded member of first same-ino dir stranded: "+
+			"a/g.txt=%q present=%v (a was skipped as a false revisit)", got, ok)
+	}
+}
+
+// cycleView fabricates a directory that lists a member reporting the
+// parent's own dev:ino — a genuine revisit (bind alias / cyclic name
+// chain). The loop guard must deduplicate it: one listing of the cycle
+// dir per pass, and the fabricated member is never descended.
+type cycleView struct {
+	ReconView
+	cycle string
+	id    string
+	calls map[string]int
+}
+
+func (v cycleView) ListStaged(scope, dir, prefix string) ([]string, error) {
+	v.calls[dir]++
+	if dir == v.cycle {
+		return []string{"self"}, nil
+	}
+	return v.ReconView.ListStaged(scope, dir, prefix)
+}
+
+func (v cycleView) Stat(scope, path string) (FileInfo, error) {
+	if path == v.cycle+"/self" {
+		return FileInfo{Kind: "dir", Fingerprint: "9:0:0:0", DevIno: v.id}, nil
+	}
+	st, err := v.ReconView.Stat(scope, path)
+	if err == nil && path == v.cycle {
+		st.DevIno = v.id
+	}
+	return st, err
+}
+
+// 197 converse — a genuine revisit (same dev:ino under a second name,
+// e.g. a bind-mounted alias) is still deduplicated: the walk of the
+// cycle terminates and the revisited object is not reprocessed.
+func TestLateRepairSweepKeyAliasDedup(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newPGStore(t, dsn, dir)
+	ctx := context.Background()
+	// The sweep enumerates scopes holding a row — anchor "ws" with a
+	// real write so the dead namespace is reachable.
+	if _, _, err := s.WithWrite(ctx, "ws", "keep.txt", "write",
+		IfVersion{Mode: "any"}, sha("K"), authProbe(root, "keep.txt"),
+		authWriteFn(root, "keep.txt", "K")); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "dead.txt",
+		version: authMint(t, s), preFP: "0:0:0:0", at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-al"
+	if err := os.MkdirAll(dir+"/ws/"+parked+"/x", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+	cv := cycleView{cycle: parked + "/x", id: "9:9", calls: map[string]int{}}
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		cv.ReconView = v
+		return cv
+	}))
+	authSettle(t, s) // 3 passes — the seen set is per-pass
+	if cv.calls[parked+"/x"] != 3 {
+		t.Fatalf("cycle dir listed %d times over 3 passes, want 3", cv.calls[parked+"/x"])
+	}
+	if cv.calls[parked+"/x/self"] != 0 {
+		t.Fatalf("revisited object reprocessed: self listed %d times",
+			cv.calls[parked+"/x/self"])
+	}
+}
+
+// 197 fallback — an object with NO identifiable traversal key (dev:ino
+// unavailable) is keyed by path: distinct paths are never deduplicated,
+// which is the safe direction for recorded members.
+func TestLateRepairSweepKeyPathFallback(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if _, _, err := s.WithWrite(ctx, "ws", "a/g.txt", "write",
+		IfVersion{Mode: "any"}, sha("G"), authProbe(root, "a/g.txt"),
+		authWriteFn(root, "a/g.txt", "G")); err != nil {
+		t.Fatalf("write a/g.txt: %v", err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "b/f.txt", "write",
+		IfVersion{Mode: "any"}, sha("F"), authProbe(root, "b/f.txt"),
+		authWriteFn(root, "b/f.txt", "F")); err != nil {
+		t.Fatalf("write b/f.txt: %v", err)
+	}
+	it := intent{owner: "dead-inst", scope: "ws", op: "write", path: "dead.txt",
+		version: authMint(t, s), preFP: "0:0:0:0", at: time.Now().Add(-time.Hour)}
+	it.id = insertIntent(t, s, it)
+	parked := opStagePrefix + strconv.FormatInt(it.id, 10) + "-p-fb"
+	if err := os.Mkdir(dir+"/ws/"+parked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/a", dir+"/ws/"+parked+"/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir+"/ws/b", dir+"/ws/"+parked+"/b"); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
+	// No dev:ino at all — paths must carry the guard, so both dirs walk.
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return sweepIDView{ReconView: v,
+			fp: map[string]string{parked + "/a": "5:0:0:0", parked + "/b": "5:0:0:0"},
+			id: map[string]string{parked + "/a": "-", parked + "/b": "-"}}
+	}))
+	authSettle(t, s)
+	if got, ok := authReadOpt(dir, "ws/b/f.txt"); !ok || got != "F" {
+		t.Fatalf("path-fallback sweep stranded recorded member: %q present=%v", got, ok)
+	}
+	if got, ok := authReadOpt(dir, "ws/a/g.txt"); !ok || got != "G" {
+		t.Fatalf("path-fallback sweep stranded recorded member: %q present=%v", got, ok)
+	}
+}

@@ -1336,6 +1336,59 @@ func (s *Store) recordedAt(ctx context.Context, scope, st3 string) (string, bool
 	return home, true, nil
 }
 
+// recordedAtObject routes a parked object to the home a version row
+// records for it. Files match on fp3 — ino:size:mtime is the content
+// generation a file row acknowledges. Directories match on the inode
+// leg alone: a dir's size and mtime churn with every member create or
+// unlink, so the fp3 recorded at commit diverges from the same live
+// dir; the inode is the directory's object identity. The residual is
+// documented: the row does not persist dev, so an inode match across a
+// mount boundary inside one scope could misroute — same class as the
+// fp3 reuse caveat.
+func (s *Store) recordedAtObject(ctx context.Context, scope string, st FileInfo) (string, bool, error) {
+	if st.Kind != "dir" {
+		return s.recordedAt(ctx, scope, fp3(st.Fingerprint))
+	}
+	ino, _, _, ok := fpParts(st.Fingerprint)
+	if !ok || s.pool == nil {
+		return "", false, nil // unidentifiable — preserve
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var home string
+	// 'ino:%:%:%' pins the inode leg of a 4-field fingerprint; the
+	// 2-field fallback form cannot produce a false match.
+	err := s.pool.QueryRow(dctx,
+		`SELECT path FROM file_version
+		  WHERE scope=$1 AND fp LIKE $2 || ':%:%:%'
+		  ORDER BY path LIMIT 1`, scope, ino).Scan(&home)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return home, true, nil
+}
+
+// recordedMatch reports whether the row fingerprint records this live
+// object — fp3 for files, inode identity for directories.
+func recordedMatch(rowFP string, st FileInfo) bool {
+	if st.Kind == "dir" {
+		ri, _, _, ok1 := fpParts(rowFP)
+		si, _, _, ok2 := fpParts(st.Fingerprint)
+		return ok1 && ok2 && ri == si
+	}
+	return fp3(rowFP) == fp3(st.Fingerprint)
+}
+
+// sameObjectAt reports whether dst is the same object as st — the
+// "still at its recorded home" check. Dirs compare by inode; files by
+// content-generation triple.
+func sameObjectAt(st, dst FileInfo) bool {
+	return st.Kind == dst.Kind && recordedMatch(dst.Fingerprint, st)
+}
+
 // intentApplied reports whether this intent's effect committed and was
 // recorded: its apply journaled the file_event row AND removed the intent
 // row, in one transaction. The event alone is not that proof — a diverged
@@ -1463,15 +1516,14 @@ func (s *Store) recordedFP(ctx context.Context, scope, path string) (fp string, 
 // parked at the sealed name, enumerable for the next pass.
 func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 	rel string, st FileInfo, tombstoned bool, wantFP3, wantSHA string, needCommit bool) {
-	st3 := fp3(st.Fingerprint)
 	// Decision-time screen: still recorded and absent from its recorded
 	// home means this object is recorded content parked here by a
 	// delayed effect — restore it, never delete.
-	if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+	if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
 		return // row set unverifiable — preserve
 	} else if found {
 		dst, serr := view.Stat(it.scope, home)
-		if serr != nil || fp3(dst.Fingerprint) != st3 {
+		if serr != nil || !sameObjectAt(st, dst) {
 			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
 			return
 		}
@@ -1487,8 +1539,7 @@ func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 			if derr != nil || busy {
 				return true, derr
 			}
-			cap3 := fp3(captured.Fingerprint)
-			home, found, derr := s.recordedAt(ctx, it.scope, cap3)
+			home, found, derr := s.recordedAtObject(ctx, it.scope, captured)
 			if derr != nil {
 				return true, derr
 			}
@@ -1499,7 +1550,7 @@ func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 				// Otherwise it is displaced recorded content: preserve
 				// it for the next pass's restore.
 				dst, serr := view.Stat(it.scope, home)
-				if serr != nil || fp3(dst.Fingerprint) != cap3 {
+				if serr != nil || !sameObjectAt(captured, dst) {
 					return true, nil
 				}
 			}
@@ -1574,7 +1625,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// content belongs, so route it home (its home may be this
 		// intent's own path: restoreStaged swaps only when the row
 		// records this very object there, never a bare name).
-		if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+		if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
 			return // row set unverifiable — preserve, never misplace
 		} else if found {
 			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
@@ -1648,7 +1699,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// Recorded content parked under a remove intent belongs at its
 		// recorded home — which need not be this intent's path.
 		dest := it.path
-		if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+		if home, found, derr := s.recordedAtObject(ctx, it.scope, st); derr != nil {
 			return
 		} else if found {
 			dest = home
@@ -1680,8 +1731,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 // else the source name — the object was captured there, so restoring
 // the source name recovers the pre-effect shape.
 func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
-	st3 := fp3(st.Fingerprint)
-	if home, found, err := s.recordedAt(ctx, it.scope, st3); err != nil {
+	if home, found, err := s.recordedAtObject(ctx, it.scope, st); err != nil {
 		return "" // row set unverifiable — leave parked
 	} else if found {
 		return home
@@ -1691,7 +1741,7 @@ func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
 	var rowFP string
 	if it.toPath != "" && s.pool.QueryRow(dctx,
 		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
-		it.scope, it.toPath).Scan(&rowFP) == nil && fp3(rowFP) == st3 {
+		it.scope, it.toPath).Scan(&rowFP) == nil && recordedMatch(rowFP, st) {
 		return it.toPath
 	}
 	return it.path
@@ -1719,7 +1769,7 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
 		scope, destPath).Scan(&rowFP)
 	cancel()
-	rowMatch := rerr == nil && fp3(rowFP) == fp3(st.Fingerprint)
+	rowMatch := rerr == nil && recordedMatch(rowFP, st)
 	dst, derr := view.Stat(scope, destPath)
 	switch {
 	case derr == nil:
@@ -1727,7 +1777,7 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		// overwrite a name merely because something sits parked. A
 		// sealed rel cannot receive the displaced squatter, so drain
 		// through the unsealed base slot instead.
-		if rowMatch && fp3(dst.Fingerprint) != fp3(rowFP) {
+		if rowMatch && !sameObjectAt(st, dst) {
 			// The occupant may be a live writer's fresh object whose row
 			// has not committed yet; moving it now would only churn it
 			// into this namespace. Retry once those writers settle.
@@ -1827,8 +1877,8 @@ func (s *Store) sweepOrphanStaged(ctx context.Context, view ReconView) {
 // namespaces can sit that deep, so a cutoff would strand recorded
 // content where no pass ever enumerates it. Loop safety comes from the
 // seen set: a directory revisited under a second path (a bind mount or
-// cyclic name chain) is identified by inode — or by path when the
-// fingerprint carries no inode — and not walked twice.
+// cyclic name chain) is identified by dev:ino — or by path when the
+// object cannot be identified — and not walked twice.
 func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconView, dir string, seen map[string]struct{}) {
 	names, err := view.ListStaged(scope, dir, "")
 	if err != nil {
@@ -1857,15 +1907,18 @@ func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconVie
 }
 
 // markSeen records a directory identity for the sweep's loop guard.
-// The inode leg of the fingerprint is the object identity across
-// renames and bind-mounted aliases; when the fingerprint has no inode
-// (the two-field fallback form) the path itself keys the entry — a
-// cyclic structure of unidentifiable dirs can still lengthen paths,
-// but path resolution fails closed at the OS limit, ending the walk.
+// dev:ino is the object identity across renames and bind-mounted
+// aliases — an inode alone is unique only within one filesystem, so a
+// bare ino would collapse distinct directories from different devices.
+// When the object cannot be identified (no dev:ino — a stat whose
+// Sys() is not Stat_t) the path keys the entry: distinct paths are then
+// never deduplicated, which is the safe direction — a cyclic structure
+// of unidentifiable dirs can lengthen paths, but path resolution fails
+// closed at the OS limit, ending the walk.
 func markSeen(seen map[string]struct{}, st FileInfo, rel string) bool {
 	key := "p:" + rel
-	if ino, _, _, ok := fpParts(st.Fingerprint); ok {
-		key = "i:" + ino
+	if st.DevIno != "" {
+		key = "o:" + st.DevIno
 	}
 	if _, dup := seen[key]; dup {
 		return false
@@ -1902,13 +1955,12 @@ func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view Recon
 	if err != nil {
 		return
 	}
-	st3 := fp3(st.Fingerprint)
-	home, found, derr := s.recordedAt(ctx, scope, st3)
+	home, found, derr := s.recordedAtObject(ctx, scope, st)
 	if derr != nil {
 		return // unverifiable — preserve
 	}
 	if found {
-		if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
+		if dst, serr := view.Stat(scope, home); serr == nil && sameObjectAt(st, dst) {
 			return // still present at its recorded home — surplus link, leave it
 		}
 		s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
@@ -1947,26 +1999,33 @@ func (s *Store) settleOrphanContents(ctx context.Context, scope string, view Rec
 		if serr != nil {
 			continue
 		}
-		if st.Kind == "dir" {
-			if markSeen(seen, st, rel) {
-				s.settleOrphanContents(ctx, scope, view, rel, seen)
+		home, found, derr := s.recordedAtObject(ctx, scope, st)
+		if derr != nil {
+			continue // unverifiable — preserve
+		}
+		if found {
+			// A recorded object — file OR directory — is restored whole
+			// to its recorded home. Judge the container before touching
+			// its contents: descending first would move members out of a
+			// dir that is itself recorded, leaving the dir's own row
+			// stranded (an empty recorded dir has no members to find).
+			if dst, serr := view.Stat(scope, home); serr == nil && sameObjectAt(st, dst) {
+				continue // already present at its recorded home — surplus link
 			}
+			if pdir, _ := splitRel(home); pdir != "" {
+				if err := view.EnsureDir(scope, pdir); err != nil {
+					continue // parent chain unverifiable — retry next pass
+				}
+			}
+			s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
 			continue
 		}
-		st3 := fp3(st.Fingerprint)
-		home, found, derr := s.recordedAt(ctx, scope, st3)
-		if derr != nil || !found {
-			continue
+		// Unrecorded members stay parked — but an unrecorded DIRECTORY
+		// can hold recorded members (auto-created parents carry no row),
+		// so descend into it and judge each member by its own row.
+		if st.Kind == "dir" && markSeen(seen, st, rel) {
+			s.settleOrphanContents(ctx, scope, view, rel, seen)
 		}
-		if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
-			continue // already present at its recorded home — surplus link
-		}
-		if pdir, _ := splitRel(home); pdir != "" {
-			if err := view.EnsureDir(scope, pdir); err != nil {
-				continue // parent chain unverifiable — retry next pass
-			}
-		}
-		s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
 	}
 }
 
