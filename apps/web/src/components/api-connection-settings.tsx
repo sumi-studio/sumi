@@ -2,6 +2,7 @@ import { Button } from "@sumi/ui/components/button";
 import { useEffect, useRef, useState } from "react";
 import {
   type APIConnection,
+  APIConnectionError,
   type APIConnectionsClient,
   type ConnectionInput,
   type ConnectionSelection,
@@ -68,9 +69,11 @@ export function APIConnectionSettings({
       const next = await client.list(controller.signal);
       if (!controller.signal.aborted) setState(next);
     } catch (e) {
+      // Only the client's typed failure is written for display; any other
+      // error message may be a transport or provider diagnostic.
       if (!controller.signal.aborted)
         setError(
-          e instanceof Error && e.message
+          e instanceof APIConnectionError
             ? e.message
             : "接続を更新できませんでした。入力と接続状態を確認して、もう一度お試しください。",
         );
