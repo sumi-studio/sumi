@@ -208,6 +208,19 @@ export interface ModelBinding {
     base_url: string;
     model: string;
     version: string;
+    /**
+     * Per-connection extra request headers, present only when the
+     * credential store is armed — they are sealed with the credential and
+     * sent only to this connection's endpoint. Never logged or echoed
+     * into state/events.
+     */
+    extra_headers?: Record<string, string>;
+    /**
+     * The connection's requested bound on generated tokens (Anthropic
+     * max_tokens / Responses max_output_tokens). Absent = protocol
+     * default.
+     */
+    max_output_tokens?: number;
   };
   api_key?: string;
   credential_available?: boolean;

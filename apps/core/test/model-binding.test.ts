@@ -37,7 +37,17 @@ class Fallback implements ModelProvider {
   }
 }
 
-type Seen = { auth: string | undefined; model: string };
+type Seen = {
+  url: string | undefined;
+  auth: string | undefined;
+  apiKeyHeader: string | undefined;
+  versionHeader: string | undefined;
+  extra: string | undefined;
+  sessionHeader: string | undefined;
+  model: string;
+  outputBound: unknown;
+  cacheKey: unknown;
+};
 
 async function withModelServer(
   fn: (baseUrl: string, seen: Seen[]) => Promise<void>,
@@ -47,12 +57,46 @@ async function withModelServer(
     let body = "";
     req.on("data", (d) => (body += d));
     req.on("end", () => {
-      const model = String((JSON.parse(body) as { model: unknown }).model);
-      seen.push({ auth: req.headers.authorization, model });
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const model = String(parsed.model);
+      seen.push({
+        url: req.url,
+        auth: req.headers.authorization,
+        apiKeyHeader: req.headers["x-api-key"] as string | undefined,
+        versionHeader: req.headers["anthropic-version"] as string | undefined,
+        extra: req.headers["x-fixture-tag"] as string | undefined,
+        sessionHeader: req.headers["x-opencode-session"] as string | undefined,
+        model: String(parsed.model),
+        outputBound: parsed.max_tokens ?? parsed.max_output_tokens,
+        cacheKey: parsed.prompt_cache_key,
+      });
       res.writeHead(200, { "content-type": "text/event-stream" });
+      const url = req.url ?? "";
+      if (url.endsWith("/responses")) {
+        res.end(
+          [
+            `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, content_index: 0, delta: `from ${model}` })}\n\n`,
+            `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 3, output_tokens: 2 }, output: [] } })}\n\n`,
+          ].join(""),
+        );
+        return;
+      }
+      if (url.endsWith("/v1/messages")) {
+        res.end(
+          [
+            `data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 3 } } })}\n\n`,
+            `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `from ${model}` } })}\n\n`,
+            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } })}\n\n`,
+            `data: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+          ].join(""),
+        );
+        return;
+      }
       res.end(
         [
-          JSON.stringify({ choices: [{ delta: { content: `from ${model}` } }] }),
+          JSON.stringify({
+            choices: [{ delta: { content: `from ${model}` } }],
+          }),
           JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }),
           "[DONE]",
         ]
@@ -115,7 +159,9 @@ test("an API selection streams from exactly that connection and is re-read on ev
     state.setModelBinding(PERSONA, api(baseUrl));
     const first = await collect(p);
     assert.deepEqual(first[0], { type: "text", delta: "from model-a" });
-    const done = first.at(-1) as unknown as { usage: { model_binding: unknown } };
+    const done = first.at(-1) as unknown as {
+      usage: { model_binding: unknown };
+    };
     assert.deepEqual(done.usage.model_binding, {
       selection: "api",
       connection_id: "conn-1",
@@ -134,9 +180,72 @@ test("an API selection streams from exactly that connection and is re-read on ev
     assert.deepEqual(second[0], { type: "text", delta: "from model-b" });
 
     assert.deepEqual(seen, [
-      { auth: "Bearer key-a", model: "model-a" },
-      { auth: "Bearer key-b", model: "model-b" },
+      {
+        url: "/chat/completions",
+        auth: "Bearer key-a",
+        apiKeyHeader: undefined,
+        versionHeader: undefined,
+        extra: undefined,
+        sessionHeader: undefined,
+        model: "model-a",
+        outputBound: undefined,
+        cacheKey: undefined,
+      },
+      {
+        url: "/chat/completions",
+        auth: "Bearer key-b",
+        apiKeyHeader: undefined,
+        versionHeader: undefined,
+        extra: undefined,
+        sessionHeader: undefined,
+        model: "model-b",
+        outputBound: undefined,
+        cacheKey: undefined,
+      },
     ]);
+    assert.equal(fallback.calls, 0);
+  });
+});
+
+test("the selected preset picks the wire protocol and carries the connection's extra headers", async () => {
+  await withModelServer(async (baseUrl, seen) => {
+    const state = new FakeState();
+    const fallback = new Fallback();
+    const p = selected(state, fallback);
+
+    for (const [preset, url, authField] of [
+      ["openai-chat", "/chat/completions", "auth"],
+      ["openai-responses", "/responses", "auth"],
+      ["anthropic", "/v1/messages", "apiKeyHeader"],
+    ] as const) {
+      state.setModelBinding(
+        PERSONA,
+        api(baseUrl, { preset, extra_headers: { "X-Fixture-Tag": preset } }),
+      );
+      const evs = await collect(p);
+      assert.equal(
+        evs
+          .filter((e) => e.type === "text")
+          .map((e) => e.delta)
+          .join(""),
+        "from model-a",
+        preset,
+      );
+      const req = seen.at(-1)!;
+      assert.equal(req.url, url, preset);
+      // Exactly one auth mechanism per wire; the connection's extra
+      // header arrived only on this connection's request.
+      assert.equal(req.extra, preset, `${preset}: extra header`);
+      if (authField === "auth") {
+        assert.equal(req.auth, "Bearer key-a", preset);
+        assert.equal(req.apiKeyHeader, undefined, preset);
+      } else {
+        assert.equal(req.apiKeyHeader, "key-a", preset);
+        assert.equal(req.auth, undefined, preset);
+        assert.equal(req.versionHeader, "2023-06-01", preset);
+      }
+    }
+    assert.equal(seen.length, 3);
     assert.equal(fallback.calls, 0);
   });
 });
@@ -146,11 +255,18 @@ test("a selection the core cannot honor fails the request without using another 
     const cases: [string, ModelBinding][] = [
       ["接続しない", { selection: "none" }],
       ["chatgpt", { selection: "chatgpt", reason: "not served" }],
-      ["anthropic wire", api(baseUrl, { preset: "anthropic" })],
-      ["responses wire", api(baseUrl, { preset: "openai-responses" })],
+      ["unknown wire", api(baseUrl, { preset: "not-a-wire" })],
       [
         "no credential",
         { ...api(baseUrl), api_key: undefined, credential_available: false },
+      ],
+      [
+        "no credential (anthropic)",
+        {
+          ...api(baseUrl, { preset: "anthropic" }),
+          api_key: undefined,
+          credential_available: false,
+        },
       ],
       ["deleted connection", { selection: "api", reason: "gone" }],
     ];
@@ -160,7 +276,13 @@ test("a selection the core cannot honor fails the request without using another 
       state.setModelBinding(PERSONA, binding);
       await assert.rejects(
         collect(selected(state, fallback)),
-        (e: unknown) => e instanceof ModelError && !e.retryable,
+        (e: unknown) =>
+          e instanceof ModelError &&
+          !e.retryable &&
+          // An unusable selection is an availability gap — distinguishable
+          // from a genuine evaluated-model failure so callers that spend
+          // model budget (memory attempts) can pause instead.
+          e.unavailable === true,
         label,
       );
       assert.equal(fallback.calls, 0, `${label}: operator model not used`);
@@ -169,15 +291,61 @@ test("a selection the core cannot honor fails the request without using another 
   });
 });
 
+test("the connection's output bound reaches its wire; OpenCode carries the session header", async () => {
+  await withModelServer(async (baseUrl, seen) => {
+    const state = new FakeState();
+    const p = selected(state, new Fallback());
+
+    // Anthropic requires the field — the configured bound overrides the
+    // default budget.
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "anthropic", max_output_tokens: 512 }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, 512);
+
+    // Responses: unconfigured omits the field; configured sends it; the
+    // persona id feeds prompt_cache_key either way.
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "openai-responses" }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, undefined);
+    assert.equal(seen.at(-1)!.cacheKey, PERSONA);
+    state.setModelBinding(
+      PERSONA,
+      api(baseUrl, { preset: "openai-responses", max_output_tokens: 900 }),
+    );
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, 900);
+
+    // The chat wire sends no output bound; OpenCode presets carry the
+    // persona's stable identity as the session header.
+    state.setModelBinding(PERSONA, api(baseUrl, { preset: "opencode-go" }));
+    await collect(p);
+    assert.equal(seen.at(-1)!.outputBound, undefined);
+    assert.equal(seen.at(-1)!.sessionHeader, PERSONA);
+    state.setModelBinding(PERSONA, api(baseUrl, { preset: "openai-chat" }));
+    await collect(p);
+    assert.equal(seen.at(-1)!.sessionHeader, undefined);
+  });
+});
+
 test("no selection uses the operator default; a lookup outage retries rather than guessing", async () => {
   const state = new FakeState();
   const fallback = new Fallback();
   const evs = await collect(selected(state, fallback));
   assert.equal(fallback.calls, 1);
-  assert.deepEqual((evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage.model_binding, {
-    selection: "unset",
-    provider: "operator-default",
-  });
+  assert.deepEqual(
+    (evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage
+      .model_binding,
+    {
+      selection: "unset",
+      provider: "operator-default",
+    },
+  );
 
   const failing = (status: number) =>
     ({
@@ -185,13 +353,19 @@ test("no selection uses the operator default; a lookup outage retries rather tha
     }) as unknown as StateClient;
   await assert.rejects(
     collect(selected(failing(503), fallback)),
-    (e: unknown) => e instanceof ModelError && e.retryable,
+    (e: unknown) =>
+      e instanceof ModelError && e.retryable && e.unavailable === true,
   );
   await assert.rejects(
     collect(selected(failing(404), fallback)),
-    (e: unknown) => e instanceof ModelError && !e.retryable,
+    (e: unknown) =>
+      e instanceof ModelError && !e.retryable && e.unavailable === true,
   );
-  assert.equal(fallback.calls, 1, "the default is never a fallback for a failed lookup");
+  assert.equal(
+    fallback.calls,
+    1,
+    "the default is never a fallback for a failed lookup",
+  );
 });
 
 test("a carried model intent blocks model calls until the destination binds", async () => {
@@ -208,7 +382,11 @@ test("a carried model intent blocks model calls until the destination binds", as
       collect(selected(state, fallback)),
       (e: unknown) => e instanceof ModelError && !e.retryable,
     );
-    assert.equal(fallback.calls, 0, "operator default never substitutes for carried intent");
+    assert.equal(
+      fallback.calls,
+      0,
+      "operator default never substitutes for carried intent",
+    );
     assert.equal(seen.length, 0, "no request reached any model");
     const b = await state.modelBinding(PERSONA);
     assert.equal(b.selection, "needs_rebinding");
@@ -222,8 +400,15 @@ test("a carried model intent blocks model calls until the destination binds", as
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.model, "model-a");
     assert.deepEqual(
-      (evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage.model_binding,
-      { selection: "api", connection_id: "conn-1", preset: "openai-chat", model: "model-a", version: "v1" },
+      (evs.at(-1) as unknown as { usage: { model_binding: unknown } }).usage
+        .model_binding,
+      {
+        selection: "api",
+        connection_id: "conn-1",
+        preset: "openai-chat",
+        model: "model-a",
+        version: "v1",
+      },
     );
 
     // Clearing the intent restores ordinary unset semantics — the
@@ -244,8 +429,9 @@ test("the intent clear is fenced to staged and active personas", async () => {
   // The intent is part of the sealed cut: clearing under seal would strip
   // what the next export ships — refused like the Go store.
   state.setPersonaAuthority(PERSONA, "sealed");
-  await assert.rejects(async () => state.clearModelIntent(PERSONA), (e: unknown) =>
-    e instanceof StateError && e.status === 409,
+  await assert.rejects(
+    async () => state.clearModelIntent(PERSONA),
+    (e: unknown) => e instanceof StateError && e.status === 409,
   );
   assert.equal(state.personas.get(PERSONA)?.model_intent?.kind, "none");
   // staged and active personas may clear — the destination escape.
@@ -259,7 +445,37 @@ test("the intent clear is fenced to staged and active personas", async () => {
   // A transferred persona is no longer this placement's to edit.
   state.setModelIntent(PERSONA, { kind: "none" });
   state.setPersonaAuthority(PERSONA, "transferred");
-  await assert.rejects(async () => state.clearModelIntent(PERSONA), (e: unknown) =>
-    e instanceof StateError && e.status === 409,
+  await assert.rejects(
+    async () => state.clearModelIntent(PERSONA),
+    (e: unknown) => e instanceof StateError && e.status === 409,
   );
+});
+
+test("the operator env fallback validates its URL at construction", async () => {
+  const { providerFromEnv } = await import("../src/host/provider-env.ts");
+  const env = (over: Record<string, string | undefined>) => (name: string) =>
+    over[name];
+  // An unparseable base URL fails at boot, not as a per-request defect.
+  assert.throws(
+    () =>
+      providerFromEnv(
+        env({
+          SUMI_MODEL_PROVIDER: "openai",
+          SUMI_MODEL_BASE_URL: "not a url",
+          SUMI_MODEL_API_KEY: "k",
+          SUMI_MODEL_MODEL: "m",
+        }),
+      ),
+    /SUMI_MODEL_BASE_URL is not a URL/,
+  );
+  // A well-formed env produces a working provider.
+  const p = providerFromEnv(
+    env({
+      SUMI_MODEL_PROVIDER: "openai",
+      SUMI_MODEL_BASE_URL: "http://127.0.0.1:1",
+      SUMI_MODEL_API_KEY: "k",
+      SUMI_MODEL_MODEL: "m",
+    }),
+  );
+  assert.equal(p.name, "openai");
 });

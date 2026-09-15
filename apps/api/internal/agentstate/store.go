@@ -316,6 +316,12 @@ type CommitRequest struct {
 type Store struct {
 	pool    *pgxpool.Pool
 	effects map[string]ToolEffect
+	// ApprovalsChanged, when set, runs after a committed change to a
+	// persona's approval set — a turn parking behind pending approvals or a
+	// recorded decision. Best-effort live fanout only: the durable rows are
+	// the record, so it runs post-commit and its outcome cannot affect the
+	// committed state. Set at wiring time; not synchronized.
+	ApprovalsChanged func(ctx context.Context, personaID string)
 }
 
 // ToolEffect delegates one tool's atomic, state-internal effect to a
@@ -1239,6 +1245,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		personaID, base); err != nil {
 		return nil, err
 	}
+	parked := false
 	switch req.Outcome {
 	case "await":
 		// The turn parks behind pending tool approvals. Lock the pending
@@ -1250,6 +1257,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		if err != nil {
 			return nil, err
 		}
+		parked = len(pending) > 0
 		if err := tx.QueryRow(ctx, `
 			UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
 			WHERE persona_id = $1 AND turn_id = $2
@@ -1382,7 +1390,18 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	if parked {
+		s.notifyApprovalsChanged(ctx, personaID)
+	}
 	return t, nil
+}
+
+// notifyApprovalsChanged runs the optional post-commit approval fanout.
+// The durable rows already committed; this is only the live nudge.
+func (s *Store) notifyApprovalsChanged(ctx context.Context, personaID string) {
+	if s != nil && s.ApprovalsChanged != nil {
+		s.ApprovalsChanged(ctx, personaID)
+	}
 }
 
 // retryBackoff bounds how soon a retryable-failed input may be claimed

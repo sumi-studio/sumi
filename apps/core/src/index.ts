@@ -11,8 +11,10 @@ export type {
   ToolCall,
   ToolSpec,
 } from "./provider.ts";
+export { AnthropicProvider } from "./providers/anthropic.ts";
 export { MockProvider } from "./providers/mock.ts";
 export { OpenAIProvider } from "./providers/openai.ts";
+export { OpenAIResponsesProvider } from "./providers/openai-responses.ts";
 export {
   assemble,
   Secretary,

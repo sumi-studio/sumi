@@ -7,9 +7,10 @@
  * from the state service for every model call, so a changed selection or a
  * rotated key applies from the next consultation without a restart:
  *
- *   api      → exactly that connection's base_url / model / api_key, when
- *              its preset speaks chat completions (the wire this core
- *              implements). Anything else fails the request.
+ *   api      → exactly that connection's base_url / model / api_key /
+ *              extra_headers, on the wire its preset declares (chat
+ *              completions, OpenAI Responses, or Anthropic Messages).
+ *              Any other preset fails the request.
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
  *   chatgpt  → not implemented by this core: the request fails.
@@ -37,16 +38,17 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
+import { AnthropicProvider } from "../providers/anthropic.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
+import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
 import { type StateClient, StateError } from "../state-client.ts";
 import type { ModelBinding } from "../types.ts";
 
 /**
  * Connection presets whose wire protocol is OpenAI chat completions — the
  * same set the Rust agent maps to ApiProtocol::OpenAiChatCompletions.
- * openai-responses and anthropic use other wires this core does not speak.
  */
 export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "openai-chat",
@@ -54,6 +56,23 @@ export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
   "glm-5.2",
   "umans",
   "umans-kimi-k2.7",
+  "opencode-go",
+  "opencode-zen-go",
+]);
+
+/** Presets on the OpenAI Responses wire (POST {base}/responses). */
+export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
+  "openai-responses",
+]);
+
+/** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
+export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
+
+/**
+ * Presets served by the OpenCode Go endpoint — the legacy agent sent
+ * `x-opencode-session` with the PA's stable session id on this wire.
+ */
+export const OPENCODE_PRESETS: ReadonlySet<string> = new Set([
   "opencode-go",
   "opencode-zen-go",
 ]);
@@ -144,6 +163,8 @@ export class SelectedModelProvider implements ModelProvider {
         e.status !== 429;
       throw new ModelError(`model selection lookup failed: ${msg}`, {
         retryable: !definite,
+        // The model was never consulted — this is an availability gap,
+        // not an evaluated-model failure.
         unavailable: true,
       });
     }
@@ -183,7 +204,11 @@ export class SelectedModelProvider implements ModelProvider {
         binding.reason ?? "the selected API connection no longer exists",
       );
     }
-    if (!CHAT_COMPLETIONS_PRESETS.has(c.preset)) {
+    if (
+      !CHAT_COMPLETIONS_PRESETS.has(c.preset) &&
+      !RESPONSES_PRESETS.has(c.preset) &&
+      !ANTHROPIC_PRESETS.has(c.preset)
+    ) {
       throw unusable(
         `the selected connection ${c.name} uses preset ${c.preset}, whose protocol this core does not implement`,
       );
@@ -193,6 +218,30 @@ export class SelectedModelProvider implements ModelProvider {
         `the selected connection ${c.name} has no usable credential (${binding.reason ?? "unavailable"}); re-enter its API key`,
       );
     }
+    // Per-connection extra headers travel with the binding (sealed with
+    // the credential on the server) and reach only this connection's
+    // endpoint.
+    const headers = c.extra_headers;
+    const shared = {
+      baseUrl: c.base_url,
+      apiKey: binding.api_key,
+      model: c.model,
+      headers,
+      timeoutMs: this.opts.timeoutMs,
+      maxOutputTokens: c.max_output_tokens,
+    };
+    const provider: ModelProvider = RESPONSES_PRESETS.has(c.preset)
+      ? new OpenAIResponsesProvider(shared)
+      : ANTHROPIC_PRESETS.has(c.preset)
+        ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
+        : new OpenAIProvider({
+            ...shared,
+            // OpenCode Go routes on a per-session header; the legacy agent
+            // supplied the PA's stable id — personaId is that identity here.
+            sessionHeader: OPENCODE_PRESETS.has(c.preset)
+              ? "x-opencode-session"
+              : undefined,
+          });
     const identity: BindingIdentity = {
       selection: "api",
       connection_id: c.id,
@@ -201,15 +250,7 @@ export class SelectedModelProvider implements ModelProvider {
       version: c.version,
     };
     this.opts.log?.("model bound to selected connection", identity);
-    return {
-      provider: new OpenAIProvider({
-        baseUrl: c.base_url,
-        apiKey: binding.api_key,
-        model: c.model,
-        timeoutMs: this.opts.timeoutMs,
-      }),
-      identity,
-    };
+    return { provider, identity };
   }
 }
 
@@ -222,8 +263,17 @@ export function providerFromEnv(
 ): ModelProvider {
   const kind = get("SUMI_MODEL_PROVIDER") ?? "mock";
   if (kind === "openai") {
+    const baseUrl = required(get, "SUMI_MODEL_BASE_URL");
+    // The connection path's URL is validated by the Go store; the env
+    // path has no such boundary, so an unparseable base URL must fail
+    // here at boot — not as a per-request fetch defect.
+    try {
+      new URL(baseUrl);
+    } catch {
+      throw new Error(`SUMI_MODEL_BASE_URL is not a URL: ${baseUrl}`);
+    }
     return new OpenAIProvider({
-      baseUrl: required(get, "SUMI_MODEL_BASE_URL"),
+      baseUrl,
       apiKey: required(get, "SUMI_MODEL_API_KEY"),
       model: required(get, "SUMI_MODEL_MODEL"),
       headers: jsonObj(get, "SUMI_MODEL_HEADERS_JSON") as

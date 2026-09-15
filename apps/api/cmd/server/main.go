@@ -688,6 +688,18 @@ func newApplicationFromEnv() (*application, error) {
 		deliverAttention = func(ctx context.Context) (messaging.AgentAttentionDeliveryStats, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
 		}
+		// The human-facing approval inbox: the browser decides as the verified
+		// session's human, and parking/deciding nudges the human's live
+		// Messaging sockets so the inbox reflects durable state promptly.
+		coreApprovals := &messaging.CoreApprovalsServer{
+			Core:           coreServer.Store(),
+			Messaging:      messagingServer.Store,
+			Hub:            messagingServer.Hub,
+			Sessions:       messagingServer.Sessions,
+			AllowedOrigins: browserOrigins,
+		}
+		coreApprovals.RegisterRoutes(mux)
+		coreServer.Store().ApprovalsChanged = coreApprovals.NotifyChanged
 		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
 		if calls := messagingServer.Calls; calls != nil {
 			// The secretary's call surface: delegated effects commit session

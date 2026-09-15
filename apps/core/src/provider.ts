@@ -84,11 +84,11 @@ export interface ModelProvider {
  * temporary working view. It is classified from the provider's own
  * status/code/message, never from a configured context window.
  *
- * `unavailable` marks a failure of the call's *plumbing*, not its content:
- * the model layer could not produce a request at all (no usable binding,
- * missing credential, a selection lookup outage). Nothing about the work
- * was evaluated, so callers that budget per-request verdicts (memory
- * chunk attempts) must treat it as a pause, not a failure.
+ * `unavailable` marks a failure before any model was consulted — an
+ * unusable selection, a failed binding lookup, a missing credential. It
+ * is distinguishable from a genuine evaluated-model failure so callers
+ * that spend budget on model work (memory preparation attempts) can
+ * pause instead of burning an attempt on a configuration gap.
  */
 export class ModelError extends Error {
   readonly retryable: boolean;
