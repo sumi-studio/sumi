@@ -1149,7 +1149,7 @@ func TestImportRefusesOverlappingCoverage(t *testing.T) {
 			"status": status, "replacement": nil, "replacement_est_tokens": nil,
 			"attempts": 0, "interruptions": 0, "last_error": nil,
 			"claimed_generation": nil, "claimed_at": nil, "not_before": nil,
-			"created_at": "2026-09-15T00:00:00Z",
+			"created_at":  "2026-09-15T00:00:00Z",
 			"prepared_at": nil, "applied_at": nil,
 		}
 	}
@@ -3788,4 +3788,199 @@ func TestImportRejectsMalformedIntentAndDebris(t *testing.T) {
 		againAppr["prior_decided_by_id"] != srcHuman || againAppr["status"] != "pending" {
 		t.Fatalf("second move lost re-pend provenance: %v", againAppr)
 	}
+}
+
+// A budget-parked input is 'waiting' on placement-local backpressure — the
+// funding it waits on is account state that never travels — so seal
+// requeues it: carrying the wait would strand the input at the destination
+// (no pending approval exists to resume it) or fail the cut's own
+// verification.
+func TestSealRequeuesBudgetWaitedInput(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "secretary")))
+	submit(t, local, pid, "in-1", "run the numbers")
+	// A cap the admission cannot fit parks the turn: the input waits.
+	connID := uuid.NewString()
+	must(local.state.SetBudgetAdmin(ctx, "connection", connID, agentstate.UsageBudget{
+		LimitMinor: 50, Currency: "USD",
+		RateInputPerMTok: 250, RateOutputPerMTok: 1000,
+		PricingRevision: "test",
+	}))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	must(local.state.Recover(ctx, pid, gen))
+	load := must(local.state.LoadTurn(ctx, pid, gen, "turn-1", 50))
+	if load.Input == nil || load.Input.InputID != "in-1" {
+		t.Fatalf("turn-1 claimed %+v", load.Input)
+	}
+	// Round 0 already applied an effect; the admission denied is round 1's,
+	// so the parked input has run part of its work.
+	plan := agentstate.Decision{Text: "checking", Calls: []agentstate.PlanCall{note("numbers checked once")}}
+	must(drop(local.state.SavePlan(ctx, pid, "turn-1", gen, 0, plan)))
+	op, _, fresh, err := local.state.ClaimOperation(ctx, pid, "turn-1", gen, "op-1-0", "journal.note", 0, plan.Calls[0].Request)
+	if err != nil || !fresh || op.Status != "done" {
+		t.Fatalf("round-0 effect: op=%+v fresh=%v err=%v", op, fresh, err)
+	}
+	if _, err := local.state.CommitTurn(ctx, pid, "turn-1", gen, agentstate.CommitRequest{
+		Outcome: "await",
+		Wait: &agentstate.CommitWait{
+			Kind: "budget", Funding: agentstate.FundingRef{Kind: "connection", ID: connID},
+			// 400k input tokens at 250 per MTok = 100 > the 50 limit.
+			Estimate: &agentstate.UsageEstimate{InputTokens: 400_000},
+		},
+	}); err != nil {
+		t.Fatalf("budget park: %v", err)
+	}
+	var status string
+	if err := local.pool.QueryRow(ctx,
+		`SELECT status FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-1'`, pid).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "waiting" {
+		t.Fatalf("parked input status %s, want waiting", status)
+	}
+	time.Sleep(20 * time.Millisecond) // a measurable parked span
+
+	// The seal must not fail the cut on the wait, and the carried input
+	// must arrive resumable — 'queued', not stranded on a funding row the
+	// destination does not have.
+	if _, err := local.svc.Seal(ctx, pid, "move-wait", placementID(t, cloud)); err != nil {
+		t.Fatalf("seal with a budget wait: %v", err)
+	}
+	if err := local.pool.QueryRow(ctx,
+		`SELECT status FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-1'`, pid).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("sealed input status %s, want queued", status)
+	}
+	// Parked time is waiting, not active retry time — the same accrual an
+	// ordinary budget resume applies.
+	var waitedMs int64
+	var notBefore *time.Time
+	if err := local.pool.QueryRow(ctx,
+		`SELECT waited_ms, not_before FROM core_inputs WHERE persona_id = $1 AND input_id = 'in-1'`,
+		pid).Scan(&waitedMs, &notBefore); err != nil {
+		t.Fatal(err)
+	}
+	if waitedMs < 20 || notBefore != nil {
+		t.Fatalf("sealed input waited_ms=%d not_before=%v, want the parked span accrued", waitedMs, notBefore)
+	}
+	var waits int
+	if err := local.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_budget_waits WHERE persona_id = $1`, pid).Scan(&waits); err != nil {
+		t.Fatal(err)
+	}
+	if waits != 0 {
+		t.Fatalf("%d budget waits survived the seal", waits)
+	}
+
+	bundle, _ := exportBytes(t, local, pid, "move-wait")
+	if bytes.Contains(bundle, []byte("core_budget_waits")) {
+		t.Fatal("budget wait rows traveled in the bundle")
+	}
+	dstHuman := newID(t)
+	mustExec(t, cloud, `INSERT INTO humans (human_id) VALUES ($1)`, dstHuman)
+	must(drop(cloud.svc.Import(ctx, bytes.NewReader(bundle), &dstHuman, false)))
+	must(cloud.svc.Activate(ctx, pid, "move-wait"))
+	// The destination's writer claims the requeued input under its own
+	// funding — a fresh denial there parks it again; it is never stranded.
+	dgen := must(cloud.state.AcquireWriter(ctx, pid, "cloud-core", time.Minute)).Generation
+	must(cloud.state.Recover(ctx, pid, dgen))
+	dload := must(cloud.state.LoadTurn(ctx, pid, dgen, "d-turn-1", 50))
+	if dload.Input == nil || dload.Input.InputID != "in-1" {
+		t.Fatalf("destination claimed %+v, want in-1", dload.Input)
+	}
+	// The same input resumes from its carried plan: round 0's claim replays
+	// the receipt applied at the source instead of writing the note again.
+	if dload.Plan == nil || len(dload.Plan.Plan) != 1 || len(dload.Plan.Plan[0].Calls) != 1 {
+		t.Fatalf("destination plan %+v, want the carried round 0", dload.Plan)
+	}
+	dop, _, dfresh, err := cloud.state.ClaimOperation(ctx, pid, "d-turn-1", dgen,
+		"op-d-0", "journal.note", 0, dload.Plan.Plan[0].Calls[0].Request)
+	if err != nil || dfresh || dop.Status != "done" || dop.OperationID != op.OperationID {
+		t.Fatalf("resumed round-0 claim: op=%+v fresh=%v err=%v, want the carried receipt %s",
+			dop, dfresh, err, op.OperationID)
+	}
+	var notes int
+	if err := cloud.pool.QueryRow(ctx,
+		`SELECT count(*) FROM core_events WHERE persona_id = $1 AND kind = 'note'`, pid).Scan(&notes); err != nil {
+		t.Fatal(err)
+	}
+	if notes != 1 {
+		t.Fatalf("destination holds %d notes, want the one applied before the move", notes)
+	}
+}
+
+// Seal retires every writer generation of the persona on this placement,
+// so a usage hold whose record never landed would never be reconciled by a
+// later commit or recovery here. The seal settles it as the source's own
+// uncertain spend — still counted, never refunded — and the fenced core's
+// late report still lands, once.
+func TestSealSettlesSourceUsageHolds(t *testing.T) {
+	ctx := context.Background()
+	local, cloud := newPlacement(t), newPlacement(t)
+	pid := newID(t)
+	must(drop(local.state.EnsurePersona(ctx, pid, nil, "secretary")))
+	must(local.state.SetBudgetAdmin(ctx, "operator", "env", agentstate.UsageBudget{
+		LimitMinor: 1_000_000, Currency: "USD",
+		RateInputPerMTok: 1_000_000, RateOutputPerMTok: 2_000_000,
+		PricingRevision: "fixture-rates-v1",
+	}))
+	gen := must(local.state.AcquireWriter(ctx, pid, "local-core", time.Minute)).Generation
+	env := agentstate.FundingRef{Kind: "operator", ID: "env"}
+	bound := int64(2)
+	for _, a := range []struct{ fact, phase string }{{"f-late", "turn"}, {"f-lost", "memory"}} {
+		// 6 input + 2 output bound = 6*1 + 2*2 = 10 estimated each.
+		res := must(local.state.AdmitUsage(ctx, pid, agentstate.UsageAdmitRequest{
+			Generation: gen, FactID: a.fact, Kind: "model_call", Phase: a.phase, Funding: env,
+			Estimate: agentstate.UsageEstimate{InputTokens: 6, OutputTokensBound: &bound},
+		}))
+		if !res.Admitted {
+			t.Fatalf("admit %s: %+v", a.fact, res)
+		}
+	}
+	budget := func(wantSpent, wantHeld int64) {
+		t.Helper()
+		b := must(local.state.BudgetView(ctx, "operator", "env"))
+		if b.SpentMinor != wantSpent || b.HeldMinor != wantHeld {
+			t.Fatalf("spent=%d held=%d, want %d/%d", b.SpentMinor, b.HeldMinor, wantSpent, wantHeld)
+		}
+	}
+	budget(0, 20)
+
+	// The core dies before either record lands, and the persona moves.
+	must(local.svc.Seal(ctx, pid, "move-holds", placementID(t, cloud)))
+	budget(20, 0)
+	facts := must(local.state.ListUsageFacts(ctx, pid, 10))
+	if len(facts) != 2 {
+		t.Fatalf("%d facts after seal, want both holds inspectable", len(facts))
+	}
+	for _, f := range facts {
+		if f.Status != "unrecorded" || f.CostMinor == nil || *f.CostMinor != 10 ||
+			f.CostBasis == nil || *f.CostBasis != "admission_estimate" {
+			t.Fatalf("sealed hold %s: %+v, want an unrecorded estimate", f.FactID, f)
+		}
+	}
+
+	// The fenced core's late report for one call still lands — once.
+	in, out := int64(6), int64(1)
+	late := agentstate.UsageRecordRequest{FactID: "f-late", Kind: "model_call", Phase: "turn",
+		Funding: env, Status: "reported", InputTokens: &in, OutputTokens: &out}
+	fact, created, err := local.state.RecordUsage(ctx, pid, late)
+	if err != nil || created || fact.Status != "reported" || fact.CostMinor == nil || *fact.CostMinor != 8 {
+		t.Fatalf("late report after seal: %+v created=%v err=%v", fact, created, err)
+	}
+	if _, created, err := local.state.RecordUsage(ctx, pid, late); err != nil || created {
+		t.Fatalf("late report redelivery: created=%v err=%v", created, err)
+	}
+	more := int64(3)
+	other := late
+	other.OutputTokens = &more
+	if _, _, err := local.state.RecordUsage(ctx, pid, other); !errors.Is(err, agentstate.ErrUsageFactConflict) {
+		t.Fatalf("second different late report err=%v, want conflict", err)
+	}
+	// 8 actual for the reported call + 10 still uncertain for the lost one.
+	budget(18, 0)
 }

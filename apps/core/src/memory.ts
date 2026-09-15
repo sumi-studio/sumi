@@ -39,6 +39,7 @@ import type {
   OmittedMemory,
   OmittedRange,
 } from "./types.ts";
+import { BudgetWaitError } from "./usage.ts";
 
 /** A sealed L0 chunk cuts at a safe boundary once it reaches this estimate. */
 export const L0_CHUNK_MIN_TOKENS = 10_000;
@@ -50,6 +51,13 @@ export const L0_LIVE_LIMIT_TOKENS = 40_000;
  * that never ends, and it is recorded as a retryable failure.
  */
 export const DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Re-admission pacing for a chunk reshelved on a budget denial — a slow
+ * heartbeat, not a poll loop: a budget or funding change clears
+ * not_before early, so this only bounds the self-healing fallback.
+ */
+const BUDGET_WAIT_RESHELVE_MS = 30_000;
 
 /**
  * The L1 preparation instruction — carried over from the previous runtime's
@@ -554,7 +562,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 type PreparationOutcome =
   | { kind: "prepared"; replacement: string }
   | { kind: "kept" }
-  | { kind: "unavailable"; reason: string }
+  | { kind: "unavailable"; reason: string; delayMs?: number }
   | { kind: "failed"; error: string; retryable: boolean };
 
 /**
@@ -586,8 +594,9 @@ async function recordMemoryOutcome(
       } else if (outcome.kind === "unavailable") {
         await state.reshelveMemoryChunk(personaId, generation, chunkSeq, {
           reason: outcome.reason,
+          delayMs: outcome.delayMs,
         });
-        log("memory preparation paused: model unavailable", {
+        log("memory preparation paused: no model request could be made", {
           chunk_seq: chunkSeq,
           reason: outcome.reason,
         });
@@ -707,8 +716,8 @@ export async function runMemoryPreparation(
   // needs_rebinding, "none", a missing credential, a selection lookup
   // outage) pauses the work instead of letting a claim reach the model
   // layer's refusal. Anything not marked unavailable falls through and
-  // the real call classifies it. The call-time path still handles the
-  // same error — the binding can die between this check and the stream.
+  // the real call classifies it — the binding can die between this check
+  // and the stream.
   if (provider.probe) {
     try {
       await provider.probe();
@@ -747,6 +756,8 @@ export async function runMemoryPreparation(
     const stream = provider.stream({
       personaId,
       turnId: `memory-l${chunk.layer}-${chunk.chunk_seq}`,
+      generation,
+      phase: "memory",
       round: 0,
       messages: branchMessages(claimed, deps.system),
       tools: deps.tools,
@@ -782,6 +793,21 @@ export async function runMemoryPreparation(
   }
   if (streamError !== null) {
     const e = streamError;
+    // Budget admission denied the call before any request was sent — a
+    // placement condition, not a verdict on the chunk. The 'budget-wait:'
+    // reason marks it so a later budget or funding change clears the
+    // pacing early; between changes a slow re-admit heartbeat keeps the
+    // wait self-healing.
+    if (e instanceof BudgetWaitError) {
+      await recordMemoryOutcome(deps, chunk.chunk_seq, {
+        kind: "unavailable",
+        reason: `budget-wait: ${e.message.slice(0, 4 * 1024)}`,
+        delayMs: BUDGET_WAIT_RESHELVE_MS,
+      });
+      // Budget retry timing belongs to the durable shelf, so do not add
+      // the separate model-unavailable in-process pause.
+      return "idle";
+    }
     // An unusable binding refused before any request was evaluated — a
     // placement condition, not a verdict on the chunk (a transferred
     // secretary is needs_rebinding until its human binds a connection).
@@ -848,7 +874,7 @@ export async function runMemoryPreparation(
   }
   // PG text cannot hold NUL — strip it rather than let an un-storable
   // candidate loop at the persistence boundary.
-  const replacement = trimmed.replace(/\u0000/g, "");
+  const replacement = trimmed.replaceAll("\u0000", "");
   await recordMemoryOutcome(deps, chunk.chunk_seq, {
     kind: "prepared",
     replacement,

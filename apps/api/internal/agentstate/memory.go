@@ -99,10 +99,11 @@ const (
 	// so a host that dies on every claim cannot loop model calls forever.
 	memoryChunkMaxInterruptions = 8
 	// memoryReshelvePacing delays a chunk returned to the shelf because the
-	// model layer was unavailable (unbound selection, missing credential,
-	// binding-lookup outage). The claim reached no model, so nothing is
-	// counted; the short delay keeps a persistent outage from spinning the
-	// claim/reshelve pair inside one host tick.
+	// model layer could not produce a request — an unusable binding or a
+	// budget-denied admission. The claim reached no model, so nothing is
+	// counted; the delay keeps a persistent block from spinning the
+	// claim/reshelve pair inside one host tick. Callers pass a longer pace
+	// for a budget wait, which clears on the next funding change.
 	memoryReshelvePacing = 200 * time.Millisecond
 )
 
@@ -1264,14 +1265,22 @@ func (s *Store) FailMemoryChunk(ctx context.Context, personaID string, generatio
 	return s.chunk(ctx, s.pool, personaID, chunkSeq)
 }
 
-// ReshelveMemoryChunk returns a claimed chunk to the shelf when the model
-// layer was unavailable — an unbound or deleted selection, a missing
-// credential, a binding-lookup outage. No model request was evaluated, so
-// the claim records no verdict and spends neither attempts nor
-// interruptions; the reason is kept on last_error for visibility and a
-// short pacing keeps a persistent outage from claiming every tick.
-func (s *Store) ReshelveMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, reason string) (*MemoryChunk, error) {
+// ReshelveMemoryChunk returns a claimed chunk to the shelf when no model
+// request could be evaluated — an unbound or deleted selection, a missing
+// credential, a binding-lookup outage, or a budget-denied admission. No
+// verdict was evaluated, so the claim spends neither an attempt nor an
+// interruption; the reason is kept on last_error for visibility. delayMs
+// paces the next claim beyond the default tick — a budget wait uses a
+// slower cadence because only a funding change can unblock it.
+func (s *Store) ReshelveMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, reason string, delayMs int64) (*MemoryChunk, error) {
 	reason = strings.ReplaceAll(reason, "\x00", "")
+	delay := time.Duration(delayMs) * time.Millisecond
+	if delay <= 0 {
+		delay = memoryReshelvePacing
+	}
+	if delay > 10*time.Minute {
+		delay = 10 * time.Minute
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -1294,7 +1303,7 @@ func (s *Store) ReshelveMemoryChunk(ctx context.Context, personaID string, gener
 			claimed_generation = NULL, claimed_at = NULL,
 			last_error = $3, not_before = now() + $4 * interval '1 millisecond'
 		WHERE persona_id = $1 AND chunk_seq = $2`,
-		personaID, chunkSeq, reason, memoryReshelvePacing.Milliseconds()); err != nil {
+		personaID, chunkSeq, reason, delay.Milliseconds()); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

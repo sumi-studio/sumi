@@ -309,6 +309,20 @@ type CommitRequest struct {
 	// now()+RetryAfterMs on top of the per-attempt backoff. Clamped to
 	// [0, 2min] — a hint can slow the next retry, never silence it.
 	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
+	// Wait explains an "await" outcome that is not a tool approval:
+	// kind 'budget' parks the input on the denied funding source until
+	// a budget or funding change resumes it.
+	Wait *CommitWait `json:"wait,omitempty"`
+}
+
+// CommitWait is the explicit blocker a turn commits 'await' on. Estimate
+// is the denied admission's estimate (BudgetWait.Estimate): the state
+// service prices it under the funding source's rate card when parking and
+// again on every budget change, so the wait resumes once the call fits.
+type CommitWait struct {
+	Kind     string         `json:"kind"` // "budget"
+	Funding  FundingRef     `json:"funding"`
+	Estimate *UsageEstimate `json:"estimate"`
 }
 
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
@@ -1206,6 +1220,45 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
+	// A held reservation from this turn with no recorded fact is an admit
+	// whose record call never landed — release its hold rather than let it
+	// suppress budget headroom until the next writer generation. This runs
+	// before the budget-wait lock below on purpose: it takes reservation
+	// rows then writes facts — the same order RecordUsage takes — and a
+	// commit that held the budget row while waiting on a reservation a
+	// RecordUsage holds (while that record waits on the budget row) would
+	// deadlock.
+	if err := reconcileHeldReservations(ctx, tx, personaID, turnID, nil); err != nil {
+		return nil, err
+	}
+	// A budget park serializes against changes to the wait's funding on
+	// the funding's budget row — the same row admits lock and a budget
+	// write contends for — taken before this commit touches any input or
+	// wait row and held until commit. Then a SetBudget/ClearBudget whose
+	// resume pass already ran cannot precede a wait insert that pass would
+	// have requeued: either the park sees the change and requeues itself,
+	// or its committed wait is found by the change's own resume. The
+	// funding staleness check covers the symmetric ordering: a human-wide
+	// resume that fully committed before this commit began cannot see the
+	// wait it is about to insert, so a wait whose funding the selection no
+	// longer resolves to requeues instead of parking on a source the next
+	// attempt would never spend.
+	var waitRoom fundingHeadroom
+	var waitStale bool
+	if req.Outcome == "await" && req.Wait != nil {
+		w := req.Wait
+		if w.Kind != "budget" || w.Funding.Kind == "" || w.Funding.ID == "" ||
+			w.Estimate == nil || w.Estimate.InputTokens < 0 ||
+			(w.Estimate.OutputTokensBound != nil && *w.Estimate.OutputTokensBound < 0) {
+			return nil, fmt.Errorf("%w: wait must be a budget wait with funding and a non-negative estimate", ErrBadRequest)
+		}
+		if waitStale, err = s.waitFundingStale(ctx, tx, personaID, w.Funding); err != nil {
+			return nil, err
+		}
+		if waitRoom, err = s.fundingHeadroomLocked(ctx, tx, w.Funding.Kind, w.Funding.ID); err != nil {
+			return nil, err
+		}
+	}
 	// Exactly one input_received per input ever lands in the journal, and
 	// every receipt names a real input: withoutJournaledInput refuses the
 	// commit when a receipt carries a non-string id or names an input row
@@ -1248,66 +1301,134 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	parked := false
 	switch req.Outcome {
 	case "await":
-		// The turn parks behind pending tool approvals. Lock the pending
-		// rows first so a decision landing mid-commit is serialized: the
-		// input waits only when an approval is still undecided; if a human
-		// decided between the claim and this commit, the input requeues
-		// directly so the resume attempt sees the recorded decision.
-		pending, err := s.pendingApprovalsForInput(ctx, tx, personaID, t.InputID)
-		if err != nil {
-			return nil, err
-		}
-		parked = len(pending) > 0
-		if err := tx.QueryRow(ctx, `
-			UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
-			WHERE persona_id = $1 AND turn_id = $2
-			RETURNING status, finished_at`,
-			personaID, turnID, reqJSON).
-			Scan(&t.Status, &t.FinishedAt); err != nil {
-			return nil, fmt.Errorf("await turn: %w", dataErr(err))
-		}
-		if len(pending) == 0 {
-			// Every approval this input parked for is already decided —
-			// resume immediately instead of waiting on a decision that
-			// already landed.
-			if _, err := tx.Exec(ctx, `
-				UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
-					turn_id = NULL, not_before = NULL
-				WHERE persona_id = $1 AND input_id = $2`,
-				personaID, t.InputID); err != nil {
+		if req.Wait != nil {
+			// A non-approval park. 'budget' is the only kind: the core was
+			// denied admission and no request was sent. The estimate is
+			// priced under the card in force at this commit — read under
+			// the budget-row lock taken above — so if the cap or the rate
+			// card changed between the denial and this commit the call now
+			// fits and the input requeues immediately instead of waiting on
+			// a blocker that no longer exists; likewise a wait whose
+			// funding the selection no longer resolves to.
+			w := req.Wait
+			if err := tx.QueryRow(ctx, `
+				UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
+				WHERE persona_id = $1 AND turn_id = $2
+				RETURNING status, finished_at`,
+				personaID, turnID, reqJSON).
+				Scan(&t.Status, &t.FinishedAt); err != nil {
+				return nil, fmt.Errorf("await turn: %w", dataErr(err))
+			}
+			fits, needed, err := waitRoom.fit(*w.Estimate)
+			if err != nil {
 				return nil, err
+			}
+			if fits || waitStale {
+				if _, err := tx.Exec(ctx, `
+					UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
+						turn_id = NULL, not_before = NULL
+					WHERE persona_id = $1 AND input_id = $2`,
+					personaID, t.InputID); err != nil {
+					return nil, err
+				}
+			} else {
+				if _, err := tx.Exec(ctx, `
+					UPDATE core_inputs SET status = 'waiting', waiting_since = now()
+					WHERE persona_id = $1 AND input_id = $2`,
+					personaID, t.InputID); err != nil {
+					return nil, err
+				}
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO core_budget_waits
+						(persona_id, input_id, turn_id, funding_kind, funding_id,
+						 needed_minor, currency, est_input_tokens, est_output_bound)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+					ON CONFLICT (persona_id, input_id) DO UPDATE SET
+						turn_id = $3, funding_kind = $4, funding_id = $5,
+						needed_minor = $6, currency = $7, est_input_tokens = $8,
+						est_output_bound = $9, created_at = now()`,
+					personaID, t.InputID, turnID, w.Funding.Kind, w.Funding.ID,
+					needed, waitRoom.budget.Currency,
+					w.Estimate.InputTokens, w.Estimate.OutputTokensBound); err != nil {
+					return nil, dataErr(err)
+				}
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO core_outbox (persona_id, seq, kind, payload)
+					SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'budget_wait', $2
+					FROM core_outbox WHERE persona_id = $1::uuidv7`,
+					personaID, map[string]any{
+						"turn_id":      turnID,
+						"input_id":     t.InputID,
+						"funding_kind": w.Funding.Kind,
+						"funding_id":   w.Funding.ID,
+						"needed_minor": needed,
+						"currency":     waitRoom.budget.Currency,
+					}); err != nil {
+					return nil, fmt.Errorf("append outbox: %w", dataErr(err))
+				}
 			}
 		} else {
-			if _, err := tx.Exec(ctx, `
-				UPDATE core_inputs SET status = 'waiting', waiting_since = now()
-				WHERE persona_id = $1 AND input_id = $2`,
-				personaID, t.InputID); err != nil {
+			// The turn parks behind pending tool approvals. Lock the pending
+			// rows first so a decision landing mid-commit is serialized: the
+			// input waits only when an approval is still undecided; if a human
+			// decided between the claim and this commit, the input requeues
+			// directly so the resume attempt sees the recorded decision.
+			pending, err := s.pendingApprovalsForInput(ctx, tx, personaID, t.InputID)
+			if err != nil {
 				return nil, err
 			}
-			// Surface the pending requests on the outbox so a delivery
-			// surface can bring the human's attention to them — the
-			// approval rows themselves remain the decision record.
-			reqs := make([]map[string]any, 0, len(pending))
-			for _, a := range pending {
-				reqs = append(reqs, map[string]any{
-					"approval_id":   a.ApprovalID,
-					"tool":          a.Tool,
-					"route":         a.Route,
-					"required_by":   a.RequiredBy,
-					"request":       a.Request,
-					"action_digest": a.ActionDigest,
-				})
+			parked = len(pending) > 0
+			if err := tx.QueryRow(ctx, `
+				UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
+				WHERE persona_id = $1 AND turn_id = $2
+				RETURNING status, finished_at`,
+				personaID, turnID, reqJSON).
+				Scan(&t.Status, &t.FinishedAt); err != nil {
+				return nil, fmt.Errorf("await turn: %w", dataErr(err))
 			}
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO core_outbox (persona_id, seq, kind, payload)
-				SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'approval_requested', $2
-				FROM core_outbox WHERE persona_id = $1::uuidv7`,
-				personaID, map[string]any{
-					"turn_id":   turnID,
-					"input_id":  t.InputID,
-					"approvals": reqs,
-				}); err != nil {
-				return nil, fmt.Errorf("append outbox: %w", dataErr(err))
+			if len(pending) == 0 {
+				// Every approval this input parked for is already decided —
+				// resume immediately instead of waiting on a decision that
+				// already landed.
+				if _, err := tx.Exec(ctx, `
+					UPDATE core_inputs SET status = 'queued', claimed_generation = NULL,
+						turn_id = NULL, not_before = NULL
+					WHERE persona_id = $1 AND input_id = $2`,
+					personaID, t.InputID); err != nil {
+					return nil, err
+				}
+			} else {
+				if _, err := tx.Exec(ctx, `
+					UPDATE core_inputs SET status = 'waiting', waiting_since = now()
+					WHERE persona_id = $1 AND input_id = $2`,
+					personaID, t.InputID); err != nil {
+					return nil, err
+				}
+				// Surface the pending requests on the outbox so a delivery
+				// surface can bring the human's attention to them — the
+				// approval rows themselves remain the decision record.
+				reqs := make([]map[string]any, 0, len(pending))
+				for _, a := range pending {
+					reqs = append(reqs, map[string]any{
+						"approval_id":   a.ApprovalID,
+						"tool":          a.Tool,
+						"route":         a.Route,
+						"required_by":   a.RequiredBy,
+						"request":       a.Request,
+						"action_digest": a.ActionDigest,
+					})
+				}
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO core_outbox (persona_id, seq, kind, payload)
+					SELECT $1::uuidv7, COALESCE(MAX(seq), 0) + 1, 'approval_requested', $2
+					FROM core_outbox WHERE persona_id = $1::uuidv7`,
+					personaID, map[string]any{
+						"turn_id":   turnID,
+						"input_id":  t.InputID,
+						"approvals": reqs,
+					}); err != nil {
+					return nil, fmt.Errorf("append outbox: %w", dataErr(err))
+				}
 			}
 		}
 	case "complete":
@@ -1562,6 +1683,13 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	// the context while preparation ran. The lost claim counts as an
 	// interruption, not a failed attempt.
 	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
+		return res, err
+	}
+	// Held usage reservations a dead generation admitted but never
+	// recorded are orphaned: their calls either resolved (fact exists —
+	// settle the bookkeeping) or were lost with the process (release the
+	// hold so the configured budget is not consumed by ghosts).
+	if err := reconcileHeldReservations(ctx, tx, personaID, "", &generation); err != nil {
 		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {

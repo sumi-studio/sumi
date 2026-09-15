@@ -47,7 +47,13 @@ import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
 import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
 import { type StateClient, StateError } from "../state-client.ts";
-import type { ModelBinding } from "../types.ts";
+import type { FundingRef, ModelBinding, UsageAdmitResult } from "../types.ts";
+import {
+  BudgetWaitError,
+  newFactId,
+  reportedTokens,
+  requestEstimate,
+} from "../usage.ts";
 
 /**
  * Connection presets whose wire protocol is OpenAI chat completions — the
@@ -153,20 +159,193 @@ export class SelectedModelProvider implements ModelProvider {
    * Binding preflight: resolves the selection exactly as the next call
    * would, without sending a request. Throws the same `ModelError` the
    * call would raise — callers that gate work on a usable model (memory
-   * preparation) can pause instead of spending it.
+   * preparation) can pause instead of spending it. The stream still
+   * re-resolves — the binding can change between this check and the call.
    */
   async probe(): Promise<void> {
     await this.resolve();
   }
 
+  /**
+   * The metered call path: resolve the selected funding, admit the
+   * priced estimate under the writer generation BEFORE any provider
+   * bytes leave, stream, then record one usage fact. A denial throws
+   * BudgetWaitError — no request was sent. The fact id is unique to this
+   * invocation: a retried or resent call is genuinely additional spend
+   * and records its own fact; only the record's own redelivery is
+   * idempotent.
+   */
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const { provider, identity } = await this.resolve();
-    for await (const ev of provider.stream(request)) {
-      // The recorded plan's usage names the connection that produced the
-      // decision, so "which model answered" is durable evidence.
-      yield ev.type === "done"
-        ? { type: "done", usage: { ...ev.usage, model_binding: identity } }
-        : ev;
+    if (request.generation === undefined) {
+      throw new Error("a metered call requires the writer generation");
+    }
+    const factId = newFactId(request);
+    const funding = fundingRef(identity);
+    // The estimate prices the provider's real wire bound — an output cap
+    // the adapter does not send cannot count as a bound on the bill.
+    const estimate = requestEstimate(request, provider.outputBound?.());
+    const admission = await this.admit(factId, request, funding, estimate);
+    if (!admission.admitted) {
+      throw new BudgetWaitError(
+        admission.wait ?? {
+          estimate,
+          funding,
+          needed_minor: 0,
+          limit_minor: 0,
+          spent_minor: 0,
+          held_minor: 0,
+          remaining_minor: 0,
+          currency: "",
+          pricing_revision: "",
+          bounded: false,
+        },
+      );
+    }
+    let usage: Record<string, unknown> | null = null;
+    let streamError: unknown = null;
+    // The provider asserts no request was produced only via an
+    // 'unavailable' error — every other outcome may have sent bytes.
+    let notSent = false;
+    try {
+      for await (const ev of provider.stream(request)) {
+        if (ev.type !== "done") {
+          yield ev;
+          continue;
+        }
+        usage = ev.usage;
+        // The recorded plan's usage names the connection that produced the
+        // decision, so "which model answered" is durable evidence.
+        yield { type: "done", usage: { ...ev.usage, model_binding: identity } };
+      }
+    } catch (e) {
+      streamError = e;
+      notSent = e instanceof ModelError && e.unavailable === true;
+    } finally {
+      // finally, not a post-loop statement: a consumer early-return or a
+      // caller abort also lands the fact — recording cannot silently
+      // disappear with the held reservation.
+      await this.record(factId, request, funding, usage, notSent);
+    }
+    if (streamError !== null) throw streamError;
+  }
+
+  /**
+   * Admit one call, replaying the SAME fact id across transient retries —
+   * the state service replays a held reservation, so a lost admit
+   * response never double-reserves. A definitive denial is a verdict, not
+   * a failure; a contract violation or a dead-writer fence is not
+   * retryable.
+   */
+  private async admit(
+    factId: string,
+    request: ModelRequest,
+    funding: FundingRef,
+    estimate: ReturnType<typeof requestEstimate>,
+  ): Promise<UsageAdmitResult> {
+    const { state, persona } = this.opts;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await state.admitUsage(persona, request.generation ?? 0, {
+          factId,
+          kind: "model_call",
+          phase: request.phase ?? "turn",
+          turnId: request.turnId,
+          inputId: request.inputId,
+          round: request.round,
+          funding,
+          estimate,
+        });
+      } catch (e) {
+        const transient =
+          !(e instanceof StateError) || e.status === 429 || e.status >= 500;
+        if (!transient || attempt === 2) {
+          throw new ModelError(`usage admission failed: ${e}`, {
+            retryable: transient,
+          });
+        }
+        await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+      }
+    }
+    throw new ModelError("usage admission failed", { retryable: true });
+  }
+
+  /**
+   * Persist the call's usage fact. Recording is not writer-fenced — the
+   * spend already happened — so this still lands after a fence loss or an
+   * aborted stream. A call whose usage never resolved records 'unknown'
+   * (the admission estimate stays spent), never silently zero; a call the
+   * provider asserts was never produced records 'not_sent' and releases
+   * its hold. A recording failure must not fail the turn: retrying the
+   * turn would spend again, so after bounded retries the gap is logged
+   * and the held reservation reconciles into an inspectable 'unrecorded'
+   * fact at turn commit or generation recovery — the durable record of
+   * the call survives even when this report does not.
+   */
+  private async record(
+    factId: string,
+    request: ModelRequest,
+    funding: FundingRef,
+    usage: Record<string, unknown> | null,
+    notSent: boolean,
+  ): Promise<void> {
+    const { state, persona, log } = this.opts;
+    const tokens =
+      usage === null
+        ? { input: null, output: null, cached: null }
+        : reportedTokens(usage);
+    // 'reported' only when the report is complete enough to price: input
+    // and output both present (cached is an optional subset). A partial
+    // report — or none at all — is 'unknown': the categories it did carry
+    // are kept, the admission estimate stays spent, and a missing category
+    // is never priced as zero. The state service refuses a partial
+    // 'reported' too. A call that produced usage was sent, whatever error
+    // followed.
+    const reported = tokens.input !== null && tokens.output !== null;
+    const status =
+      notSent && usage === null
+        ? "not_sent"
+        : reported
+          ? "reported"
+          : "unknown";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await state.recordUsage(persona, {
+          factId,
+          kind: "model_call",
+          phase: request.phase ?? "turn",
+          turnId: request.turnId,
+          inputId: request.inputId,
+          round: request.round,
+          funding,
+          status,
+          inputTokens: tokens.input,
+          outputTokens: tokens.output,
+          cachedTokens: tokens.cached,
+          quantities: usage ?? {},
+        });
+        return;
+      } catch (e) {
+        // A contract conflict (409) is authoritative — the fact is
+        // recorded or genuinely different; retrying cannot help either way.
+        if (e instanceof StateError && e.status === 409) {
+          log?.("usage fact conflicted with a recorded fact", {
+            fact_id: factId,
+            turn_id: request.turnId,
+            error: String(e),
+          });
+          return;
+        }
+        if (attempt === 2) {
+          log?.("usage fact could not be recorded", {
+            fact_id: factId,
+            turn_id: request.turnId,
+            error: String(e),
+          });
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      }
     }
   }
 
@@ -302,6 +481,26 @@ export class NoSelectionProvider implements ModelProvider {
       }),
     };
   }
+}
+
+/**
+ * The funding principal for the resolved binding — the identity recorded
+ * on the usage fact and charged at admission. 'unset' (no selection)
+ * spends the operator's environment default as kind 'operator'/'env'; a
+ * selected API connection is kind 'connection' under its own id, with the
+ * version/model/preset snapshot preserved at call time.
+ */
+function fundingRef(identity: BindingIdentity): FundingRef {
+  if (identity.selection === "unset") {
+    return { kind: "operator", id: "env", provider: identity.provider };
+  }
+  return {
+    kind: "connection",
+    id: identity.connection_id,
+    version: identity.version,
+    model: identity.model,
+    provider: identity.preset,
+  };
 }
 
 export function providerFromEnv(
