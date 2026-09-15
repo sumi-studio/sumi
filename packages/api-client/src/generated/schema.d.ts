@@ -549,10 +549,12 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Model IDs are free text and providers reject a bound above the model's cap with a 400 — set this when the selected model's output cap is below the core's default. Absent means the protocol default (Anthropic sends the core's default budget of 16384; Responses omits the field so the model's own cap applies). */
+            maxOutputTokens?: number;
         };
         ModelAPIConnectionCreate: {
             name: string;
@@ -560,12 +562,19 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores NULL (the protocol default), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
+        };
+        /** @description Per-connection request headers sent only to this connection's endpoint (for example a gateway routing header). Sealed encrypted together with the API key and never returned. Header names must be RFC 7230 tokens (max 128 chars) and may not replace the request's own authentication, protocol-version, or transport headers (for example Authorization, x-api-key, Content-Type, Host). Setting or clearing headers requires apiKey in the same request; omit the field to retain the stored headers. */
+        ModelAPIExtraHeaders: {
+            [key: string]: string;
         };
         ModelAPIConnectionUpdate: {
             name: string;
@@ -573,12 +582,15 @@ export interface components {
             preset: "openai-chat" | "openai-responses" | "anthropic" | "kimi-k3" | "glm-5.2" | "umans" | "umans-kimi-k2.7" | "opencode-go" | "opencode-zen-go";
             /**
              * Format: uri
-             * @description Public HTTPS API base URL without user info, query or fragment. Runtime transport checks every DNS destination and disallows redirects.
+             * @description Public HTTPS API base URL without user info, query or fragment. The runtime sends requests only to this literal URL and refuses to follow redirects (any 3xx fails deterministically rather than forwarding credentials to another destination). Validation covers the literal URL only — DNS is not resolved or pinned, and which networks the resolved address may reach is deployment egress policy, not enforced by this field.
              */
             baseUrl: string;
             model: string;
+            /** @description Requested bound on generated tokens for this connection (Anthropic max_tokens / OpenAI Responses max_output_tokens). Only the anthropic and openai-responses presets send a bound — it is rejected on other presets rather than stored inert. Set it when the selected model's output cap is below the core's default. Non-secret metadata returned in list responses; omitting it stores NULL (the protocol default), like other plain fields. */
+            maxOutputTokens?: number;
             /** @description Stored encrypted on this Sumi server. Never returned. Required for creation and when changing baseUrl; omitted during edits to retain the existing key. */
             apiKey?: string;
+            extraHeaders?: components["schemas"]["ModelAPIExtraHeaders"];
         };
         ModelConnectionSelection: {
             /** @enum {string} */

@@ -2,6 +2,7 @@ import { Button } from "@sumi/ui/components/button";
 import { useEffect, useRef, useState } from "react";
 import {
   type APIConnection,
+  APIConnectionError,
   type APIConnectionsClient,
   type ConnectionInput,
   type ConnectionSelection,
@@ -16,6 +17,12 @@ const blank: ConnectionInput = {
   baseUrl: "",
   model: "",
 };
+// Only these presets put an output bound on the wire (Anthropic
+// max_tokens / Responses max_output_tokens); the chat-completions
+// adapter sends none, so offering the field there would save a setting
+// that does nothing.
+const OUTPUT_BOUND_PRESETS = new Set(["anthropic", "openai-responses"]);
+const OUTPUT_BOUND_MAX = 1_000_000;
 const inputClass =
   "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm";
 export function APIConnectionSettings({
@@ -32,6 +39,9 @@ export function APIConnectionSettings({
   const [editing, setEditing] = useState<string | null | undefined>(undefined);
   const [form, setForm] = useState<ConnectionInput>(blank);
   const [key, setKey] = useState("");
+  const [headersText, setHeadersText] = useState("");
+  const [maxOutText, setMaxOutText] = useState("");
+  const [clearHeaders, setClearHeaders] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   const lifetime = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -58,10 +68,14 @@ export function APIConnectionSettings({
       await action(controller.signal);
       const next = await client.list(controller.signal);
       if (!controller.signal.aborted) setState(next);
-    } catch {
+    } catch (e) {
+      // Only the client's typed failure is written for display; any other
+      // error message may be a transport or provider diagnostic.
       if (!controller.signal.aborted)
         setError(
-          "接続を更新できませんでした。入力と接続状態を確認して、もう一度お試しください。",
+          e instanceof APIConnectionError
+            ? e.message
+            : "接続を更新できませんでした。入力と接続状態を確認して、もう一度お試しください。",
         );
     } finally {
       if (!controller.signal.aborted) setBusy(false);
@@ -80,6 +94,11 @@ export function APIConnectionSettings({
         : blank,
     );
     setKey("");
+    setHeadersText("");
+    setMaxOutText(
+      connection?.maxOutputTokens ? String(connection.maxOutputTokens) : "",
+    );
+    setClearHeaders(false);
     setRemoving(null);
     setError("");
   }
@@ -156,6 +175,9 @@ export function APIConnectionSettings({
                             if (editing === c.id) {
                               setEditing(undefined);
                               setKey("");
+                              setHeadersText("");
+                              setMaxOutText("");
+                              setClearHeaders(false);
                             }
                           }
                         })
@@ -205,25 +227,95 @@ export function APIConnectionSettings({
               const previous = state?.connections.find(
                 (connection) => connection.id === editing,
               );
-              const revokesCredential =
-                !!key ||
+              // Entering a new key replaces the sealed credential;
+              // preset/URL/model changes keep it — the same key is
+              // reused under the new settings.
+              const replacesCredential = !!key;
+              const changedSettings =
+                previous?.preset !== form.preset ||
                 previous?.baseUrl !== form.baseUrl ||
-                previous?.preset !== form.preset;
+                previous?.model !== form.model;
+              // "Name: value" per line. Stored headers are write-only:
+              // an empty field means "keep what is stored".
+              const extraHeaders: Record<string, string> = {};
+              let headersValid = true;
+              for (const line of headersText.split("\n")) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const colon = trimmed.indexOf(":");
+                if (colon < 1) {
+                  headersValid = false;
+                  continue;
+                }
+                const name = trimmed.slice(0, colon).trim();
+                const value = trimmed.slice(colon + 1).trim();
+                if (!name || !value) headersValid = false;
+                else extraHeaders[name] = value;
+              }
+              if (!headersValid) {
+                setError(
+                  "ヘッダーは「名前: 値」の形式で1行ずつ入力してください。",
+                );
+                return;
+              }
+              // Headers are sealed with the credential: setting,
+              // changing, or clearing them without resubmitting the key
+              // is rejected by the server.
+              if ((headersText.trim() || clearHeaders) && !key) {
+                setError(
+                  "ヘッダーを設定・変更・削除するにはAPIキーも入力してください。",
+                );
+                return;
+              }
+              // The bound is a whole number on the wire — validate the
+              // full text (a number input can hold "1e3"; truncating it
+              // to 1 would silently send a different bound).
+              const boundSupported = OUTPUT_BOUND_PRESETS.has(form.preset);
+              const rawBound = maxOutText.trim();
+              let maxOutputTokens: number | undefined;
+              if (boundSupported && rawBound) {
+                if (
+                  !/^\d+$/.test(rawBound) ||
+                  Number(rawBound) < 1 ||
+                  Number(rawBound) > OUTPUT_BOUND_MAX
+                ) {
+                  setError(
+                    `最大出力トークンは1〜${OUTPUT_BOUND_MAX.toLocaleString()}の整数で入力してください。`,
+                  );
+                  return;
+                }
+                maxOutputTokens = Number(rawBound);
+              }
               await client.save(
-                { ...form, ...(key ? { apiKey: key } : {}) },
+                {
+                  ...form,
+                  // Unsupported presets never carry the bound — an
+                  // ineffective saved value would be invisible to the
+                  // user and is rejected by the server as well.
+                  maxOutputTokens: boundSupported ? maxOutputTokens : undefined,
+                  ...(key ? { apiKey: key } : {}),
+                  ...(clearHeaders
+                    ? { extraHeaders: {} }
+                    : headersText.trim()
+                      ? { extraHeaders }
+                      : {}),
+                },
                 editing ?? undefined,
                 signal,
               );
               if (!signal.aborted) {
                 setKey("");
+                setHeadersText("");
+                setMaxOutText("");
+                setClearHeaders(false);
                 setEditing(undefined);
                 setNotice(
                   state?.selection?.kind === "api" &&
                     state.selection.connectionId === editing
-                    ? revokesCredential
+                    ? replacesCredential
                       ? "接続を保存しました。以前の認証情報は次のリクエストから使われなくなり、作業が止まってから新しい設定で起動します。"
-                      : previous?.model !== form.model
-                        ? "モデルを保存しました。作業が一区切りついてから切り替わります。"
+                      : changedSettings
+                        ? "接続を保存しました。認証情報はそのまま引き継がれ、作業が一区切りついてから新しい設定で起動します。"
                         : "接続を保存しました。"
                     : "接続を保存しました。「使う」を押すと切り替わります。",
                 );
@@ -285,6 +377,28 @@ export function APIConnectionSettings({
               placeholder="プロバイダーのモデルID"
             />
           </label>
+          {OUTPUT_BOUND_PRESETS.has(form.preset) && (
+            <label className="block text-sm">
+              最大出力トークン（任意）
+              <input
+                className={inputClass}
+                type="text"
+                inputMode="numeric"
+                value={maxOutText}
+                disabled={busy}
+                onChange={(e) => setMaxOutText(e.target.value)}
+                placeholder={
+                  form.preset === "anthropic" ? "16384" : "モデル既定"
+                }
+              />
+              <span className="mt-1 block text-muted-foreground text-xs">
+                {form.preset === "anthropic"
+                  ? "空欄なら16,384を送ります。モデルの出力上限がそれより小さい場合はその値に設定してください。"
+                  : "空欄ならこの項目を送らず、モデル自身の上限が使われます。出力を制限したい場合に設定してください。"}
+                上限を超える値はプロバイダーが拒否します。
+              </span>
+            </label>
+          )}
           <label className="block text-sm">
             APIキー
             <input
@@ -294,6 +408,8 @@ export function APIConnectionSettings({
               value={key}
               required={
                 !editing ||
+                !!headersText.trim() ||
+                clearHeaders ||
                 state?.connections.find((c) => c.id === editing)?.baseUrl !==
                   form.baseUrl
               }
@@ -302,8 +418,31 @@ export function APIConnectionSettings({
               placeholder={editing ? "変更しない場合は空欄" : "APIキーを入力"}
             />
           </label>
+          <label className="block text-sm">
+            追加リクエストヘッダー（任意）
+            <textarea
+              className={inputClass}
+              rows={2}
+              value={headersText}
+              disabled={busy || clearHeaders}
+              onChange={(e) => setHeadersText(e.target.value)}
+              placeholder={"X-Header-Name: value"}
+              spellCheck={false}
+            />
+          </label>
+          {editing && (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={clearHeaders}
+                disabled={busy}
+                onChange={(e) => setClearHeaders(e.target.checked)}
+              />
+              保存済みの追加ヘッダーをすべて削除する
+            </label>
+          )}
           <p className="text-muted-foreground text-xs leading-relaxed">
-            キーはこのSumiサーバーに暗号化して保存します。選んだ接続先へ会話が送られ、APIの利用料はそのアカウントに発生します。保存済みのキーは表示しません。
+            キーはこのSumiサーバーに暗号化して保存します。選んだ接続先へ会話が送られ、APIの利用料はそのアカウントに発生します。保存済みのキーは表示しません。追加ヘッダーもキーと一緒に暗号化して保存され、この接続先にだけ送られます。変更するにはAPIキーと一緒に再入力してください。
           </p>
           <div className="flex gap-3">
             <Button type="submit" disabled={busy}>
@@ -316,6 +455,9 @@ export function APIConnectionSettings({
               onClick={() => {
                 setEditing(undefined);
                 setKey("");
+                setHeadersText("");
+                setMaxOutText("");
+                setClearHeaders(false);
               }}
             >
               戻る

@@ -38,7 +38,8 @@ export class MockProvider implements ModelProvider {
       args: Record<string, unknown>;
     }[] = [];
 
-    const slow = request.round === 0 ? /^!slow\s+(\d+)\s*(.*)$/s.exec(text) : null;
+    const slow =
+      request.round === 0 ? /^!slow\s+(\d+)\s*(.*)$/s.exec(text) : null;
     if (slow) {
       const delay = Number(slow[1]);
       await waitWithSignal(delay, request.signal);

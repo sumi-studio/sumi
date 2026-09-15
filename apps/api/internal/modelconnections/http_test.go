@@ -74,3 +74,86 @@ func TestHTTPWriteOnlyAndSessionRevocation(t *testing.T) {
 		t.Fatal("revoked mutation ran", err)
 	}
 }
+
+func TestHTTPExtraHeadersWriteOnly(t *testing.T) {
+	store := fixture(t)
+	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
+		return chatgpt.LoginIdentity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+			return effect(ctx)
+		}}, nil
+	}}
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+		return w
+	}
+	// Headers save with the key and are never echoed back.
+	w := request("POST", "/api/model-connections/api", `{"name":"gw","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"private-test-key","extraHeaders":{"X-Gateway-Session":"gw-7"}}`)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "gw-7") || strings.Contains(w.Body.String(), "private-test-key") {
+		t.Fatalf("save echoed secrets: %d %s", w.Code, w.Body.String())
+	}
+	var c Connection
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	access, err := store.Resolve(context.Background(), owner, c.ID)
+	if err != nil || access.ExtraHeaders["X-Gateway-Session"] != "gw-7" {
+		t.Fatalf("headers not sealed with credential: %v %+v", err, access)
+	}
+	// The list response carries no header material either.
+	w = request("GET", "/api/model-connections", "")
+	if w.Code != 200 || strings.Contains(w.Body.String(), "gw-7") || strings.Contains(w.Body.String(), "X-Gateway-Session") {
+		t.Fatalf("list leaked headers: %s", w.Body.String())
+	}
+	// Reserved names are refused before anything is stored.
+	w = request("POST", "/api/model-connections/api", `{"name":"gw2","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","extraHeaders":{"Authorization":"Bearer evil"}}`)
+	if w.Code != 400 {
+		t.Fatalf("reserved header accepted: %d", w.Code)
+	}
+	// Headers without a resubmitted key are refused on update.
+	w = request("PUT", "/api/model-connections/api/"+c.ID, `{"name":"gw","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","extraHeaders":{"X-Tenant":"t"}}`)
+	if w.Code != 400 {
+		t.Fatalf("keyless header change accepted: %d", w.Code)
+	}
+}
+
+func TestHTTPMaxOutputTokensAndErrorDetail(t *testing.T) {
+	store := fixture(t)
+	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
+		return chatgpt.LoginIdentity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+			return effect(ctx)
+		}}, nil
+	}}
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+		return w
+	}
+	// The bound is non-secret metadata: it round-trips through save and list.
+	w := request("POST", "/api/model-connections/api", `{"name":"cap","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","maxOutputTokens":4096}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"maxOutputTokens":4096`) {
+		t.Fatalf("save %d %s", w.Code, w.Body.String())
+	}
+	var c Connection
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
+		t.Fatal(err)
+	}
+	w = request("GET", "/api/model-connections", "")
+	if !strings.Contains(w.Body.String(), `"maxOutputTokens":4096`) {
+		t.Fatalf("list omitted the bound: %s", w.Body.String())
+	}
+	// Out-of-range values are refused with the reason surfaced.
+	w = request("PUT", "/api/model-connections/api/"+c.ID, `{"name":"cap","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","maxOutputTokens":0}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "maxOutputTokens") {
+		t.Fatalf("bound 0 accepted or reason lost: %d %s", w.Code, w.Body.String())
+	}
+	// A reserved header rejection names the offending header, not the value.
+	w = request("POST", "/api/model-connections/api", `{"name":"gw2","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","extraHeaders":{"Authorization":"Bearer evil-value"}}`)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "Authorization") || strings.Contains(w.Body.String(), "evil-value") {
+		t.Fatalf("detail missing or value leaked: %d %s", w.Code, w.Body.String())
+	}
+}
