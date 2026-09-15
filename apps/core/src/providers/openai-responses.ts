@@ -76,6 +76,14 @@ export class OpenAIResponsesProvider implements ModelProvider {
     this.fetchImpl = fetchImpl;
   }
 
+  /** The output bound the next request will actually send, if any. */
+  outputBound(): number | undefined {
+    const extra = this.cfg.extra;
+    const overridden =
+      extra !== undefined ? numOr(extra.max_output_tokens) : undefined;
+    return overridden ?? this.cfg.maxOutputTokens;
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     assertExtraHeaders(this.cfg.headers);
     const tools = wireTools(request.tools);
@@ -435,4 +443,8 @@ function toInput(
     ...(system.length ? { instructions: system.join("\n\n") } : {}),
     input,
   };
+}
+
+function numOr(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
 }

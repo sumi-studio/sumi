@@ -647,7 +647,7 @@ func TestMemoryReshelveKeepsWork(t *testing.T) {
 	if claimed.Chunk == nil {
 		t.Fatal("claim")
 	}
-	c, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "model: selection needs a destination binding")
+	c, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "model: selection needs a destination binding", 0)
 	if err != nil {
 		t.Fatalf("reshelve: %v", err)
 	}
@@ -683,7 +683,7 @@ func TestMemoryReshelveKeepsWork(t *testing.T) {
 	}
 	// A reshelve against a chunk that is not this generation's live claim
 	// is a conflict — the shelf is never rewritten under the wrong claim.
-	if _, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "not claimed"); !errors.Is(err, ErrMemoryConflict) {
+	if _, err := s.ReshelveMemoryChunk(ctx, pa, gen, 1, "not claimed", 0); !errors.Is(err, ErrMemoryConflict) {
 		t.Fatalf("reshelve of unclaimed chunk: %v, want ErrMemoryConflict", err)
 	}
 }

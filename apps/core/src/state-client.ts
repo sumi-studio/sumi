@@ -4,6 +4,7 @@ import type {
   ClaimedMemoryChunk,
   CommitRequest,
   Event,
+  FundingRef,
   Job,
   JobTerminalReport,
   LoadResult,
@@ -18,6 +19,9 @@ import type {
   Schedule,
   Turn,
   TurnPlan,
+  UsageAdmitResult,
+  UsageEstimate,
+  UsageFact,
   WriterLease,
 } from "./types.ts";
 
@@ -77,6 +81,54 @@ export interface StateClient {
     generation: number,
   ): Promise<void>;
   recover(persona: string, generation: number): Promise<RecoverResult>;
+  /**
+   * Reserve priced-estimate spend for one provider call, under the
+   * writer's generation, before any request bytes are sent. Replaying the
+   * same admit (lost response) returns the held reservation rather than
+   * double-reserving. A denial creates nothing durable — the caller
+   * commits the wait itself at turn commit or reshelves the chunk.
+   */
+  admitUsage(
+    persona: string,
+    generation: number,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      estimate: UsageEstimate;
+    },
+  ): Promise<UsageAdmitResult>;
+  /**
+   * Record one call's resolved usage. Deliberately not writer-fenced: the
+   * spend already happened and a replaced writer must still be able to
+   * report it. Idempotent on fact_id — an identical redelivery replays
+   * the stored fact; a conflicting payload under a known fact_id is a
+   * 409 contract violation (a genuinely additional call must carry a
+   * fresh fact_id).
+   */
+  recordUsage(
+    persona: string,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      status: "reported" | "unknown" | "not_sent";
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cachedTokens?: number | null;
+      quantities?: Record<string, unknown>;
+    },
+  ): Promise<{ fact: UsageFact; created: boolean }>;
+  /** The persona's usage ledger, oldest first. */
+  listUsageFacts(persona: string, limit?: number): Promise<UsageFact[]>;
   loadTurn(
     persona: string,
     generation: number,
@@ -213,17 +265,19 @@ export interface StateClient {
     failure: { error: string; retryable: boolean },
   ): Promise<MemoryChunk>;
   /**
-   * Return a claimed chunk to the shelf because the model layer was
-   * unavailable before any request was evaluated — an unbound selection,
-   * a missing credential, a binding-lookup outage. Records no verdict
-   * and spends no attempts or interruptions; the chunk waits out a short
-   * pacing, then proceeds once a usable binding exists.
+   * Return a claimed chunk to the shelf when no model request could be
+   * evaluated — an unbound selection, a missing credential, a
+   * binding-lookup outage, or a denied budget admission. Records no
+   * verdict and spends no attempts or interruptions; the chunk waits out
+   * a short pacing (delayMs, or the service default), then proceeds once
+   * a usable binding exists. A funding or model-selection change clears
+   * budget pacing early.
    */
   reshelveMemoryChunk(
     persona: string,
     generation: number,
     chunkSeq: number,
-    pause: { reason: string },
+    pause: { reason: string; delayMs?: number },
   ): Promise<MemoryChunk>;
   outbox(
     persona: string,
@@ -298,6 +352,13 @@ export interface StateClient {
   ): Promise<Job>;
 }
 
+type StateResponse = {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+};
+
 type FetchLike = (
   input: string | URL,
   init?: {
@@ -306,18 +367,51 @@ type FetchLike = (
     body?: string;
     signal?: AbortSignal;
   },
-) => Promise<{
-  ok: boolean;
-  status: number;
-  json(): Promise<unknown>;
-  text(): Promise<string>;
-}>;
+) => Promise<StateResponse>;
+
+/**
+ * Per-call deadline for a state request, covering both the response
+ * headers and the body read: the same AbortSignal governs fetch() and its
+ * pending json() read. 10s is far above a healthy call (small JSON over a
+ * LAN/binding hop, tens of ms) and matches the Go wake client's timeout —
+ * a call that has not finished by then is a wedged transport, and waiting
+ * longer only stalls everyone queued behind it on startSerialized. A
+ * timed-out call is indeterminate (the service may have committed); it is
+ * classified transient so the caller's normal retry path replays it under
+ * the server-side idempotency and generation fencing that already cover
+ * uncertain outcomes.
+ */
+export const STATE_CALL_TIMEOUT_MS = 10_000;
+
+/**
+ * The deadline's rejection shape. call() passes only its own timeout
+ * signal, so an abort here is always the deadline expiring — reported as a
+ * transient 503 rather than leaking an undifferentiated AbortError, which
+ * some callers would classify as a non-transient unknown defect.
+ */
+function callDeadlineError(
+  e: unknown,
+  method: string,
+  path: string,
+  timeoutMs: number,
+): StateError | null {
+  if (
+    e instanceof Error &&
+    (e.name === "TimeoutError" || e.name === "AbortError")
+  )
+    return new StateError(
+      503,
+      `state ${method} ${path} timed out after ${timeoutMs}ms`,
+    );
+  return null;
+}
 
 /** HTTP client for the Go agentstate service. */
 export class HttpStateClient implements StateClient {
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly fetchImpl: FetchLike;
+  private readonly timeoutMs: number;
 
   constructor(
     baseUrl: string,
@@ -326,10 +420,12 @@ export class HttpStateClient implements StateClient {
     // a detached reference to the global function.
     fetchImpl: FetchLike = (input, init) =>
       fetch(input, init) as ReturnType<FetchLike>,
+    timeoutMs = STATE_CALL_TIMEOUT_MS,
   ) {
     this.baseUrl = baseUrl;
     this.token = token;
     this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
   }
 
   private async call<T>(
@@ -337,18 +433,30 @@ export class HttpStateClient implements StateClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const res = await this.fetchImpl(this.baseUrl + path, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    // One signal bounds the whole request: a service that accepts but never
+    // answers, or answers headers and stalls mid-body, fails here instead
+    // of occupying a serialized start (or a drain) forever.
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    let res: StateResponse;
+    try {
+      res = await this.fetchImpl(this.baseUrl + path, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
+      });
+    } catch (e) {
+      throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
+    }
     if (res.ok) {
       try {
         return (await res.json()) as T;
       } catch (e) {
+        const timeout = callDeadlineError(e, method, path, this.timeoutMs);
+        if (timeout) throw timeout;
         // A 200 with an unreadable body is an infrastructure blip — a
         // truncated proxy/middlebox response or a service bug — not a
         // code defect. Surface it as a transient 5xx so callers back
@@ -419,6 +527,79 @@ export class HttpStateClient implements StateClient {
         generation,
       },
     );
+  }
+  admitUsage(
+    persona: string,
+    generation: number,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      estimate: UsageEstimate;
+    },
+  ) {
+    return this.call<UsageAdmitResult>(
+      "POST",
+      `/internal/core/personas/${persona}/usage/admit`,
+      {
+        generation,
+        fact_id: req.factId,
+        kind: req.kind,
+        phase: req.phase,
+        turn_id: req.turnId,
+        input_id: req.inputId,
+        round: req.round ?? 0,
+        funding: req.funding,
+        estimate: req.estimate,
+      },
+    );
+  }
+  recordUsage(
+    persona: string,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      status: "reported" | "unknown" | "not_sent";
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cachedTokens?: number | null;
+      quantities?: Record<string, unknown>;
+    },
+  ) {
+    return this.call<{ fact: UsageFact; created: boolean }>(
+      "POST",
+      `/internal/core/personas/${persona}/usage/record`,
+      {
+        fact_id: req.factId,
+        kind: req.kind,
+        phase: req.phase,
+        turn_id: req.turnId,
+        input_id: req.inputId,
+        round: req.round ?? 0,
+        funding: req.funding,
+        status: req.status,
+        input_tokens: req.inputTokens ?? null,
+        output_tokens: req.outputTokens ?? null,
+        cached_tokens: req.cachedTokens ?? null,
+        quantities: req.quantities ?? {},
+      },
+    );
+  }
+  async listUsageFacts(persona: string, limit = 100) {
+    const res = await this.call<{ facts: UsageFact[] }>(
+      "GET",
+      `/internal/core/personas/${persona}/usage/facts?limit=${limit}`,
+    );
+    return res.facts;
   }
   loadTurn(
     persona: string,
@@ -620,12 +801,12 @@ export class HttpStateClient implements StateClient {
     persona: string,
     generation: number,
     chunkSeq: number,
-    pause: { reason: string },
+    pause: { reason: string; delayMs?: number },
   ) {
     const res = await this.call<{ chunk: MemoryChunk }>(
       "POST",
       `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/reshelve`,
-      { generation, reason: pause.reason },
+      { generation, reason: pause.reason, delay_ms: pause.delayMs },
     );
     return res.chunk;
   }

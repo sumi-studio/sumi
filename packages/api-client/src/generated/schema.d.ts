@@ -75,6 +75,76 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List this Human's funding sources with budgets, totals, recent usage and parked inputs
+         * @description Actor identity comes only from the signed browser session. Covers Human-owned API connections and live Sumi-provided allocations; the operator environment default appears only for personas with no Human selection. Costs are configured-rate estimates, never provider invoices.
+         */
+        get: operations["getUsageOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/usage/funding/{kind}/{id}/facts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "connection" | "sumi";
+                id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List recorded usage facts for one owned funding source
+         * @description Only funding sources owned by the authenticated Human are visible; another Human's source returns 404-equivalent denial. Each fact is one admitted provider call; redelivery never multiplies it.
+         */
+        get: operations["listUsageFacts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/usage/funding/{kind}/{id}/budget": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: "connection" | "sumi";
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set an explicit spend budget and rate card on an owned funding source
+         * @description Absence of a budget is uncapped, not an implicit limit. Setting or raising a budget resumes inputs parked on that source. Sumi-provided allocations are configured by the funder, not the grantee — kind 'sumi' is rejected here. Rates are clearly-labelled estimates with an explicit pricing revision, not provider prices.
+         */
+        put: operations["setUsageBudget"];
+        post?: never;
+        /**
+         * Remove the budget on an owned funding source, making it uncapped
+         * @description Clearing a budget resumes inputs parked on that source.
+         */
+        delete: operations["clearUsageBudget"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/health": {
         parameters: {
             query?: never;
@@ -916,6 +986,128 @@ export interface components {
             idempotency_key: string;
             /** @constant */
             reject_reason: "idempotency_conflict";
+        };
+        /** @description The funding principal actually selected for a call, captured at call time; a later connection switch never rewrites it. */
+        UsageFundingRef: {
+            /** @enum {string} */
+            kind: "connection" | "operator" | "sumi";
+            /** @description Connection UUID, 'env' for the operator default, or a grant funding id. */
+            id: string;
+            /** @description Non-secret connection version snapshot (connection kind only). */
+            version?: string;
+            model?: string;
+            provider?: string;
+        };
+        /** @description An explicitly configured cap with its rate card. All money is integer minor units; rates are configured estimates under pricing_revision, not provider prices. */
+        UsageBudget: {
+            /** @enum {string} */
+            funding_kind: "connection" | "operator" | "sumi";
+            funding_id: string;
+            limit_minor: number;
+            currency: string;
+            /** @description Minor units per one million input tokens. */
+            rate_input_per_mtok: number;
+            /** @description Minor units per one million output tokens. */
+            rate_output_per_mtok: number;
+            /** @description Minor units per one million cached input tokens; absent bills cached at the input rate. */
+            rate_cached_per_mtok?: number | null;
+            /** @description Caller-chosen label identifying which rate card produced these prices. */
+            pricing_revision: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** @description Priced recorded facts. */
+            spent_minor: number;
+            /** @description Currently held admission reservations. */
+            held_minor: number;
+            /** @description limit_minor - spent_minor - held_minor. */
+            remaining_minor: number;
+        };
+        UsageBudgetInput: {
+            limit_minor: number;
+            currency: string;
+            rate_input_per_mtok: number;
+            rate_output_per_mtok: number;
+            rate_cached_per_mtok?: number | null;
+            pricing_revision: string;
+        };
+        UsageTotals: {
+            calls: number;
+            /** @description Calls without a complete provider usage report (status 'unknown' — no report or only some categories — or 'unrecorded'); they carry the admission estimate as uncertain spend, never zero. */
+            unknown_calls: number;
+            /** @description Reported calls with no applicable rate card. */
+            unpriced_calls: number;
+            input_tokens: number;
+            output_tokens: number;
+            cached_tokens: number;
+            /** @description Recorded spend per currency code in minor units. A funding source can hold cost in more than one currency across rate-card edits, so totals never collapse to one number. */
+            costs: {
+                [key: string]: number;
+            };
+        };
+        /** @description One admitted provider call. Retries and extra calls are distinct facts; redelivery of the same fact_id never multiplies it. */
+        UsageFact: {
+            persona_id: string;
+            fact_id: string;
+            /** @enum {string} */
+            kind: "model_call";
+            /** @enum {string} */
+            phase: "turn" | "memory";
+            turn_id?: string;
+            input_id?: string;
+            round?: number;
+            funding: components["schemas"]["UsageFundingRef"];
+            /**
+             * @description 'reported' carries complete provider token counts (input and output). 'unknown' means the call was attempted but no complete usage report resolved — categories the provider did report are kept, and the admission estimate stays as uncertain spend until a complete report for the same fact supersedes it. 'unrecorded' means the writer lost the response before it could report — inspectable, estimate retained. 'not_sent' means the request provably never left — its reservation was released and nothing is owed.
+             * @enum {string}
+             */
+            status: "reported" | "unknown" | "not_sent" | "unrecorded";
+            input_tokens: number | null;
+            output_tokens: number | null;
+            cached_tokens: number | null;
+            /** @description Raw provider-reported quantities, preserved verbatim. */
+            quantities: Record<string, never>;
+            /** @description Priced under the rate card snapshotted at admission; null when unpriced. */
+            cost_minor: number | null;
+            currency?: string;
+            /**
+             * @description Provenance — 'configured_rates' priced provider-reported tokens; 'admission_estimate' is the reserved estimate kept for unknown/lost usage. Never a provider invoice.
+             * @enum {string}
+             */
+            cost_basis?: "configured_rates" | "admission_estimate";
+            pricing_revision?: string;
+            /** Format: date-time */
+            recorded_at: string;
+        };
+        UsageSourceView: {
+            /** @enum {string} */
+            kind: "connection" | "sumi";
+            id: string;
+            name?: string;
+            model?: string;
+            preset?: string;
+            /** @description Whether this Human's secretaries currently select this source. */
+            selected: boolean;
+            /** @description True for a Sumi-provided allocation; its budget is funder-managed. */
+            grant?: boolean;
+            budget?: components["schemas"]["UsageBudget"];
+            totals: components["schemas"]["UsageTotals"];
+            recent: components["schemas"]["UsageFact"][];
+        };
+        /** @description An input parked because admission could not reserve enough budget; resumes when a budget change (a higher limit or lower rates) lets the parked call fit, when the budget is removed, or on a funding change. needed_minor is the call's admission estimate priced under the current rate card. */
+        UsageBudgetWaitRow: {
+            persona_id: string;
+            input_id: string;
+            turn_id: string;
+            funding_kind: string;
+            funding_id: string;
+            needed_minor: number;
+            currency: string;
+            /** Format: date-time */
+            created_at: string;
+        };
+        UsageOverview: {
+            sources: components["schemas"]["UsageSourceView"][];
+            waits: components["schemas"]["UsageBudgetWaitRow"][];
         };
         /** @description placeholder for v1; no attachments are accepted yet */
         Attachment: {
@@ -1910,6 +2102,193 @@ export interface operations {
             };
             /** @description Credential storage unavailable or operation could not complete. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getUsageOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Funding sources and budget-parked inputs visible to this Human. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UsageOverview"];
+                };
+            };
+            /** @description Missing, invalid or revoked session. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Usage projection could not be read. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listUsageFacts: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                kind: "connection" | "sumi";
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage facts, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        facts: components["schemas"]["UsageFact"][];
+                    };
+                };
+            };
+            /** @description Missing, invalid or revoked session. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source is not owned by this Human. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source does not exist. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setUsageBudget: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path: {
+                kind: "connection" | "sumi";
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UsageBudgetInput"];
+            };
+        };
+        responses: {
+            /** @description Saved budget with its current spent/held/remaining projection. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        budget: components["schemas"]["UsageBudget"];
+                    };
+                };
+            };
+            /** @description Strict JSON or budget validation failed. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source is not owned by this Human, or is a Sumi allocation. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source does not exist. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    clearUsageBudget: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Same-origin browser CSRF token matching its cookie. */
+                "X-CSRF-Token": string;
+            };
+            path: {
+                kind: "connection" | "sumi";
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Budget removed; the source is now uncapped. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing, invalid or revoked session; disallowed Origin or missing mutation CSRF proof. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source is not owned by this Human, or is a Sumi allocation. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The funding source does not exist. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -11,8 +11,47 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SecretaryObject"] }],
   "vars": {
-    // Dev defaults — production values come from secrets/bindings.
+    // Local wrangler dev only: a loopback state service, the scripted mock
+    // model, and an unauthenticated wake accepted only on a loopback host.
     "SUMI_STATE_URL": "http://127.0.0.1:8180",
-    "SUMI_MODEL_PROVIDER": "mock"
+    "SUMI_MODEL_PROVIDER": "mock",
+    "SUMI_CORE_WAKE_OPEN": "loopback-dev"
+  },
+  "env": {
+    // Public alpha core: Durable Objects on Cloudflare, canonical state in
+    // the Go API on the WSL origin reached through the Workers VPC Service
+    // that already fronts that API for the sumi-alpha web edge.
+    // Secrets (wrangler secret put --env alpha):
+    //   SUMI_CORE_RUNTIME_TOKEN  = the API's SUMI_CORE_RUNTIME_TOKEN
+    //   SUMI_CORE_WAKE_TOKEN     = the API's SUMI_CORE_WAKE_TOKEN
+    "alpha": {
+      "name": "sumi-core-alpha",
+      // The API wakes personas over the public workers.dev URL; every route
+      // except /health requires SUMI_CORE_WAKE_TOKEN.
+      "workers_dev": true,
+      "preview_urls": false,
+      "compatibility_flags": [],
+      "observability": { "enabled": true },
+      "durable_objects": {
+        "bindings": [{ "name": "SECRETARY", "class_name": "SecretaryObject" }]
+      },
+      "vpc_services": [
+        {
+          // sumi-alpha-api: http 100.116.25.99:8080 via sumi-alpha-tunnel.
+          "binding": "SUMI_STATE",
+          "service_id": "01a09449-94f3-7fc3-b6db-daaffb98df22"
+        }
+      ],
+      "vars": {
+        // Host header / path base only: the VPC Service decides where the
+        // request goes.
+        "SUMI_STATE_URL": "http://100.116.25.99:8080",
+        // A persona without a selected model connection fails visibly; no
+        // operator model answers for it.
+        "SUMI_MODEL_PROVIDER": "none",
+        // Explicitly off: wake always requires SUMI_CORE_WAKE_TOKEN here.
+        "SUMI_CORE_WAKE_OPEN": ""
+      }
+    }
   }
 }

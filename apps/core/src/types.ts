@@ -411,6 +411,115 @@ export interface CommitRequest {
    * (server clamps). Absent/0 = the default per-attempt backoff.
    */
   retry_after_ms?: number;
+  /**
+   * The durable blocker behind an "await" outcome that is not a tool
+   * approval: kind 'budget' parks the input on the denied funding source
+   * until a budget or funding change resumes it. The estimate is the
+   * denied admission's (BudgetWait.estimate): the state service prices it
+   * under the card in force when parking and again on every budget change,
+   * so a lower rate card resumes the input as a higher limit does. Like an
+   * approval wait, an awaiting turn does not count as an attempt.
+   */
+  wait?: {
+    kind: "budget";
+    funding: FundingRef;
+    estimate: UsageEstimate;
+  };
+}
+
+/**
+ * The funding principal selected for one provider call. 'connection' is a
+ * Human-owned model_api_connections row (version/model/provider snapshot
+ * the identity at call time); 'operator' is the host environment default
+ * (id 'env', only when the persona has no explicit selection); 'sumi' is
+ * a Sumi-provided allocation granted to the persona's bound human.
+ * Recorded on the usage fact — a later connection switch never
+ * reattributes earlier calls.
+ */
+export interface FundingRef {
+  kind: "connection" | "operator" | "sumi";
+  id: string;
+  version?: string;
+  model?: string;
+  provider?: string;
+}
+
+/**
+ * The pre-call size estimate priced at admission. output_tokens_bound is
+ * the configured maximum output when one exists; absent means the call's
+ * spend is not bounded at admission and the reservation only bounds
+ * further admits — never presented as a guarantee on the external bill.
+ */
+export interface UsageEstimate {
+  input_tokens: number;
+  output_tokens_bound?: number;
+}
+
+/** The held spend for an admitted call until its fact lands. */
+export interface UsageReservation {
+  fact_id: string;
+  reserved_minor: number;
+  currency?: string;
+  bounded: boolean;
+  status: "held" | "settled" | "released";
+}
+
+/** A denied admission: what the call would have needed against the cap. */
+export interface BudgetWait {
+  funding: FundingRef;
+  needed_minor: number;
+  limit_minor: number;
+  spent_minor: number;
+  held_minor: number;
+  remaining_minor: number;
+  currency: string;
+  pricing_revision: string;
+  /**
+   * False when the call's output was not limited at admission — the cap
+   * bounds further admits, not that call's bill.
+   */
+  bounded: boolean;
+  /** The admission estimate that was priced — what a parked turn commits. */
+  estimate: UsageEstimate;
+}
+
+export interface UsageAdmitResult {
+  admitted: boolean;
+  reservation?: UsageReservation;
+  wait?: BudgetWait;
+}
+
+/**
+ * One ledger row: one logical provider call. status 'reported' carries
+ * the provider's own usage fields; 'unknown' means the call was attempted
+ * but no usage report resolved — its admission estimate stays spent under
+ * cost_basis 'admission_estimate'; 'not_sent' asserts no request was
+ * produced after admission (its reservation released); 'unrecorded' is a
+ * reconciliation placeholder for an admitted call whose record never
+ * landed, carrying the estimate as uncertain spend until a late report
+ * upgrades it. Normalized token columns never overlap — input_tokens
+ * excludes cached_tokens on every protocol. cost_minor is null when the
+ * fact could not be priced (no rate card, or a provably-unsent call).
+ */
+export interface UsageFact {
+  persona_id: string;
+  fact_id: string;
+  kind: string;
+  phase: string;
+  turn_id?: string;
+  input_id?: string;
+  round?: number;
+  funding: FundingRef;
+  status: "reported" | "unknown" | "not_sent" | "unrecorded";
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_tokens: number | null;
+  quantities: Record<string, unknown>;
+  cost_minor: number | null;
+  currency?: string;
+  cost_basis?: string;
+  pricing_revision?: string;
+  recorded_at: string;
 }
 
 /**

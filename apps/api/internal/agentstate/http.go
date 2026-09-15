@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -35,9 +36,17 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 //     token for one persona can never authenticate for another, and nothing
 //     per-persona needs storing. The real multi-user binding (koseki identity
 //     → persona) lands with the auth-flow milestone; this proves the shape.
+//
+// A Cloud core host serves every persona from one Worker, so it holds an
+// optional third credential, the runtime token (SUMI_CORE_RUNTIME_TOKEN): it
+// authorizes the persona-scoped routes of any persona — exactly what holding
+// every persona token would — and none of the admin-only routes (persona
+// creation, human binding, approval decisions, transfers). The runtime that
+// parks a gated call can therefore never decide it.
 type Server struct {
 	store      *Store
 	secret     []byte
+	runtime    []byte
 	maxBody    int64
 	conns      *modelconnections.Store
 	callBridge CallBridge
@@ -81,7 +90,24 @@ func (s *Server) authorized(r *http.Request, personaID string) bool {
 	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
 		return true
 	}
+	if len(s.runtime) > 0 && subtle.ConstantTimeCompare([]byte(token), s.runtime) == 1 {
+		return true
+	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.PersonaToken(personaID))) == 1
+}
+
+// SetRuntimeToken enables the runtime credential. It must be long and
+// distinct from the admin secret: equal values would silently grant the
+// runtime admin routes.
+func (s *Server) SetRuntimeToken(token string) error {
+	if len(token) < minRuntimeSecretLen {
+		return fmt.Errorf("%s must be at least %d characters", RuntimeTokenEnv, minRuntimeSecretLen)
+	}
+	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
+		return fmt.Errorf("%s must differ from the admin state token", RuntimeTokenEnv)
+	}
+	s.runtime = []byte(token)
+	return nil
 }
 
 func bearerToken(header string) (string, bool) {
@@ -140,6 +166,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/complete", s.completeMemoryChunk)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/fail", s.failMemoryChunk)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/reshelve", s.reshelveMemoryChunk)
+	// Usage accounting: admission is writer-fenced (a fenced-out generation
+	// must not hold new reservations); recording is persona-scoped but not
+	// fenced — the spend already happened and a replaced writer must still
+	// be able to report it.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/usage/admit", s.admitUsage)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/usage/record", s.recordUsage)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/usage/facts", s.listUsageFacts)
 	// Jobs: persona-token scoped, deliberately NOT writer-generation gated —
 	// a job's lifecycle and completion authority outlive the writer lease.
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs", s.submitJob)
@@ -216,16 +249,16 @@ func storeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
 		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound),
-		errors.Is(err, ErrChunkNotFound):
+		errors.Is(err, ErrChunkNotFound), errors.Is(err, ErrFundingNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
 		errors.Is(err, ErrApprovalConflict), errors.Is(err, ErrPersonaInactive),
 		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
-		errors.Is(err, ErrMemoryConflict):
+		errors.Is(err, ErrMemoryConflict), errors.Is(err, ErrUsageFactConflict):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool), errors.Is(err, ErrApprovalDecidedBy):
 		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, ErrApprovalForbidden):
+	case errors.Is(err, ErrApprovalForbidden), errors.Is(err, ErrFundingForbidden):
 		writeError(w, http.StatusForbidden, err.Error())
 	case isDataError(err):
 		// Deterministic data errors (class 22, 23514) can never succeed on
@@ -837,9 +870,10 @@ func (s *Server) failMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
 }
 
-// reshelveMemoryChunk returns a claimed chunk to the shelf when the model
-// layer was unavailable before any request was sent — no verdict, no
-// attempt spent; the chunk stays in the pipeline for a usable binding.
+// reshelveMemoryChunk returns a claimed chunk to the shelf when no model
+// request could be made — an unusable binding or a budget-denied call.
+// No verdict, no attempt spent; the chunk stays in the pipeline with its
+// budgets intact until a usable funding/binding state exists.
 func (s *Server) reshelveMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	personaID, ok := s.scope(w, r)
 	if !ok {
@@ -853,6 +887,7 @@ func (s *Server) reshelveMemoryChunk(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Generation int64  `json:"generation"`
 		Reason     string `json:"reason"`
+		DelayMs    int64  `json:"delay_ms"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
 		return
@@ -861,12 +896,75 @@ func (s *Server) reshelveMemoryChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chunk, err := s.store.ReshelveMemoryChunk(r.Context(), personaID, req.Generation,
-		chunkSeq, req.Reason)
+		chunkSeq, req.Reason, req.DelayMs)
 	if err != nil {
 		storeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
+// admitUsage is the pre-call boundary: the core reserves the priced
+// estimate against the selected funding source's configured budget
+// before any provider request is sent. Denial returns a wait detail the
+// core commits as an 'await' — no request was made, nothing is burned.
+func (s *Server) admitUsage(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req UsageAdmitRequest
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if !requireGen(w, req.Generation) {
+		return
+	}
+	res, err := s.store.AdmitUsage(r.Context(), personaID, req)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// recordUsage persists one call's resolved usage. Deliberately NOT
+// writer-fenced: the spend already happened, and a fenced-out or replaced
+// writer must still be able to report it.
+func (s *Server) recordUsage(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req UsageRecordRequest
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	fact, created, err := s.store.RecordUsage(r.Context(), personaID, req)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"fact": fact, "created": created})
+}
+
+// listUsageFacts is the persona-scoped ledger inspection — which calls
+// ran, on which funding source, with what usage and cost provenance.
+func (s *Server) listUsageFacts(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var limit int
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		limit, _ = strconv.Atoi(raw)
+	}
+	facts, err := s.store.ListUsageFacts(r.Context(), personaID, limit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"facts": facts})
 }
 
 func (s *Server) outbox(w http.ResponseWriter, r *http.Request) {

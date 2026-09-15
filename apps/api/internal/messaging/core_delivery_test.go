@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -962,5 +964,58 @@ func TestSharedIntakeEndToEndCoreReply(t *testing.T) {
 	}
 	if len(channelHistory) != 1 || channelHistory[0].Author != w.humanB {
 		t.Fatalf("channel history after ambient turn = %+v, want only Haru's message", channelHistory)
+	}
+}
+
+// TestSharedIntakeAttentionTriggersCoreWake covers the production hop the
+// earlier review never exercised: a Messaging message admitted by
+// DeliverAgentAttention into core_inputs is what cmd/server's
+// RuntimeWaker sweep turns into an authenticated POST /personas/:id/wake
+// against the configured core host.
+func TestSharedIntakeAttentionTriggersCoreWake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newSharedIntakeWorld(t, ctx)
+	w.workspaceWithChannel(t, ctx)
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	if err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+	w.send(t, ctx, dm.PlaceID, w.humanA, "wake the secretary")
+	delivery, coreStore := newSharedIntakeDelivery(t, w)
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	if stats.Admitted != 1 {
+		t.Fatalf("admitted %d events, want 1", stats.Admitted)
+	}
+
+	const wakeToken = "wake-credential-for-wiring-test-01234"
+	var mu sync.Mutex
+	var calls []string
+	host := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer "+wakeToken {
+			res.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		calls = append(calls, req.Method+" "+req.URL.Path)
+		mu.Unlock()
+		res.WriteHeader(http.StatusOK)
+	}))
+	defer host.Close()
+	waker, err := agentstate.NewRuntimeWaker(coreStore, host.URL, wakeToken)
+	if err != nil {
+		t.Fatalf("waker: %v", err)
+	}
+	if n := waker.Sweep(ctx); n != 1 {
+		t.Fatalf("sweep sent %d wakes, want 1", n)
+	}
+	want := "POST /personas/" + w.agent.ID + "/wake"
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != want {
+		t.Fatalf("wake calls = %v, want [%s]", calls, want)
 	}
 }
