@@ -152,17 +152,24 @@ CREATE INDEX usage_facts_funding
     ON usage_facts (funding_kind, funding_id, recorded_at);
 
 -- core_budget_waits: an input parked because admission denied it. The
--- turn commits 'await' with the denied funding + needed amount; a budget
--- increase, budget removal, or funding (selection) change requeues it.
--- Like an approval wait, an 'awaiting' turn does not count as an attempt.
+-- turn commits 'await' with the denied funding and the call's admission
+-- estimate. Every budget change on that funding prices the estimate again
+-- under the card then in force: a limit increase, a rate-card change the
+-- call now fits, or budget removal requeues it, as does a funding
+-- (selection) change. Like an approval wait, an 'awaiting' turn does not
+-- count as an attempt.
 CREATE TABLE core_budget_waits (
     persona_id   uuidv7 NOT NULL REFERENCES core_personas(persona_id) ON DELETE CASCADE,
     input_id     text   NOT NULL,
     turn_id      text   NOT NULL,
     funding_kind text   NOT NULL,
     funding_id   text   NOT NULL,
+    -- The estimate priced under the card in force when it parked or at
+    -- the latest budget change — display, not the resume criterion.
     needed_minor bigint NOT NULL,
     currency     text   NOT NULL,
+    est_input_tokens bigint NOT NULL CHECK (est_input_tokens >= 0),
+    est_output_bound bigint CHECK (est_output_bound >= 0),
     created_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (persona_id, input_id)
 );

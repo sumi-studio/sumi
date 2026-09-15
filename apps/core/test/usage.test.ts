@@ -21,6 +21,14 @@ import { BudgetWaitError } from "../src/usage.ts";
 const PERSONA = "01930e00-0000-7000-8000-0000000000d1";
 const HUMAN = "01930e00-0000-7000-8000-0000000000e1";
 
+/** A value the test requires — asserted at runtime, not cast away. */
+function must<T>(value: T | undefined): T {
+  assert.ok(value !== undefined, "expected a value");
+  return value;
+}
+
+const first = <T>(items: readonly T[]): T => must(items[0]);
+
 class Scripted implements ModelProvider {
   readonly name = "scripted";
   requests = 0;
@@ -87,7 +95,7 @@ test("usage: a metered call admits before streaming and records one fact", async
 
   const facts = await state.listUsageFacts(PERSONA);
   assert.equal(facts.length, 1);
-  const f = facts[0]!;
+  const f = first(facts);
   assert.equal(f.kind, "model_call");
   assert.equal(f.phase, "turn");
   assert.equal(f.funding.kind, "operator");
@@ -96,10 +104,7 @@ test("usage: a metered call admits before streaming and records one fact", async
   assert.equal(f.input_tokens, 100);
   assert.equal(f.output_tokens, 20);
   // The held reservation settled when its fact landed.
-  assert.equal(
-    [...state.usageReservations.values()][0]!.status,
-    "settled",
-  );
+  assert.equal(first([...state.usageReservations.values()]).status, "settled");
 });
 
 test("usage: a call whose usage never resolves records 'unknown', never zero", async () => {
@@ -112,9 +117,9 @@ test("usage: a call whose usage never resolves records 'unknown', never zero", a
   }
   const facts = await state.listUsageFacts(PERSONA);
   assert.equal(facts.length, 1);
-  assert.equal(facts[0]!.status, "unknown");
-  assert.equal(facts[0]!.input_tokens, null);
-  assert.equal(facts[0]!.cost_minor, null);
+  assert.equal(first(facts).status, "unknown");
+  assert.equal(first(facts).input_tokens, null);
+  assert.equal(first(facts).cost_minor, null);
 });
 
 test("usage: a stream that dies mid-call still records the attempt", async () => {
@@ -128,7 +133,7 @@ test("usage: a stream that dies mid-call still records the attempt", async () =>
   }, /connection lost/);
   const facts = await state.listUsageFacts(PERSONA);
   assert.equal(facts.length, 1);
-  assert.equal(facts[0]!.status, "unknown");
+  assert.equal(first(facts).status, "unknown");
 });
 
 test("usage: a denied budget admits nothing and sends no provider request", async () => {
@@ -149,7 +154,10 @@ test("usage: a denied budget admits nothing and sends no provider request", asyn
   } catch (e) {
     err = e;
   }
-  assert.ok(err instanceof BudgetWaitError, `expected BudgetWaitError, got ${err}`);
+  assert.ok(
+    err instanceof BudgetWaitError,
+    `expected BudgetWaitError, got ${err}`,
+  );
   assert.equal(provider.requests, 0, "no provider request on denial");
   assert.equal(err.wait.funding.id, "env");
   assert.ok(err.wait.needed_minor > err.wait.limit_minor);
@@ -170,7 +178,7 @@ test("usage: recorded facts price against the configured rate card", async () =>
   for await (const _ of p.stream(REQ(generation))) {
     // drain
   }
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const fact = first(await state.listUsageFacts(PERSONA));
   // 100 input * 1 + 20 output * 2 = 140 units.
   assert.equal(fact.cost_minor, 140);
   assert.equal(fact.currency, "USD");
@@ -216,7 +224,7 @@ test("usage: a budget-denied turn parks the input; a raise resumes it", async ()
   state.addInput(PERSONA, "in-park", "hello");
   assert.equal(await s.step(), "turn");
   assert.equal(scripted.requests, 0, "denied admission sent no request");
-  const input = state.inputs.find((i) => i.input_id === "in-park")!;
+  const input = must(state.inputs.find((i) => i.input_id === "in-park"));
   assert.equal(input.status, "waiting");
   assert.equal(state.budgetWaits.size, 1);
   // Awaiting is not an attempt: the input did not fail.
@@ -235,7 +243,7 @@ test("usage: a budget-denied turn parks the input; a raise resumes it", async ()
   assert.equal(input.status, "done");
   const facts = await state.listUsageFacts(PERSONA);
   assert.equal(facts.length, 1);
-  assert.equal(facts[0]!.status, "reported");
+  assert.equal(first(facts).status, "reported");
   await s.stop();
 });
 
@@ -246,7 +254,7 @@ test("usage: re-delivery of a fact is idempotent; a second call adds a second fa
   for await (const _ of p.stream(REQ(generation))) {
     // drain — the call records fact f1
   }
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const fact = first(await state.listUsageFacts(PERSONA));
   // Redeliver the identical record — replays, not duplicates.
   const replay = await state.recordUsage(PERSONA, {
     factId: fact.fact_id,
@@ -271,8 +279,8 @@ test("usage: re-delivery of a fact is idempotent; a second call adds a second fa
 
 // --- durable uncertain spend, admission pricing snapshot, wire-bound ----
 
-import { reportedTokens } from "../src/usage.ts";
 import { ModelError } from "../src/provider.ts";
+import { reportedTokens } from "../src/usage.ts";
 
 test("usage: token normalization keeps categories non-overlapping per protocol", () => {
   // Chat Completions: prompt_tokens INCLUDES the cached subset.
@@ -338,17 +346,20 @@ test("usage: 'not_sent' releases the hold — a request that never left owes not
     },
   };
   const fp = new SelectedModelProvider({
-    state, persona: PERSONA, fallback: failing, timeoutMs: 5_000,
+    state,
+    persona: PERSONA,
+    fallback: failing,
+    timeoutMs: 5_000,
   });
   await assert.rejects(async () => {
     for await (const _ of fp.stream(REQ(generation))) {
       // drain
     }
   }, /endpoint refused/);
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const fact = first(await state.listUsageFacts(PERSONA));
   assert.equal(fact.status, "not_sent");
   assert.equal(fact.cost_minor, null);
-  assert.equal([...state.usageReservations.values()][0]!.status, "released");
+  assert.equal(first([...state.usageReservations.values()]).status, "released");
 });
 
 test("usage: an early consumer return still records the fact", async () => {
@@ -375,12 +386,12 @@ test("usage: an unknown fact under a budget keeps the admission estimate as unce
   for await (const _ of p.stream(REQ(generation))) {
     // drain
   }
-  const res = [...state.usageReservations.values()][0]!;
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const res = first([...state.usageReservations.values()]);
+  const fact = first(await state.listUsageFacts(PERSONA));
   assert.equal(fact.status, "unknown");
   // The reserved estimate stays spent — 'admission_estimate', not zero.
   assert.equal(fact.cost_minor, res.reserved_minor);
-  assert.ok(fact.cost_minor! > 0);
+  assert.ok((fact.cost_minor ?? 0) > 0);
   assert.equal(fact.cost_basis, "admission_estimate");
 
   // A late report for the same fact id upgrades it to the priced actual.
@@ -428,11 +439,11 @@ test("usage: a lost record reconciles to 'unrecorded', keeping the estimate", as
   await state.releaseWriter(PERSONA, "w-1", lease.generation);
   const lease2 = await state.acquireWriter(PERSONA, "w-2", 60_000);
   await state.recover(PERSONA, lease2.generation);
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const fact = first(await state.listUsageFacts(PERSONA));
   assert.equal(fact.status, "unrecorded");
   assert.equal(fact.cost_basis, "admission_estimate");
-  assert.ok(fact.cost_minor! > 0);
-  assert.equal([...state.usageReservations.values()][0]!.status, "settled");
+  assert.ok((fact.cost_minor ?? 0) > 0);
+  assert.equal(first([...state.usageReservations.values()]).status, "settled");
   // The unrecorded fact still accepts the late actual report.
   const late = await state.recordUsage(PERSONA, {
     factId: "f-lost",
@@ -488,7 +499,7 @@ test("usage: a mid-call rate/currency change cannot rewrite an admitted call's p
     outputTokens: 20,
     quantities: {},
   });
-  const mid = (await state.listUsageFacts(PERSONA))[0]!;
+  const mid = first(await state.listUsageFacts(PERSONA));
   assert.equal(mid.currency, "USD");
   assert.equal(mid.cost_minor, 140); // 100*1 + 20*2 under the snapshot
 
@@ -514,7 +525,7 @@ test("usage: a mid-call rate/currency change cannot rewrite an admitted call's p
     quantities: {},
   });
   const facts = await state.listUsageFacts(PERSONA);
-  const jpy = facts.find((f) => f.fact_id === "f-jpy")!;
+  const jpy = must(facts.find((f) => f.fact_id === "f-jpy"));
   assert.equal(jpy.currency, "JPY");
   assert.equal(jpy.cost_minor, 1400); // 100*10 + 20*20 under v2
   assert.equal(mid.currency, "USD");
@@ -526,7 +537,10 @@ test("usage: the estimate carries the provider's real wire bound", async () => {
     name: "bounded",
     outputBound: () => 42,
     async *stream(): AsyncIterable<ModelEvent> {
-      yield { type: "done", usage: { prompt_tokens: 10, completion_tokens: 5 } };
+      yield {
+        type: "done",
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      };
     },
   };
   const { generation } = await metered(state, new Scripted());
@@ -536,12 +550,15 @@ test("usage: the estimate carries the provider's real wire bound", async () => {
     ...RATES,
   });
   const bp = new SelectedModelProvider({
-    state, persona: PERSONA, fallback: bounded, timeoutMs: 5_000,
+    state,
+    persona: PERSONA,
+    fallback: bounded,
+    timeoutMs: 5_000,
   });
   for await (const _ of bp.stream(REQ(generation))) {
     // drain
   }
-  const res = [...state.usageReservations.values()][0]!;
+  const res = first([...state.usageReservations.values()]);
   assert.equal(res.bounded, true);
   assert.equal(res.est_output_bound, 42);
   // Reserved = est_input + 42 * output rate, not a fabricated generic cap.
@@ -572,16 +589,19 @@ test("usage: a record that keeps failing neither fails nor reruns the paid turn;
   await s.start();
   state.addInput(PERSONA, "in-norecord", "hello");
   assert.equal(await s.step(), "turn");
-  const input = state.inputs.find((i) => i.input_id === "in-norecord")!;
+  const input = must(state.inputs.find((i) => i.input_id === "in-norecord"));
   assert.equal(input.status, "done", "the paid answer is kept");
   assert.equal(scripted.requests, 1, "no paid rerun");
   assert.equal(recordAttempts, 3, "recording retries are bounded");
   const facts = await state.listUsageFacts(PERSONA);
   assert.equal(facts.length, 1);
-  assert.equal(facts[0]!.status, "unrecorded");
-  assert.equal(facts[0]!.cost_basis, "admission_estimate");
-  assert.ok(facts[0]!.cost_minor! > 0, "the possible spend stays counted");
-  assert.equal([...state.usageReservations.values()][0]!.status, "settled");
+  assert.equal(first(facts).status, "unrecorded");
+  assert.equal(first(facts).cost_basis, "admission_estimate");
+  assert.ok(
+    (first(facts).cost_minor ?? 0) > 0,
+    "the possible spend stays counted",
+  );
+  assert.equal(first([...state.usageReservations.values()]).status, "settled");
   await s.stop();
 });
 
@@ -598,8 +618,8 @@ test("usage: a partial provider report stays 'unknown' with its categories until
   for await (const _ of p.stream(REQ(generation))) {
     // drain
   }
-  const res = [...state.usageReservations.values()][0]!;
-  const fact = (await state.listUsageFacts(PERSONA))[0]!;
+  const res = first([...state.usageReservations.values()]);
+  const fact = first(await state.listUsageFacts(PERSONA));
   assert.equal(fact.status, "unknown");
   assert.equal(fact.input_tokens, 100, "supplied category kept");
   assert.equal(fact.output_tokens, null, "missing category is not zero");
@@ -617,7 +637,11 @@ test("usage: a partial provider report stays 'unknown' with its categories until
     quantities: {},
   };
   await assert.rejects(
-    state.recordUsage(PERSONA, { ...same, status: "reported", inputTokens: 100 }),
+    state.recordUsage(PERSONA, {
+      ...same,
+      status: "reported",
+      inputTokens: 100,
+    }),
     (e) => e instanceof StateError && e.status === 400,
   );
   // Explicit zero output is a complete report.
@@ -662,7 +686,10 @@ test("usage: a later-round budget denial resumes the same input without repeatin
       } else {
         yield { type: "text", delta: "done" };
       }
-      yield { type: "done", usage: { prompt_tokens: 100, completion_tokens: 20 } };
+      yield {
+        type: "done",
+        usage: { prompt_tokens: 100, completion_tokens: 20 },
+      };
     },
   };
   const provider = new SelectedModelProvider({
@@ -688,16 +715,119 @@ test("usage: a later-round budget denial resumes the same input without repeatin
       .length;
 
   assert.equal(await s.step(), "turn");
-  const input = state.inputs.find((i) => i.input_id === "in-rounds")!;
+  const input = must(state.inputs.find((i) => i.input_id === "in-rounds"));
   assert.equal(input.status, "waiting");
   assert.deepEqual(rounds, [0], "round 1 was denied before any request");
   assert.equal(notes(), 1, "round 0 applied its effect before the denial");
 
-  state.setUsageBudget("operator", "env", { limit_minor: 1_000, ...onePerCall });
+  state.setUsageBudget("operator", "env", {
+    limit_minor: 1_000,
+    ...onePerCall,
+  });
   assert.equal(input.status, "queued");
   assert.equal(await s.step(), "turn");
   assert.equal(input.status, "done");
   assert.deepEqual(rounds, [0, 1], "round 0 replays from its plan");
   assert.equal(notes(), 1, "the resumed input reused round 0's receipt");
+  await s.stop();
+});
+
+test("usage: a record naming funding other than its admission conflicts and keeps the hold", async () => {
+  const state = new FakeState();
+  const { generation } = await metered(state, new Scripted());
+  state.setUsageBudget("operator", "env", {
+    limit_minor: 1_000_000,
+    currency: "USD",
+    ...RATES,
+  });
+  const admitted = await state.admitUsage(PERSONA, generation, {
+    factId: "f-ab",
+    kind: "model_call",
+    phase: "turn",
+    funding: { kind: "operator", id: "env" },
+    estimate: { input_tokens: 500, output_tokens_bound: 500 },
+  });
+  assert.equal(admitted.admitted, true);
+  await assert.rejects(
+    state.recordUsage(PERSONA, {
+      factId: "f-ab",
+      kind: "model_call",
+      phase: "turn",
+      funding: { kind: "sumi", id: "grant-1" },
+      status: "reported",
+      inputTokens: 400,
+      outputTokens: 100,
+    }),
+    (e) => e instanceof StateError && e.status === 409,
+  );
+  assert.equal(state.usageReservations.get(`${PERSONA}|f-ab`)?.status, "held");
+  assert.equal((await state.listUsageFacts(PERSONA)).length, 0);
+});
+
+test("usage: lowering the rates under the same limit resumes a parked turn once its call fits", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA, "test", HUMAN);
+  const scripted = new Scripted();
+  const provider = new SelectedModelProvider({
+    state,
+    persona: PERSONA,
+    fallback: scripted,
+    timeoutMs: 5_000,
+  });
+  const card = (limit: number, input: number, output: number) =>
+    state.setUsageBudget("operator", "env", {
+      limit_minor: limit,
+      currency: "USD",
+      rate_input_per_mtok: input,
+      rate_output_per_mtok: output,
+      pricing_revision: `fixture-${input}-${output}`,
+    });
+  card(1, 1_000_000, 2_000_000);
+  const s = new Secretary(secretaryCfg(state, provider));
+  await s.start();
+  state.addInput(PERSONA, "in-rate", "hello");
+  assert.equal(await s.step(), "turn");
+  const input = state.inputs.find((i) => i.input_id === "in-rate");
+  assert.ok(input);
+  assert.equal(input.status, "waiting");
+  const wait = () => state.budgetWaits.get(`${PERSONA}|in-rate`);
+  const needed = wait()?.needed_minor ?? 0;
+  assert.ok(needed >= 40, `a priced estimate to split, got ${needed}`);
+
+  // The limit now covers 60% of the call at full rates — still parked.
+  const limit = Math.floor(needed * 0.6);
+  card(limit, 1_000_000, 2_000_000);
+  assert.equal(input.status, "waiting");
+  // Three-quarter rates are cheaper but still over the unchanged limit:
+  // the wait stays parked, restated under the new card, and nothing is sent.
+  card(limit, 750_000, 1_500_000);
+  assert.equal(input.status, "waiting");
+  const restated = wait()?.needed_minor ?? 0;
+  assert.ok(restated > limit && restated < needed, `restated ${restated}`);
+  assert.equal(scripted.requests, 0);
+  // A tenth of the rates fits the same limit: the input resumes by itself.
+  card(limit, 100_000, 200_000);
+  assert.equal(input.status, "queued");
+  assert.equal(wait(), undefined);
+
+  // Other spend takes the room before the attempt: the re-admission is
+  // denied before any request, and the input parks again.
+  await state.recordUsage(PERSONA, {
+    factId: "f-other",
+    kind: "model_call",
+    phase: "turn",
+    funding: { kind: "operator", id: "env" },
+    status: "reported",
+    inputTokens: limit * 10,
+    outputTokens: 0,
+  });
+  assert.equal(await s.step(), "turn");
+  assert.equal(scripted.requests, 0, "a denied re-admission sends nothing");
+  assert.equal(input.status, "waiting");
+  card(limit * 3, 100_000, 200_000);
+  assert.equal(input.status, "queued");
+  assert.equal(await s.step(), "turn");
+  assert.equal(scripted.requests, 1);
+  assert.equal(input.status, "done");
   await s.stop();
 });

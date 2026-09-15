@@ -414,14 +414,16 @@ export interface CommitRequest {
   /**
    * The durable blocker behind an "await" outcome that is not a tool
    * approval: kind 'budget' parks the input on the denied funding source
-   * until a budget or funding change resumes it. Like an approval wait,
-   * an awaiting turn does not count as an attempt.
+   * until a budget or funding change resumes it. The estimate is the
+   * denied admission's (BudgetWait.estimate): the state service prices it
+   * under the card in force when parking and again on every budget change,
+   * so a lower rate card resumes the input as a higher limit does. Like an
+   * approval wait, an awaiting turn does not count as an attempt.
    */
   wait?: {
     kind: "budget";
     funding: FundingRef;
-    needed_minor: number;
-    currency: string;
+    estimate: UsageEstimate;
   };
 }
 
@@ -477,6 +479,8 @@ export interface BudgetWait {
    * bounds further admits, not that call's bill.
    */
   bounded: boolean;
+  /** The admission estimate that was priced — what a parked turn commits. */
+  estimate: UsageEstimate;
 }
 
 export interface UsageAdmitResult {

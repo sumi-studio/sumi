@@ -1093,7 +1093,7 @@ export interface components {
             totals: components["schemas"]["UsageTotals"];
             recent: components["schemas"]["UsageFact"][];
         };
-        /** @description An input parked because admission could not reserve enough budget; resumes on budget increase, removal, or funding change. */
+        /** @description An input parked because admission could not reserve enough budget; resumes when a budget change (a higher limit or lower rates) lets the parked call fit, when the budget is removed, or on a funding change. needed_minor is the call's admission estimate priced under the current rate card. */
         UsageBudgetWaitRow: {
             persona_id: string;
             input_id: string;

@@ -43,11 +43,7 @@ import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
 import { OpenAIResponsesProvider } from "../providers/openai-responses.ts";
 import { type StateClient, StateError } from "../state-client.ts";
-import type {
-  FundingRef,
-  ModelBinding,
-  UsageAdmitResult,
-} from "../types.ts";
+import type { FundingRef, ModelBinding, UsageAdmitResult } from "../types.ts";
 import {
   BudgetWaitError,
   newFactId,
@@ -160,15 +156,12 @@ export class SelectedModelProvider implements ModelProvider {
     const funding = fundingRef(identity);
     // The estimate prices the provider's real wire bound — an output cap
     // the adapter does not send cannot count as a bound on the bill.
-    const admission = await this.admit(
-      factId,
-      request,
-      funding,
-      requestEstimate(request, provider.outputBound?.()),
-    );
+    const estimate = requestEstimate(request, provider.outputBound?.());
+    const admission = await this.admit(factId, request, funding, estimate);
     if (!admission.admitted) {
       throw new BudgetWaitError(
         admission.wait ?? {
+          estimate,
           funding,
           needed_minor: 0,
           limit_minor: 0,

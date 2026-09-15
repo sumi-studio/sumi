@@ -11,8 +11,8 @@
  * token categories distinct.
  */
 
-import type { BudgetWait, UsageEstimate } from "./types.ts";
 import type { ChatMessage, ModelRequest, ToolSpec } from "./provider.ts";
+import type { BudgetWait, UsageEstimate } from "./types.ts";
 
 /**
  * Budget admission denied the call — no provider request was sent. This

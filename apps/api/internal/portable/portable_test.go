@@ -3825,8 +3825,9 @@ func TestSealRequeuesBudgetWaitedInput(t *testing.T) {
 	if _, err := local.state.CommitTurn(ctx, pid, "turn-1", gen, agentstate.CommitRequest{
 		Outcome: "await",
 		Wait: &agentstate.CommitWait{
-			Kind: "budget", NeededMinor: 100, Currency: "USD",
-			Funding: agentstate.FundingRef{Kind: "connection", ID: connID},
+			Kind: "budget", Funding: agentstate.FundingRef{Kind: "connection", ID: connID},
+			// 400k input tokens at 250 per MTok = 100 > the 50 limit.
+			Estimate: &agentstate.UsageEstimate{InputTokens: 400_000},
 		},
 	}); err != nil {
 		t.Fatalf("budget park: %v", err)

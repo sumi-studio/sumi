@@ -15,7 +15,6 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { APIConnectionsClient } from "../lib/api-connections";
-import type { UsageAPI } from "../lib/usage";
 import {
   CHATGPT_EFFORTS,
   CHATGPT_MODEL,
@@ -25,6 +24,7 @@ import {
   createModelConnectionsAPI,
   type ModelConnectionsAPI,
 } from "../lib/model-connections";
+import type { UsageAPI } from "../lib/usage";
 import { APIConnectionSettings } from "./api-connection-settings";
 import { UsageSettings } from "./usage-settings";
 

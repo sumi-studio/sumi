@@ -76,7 +76,7 @@ export class OpenAIProvider implements ModelProvider {
     const extra = this.cfg.extra;
     const overridden =
       extra !== undefined
-        ? (numOr(extra["max_tokens"]) ?? numOr(extra["max_completion_tokens"]))
+        ? (numOr(extra.max_tokens) ?? numOr(extra.max_completion_tokens))
         : undefined;
     return overridden ?? this.cfg.maxOutputTokens;
   }

@@ -315,12 +315,14 @@ type CommitRequest struct {
 	Wait *CommitWait `json:"wait,omitempty"`
 }
 
-// CommitWait is the explicit blocker a turn commits 'await' on.
+// CommitWait is the explicit blocker a turn commits 'await' on. Estimate
+// is the denied admission's estimate (BudgetWait.Estimate): the state
+// service prices it under the funding source's rate card when parking and
+// again on every budget change, so the wait resumes once the call fits.
 type CommitWait struct {
-	Kind        string     `json:"kind"` // "budget"
-	Funding     FundingRef `json:"funding"`
-	NeededMinor int64      `json:"needed_minor"`
-	Currency    string     `json:"currency"`
+	Kind     string         `json:"kind"` // "budget"
+	Funding  FundingRef     `json:"funding"`
+	Estimate *UsageEstimate `json:"estimate"`
 }
 
 // NewTurnID is supplied by the caller so LoadTurn retries can be linked; the
@@ -1262,15 +1264,17 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	case "await":
 		if req.Wait != nil {
 			// A non-approval park. 'budget' is the only kind: the core was
-			// denied admission and no request was sent. If the configured
-			// cap changed between the denial and this commit — the same
-			// race the approval path handles by re-checking pending rows —
-			// the input requeues immediately instead of waiting on a
-			// blocker that no longer exists.
-			if req.Wait.Kind != "budget" || req.Wait.Funding.Kind == "" ||
-				req.Wait.Funding.ID == "" || req.Wait.NeededMinor < 0 ||
-				len(req.Wait.Currency) != 3 {
-				return nil, fmt.Errorf("%w: wait must be a budget wait with funding, needed_minor and currency", ErrBadRequest)
+			// denied admission and no request was sent. The estimate is
+			// priced under the card in force at this commit: if the cap or
+			// the rate card changed between the denial and this commit — the
+			// same race the approval path handles by re-checking pending
+			// rows — and the call now fits, the input requeues immediately
+			// instead of waiting on a blocker that no longer exists.
+			w := req.Wait
+			if w.Kind != "budget" || w.Funding.Kind == "" || w.Funding.ID == "" ||
+				w.Estimate == nil || w.Estimate.InputTokens < 0 ||
+				(w.Estimate.OutputTokensBound != nil && *w.Estimate.OutputTokensBound < 0) {
+				return nil, fmt.Errorf("%w: wait must be a budget wait with funding and a non-negative estimate", ErrBadRequest)
 			}
 			if err := tx.QueryRow(ctx, `
 				UPDATE core_turns SET status = 'awaiting', finished_at = now(), commit_request = $3
@@ -1280,8 +1284,11 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				Scan(&t.Status, &t.FinishedAt); err != nil {
 				return nil, fmt.Errorf("await turn: %w", dataErr(err))
 			}
-			fits, err := s.budgetFits(ctx, tx, req.Wait.Funding.Kind,
-				req.Wait.Funding.ID, req.Wait.NeededMinor)
+			room, err := s.fundingHeadroom(ctx, tx, w.Funding.Kind, w.Funding.ID)
+			if err != nil {
+				return nil, err
+			}
+			fits, needed, err := room.fit(*w.Estimate)
 			if err != nil {
 				return nil, err
 			}
@@ -1303,13 +1310,15 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				if _, err := tx.Exec(ctx, `
 					INSERT INTO core_budget_waits
 						(persona_id, input_id, turn_id, funding_kind, funding_id,
-						 needed_minor, currency)
-					VALUES ($1, $2, $3, $4, $5, $6, $7)
+						 needed_minor, currency, est_input_tokens, est_output_bound)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 					ON CONFLICT (persona_id, input_id) DO UPDATE SET
 						turn_id = $3, funding_kind = $4, funding_id = $5,
-						needed_minor = $6, currency = $7, created_at = now()`,
-					personaID, t.InputID, turnID, req.Wait.Funding.Kind,
-					req.Wait.Funding.ID, req.Wait.NeededMinor, req.Wait.Currency); err != nil {
+						needed_minor = $6, currency = $7, est_input_tokens = $8,
+						est_output_bound = $9, created_at = now()`,
+					personaID, t.InputID, turnID, w.Funding.Kind, w.Funding.ID,
+					needed, room.budget.Currency,
+					w.Estimate.InputTokens, w.Estimate.OutputTokensBound); err != nil {
 					return nil, dataErr(err)
 				}
 				if _, err := tx.Exec(ctx, `
@@ -1319,10 +1328,10 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 					personaID, map[string]any{
 						"turn_id":      turnID,
 						"input_id":     t.InputID,
-						"funding_kind": req.Wait.Funding.Kind,
-						"funding_id":   req.Wait.Funding.ID,
-						"needed_minor": req.Wait.NeededMinor,
-						"currency":     req.Wait.Currency,
+						"funding_kind": w.Funding.Kind,
+						"funding_id":   w.Funding.ID,
+						"needed_minor": needed,
+						"currency":     room.budget.Currency,
 					}); err != nil {
 					return nil, fmt.Errorf("append outbox: %w", dataErr(err))
 				}

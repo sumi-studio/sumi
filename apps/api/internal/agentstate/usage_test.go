@@ -352,8 +352,7 @@ func TestUsageBudgetWaitCommitAndResume(t *testing.T) {
 	turn, err := s.CommitTurn(ctx, pa, "t-w", gen, CommitRequest{
 		Outcome: "await",
 		Wait: &CommitWait{
-			Kind: "budget", Funding: wait.Funding,
-			NeededMinor: wait.NeededMinor, Currency: wait.Currency,
+			Kind: "budget", Funding: wait.Funding, Estimate: &wait.Estimate,
 		},
 	})
 	if err != nil || turn.Status != "awaiting" {
@@ -421,7 +420,7 @@ func TestUsageBudgetWaitFitsAtCommit(t *testing.T) {
 	if _, err := s.CommitTurn(ctx, pa, "t-f", gen, CommitRequest{
 		Outcome: "await",
 		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
-			NeededMinor: res.Wait.NeededMinor, Currency: res.Wait.Currency},
+			Estimate: &res.Wait.Estimate},
 	}); err != nil {
 		t.Fatalf("await commit: %v", err)
 	}
@@ -458,7 +457,7 @@ func TestUsageBudgetClearResumes(t *testing.T) {
 	if _, err := s.CommitTurn(ctx, pa, "t-c", gen, CommitRequest{
 		Outcome: "await",
 		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
-			NeededMinor: res.Wait.NeededMinor, Currency: res.Wait.Currency},
+			Estimate: &res.Wait.Estimate},
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -900,5 +899,299 @@ func TestUsagePartialReportSupersededByCompleteReport(t *testing.T) {
 	bad.Status, bad.InputTokens, bad.OutputTokens = "reported", i64(-1), i64(1)
 	if _, _, err := s.RecordUsage(ctx, pa, bad); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("negative tokens err=%v, want ErrBadRequest", err)
+	}
+}
+
+// A record must carry the funding its admission reserved under. Another
+// source the persona may also spend — a second connection of the same
+// human — cannot take the call over: the fact would attribute spend to B
+// while A's hold settles, silently moving cost and budget authority
+// between funding sources.
+func TestUsageRecordFundingMustMatchAdmission(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	connA := mustConnection(t, pool, human)
+	connB := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+	for _, c := range []string{connA, connB} {
+		if _, err := s.SetBudget(ctx, human, "connection", c, fixtureBudget(1_000_000)); err != nil {
+			t.Fatalf("set budget: %v", err)
+		}
+	}
+	// 500*1 + 500*2 = 1500 held on A.
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-ab", gen, connFunding(connA), 500, 500)); err != nil {
+		t.Fatalf("admit A: %v", err)
+	}
+	in, out := int64(400), int64(100) // 400*1 + 100*2 = 600
+	report := func(factID string, f FundingRef) UsageRecordRequest {
+		return UsageRecordRequest{FactID: factID, Kind: "model_call", Phase: "turn",
+			Funding: f, Status: "reported", InputTokens: &in, OutputTokens: &out,
+			Quantities: map[string]any{}}
+	}
+	spend := func(conn string) (int64, int64) {
+		t.Helper()
+		spent, held, err := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+		if err != nil {
+			t.Fatalf("funding spend: %v", err)
+		}
+		return spent, held
+	}
+
+	fact, _, err := s.RecordUsage(ctx, pa, report("f-ab", connFunding(connB)))
+	if !errors.Is(err, ErrUsageFactConflict) {
+		t.Errorf("record under B for A's admission: fact=%+v err=%v, want ErrUsageFactConflict", fact, err)
+	}
+	if facts, _ := s.ListUsageFacts(ctx, pa, 10); len(facts) != 0 {
+		t.Errorf("mismatched record left a fact: %+v", facts)
+	}
+	if spent, held := spend(connA); spent != 0 || held != 1500 {
+		t.Errorf("A spent=%d held=%d, want 0/1500 — A's hold must stay A's", spent, held)
+	}
+	if spent, held := spend(connB); spent != 0 || held != 0 {
+		t.Errorf("B spent=%d held=%d, want 0/0 — B never admitted this call", spent, held)
+	}
+	if t.Failed() {
+		return
+	}
+
+	// The admitted funding records and settles as usual.
+	fact, created, err := s.RecordUsage(ctx, pa, report("f-ab", connFunding(connA)))
+	if err != nil || !created || fact.Funding.ID != connA {
+		t.Fatalf("record under A: %+v created=%v err=%v", fact, created, err)
+	}
+	if spent, held := spend(connA); spent != 600 || held != 0 {
+		t.Fatalf("A spent=%d held=%d after its record, want 600/0", spent, held)
+	}
+	// A settled reservation still pins the call to A.
+	if _, _, err := s.RecordUsage(ctx, pa, report("f-ab", connFunding(connB))); !errors.Is(err, ErrUsageFactConflict) {
+		t.Fatalf("record under B after settlement err=%v, want ErrUsageFactConflict", err)
+	}
+	// A record with no admission at all is still accepted for funding the
+	// persona may spend now, priced under that source's current card.
+	fact, created, err = s.RecordUsage(ctx, pa, report("f-free", connFunding(connB)))
+	if err != nil || !created || fact.Funding.ID != connB || fact.CostMinor == nil ||
+		*fact.CostMinor != 600 || *fact.CostBasis != "configured_rates" {
+		t.Fatalf("unreserved record under B: %+v created=%v err=%v", fact, created, err)
+	}
+	if spent, held := spend(connB); spent != 600 || held != 0 {
+		t.Fatalf("B spent=%d held=%d, want 600/0", spent, held)
+	}
+	if spent, _ := spend(connA); spent != 600 {
+		t.Fatalf("A spent=%d, want 600 (unchanged)", spent)
+	}
+}
+
+// A's hold stays A's through every later stage: transfer seal reconciles
+// it into A's 'unrecorded' estimate, A's connection is deleted, and the
+// fenced core's late partial and then complete reports still land on A —
+// never on another source the persona can spend.
+func TestUsageLateRecordAfterSealKeepsAdmissionFunding(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	connA := mustConnection(t, pool, human)
+	connB := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+	for _, c := range []string{connA, connB} {
+		if _, err := s.SetBudget(ctx, human, "connection", c, fixtureBudget(1_000_000)); err != nil {
+			t.Fatalf("set budget: %v", err)
+		}
+	}
+	if _, err := s.AdmitUsage(ctx, pa, admitReq("f-late", gen, connFunding(connA), 500, 500)); err != nil {
+		t.Fatalf("admit A: %v", err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileRetiredReservations(ctx, tx, pa); err != nil {
+		t.Fatalf("reconcile at seal: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	facts, _ := s.ListUsageFacts(ctx, pa, 10)
+	if len(facts) != 1 || facts[0].Status != "unrecorded" || facts[0].Funding.ID != connA ||
+		facts[0].CostMinor == nil || *facts[0].CostMinor != 1500 {
+		t.Fatalf("seal reconciliation: %+v", facts)
+	}
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM model_api_connections WHERE connection_id = $1::uuid`, connA); err != nil {
+		t.Fatalf("delete connection A: %v", err)
+	}
+
+	partialIn := int64(400)
+	partial := func(f FundingRef) UsageRecordRequest {
+		return UsageRecordRequest{FactID: "f-late", Kind: "model_call", Phase: "turn",
+			Funding: f, Status: "unknown", InputTokens: &partialIn,
+			Quantities: map[string]any{}}
+	}
+	in, out := int64(400), int64(100)
+	complete := func(factID string, f FundingRef) UsageRecordRequest {
+		return UsageRecordRequest{FactID: factID, Kind: "model_call", Phase: "turn",
+			Funding: f, Status: "reported", InputTokens: &in, OutputTokens: &out,
+			Quantities: map[string]any{}}
+	}
+	if _, _, err := s.RecordUsage(ctx, pa, partial(connFunding(connB))); !errors.Is(err, ErrUsageFactConflict) {
+		t.Fatalf("late partial under B err=%v, want ErrUsageFactConflict", err)
+	}
+	fact, created, err := s.RecordUsage(ctx, pa, partial(connFunding(connA)))
+	if err != nil || created || fact.Status != "unknown" || fact.Funding.ID != connA ||
+		fact.CostMinor == nil || *fact.CostMinor != 1500 || *fact.CostBasis != "admission_estimate" {
+		t.Fatalf("late partial under deleted A: %+v created=%v err=%v", fact, created, err)
+	}
+	if _, _, err := s.RecordUsage(ctx, pa, complete("f-late", connFunding(connB))); !errors.Is(err, ErrUsageFactConflict) {
+		t.Fatalf("late complete under B err=%v, want ErrUsageFactConflict", err)
+	}
+	fact, created, err = s.RecordUsage(ctx, pa, complete("f-late", connFunding(connA)))
+	if err != nil || created || fact.Status != "reported" || fact.Funding.ID != connA ||
+		fact.CostMinor == nil || *fact.CostMinor != 600 {
+		t.Fatalf("late complete under deleted A: %+v created=%v err=%v", fact, created, err)
+	}
+	for conn, want := range map[string]int64{connA: 600, connB: 0} {
+		spent, held, err := s.fundingSpend(ctx, s.pool, "connection", conn, "USD")
+		if err != nil || spent != want || held != 0 {
+			t.Fatalf("%s spent=%d held=%d err=%v, want %d/0", conn, spent, held, err, want)
+		}
+	}
+	// With no admission to prove it, a deleted connection authorizes nothing.
+	if _, _, err := s.RecordUsage(ctx, pa, complete("f-orphan", connFunding(connA))); !errors.Is(err, ErrFundingNotFound) {
+		t.Fatalf("unreserved record under deleted A err=%v, want ErrFundingNotFound", err)
+	}
+}
+
+// parkOnBudget submits an input, claims it, has admission deny it, and
+// commits the turn 'await' on the returned wait.
+func parkOnBudget(t *testing.T, s *Store, pa, human string, gen int64, conn, inputID, turnID, factID string) *BudgetWait {
+	t.Helper()
+	ctx := context.Background()
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: inputID,
+		Kind: "message", Payload: map[string]any{"text": "hi"},
+		ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, gen, turnID, 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq(factID, gen, connFunding(conn), 6, 2))
+	if err != nil || res.Admitted || res.Wait == nil {
+		t.Fatalf("admit should deny: %+v err=%v", res, err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, turnID, gen, CommitRequest{
+		Outcome: "await",
+		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
+			Estimate: &res.Wait.Estimate},
+	}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+	return res.Wait
+}
+
+// Lowering the rate card under an unchanged limit is a configuration
+// change that can make a parked call fit: the wait is priced again under
+// the new card, so the input resumes without an unrelated change or a
+// manual nudge. A lower card that still does not fit keeps it parked.
+func TestUsageBudgetWaitResumesOnRateDecrease(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	// 6 input * 1 + 2 output * 2 = 10 > 8.
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(8)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if w := parkOnBudget(t, s, pa, human, gen, conn, "in-r", "t-r", "f-r"); w.NeededMinor != 10 {
+		t.Fatalf("denied need=%d, want 10", w.NeededMinor)
+	}
+	status := func() string {
+		t.Helper()
+		got, _, err := s.GetInput(ctx, pa, "in-r")
+		if err != nil {
+			t.Fatalf("get input: %v", err)
+		}
+		return got.Status
+	}
+	if st := status(); st != "waiting" {
+		t.Fatalf("input=%q, want waiting", st)
+	}
+	// Cheaper, but still over: 6*1 + 2*1.5 = 9 > 8.
+	b := fixtureBudget(8)
+	b.RateOutputPerMTok = 1_500_000
+	if _, err := s.SetBudget(ctx, human, "connection", conn, b); err != nil {
+		t.Fatalf("lower output rate: %v", err)
+	}
+	if st := status(); st != "waiting" {
+		t.Fatalf("input=%q after a card that still does not fit, want waiting", st)
+	}
+	waits, err := s.BudgetWaitsForHuman(ctx, human)
+	if err != nil || len(waits) != 1 || waits[0].NeededMinor != 9 || waits[0].Currency != "USD" {
+		t.Errorf("still-parked wait: %+v err=%v, want needed 9 USD under the current card", waits, err)
+	}
+	// Fits under the same limit: 6*0.5 + 2*1 = 5 <= 8.
+	b.RateInputPerMTok, b.RateOutputPerMTok = 500_000, 1_000_000
+	if _, err := s.SetBudget(ctx, human, "connection", conn, b); err != nil {
+		t.Fatalf("lower both rates: %v", err)
+	}
+	if st := status(); st != "queued" {
+		t.Fatalf("input=%q after a rate decrease that fits, want queued", st)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("wait row should be gone: %+v", waits)
+	}
+	if _, err := s.LoadTurn(ctx, pa, gen, "t-r2", 10); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq("f-r2", gen, connFunding(conn), 6, 2))
+	if err != nil || !res.Admitted || res.Reservation.ReservedMinor != 5 {
+		t.Fatalf("admit after rate decrease: %+v err=%v", res, err)
+	}
+}
+
+// A rate decrease landing between the denial and the await commit is the
+// same race as a limit raise there: the commit prices the wait under the
+// card now in force and requeues instead of parking on a stale amount.
+func TestUsageBudgetWaitRepricedAtCommit(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa, human := boundPersona(t, s, pool)
+	conn := mustConnection(t, pool, human)
+	gen := acquireWriter(t, s, pa, time.Minute)
+
+	if _, err := s.SetBudget(ctx, human, "connection", conn, fixtureBudget(8)); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: "in-rc",
+		Kind: "message", Payload: map[string]any{"text": "hi"},
+		ActorKind: "human", ActorID: human, SourceSurface: "test"}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.LoadTurn(ctx, pa, gen, "t-rc", 10); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	res, err := s.AdmitUsage(ctx, pa, admitReq("f-rc", gen, connFunding(conn), 6, 2))
+	if err != nil || res.Admitted {
+		t.Fatalf("expected denial: %+v err=%v", res, err)
+	}
+	b := fixtureBudget(8)
+	b.RateInputPerMTok, b.RateOutputPerMTok = 500_000, 1_000_000
+	if _, err := s.SetBudget(ctx, human, "connection", conn, b); err != nil {
+		t.Fatalf("lower rates: %v", err)
+	}
+	if _, err := s.CommitTurn(ctx, pa, "t-rc", gen, CommitRequest{
+		Outcome: "await",
+		Wait: &CommitWait{Kind: "budget", Funding: res.Wait.Funding,
+			Estimate: &res.Wait.Estimate},
+	}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+	got, _, _ := s.GetInput(ctx, pa, "in-rc")
+	if got.Status != "queued" {
+		t.Fatalf("input=%q, want queued (the new card fits)", got.Status)
+	}
+	if waits, _ := s.BudgetWaitsForHuman(ctx, human); len(waits) != 0 {
+		t.Fatalf("no wait row expected: %+v", waits)
 	}
 }

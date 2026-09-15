@@ -402,6 +402,8 @@ export class FakeState implements StateClient {
       funding_id: string;
       needed_minor: number;
       currency: string;
+      est_input_tokens: number;
+      est_output_bound: number | null;
       created_at: string;
     }
   >();
@@ -721,21 +723,24 @@ export class FakeState implements StateClient {
   }
 
   /**
-   * Go resumeWaits: delete the matching wait rows whose needed amount now
-   * fits (or all of them when the cap is gone), requeue still-waiting
-   * inputs — unless a pending approval is a second, independent wait —
-   * and unpark memory chunks reshelved on a budget wait.
+   * Go ResumeWaitsForFunding: price each wait's admission estimate under
+   * the card now in force, delete and requeue the ones that fit (all of
+   * them when the cap is gone) — unless a pending approval is a second,
+   * independent wait — restate the rest under that card, and unpark
+   * memory chunks reshelved on a budget wait.
    */
   private resumeBudgetWaits(kind: string, id: string) {
-    const budget = this.usageBudgets.get(`${kind}|${id}`);
-    let fitsNeeded = -1;
-    if (budget) {
-      const { spent, held } = this.fundingSpend(kind, id, budget.currency);
-      fitsNeeded = budget.limit_minor - spent - held;
-    }
     for (const [key, w] of [...this.budgetWaits]) {
       if (w.funding_kind !== kind || w.funding_id !== id) continue;
-      if (fitsNeeded >= 0 && w.needed_minor > fitsNeeded) continue;
+      const fit = this.fitEstimate(kind, id, {
+        input_tokens: w.est_input_tokens,
+        output_tokens_bound: w.est_output_bound ?? undefined,
+      });
+      if (!fit.fits) {
+        w.needed_minor = fit.needed;
+        w.currency = fit.currency ?? w.currency;
+        continue;
+      }
       this.budgetWaits.delete(key);
       this.requeueWaitingInput(w.persona_id, w.input_id);
     }
@@ -812,6 +817,22 @@ export class FakeState implements StateClient {
     return { spent, held };
   }
 
+  /** Go fundingHeadroom.fit: price an admission estimate under the card in
+   *  force now and report whether admission would admit it. */
+  private fitEstimate(kind: string, id: string, est: UsageEstimate) {
+    const budget = this.usageBudgets.get(`${kind}|${id}`);
+    if (!budget) return { fits: true, needed: 0, currency: null };
+    const needed = priceEstimate(est, budget);
+    const { spent, held } = this.fundingSpend(kind, id, budget.currency);
+    return {
+      fits:
+        needed <= budget.limit_minor &&
+        spent + held <= budget.limit_minor - needed,
+      needed,
+      currency: budget.currency,
+    };
+  }
+
   async admitUsage(
     persona: string,
     generation: number,
@@ -872,24 +893,18 @@ export class FakeState implements StateClient {
       `${req.funding.kind}|${req.funding.id}`,
     );
     let needed = 0;
-    let bounded = req.estimate.output_tokens_bound !== undefined;
+    const bounded = req.estimate.output_tokens_bound !== undefined;
     if (budget) {
-      const price = (tok: number, rate: number) =>
-        tok <= 0 || rate <= 0 ? 0 : Math.ceil((tok * rate) / 1_000_000);
-      needed =
-        price(req.estimate.input_tokens, budget.rate_input_per_mtok) +
-        (req.estimate.output_tokens_bound !== undefined
-          ? price(
-              req.estimate.output_tokens_bound,
-              budget.rate_output_per_mtok,
-            )
-          : 0);
+      needed = priceEstimate(req.estimate, budget);
       const { spent, held } = this.fundingSpend(
         req.funding.kind,
         req.funding.id,
         budget.currency,
       );
-      if (needed > budget.limit_minor || spent + held > budget.limit_minor - needed) {
+      if (
+        needed > budget.limit_minor ||
+        spent + held > budget.limit_minor - needed
+      ) {
         return {
           admitted: false,
           wait: {
@@ -902,6 +917,7 @@ export class FakeState implements StateClient {
             currency: budget.currency,
             pricing_revision: budget.pricing_revision,
             bounded,
+            estimate: req.estimate,
           },
         };
       }
@@ -968,10 +984,7 @@ export class FakeState implements StateClient {
       req.status !== "unknown" &&
       req.status !== "not_sent"
     ) {
-      throw new StateError(
-        400,
-        "status must be reported, unknown or not_sent",
-      );
+      throw new StateError(400, "status must be reported, unknown or not_sent");
     }
     const key = `${persona}|${req.factId}`;
     const res = this.usageReservations.get(key);
@@ -1006,8 +1019,7 @@ export class FakeState implements StateClient {
       req.outputTokens != null
     ) {
       // Normalized categories are non-overlapping — additive pricing.
-      const cachedRate =
-        card.rate_cached_per_mtok ?? card.rate_input_per_mtok;
+      const cachedRate = card.rate_cached_per_mtok ?? card.rate_input_per_mtok;
       costMinor =
         price(req.inputTokens, card.rate_input_per_mtok) +
         price(req.cachedTokens ?? 0, cachedRate) +
@@ -1073,6 +1085,19 @@ export class FakeState implements StateClient {
     }
     if (req.status === "not_sent" && supplied.some((v) => v != null)) {
       throw new StateError(400, "a 'not_sent' fact cannot carry token usage");
+    }
+    // Go RecordUsage funding authority: an admitted call is paid by the
+    // funding that admitted it — a record naming another source conflicts
+    // instead of moving the cost there and settling the admitting hold.
+    if (
+      res &&
+      (res.funding_kind !== req.funding.kind ||
+        res.funding_id !== req.funding.id)
+    ) {
+      throw new StateError(
+        409,
+        `fact_id ${req.factId} was admitted under different funding`,
+      );
     }
 
     const existing = this.usageFacts.get(key);
@@ -1415,7 +1440,9 @@ export class FakeState implements StateClient {
     req = {
       ...req,
       error:
-        req.error === undefined ? req.error : req.error.replace(/\u0000/g, ""),
+        req.error === undefined
+          ? req.error
+          : req.error.replaceAll("\u0000", ""),
     };
     // Exactly one input_received per input ever lands in the journal, and
     // every receipt names a real input (Go withoutJournaledInput +
@@ -1491,30 +1518,26 @@ export class FakeState implements StateClient {
       turn.status = "awaiting";
       if (req.wait) {
         // Mirror of the Go budget-wait commit: 'budget' is the only kind.
-        // The denied admission sent no request; if the cap changed between
-        // denial and commit the input requeues immediately instead of
-        // waiting on a blocker that no longer exists.
+        // The denied admission sent no request; the estimate is priced
+        // under the card in force now, so if the cap or the rates changed
+        // between denial and commit the input requeues immediately instead
+        // of waiting on a blocker that no longer exists.
         const w = req.wait;
         if (
-          w.kind !== "budget" || !w.funding.kind || !w.funding.id ||
-          w.needed_minor < 0 || w.currency.length !== 3
+          w.kind !== "budget" ||
+          !w.funding.kind ||
+          !w.funding.id ||
+          !w.estimate ||
+          w.estimate.input_tokens < 0 ||
+          (w.estimate.output_tokens_bound ?? 0) < 0
         ) {
           throw new StateError(
             400,
-            "wait must be a budget wait with funding, needed_minor and currency",
+            "wait must be a budget wait with funding and a non-negative estimate",
           );
         }
-        const budget = this.usageBudgets.get(
-          `${w.funding.kind}|${w.funding.id}`,
-        );
-        const { spent, held } = this.fundingSpend(
-          w.funding.kind,
-          w.funding.id,
-          budget?.currency ?? "",
-        );
-        const fits = !budget ||
-          spent + held + w.needed_minor <= budget.limit_minor;
-        if (fits) {
+        const fit = this.fitEstimate(w.funding.kind, w.funding.id, w.estimate);
+        if (fit.fits) {
           input.status = "queued";
           input.claimed_generation = null;
           input.turn_id = null;
@@ -1528,8 +1551,10 @@ export class FakeState implements StateClient {
             turn_id: turnId,
             funding_kind: w.funding.kind,
             funding_id: w.funding.id,
-            needed_minor: w.needed_minor,
-            currency: w.currency,
+            needed_minor: fit.needed,
+            currency: fit.currency ?? "",
+            est_input_tokens: w.estimate.input_tokens,
+            est_output_bound: w.estimate.output_tokens_bound ?? null,
             created_at: new Date().toISOString(),
           });
           this.outboxEntries.push({
@@ -1541,51 +1566,51 @@ export class FakeState implements StateClient {
               input_id: input.input_id,
               funding_kind: w.funding.kind,
               funding_id: w.funding.id,
-              needed_minor: w.needed_minor,
-              currency: w.currency,
+              needed_minor: fit.needed,
+              currency: fit.currency,
             },
             created_at: new Date().toISOString(),
             delivered_at: null,
           });
         }
       } else {
-      // Mirror of the Go await commit: the input waits only while an
-      // approval is still pending; a decision that already landed requeues
-      // it directly.
-      const pending = [...this.approvals.values()].filter(
-        (a) =>
-          a.persona_id === persona &&
-          a.input_id === input.input_id &&
-          a.status === "pending",
-      );
-      if (pending.length === 0) {
-        input.status = "queued";
-        input.claimed_generation = null;
-        input.turn_id = null;
-        input.not_before = null;
-      } else {
-        input.status = "waiting";
-        input.waiting_since = new Date().toISOString();
-        this.outboxEntries.push({
-          persona_id: persona,
-          seq: this.nextSeq(this.outboxSeq, persona),
-          kind: "approval_requested",
-          payload: {
-            turn_id: turnId,
-            input_id: input.input_id,
-            approvals: pending.map((a) => ({
-              approval_id: a.approval_id,
-              tool: a.tool,
-              route: a.route,
-              required_by: a.required_by,
-              request: a.request,
-              action_digest: a.action_digest,
-            })),
-          },
-          created_at: new Date().toISOString(),
-          delivered_at: null,
-        });
-      }
+        // Mirror of the Go await commit: the input waits only while an
+        // approval is still pending; a decision that already landed requeues
+        // it directly.
+        const pending = [...this.approvals.values()].filter(
+          (a) =>
+            a.persona_id === persona &&
+            a.input_id === input.input_id &&
+            a.status === "pending",
+        );
+        if (pending.length === 0) {
+          input.status = "queued";
+          input.claimed_generation = null;
+          input.turn_id = null;
+          input.not_before = null;
+        } else {
+          input.status = "waiting";
+          input.waiting_since = new Date().toISOString();
+          this.outboxEntries.push({
+            persona_id: persona,
+            seq: this.nextSeq(this.outboxSeq, persona),
+            kind: "approval_requested",
+            payload: {
+              turn_id: turnId,
+              input_id: input.input_id,
+              approvals: pending.map((a) => ({
+                approval_id: a.approval_id,
+                tool: a.tool,
+                route: a.route,
+                required_by: a.required_by,
+                request: a.request,
+                action_digest: a.action_digest,
+              })),
+            },
+            created_at: new Date().toISOString(),
+            delivered_at: null,
+          });
+        }
       }
     } else {
       turn.status = "failed";
@@ -1646,7 +1671,7 @@ export class FakeState implements StateClient {
    */
   private reconcileHeldReservation(
     key: string,
-    r: (typeof this.usageReservations extends Map<string, infer V> ? V : never),
+    r: typeof this.usageReservations extends Map<string, infer V> ? V : never,
   ) {
     if (!this.usageFacts.has(key)) {
       const persona = key.slice(0, key.indexOf("|"));
@@ -3592,4 +3617,24 @@ export class FakeState implements StateClient {
 function boundCodePoints(s: string, n: number): string {
   const cps = [...s];
   return cps.length > n ? `${cps.slice(0, n).join("")}…` : s;
+}
+
+/** Go priceTokens: minor units per million tokens, rounded up. */
+function priceTokens(tokens: number, ratePerMTok: number): number {
+  return tokens <= 0 || ratePerMTok <= 0
+    ? 0
+    : Math.ceil((tokens * ratePerMTok) / 1_000_000);
+}
+
+/** Go priceEstimate: input plus the output bound when one was sent. */
+function priceEstimate(
+  est: UsageEstimate,
+  card: { rate_input_per_mtok: number; rate_output_per_mtok: number },
+): number {
+  return (
+    priceTokens(est.input_tokens, card.rate_input_per_mtok) +
+    (est.output_tokens_bound !== undefined
+      ? priceTokens(est.output_tokens_bound, card.rate_output_per_mtok)
+      : 0)
+  );
 }

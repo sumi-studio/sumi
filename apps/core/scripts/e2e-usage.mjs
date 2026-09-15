@@ -271,7 +271,7 @@ async function main() {
   // 1 unit per input token, 2 per output token; no cached rate configured,
   // so cached input bills at the input rate:
   // (1000-400)*1 + 400*1 + 200*2 = 1400 units per reported call.
-  const setBudget = (limit, kind = "operator", id = "env") =>
+  const setBudget = (limit, kind = "operator", id = "env", rates = {}) =>
     req("PUT", "/internal/dev/usage-budgets", ADMIN, {
       funding_kind: kind,
       funding_id: id,
@@ -280,6 +280,7 @@ async function main() {
       rate_input_per_mtok: 1_000_000,
       rate_output_per_mtok: 2_000_000,
       pricing_revision: "fixture-rates-v1",
+      ...rates,
     });
 
   async function waitFor(fn, what, timeoutMs = 30_000) {
@@ -534,9 +535,17 @@ async function main() {
     pr.text,
   );
   pr = await recordPartial(complete);
-  check(pr.status === 200 && pr.json.created === false, "complete report replays", pr.text);
+  check(
+    pr.status === 200 && pr.json.created === false,
+    "complete report replays",
+    pr.text,
+  );
   pr = await recordPartial({ ...complete, output_tokens: 201 });
-  check(pr.status === 409, `a different report conflicts ${pr.status}`, pr.text);
+  check(
+    pr.status === 409,
+    `a different report conflicts ${pr.status}`,
+    pr.text,
+  );
   const settled = (await facts()).filter((f) => f.fact_id === partial.fact_id);
   check(
     settled.length === 1 &&
@@ -633,6 +642,75 @@ async function main() {
   const resumed = fs.at(-1);
   assert.equal(resumed.funding.kind, "connection");
   assert.equal(resumed.funding.id, conn1, "resumed call ran on conn-1");
+
+  // --- 10: a lower rate card under the same limit resumes a parked input ---
+  // The owner keeps the limit and cuts the rates. The wait is priced again
+  // under the new card: a card that still does not fit leaves the input
+  // parked with no provider request; one that fits runs it — no unrelated
+  // change and no manual nudge.
+  r = await req("POST", "/internal/dev/model-connections", ADMIN, {
+    human_id: human,
+    name: "fixture-conn-3",
+    preset: "openai-chat",
+    base_url: `http://127.0.0.1:${stubPort}`,
+    model: "fixture-model",
+    api_key: "fixture-key-fixture-conn-3",
+  });
+  check(r.status === 201, `seed connection 3 ${r.status}`, r.text);
+  const conn3 = r.json.connection_id;
+  b = await setBudget(1, "connection", conn3);
+  check(b.status === 200, `tighten conn3 ${b.status}`, b.text);
+  r = await select(conn3);
+  check(r.status === 200, `select conn3 ${r.status}`, r.text);
+  const rateId = `in-${randomUUID()}`;
+  r = await req("POST", `${P}/inputs`, ptoken, {
+    input_id: rateId,
+    kind: "message",
+    payload: { text: "usage cheaper six" },
+    actor_kind: "human",
+    actor_id: "e2e",
+    source_surface: "e2e",
+  });
+  check(r.status < 300, `submit rate ${r.status}`, r.text);
+  await waitFor(
+    async () => (await outboxFor(rateId)).some((o) => o.kind === "budget_wait"),
+    "budget_wait on conn-3",
+  );
+  const needed = (await outboxFor(rateId)).find((o) => o.kind === "budget_wait")
+    .payload.needed_minor;
+  // The limit covers 60% of the call at fixture rates.
+  const rateLimit = Math.floor(needed * 0.6);
+  b = await setBudget(rateLimit, "connection", conn3);
+  check(b.status === 200, `conn3 limit ${b.status}`, b.text);
+  const beforeRates = providerRequests();
+  b = await setBudget(rateLimit, "connection", conn3, {
+    rate_input_per_mtok: 750_000,
+    rate_output_per_mtok: 1_500_000,
+    pricing_revision: "fixture-rates-three-quarter",
+  });
+  check(b.status === 200, `conn3 three-quarter rates ${b.status}`, b.text);
+  await sleep(1_000);
+  assert.equal(await inputStatus(rateId), "waiting", "still over the limit");
+  assert.equal(providerRequests(), beforeRates, "a parked call sends nothing");
+  b = await setBudget(rateLimit, "connection", conn3, {
+    rate_input_per_mtok: 100_000,
+    rate_output_per_mtok: 200_000,
+    pricing_revision: "fixture-rates-tenth",
+  });
+  check(b.status === 200, `conn3 tenth rates ${b.status}`, b.text);
+  await waitFor(
+    async () =>
+      (await outboxFor(rateId)).some((o) => o.kind === "turn_completed"),
+    "parked input resumes after the rate decrease",
+  );
+  fs = await facts();
+  const cheaper = fs.find((f) => f.input_id === rateId && f.phase === "turn");
+  check(cheaper, "the resumed call recorded its fact", fs);
+  assert.equal(cheaper.funding.id, conn3, "resumed call ran on conn-3");
+  // 1000 input * 0.1 + 200 output * 0.2 = 140 under the lowered card.
+  assert.equal(cheaper.cost_minor, 140);
+  assert.equal(cheaper.pricing_revision, "fixture-rates-tenth");
+  log("rate decrease: needed", needed, "limit", rateLimit, "→ resumed at 140");
 
   // --- summary ---------------------------------------------------------------
   const summary = {

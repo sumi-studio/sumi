@@ -93,7 +93,7 @@ export function UsageSettings({
       {waits.length > 0 && (
         <p role="status" className="mt-3 text-sm">
           {waits.length}
-          件のリクエストが上限のために待機中です。上限を上げるか外すと自動で再開します。
+          件のリクエストが上限のために待機中です。上限を上げたり単価を下げたりして収まるようになるか、上限を外すと自動で再開します。
         </p>
       )}
       {overview && overview.sources.length === 0 && (

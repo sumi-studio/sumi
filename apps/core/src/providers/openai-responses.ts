@@ -71,7 +71,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
   outputBound(): number | undefined {
     const extra = this.cfg.extra;
     const overridden =
-      extra !== undefined ? numOr(extra["max_output_tokens"]) : undefined;
+      extra !== undefined ? numOr(extra.max_output_tokens) : undefined;
     return overridden ?? this.cfg.maxOutputTokens;
   }
 

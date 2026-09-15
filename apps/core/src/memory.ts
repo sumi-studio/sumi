@@ -874,7 +874,7 @@ export async function runMemoryPreparation(
   }
   // PG text cannot hold NUL — strip it rather than let an un-storable
   // candidate loop at the persistence boundary.
-  const replacement = trimmed.replace(/\u0000/g, "");
+  const replacement = trimmed.replaceAll("\u0000", "");
   await recordMemoryOutcome(deps, chunk.chunk_seq, {
     kind: "prepared",
     replacement,

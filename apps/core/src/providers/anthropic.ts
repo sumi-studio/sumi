@@ -74,7 +74,7 @@ export class AnthropicProvider implements ModelProvider {
   outputBound(): number | undefined {
     const extra = this.cfg.extra;
     const overridden =
-      extra !== undefined ? numOr(extra["max_tokens"]) : undefined;
+      extra !== undefined ? numOr(extra.max_tokens) : undefined;
     return overridden ?? this.cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
   }
 

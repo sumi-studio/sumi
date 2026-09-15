@@ -5,8 +5,8 @@ import {
   estTextTokens,
   evictToBudget,
   inputMarker,
-  renderJournalContext,
   renderedViewTokens,
+  renderJournalContext,
   runMemoryPreparation,
 } from "./memory.ts";
 import {
@@ -22,7 +22,6 @@ import {
   StateError,
   UnauthorizedError,
 } from "./state-client.ts";
-import { BudgetWaitError } from "./usage.ts";
 import { toolSpecs } from "./tools.ts";
 import type {
   CommitRequest,
@@ -40,6 +39,7 @@ import type {
   TurnPlan,
   WriterLease,
 } from "./types.ts";
+import { BudgetWaitError } from "./usage.ts";
 
 export interface SecretaryConfig {
   personaId: string;
@@ -128,7 +128,8 @@ const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
  * provider retry window (repair F4).
  */
 function activeAgeMs(input: Input): number {
-  let active = Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
+  let active =
+    Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
   // A still-waiting input cannot be claimed — but a store that exposes
   // waiting_since without having requeued yet is counted honestly too.
   if (input.waiting_since) {
@@ -583,8 +584,7 @@ export class Secretary {
     // the shelf's end, expressed on the wall clock the host arms against.
     // Until then the host's ordinary heartbeat carries the re-probe.
     const paused =
-      Date.now() +
-      Math.max(0, this.memoryModelPausedUntil - performance.now());
+      Date.now() + Math.max(0, this.memoryModelPausedUntil - performance.now());
     if (this.memoryShape.claimable > 0) return Math.max(Date.now(), paused);
     const next = this.memoryShape.next_claimable_at;
     return next ? Math.max(Date.parse(next), paused) : null;
@@ -1121,8 +1121,7 @@ export class Secretary {
             wait: {
               kind: "budget",
               funding: e.wait.funding,
-              needed_minor: e.wait.needed_minor,
-              currency: e.wait.currency,
+              estimate: e.wait.estimate,
             },
           });
           this.log("turn awaiting budget", {
@@ -1523,8 +1522,7 @@ export function assemble(
           placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
           messageId: p.message_id,
           attention: input.attention,
-          change:
-            typeof p.message_change === "string" ? p.message_change : "",
+          change: typeof p.message_change === "string" ? p.message_change : "",
         });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
@@ -1532,7 +1530,7 @@ export function assemble(
 
 /** Strip bytes the durable store cannot persist (PG text/jsonb reject NUL). */
 function stripNul(s: string): string {
-  return s.replace(/\u0000/g, "");
+  return s.replaceAll("\u0000", "");
 }
 
 function stripNulDeep(v: unknown): unknown {
