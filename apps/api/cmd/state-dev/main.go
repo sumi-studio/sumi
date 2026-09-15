@@ -13,6 +13,10 @@
 //	SUMI_MODEL_CONNECTION_KEY  base64-encoded 32-byte key for the user
 //	                         model-connection store; absent = metadata-only
 //	SUMI_DB_CREATE=1       create the database named in SUMI_DB_URL if absent
+//	SUMI_CORE_RUNTIME_TOKEN  optional runtime credential for a Cloud-shaped
+//	                         core host (persona-scoped routes of any persona)
+//	SUMI_CORE_WAKE_URL / SUMI_CORE_WAKE_TOKEN  optional: wake that core host
+//	                         for personas with work and no live writer
 package main
 
 import (
@@ -79,6 +83,19 @@ func main() {
 	} else {
 		conns = modelconnections.MetadataOnly(pool.Pool)
 		coreState.SetModelConnections(conns)
+	}
+	if rt := strings.TrimSpace(os.Getenv(agentstate.RuntimeTokenEnv)); rt != "" {
+		if err := coreState.SetRuntimeToken(rt); err != nil {
+			log.Fatal(err)
+		}
+	}
+	waker, err := agentstate.RuntimeWakerFromEnv(coreState.Store(), os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if waker != nil {
+		log.Printf("core wake: sweeping for personas awaiting a runtime; waking %s", waker.Target())
+		go waker.Run(context.Background())
 	}
 	coreState.RegisterRoutes(mux)
 	portable.NewServer(pool.Pool, token).RegisterRoutes(mux)

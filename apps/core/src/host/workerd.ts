@@ -23,8 +23,9 @@
  * can take minutes of model time (~104s observed), and a fetch-started drain
  * has no platform wall-clock guarantee to hold it. Preparation runs only in
  * alarm-invoked drains: Cloudflare documents a 15-minute wall time for an
- * alarm handler, and a Durable Object stays active while the handler has
- * pending I/O (ctx.waitUntil does not extend a DO's lifetime). The drain
+ * alarm handler, and the running handler invocation is what keeps the
+ * object active — a plain outgoing fetch() never prevents eviction of an
+ * idle object, and ctx.waitUntil does not extend a DO's lifetime. The drain
  * keeps a margin under that limit: it starts a branch only when the branch's
  * own timeout still fits, keeps the branch alive until it records its
  * result, and stops at the lifetime end otherwise — a stop records nothing,
@@ -36,7 +37,18 @@
  * not spin claim/probe/release at the 1s floor.
  *
  * Env bindings (worker config):
- *   SUMI_STATE_URL    — base URL of the Go state service
+ *   SUMI_STATE_URL    — base URL of the Go state service (with SUMI_STATE,
+ *                       the path base and Host header only)
+ *   SUMI_STATE        — optional fetcher (a Workers VPC Service binding in
+ *                       Cloud) that carries every state request; absent, the
+ *                       global fetch reaches SUMI_STATE_URL directly
+ *   SUMI_CORE_RUNTIME_TOKEN — state credential for any persona's scoped
+ *                       routes; a SUMI_PERSONA_TOKEN_<id> binding still wins
+ *   SUMI_CORE_WAKE_TOKEN — bearer required on /personas/:id/wake,
+ *                       /personas/:id/check and /health/state. Without it
+ *                       those routes answer 503, except
+ *                       SUMI_CORE_WAKE_OPEN=loopback-dev on a loopback
+ *                       host (local wrangler dev)
  *   SUMI_MODEL_*      — provider config (same as local host)
  *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
  *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
@@ -55,10 +67,14 @@
  * own secret store, never in DO storage.
  */
 
-import { providerForPersona } from "./provider-env.ts";
 import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory.ts";
 import { Secretary } from "../secretary.ts";
-import { HttpStateClient } from "../state-client.ts";
+import {
+  HttpStateClient,
+  StateError,
+  UnauthorizedError,
+} from "../state-client.ts";
+import { providerForPersona } from "./provider-env.ts";
 
 /** Minimal structural types — avoids a workers-types hard dependency. */
 interface DOStorage {
@@ -73,8 +89,16 @@ interface AlarmState {
   storage: DOStorage;
 }
 
+interface FetcherLike {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
 interface EnvLike {
   SUMI_STATE_URL: string;
+  SUMI_STATE?: FetcherLike;
+  SUMI_CORE_RUNTIME_TOKEN?: string;
+  SUMI_CORE_WAKE_TOKEN?: string;
+  SUMI_CORE_WAKE_OPEN?: string;
   SUMI_MODEL_PROVIDER?: string;
   SUMI_HEARTBEAT_MS?: string;
   SECRETARY: {
@@ -104,6 +128,13 @@ const MAX_ALARM_DRAIN_LIFETIME_MS = 14 * 60_000;
 const MEMORY_WAKE_MIN_MS = 1_000;
 /** Poll while a preparation branch runs and no turn is waiting. */
 const MEMORY_POLL_MS = 500;
+/**
+ * Bound on the startup a wake awaits. Startup is lease acquire/renew plus
+ * recovery — a few state calls, never a model turn — so it must answer well
+ * inside the caller's HTTP timeout instead of holding the fetch open on a
+ * state outage.
+ */
+const WAKE_START_TIMEOUT_MS = 8_000;
 
 /**
  * Thrown when no SUMI_PERSONA_TOKEN_* binding exists for a persona — a
@@ -120,8 +151,10 @@ export class MissingPersonaTokenError extends Error {
 
 function envToken(env: EnvLike, persona: string): string {
   const v = env[`SUMI_PERSONA_TOKEN_${persona.replace(/-/g, "_")}`];
-  if (typeof v !== "string" || !v) throw new MissingPersonaTokenError(persona);
-  return v;
+  if (typeof v === "string" && v) return v;
+  const runtime = env.SUMI_CORE_RUNTIME_TOKEN;
+  if (typeof runtime === "string" && runtime) return runtime;
+  throw new MissingPersonaTokenError(persona);
 }
 
 export class SecretaryObject {
@@ -191,9 +224,11 @@ export class SecretaryObject {
 
   /** Build the per-persona secretary; overridable for tests. */
   protected newSecretary(personaId: string): Secretary {
+    const binding = this.env.SUMI_STATE;
     const state = new HttpStateClient(
       this.env.SUMI_STATE_URL,
       envToken(this.env, personaId),
+      binding ? (input, init) => binding.fetch(String(input), init) : undefined,
     );
     // The persona's selected model connection is authoritative — resolved
     // through the state service for every model call, with env config only
@@ -246,11 +281,30 @@ export class SecretaryObject {
     return this.secretary;
   }
 
-  /** Wake via fetch: acquire, recover, drain pending work once. */
+  /**
+   * Wake via fetch: verify the runtime actually starts, then drain pending
+   * work once.
+   *
+   * A 200 means the secretary acquired or renewed its writer lease and
+   * recovery ran — the DO's credential authenticated through the state
+   * path — and a drain was requested. It does NOT mean work completed; the
+   * drain continues after the response. A startup failure (wrong runtime
+   * secret, unreachable state service, a live writer elsewhere) answers
+   * 503 so the caller sees an unusable runtime instead of inputs queueing
+   * silently behind a passing health check.
+   *
+   * POST /personas/:id/check is the same authentication through the state
+   * binding without starting anything: the deployment probe's proof that
+   * this DO's installed secret reaches a persona-scoped route.
+   */
   async fetch(req: Request): Promise<Response> {
-    const persona = new URL(req.url).pathname.split("/")[2];
+    const m = /^\/personas\/([^/]+)\/(wake|check)$/.exec(
+      new URL(req.url).pathname,
+    );
+    const persona = m?.[1];
     if (!persona)
       return Response.json({ error: "persona required" }, { status: 400 });
+    if (m?.[2] === "check") return this.check(persona);
     let s: Secretary;
     try {
       s = await this.build(persona);
@@ -260,10 +314,113 @@ export class SecretaryObject {
         { status: 500 },
       );
     }
+    try {
+      await this.gated(this.startSerialized(s));
+    } catch (e) {
+      // The heartbeat still arms so this DO keeps retrying on its own
+      // cadence; the drain itself would only repeat the failed start.
+      console.log(
+        `[core] persona ${persona} start failed:`,
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      );
+      await this.ensureAlarm();
+      return Response.json(
+        { ok: false, persona, reason: startFailureReason(e) },
+        { status: 503 },
+      );
+    }
     const coalesced = this.drainPromise !== null;
     this.ctx.waitUntil(this.requestDrain(s));
     await this.ensureAlarm();
     return Response.json({ ok: true, persona, coalesced });
+  }
+
+  /**
+   * One state call with the credential this DO would use for the persona —
+   * the per-persona binding when present, else the runtime token — through
+   * the SUMI_STATE binding when configured. Unlike a wake it arms no alarm
+   * and starts no writer: it only proves the mounted secret authenticates.
+   */
+  private async check(persona: string): Promise<Response> {
+    const started = Date.now();
+    const via = this.env.SUMI_STATE ? "binding" : "fetch";
+    const fail = (reason: string, fields: Record<string, unknown> = {}) =>
+      Response.json(
+        { ok: false, via, reason, ms: Date.now() - started, ...fields },
+        { status: 503 },
+      );
+    let token: string;
+    try {
+      token = envToken(this.env, persona);
+    } catch {
+      return fail("no_credential");
+    }
+    const target = `${this.env.SUMI_STATE_URL.replace(/\/+$/, "")}/internal/core/personas/${persona}/state`;
+    try {
+      const init = {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(5_000),
+      };
+      const res = this.env.SUMI_STATE
+        ? await this.env.SUMI_STATE.fetch(target, init)
+        : await fetch(target, init);
+      await res.body?.cancel();
+      if (res.ok)
+        return Response.json({
+          ok: true,
+          via,
+          state_status: res.status,
+          ms: Date.now() - started,
+        });
+      return fail(res.status === 401 ? "unauthorized" : "state_error", {
+        state_status: res.status,
+      });
+    } catch (e) {
+      return fail("unreachable", {
+        error: e instanceof Error ? e.name : String(e),
+      });
+    }
+  }
+
+  /**
+   * Serialized start: a wake's startup gate and a drain's own start share
+   * one queue so two starts (both would bump the writer generation) never
+   * overlap.
+   */
+  private startQueue: Promise<unknown> = Promise.resolve();
+
+  private startSerialized(s: Secretary): Promise<void> {
+    const p = this.startQueue.then(() => s.start());
+    this.startQueue = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    // A start that outlives its wake's gate still settles here — log the
+    // rejection so a wedged state call is visible instead of silently
+    // dropping out of the queue.
+    p.catch((e) =>
+      console.log(
+        "[core] start attempt rejected:",
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      ),
+    );
+    return p;
+  }
+
+  /** Await `p`, giving up after WAKE_START_TIMEOUT_MS. `p` still runs. */
+  private async gated<T>(p: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("runtime start timed out")),
+        WAKE_START_TIMEOUT_MS,
+      );
+    });
+    try {
+      return await Promise.race([p, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -364,7 +521,7 @@ export class SecretaryObject {
 
   private async drain(s: Secretary): Promise<void> {
     try {
-      await s.start();
+      await this.startSerialized(s);
     } catch (e) {
       // Lease held by another live writer — it owns the life; back off.
       console.log(
@@ -426,19 +583,119 @@ export class SecretaryObject {
   }
 }
 
-/** Worker entry: POST /personas/:id/wake triggers the DO for that persona. */
+/**
+ * Coarse reason a wake's startup gate failed, safe to return to the
+ * authenticated caller: no error text, which could carry endpoint details.
+ */
+function startFailureReason(e: unknown): string {
+  if (e instanceof MissingPersonaTokenError) return "no_credential";
+  if (e instanceof UnauthorizedError) return "unauthorized";
+  if (e instanceof StateError) return `state_${e.status}`;
+  return "start_failed";
+}
+
+const UUIDV7 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** Compare secrets through fixed-length digests, without early exit. */
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [x, y] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const xa = new Uint8Array(x);
+  const ya = new Uint8Array(y);
+  let diff = 0;
+  for (let i = 0; i < xa.length; i++) diff |= (xa[i] ?? 0) ^ (ya[i] ?? 0);
+  return diff === 0;
+}
+
+/**
+ * Null when the caller may use a protected route. Waking creates or
+ * resumes a Durable Object that spends model and state calls, so it is
+ * never open on a public hostname.
+ */
+export async function wakeRefusal(
+  request: Request,
+  env: EnvLike,
+): Promise<Response | null> {
+  const token =
+    typeof env.SUMI_CORE_WAKE_TOKEN === "string"
+      ? env.SUMI_CORE_WAKE_TOKEN
+      : "";
+  if (!token) {
+    if (
+      env.SUMI_CORE_WAKE_OPEN === "loopback-dev" &&
+      LOOPBACK_HOSTS.has(new URL(request.url).hostname)
+    ) {
+      return null;
+    }
+    return Response.json({ error: "wake is not configured" }, { status: 503 });
+  }
+  const header = request.headers.get("Authorization") ?? "";
+  const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!presented || !(await sameSecret(presented, token))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return null;
+}
+
+/**
+ * Reachability of the state service along the same path the secretaries
+ * use (the SUMI_STATE binding when present). 503 when it cannot answer.
+ */
+async function stateHealth(env: EnvLike): Promise<Response> {
+  const started = Date.now();
+  const via = env.SUMI_STATE ? "binding" : "fetch";
+  const target = `${env.SUMI_STATE_URL.replace(/\/+$/, "")}/health`;
+  try {
+    const init = { signal: AbortSignal.timeout(5_000) };
+    const res = env.SUMI_STATE
+      ? await env.SUMI_STATE.fetch(target, init)
+      : await fetch(target, init);
+    await res.body?.cancel();
+    return Response.json(
+      { ok: res.ok, via, state_status: res.status, ms: Date.now() - started },
+      { status: res.ok ? 200 : 503 },
+    );
+  } catch (e) {
+    return Response.json(
+      {
+        ok: false,
+        via,
+        error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+        ms: Date.now() - started,
+      },
+      { status: 503 },
+    );
+  }
+}
+
+/** Worker entry: POST /personas/:id/{wake,check} reaches the persona's DO. */
 export default {
   async fetch(request: Request, env: EnvLike): Promise<Response> {
     const url = new URL(request.url);
-    const m = /^\/personas\/([^/]+)\/wake$/.exec(url.pathname);
+    const m = /^\/personas\/([^/]+)\/(wake|check)$/.exec(url.pathname);
     if (request.method === "POST" && m) {
+      const refused = await wakeRefusal(request, env);
+      if (refused) return refused;
       const persona = m[1];
-      if (!persona)
-        return Response.json({ error: "persona required" }, { status: 400 });
+      if (!persona || !UUIDV7.test(persona))
+        return Response.json(
+          { error: "persona must be a uuidv7" },
+          { status: 400 },
+        );
       const id = env.SECRETARY.idFromName(persona);
       return env.SECRETARY.get(id).fetch(request);
     }
     if (url.pathname === "/health") return Response.json({ ok: true });
+    if (request.method === "GET" && url.pathname === "/health/state") {
+      const refused = await wakeRefusal(request, env);
+      if (refused) return refused;
+      return stateHealth(env);
+    }
     return Response.json({ error: "not found" }, { status: 404 });
   },
 };

@@ -1555,7 +1555,7 @@ function stripNulDeep(v: unknown): unknown {
  */
 function isTransportError(e: unknown): boolean {
   if (!(e instanceof Error)) return true; // non-Error throw: cannot classify — treat as transient
-  if (e.name === "AbortError") return true;
+  if (e.name === "AbortError" || e.name === "TimeoutError") return true;
   return (
     e instanceof TypeError &&
     /fetch|network|terminated|socket|connect|ECONN|ENOTFOUND|EAI_AGAIN/i.test(

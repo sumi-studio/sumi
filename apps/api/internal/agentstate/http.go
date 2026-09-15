@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -34,9 +35,17 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 //     token for one persona can never authenticate for another, and nothing
 //     per-persona needs storing. The real multi-user binding (koseki identity
 //     → persona) lands with the auth-flow milestone; this proves the shape.
+//
+// A Cloud core host serves every persona from one Worker, so it holds an
+// optional third credential, the runtime token (SUMI_CORE_RUNTIME_TOKEN): it
+// authorizes the persona-scoped routes of any persona — exactly what holding
+// every persona token would — and none of the admin-only routes (persona
+// creation, human binding, approval decisions, transfers). The runtime that
+// parks a gated call can therefore never decide it.
 type Server struct {
 	store   *Store
 	secret  []byte
+	runtime []byte
 	maxBody int64
 	conns   *modelconnections.Store
 }
@@ -79,7 +88,24 @@ func (s *Server) authorized(r *http.Request, personaID string) bool {
 	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
 		return true
 	}
+	if len(s.runtime) > 0 && subtle.ConstantTimeCompare([]byte(token), s.runtime) == 1 {
+		return true
+	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(s.PersonaToken(personaID))) == 1
+}
+
+// SetRuntimeToken enables the runtime credential. It must be long and
+// distinct from the admin secret: equal values would silently grant the
+// runtime admin routes.
+func (s *Server) SetRuntimeToken(token string) error {
+	if len(token) < minRuntimeSecretLen {
+		return fmt.Errorf("%s must be at least %d characters", RuntimeTokenEnv, minRuntimeSecretLen)
+	}
+	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
+		return fmt.Errorf("%s must differ from the admin state token", RuntimeTokenEnv)
+	}
+	s.runtime = []byte(token)
+	return nil
 }
 
 func bearerToken(header string) (string, bool) {
