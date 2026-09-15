@@ -102,7 +102,7 @@ func TestMemberSoleStaleClaimMisroutesForeignDir(t *testing.T) {
 	if fino != want {
 		t.Skipf("inode reuse not observed after 4000 tries (want %s)", aino)
 	}
-	parked := parkUnderDeadIntent(t, s, dir, "forg", "f")
+	parkUnderDeadIntent(t, s, dir, "forg", "f")
 
 	authSettle(t, s)
 	authSettle(t, s)
@@ -110,11 +110,14 @@ func TestMemberSoleStaleClaimMisroutesForeignDir(t *testing.T) {
 	if st, err := os.Stat(dir + "/ws/aa"); err == nil && st.IsDir() {
 		_, row, _ := authRow(t, s, "aa")
 		t.Fatalf("DEFECT: unrecorded foreign dir installed at 'aa' on a "+
-			"stale FILE row's sole claim — row(aa)=%q records a dead file; "+
-			"parked=%v still there", row, fileExists(dir+"/ws/"+parked))
+			"stale FILE row's sole claim — row(aa)=%q records a dead file", row)
 	}
-	if !fileExists(dir + "/ws/" + parked) {
-		t.Fatal("foreign dir vanished entirely")
+	// The foreign dir is preserved — captured out of the dead namespace
+	// and surfaced at a visible name, never destroyed and never left
+	// hidden under a private name.
+	alive := scanDirForInode(dir, "ws", strconv.FormatUint(fino, 10))
+	if alive == "" || strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("foreign dir vanished or left hidden (alive=%q)", alive)
 	}
 }
 
@@ -162,22 +165,17 @@ func TestMemberAmbiguousClaimsParkForever(t *testing.T) {
 	if _, err := os.Stat(dir + "/ws/aa"); err == nil {
 		t.Fatalf("DEFECT: dir misrouted to stale claimant 'aa'")
 	}
+	// Ambiguous equal-strength claims: the recorded dir is neither
+	// installed on a guess nor destroyed — it is surfaced at a visible
+	// recovered name, enumerable and deletable, and never left hidden
+	// under a private name.
 	if fileExists(dir + "/ws/" + parked) {
-		if fileBirth(t, dir+"/ws/"+parked) == "" {
-			// No btime on this filesystem: the crafted equal-strength
-			// rows are genuinely indistinguishable — the recorded dir
-			// stays parked, preserved and enumerable, rather than
-			// installed on a guess. Documented residual; on JuiceFS the
-			// shape needs a crafted row since inodes are never reused.
-			t.Logf("RESIDUAL (no btime): equal-strength claims park the "+
-				"recorded dir at %s — preserved, not restored", parked)
-			return
-		}
-		t.Fatalf("RESIDUAL: recorded dir permanently parked — rows zz+aa "+
-			"are stable, so recAmbiguous never resolves; zz stays empty "+
-			"while row(zz)=%q still records it", zfp)
+		t.Fatalf("ambiguous dir left hidden at private name %s", parked)
 	}
-	t.Fatal("parked dir vanished")
+	if alive := scanDirForInode(dir, "ws", zino); alive == "" ||
+		strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("ambiguous recorded dir lost (ino %s): alive=%q", zino, alive)
+	}
 }
 
 // swapView wraps a ReconView: on the first MoveStaged whose destination
@@ -332,9 +330,7 @@ func TestMemberReachesOwnHomeStrict(t *testing.T) {
 	if _, _, err := s.Rename(ctx, "ws", "ddir/m", "mout",
 		IfVersion{Mode: "any"}, authProbe(root, "mout"), authProbe(root, "ddir/m"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.rename("ws", "ddir/m", "mout", false,
-				it.dstFP, it.preFP,
-				opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.rename("ws", "ddir/m", "mout", false, it)
 		}); err != nil {
 		t.Fatalf("rename ddir/m->mout: %v", err)
 	}

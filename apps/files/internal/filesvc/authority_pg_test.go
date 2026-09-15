@@ -13,6 +13,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,8 +34,7 @@ func authProbe(root *posixRoot, path string) FPProbe {
 
 func authWriteFn(root *posixRoot, path, content string) func(intent) (FileInfo, bool, error) {
 	return func(it intent) (FileInfo, bool, error) {
-		return root.atomicWrite("ws", path, []byte(content), false,
-			it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		return root.atomicWrite("ws", path, []byte(content), false, it)
 	}
 }
 
@@ -64,7 +64,7 @@ func (g *authGate) await(t *testing.T, what string) {
 type authView struct {
 	ReconView
 	onHash func(scope, path string)
-	onSwap func(scope, staged, name string)
+	onMove func(scope, from, to string)
 }
 
 func (v authView) Hash(scope, path string) (string, error) {
@@ -74,11 +74,11 @@ func (v authView) Hash(scope, path string) (string, error) {
 	return v.ReconView.Hash(scope, path)
 }
 
-func (v authView) SwapStaged(scope, staged, name string) error {
-	if v.onSwap != nil {
-		v.onSwap(scope, staged, name)
+func (v authView) MoveStaged(scope, from, to string) error {
+	if v.onMove != nil {
+		v.onMove(scope, from, to)
 	}
-	return v.ReconView.SwapStaged(scope, staged, name)
+	return v.ReconView.MoveStaged(scope, from, to)
 }
 
 func authPinned(root *posixRoot, wrap func(ReconView) ReconView) func(context.Context) (ReconView, error) {
@@ -324,7 +324,7 @@ func authUndoParkedTombstone(t *testing.T, s *Store, root *posixRoot, dir string
 		&it.op, &it.path, &it.version, &it.preFP, &it.dstFP, &it.expectSHA, &resolved); err != nil {
 		t.Fatalf("undo-parked intent: %v", err)
 	}
-	slot := opStagePrefix + strconv.FormatInt(it.id, 10)
+	slot := loadIntentName(t, s, it.id, 0)
 	if !resolved {
 		t.Fatal("undo-parked intent not tombstoned")
 	}
@@ -419,8 +419,8 @@ func TestAuthPGCrossOwnerVetoAfterScreen(t *testing.T) {
 
 	g := newAuthGate()
 	a.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
-		return authView{ReconView: v, onSwap: func(_, _, name string) {
-			if name == "a.txt" {
+		return authView{ReconView: v, onMove: func(_, from, _ string) {
+			if strings.HasPrefix(from, ".filesv-op-") || strings.Contains(from, "/.filesv-op-") {
 				g.hit()
 			}
 		}}
@@ -428,7 +428,7 @@ func TestAuthPGCrossOwnerVetoAfterScreen(t *testing.T) {
 	a.lastTombScan.Store(0)
 	aDone := make(chan struct{})
 	go func() { defer close(aDone); a.Reconcile(ctx) }()
-	g.await(t, "A about to swap a.txt into the slot")
+	g.await(t, "A about to move the parked object off its private name")
 
 	a.releaseWriter()
 	b := newPGStore(t, dsn, dir)
@@ -498,12 +498,15 @@ func TestAuthPGTimedOutSettlerOtherPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A delayed executor-side move parks O under a private name no
+	// intent journals — an orphan the sweep must surface, never delete.
 	if err := v.MoveStaged("ws", "s.txt", opStagePrefix+strconv.FormatInt(c.id, 10)+"-p-aa01"); err != nil {
 		t.Fatalf("delayed park move: %v", err)
 	}
 	v.Close()
 
 	s.lastTombScan.Store(0)
+	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
 	if scanDirFor(t, dir, "ws", []byte("T")) == "" {
 		t.Fatal("object observed by an in-flight settler was unlinked while its apply was pending")
@@ -517,7 +520,19 @@ func TestAuthPGTimedOutSettlerOtherPath(t *testing.T) {
 		return found && fp3(fp) == fp3(o.Fingerprint) && authSettlersDone(s)
 	})
 	authSettle(t, s)
-	authAssertRecovered(t, s, root, dir, "s.txt", "T", o)
+	// Accepted-semantics change: recovery never moves a public object
+	// back by fingerprint. O was orphaned under an unjournaled private
+	// name, so it surfaces visibly with a row+event people can
+	// read/delete; s.txt's recorded row may show divergence until the
+	// surfaced object is moved back by an ordinary operation.
+	surfaced := scanDirFor(t, dir, "ws", []byte("T"))
+	if surfaced == "" {
+		t.Fatal("O was destroyed")
+	}
+	if !durExists(t, dir, "ws/"+surfaced) || !strings.HasPrefix(surfaced, "recovered-o") &&
+		!strings.Contains(surfaced, ".recovered-o") {
+		t.Fatalf("O at %q — want a visible recovered-* surface name", surfaced)
+	}
 }
 
 // 177 as witnessed (CORRECTION-REVIEW TestW4PGPostVetoRowCommit), with
@@ -561,8 +576,7 @@ func TestAuthPGWitness177PostVetoRowCommit(t *testing.T) {
 		_, _, rerr := s.Rename(ctx, "ws", "q.txt", "r.txt",
 			IfVersion{Mode: "any"}, authProbe(root, "r.txt"), authProbe(root, "q.txt"),
 			func(it intent) (FileInfo, bool, error) {
-				return root.rename("ws", "q.txt", "r.txt", false,
-					it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+				return root.rename("ws", "q.txt", "r.txt", false, it)
 			})
 		renameDone <- rerr
 	}()
@@ -591,12 +605,15 @@ func TestAuthPGWitness177PostVetoRowCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Delayed executor-side move of O under an unjournaled private name
+	// in C's namespace — an orphan the sweep must preserve and surface.
 	if err := v.MoveStaged("ws", "r.txt", opStagePrefix+strconv.FormatInt(c.id, 10)+"-p-aa01"); err != nil {
 		t.Fatalf("delayed park move: %v", err)
 	}
 	v.Close()
 
 	s.lastTombScan.Store(0)
+	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
 	if scanDirFor(t, dir, "ws", []byte(content)) == "" {
 		t.Fatal("O unlinked while the rename's apply was pending (177)")
@@ -610,7 +627,20 @@ func TestAuthPGWitness177PostVetoRowCommit(t *testing.T) {
 		return found && fp3(fp) == fp3(o.Fingerprint) && authSettlersDone(s)
 	})
 	authSettle(t, s)
-	authAssertRecovered(t, s, root, dir, "r.txt", content, o)
+	// Accepted-semantics change: O is never moved back onto a public
+	// path by fingerprint. It surfaced at a recovered-* name; the row
+	// re-keyed onto where the object observably sits keeps the
+	// recorded version reachable and deletable.
+	surfaced := scanDirFor(t, dir, "ws", []byte(content))
+	if surfaced == "" {
+		t.Fatal("O was destroyed")
+	}
+	if !strings.HasPrefix(surfaced, "recovered-o") && !strings.Contains(surfaced, ".recovered-o") {
+		t.Fatalf("O at %q — want a visible recovered-* surface name", surfaced)
+	}
+	if _, _, found := authRow(t, s, surfaced); !found {
+		t.Fatalf("no row records the surfaced object at %q", surfaced)
+	}
 }
 
 // 176. A write intent whose bytes never landed is judged diverged once
@@ -729,9 +759,11 @@ func TestAuthPGDivergedApplyAfterSupersede(t *testing.T) {
 
 // Authorized discard still progresses on the real crash shape. A dead
 // write intent verified-exchanged its bytes onto a.txt — displacing the
-// unrecorded executor object it declared — and died before discarding
-// it. The pass rolls the intent forward (apply removes the intent row
-// with its event) and, with that proof, deletes the displaced object.
+// unrecorded executor object it declared — and died after the exchange
+// result was journaled but before discarding it. The pass rolls the
+// intent forward (apply removes the intent row with its event) and,
+// with bound-oid proof that the slot holds the declared displaced
+// object, deletes it.
 func TestAuthPGRollForwardDiscardsDisplaced(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -749,23 +781,27 @@ func TestAuthPGRollForwardDiscardsDisplaced(t *testing.T) {
 	if err := os.WriteFile(dir+"/ws/a.txt", []byte("O0"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	fp0 := durFP(t, root, "ws", "a.txt")
-	x := intent{owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
-		version: authMint(t, s), preFP: fp0, dstFP: fp0, expectSHA: sha("v1"),
-		at: time.Now().Add(-time.Hour)}
-	x.id = insertIntent(t, s, x)
-	slot := opStagePrefix + strconv.FormatInt(x.id, 10)
-	if err := os.WriteFile(dir+"/ws/"+slot, []byte("v1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	v, err := root.pin(false)
+	pre, err := root.stat("ws", "a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.SwapStaged("ws", slot, "a.txt"); err != nil {
-		t.Fatalf("verified exchange: %v", err)
+	x := intent{owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: authMint(t, s), preFP: pre.Fingerprint, dstFP: pre.Fingerprint,
+		expectSHA: sha("v1"), at: time.Now().Add(-time.Hour)}
+	x.id = insertIntent(t, s, x)
+	slot := opStagePrefix + "o" + strconv.FormatInt(x.id, 10) + "-a0-t"
+	// The post-exchange crash state: the object declared at a.txt sits
+	// at the private name (moved, keeping its identity), and the
+	// write's authored bytes occupy a.txt.
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot); err != nil {
+		t.Fatal(err)
 	}
-	v.Close()
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	authExec(t, s, `UPDATE file_op SET dst_oid=$2, dst_sha=$3, names=$4::jsonb WHERE id=$1`,
+		x.id, pre.Oid, sha("O0"),
+		mustJSON([]nameRec{{Name: slot, Act: "xch", Src: "a.txt", Res: "ok"}}))
 
 	s.Reconcile(ctx)
 	if got, _ := authReadOpt(dir, "ws/a.txt"); got != "v1" {
@@ -778,6 +814,15 @@ func TestAuthPGRollForwardDiscardsDisplaced(t *testing.T) {
 		t.Fatalf("intent rows left: %d", n)
 	}
 	if where := scanDirFor(t, dir, "ws", []byte("O0")); where != "" {
+		if pre.Oid == "" {
+			// Unbound identity on this filesystem: the displaced object
+			// must be preserved visibly, never discarded on weak
+			// evidence.
+			if !strings.Contains(where, "recovered-o") {
+				t.Fatalf("unbound displaced object at %q — want a recovered-* surface", where)
+			}
+			return
+		}
 		t.Fatalf("authorized displaced object still parked at %q", where)
 	}
 }

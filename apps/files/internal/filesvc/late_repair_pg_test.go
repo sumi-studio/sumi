@@ -15,13 +15,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // lateRepairView wraps the pass-pinned production view with a hook that
@@ -41,17 +39,17 @@ func (v lateRepairView) Hash(scope, path string) (string, error) {
 	return h, err
 }
 
-// 186/W1: a rename that commits while a captured foreign object cannot be
-// restored (RENAME_NOREPLACE lost to a second racer) previously returned
-// success, applied, and deleted the intent row — leaving the recorded
-// object at a staging name no pass ever enumerates again.
+// 186/W1 — under the owned-names protocol the displaced object goes
+// straight to the journaled private name (stage-then-exchange); it can
+// never sit on a public path. A racer's object landing at the vacated
+// source name mid-rename is an ordinary external occupant — recovery
+// never moves it — while the displaced D is proven by bound identity and
+// discarded only when the committed op was authorized to displace it.
 //
-// The racers are executor-side renames at the real fault points — the
-// same positions a delayed FUSE syscall or an out-of-band move occupies.
-// Required: the commit is journaled AND the intent is retained as a
-// tombstone so the parked object keeps an enumerator; a later pass
-// restores the recorded object to its recorded home and a fresh write
-// succeeds.
+// The racer is an executor-side rename at the real fault point — the
+// same position a delayed FUSE syscall or an out-of-band move occupies.
+// Required: the commit is journaled, the journaled slot keeps its
+// enumerator, and a fresh write succeeds after finite interference.
 func TestLateRepairRenameCommitParkedRecordedObject(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -68,7 +66,7 @@ func TestLateRepairRenameCommitParkedRecordedObject(t *testing.T) {
 	}
 	// Acknowledged objects: S at old.txt (rename source), D at new.txt
 	// (declared displaced destination), R at rec.txt (the recorded
-	// object captured mid-race).
+	// object a racer lands at the vacated source name).
 	for _, w := range [][2]string{
 		{"old.txt", "S"}, {"new.txt", "D"}, {"rec.txt", "R"},
 	} {
@@ -80,78 +78,52 @@ func TestLateRepairRenameCommitParkedRecordedObject(t *testing.T) {
 	}
 	fpR := durFP(t, root, "ws", "rec.txt")
 
-	var id int64
 	root.faultHook = func(tag string) {
-		switch tag {
-		case "rename.postVerify":
-			// Between the post-exchange verify and the capture, a racer
-			// lands the RECORDED rec.txt object at the source name (D
-			// survives at dkeep.txt so its fate is not in question).
-			if err := os.Link(dir+"/ws/old.txt", dir+"/ws/dkeep.txt"); err != nil {
-				panic(err)
-			}
-			if err := os.Rename(dir+"/ws/rec.txt", dir+"/ws/old.txt"); err != nil {
-				panic(err)
-			}
-		case "rename.preRestore":
-			// A second racer re-occupies the source name before the
-			// restore — RENAME_NOREPLACE fails EEXIST; the captured R
-			// stays parked at the staging slot.
-			if err := os.WriteFile(dir+"/ws/old.txt", []byte("Q2"), 0o644); err != nil {
-				panic(err)
-			}
+		if tag != "rename.postVerify" {
+			return
+		}
+		// Between the source capture and the exchange, a racer lands
+		// the RECORDED rec.txt object at the vacated source name.
+		if err := os.Rename(dir+"/ws/rec.txt", dir+"/ws/old.txt"); err != nil {
+			panic(err)
 		}
 	}
 	_, _, rerr := s.Rename(ctx, "ws", "old.txt", "new.txt",
 		IfVersion{Mode: "any"}, authProbe(root, "new.txt"), authProbe(root, "old.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			id = it.id
-			return root.rename("ws", "old.txt", "new.txt", false,
-				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.rename("ws", "old.txt", "new.txt", false, it)
 		})
 	root.faultHook = nil
-	// The commit stands but the parked undo must be reported — the
-	// caller sees the interference, never a silent half-settled success.
-	if rerr == nil || !errors.Is(rerr, ErrExternalChange) {
-		t.Fatalf("rename with a parked undo = %v, want external_change", rerr)
+	if rerr != nil {
+		t.Fatalf("clean rename = %v", rerr)
 	}
-	slot := opStagePrefix + strconv.FormatInt(id, 10)
-	if got, parked := authReadOpt(dir, "ws/"+slot); !parked || got != "R" {
-		t.Fatalf("expected R parked at %s, got %q (present=%v)", slot, got, parked)
-	}
-	// The intent must be retained as a tombstone: deleting its row would
-	// orphan the staged namespace (no pass enumerates a removed intent's
-	// names).
-	if n := intentCount(t, s); n != 1 {
-		t.Fatalf("intent rows = %d, want 1 retained tombstone", n)
-	}
-	var resolved bool
-	if err := s.pool.QueryRow(ctx,
-		`SELECT resolved_at IS NOT NULL FROM file_op WHERE id=$1`, id).Scan(&resolved); err != nil {
-		t.Fatal(err)
-	}
-	if !resolved {
-		t.Fatal("committed+parked intent must be tombstoned, not left pending")
-	}
-	// The rename commit itself is journaled: new.txt's row records S's
-	// object.
+	// The rename commit is journaled: new.txt's row records S's object.
 	liveNew := durFP(t, root, "ws", "new.txt")
 	if _, fp, found := authRow(t, s, "new.txt"); !found || fp3(fp) != fp3(liveNew) {
 		t.Fatalf("row(new.txt) = %q found=%v, live %s — committed rename not journaled", fp, found, liveNew)
 	}
+	// R is an ordinary occupant of the vacated source name — it is
+	// never moved by recovery and never confused with the displaced D.
+	if got, ok := authReadOpt(dir, "ws/old.txt"); !ok || got != "R" {
+		t.Fatalf("external occupant at source name disturbed: old.txt=%q present=%v", got, ok)
+	}
+	// D was authorized for displacement and is gone.
+	if where := scanDirFor(t, dir, "ws", []byte("D")); where != "" {
+		t.Fatalf("displaced object outlived its authorized discard: %q", where)
+	}
 
 	authSettle(t, s)
 
-	// Required: recorded content back at its recorded home, row intact.
-	if got, ok := authReadOpt(dir, "ws/rec.txt"); !ok || got != "R" {
+	// The external move stands — R stays at old.txt; its recorded row
+	// remains at rec.txt, honestly diverged until the object is moved
+	// back by an ordinary operation.
+	if got, ok := authReadOpt(dir, "ws/old.txt"); !ok || got != "R" {
 		where := scanDirFor(t, dir, "ws", []byte("R"))
-		_, fp, found := authRow(t, s, "rec.txt")
-		t.Fatalf("recorded object not restored to its home: rec.txt=%q "+
-			"(present=%v), R bytes at %q, row(rec.txt)=%q found=%v",
-			got, ok, where, fp, found)
+		t.Fatalf("recorded object at old.txt disturbed by recovery: "+
+			"old.txt=%q present=%v, R bytes at %q", got, ok, where)
 	}
 	if _, fp, found := authRow(t, s, "rec.txt"); !found || fp3(fp) != fp3(fpR) {
-		t.Fatalf("row(rec.txt) = %q found=%v, want %s", fp, found, fpR)
+		t.Fatalf("row(rec.txt) = %q found=%v, want recorded %s", fp, found, fpR)
 	}
 	// And a fresh operation proceeds after finite interference.
 	if _, _, err := s.WithWrite(ctx, "ws", "rec.txt", "write",
@@ -208,17 +180,20 @@ func TestLateRepairParkedRecordedObjectOrphaned(t *testing.T) {
 	s.Reconcile(ctx)
 	authSettle(t, s)
 
-	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "L-content" {
-		where := scanDirFor(t, dir, "ws", []byte("L-content"))
-		_, fp, found := authRow(t, s, "h.txt")
-		t.Fatalf("recorded content not restored to its home: h.txt=%q, "+
-			"recorded bytes found at hidden name %q, row(h.txt)=%q found=%v "+
-			"(intent rows left: %d)", got, where, fp, found, intentCount(t, s))
+	// The squatter's public home is never disturbed — recovery does not
+	// evict a live occupant. The recorded object surfaces at a visible
+	// recovered sibling instead of evicting it.
+	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "squatter" {
+		t.Fatalf("public squatter evicted: h.txt=%q", got)
 	}
-	// The squatter is foreign content — parked at an enumerable staged
-	// name, never destroyed.
-	if where := scanDirFor(t, dir, "ws", []byte("squatter")); where == "" {
-		t.Fatal("squatter bytes destroyed — foreign content must be preserved")
+	where := scanDirFor(t, dir, "ws", []byte("L-content"))
+	if where == "" {
+		_, fp, found := authRow(t, s, "h.txt")
+		t.Fatalf("recorded content destroyed: h.txt row=%q found=%v "+
+			"(intent rows left: %d)", fp, found, intentCount(t, s))
+	}
+	if strings.Contains(where, opStagePrefix) {
+		t.Fatalf("recorded content still parked at a private name %q — must surface visibly", where)
 	}
 }
 
@@ -377,9 +352,10 @@ func TestLateRepairParkedRecordedUnderRemoveIntent(t *testing.T) {
 	}
 }
 
-// 186: an orphan at a SEALED (-q-) name holds recorded content while a
-// squatter occupies the home. The sealed object cannot receive the
-// squatter — the sweep drains through a fresh enumerable -p- name.
+// An orphan at a sealed (-q-) name holds recorded content while a
+// squatter occupies the home. The occupant of a public name always
+// wins — the recorded object surfaces at a visible sibling rather than
+// evicting the squatter.
 func TestLateRepairOrphanSealedRecordedRestored(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -409,21 +385,22 @@ func TestLateRepairOrphanSealedRecordedRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 	authSettle(t, s)
-	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "sealed-R" {
-		where := scanDirFor(t, dir, "ws", []byte("sealed-R"))
-		t.Fatalf("sealed orphan not restored: h.txt=%q, recorded bytes at %q", got, where)
+	// The squatter's public home is never disturbed.
+	if got, _ := authReadOpt(dir, "ws/h.txt"); got != "squatter" {
+		t.Fatalf("public squatter evicted: h.txt=%q", got)
 	}
-	if where := scanDirFor(t, dir, "ws", []byte("squatter")); where == "" {
-		t.Fatal("squatter bytes destroyed by the drain — must be parked")
+	if where := scanDirFor(t, dir, "ws", []byte("sealed-R")); where == "" ||
+		strings.Contains(where, opStagePrefix) {
+		t.Fatalf("sealed orphan not surfaced visibly: recorded bytes at %q", where)
 	}
 	if durExists(t, dir, "ws/"+sealed) {
-		t.Fatal("sealed name still occupied after the drain")
+		t.Fatal("sealed name still occupied after the settle")
 	}
 }
 
-// 186: unknown unrecorded bytes at a dead namespace are preserved —
-// recovery prioritizes acknowledged content but never collects foreign
-// objects it cannot attribute.
+// Unknown unrecorded bytes at a dead namespace are preserved and
+// surfaced at a visible recovered name — recovery never collects
+// foreign objects it cannot attribute, and never leaves them hidden.
 func TestLateRepairUnrecordedOrphanPreserved(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -448,8 +425,9 @@ func TestLateRepairUnrecordedOrphanPreserved(t *testing.T) {
 	}
 	authSettle(t, s)
 	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/"+garbage); !ok || got != "unknown-bytes" {
-		t.Fatalf("unrecorded orphan = %q present=%v — unknown bytes must be preserved", got, ok)
+	if where := scanDirFor(t, dir, "ws", []byte("unknown-bytes")); where == "" ||
+		strings.Contains(where, opStagePrefix) {
+		t.Fatalf("unrecorded orphan at %q — unknown bytes must be surfaced visibly, preserved", where)
 	}
 	if got, _ := authReadOpt(dir, "ws/k.txt"); got != "K" {
 		t.Fatalf("k.txt = %q — sweep disturbed a healthy file", got)
@@ -946,6 +924,7 @@ func TestLateRepairCommitParkedJournalsIdentity(t *testing.T) {
 		t.Fatalf("write OLD: %v", err)
 	}
 	var id int64
+	var slot string
 	root.faultHook = func(tag string) {
 		if tag != "write.preSlotDelete" {
 			return
@@ -956,7 +935,6 @@ func TestLateRepairCommitParkedJournalsIdentity(t *testing.T) {
 		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
 			panic(err)
 		}
-		slot := opStagePrefix + strconv.FormatInt(id, 10)
 		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
 			panic(err)
 		}
@@ -965,8 +943,8 @@ func TestLateRepairCommitParkedJournalsIdentity(t *testing.T) {
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
 			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			slot = it.stageBase()
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 	if werr == nil || !errors.Is(werr, ErrExternalChange) {
@@ -1020,7 +998,7 @@ func TestLateRepairCommitParkedForeignPreserved(t *testing.T) {
 		authWriteFn(root, "f.txt", "OLD")); err != nil {
 		t.Fatalf("write OLD: %v", err)
 	}
-	var id int64
+	var slot string
 	root.faultHook = func(tag string) {
 		if tag != "write.preSlotDelete" {
 			return
@@ -1028,7 +1006,6 @@ func TestLateRepairCommitParkedForeignPreserved(t *testing.T) {
 		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
 			panic(err)
 		}
-		slot := opStagePrefix + strconv.FormatInt(id, 10)
 		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
 			panic(err)
 		}
@@ -1036,9 +1013,8 @@ func TestLateRepairCommitParkedForeignPreserved(t *testing.T) {
 	_, _, werr := s.WithWrite(ctx, "ws", "f.txt", "write",
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			slot = it.stageBase()
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 	if werr == nil || !errors.Is(werr, ErrExternalChange) {
@@ -1098,8 +1074,9 @@ func TestLateRepairRenameSealConflictJournalsIdentity(t *testing.T) {
 		}
 	}
 	var id int64
+	var slot string
 	root.faultHook = func(tag string) {
-		if tag != "rename.preQuarantine" {
+		if tag != "rename.preSlotDelete" {
 			return
 		}
 		// Foreign bytes claim the captured slot between the identity
@@ -1108,7 +1085,6 @@ func TestLateRepairRenameSealConflictJournalsIdentity(t *testing.T) {
 		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-Q"), 0o644); err != nil {
 			panic(err)
 		}
-		slot := opStagePrefix + strconv.FormatInt(id, 10)
 		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
 			panic(err)
 		}
@@ -1117,8 +1093,8 @@ func TestLateRepairRenameSealConflictJournalsIdentity(t *testing.T) {
 		IfVersion{Mode: "any"}, authProbe(root, "new.txt"), authProbe(root, "old.txt"),
 		func(it intent) (FileInfo, bool, error) {
 			id = it.id
-			return root.rename("ws", "old.txt", "new.txt", false,
-				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			slot = it.stageBase()
+			return root.rename("ws", "old.txt", "new.txt", false, it)
 		})
 	root.faultHook = nil
 	if rerr == nil || !errors.Is(rerr, ErrExternalChange) {
@@ -1176,7 +1152,7 @@ func TestLateRepairCommitParkedUnverifiedIdentity(t *testing.T) {
 		authWriteFn(root, "f.txt", "OLD")); err != nil {
 		t.Fatalf("write OLD: %v", err)
 	}
-	var id int64
+	var slot string
 	root.faultHook = func(tag string) {
 		if tag != "write.preSlotDelete" {
 			return
@@ -1184,7 +1160,6 @@ func TestLateRepairCommitParkedUnverifiedIdentity(t *testing.T) {
 		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
 			panic(err)
 		}
-		slot := opStagePrefix + strconv.FormatInt(id, 10)
 		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
 			panic(err)
 		}
@@ -1197,9 +1172,8 @@ func TestLateRepairCommitParkedUnverifiedIdentity(t *testing.T) {
 	_, _, werr := s.WithWrite(ctx, "ws", "f.txt", "write",
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			slot = it.stageBase()
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 	if werr == nil || !errors.Is(werr, ErrExternalChange) {
@@ -1305,6 +1279,46 @@ func TestLateRepairOrphanDeepSweepRestores(t *testing.T) {
 	}
 }
 
+// scanDirForFile walks the scope tree looking for a directory entry
+// named name — used to assert an unrecorded member survived inside a
+// surfaced container regardless of which name holds it.
+func scanDirForFile(t *testing.T, dir, scope, name string) string {
+	t.Helper()
+	var found string
+	var walk func(d string)
+	walk = func(d string) {
+		if found != "" {
+			return
+		}
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return
+		}
+		for _, en := range ents {
+			if found != "" {
+				return
+			}
+			p := d + "/" + en.Name()
+			if en.Name() == name {
+				found = p
+				return
+			}
+			if en.IsDir() {
+				walk(p)
+			}
+		}
+	}
+	walk(filepath.Join(dir, scope))
+	if found == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(filepath.Join(dir, scope), found)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rel
+}
+
 // 196 — a parked OBJECT that is itself a directory: the container is
 // unrecorded (auto-created parents carry no version row), so its own
 // fingerprint proves nothing about its contents. The sweep must descend
@@ -1360,13 +1374,17 @@ func TestLateRepairOrphanedDirRestoresRecordedMembers(t *testing.T) {
 	if got, ok := authReadOpt(dir, "ws/dirO/sub/g.txt"); !ok || got != "NESTED" {
 		t.Fatalf("nested recorded member not restored: dirO/sub/g.txt=%q present=%v", got, ok)
 	}
-	// Unrecorded residue stays inside the parked container — preserved,
-	// never installed at public names under the sweep's authority.
-	if got, ok := authReadOpt(dir, "ws/"+parked+"/extra.bin"); !ok || got != "EXTRA" {
-		t.Fatalf("unrecorded member inside parked dir destroyed or displaced: %q present=%v", got, ok)
+	// Unrecorded residue rides the container to its visible surfaced
+	// name — preserved, never installed at the recorded member's names.
+	if got, ok := authReadOpt(dir, "ws/"+parked+"/extra.bin"); ok && got == "EXTRA" {
+		t.Fatal("container left hidden at its private name")
 	}
 	if _, ok := authReadOpt(dir, "ws/dirO/extra.bin"); ok {
-		t.Fatal("unrecorded member was installed at a public name by the sweep")
+		t.Fatal("unrecorded member was installed at a public recorded name")
+	}
+	if where := scanDirForFile(t, dir, "ws", "extra.bin"); where == "" ||
+		strings.Contains(where, opStagePrefix) {
+		t.Fatalf("unrecorded member destroyed or hidden: extra.bin at %q", where)
 	}
 }
 
@@ -1589,28 +1607,29 @@ func TestLateRepairSweepKeyCrossDevice(t *testing.T) {
 // cycleView fabricates a directory that lists a member reporting the
 // parent's own dev:ino — a genuine revisit (bind alias / cyclic name
 // chain). The loop guard must deduplicate it: one listing of the cycle
-// dir per pass, and the fabricated member is never descended.
+// dir per pass, and the fabricated member is never descended. The fake
+// keys on a "/x" path suffix so it follows the parked container when the
+// reconciler surfaces it under a public name mid-test.
 type cycleView struct {
 	ReconView
-	cycle string
 	id    string
 	calls map[string]int
 }
 
 func (v cycleView) ListStaged(scope, dir, prefix string) ([]string, error) {
-	v.calls[dir]++
-	if dir == v.cycle {
+	if strings.HasSuffix(dir, "/x") {
+		v.calls[dir]++
 		return []string{"self"}, nil
 	}
 	return v.ReconView.ListStaged(scope, dir, prefix)
 }
 
 func (v cycleView) Stat(scope, path string) (FileInfo, error) {
-	if path == v.cycle+"/self" {
+	if strings.HasSuffix(path, "/x/self") {
 		return FileInfo{Kind: "dir", Fingerprint: "9:0:0:0", DevIno: v.id}, nil
 	}
 	st, err := v.ReconView.Stat(scope, path)
-	if err == nil && path == v.cycle {
+	if err == nil && strings.HasSuffix(path, "/x") {
 		st.DevIno = v.id
 	}
 	return st, err
@@ -1644,18 +1663,24 @@ func TestLateRepairSweepKeyAliasDedup(t *testing.T) {
 		t.Fatal(err)
 	}
 	authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
-	cv := cycleView{cycle: parked + "/x", id: "9:9", calls: map[string]int{}}
+	cv := cycleView{id: "9:9", calls: map[string]int{}}
 	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
 		cv.ReconView = v
 		return cv
 	}))
 	authSettle(t, s) // 3 passes — the seen set is per-pass
-	if cv.calls[parked+"/x"] != 3 {
-		t.Fatalf("cycle dir listed %d times over 3 passes, want 3", cv.calls[parked+"/x"])
+	// The container may move to a surfaced public name after pass 1, so
+	// the cycle dir is listed under different paths across passes — but
+	// exactly once per pass, and the fabricated revisit never descends.
+	listed := 0
+	for d, n := range cv.calls {
+		if strings.HasSuffix(d, "/x/self") {
+			t.Fatalf("revisited object reprocessed: %q listed %d times", d, n)
+		}
+		listed += n
 	}
-	if cv.calls[parked+"/x/self"] != 0 {
-		t.Fatalf("revisited object reprocessed: self listed %d times",
-			cv.calls[parked+"/x/self"])
+	if listed != 3 {
+		t.Fatalf("cycle dir listed %d times over 3 passes, want 3", listed)
 	}
 }
 
@@ -1743,29 +1768,28 @@ func TestLateRepairCorrDirAmbiguousThenResolves(t *testing.T) {
 	}
 	_, dfp, _ := authRow(t, s, "zHome")
 	dIno, _, _, _ := fpParts(dfp)
-	var zbirth string
+	// Ghost row: a leftover claiming the same object identity. Both rows
+	// are seeded to equal strength — the ghost carries the object's own
+	// bound oid where the filesystem provides one, so neither durable
+	// identity nor the inode leg separates them. Equal strength is
+	// injected, not assumed: real inode reuse cannot produce two rows
+	// bound to one object.
+	var zoid string
 	{
 		dctx, cancel := s.dbCtx(ctx)
 		if err := s.pool.QueryRow(dctx,
-			`SELECT birth FROM file_version WHERE scope='ws' AND path='zHome'`).Scan(&zbirth); err != nil {
+			`SELECT oid FROM file_version WHERE scope='ws' AND path='zHome'`).Scan(&zoid); err != nil {
 			cancel()
 			t.Fatal(err)
 		}
 		cancel()
 	}
-	// Ghost row: a recycled-inode leftover claiming the same inode leg.
-	// Both rows are seeded to equal strength — diverged generation legs
-	// (fp3 differs from the live object) plus the recorded birth, so
-	// neither generation evidence nor birth separates them. Equal
-	// strength is injected, not assumed: JuiceFS does not churn dir
-	// mtime on member changes and never reuses inodes, so the shape
-	// only arises through crafted rows there.
 	authExec(t, s,
 		`UPDATE file_version SET fp=$1 WHERE scope='ws' AND path='zHome'`,
 		dIno+":8:8:8")
 	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha, birth)
-		 VALUES ('ws','aGhost',$1,$2,'',$3)`, authMint(t, s), dIno+":9:9:9", zbirth)
+		`INSERT INTO file_version (scope, path, version, fp, content_sha, oid)
+		 VALUES ('ws','aGhost',$1,$2,'dir',$3)`, authMint(t, s), dIno+":9:9:9", zoid)
 	parked := opStagePrefix + "555555-p-amb" // intent id never existed
 	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
 		t.Fatal(err)
@@ -1773,38 +1797,30 @@ func TestLateRepairCorrDirAmbiguousThenResolves(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// Ambiguous: the dir must be preserved at its parked name and NOT
-	// installed at either claimant's path.
+	// Ambiguous: the dir must be preserved and NOT installed at either
+	// claimant's path — ambiguity surfaces visibly, never guesses.
 	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
 		t.Fatal("ambiguous dir installed at ghost home aGhost")
 	}
 	if _, serr := root.lstat("ws", "zHome"); serr == nil {
 		t.Fatal("ambiguous dir installed at zHome on inode leg alone")
 	}
-	if alive := scanDirForInode(dir, "ws", dIno); alive == "" {
-		t.Fatalf("ambiguous recorded dir LOST (ino %s): neither home nor parked", dIno)
+	alive := scanDirForInode(dir, "ws", dIno)
+	if alive == "" || strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("ambiguous recorded dir LOST or hidden (ino %s): alive=%q", dIno, alive)
 	}
-	// Evidence resolves when the ghost row is removed — the remaining
-	// single claimant routes the object home where birth evidence
-	// exists. On a btime-less filesystem an empty dir's sole surviving
-	// inode-leg claim has no corroborating member, so it stays safely
-	// parked — preserved, never installed on a bare guess (documented
-	// residual).
+	// Once surfaced the object has an ordinary row at its visible name —
+	// removing the ghost row does not re-route it (public paths are
+	// never re-judged on row evidence).
 	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='aGhost'`)
 	authSettle(t, s)
 	authSettle(t, s)
-	st, serr := root.lstat("ws", "zHome")
-	if serr != nil {
-		if zbirth == "" {
-			if alive := scanDirForInode(dir, "ws", dIno); alive == "" {
-				t.Fatalf("recorded dir LOST after ambiguity resolved (ino %s)", dIno)
-			}
-			return // no-btime residual: sole ino-leg claim parks, preserved
-		}
-		t.Fatalf("recorded dir not restored after ambiguity resolved: %v", serr)
+	if _, serr := root.lstat("ws", "aGhost"); serr == nil {
+		t.Fatal("dir installed at aGhost after ambiguity resolved")
 	}
-	if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
-		t.Fatalf("zHome holds ino %s, want %s", ino, dIno)
+	if alive := scanDirForInode(dir, "ws", dIno); alive == "" ||
+		strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("recorded dir lost after ambiguity resolved (ino %s)", dIno)
 	}
 }
 
@@ -1967,227 +1983,22 @@ func TestLateRepairCorrFileCrossDevOccupant(t *testing.T) {
 	if err := os.WriteFile(dir+"/ws/homeF", []byte("IMPOSTOR"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	vf := authPinned(root, func(v ReconView) ReconView {
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
 		return sweepIDView{ReconView: v,
 			fp: map[string]string{"homeF": ffp},
 			id: map[string]string{"homeF": "7777:" + fIno}}
-	})
-	view, err := vf(ctx)
-	if err != nil {
-		t.Fatal(err)
+	}))
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
+	// The occupant is a live public object: identical fingerprints or
+	// not, recovery never evicts it — the recorded file surfaces at a
+	// visible sibling instead.
+	if got, ok := authReadOpt(dir, "ws/homeF"); !ok || got != "IMPOSTOR" {
+		t.Fatalf("fp-identical cross-dev occupant evicted: homeF=%q present=%v", got, ok)
 	}
-	defer view.Close()
-	s.reconcileOne(ctx, it, view, false)
-	if got, ok := authReadOpt(dir, "ws/homeF"); !ok || got != "HF" {
-		t.Fatalf("recorded file not restored over fp-identical cross-dev occupant: "+
-			"homeF=%q present=%v", got, ok)
-	}
-	if where := scanDirFor(t, dir, "ws", []byte("IMPOSTOR")); where == "" {
-		t.Fatal("foreign occupant destroyed — must be parked aside, never erased")
-	}
-}
-
-// fakeRows is a pgx.Rows test double: a scripted row set whose Scan can
-// fail mid-iteration and whose Err can report an interrupted read after
-// Next() exhausts — the two ways a partial claimant result used to
-// masquerade as the complete authority set.
-type fakeRows struct {
-	vals      [][]string
-	pos       int
-	scanErrAt int // 1-based row index whose Scan fails; 0 = never
-	scanErr   error
-	termErr   error // returned by Err() once iteration ends
-	closed    bool
-}
-
-func (f *fakeRows) Close() { f.closed = true }
-func (f *fakeRows) Err() error {
-	if f.pos >= len(f.vals) {
-		return f.termErr
-	}
-	return nil
-}
-func (f *fakeRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
-func (f *fakeRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
-func (f *fakeRows) Conn() *pgx.Conn                              { return nil }
-func (f *fakeRows) Values() ([]any, error)                       { return nil, errors.New("unimplemented") }
-func (f *fakeRows) RawValues() [][]byte                          { return nil }
-func (f *fakeRows) Next() bool {
-	if f.pos >= len(f.vals) {
-		return false
-	}
-	f.pos++
-	return true
-}
-func (f *fakeRows) Scan(dest ...any) error {
-	if f.scanErrAt == f.pos {
-		return f.scanErr
-	}
-	row := f.vals[f.pos-1]
-	*(dest[0].(*string)) = row[0]
-	*(dest[1].(*string)) = row[1]
-	if len(row) > 2 {
-		*(dest[2].(*string)) = row[2]
-	}
-	return nil
-}
-
-// An interrupted claimant read must never be treated as the complete
-// authority set: a Scan failure mid-iteration and a rows error after
-// the last row are both propagated, not swallowed — a one-row partial
-// read is not a single authoritative claimant.
-func TestLateRepairCollectClaimsPropagatesErrors(t *testing.T) {
-	good := [][]string{{"aHome", "1:2:3:4"}, {"bHome", "5:6:7:8"}}
-	claims, err := collectClaims(&fakeRows{vals: good})
-	if err != nil || len(claims) != 2 || claims[0].path != "aHome" {
-		t.Fatalf("clean read: claims=%v err=%v", claims, err)
-	}
-	_, err = collectClaims(&fakeRows{
-		vals: good, scanErrAt: 2, scanErr: errors.New("decode boom")})
-	if err == nil {
-		t.Fatal("mid-iteration Scan error swallowed — partial claim set returned as authority")
-	}
-	_, err = collectClaims(&fakeRows{
-		vals: [][]string{{"aHome", "1:2:3:4"}}, termErr: errors.New("conn lost")})
-	if err == nil {
-		t.Fatal("rows.Err after partial iteration swallowed — partial claim set returned as authority")
-	}
-}
-
-// Ranking: multiple exact-fingerprint claimants plus one weaker fp3-only
-// claimant must resolve (or stay ambiguous) among the exact rows alone —
-// the weaker triple row must never win merely because it is the single
-// triple. Two exact claims with no separating evidence are ambiguous.
-func TestLateRepairExactRowsOutrankTriple(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	s := newPGStore(t, dsn, dir)
-	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
-		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
-		func(it intent) (FileInfo, bool, error) {
-			return root.mkdir("ws", "zHome")
-		}); err != nil {
-		t.Fatalf("mkdir zHome: %v", err)
-	}
-	_, dfp, _ := authRow(t, s, "zHome")
-	ino, sz, mt, _ := fpParts(dfp)
-	// A second EXACT claimant and a weaker fp3-only claimant. The
-	// parked object's live fp equals the exact rows (a found object can
-	// carry its recorded fingerprint before any rename bumps ctime).
-	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha)
-		 VALUES ('ws','bGhost',$1,$2,'')`, authMint(t, s), dfp)
-	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha)
-		 VALUES ('ws','aTriple',$1,$2,'')`, authMint(t, s),
-		ino+":"+sz+":"+mt+":999")
-	view, verr := authPinned(root, nil)(ctx)
-	if verr != nil {
-		t.Fatal(verr)
-	}
-	defer view.Close()
-	st := FileInfo{Kind: "dir", Fingerprint: dfp}
-	home, claim, rerr := s.recordedAtObject(ctx, "ws", "ws/parked", st, view)
-	if rerr != nil {
-		t.Fatalf("claim query: %v", rerr)
-	}
-	if claim != recAmbiguous {
-		t.Fatalf("claim=%v home=%q — weaker triple or unresolved exact row selected", claim, home)
-	}
-	// Remove one exact row: the single remaining exact claimant wins;
-	// the weaker triple is still never consulted.
-	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='bGhost'`)
-	home, claim, rerr = s.recordedAtObject(ctx, "ws", "ws/parked", st, view)
-	if rerr != nil || claim != recFound || home != "zHome" {
-		t.Fatalf("single exact claimant must win: claim=%v home=%q err=%v", claim, home, rerr)
-	}
-}
-
-// Same ordering on the sweep path with realistic fingerprints: a parked
-// dir's live fp3 (ino:size:mtime — ctime always differs post-rename)
-// matches two triple claimants; a bare inode-leg row is weaker still and
-// must never be consulted while triple claims exist.
-func TestLateRepairTripleRowsOutrankInoLeg(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	s := newPGStore(t, dsn, dir)
-	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.WithWrite(ctx, "ws", "zHome", "mkdir",
-		IfVersion{Mode: "any"}, "dir", authProbe(root, "zHome"),
-		func(it intent) (FileInfo, bool, error) {
-			return root.mkdir("ws", "zHome")
-		}); err != nil {
-		t.Fatalf("mkdir zHome: %v", err)
-	}
-	_, dfp, _ := authRow(t, s, "zHome")
-	ino, sz, mt, _ := fpParts(dfp)
-	parked := opStagePrefix + "777777-p-rk"
-	if err := os.Rename(dir+"/ws/zHome", dir+"/ws/"+parked); err != nil {
-		t.Fatal(err)
-	}
-	// Second strongest-tier claimant: same ino:size:mtime and the same
-	// recorded birth — indistinguishable from the real row's evidence.
-	// (A birthless or ino-only ghost now loses outright — the durable
-	// identity tier resolves it without ambiguity.)
-	var zbirth string
-	{
-		dctx, cancel := s.dbCtx(ctx)
-		if err := s.pool.QueryRow(dctx,
-			`SELECT birth FROM file_version WHERE scope='ws' AND path='zHome'`).Scan(&zbirth); err != nil {
-			cancel()
-			t.Fatal(err)
-		}
-		cancel()
-	}
-	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha, birth)
-		 VALUES ('ws','bGhost',$1,$2,'',$3)`, authMint(t, s),
-		ino+":"+sz+":"+mt+":888", zbirth)
-	// Weaker inode-leg-only claimant — its fp3 cannot match and it has
-	// no birth leg.
-	authExec(t, s,
-		`INSERT INTO file_version (scope, path, version, fp, content_sha)
-		 VALUES ('ws','aWeak',$1,$2,'')`, authMint(t, s), ino+":0:0:0")
-	s.SetReconcileView(authPinned(root, nil))
-	authSettle(t, s)
-	authSettle(t, s)
-	for _, p := range []string{"aWeak", "bGhost", "zHome"} {
-		if _, serr := root.lstat("ws", p); serr == nil {
-			t.Fatalf("dir installed at %s with unresolved strongest-tier claimants", p)
-		}
-	}
-	if alive := scanDirForInode(dir, "ws", ino); alive == "" {
-		t.Fatalf("recorded dir lost (ino %s)", ino)
-	}
-	authExec(t, s, `DELETE FROM file_version WHERE scope='ws' AND path='bGhost'`)
-	authSettle(t, s)
-	authSettle(t, s)
-	if _, serr := root.lstat("ws", "aWeak"); serr == nil {
-		t.Fatal("weaker inode-leg claimant won over a stronger claimant")
-	}
-	st, serr := root.lstat("ws", "zHome")
-	if serr != nil {
-		t.Fatalf("dir not restored to remaining strongest home: %v", serr)
-	}
-	if got, _, _, _ := fpParts(st.Fingerprint); got != ino {
-		t.Fatalf("zHome holds ino %s, want %s", got, ino)
+	if where := scanDirFor(t, dir, "ws", []byte("HF")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded file destroyed or left private: %q", where)
 	}
 }
 
@@ -2270,10 +2081,10 @@ func TestLateRepairMemberExternalHomeAndUnknownRides(t *testing.T) {
 }
 
 // Member home occupied by foreign unrecorded bytes: the member's row
-// says out/m, and out/m holds newer foreign content no row records. The
-// recorded member wins its name (the row's subject is proven: the
-// occupant matches no row evidence); the occupant is swapped to a
-// parked enumerable name — never erased, and no row is rewritten.
+// says out/m, and out/m holds newer foreign content no row records. A
+// public occupant is never evicted on row evidence — the member rides
+// its container home to ddir/m, preserved with its row diverging
+// honestly, and the foreign occupant keeps its name untouched.
 func TestLateRepairMemberHomeOccupiedPreservesBoth(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -2319,25 +2130,27 @@ func TestLateRepairMemberHomeOccupiedPreservesBoth(t *testing.T) {
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
-	// The member's own row claims out/m — the recorded object wins the
-	// name; the foreign occupant is swapped into the member's old slot
-	// and rides the container to ddir/m — preserved, never erased.
-	if got, ok := authReadOpt(dir, "ws/out/m"); !ok || got != "OLD" {
-		t.Fatalf("member not installed at its recorded home: out/m=%q present=%v", got, ok)
+	// The foreign occupant's public name is never disturbed on row
+	// evidence — out/m keeps NEWER. The recorded member cannot be
+	// installed over it, so it rides the restored container to ddir/m:
+	// preserved, readable, and honestly diverged from its out/m row.
+	if got, ok := authReadOpt(dir, "ws/out/m"); !ok || got != "NEWER" {
+		t.Fatalf("foreign occupant evicted by row evidence: out/m=%q present=%v", got, ok)
 	}
-	if got, ok := authReadOpt(dir, "ws/ddir/m"); !ok || got != "NEWER" {
-		where := scanDirFor(t, dir, "ws", []byte("NEWER"))
-		t.Fatalf("foreign occupant destroyed: ddir/m=%q present=%v, NEWER at %q",
+	if got, ok := authReadOpt(dir, "ws/ddir/m"); !ok || got != "OLD" {
+		where := scanDirFor(t, dir, "ws", []byte("OLD"))
+		t.Fatalf("recorded member lost: ddir/m=%q present=%v, OLD at %q",
 			got, ok, where)
 	}
-	// The row is coherent because the object moved to its home, and the
-	// occupant's bytes survive at a parked enumerable name.
+	// The out/m row still records the member object — diverged from the
+	// live occupant, which reads report as external_change.
 	if _, fp, found := authRow(t, s, "out/m"); !found {
 		t.Fatal("member row vanished")
 	} else {
 		live, lerr := root.lstat("ws", "out/m")
-		if lerr != nil || fp3(live.Fingerprint) != fp3(fp) {
-			t.Fatalf("member row not coherent with live object: row fp=%q err=%v", fp, lerr)
+		if lerr != nil || fp3(live.Fingerprint) == fp3(fp) {
+			t.Fatalf("member row falsely coherent with foreign occupant: "+
+				"row fp=%q err=%v — divergence must stay visible", fp, lerr)
 		}
 	}
 }
@@ -2450,15 +2263,21 @@ func TestLateRepairSoleStaleFileRowCannotClaimDir(t *testing.T) {
 	if st, serr := root.lstat("ws", "aa"); serr == nil && st.Kind == "dir" {
 		t.Fatal("foreign dir installed at 'aa' on a stale file row's sole ino claim")
 	}
-	if _, serr := root.lstat("ws", parked); serr != nil {
-		t.Fatal("foreign dir vanished — must stay parked and enumerable")
+	// The unclaimable foreign object is surfaced visibly — preserved and
+	// enumerable, never installed on a stale row's word and never left
+	// hidden under a private name.
+	if alive := scanDirForInode(dir, "ws", fino); alive == "" ||
+		strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("foreign dir vanished or hidden (ino %s): alive=%q", fino, alive)
 	}
 }
 
-// Sole stale DIR row variant: kind-matched but the only evidence is the
-// bare inode leg — a stale row from inode reuse is indistinguishable
-// without stronger evidence, so the claim must be ambiguous (preserve),
-// never an install on a single unverified leg.
+// Sole stale DIR row variant: kind-matched, ino-leg-rewritten — a stale
+// row from inode reuse. Where the filesystem binds durable object
+// identity the row's recorded oid contradicts the live object and the
+// claim is rejected outright; on unbound filesystems the ino leg is the
+// only evidence a real parked recorded dir can offer, so a sole claim
+// may restore — never delete.
 func TestLateRepairSoleStaleDirRowInoOnlyIsAmbiguous(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -2493,8 +2312,22 @@ func TestLateRepairSoleStaleDirRowInoOnlyIsAmbiguous(t *testing.T) {
 		t.Fatal(serr)
 	}
 	fino, _, _, _ := fpParts(st0.Fingerprint)
+	// Rewrite only the fp leg: the row's bound oid still records the
+	// DEAD object — where identity binds, that is affirmative
+	// contradiction and the claim dies; where it does not bind, the
+	// bare ino leg is indistinguishable from a real recorded dir's.
+	var aoid string
+	{
+		dctx, cancel := s.dbCtx(ctx)
+		if err := s.pool.QueryRow(dctx,
+			`SELECT oid FROM file_version WHERE scope='ws' AND path='aa'`).Scan(&aoid); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
+	}
 	authExec(t, s,
-		`UPDATE file_version SET fp=$1, birth='' WHERE scope='ws' AND path='aa'`,
+		`UPDATE file_version SET fp=$1 WHERE scope='ws' AND path='aa'`,
 		fino+":1:1:1")
 	parked := opStagePrefix + "323232-p-mw"
 	if err := os.Rename(dir+"/ws/forg", dir+"/ws/"+parked); err != nil {
@@ -2502,26 +2335,17 @@ func TestLateRepairSoleStaleDirRowInoOnlyIsAmbiguous(t *testing.T) {
 	}
 	authSettle(t, s)
 	authSettle(t, s)
-	if st, serr := root.lstat("ws", "aa"); serr == nil && st.Kind == "dir" {
-		t.Fatal("foreign dir installed at 'aa' on a sole ino-leg-only claim")
+	if aoid != "" {
+		// Bound-oid contradiction rejected the claim: the foreign dir
+		// surfaces visibly, never at the stale row's path, never hidden.
+		if st, serr := root.lstat("ws", "aa"); serr == nil && st.Kind == "dir" {
+			t.Fatal("foreign dir installed at 'aa' over a contradicting bound oid")
+		}
 	}
-	if _, serr := root.lstat("ws", parked); serr != nil {
-		t.Fatal("foreign dir vanished — ambiguous claims preserve")
+	if alive := scanDirForInode(dir, "ws", fino); alive == "" ||
+		strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("foreign dir vanished or hidden (ino %s): alive=%q", fino, alive)
 	}
-}
-
-// --- Birth/placement-journal witnesses (member-recovery follow-up) ---
-
-// fileBirth reads the object's statx btime the way the production
-// stat path does; empty when the test filesystem cannot report it.
-func fileBirth(t *testing.T, path string) string {
-	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	return birthAt(f)
 }
 
 // Ordinary external rename must NOT be undone. A person moving a→b on
@@ -2647,143 +2471,6 @@ func TestLateRepairPlacedThenUserMovedNotReverted(t *testing.T) {
 	}
 }
 
-// A stale placement journal must not authorize moving a different
-// object: journal says fp_X sat at b, b actually holds fp_Y — the row
-// is pruned and Y preserved.
-func TestLateRepairStalePlacementJournalPruned(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
-	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.WithWrite(ctx, "ws", "a.txt", "write",
-		IfVersion{Mode: "any"}, sha("A"), authProbe(root, "a.txt"),
-		authWriteFn(root, "a.txt", "A")); err != nil {
-		t.Fatalf("write a.txt: %v", err)
-	}
-	// External move a→b; craft a journal entry for b naming a DIFFERENT
-	// (dead) object — a residue row left by an older placement.
-	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/b.txt"); err != nil {
-		t.Fatal(err)
-	}
-	authExec(t, s,
-		`INSERT INTO recovery_place (scope, path, fp) VALUES ('ws','b.txt','424242:1:1:1')`)
-	authSettle(t, s)
-	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/b.txt"); !ok || got != "A" {
-		t.Fatalf("stale journal authorized a move: ws/b.txt=%q ok=%v", got, ok)
-	}
-	var n int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM recovery_place WHERE scope='ws' AND path='b.txt'`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatal("stale placement journal not pruned")
-	}
-}
-
-// A journaled recovery misplacement IS repaired: seed the journal the
-// way a real recovery move leaves it (object fp at the landed path),
-// park the object's row at a different home — the sweep reroutes.
-func TestLateRepairJournaledResidueRerouted(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
-	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.WithWrite(ctx, "ws", "a.txt", "write",
-		IfVersion{Mode: "any"}, sha("A"), authProbe(root, "a.txt"),
-		authWriteFn(root, "a.txt", "A")); err != nil {
-		t.Fatalf("write a.txt: %v", err)
-	}
-	_, afp, _ := authRow(t, s, "a.txt")
-	// Recovery residue: O sits at public b.txt, journaled as placed.
-	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/b.txt"); err != nil {
-		t.Fatal(err)
-	}
-	birth := fileBirth(t, dir+"/ws/b.txt")
-	authExec(t, s,
-		`INSERT INTO recovery_place (scope, path, fp, birth) VALUES ('ws','b.txt',$1,$2)`,
-		afp, birth)
-	// The object's row now names home.txt (a row correction) — the
-	// journaled residue at b.txt may be reversed to reach it.
-	authExec(t, s,
-		`UPDATE file_version SET path='home.txt' WHERE scope='ws' AND path='a.txt'`)
-	authSettle(t, s)
-	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/home.txt"); !ok || got != "A" {
-		t.Fatalf("journaled residue not repaired: home.txt=%q ok=%v", got, ok)
-	}
-	if fileExists(dir + "/ws/b.txt") {
-		t.Fatal("repaired residue left at b.txt")
-	}
-}
-
-// Overlap with a legitimate in-flight Sumi write: a journaled residue
-// is NOT rerouted while a settler of this scope may still be committing
-// row writes — moving the object out from under a live apply is itself
-// interference. Once the writer clears, the next pass repairs normally.
-func TestLateRepairJournaledResidueDefersToLiveWriter(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
-	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := s.WithWrite(ctx, "ws", "a.txt", "write",
-		IfVersion{Mode: "any"}, sha("A"), authProbe(root, "a.txt"),
-		authWriteFn(root, "a.txt", "A")); err != nil {
-		t.Fatalf("write a.txt: %v", err)
-	}
-	_, afp, _ := authRow(t, s, "a.txt")
-	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/b.txt"); err != nil {
-		t.Fatal(err)
-	}
-	birth := fileBirth(t, dir+"/ws/b.txt")
-	authExec(t, s,
-		`INSERT INTO recovery_place (scope, path, fp, birth) VALUES ('ws','b.txt',$1,$2)`,
-		afp, birth)
-	authExec(t, s,
-		`UPDATE file_version SET path='home.txt' WHERE scope='ws' AND path='a.txt'`)
-	// A live settler of this scope — a Sumi write whose fs goroutine is
-	// still applying — must defer the reroute.
-	s.inflight.Store(int64(424242), "ws")
-	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/b.txt"); !ok || got != "A" {
-		t.Fatalf("residue moved under a live writer: b.txt=%q ok=%v", got, ok)
-	}
-	s.inflight.Delete(int64(424242))
-	authSettle(t, s)
-	authSettle(t, s)
-	if got, ok := authReadOpt(dir, "ws/home.txt"); !ok || got != "A" {
-		t.Fatalf("journaled residue not repaired after writer settled: home.txt=%q ok=%v", got, ok)
-	}
-}
-
 // flakyStatView returns err for path the first N stat calls, then the
 // real result — an unreadable-during-judgment candidate.
 type flakyStatView struct {
@@ -2835,8 +2522,8 @@ func TestLateRepairUnreadableCandidateNotElected(t *testing.T) {
 	// (occupied by foreign dir F). m's row claims blkH/m.txt — member
 	// corroboration for blkH only.
 	authExec(t, s,
-		`INSERT INTO file_version (scope,path,version,fp,updated,content_sha,birth)
-		 VALUES ('ws','openH',$1,$2,now(),'dir',''),('ws','blkH',$1,$2,now(),'dir','')`,
+		`INSERT INTO file_version (scope,path,version,fp,updated,content_sha)
+		 VALUES ('ws','openH',$1,$2,now(),'dir'),('ws','blkH',$1,$2,now(),'dir')`,
 		authMint(t, s), pino+":0:0:0")
 	authExec(t, s,
 		`UPDATE file_version SET path='blkH/m.txt' WHERE scope='ws' AND path='dd/m.txt'`)
@@ -2868,202 +2555,34 @@ func TestLateRepairUnreadableCandidateNotElected(t *testing.T) {
 	fv := flakyStatView{ReconView: pv, path: "blkH",
 		err: ErrUnavailable, left: &left}
 	// Claim-level discrimination: with blkH unverifiable at judgment
-	// time, member corroboration may only consider openH — which no
-	// member corroborates — so the result must be ambiguous. Electing
-	// blkH here is the defect.
-	home, claim, derr := s.recordedAtObject(ctx, "ws", parked, pst, fv)
-	if derr != nil {
-		t.Fatal(derr)
+	// time it is not a homeless path — the only electable claimant is
+	// openH, which is verifiably absent. Electing blkH is the defect.
+	home, free, found := s.recordedHome(ctx, intent{scope: "ws"}, fv, pst, parked)
+	if found && home == "blkH" {
+		t.Fatal("unverifiable candidate elected — blkH was never proven absent")
 	}
-	if claim == recFound && home == "blkH" {
-		t.Fatal("unverifiable candidate elected on member inference")
+	if !found || !free || home != "openH" {
+		t.Fatalf("verifiable absent claimant not elected: home=%q free=%v found=%v", home, free, found)
 	}
-	if claim != recAmbiguous {
-		t.Fatalf("want recAmbiguous, got claim=%v home=%q", claim, home)
-	}
-	// End-state: the foreign occupant at blkH survives every pass.
+	// End-state: the foreign occupant at blkH survives every pass; the
+	// recorded member is extracted to ITS recorded home (blkH/m.txt,
+	// verifiably absent — NOREPLACE can never evict the foreign dir's
+	// contents), and the container lands at openH.
 	s.SetReconcileView(authPinned(root, nil))
 	authSettle(t, s)
 	authSettle(t, s)
 	if got, ok := authReadOpt(dir, "ws/blkH/foreign.txt"); !ok || got != "F" {
 		t.Fatalf("foreign dir evicted via unverifiable candidate: %q ok=%v", got, ok)
 	}
-	if _, serr := root.lstat("ws", parked); serr != nil {
-		t.Fatal("parked dir vanished — ambiguous claims must preserve")
+	if got, ok := authReadOpt(dir, "ws/blkH/m.txt"); !ok || got != "M" {
+		t.Fatalf("recorded member not at its recorded home: blkH/m.txt=%q ok=%v",
+			got, ok)
 	}
-}
-
-// A stale row whose fp3 coincides with a live dir but whose persisted
-// birth names a DIFFERENT creation event is affirmative evidence the
-// row recorded another object — not a weak claim to fall back on.
-// Birth contradiction must remove the claim entirely: no tier may
-// resurrect it. (ino leg equal, fp3 equal, birth different — the
-// fingerprint is stale, not the row's authority.)
-func TestLateRepairBirthContradictionDropsClaim(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
-	if err := os.MkdirAll(dir+"/ws/dd", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(dir+"/ws/dd/m.txt", []byte("M"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	st, serr := root.lstat("ws", "dd")
+	st2, serr := root.lstat("ws", "openH")
 	if serr != nil {
-		t.Fatal(serr)
+		t.Fatalf("container not restored to openH: %v", serr)
 	}
-	pbirth := fileBirth(t, dir+"/ws/dd")
-	if pbirth == "" {
-		t.Skip("test filesystem does not report btime")
-	}
-	ino, size, mt, _ := fpParts(st.Fingerprint)
-	// fp3-equal stale claim on a DIFFERENT birth — a row left by a
-	// since-deleted object that once held this inode.
-	authExec(t, s,
-		`INSERT INTO file_version (scope,path,version,fp,updated,content_sha,birth)
-		 VALUES ('ws','aa',$1,$2,now(),'dir','1:1')`,
-		authMint(t, s), ino+":"+size+":"+mt+":9")
-	parked := parkUnderDeadIntent(t, s, dir, "dd", "b")
-	authSettle(t, s)
-	authSettle(t, s)
-	if st2, serr := root.lstat("ws", "aa"); serr == nil && st2.Kind == "dir" {
-		t.Fatal("birth-contradicting stale row claimed the live dir")
-	}
-	if _, serr := root.lstat("ws", parked); serr != nil {
-		t.Fatal("contradicted claims must leave the object preserved, not erase it")
-	}
-}
-
-// Symmetric positive case: one ino-leg claimant whose birth matches
-// outranks any number of contradicting or bare claimants — the dir
-// recovers to the row that actually recorded it.
-func TestLateRepairBirthMatchResolves(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
-	if err := os.MkdirAll(dir+"/ws/dd", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	st, serr := root.lstat("ws", "dd")
-	if serr != nil {
-		t.Fatal(serr)
-	}
-	pbirth := fileBirth(t, dir+"/ws/dd")
-	if pbirth == "" {
-		t.Skip("test filesystem does not report btime")
-	}
-	ino, _, _, _ := fpParts(st.Fingerprint)
-	// a: ino leg + contradicting birth — dropped outright.
-	// b: ino leg + matching birth — durable identity claim.
-	authExec(t, s,
-		`INSERT INTO file_version (scope,path,version,fp,updated,content_sha,birth)
-		 VALUES ('ws','aa',$1,$2,now(),'dir','1:1'),
-		        ('ws','bb',$1,$2,now(),'dir',$3)`,
-		authMint(t, s), ino+":0:0:0", pbirth)
-	parked := parkUnderDeadIntent(t, s, dir, "dd", "b")
-	authSettle(t, s)
-	authSettle(t, s)
-	if st2, serr := root.lstat("ws", "bb"); serr != nil || st2.Kind != "dir" {
-		t.Fatalf("birth-claimed home not restored: err=%v", serr)
-	}
-	if fileExists(dir + "/ws/aa") {
-		t.Fatal("contradicting claimant received the object")
-	}
-	if _, serr := root.lstat("ws", parked); serr == nil {
-		t.Fatal("dir still parked after a durable-identity claim resolved")
-	}
-}
-
-// selfCycleView injects a cyclic directory alias: every path beneath
-// dir+"/self" resolves to the same dir object (dev:ino), the shape a
-// bind-mounted self-alias creates. dirMemberCorroborates recurses into
-// dir members' own claim evaluation — the seen set must bound it.
-type selfCycleView struct {
-	ReconView
-	dir    string
-	id     string
-	fp     string
-	depth  *int
-	maxObs *int
-}
-
-func (v selfCycleView) ListStaged(scope, d, prefix string) ([]string, error) {
-	if strings.HasPrefix(d, v.dir+"/self") {
-		return []string{"self"}, nil // the cycle: each alias lists itself
-	}
-	names, err := v.ReconView.ListStaged(scope, d, prefix)
-	if err == nil && d == v.dir {
-		names = append(names, "self")
-	}
-	return names, err
-}
-
-func (v selfCycleView) Stat(scope, p string) (FileInfo, error) {
-	if strings.HasPrefix(p, v.dir+"/self") {
-		*v.depth++
-		if *v.depth > *v.maxObs {
-			*v.maxObs = *v.depth
-		}
-		return FileInfo{Kind: "dir", Fingerprint: v.fp, DevIno: v.id}, nil
-	}
-	return v.ReconView.Stat(scope, p)
-}
-
-// Corroboration recursion must terminate on a cyclic container: a dir
-// whose members include an alias of itself. Without the visited set
-// each alias level re-enters recordedAtObject → dirMemberCorroborates
-// forever.
-func TestLateRepairCorroborationCycleTerminates(t *testing.T) {
-	dsn := pgDSN(t)
-	resetTables(t, dsn)
-	dir := t.TempDir()
-	root, err := newRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := newPGStore(t, dsn, dir)
-	if err := os.MkdirAll(dir+"/ws/dd", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	st, serr := root.lstat("ws", "dd")
-	if serr != nil {
-		t.Fatal(serr)
-	}
-	ino, _, _, _ := fpParts(st.Fingerprint)
-	// Sole weak claimant — forces the corroboration walk.
-	authExec(t, s,
-		`INSERT INTO file_version (scope,path,version,fp,updated,content_sha)
-		 VALUES ('ws','hh',$1,$2,now(),'dir')`,
-		authMint(t, s), ino+":0:0:0")
-	parked := parkUnderDeadIntent(t, s, dir, "dd", "c")
-	dst, _ := root.lstat("ws", parked)
-	depth, maxObs := 0, 0
-	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
-		return selfCycleView{ReconView: v, dir: parked,
-			id: dst.DevIno, fp: dst.Fingerprint, depth: &depth, maxObs: &maxObs}
-	}))
-	authSettle(t, s)
-	authSettle(t, s)
-	// Unbounded recursion would drive alias stats to the hundreds; the
-	// seen bound keeps the whole corroboration walk to one expansion
-	// per object identity.
-	if maxObs > 20 {
-		t.Fatalf("corroboration recursion unbounded: %d alias stats", maxObs)
-	}
-	if _, serr := root.lstat("ws", parked); serr != nil {
-		t.Fatal("cyclic dir vanished — ambiguous claim must preserve")
+	if ino, _, _, _ := fpParts(st2.Fingerprint); ino != pino {
+		t.Fatalf("openH holds ino %s, want %s", ino, pino)
 	}
 }

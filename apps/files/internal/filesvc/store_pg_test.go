@@ -37,7 +37,7 @@ func resetTables(t *testing.T, dsn string) {
 	}
 	defer conn.Close(context.Background())
 	_, err = conn.Exec(context.Background(),
-		`TRUNCATE file_version, file_event, file_op, recovery_place;
+		`TRUNCATE file_version, file_event, file_op;
 		 DELETE FROM store_meta;
 		 SELECT setval('file_version_seq', 1, false)`)
 	// Tables may not exist before first migrate — that's fine, the
@@ -55,7 +55,7 @@ func resetTables(t *testing.T, dsn string) {
 		}
 		defer conn.Close(context.Background())
 		if _, err := conn.Exec(context.Background(),
-			`TRUNCATE file_version, file_event, file_op, recovery_place;
+			`TRUNCATE file_version, file_event, file_op;
 			 DELETE FROM store_meta;
 			 SELECT setval('file_version_seq', 1, false)`); err != nil {
 			t.Fatalf("reset: %v", err)
@@ -213,14 +213,28 @@ func insertIntent(t *testing.T, s *Store, it intent) int64 {
 	defer cancel()
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, names, at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
 		s.rootID, it.owner, it.scope, it.op, it.path, it.toPath,
-		it.version, it.preFP, it.dstFP, it.expectSHA, it.srcKind, it.at).Scan(&id)
+		it.version, it.preFP, it.dstFP, it.expectSHA, it.srcKind,
+		it.preOid, it.dstOid, it.dstSHA, mustJSON(it.names), it.at).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert intent: %v", err)
 	}
 	return id
+}
+
+// loadIntentName returns the journaled private name names[i] of an
+// intent row — tests use it to find the slot a live declare generated.
+func loadIntentName(t *testing.T, s *Store, id int64, i int) string {
+	t.Helper()
+	var name string
+	err := s.pool.QueryRow(context.Background(),
+		fmt.Sprintf(`SELECT names->%d->>'name' FROM file_op WHERE id=$1`, i), id).Scan(&name)
+	if err != nil {
+		t.Fatalf("load names[%d] of intent %d: %v", i, id, err)
+	}
+	return name
 }
 
 func intentCount(t *testing.T, s *Store) int {
@@ -1503,8 +1517,7 @@ func TestPGApplyUntilSettledForeignOwner(t *testing.T) {
 // declare-time evidence — exactly what its paused goroutine does on
 // resume.
 func staleWriteEffect(p *posixRoot, it intent, body string) (bool, error) {
-	_, committed, err := p.atomicWrite(it.scope, it.path, []byte(body), false,
-		it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+	_, committed, err := p.atomicWrite(it.scope, it.path, []byte(body), false, it)
 	return committed, err
 }
 
@@ -1536,8 +1549,7 @@ func TestPGStaleWritePreservesSuccessor(t *testing.T) {
 			IfVersion{Mode: "any"}, hex.EncodeToString(sum[:]),
 			probeOf(root, "ws", "a.txt"),
 			func(it intent) (FileInfo, bool, error) {
-				return root.atomicWrite("ws", "a.txt", []byte(content), false,
-					it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+				return root.atomicWrite("ws", "a.txt", []byte(content), false, it)
 			})
 		if err != nil {
 			t.Fatalf("write %q: %v", content, err)
@@ -1597,10 +1609,12 @@ func TestPGStaleWritePreservesSuccessor(t *testing.T) {
 }
 
 // The same sequence, but the retired process dies BETWEEN the exchange
-// and the verdict: the name holds its stale bytes and the displaced
-// acknowledged object sits parked at the intent's staging slot. The
-// reconciler must finish the undo — restore the acknowledged object to
-// its name and discard only the stale op's own bytes.
+// and the verdict.
+// A dead write whose authored bytes reached the path (lost reply)
+// commits by disk verdict; the displaced occupant it captured is not
+// provably the declared displaced object (the journaled dst_fp does not
+// match) — it is preserved at a visible sibling, never destroyed and
+// never moved over the occupant.
 func TestPGReconcileCompletesDeadUndo(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -1615,8 +1629,9 @@ func TestPGReconcileCompletesDeadUndo(t *testing.T) {
 	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Acknowledged successor content at the path; the stale effect
-	// already exchanged: name = stale bytes, staged = displaced object.
+	// The dead op's own content at the path; the displaced object sits
+	// at a private name its journal does not own (a dead pre-journal
+	// protocol's residue — the sweep adopts it).
 	if err := os.WriteFile(dir+"/ws/a.txt", []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1630,18 +1645,25 @@ func TestPGReconcileCompletesDeadUndo(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "new" {
-		t.Fatalf("a.txt = %q — dead op's undo not completed", got)
+	// The write's authored bytes are at the path: the effect landed and
+	// the intent commits. The private name must be drained.
+	if got := durRead(t, dir, "ws/a.txt"); got != "stale" {
+		t.Fatalf("a.txt = %q — landed write not committed by disk verdict", got)
 	}
 	if durExists(t, dir, "ws/"+opStagePrefix+strconv.FormatInt(id, 10)) {
-		t.Fatal("stale staged bytes not discarded")
+		t.Fatal("private name not settled")
+	}
+	// The displaced object was never proven ours to destroy — it is
+	// preserved at a visible name where people can read and delete it.
+	if where := scanDirFor(t, dir, "ws", []byte("new")); where == "" {
+		t.Fatal("displaced successor content destroyed — must be preserved visibly")
 	}
 }
 
-// A parked recovery object that IS the recorded content for an occupied
-// name is swapped back onto it — the squatter is preserved at the slot,
-// never unlinked. This is the row-fp rule: file_version.fp is the
-// acknowledged fingerprint; ctime ordering is not consulted.
+// A parked object that IS recorded content meets an occupied home: the
+// squatter is a live public object and is never evicted — the recorded
+// object surfaces at a visible sibling name with a readable row, and
+// the squatter's bytes are never touched.
 func TestPGReconcileRestoresRecordedOverSquatter(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -1666,8 +1688,7 @@ func TestPGReconcileRestoresRecordedOverSquatter(t *testing.T) {
 	_, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false, it)
 		})
 	if err != nil {
 		t.Fatalf("write v1: %v", err)
@@ -1687,18 +1708,22 @@ func TestPGReconcileRestoresRecordedOverSquatter(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
-		t.Fatalf("a.txt = %q — recorded content not restored over squatter", got)
+	// The squatter is a live public object: recovery never moves it.
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
+		t.Fatalf("a.txt = %q — foreign occupant must not be evicted", got)
 	}
-	if got := durRead(t, dir, "ws/"+opStagePrefix+strconv.FormatInt(id, 10)); got != "squatter" {
-		t.Fatalf("squatter = %q — foreign object must be preserved parked", got)
+	// The recorded object surfaces at a visible sibling, preserved and
+	// readable — never deleted, never moved over the occupant.
+	if where := scanDirFor(t, dir, "ws", []byte("v1")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded content lost or left private: %q", where)
 	}
 }
 
-// A sealed (-q-) quarantine object holding the recorded row content must
-// restore onto an occupied name WITHOUT anything ever writing into the
-// sealed name: drainSealed parks the squatter at the unsealed base slot
-// and moves the sealed object out. Through real Reconcile + real
+// A sealed (-q-) name holding recorded content must be drained WITHOUT
+// anything ever writing into the sealed name: recovery captures the
+// object into a fresh unsealed name and surfaces it visibly — the
+// squatter keeps the occupied home. Through real Reconcile + real
 // file_version rows — not a DB-free branch.
 func TestPGReconcileDrainsSealedObject(t *testing.T) {
 	dsn := pgDSN(t)
@@ -1724,8 +1749,7 @@ func TestPGReconcileDrainsSealedObject(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false, it)
 		}); err != nil {
 		t.Fatalf("write v1: %v", err)
 	}
@@ -1744,32 +1768,35 @@ func TestPGReconcileDrainsSealedObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
-		t.Fatalf("a.txt = %q — sealed recorded object not drained onto the name", got)
+	// The squatter keeps its public name — never evicted, never moved.
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
+		t.Fatalf("a.txt = %q — foreign occupant must not be evicted", got)
 	}
 	if durExists(t, dir, "ws/"+qrel) {
 		t.Fatal("sealed name still occupied after the drain")
 	}
-	// The squatter was preserved — parked at a fresh enumerable -p- name.
-	slot := opStagePrefix + strconv.FormatInt(id, 10)
-	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
-		t.Fatalf("squatter = %q at -p- name — foreign bytes must be preserved", got)
+	// The recorded object was moved OUT of the sealed name and surfaced
+	// at a visible name where it stays readable.
+	if where := scanDirFor(t, dir, "ws", []byte("v1")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("sealed recorded object lost or left private: %q", where)
 	}
-	// A second pass settles the squatter decision; nothing is deleted
-	// without identity proof.
+	// Convergence: a second pass changes nothing and deletes nothing.
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
 		t.Fatalf("a.txt = %q after second pass", got)
 	}
-	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
-		t.Fatalf("squatter lost after second pass: %q", got)
+	if where := scanDirFor(t, dir, "ws", []byte("v1")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded object lost after second pass: %q", where)
 	}
 }
 
-// The fixed base slot occupied by an unattributable foreign object must
-// NOT stall the drain forever: drainSealed parks the squatter at a fresh
-// -p- name each pass, so the recorded sealed object still reaches its
-// name and every foreign object stays preserved and enumerable.
+// A private base slot occupied by an unattributable foreign object must
+// NOT stall the drain forever: every occupied private name is captured
+// and surfaced independently, so the recorded sealed object and the
+// foreign base occupant each reach a visible name — none is destroyed
+// or left stranded.
 func TestPGReconcileDrainsSealedBaseSlotOccupied(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -1793,8 +1820,7 @@ func TestPGReconcileDrainsSealedBaseSlotOccupied(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false, it)
 		}); err != nil {
 		t.Fatalf("write v1: %v", err)
 	}
@@ -1817,44 +1843,51 @@ func TestPGReconcileDrainsSealedBaseSlotOccupied(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
-		t.Fatalf("a.txt = %q — occupied base slot must not stall the drain", got)
+	// The squatter keeps its public name — never evicted.
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
+		t.Fatalf("a.txt = %q — foreign occupant must not be evicted", got)
 	}
 	if durExists(t, dir, "ws/"+qrel) {
 		t.Fatal("sealed name still occupied after the drain")
 	}
-	// Every foreign object survives: the base occupant untouched at the
-	// slot, the squatter parked at a fresh -p- name.
-	if got := durRead(t, dir, "ws/"+slot); got != "base-occupant" {
-		t.Fatalf("base occupant = %q — must be preserved", got)
+	if durExists(t, dir, "ws/"+slot) {
+		t.Fatal("base slot still occupied after the drain")
 	}
-	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
-		t.Fatalf("squatter = %q at -p- name — must be preserved", got)
+	// Every object survives at a visible name: the recorded v1 and the
+	// foreign base occupant are each surfaced, never destroyed.
+	if where := scanDirFor(t, dir, "ws", []byte("v1")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded object lost or left private: %q", where)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("base-occupant")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("foreign base occupant lost or left private: %q", where)
 	}
 	// Convergence: a second pass changes nothing and deletes nothing.
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
 		t.Fatalf("a.txt = %q after second pass", got)
 	}
-	if got := durRead(t, dir, "ws/"+slot); got != "base-occupant" {
-		t.Fatalf("base occupant lost after second pass: %q", got)
+	if where := scanDirFor(t, dir, "ws", []byte("v1")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded object lost after second pass: %q", where)
 	}
-	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
-		t.Fatalf("squatter lost after second pass: %q", got)
+	if where := scanDirFor(t, dir, "ws", []byte("base-occupant")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("base occupant lost after second pass: %q", where)
 	}
 }
 
 // --- F-3: discard authority -------------------------------------------
 //
-// The staged-object fingerprint matching an intent's dst_fp is NOT
-// commit evidence: a delayed drain or swap can park the recorded object
-// into the intent's namespace after the intent failed or was
-// tombstoned. Deleting on the fingerprint match alone destroyed
-// acknowledged content while its version row still recorded it. The
-// repaired rule: a row recording the object (and absent from its
-// recorded home) forces restore; otherwise deletion additionally
-// requires the intent's own journaled apply event, re-verified after
-// the object is captured at a sealed name.
+// A private name holding an object whose fingerprint matches an
+// intent's dst_fp is NOT discard authority: content similarity is not
+// operation-bound proof. Under the names protocol, discard of a
+// displaced object additionally requires a journaled act with an
+// observed result plus bound durable identity — and an orphaned name
+// carries no provenance at all. Whatever the evidence level, recorded
+// content is restored to a free recorded home or surfaced visibly; it
+// is never erased on a fingerprint match.
 
 // insertEvent writes the file_event row an intent's apply would have
 // journaled — positive commit evidence for composed dead-intent states.
@@ -1872,9 +1905,9 @@ func insertEvent(t *testing.T, s *Store, scope, path, fromPath, op string, versi
 // The witnessed F-3 shape through real Reconcile + real rows: a dead
 // write intent's declared occupant (still the recorded content for its
 // name) is parked at a -p- name by a delayed drain, and a squatter
-// holds the path. The old rule deleted the recorded object on the
-// fingerprint match; the repair restores it to its recorded home and
-// preserves the squatter.
+// holds the path. The fingerprint match must never delete the recorded
+// object: the squatter keeps its public name and the recorded object
+// surfaces at a visible sibling — preserved, readable, deletable.
 func TestPGReconcilePreservesRecordedDstFPObject(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -1899,8 +1932,7 @@ func TestPGReconcilePreservesRecordedDstFPObject(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false, it)
 		}); err != nil {
 		t.Fatalf("write O0: %v", err)
 	}
@@ -1924,24 +1956,29 @@ func TestPGReconcilePreservesRecordedDstFPObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	// Recorded O0 must be restored, never deleted.
-	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
-		t.Fatalf("a.txt = %q — recorded content lost to fingerprint-match delete", got)
+	// The squatter is a live public object — never evicted by recovery.
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
+		t.Fatalf("a.txt = %q — foreign occupant must not be evicted", got)
 	}
-	// The squatter is preserved at an enumerable parked name.
-	if where := scanDirFor(t, dir, "ws", []byte("squatter")); where == "" {
-		t.Fatal("squatter bytes destroyed — foreign objects must be preserved")
+	// Recorded O0 must surface at a visible name, never deleted.
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded content lost to fingerprint-match delete or left private: %q", where)
 	}
-	// Convergence: further passes keep O0 at its name.
+	// Convergence: further passes keep O0 surfaced and the squatter home.
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
 		t.Fatalf("a.txt = %q after second pass", got)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("recorded object lost after second pass: %q", where)
 	}
 }
 
 // The same shape for a tombstoned intent: resolved intents are
 // re-judged on the hot tombstone scan, and the recorded object must
-// still be restored rather than deleted.
+// still be surfaced — never deleted on a fingerprint match.
 func TestPGReconcilePreservesRecordedDstFPTombstoned(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -1965,8 +2002,7 @@ func TestPGReconcilePreservesRecordedDstFPTombstoned(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false, it)
 		}); err != nil {
 		t.Fatalf("write O0: %v", err)
 	}
@@ -1993,14 +2029,21 @@ func TestPGReconcilePreservesRecordedDstFPTombstoned(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
-		t.Fatalf("a.txt = %q — tombstoned intent destroyed recorded content", got)
+	if got := durRead(t, dir, "ws/a.txt"); got != "squatter" {
+		t.Fatalf("a.txt = %q — foreign occupant must not be evicted", got)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("tombstoned intent destroyed recorded content: %q", where)
 	}
 }
 
-// A committed intent's discard still progresses: the displaced object
-// is no longer recorded (its row was superseded by the apply) and the
-// intent's own apply event is journaled — the delete is authorized.
+// A committed intent's displaced object parked at an unjournaled name
+// carries no operation-bound provenance: even with the apply event
+// journaled, the orphaned object cannot be proven to be the declared
+// displaced object — it surfaces visibly, never deleted on the
+// fingerprint match. (A live atomicWrite still discards its displaced
+// object in-process; recovery-time discard needs bound identity.)
 func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -2024,8 +2067,7 @@ func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false, it)
 		}); err != nil {
 		t.Fatalf("write O0: %v", err)
 	}
@@ -2061,8 +2103,11 @@ func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
 	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
 		t.Fatalf("a.txt = %q, want committed v1", got)
 	}
-	if where := scanDirFor(t, dir, "ws", []byte("O0")); where != "" {
-		t.Fatalf("displaced O0 still parked at %q — committed discard did not progress", where)
+	// The orphaned displaced object is preserved at a visible name —
+	// without journaled provenance nothing authorizes its destruction.
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("displaced O0 destroyed or left private: %q", where)
 	}
 }
 
@@ -2107,39 +2152,49 @@ func TestPGReconcileUncommittedDstFPPreserved(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
-	// Not recorded + not committed → preserved at a sealed name, not
-	// deleted to "finish" a discard that never happened.
-	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" {
-		t.Fatal("unrecorded object deleted without commit evidence")
+	// Not recorded + not committed → surfaced visibly, not deleted to
+	// "finish" a discard that never happened.
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("unrecorded object deleted without commit evidence: %q", where)
 	}
 	// An event alongside the retained (tombstoned) intent row proves
 	// nothing about commit — still preserved.
 	insertEvent(t, s, "ws", "a.txt", "", "write", 73)
 	s.lastTombScan.Store(0)
 	s.Reconcile(ctx)
-	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" {
-		t.Fatal("object deleted on an event whose intent row was retained")
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("object deleted on an event whose intent row was retained: %q", where)
 	}
-	// The intent's effect lands late: its bytes appear at the path, the
-	// tombstone rolls forward (apply removes the intent row with its
-	// event), and the authorized discard completes in the same pass.
+	// The intent's effect lands late: its bytes appear at the path and
+	// the tombstone rolls forward — apply removes the intent row with
+	// its event. The surfaced object has no operation-bound provenance:
+	// it stays visible, preserved forever — the roll-forward never
+	// retroactively authorizes destroying it.
 	if err := os.WriteFile(dir+"/ws/a.txt", []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s.lastTombScan.Store(0)
 	s.Reconcile(ctx)
-	if n := intentCount(t, s); n != 0 {
-		t.Fatalf("roll-forward did not settle the intent: %d rows", n)
+	var pending int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_op WHERE resolved_at IS NULL`).Scan(&pending); err != nil {
+		t.Fatal(err)
 	}
-	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where != "" {
-		t.Fatalf("object still parked at %q after the intent's apply committed", where)
+	if pending != 0 {
+		t.Fatalf("roll-forward did not settle the intent: %d pending rows", pending)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" ||
+		strings.HasPrefix(where, opStagePrefix) {
+		t.Fatalf("object destroyed after the intent's apply committed: %q", where)
 	}
 }
 
-// Remove intents get the same authority rule: the captured object is
-// the one the remove was allowed to delete only if the removal
-// committed. While the row still records it, the object is restored to
-// its name — never deleted.
+// Remove intents get the same authority rule: a captured object whose
+// capture result was never journaled (the op died mid-flight) is not
+// proven to be the declared object — while the row still records it,
+// the object is restored to its name, never deleted.
 func TestPGReconcileRemoveRecordedDstFP(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -2163,8 +2218,7 @@ func TestPGReconcileRemoveRecordedDstFP(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
 		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false, it)
 		}); err != nil {
 		t.Fatalf("write O0: %v", err)
 	}
@@ -2178,8 +2232,14 @@ func TestPGReconcileRemoveRecordedDstFP(t *testing.T) {
 		at: time.Now().Add(-time.Hour),
 	})
 	slot := opStagePrefix + strconv.FormatInt(id, 10)
-	// The dead remove captured O0 but never committed the unlink — the
-	// row still records it at a.txt.
+	// The dead remove journaled its capture of a.txt's object into its
+	// private name but died before recording the result — the captured
+	// object is not proven to be the declared one.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET names=$2 WHERE id=$1`, id,
+		mustJSON([]nameRec{{Name: slot, Act: "cap", Src: "a.txt"}})); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot); err != nil {
 		t.Fatal(err)
 	}
@@ -2216,8 +2276,7 @@ func TestPGReconcileRenameRecordedDstFP(t *testing.T) {
 	if _, _, err = s.WithWrite(ctx, "ws", "new.txt", "write",
 		IfVersion{Mode: "any"}, sha("D0"), probeOf("new.txt"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.atomicWrite("ws", "new.txt", []byte("D0"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "new.txt", []byte("D0"), false, it)
 		}); err != nil {
 		t.Fatalf("write D0: %v", err)
 	}
@@ -2273,14 +2332,16 @@ func TestPGReconcileDBErrorPreservesDstFP(t *testing.T) {
 	}
 	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
 		path: "a.txt", version: 76, dstFP: fpX.Fingerprint,
-		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour)}
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+		names: []nameRec{{Name: slot}}}
+	it.journal = &nameJournal{s: s, id: id}
 	view, err := root.pin(false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer view.Close()
-	s.pool.Close() // the row set is unverifiable
-	s.settleStaged(ctx, it, view, false)
+	s.pool.Close() // the row set is unverifiable — no capture, no judgment
+	s.reconcileOne(ctx, it, view, false)
 	if where := scanDirFor(t, dir, "ws", []byte("maybe-recorded")); where == "" {
 		t.Fatal("object deleted while the version rows were unverifiable")
 	}

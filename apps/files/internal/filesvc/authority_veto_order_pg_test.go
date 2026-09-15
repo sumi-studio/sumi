@@ -1,16 +1,16 @@
 package filesvc
 
-// The discard veto's two reads — "may another writer still record this
-// object?" and "does a row record it?" — are separate statements. An apply
-// committing between them removes its evidence from the first and adds
-// it to the second, so it is caught only if the recorder check is read
-// first. This witness lands exactly that commit between the reads.
+// A settler's apply can commit while the orphan sweep is surfacing the
+// very object it recorded. The object's row must follow it to the
+// surfaced name — never destroyed, never left describing an absent
+// path while the object sits unrecorded elsewhere.
 
 import (
 	"context"
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,12 +26,10 @@ func TestAuthPGApplyCommitsBetweenVetoReads(t *testing.T) {
 	}
 	ctx := context.Background()
 	s := newPGStore(t, dsn, dir)
-	s.SetReconcileView(authPinned(root, nil))
 	s.SetOpTimeout(400 * time.Millisecond)
 	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	vC := authMint(t, s)
 	hold := authHold(t, dsn)
 	o, bDone := authHeldWrite(t, s, root, hold, "s.txt", "T")
 	select {
@@ -43,48 +41,77 @@ func TestAuthPGApplyCommitsBetweenVetoReads(t *testing.T) {
 		t.Fatal("held write did not time out")
 	}
 	c := intent{owner: "dead-inst", scope: "ws", op: "write", path: "r.txt",
-		version: vC, preFP: "0:0:0:0", expectSHA: sha("T"), at: time.Now().Add(-time.Hour)}
+		version: authMint(t, s), preFP: "0:0:0:0", expectSHA: sha("T"), at: time.Now().Add(-time.Hour)}
 	c.id = insertIntent(t, s, c)
 	authExec(t, s, `UPDATE file_op SET resolved_at = now() - interval '1 minute' WHERE id=$1`, c.id)
 	v, err := root.pin(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := v.MoveStaged("ws", "s.txt", opStagePrefix+strconv.FormatInt(c.id, 10)+"-p-aa01"); err != nil {
+	// Delayed executor-side move parks O under an unjournaled private
+	// name — an orphan the sweep surfaces, never deletes.
+	parked := opStagePrefix + strconv.FormatInt(c.id, 10) + "-p-aa01"
+	if err := v.MoveStaged("ws", "s.txt", parked); err != nil {
 		t.Fatalf("delayed park move: %v", err)
 	}
 	v.Close()
 
 	var once sync.Once
 	var hookErr error
-	discardVetoHook = func() {
-		once.Do(func() {
-			if err := hold.Commit(ctx); err != nil {
-				hookErr = err
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return authView{ReconView: v, onMove: func(_, from, _ string) {
+			if from != parked {
 				return
 			}
-			deadline := time.Now().Add(30 * time.Second)
-			for time.Now().Before(deadline) {
-				var fp string
-				if s.pool.QueryRow(ctx, `SELECT fp FROM file_version WHERE scope='ws' AND path='s.txt'`).Scan(&fp) == nil &&
-					fp3(fp) == fp3(o.Fingerprint) && authSettlersDone(s) {
+			once.Do(func() {
+				// The in-flight apply commits between the sweep's
+				// stat and the surface row mint.
+				if err := hold.Commit(ctx); err != nil {
+					hookErr = err
 					return
 				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			hookErr = errors.New("settler apply did not commit inside the veto window")
-		})
-	}
-	defer func() { discardVetoHook = nil }()
+				deadline := time.Now().Add(30 * time.Second)
+				for time.Now().Before(deadline) {
+					var fp string
+					if s.pool.QueryRow(ctx, `SELECT fp FROM file_version WHERE scope='ws' AND path='s.txt'`).Scan(&fp) == nil &&
+						fp3(fp) == fp3(o.Fingerprint) && authSettlersDone(s) {
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				hookErr = errors.New("settler apply did not commit inside the surface window")
+			})
+		}}
+	}))
 	s.lastTombScan.Store(0)
+	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
-	discardVetoHook = nil
+	// The sweep created the recover intent during that pass; the next
+	// pass settles it.
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
 	if hookErr != nil {
 		t.Fatal(hookErr)
 	}
-	if scanDirFor(t, dir, "ws", []byte("T")) == "" {
-		t.Fatal("object unlinked after its apply committed between the veto's reads")
+	where := scanDirFor(t, dir, "ws", []byte("T"))
+	if where == "" {
+		t.Fatal("object unlinked while its apply was committing")
 	}
 	authSettle(t, s)
-	authAssertRecovered(t, s, root, dir, "s.txt", "T", o)
+	// The row must describe the object wherever it ended up: restored
+	// to its recorded home s.txt (the home was free), or re-keyed onto
+	// a visible recovered-* surface name.
+	if _, fp, found := authRow(t, s, where); !found {
+		t.Fatalf("no row records the recovered object at %q", where)
+	} else if fp3(fp) != fp3(o.Fingerprint) {
+		t.Fatalf("row at %q fp %q does not describe O (%q)", where, fp, o.Fingerprint)
+	}
+	if where != "s.txt" {
+		if !strings.Contains(where, "recovered-o") {
+			t.Fatalf("O at %q — want s.txt restore or a visible recovered-* surface", where)
+		}
+		if _, _, found := authRow(t, s, "s.txt"); found {
+			t.Fatal("stale row still claims s.txt while the object sits surfaced")
+		}
+	}
 }

@@ -30,6 +30,7 @@ type posixRoot struct {
 
 	mcMu       sync.Mutex
 	mcInflight *inflightMountCheck // single-flight: one checker serves all requests
+	mcIdent    mountIdent          // identity of the last verified mount ("" when never verified)
 
 	// faultHook, when non-nil (tests only), runs between a verified
 	// exchange's post-verify and the displaced-object discard — the
@@ -43,6 +44,23 @@ type posixRoot struct {
 type inflightMountCheck struct {
 	done chan struct{}
 	err  error
+}
+
+// mountIdent is the verified identity of the mount serving the root,
+// recorded each time the mount check succeeds. Durable object identity
+// (objectID) consults it: a FUSE object's mount ID must equal the
+// verified mount's, and a JuiceFS object's namespace is the volume
+// UUID, so identity is bound to the verified mount instance — never
+// assumed from a path.
+type mountIdent struct {
+	mntID  uint64
+	fstype string
+	// jfsUUID is the mounted JuiceFS volume's identifier, read from the
+	// in-mount /.config during verification. A remount of the same
+	// volume keeps it (identity continuity across remounts); a
+	// replacement volume reports a different UUID, so objects from two
+	// metadata histories can never compare equal.
+	jfsUUID string
 }
 
 // mountInfoEntry is one parsed /proc/self/mountinfo line.
@@ -197,6 +215,23 @@ func (p *posixRoot) checkMount() error {
 	}
 }
 
+// setMountIdent records the identity of the mount that just passed
+// verification; objectID compares an object's own mount ID against it
+// for FUSE filesystems (identity is only provable while the fd is
+// served by the mount that was verified — a replaced mount answers
+// with a different ID and binds nothing).
+func (p *posixRoot) setMountIdent(mi mountIdent) {
+	p.mcMu.Lock()
+	p.mcIdent = mi
+	p.mcMu.Unlock()
+}
+
+func (p *posixRoot) mountIdent() mountIdent {
+	p.mcMu.Lock()
+	defer p.mcMu.Unlock()
+	return p.mcIdent
+}
+
 func (p *posixRoot) checkMountInner() error {
 	var stx unix.Statx_t
 	err := unix.Statx(unix.AT_FDCWD, p.root,
@@ -217,6 +252,7 @@ func (p *posixRoot) checkMountInner() error {
 	if err := mountVerdict(visible, p.root); err != nil {
 		return err
 	}
+	mi := mountIdent{mntID: stx.Mnt_id, fstype: visible.fstype}
 	if visible.fstype == "fuse.juicefs" {
 		// The .config we inspect must be served by the same verified
 		// mount — a file bind-mounted over it carries its own mount ID
@@ -235,8 +271,16 @@ func (p *posixRoot) checkMountInner() error {
 			return fmt.Errorf("%w: .config is not served by the verified mount",
 				ErrMountPolicy)
 		}
-		return checkZeroMetadataCache(cfgPath)
+		cfg, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
+		}
+		if err := checkZeroMetadataCacheData(cfg); err != nil {
+			return err
+		}
+		mi.jfsUUID = jfsUUIDFromConfig(cfg)
 	}
+	p.setMountIdent(mi)
 	return nil
 }
 
@@ -549,30 +593,110 @@ type FileInfo struct {
 	// ordinary, while a bind-mounted alias keeps dev+ino and is correctly
 	// recognized as the same object.
 	DevIno string `json:"-"`
-	// Birth is the object's creation-time identity ("sec:nsec" from
-	// statx STATX_BTIME), persisted on file_version rows. Unlike fp3 it
-	// survives membership churn on directories and every rename; unlike
-	// ctime it is immutable after creation. ino+birth distinguishes an
-	// object from a later inode reuser — the durable claim a stale row
-	// cannot counterfeit without actually being this object's row.
-	// Empty when the filesystem does not report btime; such rows fall
-	// back to the weaker fingerprint tiers.
-	Birth string `json:"-"`
+	// Oid is the object's durable filesystem identity, derived at
+	// open time from the opened object itself — never inferred from
+	// path/fingerprint/hash matching. Empty ("") when the filesystem
+	// cannot prove a stable identity: callers then fall back to
+	// generation evidence (fp3/sha) and never upgrade a match to
+	// old-object identity.
+	Oid string `json:"-"`
+	// oidCls records HOW Oid was derived so the declaring intent can
+	// distinguish "identity unsupported on this filesystem" (unbound —
+	// proceed on weaker evidence) from "identity exists but could not
+	// be proven right now" (transient — a race-class failure; declare
+	// must fail rather than record a blind intent).
+	oidCls idClass
+	// Nlink is the link count — a shared object (hardlink) must never be
+	// silently discarded during recovery cleanup.
+	Nlink uint64 `json:"-"`
 }
 
-// birthAt reads the object's birth time through an open fd (O_PATH fds
-// are accepted — statx does not require read permission). Returns ""
-// when the filesystem cannot prove creation identity.
-func birthAt(f *os.File) string {
+// idClass classifies an objectID attempt.
+type idClass int
+
+const (
+	idBound     idClass = iota // identity proven for this object
+	idUnbound                  // filesystem cannot prove identity — no evidence
+	idTransient                // identity exists but proof raced (handle stale, etc.) — retryable
+	idMisuse                   // caller asked outside a verified context — no evidence
+)
+
+// objectID derives the durable identity of the object behind an OPEN fd.
+// The fd is the provenance: the identity describes the object that was
+// opened, never a path observed later. Per filesystem:
+//
+//   - ext-family/tmpfs: fstatfs fsid + name_to_handle_at — the kernel's
+//     durable object token, stable across rename and remount, unique
+//     within the filesystem instance (fsid changes on mkfs, so a
+//     replacement volume can never alias old identities).
+//   - fuse.juicefs: the verified mount's volume UUID + inode. Valid
+//     only while the object's fd is served by the verified mount ID —
+//     a remount mints a new mount ID, so an fd opened after a
+//     replacement can never be confused with pre-replacement identity.
+//     JuiceFS allocates inodes monotonically within a metadata
+//     history (verified on the fixture: no reuse across churn), so
+//     UUID+ino identifies one object for the volume's lifetime.
+//   - everything else: unbound — the filesystem offers no provable
+//     object identity and recovery precision degrades accordingly.
+func (p *posixRoot) objectID(f *os.File) (string, idClass) {
+	var sfs unix.Statfs_t
+	if err := unix.Fstatfs(int(f.Fd()), &sfs); err != nil {
+		return "", idUnbound
+	}
+	if uint64(sfs.Type) == 0xef53 || uint64(sfs.Type) == unix.TMPFS_MAGIC {
+		// ext-family/tmpfs: fstatfs fsid + name_to_handle_at.
+		h, _, err := unix.NameToHandleAt(int(f.Fd()), "", unix.AT_EMPTY_PATH)
+		if err != nil {
+			if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOSYS) {
+				return "", idUnbound // kernel/fs lacks handle support
+			}
+			return "", idTransient // EBADF/ESTALE-class — proof raced
+		}
+		ns := fmt.Sprintf("%x:%x", uint32(sfs.Fsid.Val[0]), uint32(sfs.Fsid.Val[1]))
+		return "h:" + ns + ":" + strconv.Itoa(int(h.Type())) + ":" +
+			hex.EncodeToString(h.Bytes()), idBound
+	}
+	// FUSE and everything else: only JuiceFS beneath a VERIFIED mount
+	// carries provable identity — the object's own mount ID must equal
+	// the mount ID that passed verification.
+	mi := p.mountIdent()
+	if mi.fstype != "fuse.juicefs" || mi.jfsUUID == "" {
+		return "", idUnbound
+	}
 	var stx unix.Statx_t
 	if err := unix.Statx(int(f.Fd()), "", unix.AT_EMPTY_PATH,
-		unix.STATX_BTIME, &stx); err != nil {
-		return ""
+		unix.STATX_MNT_ID, &stx); err != nil || stx.Mask&unix.STATX_MNT_ID == 0 {
+		return "", idTransient // mount identity unprovable right now
 	}
-	if stx.Mask&unix.STATX_BTIME == 0 {
-		return ""
+	if stx.Mnt_id != mi.mntID {
+		return "", idMisuse // fd is served by a different mount — not the verified one
 	}
-	return fmt.Sprintf("%d:%d", stx.Btime.Sec, stx.Btime.Nsec)
+	st, err := f.Stat()
+	if err != nil {
+		return "", idTransient
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", idUnbound
+	}
+	return "j:" + mi.jfsUUID + ":" + strconv.FormatUint(sys.Ino, 10), idBound
+}
+
+// fileIdentity populates the durable-identity fields of a FileInfo for
+// the object behind f, retrying the transient race once. The class is
+// recorded so a declaring intent can fail on transient rather than
+// record blind evidence.
+func (p *posixRoot) fileIdentity(f *os.File) (oid string, cls idClass, nlink uint64) {
+	oid, cls = p.objectID(f)
+	if cls == idTransient {
+		oid, cls = p.objectID(f)
+	}
+	if st, err := f.Stat(); err == nil {
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+			nlink = sys.Nlink
+		}
+	}
+	return oid, cls, nlink
 }
 
 func fingerprint(st fs.FileInfo) string {
@@ -622,9 +746,10 @@ func fp3at(dfd *os.File, name string) (string, fs.FileMode, int64, error) {
 
 // errUndoParked marks a verification undo that could not cleanly restore
 // the pre-effect shape because a racing writer occupied the name again:
-// the newest foreign object keeps the path and the older foreign object
-// stays parked at the intent's staging name for the reconciler. Foreign
-// bytes are never unlinked — only objects the op itself created.
+// the name's occupant keeps the path and the foreign object stays parked
+// at the intent's private name for the reconciler. Foreign bytes are
+// never unlinked — only objects the op itself created or was authorized
+// to displace.
 var errUndoParked = errors.New("undo parked a foreign object")
 
 // errVerifyUnobserved: a verified effect committed its exchange but the
@@ -653,127 +778,75 @@ func isSealedName(base string) bool {
 	return strings.HasPrefix(base, opStagePrefix) && strings.Contains(base, "-q-")
 }
 
-// removeStagedPreUnlinkHook is a test-only seam marking the gap between
-// a sealed re-verify and the unlink — the position a retired actor's
-// delayed syscall would land in. Production never sets it.
-var removeStagedPreUnlinkHook func()
-
-// inoAt returns the inode of name beneath dfd (lstat semantics).
-func inoAt(dfd *os.File, name string) (uint64, error) {
-	var st unix.Stat_t
-	if err := unix.Fstatat(int(dfd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return 0, mapPathErr(err)
+// discardOwned unlinks the object at name beneath pfd after re-proving
+// its fp3. The name is an owned single-epoch private name: the identity
+// recheck plus in-place unlink is definitive because nothing else may
+// write the name. ENOTEMPTY/EEXIST (a dir that gained members) maps to
+// ErrNotEmpty so callers can treat it as divergence; a foreign capture
+// (fp3 mismatch) reports ErrConflict and leaves the object parked.
+func discardOwned(pfd *os.File, name, want3 string) error {
+	st3, _, _, err := fp3at(pfd, name)
+	if errors.Is(err, ErrNotFound) {
+		return nil
 	}
-	return st.Ino, nil
-}
-
-// quarantineDeleteMatch deletes the object at name beneath pfd only
-// after re-proving its identity at a sealed name. The object is
-// captured to qname (created by this call, so no delayed syscall can
-// have it as a pending target, and sealed so nothing may write into it
-// once it exists), the match predicate re-run there, and the unlink
-// issued only on a match. A mismatched capture stays parked at the
-// sealed name — preserved bytes for the reconciler — and ErrConflict
-// is returned along with the qname so the caller can restore it if it
-// wants. ENOENT at name reports success: already-gone is the desired
-// end state, and once the name is gone a delayed exchange into it can
-// only ENOENT.
-func quarantineDeleteMatch(pfd *os.File, name string, match func(qname string) (bool, error)) (string, error) {
-	qname := name
-	if !isSealedName(name) {
-		if strings.HasPrefix(name, opStagePrefix) {
-			qname = name + "-q-" + randHex(6)
-		} else {
-			// A non-intent staging name: quarantine under the
-			// never-swept prefix so a parked foreign object can't be
-			// collected by the .filesv-tmp- sweep.
-			qname = opStagePrefix + "q-" + randHex(8)
-		}
-		if err := unix.Renameat2(int(pfd.Fd()), name,
-			int(pfd.Fd()), qname, unix.RENAME_NOREPLACE); err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				return qname, nil
-			}
-			return qname, mapPathErr(err)
-		}
-	}
-	ok, err := match(qname)
 	if err != nil {
-		return qname, err
+		return err
 	}
-	if !ok {
-		return qname, ErrConflict
+	if st3 != want3 {
+		return ErrConflict
 	}
-	if removeStagedPreUnlinkHook != nil {
-		removeStagedPreUnlinkHook()
-	}
-	uerr := unix.Unlinkat(int(pfd.Fd()), qname, 0)
+	uerr := unix.Unlinkat(int(pfd.Fd()), name, 0)
 	if errors.Is(uerr, unix.EISDIR) {
-		uerr = unix.Unlinkat(int(pfd.Fd()), qname, unix.AT_REMOVEDIR)
+		uerr = unix.Unlinkat(int(pfd.Fd()), name, unix.AT_REMOVEDIR)
 	}
-	if uerr != nil && !errors.Is(uerr, unix.ENOENT) {
-		return qname, mapPathErr(uerr)
+	switch {
+	case uerr == nil || errors.Is(uerr, unix.ENOENT):
+		return nil
+	case errors.Is(uerr, unix.ENOTEMPTY) || errors.Is(uerr, unix.EEXIST):
+		return ErrNotEmpty
+	default:
+		return mapPathErr(uerr)
 	}
-	return qname, nil
-}
-
-// quarantineDelete is quarantineDeleteMatch with an fp3 identity check.
-func quarantineDelete(pfd *os.File, name, want3 string) (string, error) {
-	return quarantineDeleteMatch(pfd, name, func(qname string) (bool, error) {
-		q3, _, _, err := fp3at(pfd, qname)
-		if err != nil {
-			return false, err
-		}
-		return q3 == want3, nil
-	})
-}
-
-// discardStaged removes the staged file at tmp only while it is still
-// the inode this call created — a delayed exchange decided earlier could
-// land different bytes at the enumerable slot name between the create
-// and this cleanup; an inode mismatch parks the foreign object at the
-// sealed name for the reconciler instead of deleting it. A non-nil
-// return means a residual may remain at the slot or sealed name: callers
-// must keep the intent (errUndoParked) so the parked object stays
-// enumerable, rather than letting a definitive error drop it.
-func discardStaged(pfd *os.File, tmp string, ino uint64) error {
-	_, err := quarantineDeleteMatch(pfd, tmp, func(qname string) (bool, error) {
-		qino, err := inoAt(pfd, qname)
-		if err != nil {
-			return false, err
-		}
-		return qino == ino, nil
-	})
-	return err
 }
 
 // undoDisplaced reverses a committed exchange after verification found
-// the displaced object was not the declared expectation. It repeatedly
-// exchanges (sname under sfd) with (dname under dfd) until the op's own
-// object is back at sname (nil), or gives up with errUndoParked when
-// both names hold foreign objects. park, when non-empty, moves the
-// foreign object at sname to that recovery name in the same directory
-// before returning.
+// the displaced object was not the declared expectation. (sname under
+// sfd) is the op's private name; (dname under dfd) is the public name
+// it exchanged with. The loop runs until our object is back at sname
+// (nil) or the undo cannot proceed without destroying foreign bytes:
 //
-// When both endpoints are foreign, ctime picks which keeps the public
-// name. That is a convergence hint only — a rename changes ctime and
-// the clock can step, so it is NOT an acknowledged-version ordering
-// proof. Byte preservation is the guarantee here: both foreign objects
-// survive (one at dname, one parked). If the hint leaves a stale object
-// on the name, the reconciler's row-fp rule (file_version.fp is the
-// acknowledged fingerprint) swaps the recorded content back. Bounded:
-// each iteration either restores our object, leaves one foreign object
-// at dname, or gives up honestly.
-func undoDisplaced(sfd, dfd *os.File, sname, dname, park string, ours func(string) bool) error {
+//   - sname already holds ours → done.
+//   - dname holds ours → swap (sname's foreign object goes back to its
+//     public name; ours returns to the private name) or, when sname is
+//     empty, move ours back to sname.
+//   - dname is empty but sname holds a foreign object → that object
+//     came from dname via our exchange: put it back (NOREPLACE).
+//   - dname holds a foreign object → it is NEVER evicted; the staged
+//     foreign object stays parked for the reconciler.
+//
+// The name's occupant always wins — no ctime or recency arbitration:
+// a heuristic that evicts acknowledged content on a guess is not
+// authority. Bounded by a fixed iteration count; giving up reports
+// errUndoParked honestly.
+func undoDisplaced(sfd, dfd *os.File, sname, dname string, ours func(string) bool) error {
 	for i := 0; i < 4; i++ {
 		s3, _, _, serr := fp3at(sfd, sname)
 		if serr == nil && ours(s3) {
-			return nil // our object is back at the staging name
+			return nil // our object is back at the private name
 		}
-		d3, _, dCtim, derr := fp3at(dfd, dname)
+		if serr != nil && !errors.Is(serr, ErrNotFound) {
+			return serr
+		}
+		d3, _, _, derr := fp3at(dfd, dname)
 		switch {
-		case errors.Is(derr, unix.ENOENT):
-			// The name is empty — return whatever is staged to it.
+		case errors.Is(derr, ErrNotFound):
+			// The public name is empty. If the private name holds a
+			// foreign object it came from there via our exchange —
+			// return it. An empty private name means our object is
+			// unaccounted for: give up honestly.
+			if serr != nil {
+				return errUndoParked
+			}
 			if rerr := unix.Renameat2(int(sfd.Fd()), sname,
 				int(dfd.Fd()), dname, unix.RENAME_NOREPLACE); rerr != nil {
 				return errUndoParked
@@ -781,30 +854,24 @@ func undoDisplaced(sfd, dfd *os.File, sname, dname, park string, ours func(strin
 		case derr != nil:
 			return derr
 		case ours(d3):
-			// Our object still occupies the name; swap the staged foreign
-			// object back onto it.
-			if xerr := unix.Renameat2(int(sfd.Fd()), sname,
-				int(dfd.Fd()), dname, unix.RENAME_EXCHANGE); xerr != nil {
+			// Our object occupies the public name — bring it back
+			// under the private name. When the private name holds a
+			// foreign object, the swap returns it to the public name.
+			var xerr error
+			if serr == nil {
+				xerr = unix.Renameat2(int(sfd.Fd()), sname,
+					int(dfd.Fd()), dname, unix.RENAME_EXCHANGE)
+			} else {
+				xerr = unix.Renameat2(int(dfd.Fd()), dname,
+					int(sfd.Fd()), sname, unix.RENAME_NOREPLACE)
+			}
+			if xerr != nil {
 				return errUndoParked
 			}
 		default:
-			// Both endpoints hold foreign objects (a racing writer landed
-			// after our verify). The later-ctime object keeps the name
-			// (hint only — the reconciler's row-fp rule corrects a wrong
-			// guess); the other is preserved at the staging name — never
-			// unlinked.
-			_, _, sCtim, _ := fp3at(sfd, sname)
-			if sCtim > dCtim {
-				if xerr := unix.Renameat2(int(sfd.Fd()), sname,
-					int(dfd.Fd()), dname, unix.RENAME_EXCHANGE); xerr != nil {
-					return errUndoParked
-				}
-				continue
-			}
-			if park != "" {
-				unix.Renameat2(int(sfd.Fd()), sname,
-					int(sfd.Fd()), park, unix.RENAME_NOREPLACE)
-			}
+			// The name's occupant is foreign — it is never evicted.
+			// Whatever the private name holds stays parked for the
+			// reconciler.
 			return errUndoParked
 		}
 	}
@@ -830,7 +897,7 @@ func (p *posixRoot) stat(scope, path string) (FileInfo, error) {
 		return FileInfo{}, err
 	}
 	defer rfd.Close()
-	return statFrom(rfd, scope, path)
+	return p.statFrom(rfd, scope, path)
 }
 
 // lstat fingerprints the object AT the path — a symlink itself, never its
@@ -863,15 +930,16 @@ func (p *posixRoot) lstat(scope, path string) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, mapPathErr(err)
 	}
+	oid, cls, nlink := p.fileIdentity(f)
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st), Birth: birthAt(f)}, nil
+		DevIno: devIno(st), Oid: oid, oidCls: cls, Nlink: nlink}, nil
 }
 
 // statFrom stats beneath a pinned root fd — the reconciler's view so an
 // "absent" verdict is bound to the filesystem the pass verified, never
 // to a bare directory left behind by a mid-pass unmount.
-func statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
+func (p *posixRoot) statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
 	sfd, err := scopeDirFrom(rfd, scope, false)
 	if err != nil {
 		return FileInfo{}, err
@@ -896,9 +964,10 @@ func statFrom(rfd *os.File, scope, path string) (FileInfo, error) {
 	if err != nil {
 		return FileInfo{}, mapPathErr(err)
 	}
+	oid, cls, nlink := p.fileIdentity(f)
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st), Birth: birthAt(f)}, nil
+		DevIno: devIno(st), Oid: oid, oidCls: cls, Nlink: nlink}, nil
 }
 
 type ListEntry struct {
@@ -975,10 +1044,10 @@ func (p *posixRoot) open(scope, path string, off int64) (*os.File, FileInfo, err
 		return nil, FileInfo{}, err
 	}
 	defer rfd.Close()
-	return openFrom(rfd, scope, path, off)
+	return p.openFrom(rfd, scope, path, off)
 }
 
-func openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, error) {
+func (p *posixRoot) openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, error) {
 	sfd, err := scopeDirFrom(rfd, scope, false)
 	if err != nil {
 		return nil, FileInfo{}, err
@@ -1007,7 +1076,8 @@ func openFrom(rfd *os.File, scope, path string, off int64) (*os.File, FileInfo, 
 	}
 	// Regular file: O_NONBLOCK has no effect on ordinary reads; the flag
 	// only mattered to make the open itself non-wedging.
-	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st), DevIno: devIno(st), Birth: birthAt(f)}
+	oid, cls, nlink := p.fileIdentity(f)
+	info := FileInfo{Kind: "file", Size: st.Size(), MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st), DevIno: devIno(st), Oid: oid, oidCls: cls, Nlink: nlink}
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			f.Close()
@@ -1026,11 +1096,11 @@ func (p *posixRoot) hash(scope, path string) (string, error) {
 		return "", err
 	}
 	defer rfd.Close()
-	return hashFrom(rfd, scope, path)
+	return p.hashFrom(rfd, scope, path)
 }
 
-func hashFrom(rfd *os.File, scope, path string) (string, error) {
-	f, _, err := openFrom(rfd, scope, path, 0)
+func (p *posixRoot) hashFrom(rfd *os.File, scope, path string) (string, error) {
+	f, _, err := p.openFrom(rfd, scope, path, 0)
 	if err != nil {
 		return "", err
 	}
@@ -1049,6 +1119,7 @@ func hashFrom(rfd *os.File, scope, path string) (string, error) {
 // silently reading the bare directory the mountpoint leaves behind
 // (F-RA-1).
 type rootView struct {
+	p   *posixRoot
 	rfd *os.File
 }
 
@@ -1072,7 +1143,7 @@ func (p *posixRoot) pin(requireMount bool) (*rootView, error) {
 			return nil, err
 		}
 	}
-	return &rootView{rfd: rfd}, nil
+	return &rootView{p: p, rfd: rfd}, nil
 }
 
 // verifyPinnedMount is checkMountInner re-expressed against the pinned
@@ -1098,6 +1169,7 @@ func (p *posixRoot) verifyPinnedMount(rfd *os.File) error {
 	if err := mountVerdict(visible, p.root); err != nil {
 		return err
 	}
+	mi := mountIdent{mntID: stx.Mnt_id, fstype: visible.fstype}
 	if visible.fstype == "fuse.juicefs" {
 		cfg, err := openBeneath(rfd, ".config", unix.O_RDONLY|unix.O_NOFOLLOW, 0)
 		if err != nil {
@@ -1118,17 +1190,35 @@ func (p *posixRoot) verifyPinnedMount(rfd *os.File) error {
 		if err != nil {
 			return fmt.Errorf("%w: no verifiable mount config", ErrMountPolicy)
 		}
-		return checkZeroMetadataCacheData(content)
+		if err := checkZeroMetadataCacheData(content); err != nil {
+			return err
+		}
+		mi.jfsUUID = jfsUUIDFromConfig(content)
 	}
+	p.setMountIdent(mi)
 	return nil
 }
 
+// jfsUUIDFromConfig extracts the JuiceFS volume UUID from a verified
+// /.config body — the durable namespace leg for object identity on
+// JuiceFS. An absent or malformed field degrades identity to unbound,
+// never fails the mount check (freshness verdicts stay independent of
+// identity capability).
+func jfsUUIDFromConfig(cfg []byte) string {
+	var c map[string]any
+	if err := json.Unmarshal(cfg, &c); err != nil {
+		return ""
+	}
+	u, _ := c["UUID"].(string)
+	return u
+}
+
 func (v *rootView) Stat(scope, path string) (FileInfo, error) {
-	return statFrom(v.rfd, scope, path)
+	return v.p.statFrom(v.rfd, scope, path)
 }
 
 func (v *rootView) Hash(scope, path string) (string, error) {
-	return hashFrom(v.rfd, scope, path)
+	return v.p.hashFrom(v.rfd, scope, path)
 }
 
 // MoveStaged restores a recovery object to an empty name, resolved
@@ -1173,66 +1263,13 @@ func (v *rootView) MoveStaged(scope, from, to string) error {
 	return nil
 }
 
-// SwapStaged exchanges the staged recovery object with whatever the name
-// holds — the dead op's undone exchange continued under the successor.
-// Whatever was at the name lands back at the staging slot, where the
-// caller inspects it: own staged bytes are discarded, foreign objects
-// stay parked. Nothing is unlinked here.
-func (v *rootView) SwapStaged(scope, staged, name string) error {
-	sfd, err := scopeDirFrom(v.rfd, scope, false)
-	if err != nil {
-		return err
-	}
-	defer sfd.Close()
-	relS, err := relPath(staged)
-	if err != nil {
-		return err
-	}
-	relN, err := relPath(name)
-	if err != nil {
-		return err
-	}
-	sDir, sName := splitRel(relS)
-	nDir, nName := splitRel(relN)
-	if isSealedName(sName) || isSealedName(nName) {
-		// The exchange writes into BOTH names — a sealed quarantine
-		// name can never be a write target on either side, or the
-		// verify→unlink of a pending delete could land on bytes nobody
-		// checked.
-		return ErrReserved
-	}
-	spfd, err := openDirBeneath(sfd, sDir, false)
-	if err != nil {
-		return err
-	}
-	defer spfd.Close()
-	npfd, err := openDirBeneath(sfd, nDir, false)
-	if err != nil {
-		return err
-	}
-	defer npfd.Close()
-	if err := unix.Renameat2(int(spfd.Fd()), sName,
-		int(npfd.Fd()), nName, unix.RENAME_EXCHANGE); err != nil {
-		return mapPathErr(err)
-	}
-	syncDir(npfd)
-	return nil
-}
-
-// RemoveStaged deletes a recovery object beneath the pinned root only
-// after re-proving its identity at a sealed quarantine name. A live
-// retired actor may still exchange into the intent's staging slot
-// between the caller's inspection and the unlink, so the object is
-// first moved to a per-call sealed name — created by this call, and
-// unreachable as a write target by construction — re-verified, and
-// unlinked there. A mismatched capture stays parked at the sealed
-// name — bytes are preserved for a later pass rather than destroyed.
-func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
-	return v.RemoveStagedVeto(scope, path, wantFP3, wantSHA, nil)
-}
-
-func (v *rootView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
-	veto func(captured FileInfo) (bool, error)) error {
+// RemoveName deletes the object at an owned private name beneath the
+// pinned root. Only recovery ever calls it, and only on names recorded
+// in the intent's journal as owned by this instance — nothing else may
+// write those names, so an in-place verified unlink is definitive. A
+// directory is removed only when empty; a non-empty dir reports
+// ErrNotEmpty and the caller surfaces the container instead.
+func (v *rootView) RemoveName(scope, path string) error {
 	sfd, err := scopeDirFrom(v.rfd, scope, false)
 	if err != nil {
 		return err
@@ -1248,71 +1285,19 @@ func (v *rootView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
 		return err
 	}
 	defer pfd.Close()
-	qname := name
-	if !isSealedName(name) {
-		// Two-hop: move to a sealed name created by this call. Whoever
-		// occupied `path` at move time is captured — possibly not the
-		// object the caller verified, which is why it is re-verified
-		// below. Sealing means no delayed syscall can write into qname:
-		// it did not exist when any retired effect was issued, and the
-		// writer checks reject it as a target once it exists.
-		qname = name + "-q-" + randHex(6)
-		if err := unix.Renameat2(int(pfd.Fd()), name,
-			int(pfd.Fd()), qname, unix.RENAME_NOREPLACE); err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				return nil // already gone — desired end state
-			}
-			return mapPathErr(err)
-		}
-	}
-	qrel := qname
-	if dirRel != "" {
-		qrel = dirRel + "/" + qname
-	}
-	st, serr := statFrom(v.rfd, scope, qrel)
-	if serr != nil {
-		return mapPathErr(serr)
-	}
-	match := false
-	if wantFP3 != "" {
-		match = fp3(st.Fingerprint) == wantFP3
-	} else if wantSHA != "" && st.Kind == "file" {
-		h, herr := hashFrom(v.rfd, scope, qrel)
-		match = herr == nil && h == wantSHA
-	}
-	if !match {
-		// Captured something other than the verified object — leave it
-		// parked at the sealed quarantine name.
-		return ErrConflict
-	}
-	if veto != nil {
-		// The object is captured and immobilized at the sealed name —
-		// nothing can write into it and a move-out leaves it empty for
-		// the unlink below. The veto is evaluated at this effect-time
-		// point, on the CAPTURED object's identity (a hash-only match can
-		// capture a different inode than the caller verified), so a check
-		// consulting durable state cannot be invalidated by a delayed
-		// syscall decided before the state changed.
-		keep, verr := veto(st)
-		if verr != nil {
-			return verr
-		}
-		if keep {
-			return ErrConflict
-		}
-	}
-	if removeStagedPreUnlinkHook != nil {
-		removeStagedPreUnlinkHook()
-	}
-	err = unix.Unlinkat(int(pfd.Fd()), qname, 0)
+	err = unix.Unlinkat(int(pfd.Fd()), name, 0)
 	if errors.Is(err, unix.EISDIR) {
-		err = unix.Unlinkat(int(pfd.Fd()), qname, unix.AT_REMOVEDIR)
+		err = unix.Unlinkat(int(pfd.Fd()), name, unix.AT_REMOVEDIR)
 	}
-	if err != nil && !errors.Is(err, unix.ENOENT) {
+	switch {
+	case err == nil, errors.Is(err, unix.ENOENT):
+		syncDir(pfd)
+		return nil
+	case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
+		return ErrNotEmpty
+	default:
 		return mapPathErr(err)
 	}
-	syncDir(pfd)
-	return nil
 }
 
 // ListStaged returns the base names in dir that begin with prefix,
@@ -1348,6 +1333,29 @@ func (v *rootView) ListStaged(scope, dir, prefix string) ([]string, error) {
 	return out, nil
 }
 
+// ListDir returns every entry in dir, unfiltered — the orphan sweep
+// uses it to recurse into subdirectories.
+func (v *rootView) ListDir(scope, dir string) ([]string, error) {
+	sfd, err := scopeDirFrom(v.rfd, scope, false)
+	if err != nil {
+		return nil, err
+	}
+	defer sfd.Close()
+	rel, err := relPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	dfd := sfd
+	if rel != "" {
+		dfd, err = openBeneath(sfd, rel, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer dfd.Close()
+	}
+	return dfd.Readdirnames(-1)
+}
+
 // EnsureDir creates dir and any missing parents beneath the scope —
 // fd-relative mkdir-p under the pinned root, so the walk cannot be
 // redirected outside it by a racing rename. Recovery uses it to
@@ -1377,36 +1385,28 @@ func (v *rootView) EnsureDir(scope, dir string) error {
 
 func (v *rootView) Close() error { return v.rfd.Close() }
 
-// atomicWrite stages content to a temp sibling, fsyncs, renames over the
-// target, and fsyncs the directory. A name never resolves to torn content.
-// Caller holds the version CAS; this is the durable part of the write.
-// exclusive=true publishes the staged file with linkat(2), which fails
-// with EEXIST if anything already occupies the name — the create-only
-// check is atomic against executor-side creates, not just advisory.
-// Non-exclusive publish uses renameat2(2), which replaces whatever name
-// exists (including a dangling symlink — A F3) atomically and entirely
-// within the pinned parent directory.
-// The bool result reports whether the commit point was REACHED — the
-// publish call (linkat/renameat2) succeeded. A trailing stat error after
-// that means "the write landed but we could not observe the result"; the
-// caller must preserve the intent for reconciliation rather than drop it
-// as never-committed (F-RA-5/f120).
-// atomicWrite stages the body at a deterministic per-intent name, then
-// publishes. A non-exclusive publish is VERIFIED: RENAME_EXCHANGE moves
-// whatever the path held into the staging slot, and the displaced
-// object's identity must equal expectFP — the fingerprint observed at
-// declare. Only the expected object is discarded; a foreign object is
-// restored to the name (or parked at the staging slot if a racing writer
-// claimed it). This is what prevents a stale in-flight write — issued
-// before ownership was lost, completing after a successor's save — from
-// destroying newer acknowledged bytes. An effect interrupted between the
-// exchange and the verdict leaves both objects recoverable for the
-// reconciler.
+// atomicWrite stages the body at the intent's declared private name
+// (it.stageBase — recorded in the journal before this call can populate
+// it), fsyncs, and publishes. A name never resolves to torn content.
+//
+// exclusive=true publishes with linkat(2): EEXIST if anything already
+// occupies the name — the create-only check is atomic. Non-exclusive
+// publish is VERIFIED: RENAME_EXCHANGE moves whatever the path held
+// into the private name, and the displaced object's identity must equal
+// it.dstFP — the fingerprint (and oid, when bound) observed at declare.
+// Only the expected object is discarded; a foreign object is restored
+// to the name, or stays parked at the private name for the reconciler
+// when a racing writer claimed the path. The private name is a
+// single-epoch owned name: only this process's recorded acts may write
+// it, so verify-then-unlink in place is definitive — a delayed syscall
+// from a retired epoch can never target it (it was declared with a
+// unique ordinal under this intent).
+//
 // The bool result reports whether the fs effect committed — an error
 // after that point means "landed but unobserved", not "never ran"; the
-// caller must preserve the intent for reconciliation rather than drop it
-// as never-committed (F-RA-5/f120).
-func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool, expectFP, stage string) (FileInfo, bool, error) {
+// caller must preserve the intent for reconciliation rather than drop
+// it as never-committed (F-RA-5/f120).
+func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bool, it intent) (FileInfo, bool, error) {
 	if err := checkReserved(path); err != nil {
 		return FileInfo{}, false, err
 	}
@@ -1428,37 +1428,50 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		return FileInfo{}, false, err
 	}
 	defer pfd.Close()
-	tmp := stage
-	park := ""
+	tmp := it.stageBase()
 	if tmp == "" {
-		tmp = stagingPrefix + randHex(8)
-		// A foreign object the undo cannot restore must not sit at a
-		// .filesv-tmp- name — the staging sweep would delete it. Give the
-		// park slot the never-swept recovery prefix.
-		park = opStagePrefix + "adhoc-" + randHex(8)
+		// No journal (unintented caller) — still a private recovery name.
+		tmp = opStagePrefix + "adhoc-" + randHex(8)
 	}
+	expectFP := it.dstFP
 	tf, err := openBeneath(pfd, tmp,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return FileInfo{}, false, err
 	}
-	// The inode binds every later cleanup of this name to THIS object:
-	// a retired pass's delayed exchange can land foreign bytes at the
-	// enumerable slot between create and cleanup, and an inode-mismatched
-	// capture is parked rather than deleted.
-	ourIno, _ := inoAt(pfd, tmp)
+	// Our object's inode from the open fd — fd-bound, so it stays
+	// correct even if a delayed effect swaps what the name points at.
+	var ownIno uint64
+	var fst unix.Stat_t
+	if unix.Fstat(int(tf.Fd()), &fst) == nil {
+		ownIno = fst.Ino
+	}
 	if p.faultHook != nil {
 		p.faultHook("write.postCreate")
 	}
 	// fail returns a pre-commit error after best-effort cleanup of the
-	// staged file. If the cleanup left a residual — a foreign object
-	// parked under a sealed name, or the slot still occupied — the intent
-	// must be tombstoned, not dropped: only a live intent keeps that
-	// evidence enumerable for the reconciler.
+	// staged file. The name is ours, but a delayed effect may have
+	// swapped its occupant between create and now — verify the name
+	// still holds OUR object (same inode; an in-place scribble on our
+	// own object is still ours to delete) before unlinking; a foreign
+	// occupant stays parked and the intent must be tombstoned.
 	fail := func(perr error) (FileInfo, bool, error) {
-		if derr := discardStaged(pfd, tmp, ourIno); derr != nil {
+		cur3, _, _, cerr := fp3at(pfd, tmp)
+		curIno, _, _, _ := fpParts(cur3 + ":0")
+		switch {
+		case errors.Is(cerr, ErrNotFound):
+			// Name already empty — nothing to clean.
+		case cerr == nil && curIno != "" && curIno == strconv.FormatUint(ownIno, 10):
+			if uerr := unix.Unlinkat(int(pfd.Fd()), tmp, 0); uerr != nil && !errors.Is(uerr, unix.ENOENT) {
+				return FileInfo{}, false, fmt.Errorf("%w: %w", perr, errUndoParked)
+			}
+		case cerr == nil:
+			// A foreign object sits at our name — never unlink it.
+			return FileInfo{}, false, fmt.Errorf("%w: %w", perr, errUndoParked)
+		default:
 			return FileInfo{}, false, fmt.Errorf("%w: %w", perr, errUndoParked)
 		}
+		it.njDone()
 		return FileInfo{}, false, perr
 	}
 	if _, err := tf.Write(content); err != nil {
@@ -1472,28 +1485,16 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	if err := tf.Close(); err != nil {
 		return fail(mapPathErr(err))
 	}
+	// Record the populate result — a successor judging this name later
+	// sees the slot definitively populated by this epoch.
+	it.njRes("ok")
 	// Our object's identity before any exchange — ctime shifts on relink,
 	// so identity is the ino:size:mtime triple only.
 	our3, _, _, ourErr := fp3at(pfd, tmp)
-	// commit deletes the staging name's object, fsyncs, and stats the
-	// result. The slot is enumerable by every reconcile pass and
-	// reachable by swaps a retired pass decided while the name held
-	// these bytes — so the delete goes through quarantineDelete:
-	// capture to a sealed name nothing can write into, re-verify
-	// identity, unlink only what we meant to. want3 is the fp3 the
-	// caller expects at the slot (our staged bytes, or the declared
-	// displaced object). A foreign capture stays parked at the sealed
-	// name: the fs commit stands but the intent must survive for the
-	// reconciler to settle the parked object.
-	//
 	// commitInfo returns the committed object's observed identity only
 	// when the name provably still holds the object this op published
-	// (fp3 == our3, captured before the publish). A late stat that
-	// observes a different writer's object — or no verifiable identity
-	// at all — must not be journaled as this version's content: the
-	// caller reports a plain committed error and the intent stays
-	// unresolved, so the reconciler settles the commit by observation
-	// (hash/fp3-verified) instead of recording foreign bytes or fp="".
+	// (fp3 == our3). A late stat that observes a different writer's
+	// object — or fails — yields no identity this commit may journal.
 	commitInfo := func() (FileInfo, error) {
 		info, serr := p.stat(scope, path)
 		if serr != nil {
@@ -1504,15 +1505,20 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		}
 		return info, nil
 	}
+	// commit drops the staging name's object (verified in place — the
+	// name is owned), fsyncs, and stats the result. want3 is the fp3
+	// expected at the slot: our staged bytes, or the declared displaced
+	// object. A foreign object at the slot reports ErrConflict and stays
+	// parked for the reconciler.
 	commit := func(want3 string) (FileInfo, bool, error) {
 		if p.faultHook != nil {
 			p.faultHook("write.preSlotDelete")
 		}
-		if _, derr := quarantineDelete(pfd, tmp, want3); derr != nil {
+		if derr := discardOwned(pfd, tmp, want3); derr != nil {
 			if errors.Is(derr, ErrConflict) {
-				// Foreign bytes are parked at a sealed name; the
-				// publish committed. Journal only an identity verified
-				// against our own object.
+				// Foreign bytes parked at the private name; the publish
+				// committed. Journal only an identity verified against
+				// our own object.
 				if info, verr := commitInfo(); verr == nil {
 					return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 				} else {
@@ -1521,11 +1527,10 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 			}
 			return FileInfo{}, true, derr
 		}
+		it.njDone()
 		syncDir(pfd)
 		info, verr := commitInfo()
 		if verr != nil {
-			// The publish committed; the observation failed or the name
-			// already holds a different writer's object.
 			return FileInfo{}, true, verr
 		}
 		return info, true, nil
@@ -1536,9 +1541,15 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		}
 		return commit(our3)
 	}
+	// Record the exchange BEFORE it can populate the private name with
+	// the displaced object — a crash between syscall and record leaves
+	// the act declared-but-unresulted, which the reconciler reads as
+	// outcome-unknown, never "definitively absent".
+	it.njAct("xch", name)
 	err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_EXCHANGE)
 	switch {
 	case errors.Is(err, unix.ENOENT):
+		it.njRes("noeff")
 		// The name is empty.
 		if expectFP != "" {
 			// The object the intent expected to displace is gone.
@@ -1555,9 +1566,12 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		}
 		return commit(our3)
 	case err != nil:
+		it.njRes("noeff")
 		return fail(mapPublishErr(err, exclusive))
 	}
-	// Exchanged: tmp now holds the object the name used to hold.
+	it.njRes("ok")
+	// Exchanged: the private name now holds the object the path used to
+	// hold.
 	d3, dMode, _, serr := fp3at(pfd, tmp)
 	if serr != nil {
 		// Displaced object unobservable — the effect committed; let the
@@ -1575,24 +1589,23 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	if p.faultHook != nil {
 		p.faultHook("write.preUndo")
 	}
-	uerr := undoDisplaced(pfd, pfd, tmp, name, park,
+	uerr := undoDisplaced(pfd, pfd, tmp, name,
 		func(t3 string) bool { return t3 == our3 })
 	if p.faultHook != nil {
 		p.faultHook("write.postUndo")
 	}
 	if uerr == nil {
-		// tmp holds our own staged bytes — but the slot name stayed
-		// enumerable throughout the undo, so a retired pass's delayed
-		// swap may have replaced them since undoDisplaced returned.
-		// Capture to a sealed name and re-verify before deleting.
-		if _, derr := quarantineDelete(pfd, tmp, our3); derr != nil {
+		// tmp holds our own staged bytes again — discard them in place
+		// (the name is owned; identity re-verified by discardOwned).
+		if derr := discardOwned(pfd, tmp, our3); derr != nil {
 			if errors.Is(derr, ErrConflict) {
-				// Whatever landed at the slot is foreign and now
-				// parked; the undo itself already restored the name.
+				// Whatever landed at the slot is foreign and parked;
+				// the undo itself already restored the name.
 				return FileInfo{}, false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 			}
 			return FileInfo{}, true, derr
 		}
+		it.njDone()
 		if kindOf(dMode) == "dir" {
 			return FileInfo{}, false, ErrWrongKind
 		}
@@ -1631,18 +1644,30 @@ func mapPublishErr(err error, exclusive bool) error {
 
 // rename moves (scope, from) to (scope, to) beneath the pinned scope dir;
 // both parent directories are resolved in-kernel so neither endpoint can
-// be redirected outside the scope mid-op. noReplace uses
-// renameat2(RENAME_NOREPLACE); when dstFP is non-empty (the destination
-// was expected to hold a specific object) the move is VERIFIED instead:
-// RENAME_EXCHANGE puts the displaced object back at the source name, its
-// identity must equal dstFP, and only that expected object is removed —
-// a foreign destination is restored and the source returned, so a stale
-// rename can never destroy a successor's acknowledged object. stage is
-// the deterministic recovery name a parked foreign object is moved to.
-// The bool result reports whether renameat2 committed — a trailing stat
-// failure after that point means "landed but unobserved", not "never
-// ran" (F-RA-5/f120).
-func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP, stage string) (FileInfo, bool, error) {
+// be redirected outside the scope mid-op. noReplace (or a destination
+// declared absent) uses renameat2(RENAME_NOREPLACE). A rename OVER an
+// occupied destination is two-legged and verified:
+//
+//  1. CAPTURE: the source object moves to the intent's declared private
+//     name (recorded in the journal before this call can populate it).
+//     The source name is momentarily empty — the accepted gap; a crash
+//     here leaves the source parked under owned storage, never on a
+//     public path it could be mistaken for a user's move.
+//  2. EXCHANGE: the private name swaps with the destination. The
+//     displaced destination object lands at the private name — declared
+//     private storage — so a crash can never strand it on the public
+//     source name indistinguishable from an ordinary `mv`.
+//  3. VERIFY + DISCARD: the private name's object must equal the
+//     declared destination (oid when bound, fp3 otherwise). Only that
+//     object is unlinked — in place, under the single-epoch name. A
+//     foreign object undoes the exchange (its content goes back to the
+//     destination name, ours back to the private name, then home) or
+//     stays parked for the reconciler.
+//
+// The bool result reports whether the fs effect committed — an error
+// after the exchange means "landed but unobserved", not "never ran"
+// (F-RA-5/f120).
+func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (FileInfo, bool, error) {
 	if err := checkReserved(to); err != nil {
 		return FileInfo{}, false, err
 	}
@@ -1684,19 +1709,14 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 	if serr != nil {
 		return FileInfo{}, false, serr
 	}
-	if srcFP != "" && src3 != fp3(srcFP) {
+	if it.preFP != "" && src3 != fp3(it.preFP) {
 		// The source object changed since the intent declared — moving it
 		// would relocate foreign content under the op's authority.
 		return FileInfo{}, false, ErrExternalChange
 	}
 	// committedInfo returns the moved object's observed identity only
 	// when the destination provably still holds the object this rename
-	// moved (fp3 == src3, captured before the exchange). A stat that
-	// observes a different writer's object — or fails — yields no
-	// identity this commit may journal: callers report the commit with
-	// a plain error and the intent stays unresolved, so the reconciler
-	// settles it by observation rather than recording foreign bytes or
-	// fp="" as this version's content.
+	// moved (fp3 == src3, captured before the move).
 	committedInfo := func() (FileInfo, error) {
 		info, serr := p.stat(scope, to)
 		if serr != nil {
@@ -1707,21 +1727,14 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 		}
 		return info, nil
 	}
-	var flags uint
-	switch {
-	case noReplace || dstFP == "":
+	if noReplace || it.dstFP == "" {
 		// Destination expected absent at declare (or create-only
 		// requested): NOREPLACE makes the move fail rather than
 		// overwrite an object that appeared after the declare.
-		flags = unix.RENAME_NOREPLACE
-	default:
-		flags = unix.RENAME_EXCHANGE
-	}
-	err = unix.Renameat2(int(srcPfd.Fd()), srcName, int(dstPfd.Fd()), dstName, flags)
-	if err != nil {
-		return FileInfo{}, false, mapPublishErr(err, true)
-	}
-	if flags&unix.RENAME_NOREPLACE != 0 {
+		if err := unix.Renameat2(int(srcPfd.Fd()), srcName,
+			int(dstPfd.Fd()), dstName, unix.RENAME_NOREPLACE); err != nil {
+			return FileInfo{}, false, mapPublishErr(err, true)
+		}
 		syncDir(dstPfd)
 		info, serr := committedInfo()
 		if serr != nil {
@@ -1729,135 +1742,156 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 		}
 		return info, true, nil
 	}
-	// Exchanged: srcName now holds the displaced destination object.
-	d3, dMode, _, derr := fp3at(srcPfd, srcName)
+	// Rename-over: stage the source beneath the intent's private name
+	// first so the exchange can displace the destination object into
+	// owned storage rather than onto the public source name.
+	stage := it.stageBase()
+	if stage == "" {
+		stage = opStagePrefix + "adhoc-" + randHex(8)
+	}
+	// restoreSrc returns the staged source object to its public name —
+	// non-destructive (NOREPLACE); a name claimed meanwhile leaves it
+	// parked under the private name for the reconciler.
+	restoreSrc := func(fail error) (FileInfo, bool, error) {
+		rerr := unix.Renameat2(int(srcPfd.Fd()), stage,
+			int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE)
+		syncDir(srcPfd)
+		switch {
+		case rerr == nil:
+			return FileInfo{}, false, fail
+		case errors.Is(rerr, unix.EEXIST):
+			return FileInfo{}, false, fmt.Errorf("%w: %w", fail, errUndoParked)
+		default:
+			return FileInfo{}, false, rerr
+		}
+	}
+	// 1. Capture the source beneath the declared private name — the act
+	// is recorded before the syscall can populate the name, so a crash
+	// leaves a declared-unresulted record, never an unowned object.
+	it.njAct("cap", relFrom)
+	if err := unix.Renameat2(int(srcPfd.Fd()), srcName,
+		int(srcPfd.Fd()), stage, unix.RENAME_NOREPLACE); err != nil {
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			it.njRes("noeff")
+			return FileInfo{}, false, ErrNotFound
+		case errors.Is(err, unix.EEXIST):
+			it.njRes("noeff")
+			return FileInfo{}, false, ErrConflict // slot holds leftover residue
+		default:
+			it.njRes("noeff")
+			return FileInfo{}, false, mapPathErr(err)
+		}
+	}
+	it.njRes("ok")
+	// 2. Re-verify the CAPTURED object is the declared source: a foreign
+	// object could have claimed `from` between the pre-check and the
+	// capture. A mismatch is restored to its name — never moved onward.
+	st3, stMode, _, verr := fp3at(srcPfd, stage)
+	if verr != nil {
+		return restoreSrc(verr)
+	}
+	if st3 != src3 {
+		return restoreSrc(ErrExternalChange)
+	}
+	if p.faultHook != nil {
+		p.faultHook("rename.postVerify")
+	}
+	// 3. Exchange the private name with the destination — recorded
+	// before the syscall can populate the name with the displaced
+	// object.
+	it.njAct("xch", relTo)
+	err = unix.Renameat2(int(srcPfd.Fd()), stage,
+		int(dstPfd.Fd()), dstName, unix.RENAME_EXCHANGE)
+	if err != nil {
+		it.njRes("noeff")
+		switch {
+		case errors.Is(err, unix.ENOENT):
+			// The destination vanished since declare — nothing to
+			// exchange with; restore the source.
+			return restoreSrc(ErrExternalChange)
+		default:
+			return restoreSrc(mapPublishErr(err, true))
+		}
+	}
+	it.njRes("ok")
+	// Exchanged: the private name now holds the displaced destination
+	// object.
+	d3, dMode, _, derr := fp3at(srcPfd, stage)
 	m3, _, _, merr := fp3at(dstPfd, dstName)
 	if derr != nil || merr != nil {
-		// Post-exchange observation failed — the move committed; the
-		// reconciler settles by inspection.
 		return FileInfo{}, true, errVerifyUnobserved
 	}
 	var fail error
 	switch {
-	case d3 != fp3(dstFP) || m3 != src3:
+	case d3 != fp3(it.dstFP) || m3 != src3:
 		fail = ErrExternalChange // displaced/moved object isn't the declared one
-	case dMode.IsDir() != srcMode.IsDir():
+	case dMode.IsDir() != srcMode.IsDir() || stMode.IsDir() != srcMode.IsDir():
 		fail = ErrWrongKind // dir↔non-dir exchange never commits
-	case stage == "":
-		// No private slot to verify the discard under — never unlink a
-		// public name (a paused actor resuming could delete a successor's
-		// object). Undo instead.
-		fail = ErrExternalChange
 	default:
-		// The displaced destination is the declared object — but it sits
-		// at the PUBLIC source name, so the delete must happen under the
-		// intent's private slot: capture it there (NOREPLACE, non-
-		// destructive), re-verify identity at the slot, then unlink.
+		// The displaced destination is the declared object, parked under
+		// our single-epoch private name: verify-and-unlink in place.
 		if p.faultHook != nil {
-			p.faultHook("rename.postVerify")
+			p.faultHook("rename.preSlotDelete")
 		}
-		if merr := unix.Renameat2(int(srcPfd.Fd()), srcName,
-			int(srcPfd.Fd()), stage, unix.RENAME_NOREPLACE); merr != nil {
-			if errors.Is(merr, unix.EEXIST) {
-				fail = ErrConflict // slot occupied by a prior leftover
-				break
-			}
-			return FileInfo{}, true, mapPathErr(merr)
-		}
-		p3, _, _, perr := fp3at(srcPfd, stage)
-		if perr != nil {
-			return FileInfo{}, true, perr // captured but unobservable — parked
-		}
-		if p3 != fp3(dstFP) {
-			// A racing writer's object reached srcName between the verify
-			// and the capture — it is foreign, not ours to delete. Put it
-			// back on its name; if the name is already re-occupied it
-			// stays parked for the reconciler. The rename itself
-			// committed either way.
-			if p.faultHook != nil {
-				p.faultHook("rename.preRestore")
-			}
-			rerr := unix.Renameat2(int(srcPfd.Fd()), stage,
-				int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE)
-			syncDir(dstPfd)
-			info, serr := committedInfo()
-			if serr != nil {
-				return FileInfo{}, true, serr
-			}
-			if rerr != nil {
-				// The captured foreign object stayed parked at the
-				// staging slot. The commit stands, but the caller must
-				// keep the intent — deleting its row would leave the
-				// parked object under a namespace no pass enumerates.
-				return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
-			}
-			return info, true, nil
-		}
-		// The slot name is enumerable and reachable by delayed swaps a
-		// retired reconciler decided while the slot held foreign bytes —
-		// the delete must happen under a sealed name: capture stage→-q,
-		// re-verify, unlink only the declared object.
-		if p.faultHook != nil {
-			p.faultHook("rename.preQuarantine")
-		}
-		qname, uerr := quarantineDelete(srcPfd, stage, fp3(dstFP))
-		if uerr == nil {
-			syncDir(dstPfd)
+		uerr := discardOwned(srcPfd, stage, fp3(it.dstFP))
+		switch {
+		case uerr == nil:
+			it.njDone()
+			syncDir(srcPfd)
 			info, serr := committedInfo()
 			if serr != nil {
 				return FileInfo{}, true, serr
 			}
 			return info, true, nil
-		}
-		if errors.Is(uerr, ErrConflict) {
-			// A foreign object reached the slot between the verify and
-			// the sealed capture — it is parked, not destroyed. The
-			// rename committed; the intent survives for the reconciler.
+		case errors.Is(uerr, ErrConflict):
+			// A foreign object reached the slot — it is parked, not
+			// destroyed. The rename committed; the intent survives.
 			info, serr := committedInfo()
 			if serr != nil {
 				return FileInfo{}, true, serr
 			}
 			return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
-		}
-		if !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST) {
+		case errors.Is(uerr, ErrNotEmpty):
+			// The captured dir gained members — it diverged from what
+			// the intent was allowed to discard. Undo like a
+			// pre-exchange ENOTEMPTY.
+			fail = ErrNotEmpty
+		default:
 			return FileInfo{}, true, uerr
 		}
-		// The captured dir gained members — it diverged from what the
-		// intent was allowed to discard. Move it back to srcName and fall
-		// through to the undo, refusing the whole op like a pre-exchange
-		// ENOTEMPTY would have.
-		if unix.Renameat2(int(srcPfd.Fd()), qname,
-			int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE) != nil {
-			info, serr := committedInfo()
-			if serr != nil {
-				return FileInfo{}, true, serr
-			}
-			return info, true, fmt.Errorf("%w: %w", ErrNotEmpty, errUndoParked)
-		}
-		fail = ErrNotEmpty
 	}
-	// Undo the exchange without ever unlinking foreign bytes. Our
-	// object's identity is the source triple captured before the move.
-	uerr := undoDisplaced(srcPfd, dstPfd, srcName, dstName, stage,
+	// Undo: exchange the private name back with the destination (the
+	// foreign object returns to its name, ours to the private name),
+	// then restore the source to `from`. Never unlinks foreign bytes.
+	uerr := undoDisplaced(srcPfd, dstPfd, stage, dstName,
 		func(t3 string) bool { return t3 == src3 })
 	if uerr == nil {
-		return FileInfo{}, false, fail
+		// Our source is back under the private name — return it home.
+		return restoreSrc(fail)
 	}
 	if errors.Is(uerr, errUndoParked) {
+		// Committed state unknown — the exchange may stand with a
+		// foreign object parked at the private name.
+		info, serr := committedInfo()
+		if serr == nil {
+			return info, true, fmt.Errorf("%w: %w", fail, errUndoParked)
+		}
 		return FileInfo{}, false, fmt.Errorf("%w: %w", fail, errUndoParked)
 	}
 	return FileInfo{}, true, uerr
 }
 
 // remove deletes (scope, path) VERIFIED: the target is first moved aside
-// to the intent's staging name — never unlinked outright — and its
-// identity is compared to expectFP, the object observed at declare. Only
-// the expected object is unlinked; a foreign object is restored to the
-// path (or left parked at the staging name if a racing writer claimed
-// it). A stale remove therefore cannot destroy a successor's newer save.
+// to the intent's declared private name — never unlinked outright — and
+// its identity is compared to it.dstFP, the object observed at declare.
+// Only the expected object is unlinked, in place under the single-epoch
+// private name; a foreign object is restored to the path (or left parked
+// under the private name if a racing writer claimed it). A stale remove
+// therefore cannot destroy a successor's newer save.
 // The bool result reports whether the object is gone — an error after
 // that point is observation, not non-commit (F-RA-5/f120).
-func (p *posixRoot) remove(scope, path, expectFP, stage string) (bool, error) {
+func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 	if err := checkReserved(path); err != nil {
 		return false, err
 	}
@@ -1879,34 +1913,45 @@ func (p *posixRoot) remove(scope, path, expectFP, stage string) (bool, error) {
 		return false, err
 	}
 	defer pfd.Close()
+	stage := it.stageBase()
 	if stage == "" {
-		// The capture may end up holding foreign content — never a
-		// .filesv-tmp- name, which the staging sweep would delete.
+		// No journal — still a private recovery name.
 		stage = opStagePrefix + "adhoc-" + randHex(8)
 	}
-	// Non-destructive capture: move the target to the staging name. A
-	// leftover parked object occupying it refuses the op rather than
-	// clobber recovery bytes.
+	// Non-destructive capture: move the target to the private name —
+	// the act is journaled before the syscall can populate it. A
+	// leftover parked object occupying the name refuses the op rather
+	// than clobber recovery bytes.
+	it.njAct("cap", rel)
 	err = unix.Renameat2(int(pfd.Fd()), name, int(pfd.Fd()), stage, unix.RENAME_NOREPLACE)
 	switch {
 	case errors.Is(err, unix.ENOENT):
+		it.njRes("noeff")
 		return false, ErrNotFound
 	case errors.Is(err, unix.EEXIST):
+		it.njRes("noeff")
 		return false, ErrConflict
 	case err != nil:
+		it.njRes("noeff")
 		return false, mapPathErr(err)
 	}
+	it.njRes("ok")
 	st3, _, _, serr := fp3at(pfd, stage)
 	if serr != nil {
-		return false, serr // captured but unobservable — reconciler settles
+		// Captured but unobservable — put it back before reporting.
+		rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
+		if rerr != nil {
+			return false, fmt.Errorf("%w: %w", serr, errUndoParked)
+		}
+		return false, serr
 	}
-	if st3 == fp3(expectFP) {
-		// Captured the expected object — complete the removal under a
-		// sealed name: the slot stayed enumerable through this window,
-		// so a delayed swap could have replaced the verified object.
-		qname, uerr := quarantineDelete(pfd, stage, st3)
+	if st3 == fp3(it.dstFP) {
+		// Captured the declared object — unlink it in place under the
+		// owned private name (identity re-verified inside discardOwned).
+		uerr := discardOwned(pfd, stage, st3)
 		switch {
 		case uerr == nil:
+			it.njDone()
 			// If a racing reconcile pass restored the captured object
 			// to its name, the removal did not land — the name holding
 			// an object again means the intent's purpose is unmet.
@@ -1916,34 +1961,31 @@ func (p *posixRoot) remove(scope, path, expectFP, stage string) (bool, error) {
 			syncDir(pfd)
 			return true, nil
 		case errors.Is(uerr, ErrConflict):
-			// Foreign bytes reached the slot between verify and the
-			// sealed capture — parked, not destroyed; the reconciler
-			// settles them.
+			// Foreign bytes reached the slot — parked, not destroyed;
+			// the reconciler settles them.
 			return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
-		case !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST):
-			// The post-capture state is uncertain — the object may sit
-			// at the slot, at the sealed name, or be gone. Tombstone so
-			// the reconciler settles whatever was left rather than
-			// dropping the intent over live recovery evidence.
-			return false, fmt.Errorf("%w: %w", uerr, errUndoParked)
-		}
-		// ENOTEMPTY: a dir gained members after capture — it diverged
-		// from the declared object; restore it from the sealed name
-		// instead of deleting.
-		rerr := unix.Renameat2(int(pfd.Fd()), qname, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
-		switch {
-		case rerr == nil:
-			syncDir(pfd)
-			return false, ErrExternalChange
-		case errors.Is(rerr, unix.EEXIST):
-			return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+		case errors.Is(uerr, ErrNotEmpty):
+			// A dir gained members after capture — it diverged from the
+			// declared object; restore it instead of deleting.
+			rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
+			switch {
+			case rerr == nil:
+				syncDir(pfd)
+				return false, ErrExternalChange
+			case errors.Is(rerr, unix.EEXIST):
+				return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+			default:
+				return false, rerr
+			}
 		default:
-			return false, rerr
+			// The post-capture state is uncertain — tombstone so the
+			// reconciler settles whatever was left.
+			return false, fmt.Errorf("%w: %w", uerr, errUndoParked)
 		}
 	}
 	// Captured object is not what the intent declared — put it back. A
 	// racing writer's object occupying the name keeps it; the captured
-	// object stays parked at the staging name for recovery.
+	// object stays parked at the private name for recovery.
 	rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 	switch {
 	case rerr == nil:
@@ -1986,7 +2028,7 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	// op's acknowledgement — the same false-identity class as the
 	// write/rename commit paths.
 	st, serr := pfd.Stat()
-	birth := birthAt(pfd)
+	oid, _, nlink := p.fileIdentity(pfd)
 	pfd.Close()
 	syncDir(sfd)
 	if serr != nil {
@@ -1994,7 +2036,7 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	}
 	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
 		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
-		DevIno: devIno(st), Birth: birth}, true, nil
+		DevIno: devIno(st), Oid: oid, Nlink: nlink}, true, nil
 }
 
 // sweepStaging removes service staging files older than 10 minutes — e.g.

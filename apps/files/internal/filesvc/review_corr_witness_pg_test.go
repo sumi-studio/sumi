@@ -26,6 +26,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -160,14 +161,18 @@ func TestReviewCorrPGCrossDevDirSweepStrandsRecorded(t *testing.T) {
 	}))
 	authSettle(t, s)
 	authSettle(t, s)
-	// Required: the recorded dir is restored home (the impostor is
-	// parked aside) — or at minimum not mistaken for already-home.
-	if st, serr := root.lstat("ws", "sweepHome"); serr != nil {
-		t.Fatalf("sweepHome unverifiable: %v", serr)
-	} else if ino, _, _, _ := fpParts(st.Fingerprint); ino != dIno {
-		t.Fatalf("recorded dir stranded by false surplus classification: "+
-			"sweepHome holds impostor ino %s, recorded ino %s still parked",
-			ino, dIno)
+	// Required: the impostor — a live public object — keeps its name;
+	// recovery never evicts it. The recorded dir must not be stranded
+	// in private space either: it surfaces at a visible sibling.
+	alive := scanDirForInode(dir, "ws", dIno)
+	if alive == "" {
+		t.Fatal("recorded dir destroyed by the sweep")
+	}
+	if strings.Contains(alive, opStagePrefix) {
+		t.Fatalf("recorded dir stranded at private name %s", alive)
+	}
+	if st, serr := root.lstat("ws", "sweepHome"); serr != nil || st.Kind != "dir" {
+		t.Fatalf("sweepHome impostor evicted: %v", serr)
 	}
 }
 

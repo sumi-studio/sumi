@@ -168,10 +168,11 @@ func corrFixture(t *testing.T, s *Store, root *posixRoot, dir string) (collider,
 }
 
 // CW1 — root's concern, destructive direction. A recorded dir X parked
-// at a committed intent's staged slot must be RESTORED, not deleted.
+// under a dead intent's journaled name must be RESTORED, not deleted.
 // With a colliding ino row whose home holds a same-ino dir on ANOTHER
-// device, the veto's sameObjectAt misclassifies "still at recorded home"
-// and the sealed capture is unlinked — acknowledged content destroyed.
+// device, weaker evidence could misidentify X — the names journal only
+// discards on bound-oid proof plus a journaled successful capture; X's
+// own row (bound identity or ino leg) is the home it returns to.
 func TestCorrCrossDeviceInoDelete(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -186,44 +187,39 @@ func TestCorrCrossDeviceInoDelete(t *testing.T) {
 	xDevIno := devInoOf(t, dir+"/ws/mntB/xd")
 	t.Logf("X recorded at mntB/xd dev:ino=%s; collider at %s", xDevIno, collider)
 
-	// A pending remove intent whose authorized-displacement object is X
-	// (dstFP = X's fp — X was the object at the intent's declared path).
-	// Its own namespace lives on tmpfsB so the parked object can rename in.
+	// A dead remove intent whose displaced-object fingerprint is X's —
+	// but with no bound oid and no journaled capture act, there is no
+	// operation-bound proof that deleting X was authorized.
 	if err := os.MkdirAll(dir+"/ws/mntB/work", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	it := intent{owner: s.owner, scope: "ws", op: "remove",
+	it := intent{owner: "dead-inst", scope: "ws", op: "remove",
 		path: "mntB/work/q", version: authMint(t, s),
-		preFP: "0:0:0:0", dstFP: xfp, at: time.Now()}
+		preFP: "0:0:0:0", dstFP: xfp, at: time.Now().Add(-time.Hour)}
 	it.id = insertIntent(t, s, it)
-	slot := "mntB/work/" + opStagePrefix + strconv.FormatInt(it.id, 10)
+	base := opStagePrefix + strconv.FormatInt(it.id, 10)
+	slot := "mntB/work/" + base
+	authExec(t, s,
+		`UPDATE file_op SET names=$2 WHERE id=$1`,
+		it.id, mustJSON([]nameRec{{Name: base, Dir: "mntB/work"}}))
 	if err := os.Rename(dir+"/ws/mntB/xd", dir+"/ws/"+slot); err != nil {
 		t.Fatal(err)
 	}
-	// The intent's own apply commits between the veto's recordersActive
-	// read and its row read — the position discardVetoHook marks.
-	discardVetoHook = func() {
-		authExec(t, s, `DELETE FROM file_op WHERE id=$1`, it.id)
-		authExec(t, s,
-			`INSERT INTO file_event (scope, path, op, version) VALUES ($1,$2,$3,$4)`,
-			"ws", it.path, "remove", it.version)
-	}
-	defer func() { discardVetoHook = nil }()
 
 	authSettle(t, s)
 
-	if treeHasDevIno(t, dir, "ws", xDevIno) {
-		if _, err := os.Stat(dir + "/ws/mntB/xd"); err == nil {
-			t.Log("X restored to its recorded home — correct outcome")
-			return
-		}
-		t.Fatalf("X still parked somewhere instead of restored to mntB/xd")
+	if !treeHasDevIno(t, dir, "ws", xDevIno) {
+		_, fp, found := authRow(t, s, "mntB/xd")
+		t.Fatalf("DEFECT: recorded dir X destroyed — dev:ino %s absent everywhere; "+
+			"row(mntB/xd) still records fp=%q (found=%v). Weak evidence must "+
+			"never authorize deletion; collider at %s",
+			xDevIno, fp, found, collider)
 	}
-	_, fp, found := authRow(t, s, "mntB/xd")
-	t.Fatalf("DEFECT: recorded dir X destroyed — dev:ino %s absent everywhere; "+
-		"row(mntB/xd) still records fp=%q (found=%v). Cross-device ino "+
-		"collision at %s satisfied the veto's 'still at recorded home' check",
-		xDevIno, fp, found, collider)
+	if _, err := os.Stat(dir + "/ws/mntB/xd"); err == nil {
+		t.Log("X restored to its recorded home — correct outcome")
+	} else {
+		t.Log("X preserved at a recovery name — acceptable outcome")
+	}
 }
 
 // CW2 — same collision through the orphan sweep: no delete is involved,
@@ -371,8 +367,7 @@ func TestCorrWholesaleRestoreMemberElsewhere(t *testing.T) {
 	if _, _, err := s.Rename(ctx, "ws", "ddir/m", "mout",
 		IfVersion{Mode: "any"}, authProbe(root, "mout"), authProbe(root, "ddir/m"),
 		func(it intent) (FileInfo, bool, error) {
-			return root.rename("ws", "ddir/m", "mout", false,
-				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.rename("ws", "ddir/m", "mout", false, it)
 		}); err != nil {
 		t.Fatalf("rename ddir/m->mout: %v", err)
 	}
@@ -454,8 +449,7 @@ func TestCorrWriteCommitParkedJournalsRealFP(t *testing.T) {
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
 			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 	t.Logf("write err: %v", werr)
@@ -512,8 +506,7 @@ func TestCorrWriteCommitParkedCascadeClosed(t *testing.T) {
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
 			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 
@@ -582,8 +575,7 @@ func TestCorrWriteCommitParkedUnverifiedIdentity(t *testing.T) {
 		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
 		func(it intent) (FileInfo, bool, error) {
 			id = it.id
-			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false, it)
 		})
 	root.faultHook = nil
 	if !flipped {

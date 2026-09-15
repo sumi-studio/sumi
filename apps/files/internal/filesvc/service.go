@@ -319,8 +319,7 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 		hex.EncodeToString(sum[:]),
 		s.probe(scope, path),
 		func(it intent) (FileInfo, bool, error) {
-			return s.root.atomicWrite(scope, path, body, exclusive,
-				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return s.root.atomicWrite(scope, path, body, exclusive, it)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -380,8 +379,7 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 	ver, _, err := s.store.Rename(r.Context(), scope, from, to, iv,
 		s.probe(scope, to), s.probe(scope, from),
 		func(it intent) (FileInfo, bool, error) {
-			return s.root.rename(scope, from, to, noReplace,
-				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+			return s.root.rename(scope, from, to, noReplace, it)
 		})
 	if err != nil {
 		s.mapErr(w, err)
@@ -424,8 +422,7 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, pa
 	}
 	err = s.store.Remove(r.Context(), scope, path, iv, s.probe(scope, path),
 		func(it intent) (bool, error) {
-			return s.root.remove(scope, path, it.dstFP,
-				opStagePrefix+strconv.FormatInt(it.id, 10))
+			return s.root.remove(scope, path, it)
 		})
 	if err != nil {
 		s.mapErr(w, err)
