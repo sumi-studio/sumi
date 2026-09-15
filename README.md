@@ -1,6 +1,7 @@
-
 # Sumi
 A shared workspace where people and their AI secretaries work together.
+
+English | [日本語](README.ja.md)
 
 ### Description
 
@@ -14,116 +15,137 @@ Each AI secretary lives there as an individual, moving through time alongside th
 
 Sumi aims to democratize access to personal secretaries and extend what a personal secretary can be.
 
-## 技術スタック
+## Where Sumi is today
 
-| レイヤ | 技術 |
-|---|---|
-| フロントエンド | React 19 + TypeScript + Vite |
-| ルーティング | TanStack Router |
-| スタイリング / UI | Tailwind CSS v4 + 自作コンポーネントカタログ (shadcn/ui ベース) |
-| 動的UI (SDUI) | zod スキーマ + component registry |
-| 状態管理 | Zustand + TanStack Query |
-| クライアント面 | WebApp (Web / mobile) + Electron (desktop) |
-| エージェント基盤 | Rust (durable runtime + 分離 tool executor) |
-| バックエンド | Go |
-| API 定義 | OpenAPI 3.1 (契約ファースト) |
-| モノレポ | pnpm workspaces + Turborepo |
-| Lint / Format | Biome |
-| インフラ | Terraform |
-| CI/CD | GitHub Actions |
+Sumi is in alpha. The Description above is the goal. Today there are three separate ways to see Sumi, and they do not yet run the same secretary system.
 
-選定理由は [docs/adr/](docs/adr/) を参照。
+| Way to see Sumi | What it is today | Who can use it |
+|---|---|---|
+| **Hosted alpha Web app** | The existing Web app, with invite-only sign-in, Workspaces and Messaging. | Invited developers and testers only; there is no public sign-up. Integration with the new secretary core is still being verified. |
+| **[Local host](#try-the-local-host)** | The new secretary core on one Linux or WSL machine, without a Sumi Cloud account. | Anyone who installs it from a source checkout. Its browser page and `say` command are engineering surfaces, not the product UI. |
+| **[Web app from source](#run-the-web-app-from-source)** | The full Web app — sign-in, Workspaces, Messaging and settings — with one secretary on the Rust agent runtime. | Developers with their own Firebase project and model-provider credentials. |
 
-## ディレクトリ構成
+### The new secretary core
 
-```text
-sumi-studio/
-├── apps/                      # デプロイ可能物
-│   ├── web/                   # React SPA (Web配信とElectron bundleの正本)
-│   │   ├── src/
-│   │   ├── index.html
-│   │   ├── vite.config.ts
-│   │   └── package.json
-│   ├── desktop/               # Electron main / preload / packaging (実装時に追加)
-│   │   └── package.json       # apps/web の同一build artifactをbundleする
-│   ├── api/                   # Go — サービスAPI: 認証、ドメインCRUD、リアルタイムゲートウェイ
-│   │   ├── cmd/server/        # エントリポイント
-│   │   ├── internal/          # handler / service / repository
-│   │   ├── go.mod
-│   │   └── package.json       # turbo から go build/test を呼ぶ薄いラッパー
-├── packages/                  # 共有パッケージ
-│   ├── ui/                    # @sumi/ui — コンポーネントカタログ
-│   ├── sdui/                  # @sumi/sdui — 宣言UIスキーマ(zod) + レンダラー
-│   ├── api-client/            # @sumi/api-client — contracts/ から型生成
-│   └── typescript-config/     # @sumi/typescript-config — tsconfig プリセット
-├── contracts/                 # 境界の契約 (OpenAPI、イベントスキーマ等)
-│   └── openapi.yaml
-├── infra/                     # Terraform
-│   ├── modules/               # 再利用可能なモジュール
-│   └── environments/
-│       ├── dev/
-│       ├── staging/
-│       └── prod/
-├── docs/                      # Wiki・ADR
-│   └── adr/
-├── scripts/                   # 開発・運用用スクリプト
-├── .github/
-│   └── workflows/             # CI/CD (パスフィルタで apps/* / infra を分割)
-├── turbo.json
-├── pnpm-workspace.yaml
-├── biome.json
-├── package.json
-├── Makefile                   # よく使うコマンドの入口
-└── README.md
-```
+The new core is what the Local host runs and what Sumi Cloud is moving to. Its source and tests establish the following.
 
-`apps/agent` には production bootstrap、durable agent loop、3 層メモリ、
-provider 接続、分離 tool executor を実装している。設計判断は
-[ADR 0002](docs/adr/0002-agent-stack.md)、
-[ADR 0007](docs/adr/0007-production-runtime-bootstrap-boundary.md)、
-[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md) を参照。
+- **A secretary's state outlives the process running it.** Identity, conversation history, queued and in-progress requests, and schedules are saved in PostgreSQL through the Go API. After a stop or crash, the next start continues interrupted requests from their saved progress instead of starting them over. On the Local host, the same secretary also returns after `uninstall` and reinstall, as long as the state home is kept. See [Local host semantics](docs/local-host.md#semantics).
+- **One core for Local and Cloud.** The core runs as a Node.js process on your machine or, for Sumi Cloud, as one Cloudflare Durable Object per secretary. Both read and write state through the Go API.
+- **A secretary chooses how to take part in a conversation.** Messaging passes the secretary the messages its notification settings let through. A direct message, a mention, a reply to the secretary's own message, or a reminder the secretary set asks for a response; other messages arrive for awareness. The secretary decides whether to speak, so not every message gets a reply.
+- **Operations that need permission wait for a person.** The request waits in that person's approval inbox. Tests of the approval flow check that an approved operation resumes the waiting request and runs once, that a denied operation does not run, and that another person cannot see or decide it.
+- **Each person chooses their secretary's model.** A person connects their own API key through a supported preset, such as an OpenAI-compatible chat completions endpoint, OpenAI Responses, Anthropic Messages or OpenCode Go. The core uses exactly that connection; if it cannot be used, the request fails rather than being answered by a different model. Model usage is recorded.
 
-### アーキテクチャ上の原則
+### Not available yet
 
-- **契約は `contracts/` が単一の源泉**: `packages/api-client` (TS)、Go 側 (oapi-codegen 等)、agent の Rust クライアントはいずれも `contracts/openapi.yaml` を正典とする。Rust は初期のみ薄い手書き実装を許すが、契約から逸脱させない。
-- **agent はドメイン DB を直接触らない**: ドメイン操作 (ToDo・リマインダー等) は `contracts/openapi.yaml` 由来の Rust クライアント経由で `apps/api` を叩く。API が小さい初期段階は薄い reqwest 実装とし、生成導入後も契約を単一の源泉に保つ。権限モデルの強制点を API 層の1箇所に保つため。一方、agent 自身の状態 — 3層メモリ、opaque provider context を除く暗号化チャット原文 (平文 reasoning 込み) と redacted 検索投影、恒久イベントログ、承認ルール — は agent ローカルの SQLite とワークスペースに永続化する (詳細は [docs/agent/](docs/agent/))。ドメインデータの複製はそこに持たない。
-- **エージェントのツール定義はリリース単位で凍結**: agent の Tool Definitions の変更は LLM プロバイダ側プレフィックスキャッシュの全壊(コスト・レイテンシの悪化)と同義のため、ツールの追加・変更は随時行わず、リリース単位でまとめて反映する。詳細は[エージェント実装計画](docs/agent/implementation-plan.md)の第8章を参照。
-- **renderer と shell の分離**: `apps/web` を Web / mobile WebApp / Electron の唯一のrenderer正本とする。`apps/desktop` はOS統合と将来のbrowser chassisだけを所有し、domain model・application authorization・agent foundationを複製しない。詳細は [ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md) を参照。
+- **Using the full Web app on the new core as a product.** Connecting the existing Web app to the new core for everyday use is still being verified. No documented local setup runs the full Web app on it yet.
+- **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
+- **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
+- **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
+- **Desktop and native mobile apps.** `apps/web` is designed to be the single renderer for the Web app, a mobile WebApp and a future Electron desktop app ([ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md)). No desktop or native mobile app exists yet.
+- **Signing in with a ChatGPT/Codex subscription in the new core.** Use an API-key connection instead.
 
-## 開発環境セットアップ
+## Try the Local host
 
-必要なもの: Node.js >= 20.19、pnpm 11、Go、Rust stable、`curl`、
-`openssl`、`flock`。ブラウザから実際のエージェントを使う手順と Firebase /
-provider credential の設定は
-[Real local stack](docs/local-development.md) を参照。
+`deploy/local-host/sumi-local` installs and runs the new secretary core on one machine. It runs two processes: a Go state service backed by PostgreSQL, and the secretary. With no model configured, the secretary uses a `mock` model that echoes your message, so you can try restarts and recovery before connecting a real model.
 
-Cloud アカウント無しで新しいコアを単体インストールして動かす場合は
-[Local host](docs/local-host.md) (`deploy/local-host/sumi-local`) を参照。
+Requirements: Linux (use WSL on Windows), bash 5 or newer, Node.js 22.18 or newer (or 23.6 or newer), Go, `curl`, `openssl`, `flock` and `tar`, and either Docker or a PostgreSQL database you provide.
 
 ```sh
-make setup     # pnpm install
-make dev-check # Firebase/provider/identity 設定を検証
-make dev       # 認証済み real stack を依存順・readiness gate 付きで起動
-make build     # 全ビルド
-make lint      # Biome + Go + Rust lint
-make test      # 全テスト
+deploy/local-host/sumi-local install --managed-pg   # or: --db-url postgres://…
+sumi-local doctor
+sumi-local start
+sumi-local say --wait 60 "hello"
+sumi-local status
+sumi-local stop
 ```
 
-既定の `make dev` URL は正確に `http://127.0.0.1:5173`。Vite が同一
-origin の `/auth` (HTTP) と `/direct-chat` (WebSocket) を Go API へ
-proxy する。別の Tailnet 端末から直接使う場合は、wildcard ではなく
-`SUMI_PUBLIC_LISTEN=<literal-tailscale-ipv4>:8080` を設定する。詳細は
-[Real local stack](docs/local-development.md#direct-tailnet-access) を参照。
-`make dev-workspaces` は raw Turbo task 用であり、利用可能な product stack を
-起動するコマンドではない。
+`install` adds a `sumi-local` command to `~/.local/bin`. `sumi-local url` prints the browser address; it contains the page's access token, so treat it like a password. `sumi-local uninstall` keeps your secretary's data, and `sumi-local uninstall --purge` deletes it. `sumi-local pack` builds a bundle you can install on another Linux (amd64) machine without Go; no prebuilt bundle is published.
 
-API の型を変更する場合は `contracts/openapi.yaml` を編集後、`pnpm --filter @sumi/api-client generate` で TS 型を再生成する。
+To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*` values for an OpenAI-compatible endpoint in the install's `config.env`. The Local host runs one secretary per install. See [Local host](docs/local-host.md) for configuration, recovery behavior and current limits.
 
-## CI/CD
+## Run the Web app from source
 
-GitHub Actions (`.github/workflows/`) でパスフィルタを使い、変更のあった領域のみ実行する:
+`make dev` starts the full Web app with one real secretary on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor, and Vite. This developer stack runs the secretary on the Rust agent runtime (`apps/agent`), not on the new TypeScript secretary core used by the Local host and Sumi Cloud.
 
-- `apps/web/**`, `apps/desktop/**`, `packages/**` の変更 → Web / desktop frontend の Lint / テスト / ビルド
-- `apps/api/**`, `contracts/**` の変更 → API の Lint / テスト / ビルド
-- `apps/agent/**`, `contracts/**` の変更 → エージェント基盤の Lint / テスト / ビルド (`apps/agent` 導入後。`contracts/agent-events.yaml` からの wire 型生成と fixture round-trip 検証を含むため)
-- `infra/**` の変更 → `terraform plan` (apply は手動承認後)
+Requirements: Node.js 20.19 or newer, pnpm 11, Go, Rust stable, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; and model-provider credentials for the conversation model and for two separate review models.
+
+```sh
+make setup
+cp deploy/local/.env.example deploy/local/.env.local
+chmod 600 deploy/local/.env.local
+# Fill in the Firebase, identity and model values described in docs/local-development.md
+make dev-check
+make dev
+```
+
+Open exactly <http://127.0.0.1:5173>. [Real local stack](docs/local-development.md) explains each setting, access from another Tailnet device, calls and recovery.
+
+## Repository layout
+
+```text
+apps/
+  web/                React Web app: the single renderer for Web, mobile WebApp and a future desktop app
+                      (cloudflare/ holds the edge Worker for serving the Web app on Cloudflare)
+  api/                Go API: sign-in sessions, identity, Workspaces, Messaging, approvals,
+                      model connections, usage, and the state service the secretary core uses
+  core/               TypeScript secretary core: Node.js hosts and the Cloudflare Durable Object host
+  agent/              Rust agent runtime and isolated tool executor used by `make dev`
+packages/
+  ui/                 @sumi/ui component catalog (based on shadcn/ui)
+  sdui/               @sumi/sdui declarative UI schema (zod) and renderer
+  api-client/         @sumi/api-client types generated from contracts/
+  typescript-config/  shared tsconfig presets
+contracts/            OpenAPI and agent event schemas
+deploy/               local-host/ (sumi-local), local/ (development Compose), service Dockerfiles, firebase/
+docs/                 ADRs, design notes and runbooks
+scripts/              development, acceptance and operations scripts
+CONTEXT.md            domain glossary (Japanese)
+```
+
+## Technology
+
+| Area | Technology |
+|---|---|
+| Web app | React 19, TypeScript, Vite, TanStack Router, Tailwind CSS v4, Zustand, zod |
+| UI components | `@sumi/ui` (based on shadcn/ui), `@sumi/sdui` |
+| Sign-in | Firebase Authentication, with sessions issued by the Go API |
+| API and canonical state | Go, PostgreSQL |
+| Secretary core | TypeScript on Node.js (Local) and Cloudflare Workers Durable Objects (Cloud) |
+| Agent runtime for the developer stack | Rust |
+| Calls | LiveKit |
+| Contracts | OpenAPI, JSON Schema |
+| Monorepo and tooling | pnpm workspaces, Turborepo, Biome |
+| Build configuration | GitHub Actions workflows; a `Jenkinsfile` for building container images |
+
+## Development commands
+
+```sh
+make build     # build all apps and packages
+make lint      # Biome, go vet, cargo clippy and rustfmt
+make test      # all tests
+make format    # format the repository
+make db-up     # start the development PostgreSQL in Docker
+make migrate   # apply API schema migrations (requires SUMI_DB_URL)
+```
+
+After editing `contracts/openapi.yaml` or `contracts/agent-events.yaml`, regenerate the TypeScript types with `pnpm --filter @sumi/api-client generate`. `make dev-workspaces` only runs each package's raw dev task; it does not start a usable Sumi.
+
+The workflows in `.github/workflows/` are configured to run on every pull request and on pushes to `main`: Web and shared TypeScript checks, Web edge contracts, API contracts against PostgreSQL, the secretary core, and the Rust agent.
+
+## Design principles
+
+- **People and secretaries use the same apps.** A secretary works through the same applications, operations and authorization checks as people, not through a separate agent-only copy of the product ([ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md), [ADR 0011 (proposed)](docs/adr/0011-messaging-surface-and-agent-participation.md), [ADR 0013](docs/adr/0013-tool-invocation-routes-and-authority-provenance.md)).
+- **A secretary is one continuing individual.** People and secretaries are registered in the same identity registry. Starting or stopping the process that runs a secretary is resource management; it is not the secretary sleeping or ending ([ADR 0009](docs/adr/0009-human-koseki-and-multi-user-auth.md), [CONTEXT.md](CONTEXT.md)).
+- **Canonical state lives behind the API.** The processes that run a secretary keep no canonical state, so they can be stopped, restarted or replaced, and the next process recovers from what was saved.
+- **A person's model choice is authoritative.** The new secretary core does not substitute an operator model for the connection a person selected.
+- **One renderer and one contract source.** `apps/web` is the only application renderer, and `contracts/` defines the API and event schemas shared across languages.
+
+## Documentation
+
+- [CONTEXT.md](CONTEXT.md) — domain terms such as Human, Secretary, Workspace and Hire (Japanese)
+- [docs/adr/](docs/adr/) — architecture decisions
+- [Local host](docs/local-host.md) — installing and running the new secretary core without a Cloud account
+- [Real local stack](docs/local-development.md) — running the full Web app from source
+- [Portable secretary state](docs/agent/portable-state.md) — the foundation for moving a secretary between Local and Cloud
+- [Secretary core on Cloudflare](docs/operations/cloud-core-alpha.md) — how the Cloud secretary core is deployed and verified (operators)
+- [Roadmap](docs/roadmap.md)
