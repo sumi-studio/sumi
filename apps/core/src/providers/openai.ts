@@ -106,7 +106,11 @@ export class OpenAIProvider implements ModelProvider {
                 role: m.role,
                 content: m.content,
                 ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
-                ...(m.name ? { name: m.name } : {}),
+                // `tool_call_id` links a tool result to its call. Some upstreams
+                // reject an extra `name` field — omen-alpha 400s with 'messages[i]:
+                // "name" is not supported by this endpoint'. Other roles
+                // still pass it through.
+                ...(m.name && m.role !== "tool" ? { name: m.name } : {}),
                 ...(m.toolCalls?.length
                   ? {
                       tool_calls: m.toolCalls.map((c) => ({

@@ -570,6 +570,8 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
   let parsed: {
     messages?: {
       role: string;
+      name?: string;
+      tool_call_id?: string;
       tool_calls?: { id: string; function: { name: string } }[];
     }[];
   } = {};
@@ -601,7 +603,16 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
               },
             ],
           },
-          { role: "tool", toolCallId: "c1", content: '{"ok":true}' },
+          {
+            role: "tool",
+            toolCallId: "c1",
+            // The secretary sets the canonical name on tool results; the
+            // wire must NOT carry it — tool_call_id is the linkage and
+            // some upstreams reject the extra field (observed live:
+            // omen-alpha 400s '"name" is not supported by this endpoint').
+            name: "journal.note",
+            content: '{"ok":true}',
+          },
         ],
       })) {
         /* drain */
@@ -611,6 +622,9 @@ test("a replayed call keeps a valid wire name after the tool leaves the advertis
   const replayed = parsed.messages?.[0]?.tool_calls?.[0];
   assert.equal(replayed?.id, "c1");
   assert.equal(replayed?.function.name, "journal_note");
+  const toolMsg = parsed.messages?.find((m) => m.role === "tool");
+  assert.equal(toolMsg?.tool_call_id, "c1");
+  assert.equal(toolMsg?.name, undefined, "tool message leaked name field");
 });
 
 test("a configured session header carries the persona's stable identity", async () => {
