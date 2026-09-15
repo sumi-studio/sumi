@@ -37,7 +37,7 @@ func resetTables(t *testing.T, dsn string) {
 	}
 	defer conn.Close(context.Background())
 	_, err = conn.Exec(context.Background(),
-		`TRUNCATE file_version, file_event, file_op;
+		`TRUNCATE file_version, file_event, file_op, recovery_place;
 		 DELETE FROM store_meta;
 		 SELECT setval('file_version_seq', 1, false)`)
 	// Tables may not exist before first migrate — that's fine, the
@@ -55,7 +55,7 @@ func resetTables(t *testing.T, dsn string) {
 		}
 		defer conn.Close(context.Background())
 		if _, err := conn.Exec(context.Background(),
-			`TRUNCATE file_version, file_event, file_op;
+			`TRUNCATE file_version, file_event, file_op, recovery_place;
 			 DELETE FROM store_meta;
 			 SELECT setval('file_version_seq', 1, false)`); err != nil {
 			t.Fatalf("reset: %v", err)

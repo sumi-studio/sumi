@@ -467,6 +467,20 @@ func (s *Store) migrate(ctx context.Context) error {
 		);
 		ALTER TABLE file_event ADD COLUMN IF NOT EXISTS from_path text;
 		CREATE INDEX IF NOT EXISTS file_event_scope_seq ON file_event(scope, seq);
+		-- recovery_place journals which object identity a recovery pass
+		-- last placed at a public path. It is the evidence that lets a
+		-- later sweep repair a recovery-caused misplacement WITHOUT
+		-- mistaking an ordinary external rename for damage: only an
+		-- object the service itself put at a public name may be moved
+		-- back off it.
+		CREATE TABLE IF NOT EXISTS recovery_place (
+			scope text NOT NULL,
+			path  text NOT NULL,
+			fp    text NOT NULL,
+			birth text NOT NULL DEFAULT '',
+			at    timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (scope, path)
+		);
 		CREATE SEQUENCE IF NOT EXISTS file_version_seq;
 		CREATE TABLE IF NOT EXISTS store_meta (
 			id          boolean PRIMARY KEY DEFAULT true CHECK (id),
@@ -1312,32 +1326,6 @@ func stageRel(it intent) string {
 	return parent + "/" + name
 }
 
-// recordedAt returns the scope path whose file_version row currently
-// records fingerprint st3 (the ino:size:mtime triple — ctime is never
-// compared), or "" when no row records it. A non-nil error means the
-// row set is unverifiable — callers must fail closed (preserve the
-// object, never delete).
-func (s *Store) recordedAt(ctx context.Context, scope, st3 string) (string, bool, error) {
-	if s.pool == nil {
-		return "", false, nil // test-only Store without a pool: empty row set
-	}
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	var home string
-	err := s.pool.QueryRow(dctx,
-		`SELECT path FROM file_version
-		  WHERE scope=$1 AND (fp = $2 OR fp LIKE $2 || ':%')
-		    AND content_sha <> 'dir'
-		  ORDER BY path LIMIT 1`, scope, st3).Scan(&home)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	return home, true, nil
-}
-
 // recClaim is the outcome of resolving which version row records a
 // parked object.
 type recClaim int
@@ -1368,26 +1356,39 @@ const (
 // unresolvable is recAmbiguous — callers preserve rather than install
 // content at a home no evidence supports.
 func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st FileInfo, view ReconView) (string, recClaim, error) {
-	if st.Kind != "dir" {
-		home, found, err := s.recordedAt(ctx, scope, fp3(st.Fingerprint))
-		if err != nil || !found {
-			return "", recNone, err
-		}
-		return home, recFound, nil
+	return s.recordedAtObjectSeen(ctx, scope, rel, st, view, map[string]struct{}{})
+}
+
+func (s *Store) recordedAtObjectSeen(ctx context.Context, scope, rel string, st FileInfo, view ReconView, seen map[string]struct{}) (string, recClaim, error) {
+	if s.pool == nil {
+		return "", recNone, nil
 	}
-	ino, _, _, ok := fpParts(st.Fingerprint)
-	if !ok || s.pool == nil {
-		return "", recNone, nil // unidentifiable — preserve
-	}
-	// Kind discrimination: a directory object is claimable only by rows
-	// that record directories (content_sha='dir') or carry no kind
-	// evidence (''). A file row must never route a dir onto its path.
+	// Claim collection differs by kind. A file row's match key is fp3 —
+	// ino:size:mtime, the content generation it acknowledges — and a
+	// file object may never be claimed by a 'dir' row. A directory's
+	// fp3 churns with membership, so its claim key is the inode leg,
+	// and a real-sha file row may never claim a dir object.
+	var rows pgx.Rows
+	var qerr error
 	dctx, cancel := s.dbCtx(ctx)
-	rows, qerr := s.pool.Query(dctx,
-		`SELECT path, fp, birth FROM file_version
-		  WHERE scope=$1 AND fp LIKE $2 || ':%:%:%'
-		    AND (content_sha='dir' OR content_sha='')
-		  ORDER BY path`, scope, ino)
+	if st.Kind == "dir" {
+		ino, _, _, ok := fpParts(st.Fingerprint)
+		if !ok {
+			cancel()
+			return "", recNone, nil // unidentifiable — preserve
+		}
+		rows, qerr = s.pool.Query(dctx,
+			`SELECT path, fp, birth FROM file_version
+			  WHERE scope=$1 AND fp LIKE $2 || ':%:%:%'
+			    AND (content_sha='dir' OR content_sha='')
+			  ORDER BY path`, scope, ino)
+	} else {
+		rows, qerr = s.pool.Query(dctx,
+			`SELECT path, fp, birth FROM file_version
+			  WHERE scope=$1 AND (fp = $2 OR fp LIKE $2 || ':%')
+			    AND content_sha <> 'dir'
+			  ORDER BY path`, scope, fp3(st.Fingerprint))
+	}
 	if qerr != nil {
 		cancel()
 		return "", recNone, qerr
@@ -1399,26 +1400,27 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 		// complete claim set — fail closed.
 		return "", recNone, cerr
 	}
+	// A birth contradiction is positive evidence AGAINST a claim: when
+	// both the row and the live object carry btime, a mismatch proves
+	// the row recorded a different object — it cannot then re-enter
+	// through a weaker leg. Missing birth on either side is no
+	// evidence at all, never a contradiction.
+	kept := claims[:0]
+	for _, c := range claims {
+		if st.Birth != "" && c.birth != "" && c.birth != st.Birth {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	claims = kept
 	if len(claims) == 0 {
 		return "", recNone, nil
 	}
-	// Presence beats tiering: a home that currently holds THIS object
-	// (dev:ino) is already satisfied — the parked name is a surplus
-	// link to the same content, whatever the claim's strength.
-	if view != nil {
-		for _, c := range claims {
-			if dst, err := view.Stat(scope, c.path); err == nil && sameObjectAt(st, dst) {
-				return c.path, recFound, nil
-			}
-		}
-	}
 	// Evidence tiers, strongest first. ino+birth is durable object
-	// identity: btime survives rename and membership churn and is
-	// unique per object on a filesystem — a stale row from inode reuse
-	// cannot counterfeit it. Exact fingerprint and fp3 are
-	// generation-level evidence; the bare inode leg is the weakest —
-	// necessary for pre-birth rows but never sufficient on its own
-	// when it is the only claim a live object cannot corroborate.
+	// identity where the filesystem reports btime. Exact fingerprint
+	// and fp3 are generation-level evidence; the bare inode leg is the
+	// weakest — needed for pre-birth rows and btime-less filesystems
+	// but never sufficient alone for an uncorroborated dir claim.
 	var born, exact, triple, rest []string
 	st3 := fp3(st.Fingerprint)
 	for _, c := range claims {
@@ -1446,36 +1448,50 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 		cands = rest
 		strong = false
 	}
+	// Presence inside the strongest tier: a candidate path that already
+	// holds THIS object (dev:ino) is satisfied — the parked name is a
+	// surplus link. Presence never preempts ranking itself: a weaker
+	// claimant that happens to hold the object cannot outrank a
+	// stronger claim elsewhere.
+	if view != nil {
+		for _, p := range cands {
+			if dst, err := view.Stat(scope, p); err == nil && sameObjectAt(st, dst) {
+				return p, recFound, nil
+			}
+		}
+	}
 	if len(cands) == 1 {
 		if strong {
 			return cands[0], recFound, nil
 		}
 		// A sole inode-leg claimant is a guess, not authority: an
 		// externally deleted object's row keeps its fp forever, and
-		// inode reuse hands that leg to an unrelated object. Require
-		// the container's own membership to corroborate the claimant —
-		// a recorded member whose row resolves beneath it — else the
+		// inode reuse (ext4 recycles ino; a mount brings its own space)
+		// hands that leg to an unrelated object. Require the
+		// container's own membership to corroborate the claimant — a
+		// recorded member whose row resolves beneath it — else the
 		// claim is ambiguous and the object is preserved.
-		if view != nil && s.dirMemberCorroborates(ctx, view, scope, rel, cands[0]) {
+		if view != nil && s.dirMemberCorroborates(ctx, view, scope, rel, cands[0], seen) {
 			return cands[0], recFound, nil
 		}
 		return "", recAmbiguous, nil
 	}
 	// Multiple strongest-tier claimants. Member corroboration may elect
-	// only a candidate whose path is open — absent or holding this very
-	// object (presence above). A candidate occupied by a different live
-	// object stays eligible only when NO open candidate exists: member
-	// inference can bind a container to a home, but evicting a live
-	// occupant needs object-level evidence, which parkedOwnsRow ranks
-	// once the home is chosen — corroboration alone must not order an
-	// eviction while an equal open home exists.
+	// only a candidate whose path is open — verified absent. A
+	// candidate that is occupied OR unverifiable (EIO/EACCES/timeout —
+	// a stat error is not absence) stays eligible only when NO open
+	// candidate exists: member inference can bind a container to a
+	// home, but evicting whatever may sit at an unverified path needs
+	// object-level evidence, which parkedOwnsRow ranks once the home
+	// is chosen — and which cannot even run when the destination
+	// cannot be observed.
 	if view != nil {
 		var open, blocked []string
 		for _, p := range cands {
-			if _, err := view.Stat(scope, p); err != nil {
-				open = append(open, p) // absent — installable
+			if _, err := view.Stat(scope, p); absentVerdict(err) {
+				open = append(open, p) // verified absent — installable
 			} else {
-				blocked = append(blocked, p) // held by a different live object
+				blocked = append(blocked, p) // occupied or unverifiable
 			}
 		}
 		pool := open
@@ -1484,7 +1500,7 @@ func (s *Store) recordedAtObject(ctx context.Context, scope, rel string, st File
 		}
 		var corroborated []string
 		for _, p := range pool {
-			if s.dirMemberCorroborates(ctx, view, scope, rel, p) {
+			if s.dirMemberCorroborates(ctx, view, scope, rel, p, seen) {
 				corroborated = append(corroborated, p)
 			}
 		}
@@ -1524,7 +1540,13 @@ func collectClaims(rows pgx.Rows) ([]dirClaim, error) {
 // container swapped at rel mid-pass only yields whichever members the
 // current object holds, and corroboration can never authorize
 // anything on its own beyond choosing among claimant rows.
-func (s *Store) dirMemberCorroborates(ctx context.Context, view ReconView, scope, rel, home string) bool {
+// seen bounds the corroboration recursion: a dir member's own claim
+// evaluation may itself need corroboration, which walks ITS members.
+// Without a visited set a cyclic structure (a bind-mounted alias, a
+// dir reachable inside itself) would recurse forever — each container
+// is expanded once per top-level judgment, keyed by dev:ino or path
+// when the object cannot be identified.
+func (s *Store) dirMemberCorroborates(ctx context.Context, view ReconView, scope, rel, home string, seen map[string]struct{}) bool {
 	members, lerr := view.ListStaged(scope, rel, "")
 	if lerr != nil {
 		return false
@@ -1533,13 +1555,19 @@ func (s *Store) dirMemberCorroborates(ctx context.Context, view ReconView, scope
 		if strings.HasPrefix(m, opStagePrefix) || strings.HasPrefix(m, stagingPrefix) {
 			continue
 		}
-		mst, merr := view.Stat(scope, rel+"/"+m)
+		mrel := rel + "/" + m
+		mst, merr := view.Stat(scope, mrel)
 		if merr != nil {
 			continue
 		}
+		if mst.Kind == "dir" {
+			if !markSeen(seen, mst, mrel) {
+				continue // already expanded — cycle or second alias
+			}
+		}
 		// Kind-aware: a dir member's own claim runs the dir-claim path
 		// (inode leg + birth), a file member's the fp3 path.
-		mh, mclaim, merr := s.recordedAtObject(ctx, scope, rel+"/"+m, mst, view)
+		mh, mclaim, merr := s.recordedAtObjectSeen(ctx, scope, mrel, mst, view, seen)
 		if merr != nil || mclaim != recFound {
 			continue
 		}
@@ -1868,9 +1896,11 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 				}
 				if _, base := splitRel(rel); isSealedName(base) {
 					s.drainSealed(view, it.scope, stageRel(it), rel, it.path)
+					s.journalPlacement(ctx, it.scope, view, it.path)
 					return
 				}
 				if view.SwapStaged(it.scope, rel, it.path) == nil {
+					s.journalPlacement(ctx, it.scope, view, it.path)
 					if h2, herr2 := view.Hash(it.scope, rel); herr2 == nil && h2 == it.expectSHA {
 						// Our stale bytes came back — discard them
 						// unless a row records this object.
@@ -1974,12 +2004,13 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		s.extractDivergentMembers(ctx, scope, view, rel, destPath)
 	}
 	dctx, cancel := s.dbCtx(ctx)
-	var rowFP, rowSHA string
+	var rowFP, rowSHA, rowBirth string
 	rerr := s.pool.QueryRow(dctx,
-		`SELECT fp, content_sha FROM file_version WHERE scope=$1 AND path=$2`,
-		scope, destPath).Scan(&rowFP, &rowSHA)
+		`SELECT fp, content_sha, birth FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, destPath).Scan(&rowFP, &rowSHA, &rowBirth)
 	cancel()
-	rowMatch := rerr == nil && recordedMatch(rowFP, st)
+	rowMatch := rerr == nil && recordedMatch(rowFP, st) &&
+		birthVerdict(rowBirth, st) >= 0
 	dst, derr := view.Stat(scope, destPath)
 	switch {
 	case derr == nil:
@@ -1988,7 +2019,7 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 		// sealed rel cannot receive the displaced squatter, so drain
 		// through the unsealed base slot instead.
 		if rowMatch && !sameObjectAt(st, dst) &&
-			s.parkedOwnsRow(ctx, view, scope, rel, destPath, rowFP, rowSHA, st, dst) {
+			s.parkedOwnsRow(ctx, view, scope, rel, destPath, rowFP, rowSHA, rowBirth, st, dst) {
 			// The occupant may be a live writer's fresh object whose row
 			// has not committed yet; moving it now would only churn it
 			// into this namespace. Retry once those writers settle.
@@ -2000,8 +2031,9 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 			}
 			if _, base := splitRel(rel); isSealedName(base) {
 				s.drainSealed(view, scope, parkBase, rel, destPath)
-			} else {
-				_ = view.SwapStaged(scope, rel, destPath)
+				s.journalPlacement(ctx, scope, view, destPath)
+			} else if view.SwapStaged(scope, rel, destPath) == nil {
+				s.journalPlacement(ctx, scope, view, destPath)
 			}
 		}
 	case absentVerdict(derr):
@@ -2011,8 +2043,9 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 			// restoring recovers the pre-effect shape.
 			movable = true
 		}
-		if movable && s.moveJudged(view, scope, rel, st) {
-			_ = view.MoveStaged(scope, rel, destPath)
+		if movable && s.moveJudged(view, scope, rel, st) &&
+			view.MoveStaged(scope, rel, destPath) == nil {
+			s.journalPlacement(ctx, scope, view, destPath)
 		}
 	default:
 		// unverifiable — leave parked
@@ -2025,6 +2058,41 @@ func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, vie
 			s.routeDirMembers(ctx, scope, view, destPath)
 		}
 	}
+}
+
+// journalPlacement records which object a recovery move actually landed
+// at a public path — stat'ed AFTER the move, so a swap inside the
+// stat→move window journals the true occupant, not the intended one.
+// This is the ownership evidence verifyPublicMember needs before it may
+// reverse a placement: without it the service cannot distinguish its own
+// recovery residue from an ordinary external rename it must not undo.
+// Journal failure is fail-safe in the conservative direction: an
+// unjournaled placement is simply never auto-reversed.
+func (s *Store) journalPlacement(ctx context.Context, scope string, view ReconView, destPath string) {
+	if s.pool == nil || view == nil {
+		return
+	}
+	dst, serr := view.Stat(scope, destPath)
+	if serr != nil {
+		return // nothing verifiably landed — journal nothing
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	_, _ = s.pool.Exec(dctx,
+		`INSERT INTO recovery_place (scope, path, fp, birth)
+		 VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (scope,path) DO UPDATE
+		 SET fp=EXCLUDED.fp, birth=EXCLUDED.birth, at=now()`,
+		scope, destPath, dst.Fingerprint, dst.Birth)
+	cancel()
+}
+
+// placedHere reports whether a recovery_place row records THIS object —
+// the same contract as row matching (recordedMatch): fp3 generation for
+// files, inode leg for directories. A full-fingerprint compare would
+// break on every rename, which legitimately updates ctime; birth is a
+// positive confirmation only, never required (btime-less filesystems).
+func placedHere(fp, birth string, st FileInfo) bool {
+	return recordedMatch(fp, st) && birthVerdict(birth, st) >= 0
 }
 
 // moveJudged binds the mutation to the object this pass judged: the
@@ -2130,13 +2198,17 @@ func (s *Store) extractDivergentMembers(ctx context.Context, scope string, view 
 //
 //  1. If the occupant fails the row's evidence outright it is an
 //     undisputed impostor — swap.
-//  2. Recorded generation: exactly one candidate still equals the
+//  2. Birth evidence: the row's persisted btime names one creation
+//     event. A candidate whose own birth contradicts the row's cannot
+//     be its subject; a matching birth beats every weaker leg. Missing
+//     birth on either side is no evidence — never a contradiction.
+//  3. Recorded generation: exactly one candidate still equals the
 //     row's fp3 — the object the row recorded, unchurned since commit.
-//  3. Content evidence: a file row's content_sha names the recorded
+//  4. Content evidence: a file row's content_sha names the recorded
 //     bytes — a hash match beats an fp3-coincident impostor.
-//  4. Container corroboration: a member of the parked dir whose own
+//  5. Container corroboration: a member of the parked dir whose own
 //     row resolves beneath destPath binds the container to that home.
-//  5. Nothing separates them — preserve both: leave the occupant,
+//  6. Nothing separates them — preserve both: leave the occupant,
 //     keep the parked object enumerable for a pass with better
 //     evidence. Never evict on a guess.
 //
@@ -2146,9 +2218,13 @@ func (s *Store) extractDivergentMembers(ctx context.Context, scope string, view 
 // recorded (mount topology can change). Device evidence binds two live
 // stats (sameObjectAt); it cannot reconstruct which object a row
 // described.
-func (s *Store) parkedOwnsRow(ctx context.Context, view ReconView, scope, rel, destPath, rowFP, rowSHA string, st, dst FileInfo) bool {
+func (s *Store) parkedOwnsRow(ctx context.Context, view ReconView, scope, rel, destPath, rowFP, rowSHA, rowBirth string, st, dst FileInfo) bool {
 	if !recordedMatch(rowFP, dst) {
 		return true // occupant is not the row's subject at all
+	}
+	stB, dstB := birthVerdict(rowBirth, st), birthVerdict(rowBirth, dst)
+	if stB != dstB {
+		return stB > dstB // matching birth > unknown > contradicting
 	}
 	stGen := fp3(rowFP) == fp3(st.Fingerprint)
 	dstGen := fp3(rowFP) == fp3(dst.Fingerprint)
@@ -2162,10 +2238,22 @@ func (s *Store) parkedOwnsRow(ctx context.Context, view ReconView, scope, rel, d
 			return hs == rowSHA
 		}
 	}
-	if st.Kind == "dir" && s.dirMemberCorroborates(ctx, view, scope, rel, destPath) {
+	if st.Kind == "dir" && s.dirMemberCorroborates(ctx, view, scope, rel, destPath, map[string]struct{}{}) {
 		return true
 	}
 	return false
+}
+
+// birthVerdict compares a row's persisted birth with a live object's:
+// +1 match, 0 when either side lacks the evidence, -1 contradiction.
+func birthVerdict(rowBirth string, st FileInfo) int {
+	if rowBirth == "" || st.Birth == "" {
+		return 0
+	}
+	if rowBirth == st.Birth {
+		return 1
+	}
+	return -1
 }
 
 // drainSealed moves a sealed quarantine object onto its home name when
@@ -2286,32 +2374,68 @@ func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconVie
 // treat rel as the same entry. An object stays when the row at its
 // path records it (coherent), when no row anywhere records it (unknown
 // — preserved), or when claims cannot be resolved (ambiguous —
-// preserved). Only a verifiably-recorded-elsewhere object moves, and
-// the move runs the same authority path as any restore: occupied homes
-// are arbitrated by parkedOwnsRow, never overwritten.
+// preserved).
+//
+// A public path holding a recorded-elsewhere object is not proof the
+// service put it there: people and secretaries share this filesystem,
+// and an ordinary external `mv a b` produces exactly this shape —
+// object at b, row still naming a. Automatically undoing a deliberate
+// move is not acceptable, so rerouting requires the recovery_place
+// journal to prove THIS object was placed at rel by a recovery pass.
+// What the journal cannot distinguish — an externally misplaced
+// recorded object at a public path — stays put by design; its row stays
+// truthful and the object remains reachable. Recovery repairs only its
+// own residue.
 func (s *Store) verifyPublicMember(ctx context.Context, scope string, view ReconView, rel string, st FileInfo) bool {
 	dctx, cancel := s.dbCtx(ctx)
-	var rowFP, rowSHA string
+	var rowFP, rowSHA, rowBirth string
 	rerr := s.pool.QueryRow(dctx,
-		`SELECT fp, content_sha FROM file_version WHERE scope=$1 AND path=$2`,
-		scope, rel).Scan(&rowFP, &rowSHA)
+		`SELECT fp, content_sha, birth FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, rel).Scan(&rowFP, &rowSHA, &rowBirth)
 	cancel()
 	if rerr != nil && !errors.Is(rerr, pgx.ErrNoRows) {
 		return true // row set unverifiable — preserve, never reroute
 	}
 	// Coherence needs kind agreement too: a real-sha file row cannot
 	// record a dir object, and a 'dir' row cannot record a file. An
-	// empty sha carries no kind evidence — coherent for either.
+	// empty sha carries no kind evidence — coherent for either. Birth
+	// likewise only contradicts when both sides carry it.
 	kindOK := st.Kind != "dir" || rowSHA == "dir" || rowSHA == ""
 	if st.Kind == "file" && rowSHA == "dir" {
 		kindOK = false
 	}
-	if rerr == nil && recordedMatch(rowFP, st) && kindOK {
+	if rerr == nil && recordedMatch(rowFP, st) && kindOK &&
+		birthVerdict(rowBirth, st) >= 0 {
 		return true // the row at this path records this object — coherent
 	}
 	home, claim, derr := s.recordedAtObject(ctx, scope, rel, st, view)
 	if derr != nil || claim != recFound || home == rel {
 		return true // unrecorded, unverifiable, or ambiguous — preserved
+	}
+	// Ownership gate: only an object a recovery pass itself placed at
+	// rel may be moved off it — anything else is user-domain content
+	// (an ordinary rename, an editor's write), which must not be
+	// reverted. A stale or contradicting journal row is pruned.
+	dctx, cancel = s.dbCtx(ctx)
+	var placeFP, placeBirth string
+	perr := s.pool.QueryRow(dctx,
+		`SELECT fp, birth FROM recovery_place WHERE scope=$1 AND path=$2`,
+		scope, rel).Scan(&placeFP, &placeBirth)
+	cancel()
+	if perr != nil {
+		return true // not journaled (or unreadable) — preserve
+	}
+	if !placedHere(placeFP, placeBirth, st) {
+		dctx, cancel = s.dbCtx(ctx)
+		_, _ = s.pool.Exec(dctx,
+			`DELETE FROM recovery_place WHERE scope=$1 AND path=$2`, scope, rel)
+		cancel()
+		return true // journal records a different object — stale; preserve
+	}
+	// A live writer may be committing to rel or home this instant —
+	// defer rather than move an object out from under an in-flight op.
+	if busy, berr := s.recordersActive(ctx, scope); berr != nil || busy {
+		return true
 	}
 	if pdir, _ := splitRel(home); pdir != "" {
 		if err := view.EnsureDir(scope, pdir); err != nil {
@@ -2319,8 +2443,15 @@ func (s *Store) verifyPublicMember(ctx context.Context, scope string, view Recon
 		}
 	}
 	s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
-	_, serr := view.Stat(scope, rel)
-	return serr == nil
+	if _, serr := view.Stat(scope, rel); serr != nil {
+		// The object left rel — the placement journal is consumed.
+		dctx, cancel = s.dbCtx(ctx)
+		_, _ = s.pool.Exec(dctx,
+			`DELETE FROM recovery_place WHERE scope=$1 AND path=$2`, scope, rel)
+		cancel()
+		return false
+	}
+	return true
 }
 
 // markSeen records a directory identity for the sweep's loop guard.
