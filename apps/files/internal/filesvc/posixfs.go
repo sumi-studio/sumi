@@ -689,15 +689,19 @@ func quarantineDelete(pfd *os.File, name, want3 string) (string, error) {
 // the inode this call created — a delayed exchange decided earlier could
 // land different bytes at the enumerable slot name between the create
 // and this cleanup; an inode mismatch parks the foreign object at the
-// sealed name for the reconciler instead of deleting it.
-func discardStaged(pfd *os.File, tmp string, ino uint64) {
-	_, _ = quarantineDeleteMatch(pfd, tmp, func(qname string) (bool, error) {
+// sealed name for the reconciler instead of deleting it. A non-nil
+// return means a residual may remain at the slot or sealed name: callers
+// must keep the intent (errUndoParked) so the parked object stays
+// enumerable, rather than letting a definitive error drop it.
+func discardStaged(pfd *os.File, tmp string, ino uint64) error {
+	_, err := quarantineDeleteMatch(pfd, tmp, func(qname string) (bool, error) {
 		qino, err := inoAt(pfd, qname)
 		if err != nil {
 			return false, err
 		}
 		return qino == ino, nil
 	})
+	return err
 }
 
 // undoDisplaced reverses a committed exchange after verification found
@@ -1145,9 +1149,9 @@ func (v *rootView) SwapStaged(scope, staged, name string) error {
 	}
 	sDir, sName := splitRel(relS)
 	nDir, nName := splitRel(relN)
-	if isSealedName(sName) {
-		// The exchange writes the name's content into `staged` — a
-		// sealed quarantine name can never be a write target, or the
+	if isSealedName(sName) || isSealedName(nName) {
+		// The exchange writes into BOTH names — a sealed quarantine
+		// name can never be a write target on either side, or the
 		// verify→unlink of a pending delete could land on bytes nobody
 		// checked.
 		return ErrReserved
@@ -1350,19 +1354,30 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// enumerable slot between create and cleanup, and an inode-mismatched
 	// capture is parked rather than deleted.
 	ourIno, _ := inoAt(pfd, tmp)
+	if p.faultHook != nil {
+		p.faultHook("write.postCreate")
+	}
+	// fail returns a pre-commit error after best-effort cleanup of the
+	// staged file. If the cleanup left a residual — a foreign object
+	// parked under a sealed name, or the slot still occupied — the intent
+	// must be tombstoned, not dropped: only a live intent keeps that
+	// evidence enumerable for the reconciler.
+	fail := func(perr error) (FileInfo, bool, error) {
+		if derr := discardStaged(pfd, tmp, ourIno); derr != nil {
+			return FileInfo{}, false, fmt.Errorf("%w: %w", perr, errUndoParked)
+		}
+		return FileInfo{}, false, perr
+	}
 	if _, err := tf.Write(content); err != nil {
 		tf.Close()
-		discardStaged(pfd, tmp, ourIno)
-		return FileInfo{}, false, mapPathErr(err)
+		return fail(mapPathErr(err))
 	}
 	if err := tf.Sync(); err != nil {
 		tf.Close()
-		discardStaged(pfd, tmp, ourIno)
-		return FileInfo{}, false, mapPathErr(err)
+		return fail(mapPathErr(err))
 	}
 	if err := tf.Close(); err != nil {
-		discardStaged(pfd, tmp, ourIno)
-		return FileInfo{}, false, mapPathErr(err)
+		return fail(mapPathErr(err))
 	}
 	// Our object's identity before any exchange — ctime shifts on relink,
 	// so identity is the ino:size:mtime triple only.
@@ -1394,8 +1409,7 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	}
 	if exclusive {
 		if err := unix.Linkat(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0); err != nil {
-			discardStaged(pfd, tmp, ourIno)
-			return FileInfo{}, false, mapPublishErr(err, exclusive)
+			return fail(mapPublishErr(err, exclusive))
 		}
 		return commit(our3)
 	}
@@ -1405,23 +1419,20 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		// The name is empty.
 		if expectFP != "" {
 			// The object the intent expected to displace is gone.
-			discardStaged(pfd, tmp, ourIno)
-			return FileInfo{}, false, ErrExternalChange
+			return fail(ErrExternalChange)
 		}
 		if perr := unix.Renameat2(int(pfd.Fd()), tmp,
 			int(pfd.Fd()), name, unix.RENAME_NOREPLACE); perr != nil {
-			discardStaged(pfd, tmp, ourIno)
 			if errors.Is(perr, unix.EEXIST) {
 				// A foreign object claimed the empty name — do not
 				// overwrite it.
-				return FileInfo{}, false, ErrExternalChange
+				return fail(ErrExternalChange)
 			}
-			return FileInfo{}, false, mapPublishErr(perr, exclusive)
+			return fail(mapPublishErr(perr, exclusive))
 		}
 		return commit(our3)
 	case err != nil:
-		discardStaged(pfd, tmp, ourIno)
-		return FileInfo{}, false, mapPublishErr(err, exclusive)
+		return fail(mapPublishErr(err, exclusive))
 	}
 	// Exchanged: tmp now holds the object the name used to hold.
 	d3, dMode, _, serr := fp3at(pfd, tmp)
@@ -1685,6 +1696,9 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 // The bool result reports whether the object is gone — an error after
 // that point is observation, not non-commit (F-RA-5/f120).
 func (p *posixRoot) remove(scope, path, expectFP, stage string) (bool, error) {
+	if err := checkReserved(path); err != nil {
+		return false, err
+	}
 	rel, err := relPath(path)
 	if err != nil {
 		return false, err

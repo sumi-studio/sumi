@@ -1196,10 +1196,12 @@ func stageRel(it intent) string {
 func (s *Store) settleStaged(ctx context.Context, it intent, view ReconView, tombstoned bool) {
 	rel := stageRel(it)
 	s.settleStagedOne(ctx, it, view, rel, tombstoned)
-	// Crash-orphaned quarantine objects carry the same identity
-	// evidence; re-judge them each pass.
+	// Crash-orphaned quarantine (-q-) and parked (-p-) objects carry the
+	// same identity evidence; re-judge them each pass. The "-"-suffixed
+	// prefix covers both classes and -p-…-q- chains from sealed captures
+	// of a parked name.
 	dir, base := splitRel(rel)
-	if names, err := view.ListStaged(it.scope, dir, base+"-q-"); err == nil {
+	if names, err := view.ListStaged(it.scope, dir, base+"-"); err == nil {
 		for _, n := range names {
 			qrel := n
 			if dir != "" {
@@ -1350,14 +1352,16 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 
 // drainSealed moves a sealed quarantine object onto its home name when
 // that name holds content that must give way — without ever writing
-// into the sealed name. The name's current object is first parked at
-// the intent's unsealed base slot (NOREPLACE, so an occupied slot
-// defers the whole restore to a later pass); then the sealed object
-// moves onto the now-empty name. A racer claiming the name between the
-// two moves leaves the sealed object parked — bytes are preserved and
-// the next pass retries. Nothing is deleted here.
+// into the sealed name. The name's current object is first parked at a
+// fresh enumerable -p- name (never the fixed base slot: a permanently
+// parked unattributable object there must not stall restores forever),
+// then the sealed object moves onto the now-empty name. A racer
+// claiming the name between the two moves leaves the sealed object
+// parked — bytes are preserved and the next pass retries with a fresh
+// park name, so convergence requires only finite interference, never a
+// free base slot. Nothing is deleted here.
 func (s *Store) drainSealed(view ReconView, it intent, rel, name string) {
-	if view.MoveStaged(it.scope, name, stageRel(it)) != nil {
+	if view.MoveStaged(it.scope, name, stageRel(it)+"-p-"+randHex(6)) != nil {
 		return
 	}
 	_ = view.MoveStaged(it.scope, rel, name)

@@ -145,19 +145,40 @@ info:
     it is the recorded content for that name (fingerprint match against
     file_version.fp — the acknowledged ordering, never ctime). Over an
     occupied name holding non-recorded content, a sealed parked object
-    is restored by draining: the squatter is parked at the intent's
-    unsealed slot first (never written into the sealed name), then the
-    recorded object moves onto the name. The version row is
-    version-guarded, so a stale intent can never roll a newer
-    acknowledged row back.
-    Explicit if_version:any from the current authorized writer still
-    overwrites unconditionally — the declare-time fingerprint captures
-    exactly which object that writer was allowed to displace, and only
-    that object is discarded; anything else is preserved. Residual: an
-    effect that lands differently than declared cannot be distinguished
-    from an external change — it is reported as external_change, the
-    foreign bytes survive parked, never laundered into the service's
-    version.
+    is restored by draining: the squatter is parked at a fresh
+    enumerable .filesv-op-<id>-p-<random> name first (never written
+    into the sealed name, and never at the fixed base slot — a
+    permanently parked unattributable object there must not stall
+    recovery), then the recorded object moves onto the name. The
+    version row is version-guarded, so a stale intent can never roll a
+    newer acknowledged row back. Unknown foreign objects that match no
+    recorded row are never deleted to make room — they stay parked,
+    hidden, and enumerable, because the service holds no discard
+    authority over them; recorded content is recoverable regardless of
+    how many accumulate.
+    if_version:any means the caller requires no specific version — it
+    does NOT promise the overwrite is unconditional under concurrent
+    interference. The declare-time fingerprint captures exactly which
+    object the writer was allowed to displace, and only that object is
+    discarded; anything else is preserved. If the observed occupant
+    changes during the attempt — a racing writer, or a delayed effect
+    of a retired operation landing mid-flight — the service may return
+    409 external_change instead of committing. A fresh attempt retries
+    the whole check-and-publish sequence and can succeed once
+    interference has stopped; no guarantee is made while interference
+    continues. This is an observable concurrency outcome, not a change
+    to the uncontended behavior: a fresh `any` write against a stable
+    occupant still succeeds exactly as before.
+    Reserved namespace: every name segment beginning .filesv-tmp- or
+    .filesv-op- is service-internal. All public operations — write,
+    rename, mkdir, AND remove — reject any path containing such a
+    segment (400 reserved_name), nested or not, whether or not the
+    object exists. Recovery names are not user-addressable: they are
+    hidden from listings, and only the service's own recovery paths may
+    move objects out of them or delete them. Parked foreign objects may
+    therefore remain indefinitely: retained, hidden, and inspectable
+    through the recorded-intent evidence, because no safe discard
+    authority exists for bytes the service cannot attribute.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so
@@ -298,8 +319,9 @@ paths:
         - { name: path, in: query, required: true, schema: { type: string } }
       responses:
         '200': { description: '{ "removed": true }' }
+        '400': { description: reserved_name (any .filesv-tmp-/.filesv-op- path segment) }
         '404': { description: Path not found }
-        '409': { description: version_conflict }
+        '409': { description: version_conflict | external_change }
         '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/changes:
     get:

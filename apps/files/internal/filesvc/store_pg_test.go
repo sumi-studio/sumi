@@ -1750,15 +1750,96 @@ func TestPGReconcileDrainsSealedObject(t *testing.T) {
 	if durExists(t, dir, "ws/"+qrel) {
 		t.Fatal("sealed name still occupied after the drain")
 	}
-	// The squatter was preserved — parked at the intent's unsealed slot.
+	// The squatter was preserved — parked at a fresh enumerable -p- name.
 	slot := opStagePrefix + strconv.FormatInt(id, 10)
-	if got := durRead(t, dir, "ws/"+slot); got != "squatter" {
-		t.Fatalf("squatter = %q at slot — foreign bytes must be preserved", got)
+	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
+		t.Fatalf("squatter = %q at -p- name — foreign bytes must be preserved", got)
 	}
 	// A second pass settles the squatter decision; nothing is deleted
 	// without identity proof.
 	s.Reconcile(ctx)
 	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
 		t.Fatalf("a.txt = %q after second pass", got)
+	}
+	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
+		t.Fatalf("squatter lost after second pass: %q", got)
+	}
+}
+
+// The fixed base slot occupied by an unattributable foreign object must
+// NOT stall the drain forever: drainSealed parks the squatter at a fresh
+// -p- name each pass, so the recorded sealed object still reaches its
+// name and every foreign object stays preserved and enumerable.
+func TestPGReconcileDrainsSealedBaseSlotOccupied(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("v1"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("v1"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 70, preFP: "0:0:0:0", dstFP: "9:9:9",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	qrel := slot + "-q-ab12cd"
+	// Recorded content sealed; name squatted; BASE SLOT permanently
+	// occupied by an unattributable foreign object.
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+qrel); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("squatter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/"+slot, []byte("base-occupant"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q — occupied base slot must not stall the drain", got)
+	}
+	if durExists(t, dir, "ws/"+qrel) {
+		t.Fatal("sealed name still occupied after the drain")
+	}
+	// Every foreign object survives: the base occupant untouched at the
+	// slot, the squatter parked at a fresh -p- name.
+	if got := durRead(t, dir, "ws/"+slot); got != "base-occupant" {
+		t.Fatalf("base occupant = %q — must be preserved", got)
+	}
+	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
+		t.Fatalf("squatter = %q at -p- name — must be preserved", got)
+	}
+	// Convergence: a second pass changes nothing and deletes nothing.
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q after second pass", got)
+	}
+	if got := durRead(t, dir, "ws/"+slot); got != "base-occupant" {
+		t.Fatalf("base occupant lost after second pass: %q", got)
+	}
+	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != "squatter" {
+		t.Fatalf("squatter lost after second pass: %q", got)
 	}
 }

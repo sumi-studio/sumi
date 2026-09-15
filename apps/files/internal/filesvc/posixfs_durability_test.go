@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func durRoot(t *testing.T) (*posixRoot, string) {
@@ -41,6 +43,22 @@ func durExists(t *testing.T, dir, rel string) bool {
 	t.Helper()
 	_, err := os.Lstat(filepath.Join(dir, rel))
 	return err == nil
+}
+
+// durReadGlob reads the single directory entry beneath dir matching a
+// filepath.Match pattern — used to find random-suffixed recovery names
+// (-p-/-q-) whose bytes must be preserved.
+func durReadGlob(t *testing.T, dir, pattern string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("glob %s: %v (%d matches)", pattern, err, len(matches))
+	}
+	b, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read %s: %v", matches[0], err)
+	}
+	return string(b)
 }
 
 // durFP returns the current fingerprint of (scope, path) via the real
@@ -446,10 +464,11 @@ func waitOr(t *testing.T, ch <-chan struct{}, what string) {
 // arbitrarily late.
 type gatedView struct {
 	ReconView
-	waiting chan struct{}
-	gate    chan struct{}
-	done    chan struct{}
-	once    sync.Once
+	waiting  chan struct{}
+	gate     chan struct{}
+	done     chan struct{}
+	once     sync.Once
+	onlyMove bool // gate MoveStaged only; SwapStaged runs immediately
 }
 
 // hold defers the first mutating call until the gate is released;
@@ -472,6 +491,9 @@ func (g *gatedView) hold(fn func() error) error {
 }
 
 func (g *gatedView) SwapStaged(scope, staged, name string) error {
+	if g.onlyMove {
+		return g.ReconView.SwapStaged(scope, staged, name)
+	}
 	return g.hold(func() error { return g.ReconView.SwapStaged(scope, staged, name) })
 }
 
@@ -762,5 +784,257 @@ func TestSealedActorSlotUnlinkPreservesSuccessor(t *testing.T) {
 	}
 	if where := scanDirFor(t, dir, "ws", stale); where != "" {
 		t.Fatalf("stale bytes still parked at %q — settle did not discard them", where)
+	}
+}
+
+// Finding 151: public remove must reject reserved staging/recovery
+// names — direct, nested, and objects that actually exist on disk —
+// while internal recovery keeps its legal move-out/delete paths.
+func TestRemoveRejectsReservedObjects(t *testing.T) {
+	p, dir := durRoot(t)
+	// Real objects at every reserved shape the public op could name.
+	for _, rel := range []string{
+		"ws/" + stagingPrefix + "abc123",
+		"ws/" + opStagePrefix + "7",
+		"ws/" + opStagePrefix + "7-q-ab12cd",
+		"ws/sub/" + opStagePrefix + "9",
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte("recovery-bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{
+		stagingPrefix + "abc123",
+		opStagePrefix + "7",
+		opStagePrefix + "7-q-ab12cd",
+		"sub/" + opStagePrefix + "9",       // nested reserved segment
+		"sub/" + opStagePrefix + "9/inner", // nested beneath a reserved dir
+		stagingPrefix + "nonexistent",      // reserved shape, absent object
+	} {
+		if _, err := p.remove("ws", path, "", opStagePrefix+"1"); !errors.Is(err, ErrReserved) {
+			t.Fatalf("remove(%q) = %v, want ErrReserved", path, err)
+		}
+	}
+	// Nothing was touched.
+	for _, rel := range []string{
+		"ws/" + stagingPrefix + "abc123",
+		"ws/" + opStagePrefix + "7",
+		"ws/" + opStagePrefix + "7-q-ab12cd",
+		"ws/sub/" + opStagePrefix + "9",
+	} {
+		if got := durRead(t, dir, rel); got != "recovery-bytes" {
+			t.Fatalf("%s = %q — reserved object was mutated", rel, got)
+		}
+	}
+	// Internal recovery keeps its legal paths: moving out of a reserved
+	// name and deleting a staged object both still work.
+	v, err := p.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if err := v.MoveStaged("ws", opStagePrefix+"7", "free.txt"); err != nil {
+		t.Fatalf("recovery move-out of reserved name: %v", err)
+	}
+	if got := durRead(t, dir, "ws/free.txt"); got != "recovery-bytes" {
+		t.Fatalf("moved object = %q", got)
+	}
+}
+
+// The exchange writes into BOTH endpoint names: a sealed quarantine name
+// must be refused as the destination too, not only as the staged side.
+func TestSwapStagedRejectsSealedDestination(t *testing.T) {
+	p, dir := durRoot(t)
+	v, err := p.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	if _, _, err := p.atomicWrite("ws", "f.txt", []byte("live"), true, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	q := opStagePrefix + "5-q-aa11bb"
+	if err := os.WriteFile(filepath.Join(dir, "ws", q), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.SwapStaged("ws", "f.txt", q); !errors.Is(err, ErrReserved) {
+		t.Fatalf("SwapStaged with sealed destination = %v, want ErrReserved", err)
+	}
+	// Neither endpoint was touched.
+	if got := durRead(t, dir, "ws/f.txt"); got != "live" {
+		t.Fatalf("f.txt = %q", got)
+	}
+	if got := durRead(t, dir, "ws/"+q); got != "x" {
+		t.Fatalf("sealed object = %q", got)
+	}
+}
+
+// Finding 153: a delayed retired exchange lands foreign bytes at the
+// enumerable slot between the O_EXCL create and the pre-commit failure
+// cleanup. discardStaged must park them at a sealed name, and the op
+// must report errUndoParked so runFs tombstones the intent — a
+// definitive-looking early error must not orphan live recovery evidence.
+func TestDiscardStagedForeignParkKeepsEvidence(t *testing.T) {
+	p, dir := durRoot(t)
+	slot := opStagePrefix + "77"
+	foreign := []byte("foreign-landed-at-slot")
+	if _, _, err := p.atomicWrite("ws", "f.txt", []byte("occupied"), true, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Post-create, pre-publish: a delayed exchange decided by a retired
+	// pass lands foreign bytes at the slot; our staged bytes move aside.
+	p.faultHook = func(tag string) {
+		if tag != "write.postCreate" {
+			return
+		}
+		other := filepath.Join(dir, "ws", opStagePrefix+"77-other")
+		if err := os.WriteFile(other, foreign, 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := unix.Renameat2(unix.AT_FDCWD, other,
+			unix.AT_FDCWD, filepath.Join(dir, "ws", slot),
+			unix.RENAME_EXCHANGE); err != nil {
+			t.Error(err)
+		}
+	}
+	// exclusive write onto an occupied name → Linkat EEXIST → the
+	// definitive-failure cleanup runs discardStaged on a slot that now
+	// holds foreign bytes.
+	_, committed, err := p.atomicWrite("ws", "f.txt", []byte("new"), true, "", slot)
+	p.faultHook = nil
+	if err == nil {
+		t.Fatal("exclusive write over occupied name unexpectedly succeeded")
+	}
+	if !errors.Is(err, errUndoParked) {
+		t.Fatalf("err = %v — must carry errUndoParked so the intent tombstones", err)
+	}
+	if committed {
+		t.Fatal("exclusive write reported committed")
+	}
+	// The foreign bytes survive at a sealed enumerable name.
+	if got := durReadGlob(t, dir, "ws/"+slot+"-q-*"); got != string(foreign) {
+		t.Fatalf("foreign object = %q at sealed name — must be preserved", got)
+	}
+	if durExists(t, dir, "ws/"+slot) {
+		t.Fatalf("slot still occupied — the capture did not land")
+	}
+	if got := durRead(t, dir, "ws/f.txt"); got != "occupied" {
+		t.Fatalf("f.txt = %q — untouched by the refused write", got)
+	}
+}
+
+// Finding 152: drainSealed parked the name's occupant at the FIXED base
+// slot, so a permanently parked unattributable object there stalled every
+// later drain. The repair parks at a fresh enumerable -p- name each
+// attempt. This test drives the real drainSealed on a real filesystem
+// with the base slot occupied, plus a retired pass's delayed drain
+// effects landing mid-pass — displaced, never destroyed, enumerable for
+// the next pass. (The full Reconcile + row-driven convergence is proven
+// in TestPGReconcileDrainsSealedBaseSlotOccupied; a DB-free settle pass
+// cannot keep the base slot occupied — its own judgment moves or
+// deletes every object there — and restoreStaged needs a real pool.)
+func TestSealedDrainConvergesWithOccupiedBaseSlot(t *testing.T) {
+	pR1, dir := durRoot(t)
+	pR2, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	squatter := []byte("name-occupant")
+	V1 := []byte("sealed-recorded-content")
+	occupant := []byte("base-slot-occupant")
+	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	slot := opStagePrefix + "88"
+	qrel := slot + "-q-cc33dd"
+	if err := os.WriteFile(filepath.Join(dir, "ws", "f.txt"), squatter, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", qrel), V1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ws", slot), occupant, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	it := intent{id: 88, scope: "ws", op: "write", path: "f.txt",
+		expectSHA: sha("unrelated"), dstFP: "999:9:9:9"}
+
+	// R1 (retired pass): its drain decision stalls inside the first
+	// MoveStaged — the syscall lands arbitrarily late.
+	gv := &gatedView{
+		waiting: make(chan struct{}),
+		gate:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	v1, err := pR1.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v1.Close()
+	gv.ReconView = v1
+	var s1 Store
+	r1done := make(chan struct{})
+	go func() {
+		defer close(r1done)
+		s1.drainSealed(gv, it, qrel, "f.txt")
+	}()
+	select {
+	case <-gv.waiting:
+	case <-r1done:
+		t.Fatal("R1 finished without a pending effect — premise failed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for R1's decision")
+	}
+
+	// R2 (live) drains with the base slot occupied: the squatter parks
+	// at a FRESH -p- name — the base occupant is irrelevant — and the
+	// sealed object reaches its name.
+	v2, err := pR2.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v2.Close()
+	var s2 Store
+	s2.drainSealed(v2, it, qrel, "f.txt")
+	if got := durRead(t, dir, "ws/f.txt"); got != string(V1) {
+		t.Fatalf("f.txt = %q — occupied base slot must not stall the drain", got)
+	}
+	if got := durRead(t, dir, "ws/"+slot); got != string(occupant) {
+		t.Fatalf("base occupant = %q — must be preserved", got)
+	}
+	if got := durReadGlob(t, dir, "ws/"+slot+"-p-*"); got != string(squatter) {
+		t.Fatalf("squatter = %q at -p- name — must be preserved", got)
+	}
+	if durExists(t, dir, "ws/"+qrel) {
+		t.Fatal("sealed name still occupied after the drain")
+	}
+
+	// R1's delayed drain lands now: its first move parks whatever sits
+	// at f.txt — V1, the just-restored bytes — at its own fresh -p-
+	// name; its second move finds the sealed name already empty. Every
+	// object is displaced to an enumerable name — never destroyed.
+	close(gv.gate)
+	<-gv.done
+	<-r1done
+	parkedV1 := scanDirFor(t, dir, "ws", V1)
+	if parkedV1 == "" {
+		t.Fatal("delayed drain destroyed the recorded bytes")
+	}
+	if scanDirFor(t, dir, "ws", squatter) == "" {
+		t.Fatal("delayed drain destroyed the squatter's bytes")
+	}
+	if scanDirFor(t, dir, "ws", occupant) == "" {
+		t.Fatal("base occupant destroyed")
+	}
+	if durExists(t, dir, "ws/f.txt") {
+		t.Fatalf("f.txt = %q — delayed drain should have vacated it",
+			durRead(t, dir, "ws/f.txt"))
+	}
+	if !strings.HasPrefix(parkedV1, slot+"-p-") {
+		t.Fatalf("recorded bytes parked at %q — want an enumerable -p- name", parkedV1)
 	}
 }
