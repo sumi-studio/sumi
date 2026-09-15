@@ -177,6 +177,9 @@ scripts/dev/migration-freeze.mjs check` provides the same explicit operator
 check. Pull requests and pushes to `main` additionally compare the candidate
 against the exact event base commit with `migration-freeze.mjs verify-base`, so
 changing historical SQL and its candidate manifest digest together is rejected.
+`verify-base` accepts an unchanged seal or a contiguous run of complete new
+migration versions appended after the sealed maximum, since a branch can
+legitimately accumulate several forward migrations.
 A later forward migration must use the next numeric version and be added to the
 manifest with
 `node scripts/dev/migration-freeze.mjs extend`; that command refuses to extend
