@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -35,10 +36,11 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 //     per-persona needs storing. The real multi-user binding (koseki identity
 //     → persona) lands with the auth-flow milestone; this proves the shape.
 type Server struct {
-	store   *Store
-	secret  []byte
-	maxBody int64
-	conns   *modelconnections.Store
+	store      *Store
+	secret     []byte
+	maxBody    int64
+	conns      *modelconnections.Store
+	callBridge CallBridge
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
@@ -147,6 +149,14 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/cancel", s.cancelJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/heartbeat", s.heartbeatJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/complete", s.completeJob)
+	// Call sessions: persona-token scoped like jobs — the media bridge's claim
+	// is its own authority, deliberately not writer-generation gated.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/claim", s.claimCallSessions)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/heartbeat", s.heartbeatCallSession)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/ticket", s.callSessionTicket)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/status", s.reportCallSessionStatus)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/calls/sessions/{session}/utterances", s.pendingCallUtterances)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/utterances/{utterance}/disposition", s.reportCallUtterance)
 }
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -222,6 +232,7 @@ func storeError(w http.ResponseWriter, err error) {
 		// retry; report them as 400, not a transient-looking 500.
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
+		log.Printf("agentstate internal error: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
 }

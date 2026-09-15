@@ -689,6 +689,28 @@ func newApplicationFromEnv() (*application, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
 		}
 		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
+		if calls := messagingServer.Calls; calls != nil {
+			// The secretary's call surface: delegated effects commit session
+			// and utterance intent atomically with the operation record, and
+			// the persona-scoped bridge routes let a per-placement media
+			// runner claim sessions, mint short tickets, and report status
+			// and playback dispositions under its own claim authority.
+			calls.Hooks = &messaging.CallHooks{Core: coreServer.Store()}
+			for tool, effect := range map[string]agentstate.ToolEffect{
+				messaging.CallJoinTool:  calls.CallJoinEffect(),
+				messaging.CallLeaveTool: calls.CallLeaveEffect(),
+				messaging.CallSayTool:   calls.CallSayEffect(),
+				messaging.CallStateTool: calls.CallStateEffect(),
+			} {
+				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+					stopBackground()
+					closeOnError()
+					return nil, fmt.Errorf("register core call effect %s: %w", tool, err)
+				}
+			}
+			coreServer.SetCallBridge(calls)
+			log.Print("call sessions ready (call.join/leave/say/state effects + media bridge routes)")
+		}
 	case messagingServer != nil && spawnManager != nil:
 		delivery := &messaging.AgentAttentionGateway{
 			Gateway: runtime, Spawner: spawnManager,

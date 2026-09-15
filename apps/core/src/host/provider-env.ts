@@ -37,6 +37,7 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
+import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
 import { type StateClient, StateError } from "../state-client.ts";
@@ -231,6 +232,10 @@ export function providerFromEnv(
       extra: jsonObj(get, "SUMI_MODEL_EXTRA_JSON"),
       timeoutMs: numEnv(get, "SUMI_MODEL_TIMEOUT_MS", 120_000),
     });
+  }
+  if (kind === "fixture") {
+    // Scripted deterministic model for integration tests; see fixture.ts.
+    return new FixtureProvider(required(get, "SUMI_MODEL_FIXTURE"));
   }
   if (kind !== "mock") throw new Error(`unknown SUMI_MODEL_PROVIDER ${kind}`);
   return new MockProvider();

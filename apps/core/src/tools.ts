@@ -202,6 +202,77 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       required: ["job_id"],
     },
   },
+  {
+    internal: true,
+    delegated: true,
+    name: "call.join",
+    description:
+      "Join the live voice/video call in a Messaging place as yourself. Only works while a call is actually running there; use the place_id from the input. Returns a call session you can speak and leave through. You may stay silent and listen — joining does not oblige you to speak.",
+    parameters: {
+      type: "object",
+      properties: {
+        place_id: {
+          type: "string",
+          description: "the Messaging place id whose call to join",
+        },
+      },
+      required: ["place_id"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "call.say",
+    description:
+      "Speak aloud in a call you have joined. Commits your words as durable intent; the media bridge renders them to audio and records what is known about playback (started, finished, interrupted). A recorded 'emitted' disposition means the audio was rendered to the room — never a claim that anyone heard it. If the bridge dies mid-utterance the record stays honest rather than replaying into a later call.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "the call session_id from call.join or call.state",
+        },
+        text: {
+          type: "string",
+          description: "what to say out loud",
+        },
+      },
+      required: ["session_id", "text"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "call.leave",
+    description:
+      "Leave a call you joined. The media bridge disconnects and the session ends; use this when the call is over or your presence is no longer wanted.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "the call session_id to leave",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "call.state",
+    description:
+      "Read call state: whether a call is running in a place, who is in it, and your own live call sessions. A read, not a side effect.",
+    parameters: {
+      type: "object",
+      properties: {
+        place_id: {
+          type: "string",
+          description: "optional Messaging place id to inspect",
+        },
+      },
+    },
+  },
 ];
 
 /**
