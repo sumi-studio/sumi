@@ -824,7 +824,7 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 			            AND (d.admitted_at IS NOT NULL
 			                 OR d.source_kind IN ('reply_later_due','messaging_poll_vote')
 			                 OR EXISTS (SELECT 1 FROM core_inputs ci
-			                            WHERE ci.input_id='messaging:'||d.event_id::text))),
+			                            WHERE ci.persona_id=$2 AND ci.input_id='messaging:'||d.event_id::text))),
 			  EXISTS (SELECT 1 FROM agent_attention_deliveries d
 			          WHERE d.message_id=$1 AND d.personality_agent_id=$2 AND d.event_id<>$3
 			            AND d.admitted_at IS NULL AND d.suppressed_at IS NULL
