@@ -24,7 +24,12 @@ const confirmation = {
   next_action: "create_account",
   continuation: "/",
 };
-const terminal = { ...proof, outcome: "account_created", continuation: "/" };
+const terminal = {
+  ...proof,
+  outcome: "account_created",
+  continuation: "/",
+  human_id: "human-1",
+};
 function capture() {
   history.replaceState(null, "", `/#invite=${token}`);
   captureEnrollmentInvitation();

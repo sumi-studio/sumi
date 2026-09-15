@@ -32,6 +32,7 @@ type firebaseEmailPrincipalClient interface {
 	GetUserByEmail(ctx context.Context, email string) (*firebaseauth.UserRecord, error)
 	GetUser(ctx context.Context, uid string) (*firebaseauth.UserRecord, error)
 	CreateUser(ctx context.Context, user *firebaseauth.UserToCreate) (*firebaseauth.UserRecord, error)
+	UpdateUser(ctx context.Context, uid string, user *firebaseauth.UserToUpdate) (*firebaseauth.UserRecord, error)
 	DeleteUser(ctx context.Context, uid string) error
 	CustomToken(ctx context.Context, uid string) (string, error)
 }
@@ -52,7 +53,8 @@ func (c *emailCodeController) start(ctx context.Context, request agentevents.Sta
 	flow, state, err := c.store.StartEmailCodeFlow(ctx, koseki.StartAuthFlowRequest{
 		InviteToken: request.InviteToken, Intent: koseki.AuthIntent(request.Intent),
 		Channel: koseki.ChannelEmailCode, ExpectedProvider: koseki.EmailCodeSignInProvider,
-		NormalizedEmail: email, Continuation: request.Continuation, Nonce: request.Nonce, TTL: emailCodeFlowTTL,
+		NormalizedEmail: email, Continuation: request.Continuation, Nonce: request.Nonce,
+		BrowserEpochHash: request.BrowserEpochHash, TTL: emailCodeFlowTTL,
 	})
 	if err != nil {
 		return agentevents.BrowserAuthFlowResult{}, mapFlowError(err)
@@ -81,16 +83,16 @@ func emailChallengeResult(proof koseki.EmailProof, state koseki.EmailChallengeSt
 		FlowID: proof.FlowID, FlowStatus: flowStatus, Email: proof.NormalizedEmail,
 		FlowExpiresAt: proof.FlowExpiresAt, ChallengeExpiresAt: state.ChallengeExpires,
 		AttemptsRemaining: state.AttemptsRemaining, Delivery: state.DeliveryStatus,
-		ResendAvailableAt: state.ResendAvailableAt,
+		ResendAvailableAt: state.ResendAvailableAt, HumanID: proof.HumanID,
 	}
 }
 
-func (c *emailCodeController) VerifyEmailCode(ctx context.Context, request agentevents.VerifyEmailCodeRequest) (agentevents.EmailProofResult, error) {
+func (c *emailCodeController) VerifyEmailCode(ctx context.Context, request agentevents.VerifyEmailCodeRequest, session *agentevents.UserSessionClaims) (agentevents.EmailProofResult, error) {
 	proof, err := c.store.VerifyEmailCode(ctx, request.FlowID, request.Nonce, request.Code)
 	if err != nil {
 		return agentevents.EmailProofResult{}, mapFlowError(err)
 	}
-	return c.finishProof(ctx, proof, request.Nonce)
+	return c.finishProof(ctx, proof, request.Nonce, session)
 }
 
 func (c *emailCodeController) ResendEmailCode(ctx context.Context, request agentevents.EmailFlowRequest) (agentevents.EmailChallengeResult, error) {
@@ -125,10 +127,13 @@ func (c *emailCodeController) InspectEmailLink(ctx context.Context, request agen
 }
 
 // sessionRelation is read-only: it never creates a Firebase user for an
-// unproved address. Anything uncertain requires the explicit switch path.
+// unproved address. The bound Human — not Firebase's email_verified flag —
+// decides "same_account": a signed-in owner of an unverified bound principal
+// is the same account, and mailbox proof now enables its verified email.
+// Anything uncertain requires the explicit switch path.
 func (c *emailCodeController) sessionRelation(ctx context.Context, email, humanID string) string {
 	record, err := c.firebase.GetUserByEmail(ctx, email)
-	if err != nil || record == nil || !record.EmailVerified {
+	if err != nil || record == nil || record.UID == "" {
 		return "other_account"
 	}
 	boundHuman, ok, err := c.store.HumanForFirebaseUID(ctx, record.UID)
@@ -138,21 +143,23 @@ func (c *emailCodeController) sessionRelation(ctx context.Context, email, humanI
 	return "other_account"
 }
 
-func (c *emailCodeController) CompleteEmailLink(ctx context.Context, request agentevents.CompleteEmailLinkRequest) (agentevents.EmailProofResult, error) {
-	proof, err := c.store.CompleteEmailLink(ctx, request.ChallengeID, request.Token, request.Nonce, request.Adopt)
+func (c *emailCodeController) CompleteEmailLink(ctx context.Context, request agentevents.CompleteEmailLinkRequest, session *agentevents.UserSessionClaims) (agentevents.EmailProofResult, error) {
+	proof, err := c.store.CompleteEmailLink(ctx, request.ChallengeID, request.Token, request.Nonce, request.Adopt, request.BrowserEpochHash)
 	if err != nil {
 		return agentevents.EmailProofResult{}, mapFlowError(err)
 	}
-	return c.finishProof(ctx, proof, request.Nonce)
+	return c.finishProof(ctx, proof, request.Nonce, session)
 }
 
 // finishProof crosses the Firebase boundary after the mailbox proof has
 // committed. Every failure here is retryable by the same flow authority: the
 // retry skips the code, reuses the bound UID, and mints a fresh custom token.
-func (c *emailCodeController) finishProof(ctx context.Context, proof koseki.EmailProof, nonce string) (agentevents.EmailProofResult, error) {
+// The session claims only identify the currently signed-in Human, letting the
+// same Human enable verified email on their own bound unverified principal.
+func (c *emailCodeController) finishProof(ctx context.Context, proof koseki.EmailProof, nonce string, session *agentevents.UserSessionClaims) (agentevents.EmailProofResult, error) {
 	uid := proof.UID
 	if uid == "" {
-		resolved, err := c.resolvePrincipal(ctx, proof.NormalizedEmail)
+		resolved, err := c.resolvePrincipal(ctx, proof.NormalizedEmail, session)
 		if err != nil {
 			return agentevents.EmailProofResult{}, err
 		}
@@ -177,7 +184,15 @@ func (c *emailCodeController) finishProof(ctx context.Context, proof koseki.Emai
 	if err != nil || token == "" {
 		return agentevents.EmailProofResult{}, agentevents.ErrBrowserAuthProviderUnavailable
 	}
-	return agentevents.EmailProofResult{FlowID: proof.FlowID, Intent: string(proof.Intent), CustomToken: token}, nil
+	humanID := proof.HumanID
+	if humanID == "" {
+		if bound, ok, err := c.store.HumanForFirebaseUID(ctx, uid); err == nil && ok {
+			humanID = bound
+		}
+	}
+	return agentevents.EmailProofResult{
+		FlowID: proof.FlowID, Intent: string(proof.Intent), CustomToken: token, HumanID: humanID,
+	}, nil
 }
 
 func verifiedPrincipalFor(record *firebaseauth.UserRecord, email string) bool {
@@ -192,10 +207,13 @@ func verifiedPrincipalFor(record *firebaseauth.UserRecord, email string) bool {
 // Firebase keeps one account per email, so concurrent creation converges on
 // the same UID through EMAIL_EXISTS. A principal whose email Firebase has not
 // verified may belong to someone who never proved this mailbox:
-//   - bound to a Human: fail closed; that Human keeps its linked providers;
+//   - bound to a Human: fail closed; that Human keeps its linked providers.
+//     Exception: when the request carries a live session for exactly that
+//     bound Human, the mailbox proof enables verified email on the same UID —
+//     the owner proving their own mailbox, never a takeover;
 //   - never bound: delete it under the credential lock and create a verified
 //     principal, so no unverified sign-in method survives the mailbox proof.
-func (c *emailCodeController) resolvePrincipal(ctx context.Context, email string) (string, error) {
+func (c *emailCodeController) resolvePrincipal(ctx context.Context, email string, session *agentevents.UserSessionClaims) (string, error) {
 	for attempt := 0; attempt < emailPrincipalAttempts; attempt++ {
 		record, err := c.firebase.GetUserByEmail(ctx, email)
 		if firebaseauth.IsUserNotFound(err) {
@@ -225,6 +243,19 @@ func (c *emailCodeController) resolvePrincipal(ctx context.Context, email string
 			return nil
 		})
 		if errors.Is(err, koseki.ErrCredentialAlreadyBound) {
+			if session != nil {
+				boundHuman, ok, lookupErr := c.store.HumanForFirebaseUID(ctx, uid)
+				if lookupErr == nil && ok && boundHuman == session.UserID {
+					updated, updateErr := c.firebase.UpdateUser(ctx, uid,
+						(&firebaseauth.UserToUpdate{}).EmailVerified(true))
+					if updateErr != nil {
+						return "", agentevents.ErrBrowserAuthProviderUnavailable
+					}
+					if updated != nil && updated.EmailVerified {
+						return uid, nil
+					}
+				}
+			}
 			return "", &agentevents.BrowserEmailUnverifiedAccountError{SignInProviders: browserSignInProviders(record)}
 		}
 		if err != nil {

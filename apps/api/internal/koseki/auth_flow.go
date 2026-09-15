@@ -3,6 +3,7 @@ package koseki
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -54,6 +55,9 @@ type StartAuthFlowRequest struct {
 	NormalizedEmail  string
 	Continuation     string
 	Nonce            string
+	// BrowserEpochHash binds the flow to the browser jar that started it, so
+	// that jar's logout can cancel its issuance authority.
+	BrowserEpochHash string
 	TTL              time.Duration
 }
 
@@ -78,6 +82,11 @@ type AuthFlow struct {
 	CompletedAt             *time.Time
 	EmailProofUID           string
 	EmailProofUIDBoundAt    *time.Time
+	// BrowserEpochHash is the hashed browser epoch cookie of the jar that may
+	// complete this flow. ClosedAt mirrors the durable session store's
+	// closed-flow barrier: once set, the flow can never issue a session again.
+	BrowserEpochHash string
+	ClosedAt         *time.Time
 }
 
 type VerifiedIdentity struct {
@@ -113,6 +122,14 @@ func NormalizeEmail(raw string) (string, error) {
 		return "", errors.New("invalid email")
 	}
 	return strings.ToLower(raw), nil
+}
+
+// validBrowserEpochHash matches the agentevents browser-epoch cookie hash:
+// base64url SHA-256. Keeping the check local avoids a package cycle.
+func validBrowserEpochHash(hash string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(hash)
+	return err == nil && len(decoded) == sha256.Size &&
+		base64.RawURLEncoding.EncodeToString(decoded) == hash
 }
 
 func validateNonce(raw string) ([]byte, error) {
@@ -185,6 +202,9 @@ func (s *Store) prepareAuthFlowStart(ctx context.Context, request StartAuthFlowR
 	if err != nil {
 		return preparedAuthFlowStart{}, err
 	}
+	if request.BrowserEpochHash != "" && !validBrowserEpochHash(request.BrowserEpochHash) {
+		return preparedAuthFlowStart{}, ErrInvalidAuthFlow
+	}
 	inviteID := ""
 	if request.InviteToken != "" {
 		hash, err := enrollmentTokenHash(request.InviteToken)
@@ -215,19 +235,21 @@ func insertAuthFlow(ctx context.Context, q authFlowQueryRower, request StartAuth
 	var result AuthFlow
 	err := q.QueryRow(ctx, `
 		INSERT INTO auth_flows
-			(flow_id, nonce_hash, intent, channel, expected_provider, normalized_email, continuation, expires_at, enrollment_invite_id)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, NULLIF($9,'')::uuid)
+			(flow_id, nonce_hash, intent, channel, expected_provider, normalized_email, continuation, expires_at, enrollment_invite_id, browser_epoch_hash)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, NULLIF($9,'')::uuid, NULLIF($10,''))
 		ON CONFLICT (nonce_hash) DO UPDATE SET nonce_hash = auth_flows.nonce_hash
 		RETURNING flow_id, intent, channel, expected_provider, COALESCE(normalized_email, ''),
 			continuation, status, COALESCE(confirmation_action, ''),
 			COALESCE(terminal_outcome, ''), COALESCE(human_id::text, ''),
-			COALESCE(personality_agent_id::text, ''), expires_at, COALESCE(enrollment_invite_id::text,'')`,
+			COALESCE(personality_agent_id::text, ''), expires_at, COALESCE(enrollment_invite_id::text,''),
+			COALESCE(browser_epoch_hash, '')`,
 		flowID, nonceHash, request.Intent, request.Channel, request.ExpectedProvider,
-		request.NormalizedEmail, request.Continuation, expiresAt, inviteID,
+		request.NormalizedEmail, request.Continuation, expiresAt, inviteID, request.BrowserEpochHash,
 	).Scan(&result.FlowID, &result.Intent, &result.Channel, &result.ExpectedProvider,
 		&result.NormalizedEmail, &result.Continuation, &result.Status,
 		&result.ConfirmationAction, &result.TerminalOutcome, &result.HumanID,
-		&result.AgentID, &result.ExpiresAt, &result.EnrollmentInviteID)
+		&result.AgentID, &result.ExpiresAt, &result.EnrollmentInviteID,
+		&result.BrowserEpochHash)
 	if err != nil {
 		return AuthFlow{}, fmt.Errorf("start auth flow: %w", err)
 	}
@@ -269,6 +291,9 @@ func (s *Store) AuthFlowStatus(ctx context.Context, flowID, nonce string) (AuthF
 	if err != nil {
 		return AuthFlow{}, err
 	}
+	if flow.ClosedAt != nil {
+		return AuthFlow{}, ErrAuthFlowConsumed
+	}
 	if flow.Status != "completed" && !time.Now().UTC().Before(flow.ExpiresAt) {
 		return AuthFlow{}, ErrAuthFlowExpired
 	}
@@ -308,6 +333,11 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 			return AuthFlow{}, unknownAuthFlowAuthority(ctx, tx, flowID, nonceHash)
 		}
 		return AuthFlow{}, err
+	}
+	if flow.ClosedAt != nil {
+		// The session store closed this flow's issuance authority (logout,
+		// discard, or an account switch); no proof or replay may proceed.
+		return AuthFlow{}, ErrAuthFlowConsumed
 	}
 	if flow.Channel == ChannelEmailCode && flow.Status == "completed" {
 		return replayEmailCompletionTx(ctx, tx, flow, firebaseUID, identity, action)
@@ -477,14 +507,16 @@ func scanAuthFlowForUpdate(ctx context.Context, tx pgx.Tx, flowID string, nonceH
 		COALESCE(human_id::text, ''), COALESCE(personality_agent_id::text, ''),
 		expires_at, COALESCE(firebase_uid, ''), COALESCE(provider_subject, ''),
 		COALESCE(verified_display_name, ''), COALESCE(enrollment_invite_id::text,''), COALESCE(verified_email,''), email_verified,
-		COALESCE(email_proof_uid,''), email_proof_uid_bound_at, completed_at FROM auth_flows
+		COALESCE(email_proof_uid,''), email_proof_uid_bound_at, completed_at,
+		COALESCE(browser_epoch_hash,''), closed_at FROM auth_flows
 		WHERE flow_id=$1 AND nonce_hash=$2 FOR UPDATE`, flowID, nonceHash).Scan(
 		&flow.FlowID, &flow.Intent, &flow.Channel, &flow.ExpectedProvider,
 		&flow.NormalizedEmail, &flow.Continuation, &flow.Status,
 		&flow.ConfirmationAction, &flow.TerminalOutcome, &flow.HumanID,
 		&flow.AgentID, &flow.ExpiresAt, &firebaseUID, &flow.VerifiedProviderSubject,
 		&flow.VerifiedDisplayName, &flow.EnrollmentInviteID, &flow.VerifiedEmail, &flow.EmailVerified,
-		&flow.EmailProofUID, &flow.EmailProofUIDBoundAt, &flow.CompletedAt)
+		&flow.EmailProofUID, &flow.EmailProofUIDBoundAt, &flow.CompletedAt,
+		&flow.BrowserEpochHash, &flow.ClosedAt)
 	return flow, firebaseUID, err
 }
 
@@ -599,4 +631,84 @@ func syncVerifiedProviderTx(ctx context.Context, tx pgx.Tx, humanID, provider, s
 			VALUES ($1,$2,'provider_linked',$3,'linked')`, humanID, provider, decisionPath)
 	}
 	return err
+}
+
+// BrowserFlowRef is the revocation-facing view of one flow: enough to fence
+// session issuance without exposing the nonce or proof material.
+type BrowserFlowRef struct {
+	FlowID    string
+	HumanID   string
+	EpochHash string
+	ExpiresAt time.Time
+	ClosedAt  *time.Time
+}
+
+// BrowserFlowRefForNonce returns the flow only to its nonce authority, so a
+// discard request cancels only a flow the calling browser actually owns.
+func (s *Store) BrowserFlowRefForNonce(ctx context.Context, flowID, nonce string) (BrowserFlowRef, error) {
+	nonceHash, err := validateNonce(nonce)
+	if err != nil {
+		return BrowserFlowRef{}, err
+	}
+	var ref BrowserFlowRef
+	var storedNonce []byte
+	err = s.pool.QueryRow(ctx, `SELECT flow_id, nonce_hash, COALESCE(human_id::text,''),
+		COALESCE(browser_epoch_hash,''), expires_at, closed_at FROM auth_flows WHERE flow_id=$1`, flowID).Scan(
+		&ref.FlowID, &storedNonce, &ref.HumanID, &ref.EpochHash, &ref.ExpiresAt, &ref.ClosedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BrowserFlowRef{}, ErrInvalidAuthFlow
+	}
+	if err != nil {
+		return BrowserFlowRef{}, err
+	}
+	if subtle.ConstantTimeCompare(storedNonce, nonceHash) != 1 {
+		return BrowserFlowRef{}, ErrAuthProofMismatch
+	}
+	return ref, nil
+}
+
+// AuthFlowEpochHash reads the flow's recorded browser epoch for admission.
+func (s *Store) AuthFlowEpochHash(ctx context.Context, flowID string) (string, error) {
+	var epoch string
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(browser_epoch_hash,'') FROM auth_flows WHERE flow_id=$1`, flowID).Scan(&epoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrInvalidAuthFlow
+	}
+	return epoch, err
+}
+
+// OpenBrowserFlows lists a browser epoch's flows that could still issue a
+// session. Logout closes all of them so a pending or just-completed flow
+// cannot sign the jar back in.
+func (s *Store) OpenBrowserFlows(ctx context.Context, epochHash string) ([]BrowserFlowRef, error) {
+	rows, err := s.pool.Query(ctx, `SELECT flow_id, COALESCE(human_id::text,''), expires_at, closed_at
+		FROM auth_flows WHERE browser_epoch_hash=$1 AND closed_at IS NULL`, epochHash)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []BrowserFlowRef
+	for rows.Next() {
+		var ref BrowserFlowRef
+		if err := rows.Scan(&ref.FlowID, &ref.HumanID, &ref.ExpiresAt, &ref.ClosedAt); err != nil {
+			return nil, err
+		}
+		ref.EpochHash = epochHash
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+// CloseAuthFlows mirrors the session store's closed-flow barrier into
+// PostgreSQL so status, proof, and replay paths report the closure. Issuance
+// never consults this column; the session store decides. The update is
+// idempotent and safe to retry after an ambiguous failure.
+func (s *Store) CloseAuthFlows(ctx context.Context, flowIDs []string) error {
+	for _, flowID := range flowIDs {
+		if _, err := s.pool.Exec(ctx, `UPDATE auth_flows SET closed_at=clock_timestamp()
+			WHERE flow_id=$1 AND closed_at IS NULL`, flowID); err != nil {
+			return fmt.Errorf("close auth flow %s: %w", flowID, err)
+		}
+	}
+	return nil
 }

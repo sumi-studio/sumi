@@ -29,6 +29,9 @@ type CompleteEmailLinkRequest struct {
 	Token       string `json:"token"`
 	Nonce       string `json:"nonce"`
 	Adopt       bool   `json:"adopt"`
+	// BrowserEpochHash is set by the server from the epoch cookie so an
+	// adoption rebinds the flow to the adopting jar.
+	BrowserEpochHash string `json:"-"`
 }
 
 type EmailChallengeResult struct {
@@ -40,6 +43,10 @@ type EmailChallengeResult struct {
 	AttemptsRemaining  int       `json:"attempts_remaining"`
 	Delivery           string    `json:"delivery"`
 	ResendAvailableAt  time.Time `json:"resend_available_at"`
+	// HumanID names the Human a completed flow resolved to, so a poller can
+	// compare it against the browser's current session identity instead of
+	// treating any authenticated session as this flow's outcome.
+	HumanID string `json:"human_id,omitempty"`
 }
 
 // EmailProofResult carries a short-lived Firebase custom token for the
@@ -48,6 +55,9 @@ type EmailProofResult struct {
 	FlowID      string `json:"flow_id"`
 	Intent      string `json:"intent"`
 	CustomToken string `json:"custom_token"`
+	// HumanID names the Human this proof will resolve to when one is bound,
+	// so the browser can compare it against its current session identity.
+	HumanID string `json:"human_id,omitempty"`
 }
 
 type EmailLinkInspectionResult struct {
@@ -62,12 +72,15 @@ type EmailLinkInspectionResult struct {
 
 // BrowserEmailAuthController owns Sumi mailbox proof. It never establishes a
 // session: the custom-token sign-in still resolves through the flow routes.
+// The optional session claims identify the currently signed-in Human for
+// same-Human verification and inspection labeling; they never authorize a
+// session change by themselves.
 type BrowserEmailAuthController interface {
-	VerifyEmailCode(ctx context.Context, request VerifyEmailCodeRequest) (EmailProofResult, error)
+	VerifyEmailCode(ctx context.Context, request VerifyEmailCodeRequest, session *UserSessionClaims) (EmailProofResult, error)
 	ResendEmailCode(ctx context.Context, request EmailFlowRequest) (EmailChallengeResult, error)
 	EmailFlowStatus(ctx context.Context, request EmailFlowRequest) (EmailChallengeResult, error)
 	InspectEmailLink(ctx context.Context, request InspectEmailLinkRequest, session *UserSessionClaims) (EmailLinkInspectionResult, error)
-	CompleteEmailLink(ctx context.Context, request CompleteEmailLinkRequest) (EmailProofResult, error)
+	CompleteEmailLink(ctx context.Context, request CompleteEmailLinkRequest, session *UserSessionClaims) (EmailProofResult, error)
 }
 
 var (
@@ -127,7 +140,12 @@ func (s *BrowserAuthServer) serveVerifyEmailCode(w http.ResponseWriter, r *http.
 		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	result, err := s.EmailFlows.VerifyEmailCode(r.Context(), request)
+	session, err := s.currentSessionClaims(r)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
+	result, err := s.EmailFlows.VerifyEmailCode(r.Context(), request, session)
 	if err != nil {
 		writeFlowError(w, err)
 		return
@@ -201,8 +219,10 @@ func (s *BrowserAuthServer) serveInspectEmailLink(w http.ResponseWriter, r *http
 	writeBrowserAuthJSON(w, http.StatusOK, result)
 }
 
-// serveCompleteEmailLink refuses to run beside a live session. Switching
-// accounts is an explicit logout first, enforced here rather than in the UI.
+// serveCompleteEmailLink proves the mailbox; it never issues a session. The
+// session claims feed same-Human inspection and verification. A different
+// Human may only take over the jar through the resolve step's explicit
+// switch, so same-Human proof beside a live session stays allowed.
 func (s *BrowserAuthServer) serveCompleteEmailLink(w http.ResponseWriter, r *http.Request) {
 	if !s.allowAuthAllocation(w, r) || !s.allowOrigin(w, r) || !s.requireCSRF(w, r) {
 		return
@@ -220,11 +240,13 @@ func (s *BrowserAuthServer) serveCompleteEmailLink(w http.ResponseWriter, r *htt
 		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
-	if session != nil {
-		writeFlowError(w, ErrBrowserSessionActive)
+	epochHash, err := s.browserEpochHash(w, r, true)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
 		return
 	}
-	result, err := s.EmailFlows.CompleteEmailLink(r.Context(), request)
+	request.BrowserEpochHash = epochHash
+	result, err := s.EmailFlows.CompleteEmailLink(r.Context(), request, session)
 	if err != nil {
 		writeFlowError(w, err)
 		return

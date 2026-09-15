@@ -138,6 +138,9 @@ type EmailProof struct {
 	UID             string
 	UIDBoundAt      time.Time
 	Status          string
+	// HumanID is set once the flow resolved to a Human; it lets the browser
+	// compare the completing identity against the current session.
+	HumanID string
 }
 
 type EmailLinkInspection struct {
@@ -164,11 +167,13 @@ func scanEmailFlowForUpdate(ctx context.Context, tx pgx.Tx, where string, args .
 	var row emailFlowRow
 	err := tx.QueryRow(ctx, `SELECT flow_id, intent, channel, COALESCE(normalized_email,''), status,
 		COALESCE(terminal_outcome,''), expires_at, completed_at, nonce_hash, email_proved_at, COALESCE(email_proof_method,''),
-		COALESCE(email_proof_uid,''), email_proof_uid_bound_at
+		COALESCE(email_proof_uid,''), email_proof_uid_bound_at,
+		COALESCE(human_id::text,''), COALESCE(browser_epoch_hash,''), closed_at
 		FROM auth_flows WHERE `+where+` FOR UPDATE`, args...).Scan(
 		&row.flow.FlowID, &row.flow.Intent, &row.flow.Channel, &row.flow.NormalizedEmail,
 		&row.flow.Status, &row.flow.TerminalOutcome, &row.flow.ExpiresAt, &row.flow.CompletedAt, &row.nonceHash, &row.provedAt, &row.proofMethod,
-		&row.proofUID, &row.proofUIDBound)
+		&row.proofUID, &row.proofUIDBound,
+		&row.flow.HumanID, &row.flow.BrowserEpochHash, &row.flow.ClosedAt)
 	return row, err
 }
 
@@ -199,6 +204,7 @@ func (r emailFlowRow) proof() EmailProof {
 	proof := EmailProof{
 		FlowID: r.flow.FlowID, Intent: r.flow.Intent, NormalizedEmail: r.flow.NormalizedEmail,
 		Method: r.proofMethod, UID: r.proofUID, Status: r.flow.Status, FlowExpiresAt: r.flow.ExpiresAt,
+		HumanID: r.flow.HumanID,
 	}
 	if r.provedAt != nil {
 		proof.ProvedAt = *r.provedAt
@@ -221,6 +227,9 @@ func lockEmailFlowByNonce(ctx context.Context, tx pgx.Tx, flowID string, nonceHa
 	}
 	if row.flow.Channel != ChannelEmailCode {
 		return emailFlowRow{}, ErrInvalidAuthFlow
+	}
+	if row.flow.ClosedAt != nil {
+		return emailFlowRow{}, ErrAuthFlowConsumed
 	}
 	return row, nil
 }
@@ -662,11 +671,11 @@ func (s *Store) InspectEmailLink(ctx context.Context, challengeID, token, nonce 
 	}
 	var result EmailLinkInspection
 	var nonceHash []byte
-	var proved bool
+	var proved, closed bool
 	var now time.Time
 	err = s.pool.QueryRow(ctx, `SELECT flow_id, intent, normalized_email, status, expires_at, nonce_hash,
-		email_proved_at IS NOT NULL, clock_timestamp() FROM auth_flows WHERE flow_id=$1`, challenge.flowID).Scan(
-		&result.FlowID, &result.Intent, &result.NormalizedEmail, &result.State, &result.ExpiresAt, &nonceHash, &proved, &now)
+		email_proved_at IS NOT NULL, closed_at IS NOT NULL, clock_timestamp() FROM auth_flows WHERE flow_id=$1`, challenge.flowID).Scan(
+		&result.FlowID, &result.Intent, &result.NormalizedEmail, &result.State, &result.ExpiresAt, &nonceHash, &proved, &closed, &now)
 	if err != nil {
 		return EmailLinkInspection{}, err
 	}
@@ -680,6 +689,8 @@ func (s *Store) InspectEmailLink(ctx context.Context, challengeID, token, nonce 
 	switch {
 	case flowStatus == "completed":
 		result.State = "completed"
+	case closed:
+		result.State = "consumed"
 	case challenge.consumed && proved && result.SameBrowser:
 		result.State = "proved_here"
 	case challenge.consumed:
@@ -696,8 +707,9 @@ func (s *Store) InspectEmailLink(ctx context.Context, challengeID, token, nonce 
 
 // CompleteEmailLink proves the mailbox with the link token. The flow's own
 // nonce completes directly; another browser must explicitly adopt the flow,
-// which moves its authority to the new nonce.
-func (s *Store) CompleteEmailLink(ctx context.Context, challengeID, token, nonce string, adopt bool) (EmailProof, error) {
+// which moves its authority to the new nonce and its browser-epoch binding to
+// the adopter's jar, so the original browser's logout can no longer cover it.
+func (s *Store) CompleteEmailLink(ctx context.Context, challengeID, token, nonce string, adopt bool, adopterEpochHash string) (EmailProof, error) {
 	nonceHash, err := validateNonce(nonce)
 	if err != nil {
 		return EmailProof{}, err
@@ -714,6 +726,9 @@ func (s *Store) CompleteEmailLink(ctx context.Context, challengeID, token, nonce
 	row, err := scanEmailFlowForUpdate(ctx, tx, "flow_id=$1", unlocked.flowID)
 	if err != nil {
 		return EmailProof{}, err
+	}
+	if row.flow.ClosedAt != nil {
+		return EmailProof{}, ErrAuthFlowConsumed
 	}
 	sameBrowser := subtle.ConstantTimeCompare(row.nonceHash, nonceHash) == 1
 	if row.provedAt != nil {
@@ -749,8 +764,12 @@ func (s *Store) CompleteEmailLink(ctx context.Context, challengeID, token, nonce
 		return EmailProof{}, ErrEmailChallengeExpired
 	}
 	if !sameBrowser {
-		tag, err := tx.Exec(ctx, `UPDATE auth_flows SET adopted_from_nonce_hash=nonce_hash, nonce_hash=$2
-			WHERE flow_id=$1 AND adopted_from_nonce_hash IS NULL`, row.flow.FlowID, nonceHash)
+		if adopterEpochHash != "" && !validBrowserEpochHash(adopterEpochHash) {
+			return EmailProof{}, ErrInvalidAuthFlow
+		}
+		tag, err := tx.Exec(ctx, `UPDATE auth_flows SET adopted_from_nonce_hash=nonce_hash, nonce_hash=$2,
+			browser_epoch_hash=COALESCE(NULLIF($3,''), browser_epoch_hash)
+			WHERE flow_id=$1 AND adopted_from_nonce_hash IS NULL`, row.flow.FlowID, nonceHash, adopterEpochHash)
 		if isUniqueViolation(err) {
 			return EmailProof{}, ErrInvalidAuthFlow
 		}

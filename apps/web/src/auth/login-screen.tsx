@@ -23,9 +23,12 @@ const emailStatusPollMs = 5_000;
 
 export function LoginScreen() {
   const {
+    accountSwitch,
     authenticated,
+    cancelAccountSwitch,
     cancelEmailCode,
     cancelIntentTransition,
+    confirmAccountSwitch,
     confirmation,
     configured,
     confirmIntentTransition,
@@ -312,21 +315,66 @@ export function LoginScreen() {
                 id="login-title"
                 className="font-semibold text-2xl tracking-[-0.025em]"
               >
-                {emailLinkPending
-                  ? authenticated
-                    ? "アカウントを切り替えますか？"
-                    : "メールのリンクで続ける"
-                  : confirmation
-                    ? "続行方法の確認"
-                    : emailCode
-                      ? "確認コードを入力"
-                      : intent === "sign_in"
-                        ? "アカウントにログイン"
-                        : "Sumiへようこそ"}
+                {accountSwitch
+                  ? "アカウントを切り替えますか？"
+                  : emailLinkPending
+                    ? authenticated
+                      ? "アカウントを切り替えますか？"
+                      : "メールのリンクで続ける"
+                    : confirmation
+                      ? "続行方法の確認"
+                      : emailCode
+                        ? "確認コードを入力"
+                        : intent === "sign_in"
+                          ? "アカウントにログイン"
+                          : "Sumiへようこそ"}
               </h1>
             </div>
 
-            {emailLinkPending ? (
+            {accountSwitch ? (
+              <div className="space-y-4">
+                <p className="rounded-lg bg-muted px-3 py-2.5 text-sm">
+                  現在のログイン:{" "}
+                  {accountSwitch.currentDisplayName ?? "別のアカウント"}
+                </p>
+                <p className="text-muted-foreground text-sm leading-6">
+                  {accountSwitch.target}
+                  のログインを完了すると、現在のセッションは終了し、このブラウザはそのアカウントへ切り替わります。
+                </p>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    setBusy("confirm");
+                    setError(null);
+                    void confirmAccountSwitch()
+                      .catch((nextError: unknown) => {
+                        setError(getAuthErrorMessage(nextError));
+                      })
+                      .finally(() => setBusy(null));
+                  }}
+                  disabled={busy !== null}
+                  className="h-11 w-full rounded-lg"
+                >
+                  {busy === "confirm" && (
+                    <LoaderCircle className="size-5 animate-spin" />
+                  )}
+                  切り替える
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setBusy("cancel");
+                    cancelAccountSwitch();
+                    setBusy(null);
+                  }}
+                  disabled={busy !== null}
+                  className="h-11 w-full rounded-lg"
+                >
+                  キャンセル
+                </Button>
+              </div>
+            ) : emailLinkPending ? (
               <EmailLinkPanel
                 authenticated={authenticated}
                 busy={busy !== null}

@@ -31,6 +31,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     redirectSignInPending,
     sessionState,
     refreshSession,
+    accountSwitch,
   } = auth;
   // Hidden children keep their last verified context: an inner auth gate must
   // not replace a form while Activity has paused its effects.
@@ -86,6 +87,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
         }
       />
     );
+  } else if (accountSwitch) {
+    // A sign-in resolved to another Human while this jar's session is live.
+    // The prompt overlays the still-mounted workspace so cancelling returns
+    // the person to it untouched.
+    status = <LoginScreen />;
   } else if (canUseDirectChat && !sessionSuspended && !ready) {
     status = <AuthStatus title="セッションを切り替えています…" />;
   } else if (sessionState === "unauthenticated") {

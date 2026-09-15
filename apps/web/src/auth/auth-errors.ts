@@ -75,6 +75,7 @@ const emailErrorMessages: Record<string, string> = {
   session_active:
     "別のアカウントでログインしています。切り替える場合は、現在のセッションを終了してください。",
   flow_consumed: "このログインはすでに完了しています。",
+  flow_closed: "このログインは取り消されました。もう一度お試しください。",
 };
 
 function emailAuthErrorMessage(error: AuthAPIError): string | null {

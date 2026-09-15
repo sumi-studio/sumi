@@ -14,6 +14,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
 import type { PendingRedirectAuthFlow } from "./auth-flow-state";
+import {
+  loadPendingEmailFlow,
+  savePendingEmailFlow,
+} from "./auth-flow-state";
 import { RedirectSignInAbandonedError } from "./redirect-sign-in";
 import {
   AuthAPIError,
@@ -40,9 +44,11 @@ const authMocks = vi.hoisted(() => ({
     outcome: "signed_in",
     continuation: "/",
     expiresAt: "2026-08-01T01:00:00Z",
+    humanId: "user-b",
   }),
   confirmAuthFlow: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
+  discardAuthFlow: vi.fn(),
   abandonEmailCodeFlow: vi.fn(),
   beginEmailCodeAuth: vi.fn(),
   clearPendingEmailLink: vi.fn(),
@@ -89,6 +95,7 @@ vi.mock("./session-client", async (importOriginal) => ({
 vi.mock("./auth-flow-client", () => ({
   confirmAuthFlow: authMocks.confirmAuthFlow,
   createAuthFlowNonce: authMocks.createAuthFlowNonce,
+  discardAuthFlow: authMocks.discardAuthFlow,
   resolveAuthFlow: authMocks.resolveAuthFlow,
   startAuthFlow: authMocks.startAuthFlow,
 }));
@@ -159,12 +166,14 @@ beforeEach(() => {
     outcome: "signed_in",
     continuation: "/",
     expiresAt: "2026-08-01T01:00:00Z",
+    humanId: "user-b",
   });
   authMocks.confirmAuthFlow.mockResolvedValue({
     flowId: "flow-id",
     outcome: "account_created",
     continuation: "/",
     expiresAt: "2026-08-01T01:00:00Z",
+    humanId: "user-new",
   });
   authMocks.logoutSumiSession.mockResolvedValue(undefined);
   authMocks.getSumiProfile.mockResolvedValue({
@@ -186,6 +195,7 @@ beforeEach(() => {
     "provider_linked",
   );
   authMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
+  authMocks.discardAuthFlow.mockResolvedValue(undefined);
   authMocks.loadActiveEmailCodeFlow.mockReturnValue(null);
   authMocks.pendingEmailLink.mockReturnValue(null);
   // The tab leaves for the provider: the promise that normally navigates away
@@ -1113,6 +1123,7 @@ describe("logout authority transition", () => {
         outcome: "signed_in",
         continuation: "/",
         expiresAt: "2099-08-01T01:00:00Z",
+        humanId: "human-existing",
       },
       firebaseUser,
     });
@@ -1239,6 +1250,7 @@ describe("logout authority transition", () => {
       outcome: "account_created",
       continuation: "/",
       expiresAt: "2026-08-01T01:00:00Z",
+      humanId: "user-new",
     });
     authMocks.verifyCommittedSumiSession.mockResolvedValue({
       authenticated: true,
@@ -1349,6 +1361,7 @@ describe("logout authority transition", () => {
         outcome: "account_created",
         continuation: "/",
         expiresAt: "2026-08-01T01:00:00Z",
+        humanId: "user-new",
       };
     });
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
@@ -1933,6 +1946,272 @@ describe("redirect return resilience", () => {
     // The server rejected the exchange, so the orphaned Firebase identity is
     // display state only and is signed out.
     expect(authMocks.signOut).toHaveBeenCalled();
+  });
+});
+
+describe("account switch and closed-flow authority", () => {
+  function SwitchProbe() {
+    const auth = useAuth();
+    return (
+      <>
+        <div data-testid="session-state">{auth.sessionState}</div>
+        <div data-testid="user-id">{auth.user?.id ?? "none"}</div>
+        <div data-testid="switch-prompt">
+          {auth.accountSwitch
+            ? `${auth.accountSwitch.currentUserId}->${auth.accountSwitch.target}`
+            : "none"}
+        </div>
+        <button
+          type="button"
+          onClick={() => void auth.submitEmailCode("123456").catch(() => undefined)}
+        >
+          complete email
+        </button>
+        <button
+          type="button"
+          onClick={() => void auth.confirmAccountSwitch().catch(() => undefined)}
+        >
+          confirm switch
+        </button>
+        <button type="button" onClick={() => auth.cancelAccountSwitch()}>
+          cancel switch
+        </button>
+        <button
+          type="button"
+          onClick={() => auth.cancelEmailCode()}
+        >
+          cancel email
+        </button>
+        <button
+          type="button"
+          onClick={() => void auth.logout().catch(() => undefined)}
+        >
+          logout
+        </button>
+      </>
+    );
+  }
+
+  function activeEmailFlow() {
+    return { state: "s".repeat(24), flow: recoveryEmailFlow() };
+  }
+
+  it("offers an explicit switch instead of silently replacing the session", async () => {
+    const active = activeEmailFlow();
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Current" },
+    });
+    authMocks.loadActiveEmailCodeFlow.mockReturnValue(active);
+    authMocks.verifyEmailCode.mockResolvedValue({
+      active,
+      customToken: "custom-token",
+    });
+    authMocks.finishEmailProof
+      .mockRejectedValueOnce(new AuthAPIError("session_active", 409))
+      .mockResolvedValue({
+        flow: active.flow,
+        result: {
+          flowId: "email-flow",
+          outcome: "signed_in",
+          continuation: "/",
+          expiresAt: "2099-08-01T01:00:00Z",
+          humanId: "user-b",
+        },
+        firebaseUser: { uid: "firebase-b", displayName: null, email: null },
+      });
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b" },
+    });
+
+    render(
+      <AuthProvider>
+        <SwitchProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "complete email" }));
+
+    // The session stays with the active Human while the prompt is open.
+    await waitFor(() =>
+      expect(screen.getByTestId("switch-prompt")).toHaveTextContent(
+        "user-a->existing@example.com",
+      ),
+    );
+    expect(screen.getByTestId("user-id")).toHaveTextContent("user-a");
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+
+    // Confirming retries the same completion naming the replaced Human.
+    fireEvent.click(screen.getByRole("button", { name: "confirm switch" }));
+    await waitFor(() => {
+      expect(authMocks.finishEmailProof).toHaveBeenLastCalledWith(
+        expect.anything(),
+        { switchFromUserId: "user-a" },
+      );
+      expect(screen.getByTestId("user-id")).toHaveTextContent("user-b");
+      expect(screen.getByTestId("switch-prompt")).toHaveTextContent("none");
+    });
+  });
+
+  it("cancelling a switch discards only the interrupted flow", async () => {
+    const active = activeEmailFlow();
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Current" },
+    });
+    authMocks.loadActiveEmailCodeFlow.mockReturnValue(active);
+    authMocks.verifyEmailCode.mockResolvedValue({
+      active,
+      customToken: "custom-token",
+    });
+    authMocks.finishEmailProof.mockRejectedValue(
+      new AuthAPIError("session_active", 409),
+    );
+
+    render(
+      <AuthProvider>
+        <SwitchProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "complete email" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("switch-prompt")).toHaveTextContent("user-a->"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "cancel switch" }));
+    await waitFor(() =>
+      expect(authMocks.discardAuthFlow).toHaveBeenCalledWith(
+        "email-flow",
+        "n".repeat(43),
+      ),
+    );
+    expect(screen.getByTestId("switch-prompt")).toHaveTextContent("none");
+    expect(screen.getByTestId("user-id")).toHaveTextContent("user-a");
+    expect(authMocks.logoutSumiSession).not.toHaveBeenCalled();
+  });
+
+  it("resumes without a prompt when the conflicting session already ended", async () => {
+    const active = activeEmailFlow();
+    let sessionReads = 0;
+    authMocks.getSumiSession.mockImplementation(async () => {
+      sessionReads += 1;
+      return sessionReads === 1
+        ? {
+            authenticated: true,
+            authorityBindingId: authorityBindingA,
+            user: { id: "user-a" },
+          }
+        : { authenticated: false };
+    });
+    authMocks.loadActiveEmailCodeFlow.mockReturnValue(active);
+    authMocks.verifyEmailCode.mockResolvedValue({
+      active,
+      customToken: "custom-token",
+    });
+    authMocks.finishEmailProof
+      .mockRejectedValueOnce(new AuthAPIError("session_active", 409))
+      .mockResolvedValue({
+        flow: active.flow,
+        result: {
+          flowId: "email-flow",
+          outcome: "signed_in",
+          continuation: "/",
+          expiresAt: "2099-08-01T01:00:00Z",
+          humanId: "user-b",
+        },
+        firebaseUser: { uid: "firebase-b", displayName: null, email: null },
+      });
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b" },
+    });
+
+    render(
+      <AuthProvider>
+        <SwitchProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "complete email" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("user-id")).toHaveTextContent("user-b"),
+    );
+    expect(screen.getByTestId("switch-prompt")).toHaveTextContent("none");
+  });
+
+  it("logout names pending email flows so the server closes their replay authority", async () => {
+    authMocks.getSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a" },
+    });
+    savePendingEmailFlow("s".repeat(24), recoveryEmailFlow());
+
+    render(
+      <AuthProvider>
+        <SwitchProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "logout" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      ),
+    );
+    expect(authMocks.logoutSumiSession).toHaveBeenCalledWith([
+      { flowId: "email-flow", nonce: "n".repeat(43) },
+    ]);
+    expect(loadPendingEmailFlow("s".repeat(24))).toBeNull();
+  });
+
+  it("cancelling a pending email code closes the flow's issuance authority", async () => {
+    const active = activeEmailFlow();
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.loadActiveEmailCodeFlow.mockReturnValue(active);
+
+    render(
+      <AuthProvider>
+        <SwitchProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "cancel email" }));
+
+    await waitFor(() =>
+      expect(authMocks.discardAuthFlow).toHaveBeenCalledWith(
+        "email-flow",
+        "n".repeat(43),
+      ),
+    );
   });
 });
 

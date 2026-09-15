@@ -16,7 +16,7 @@ type fakeEmailAuthController struct {
 	inspectSession *UserSessionClaims
 }
 
-func (f *fakeEmailAuthController) VerifyEmailCode(context.Context, VerifyEmailCodeRequest) (EmailProofResult, error) {
+func (f *fakeEmailAuthController) VerifyEmailCode(context.Context, VerifyEmailCodeRequest, *UserSessionClaims) (EmailProofResult, error) {
 	f.verifyCalls++
 	if f.err != nil {
 		return EmailProofResult{}, f.err
@@ -37,7 +37,7 @@ func (f *fakeEmailAuthController) InspectEmailLink(_ context.Context, _ InspectE
 	return EmailLinkInspectionResult{FlowID: "flow-id", State: "usable", Session: "none"}, f.err
 }
 
-func (f *fakeEmailAuthController) CompleteEmailLink(context.Context, CompleteEmailLinkRequest) (EmailProofResult, error) {
+func (f *fakeEmailAuthController) CompleteEmailLink(context.Context, CompleteEmailLinkRequest, *UserSessionClaims) (EmailProofResult, error) {
 	f.completeCalls++
 	return EmailProofResult{FlowID: "flow-id", Intent: "sign_in", CustomToken: "custom-token"}, f.err
 }
@@ -54,12 +54,13 @@ func newEmailAuthTestServer(t *testing.T, controller *fakeEmailAuthController) (
 
 func postEmailAuth(t *testing.T, server *BrowserAuthServer, mux *http.ServeMux, path, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Origin", browserAuthTestOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CSRF-Token", csrf)
 	req.AddCookie(csrfCookie)
+	req.AddCookie(epochCookie)
 	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
@@ -124,7 +125,7 @@ func TestEmailAuthRoutesMapSemanticErrorsWithoutSession(t *testing.T) {
 	}
 }
 
-func TestEmailLinkCompletionRefusesActiveSessionAndInspectSeesIt(t *testing.T) {
+func TestEmailLinkCompletionPassesSessionThroughAndInspectSeesIt(t *testing.T) {
 	controller := &fakeEmailAuthController{}
 	server, mux, sessions := newEmailAuthTestServer(t, controller)
 	claims := UserSessionClaims{TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011"}
@@ -138,15 +139,18 @@ func TestEmailLinkCompletionRefusesActiveSessionAndInspectSeesIt(t *testing.T) {
 	if inspected.Code != http.StatusOK || controller.inspectSession == nil || controller.inspectSession.UserID != claims.UserID {
 		t.Fatalf("inspect with session: %d %s %+v", inspected.Code, inspected.Body.String(), controller.inspectSession)
 	}
-	blocked := postEmailAuth(t, server, mux, "/auth/email/link/complete", emailLinkTestBody, sessionCookie)
-	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), `"error":"session_active"`) || controller.completeCalls != 0 {
-		t.Fatalf("complete beside session: %d %s calls=%d", blocked.Code, blocked.Body.String(), controller.completeCalls)
+	// Completion beside a live session is now allowed through: the proof is
+	// only mailbox evidence, and resolve decides same-account vs. explicit
+	// switch through session admission.
+	completed := postEmailAuth(t, server, mux, "/auth/email/link/complete", emailLinkTestBody, sessionCookie)
+	if completed.Code != http.StatusOK || controller.completeCalls != 1 {
+		t.Fatalf("complete beside session: %d %s calls=%d", completed.Code, completed.Body.String(), controller.completeCalls)
 	}
 	if _, err := sessions.VerifySession(context.Background(), session); err != nil {
-		t.Fatalf("blocked completion changed the active session: %v", err)
+		t.Fatalf("completion changed the active session: %v", err)
 	}
-	completed := postEmailAuth(t, server, mux, "/auth/email/link/complete", emailLinkTestBody)
-	if completed.Code != http.StatusOK || controller.completeCalls != 1 {
+	completed = postEmailAuth(t, server, mux, "/auth/email/link/complete", emailLinkTestBody)
+	if completed.Code != http.StatusOK || controller.completeCalls != 2 {
 		t.Fatalf("complete without session: %d %s", completed.Code, completed.Body.String())
 	}
 }

@@ -158,7 +158,7 @@ func TestEmailCodeWrongGuessesAreCommittedAndLockOnlyThatCode(t *testing.T) {
 	}
 
 	// The link in the locked email still proves the mailbox.
-	proof, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false)
+	proof, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false, "")
 	if err != nil || proof.Method != "link" {
 		t.Fatalf("link after code lock: %+v %v", proof, err)
 	}
@@ -206,7 +206,7 @@ func TestEmailCodeResendReusesLiveCodeOrSupersedesIt(t *testing.T) {
 	if err != nil || inspection.State != "superseded" {
 		t.Fatalf("old link inspection: %+v %v", inspection, err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, first.ChallengeID, firstToken, nonce, false); !errors.Is(err, ErrEmailChallengeSuperseded) {
+	if _, err := store.CompleteEmailLink(ctx, first.ChallengeID, firstToken, nonce, false, ""); !errors.Is(err, ErrEmailChallengeSuperseded) {
 		t.Fatalf("old link complete: %v", err)
 	}
 	if proof, err := store.VerifyEmailCode(ctx, flow.FlowID, nonce, newCode); err != nil || proof.Method != "code" {
@@ -502,14 +502,14 @@ func TestEmailLinkInspectionDoesNotConsumeAndOtherBrowserMustAdopt(t *testing.T)
 		t.Fatalf("tampered token: %v", err)
 	}
 	browserNonce := testNonce(t)
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, false); !errors.Is(err, ErrEmailLinkAdoptionRequired) {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, false, ""); !errors.Is(err, ErrEmailLinkAdoptionRequired) {
 		t.Fatalf("other browser without explicit choice: %v", err)
 	}
 	// Scanning and a declined continuation left the PWA code usable.
 	if proof, err := store.VerifyEmailCode(ctx, flow.FlowID, pwaNonce, code); err != nil || proof.Method != "code" {
 		t.Fatalf("code after link inspection: %+v %v", proof, err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true); !errors.Is(err, ErrEmailChallengeConsumed) {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true, ""); !errors.Is(err, ErrEmailChallengeConsumed) {
 		t.Fatalf("adopt after code proof: %v", err)
 	}
 
@@ -517,11 +517,11 @@ func TestEmailLinkInspectionDoesNotConsumeAndOtherBrowserMustAdopt(t *testing.T)
 	flow, state = startCodeFlow(t, ctx, store, IntentSignIn, "adopt@example.com", pwaNonce, false)
 	code, token = challengeSecrets(t, store, state.ChallengeID)
 	browserNonce = testNonce(t)
-	proof, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true)
+	proof, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true, "")
 	if err != nil || proof.Method != "link" || proof.FlowID != flow.FlowID {
 		t.Fatalf("adopt: %+v %v", proof, err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, false); err != nil {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, false, ""); err != nil {
 		t.Fatalf("adopting browser retry: %v", err)
 	}
 	if _, err := store.VerifyEmailCode(ctx, flow.FlowID, pwaNonce, code); !errors.Is(err, ErrEmailFlowContinuedElsewhere) {
@@ -533,7 +533,7 @@ func TestEmailLinkInspectionDoesNotConsumeAndOtherBrowserMustAdopt(t *testing.T)
 	if _, err := store.AuthFlowStatus(ctx, flow.FlowID, pwaNonce); !errors.Is(err, ErrEmailFlowContinuedElsewhere) {
 		t.Fatalf("original auth status: %v", err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, testNonce(t), true); !errors.Is(err, ErrEmailChallengeConsumed) {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, testNonce(t), true, ""); !errors.Is(err, ErrEmailChallengeConsumed) {
 		t.Fatalf("third browser adoption: %v", err)
 	}
 	if inspection, err := store.InspectEmailLink(ctx, state.ChallengeID, token, browserNonce); err != nil || inspection.State != "proved_here" {
@@ -568,7 +568,7 @@ func TestEmailCodeAndLinkRaceYieldsExactlyOneAuthority(t *testing.T) {
 		go func() { defer wg.Done(); _, codeErr = store.VerifyEmailCode(ctx, flow.FlowID, pwaNonce, code) }()
 		go func() {
 			defer wg.Done()
-			_, linkErr = store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true)
+			_, linkErr = store.CompleteEmailLink(ctx, state.ChallengeID, token, browserNonce, true, "")
 		}()
 		wg.Wait()
 		switch {
@@ -604,7 +604,7 @@ func TestEmailChallengeExpiryAndKeyRotationRecoverByResend(t *testing.T) {
 	if inspection, err := store.InspectEmailLink(ctx, state.ChallengeID, token, ""); err != nil || inspection.State != "expired" {
 		t.Fatalf("expired inspection: %+v %v", inspection, err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false); !errors.Is(err, ErrEmailChallengeExpired) {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false, ""); !errors.Is(err, ErrEmailChallengeExpired) {
 		t.Fatalf("expired link: %v", err)
 	}
 	allowResend(t, ctx, store, flow.FlowID)
@@ -848,7 +848,7 @@ func TestProvedEmailFlowRetriesEndAtFlowExpiry(t *testing.T) {
 	if _, err := store.VerifyEmailCode(ctx, flow.FlowID, nonce, ""); err != nil {
 		t.Fatalf("code retry before expiry: %v", err)
 	}
-	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false); err != nil {
+	if _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false, ""); err != nil {
 		t.Fatalf("link retry before expiry: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE auth_flows SET created_at=created_at-interval '1 hour',
@@ -857,7 +857,7 @@ func TestProvedEmailFlowRetriesEndAtFlowExpiry(t *testing.T) {
 	}
 	for name, retry := range map[string]func() error{
 		"code":    func() error { _, err := store.VerifyEmailCode(ctx, flow.FlowID, nonce, ""); return err },
-		"link":    func() error { _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false); return err },
+		"link":    func() error { _, err := store.CompleteEmailLink(ctx, state.ChallengeID, token, nonce, false, ""); return err },
 		"bind":    func() error { _, err := store.BindEmailProofUID(ctx, flow.FlowID, nonce, "expiring-uid"); return err },
 		"resolve": func() error { _, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, customTokenProof("expiring-uid")); return err },
 	} {
@@ -900,7 +900,7 @@ func TestEmailSendLimitIsHourlyAndLiveLinksStayUsable(t *testing.T) {
 	// While sends are paused, a delivered live link still proves the mailbox,
 	// including from another browser that adopts the flow.
 	_, token := challengeSecrets(t, store, firstState.ChallengeID)
-	if proof, err := store.CompleteEmailLink(ctx, firstState.ChallengeID, token, testNonce(t), true); err != nil || proof.Method != "link" {
+	if proof, err := store.CompleteEmailLink(ctx, firstState.ChallengeID, token, testNonce(t), true, ""); err != nil || proof.Method != "link" {
 		t.Fatalf("live link during send pause: %+v %v", proof, err)
 	}
 	// There is no longer pause than the rolling hour, even after 20 intents

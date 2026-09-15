@@ -69,6 +69,11 @@ export interface EmailLinkInspection {
 export interface EmailProof {
   active: ActiveEmailCodeFlow;
   customToken: string;
+  /**
+   * The Human the mailbox proof resolved to. Absent for proofs that precede
+   * identity resolution; the resolve result still carries it.
+   */
+  humanId?: string;
 }
 
 export interface EmailProofCompletion {
@@ -242,7 +247,11 @@ export async function verifyEmailCode(
       code,
     }),
   );
-  return { active, customToken: parseEmailProof(body, active.flow.flowId) };
+  return {
+    active,
+    customToken: parseEmailProof(body, active.flow.flowId),
+    humanId: parseHumanId(body),
+  };
 }
 
 export async function inspectEmailLink(
@@ -299,6 +308,7 @@ export async function completeEmailLink(
   return {
     active: authority,
     customToken: parseEmailProof(body, inspection.flowId),
+    humanId: parseHumanId(body),
   };
 }
 
@@ -307,10 +317,10 @@ export async function completeEmailLink(
  * The pending record stays until the resolution and its session exist, so
  * every failure before that is an ordinary retry of the same proof.
  */
-export async function finishEmailProof({
-  active,
-  customToken,
-}: EmailProof): Promise<EmailProofCompletion> {
+export async function finishEmailProof(
+  { active, customToken }: EmailProof,
+  options?: { switchFromUserId?: string },
+): Promise<EmailProofCompletion> {
   const { state, flow } = active;
   const credential = await signInWithCustomToken(
     getFirebaseAuth(),
@@ -321,8 +331,11 @@ export async function finishEmailProof({
     nonce: flow.nonce,
     idToken: await getIdToken(credential.user, true),
   };
-  const result = await resolveAuthFlow(request);
-  await ensureEmailCompletionSession(request, result);
+  const result = await resolveAuthFlow({
+    ...request,
+    switchFromUserId: options?.switchFromUserId,
+  });
+  await ensureEmailCompletionSession(request, result, options);
   // Claim a pending provider credential before any provider mutation.
   if (flow.credentialRecovery) consumePendingCredentialRecovery(state, flow);
   else clearPendingEmailFlow(state);
@@ -344,15 +357,33 @@ export async function finishEmailProof({
 export async function ensureEmailCompletionSession(
   request: { flowId: string; nonce: string; idToken: string },
   result: AuthFlowResult,
+  options?: { switchFromUserId?: string },
 ): Promise<void> {
   if (result.outcome !== "signed_in" && result.outcome !== "account_created") {
     return;
   }
-  if ((await getSumiSession()).authenticated) return;
-  const replayed = await resolveAuthFlow(request);
+  const session = await getSumiSession();
+  if (session.authenticated) {
+    // A session may only stand in for this completion when it belongs to
+    // the Human the flow resolved to. Any other account is the person's
+    // later choice: completing over it needs their explicit switch, which
+    // the server also enforces through session_active.
+    if (session.user.id === result.humanId) return;
+    throw new AuthAPIError("session_active", 409);
+  }
+  const replayed = await resolveAuthFlow({
+    ...request,
+    switchFromUserId: options?.switchFromUserId,
+  });
   if (replayed.outcome !== result.outcome) invalidResponse();
-  if (!(await getSumiSession()).authenticated) {
+  const next = await getSumiSession();
+  if (!next.authenticated) {
     throw new AuthAPIError("Sumi session was not established.", 0);
+  }
+  if (next.user.id !== replayed.humanId) {
+    // The replay could not mint its own session because this jar now
+    // belongs to a different Human.
+    throw new AuthAPIError("session_active", 409);
   }
 }
 
@@ -429,6 +460,19 @@ function parseEmailLinkInspection(value: unknown): EmailLinkInspection {
     session,
     expiresAt: expires_at,
   };
+}
+
+function parseHumanId(value: unknown): string | undefined {
+  if (!isObject(value)) return undefined;
+  const humanId = value.human_id;
+  if (
+    typeof humanId !== "string" ||
+    humanId.length === 0 ||
+    humanId.length > 256
+  ) {
+    return undefined;
+  }
+  return humanId;
 }
 
 function isEmailLinkParams(value: unknown): value is EmailLinkParams {

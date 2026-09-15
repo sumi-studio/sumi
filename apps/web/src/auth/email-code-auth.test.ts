@@ -41,6 +41,7 @@ const signedIn = {
   outcome: "signed_in",
   continuation: "/",
   expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+  human_id: "human-id",
 };
 
 const authenticatedSession = {
@@ -139,13 +140,7 @@ describe("email code flow", () => {
       ],
       "/auth/flows/resolve": [
         () => Response.json({ error: "provider_unavailable" }, { status: 409 }),
-        () =>
-          Response.json({
-            flow_id: "flow-id",
-            outcome: "signed_in",
-            continuation: "/",
-            expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
-          }),
+        () => Response.json(signedIn),
       ],
       "/auth/flows/status": [
         () => Response.json({ error: "invalid_flow" }, { status: 400 }),

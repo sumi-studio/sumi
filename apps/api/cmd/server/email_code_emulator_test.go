@@ -152,12 +152,12 @@ func TestFirebaseEmulatorEmailCodeSignsInExistingPrincipalWithCustomClaims(t *te
 	}
 
 	started, nonce, code := h.start(t, ctx, email)
-	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if err != nil || proof.CustomToken == "" {
 		t.Fatalf("verify: %+v %v", proof, err)
 	}
 	// A dropped Firebase exchange: the same flow authority gets a new token.
-	retry, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce})
+	retry, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}, nil)
 	if err != nil || retry.CustomToken == "" {
 		t.Fatalf("retry after proof: %+v %v", retry, err)
 	}
@@ -172,7 +172,7 @@ func TestFirebaseEmulatorEmailCodeSignsInExistingPrincipalWithCustomClaims(t *te
 	}
 	// The resolve response was lost: inside the replay window the same flow
 	// authority gets a token for the same UID and signs in the same Human.
-	replayProof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	replayProof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if err != nil || replayProof.CustomToken == "" {
 		t.Fatalf("verify replay after sign-in: %+v %v", replayProof, err)
 	}
@@ -187,7 +187,7 @@ func TestFirebaseEmulatorEmailCodeSignsInExistingPrincipalWithCustomClaims(t *te
 		t.Fatal(err)
 	}
 	minted := h.principals.customTokenCalls
-	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}); !errors.Is(err, agentevents.ErrBrowserAuthFlowConsumed) {
+	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil); !errors.Is(err, agentevents.ErrBrowserAuthFlowConsumed) {
 		t.Fatalf("second use after sign-in: %v", err)
 	}
 	if _, err := h.controller.Resolve(ctx, agentevents.ResolveBrowserAuthFlowRequest{FlowID: started.FlowID, Nonce: nonce}, identity); !errors.Is(err, agentevents.ErrBrowserAuthFlowConsumed) {
@@ -221,7 +221,7 @@ func TestFirebaseEmulatorEmailCodeConcurrentRetriesCreateOnePrincipal(t *testing
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+			proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 			if err != nil {
 				errs <- err
 				return
@@ -253,7 +253,7 @@ func TestFirebaseEmulatorEmailCodeConcurrentRetriesCreateOnePrincipal(t *testing
 	t.Cleanup(func() { _ = h.client.DeleteUser(context.Background(), record.UID) })
 
 	// The failed signing call is an ordinary retry of the same authority.
-	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce})
+	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestFirebaseEmulatorEmailCodeReplacesUnboundUnverifiedPrincipal(t *testing.
 	t.Cleanup(func() { _ = h.client.DeleteUser(context.Background(), attackerUID) })
 
 	started, nonce, code := h.start(t, ctx, email)
-	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestFirebaseEmulatorEmailCodeFailsClosedForBoundUnverifiedPrincipal(t *test
 	}
 	started, nonce, code := h.start(t, ctx, email)
 	var unverified *agentevents.BrowserEmailUnverifiedAccountError
-	_, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	_, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if !errors.Is(err, agentevents.ErrBrowserEmailUnverifiedAccount) || !errors.As(err, &unverified) || len(unverified.SignInProviders) != 0 {
 		t.Fatalf("bound unverified principal without providers: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestFirebaseEmulatorEmailCodeFailsClosedForBoundUnverifiedPrincipal(t *test
 		t.Fatal(err)
 	}
 	started, nonce, code = h.start(t, ctx, githubEmail)
-	_, err = h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	_, err = h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if !errors.As(err, &unverified) || len(unverified.SignInProviders) != 1 || unverified.SignInProviders[0] != "github.com" {
 		t.Fatalf("GitHub-first account refusal: %v %+v", err, unverified)
 	}
@@ -363,10 +363,10 @@ func TestFirebaseEmulatorEmailCodeExpiredProofMintsNoCustomToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	started, nonce, code := h.start(t, ctx, email)
-	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}); err != nil {
+	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}); err != nil {
+	if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}, nil); err != nil {
 		t.Fatalf("retry before expiry: %v", err)
 	}
 	minted := h.principals.customTokenCalls
@@ -378,7 +378,7 @@ func TestFirebaseEmulatorEmailCodeExpiredProofMintsNoCustomToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}); !errors.Is(err, agentevents.ErrBrowserAuthFlowExpired) {
+		if _, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce}, nil); !errors.Is(err, agentevents.ErrBrowserAuthFlowExpired) {
 			t.Fatalf("retry after flow expiry: %v", err)
 		}
 	}
@@ -420,11 +420,11 @@ func TestFirebaseEmulatorEmailLinkAdoptionAndSessionRelation(t *testing.T) {
 	}
 	browserNonce := controllerNonce(t)
 	complete := agentevents.CompleteEmailLinkRequest{ChallengeID: state.ChallengeID, Token: token, Nonce: browserNonce}
-	if _, err := h.controller.email.CompleteEmailLink(ctx, complete); !errors.Is(err, agentevents.ErrBrowserEmailAdoptionRequired) {
+	if _, err := h.controller.email.CompleteEmailLink(ctx, complete, nil); !errors.Is(err, agentevents.ErrBrowserEmailAdoptionRequired) {
 		t.Fatalf("other browser without choice: %v", err)
 	}
 	complete.Adopt = true
-	proof, err := h.controller.email.CompleteEmailLink(ctx, complete)
+	proof, err := h.controller.email.CompleteEmailLink(ctx, complete, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +455,7 @@ func TestFirebaseEmulatorEmailCodeCountsAsUnlinkMethodOnlyWhenEnabled(t *testing
 		t.Fatal(err)
 	}
 	started, nonce, code := h.start(t, ctx, email)
-	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code})
+	proof, err := h.controller.email.VerifyEmailCode(ctx, agentevents.VerifyEmailCodeRequest{FlowID: started.FlowID, Nonce: nonce, Code: code}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

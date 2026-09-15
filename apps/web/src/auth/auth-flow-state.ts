@@ -256,6 +256,33 @@ function isExpiredPendingEmailFlow(flow: PendingEmailAuthFlow): boolean {
   );
 }
 
+/**
+ * Every live pending email flow this jar still holds authority over.
+ * Logout lists them so the server can close flows whose epoch cookie this
+ * jar no longer presents — epoch enumeration cannot find those on its own.
+ */
+export function listPendingEmailFlows(): Array<{
+  state: string;
+  flowId: string;
+  nonce: string;
+}> {
+  const flows: Array<{ state: string; flowId: string; nonce: string }> = [];
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(emailFlowPrefix)) continue;
+      const state = key.slice(emailFlowPrefix.length);
+      const flow = loadPendingEmailFlow(state);
+      if (flow) {
+        flows.push({ state, flowId: flow.flowId, nonce: flow.nonce });
+      }
+    }
+  } catch {
+    // Storage may be unavailable; logout still closes what the epoch covers.
+  }
+  return flows;
+}
+
 export function cleanupPendingEmailFlowStorage(): void {
   try {
     const keys: string[] = [];

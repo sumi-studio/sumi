@@ -125,6 +125,27 @@ export async function postAuthJSON(
   body: Record<string, string | boolean>,
 ): Promise<unknown> {
   const csrfToken = await fetchCSRFToken();
+  const response = await postAuth(path, body, csrfToken);
+  return readAuthJSON(response);
+}
+
+/**
+ * Same CSRF-authenticated POST as postAuthJSON for endpoints that answer
+ * 204 No Content on success (discard, logout-style mutations).
+ */
+export async function postAuthNoContent(
+  path: `/auth/${string}`,
+  body: Record<string, string | boolean>,
+): Promise<void> {
+  const csrfToken = await fetchCSRFToken();
+  await postAuth(path, body, csrfToken);
+}
+
+async function postAuth(
+  path: `/auth/${string}`,
+  body: Record<string, string | boolean>,
+  csrfToken: string,
+): Promise<Response> {
   const response = await fetch(path, {
     method: "POST",
     credentials: "include",
@@ -140,17 +161,21 @@ export async function postAuthJSON(
   if (!response.ok) {
     throw await authAPIError(response);
   }
-  return readAuthJSON(response);
+  return response;
 }
 
 /**
  * A terminal auth-flow response commits HttpOnly authority before the browser can
- * confirm its status. Keep both operations in one mutation and compensate
- * with a Sumi logout if any post-commit status read fails.
+ * confirm its status. Keep both operations in one mutation and compensate if
+ * any post-commit status read fails. The caller passes the compensation —
+ * normally a flow-scoped discard that revokes only what this flow minted —
+ * because a jar-wide logout could erase a different account another tab chose
+ * while this exchange was in flight.
  */
-export async function verifyCommittedSumiSession(): Promise<
-  Extract<SumiSessionStatus, { authenticated: true }>
-> {
+export async function verifyCommittedSumiSession(options?: {
+  compensate?: () => Promise<void>;
+}): Promise<Extract<SumiSessionStatus, { authenticated: true }>> {
+  const compensate = options?.compensate ?? logoutSumiSession;
   try {
     const session = await getSumiSession();
     if (!session.authenticated) {
@@ -159,7 +184,7 @@ export async function verifyCommittedSumiSession(): Promise<
     return session;
   } catch (error) {
     try {
-      await logoutSumiSession();
+      await compensate();
     } catch (logoutError) {
       throw new SumiSessionCompensationFailedError(error, logoutError);
     }
@@ -304,16 +329,33 @@ export function canonicalizeSumiDisplayName(displayName: string): string {
   return displayName.trim().replace(/\s+/gu, " ");
 }
 
-export async function logoutSumiSession(): Promise<void> {
+/**
+ * Ends the server-side session and closes this browser's authentication
+ * work. The pending flows the caller lists are closed by their nonce
+ * authority; they cover work bound to an epoch cookie this jar no longer
+ * presents, which server-side epoch enumeration cannot find on its own.
+ */
+export async function logoutSumiSession(
+  flows?: ReadonlyArray<{ flowId: string; nonce: string }>,
+): Promise<void> {
   const csrfToken = await fetchCSRFToken();
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "X-CSRF-Token": csrfToken,
+  };
+  let body: string | undefined;
+  if (flows && flows.length > 0) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify({
+      flows: flows.map((flow) => ({ flow_id: flow.flowId, nonce: flow.nonce })),
+    });
+  }
   const response = await fetch("/auth/logout", {
     method: "POST",
     credentials: "include",
     cache: "no-store",
-    headers: {
-      Accept: "application/json",
-      "X-CSRF-Token": csrfToken,
-    },
+    headers,
+    body,
     signal: authRequestSignal(),
   });
   if (!response.ok) {

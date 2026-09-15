@@ -58,7 +58,8 @@ func (c *kosekiAuthFlowController) Start(ctx context.Context, request agentevent
 	flow, err := c.store.StartAuthFlow(ctx, koseki.StartAuthFlowRequest{
 		InviteToken: request.InviteToken, Intent: koseki.AuthIntent(request.Intent), Channel: koseki.ChannelProvider,
 		ExpectedProvider: request.Provider,
-		Continuation:     request.Continuation, Nonce: request.Nonce, TTL: authFlowTTL,
+		Continuation:     request.Continuation, Nonce: request.Nonce,
+		BrowserEpochHash: request.BrowserEpochHash, TTL: authFlowTTL,
 	})
 	if err != nil {
 		return agentevents.BrowserAuthFlowResult{}, mapFlowError(err)
@@ -94,6 +95,51 @@ func (c *kosekiAuthFlowController) Status(ctx context.Context, request agenteven
 	return c.flowResult(flow), nil
 }
 
+// AuthFlowEpoch exposes the flow's browser-epoch binding to session admission.
+func (c *kosekiAuthFlowController) AuthFlowEpoch(ctx context.Context, flowID string) (string, error) {
+	epoch, err := c.store.AuthFlowEpochHash(ctx, flowID)
+	if err != nil {
+		return "", mapFlowError(err)
+	}
+	return epoch, nil
+}
+
+// AuthFlowForNonce authenticates a flow-scoped discard: only the browser that
+// holds the nonce may cancel this flow's issuance authority.
+func (c *kosekiAuthFlowController) AuthFlowForNonce(ctx context.Context, flowID, nonce string) (agentevents.BrowserFlowRef, error) {
+	ref, err := c.store.BrowserFlowRefForNonce(ctx, flowID, nonce)
+	if err != nil {
+		return agentevents.BrowserFlowRef{}, mapFlowError(err)
+	}
+	return browserFlowRefFromKoseki(ref), nil
+}
+
+// OpenBrowserFlows enumerates the epoch's unclosed flows for logout closure.
+func (c *kosekiAuthFlowController) OpenBrowserFlows(ctx context.Context, epochHash string) ([]agentevents.BrowserFlowRef, error) {
+	refs, err := c.store.OpenBrowserFlows(ctx, epochHash)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agentevents.BrowserFlowRef, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, browserFlowRefFromKoseki(ref))
+	}
+	return out, nil
+}
+
+// CloseFlows mirrors the committed session-store closure. Issuance is fenced
+// by the session store, not this column.
+func (c *kosekiAuthFlowController) CloseFlows(ctx context.Context, flowIDs []string) error {
+	return c.store.CloseAuthFlows(ctx, flowIDs)
+}
+
+func browserFlowRefFromKoseki(ref koseki.BrowserFlowRef) agentevents.BrowserFlowRef {
+	return agentevents.BrowserFlowRef{
+		FlowID: ref.FlowID, HumanID: ref.HumanID, EpochHash: ref.EpochHash,
+		ExpiresAt: ref.ExpiresAt, Closed: ref.ClosedAt != nil,
+	}
+}
+
 func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.BrowserAuthFlowResult {
 	result := agentevents.BrowserAuthFlowResult{
 		FlowID: flow.FlowID, Continuation: flow.Continuation, ExpiresAt: flow.ExpiresAt,
@@ -103,6 +149,7 @@ func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.
 		return result
 	}
 	result.Outcome = flow.TerminalOutcome
+	result.HumanID = flow.HumanID
 	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, UserID: flow.HumanID, PersonalityAgentID: flow.AgentID}
 	return result
 }

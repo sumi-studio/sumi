@@ -1927,11 +1927,12 @@ func TestBrowserLogoutClosesOnlyMatchingLiveSessionAndStopsReconnect(t *testing.
 		t.Fatal(err)
 	}
 	auth.Connections = browser
-	csrf, csrfCookie := obtainCSRF(t, auth)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, auth)
 	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	logout.Header.Set("Origin", browserAuthTestOrigin)
 	logout.Header.Set("X-CSRF-Token", csrf)
 	logout.AddCookie(csrfCookie)
+	logout.AddCookie(epochCookie)
 	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: firstSession})
 	logoutRecorder := httptest.NewRecorder()
 	auth.serveLogout(logoutRecorder, logout)

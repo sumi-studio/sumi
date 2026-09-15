@@ -171,6 +171,110 @@ func (s *testBrowserSessionRevocationStore) RotateBrowserSession(
 	return nil
 }
 
+func (s *testBrowserSessionRevocationStore) AdmitBrowserSession(
+	_ context.Context,
+	admission BrowserSessionAdmission,
+	now time.Time,
+) (BrowserSessionAdmissionOutcome, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return BrowserSessionAdmissionOutcome{}, s.revokeErr
+	}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	outcome, err := admitBrowserSessionState(&next, admission, now, s.max)
+	if err != nil {
+		return BrowserSessionAdmissionOutcome{}, err
+	}
+	if err := validateBrowserSessionRevocationState(next); err != nil {
+		return BrowserSessionAdmissionOutcome{}, err
+	}
+	s.state = next
+	return outcome, nil
+}
+
+func (s *testBrowserSessionRevocationStore) CheckBrowserEpoch(
+	_ context.Context,
+	epochHash string,
+	now time.Time,
+) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.checkErr != nil {
+		return s.checkErr
+	}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	if _, closed := next.ClosedEpochs[epochHash]; closed {
+		return errBrowserEpochClosed
+	}
+	return nil
+}
+
+func (s *testBrowserSessionRevocationStore) CloseBrowserSessionsForLogout(
+	_ context.Context,
+	presented []BrowserSessionIdentity,
+	epochs []string,
+	extraFlows map[string]int64,
+	now time.Time,
+) ([]string, []string, []string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return nil, nil, nil, s.revokeErr
+	}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	closedFlows, closedEpochs, retiredSessions, err :=
+		closeBrowserSessionsForLogoutState(&next, presented, epochs, extraFlows, now, s.max)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := validateBrowserSessionRevocationState(next); err != nil {
+		return nil, nil, nil, err
+	}
+	s.state = next
+	return closedFlows, closedEpochs, retiredSessions, nil
+}
+
+func (s *testBrowserSessionRevocationStore) CloseBrowserFlow(
+	_ context.Context,
+	flowID string,
+	retainUntil time.Time,
+	now time.Time,
+) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revokeErr != nil {
+		return nil, s.revokeErr
+	}
+	if !now.Before(retainUntil) {
+		return nil, nil
+	}
+	next := cloneBrowserSessionRevocationState(s.state)
+	cleanupBrowserSessionRevocations(&next, now.Unix())
+	closeBrowserFlowState(&next, flowID, retainUntil.Unix())
+	var retired []string
+	for sessionID, lineage := range next.Lineages {
+		if lineage.Flow != flowID {
+			continue
+		}
+		if _, revoked := next.Entries[sessionID]; revoked {
+			continue
+		}
+		if err := revokeBrowserSessionState(&next, sessionID, lineage.ExpiresAt, s.max); err != nil {
+			return nil, err
+		}
+		retired = append(retired, sessionID)
+	}
+	if err := validateBrowserSessionRevocationState(next); err != nil {
+		return nil, err
+	}
+	s.state = next
+	return retired, nil
+}
+
 type testSessionClaims struct {
 	TenantID           string `json:"tenant_id"`
 	UserID             string `json:"user_id"`

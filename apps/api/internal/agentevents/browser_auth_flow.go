@@ -17,6 +17,9 @@ type StartBrowserAuthFlowRequest struct {
 	Email        string `json:"email,omitempty"`
 	Continuation string `json:"continuation"`
 	Nonce        string `json:"nonce"`
+	// BrowserEpochHash is set by the server from the browser epoch cookie,
+	// never decoded from the request body.
+	BrowserEpochHash string `json:"-"`
 }
 
 type BrowserAuthFlowResult struct {
@@ -25,6 +28,9 @@ type BrowserAuthFlowResult struct {
 	NextAction   string    `json:"next_action,omitempty"`
 	Continuation string    `json:"continuation,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	// HumanID identifies the Human a terminal outcome resolved to, so the
+	// browser can compare it against its current session identity.
+	HumanID string `json:"human_id,omitempty"`
 	// EmailChallenge describes the first emailed code of an email flow.
 	EmailChallenge *EmailChallengeResult `json:"email_challenge,omitempty"`
 	Claims         UserSessionClaims     `json:"-"`
@@ -34,12 +40,28 @@ type ResolveBrowserAuthFlowRequest struct {
 	FlowID  string `json:"flow_id"`
 	Nonce   string `json:"nonce"`
 	IDToken string `json:"id_token"`
+	// SwitchFromUserID is the person's explicit choice to replace the
+	// currently active Human; it must equal that Human, not merely some
+	// cookie the request happened to carry.
+	SwitchFromUserID string `json:"switch_from_user_id,omitempty"`
 }
 
 type ConfirmBrowserAuthFlowRequest struct {
 	FlowID string `json:"flow_id"`
 	Nonce  string `json:"nonce"`
 	Action string `json:"action"`
+	// SwitchFromUserID mirrors ResolveBrowserAuthFlowRequest: confirming a
+	// different Human requires explicitly naming the replaced one.
+	SwitchFromUserID string `json:"switch_from_user_id,omitempty"`
+}
+
+// BrowserFlowRef is the revocation-facing view of one flow.
+type BrowserFlowRef struct {
+	FlowID    string
+	HumanID   string
+	EpochHash string
+	ExpiresAt time.Time
+	Closed    bool
 }
 
 type StartProviderOperationRequest struct {
@@ -116,6 +138,16 @@ type BrowserAuthFlowController interface {
 	CompleteProviderOperation(ctx context.Context, claims UserSessionClaims, request CompleteProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	FailProviderOperation(ctx context.Context, claims UserSessionClaims, request FailProviderOperationRequest) (ProviderOperationResult, error)
 	StatusProviderOperation(ctx context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error)
+	// AuthFlowEpoch returns the browser epoch hash bound at flow start.
+	AuthFlowEpoch(ctx context.Context, flowID string) (string, error)
+	// AuthFlowForNonce returns a flow only to its nonce authority, for the
+	// flow-scoped discard boundary.
+	AuthFlowForNonce(ctx context.Context, flowID, nonce string) (BrowserFlowRef, error)
+	// OpenBrowserFlows lists a browser epoch's unclosed flows for logout.
+	OpenBrowserFlows(ctx context.Context, epochHash string) ([]BrowserFlowRef, error)
+	// CloseFlows mirrors a committed session-store flow closure into durable
+	// flow state; issuance never consults it.
+	CloseFlows(ctx context.Context, flowIDs []string) error
 }
 
 func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +161,12 @@ func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Re
 	if !decodeAuthJSON(w, r, &request) {
 		return
 	}
+	epochHash, err := s.browserEpochHash(w, r, true)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
+	request.BrowserEpochHash = epochHash
 	result, err := s.Flows.Start(r.Context(), request)
 	if err != nil {
 		writeFlowError(w, err)
@@ -163,8 +201,8 @@ func (s *BrowserAuthServer) serveResolveAuthFlow(w http.ResponseWriter, r *http.
 		return
 	}
 	if result.Outcome == "signed_in" || result.Outcome == "account_created" {
-		if err := s.establishSession(w, r, result.Claims); err != nil {
-			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		if err := s.establishSession(w, r, result.Claims, request.FlowID, request.SwitchFromUserID); err != nil {
+			s.writeSessionIssuanceError(w, err)
 			return
 		}
 	}
@@ -187,8 +225,8 @@ func (s *BrowserAuthServer) serveConfirmAuthFlow(w http.ResponseWriter, r *http.
 		writeFlowError(w, err)
 		return
 	}
-	if err := s.establishSession(w, r, result.Claims); err != nil {
-		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+	if err := s.establishSession(w, r, result.Claims, request.FlowID, request.SwitchFromUserID); err != nil {
+		s.writeSessionIssuanceError(w, err)
 		return
 	}
 	writeBrowserAuthJSON(w, http.StatusOK, result)
