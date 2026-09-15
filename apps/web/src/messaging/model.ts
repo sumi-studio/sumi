@@ -404,7 +404,13 @@ export type ServerEvent =
   /** channelのmutable属性（v0: topic）の変更。 */
   | { type: "place_updated"; channel: ChannelSummary }
   /** Volatile presence: reconnect repairs it through GET /messaging/calls. */
-  | { type: "call_state"; call: CallState };
+  | { type: "call_state"; call: CallState }
+  /**
+   * 自分の秘書の永続approval inboxが変わった合図（parked/decided）。
+   * payloadを持たず、GET /me/approvals の耐久レコードが正——これは再読込の
+   * きっかけに過ぎない。対象humanの接続にだけ届く。
+   */
+  | { type: "core_approval_changed" };
 
 export interface SendMessageInput {
   place: Place;

@@ -350,6 +350,7 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
+		s.notifyApprovalsChanged(ctx, personaID)
 		return &a, nil
 	}
 	provenance := ""
@@ -431,6 +432,7 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	s.notifyApprovalsChanged(ctx, personaID)
 	return &a, nil
 }
 
