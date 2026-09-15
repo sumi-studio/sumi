@@ -122,6 +122,17 @@ type ReconView interface {
 	// use content hash. ENOENT at path reports nil — already gone is the
 	// desired end state.
 	RemoveStaged(scope, path, wantFP3, wantSHA string) error
+	// RemoveStagedVeto is RemoveStaged with a veto evaluated after the
+	// object is captured at the sealed name — the last moment a check
+	// can still bind to the object about to be unlinked. While captured,
+	// the object cannot be observed at any public path, so a veto
+	// consulting durable state (the version rows) answers at effect
+	// time: a stale decision made before the state changed cannot
+	// outlive a row that now records the object. keep=true parks the
+	// object at the sealed name (enumerable for the next pass) and
+	// reports ErrConflict; a veto error does the same with that error.
+	// A nil veto behaves exactly as RemoveStaged.
+	RemoveStagedVeto(scope, path, wantFP3, wantSHA string, veto func() (bool, error)) error
 	// ListStaged returns base names in dir (a path beneath the scope root)
 	// beginning with prefix — used to find crash-orphaned quarantine
 	// objects left by a reconciler that died mid-delete.
@@ -1185,6 +1196,122 @@ func stageRel(it intent) string {
 	return parent + "/" + name
 }
 
+// recordedAt returns the scope path whose file_version row currently
+// records fingerprint st3 (the ino:size:mtime triple — ctime is never
+// compared), or "" when no row records it. A non-nil error means the
+// row set is unverifiable — callers must fail closed (preserve the
+// object, never delete).
+func (s *Store) recordedAt(ctx context.Context, scope, st3 string) (string, bool, error) {
+	if s.pool == nil {
+		return "", false, nil // test-only Store without a pool: empty row set
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var home string
+	err := s.pool.QueryRow(dctx,
+		`SELECT path FROM file_version
+		  WHERE scope=$1 AND (fp = $2 OR fp LIKE $2 || ':%')
+		  ORDER BY path LIMIT 1`, scope, st3).Scan(&home)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return home, true, nil
+}
+
+// intentApplied reports whether this intent's own apply journaled its
+// file_event row — the only positive proof that its filesystem effect
+// committed AND was recorded (apply writes the event in the same
+// transaction as the version-row effect). A matching staged fingerprint
+// cannot prove commit: a delayed drain or swap can park the recorded
+// object into the intent's namespace without its effect ever landing
+// (F-3). Rename's event is journaled at the destination path.
+func (s *Store) intentApplied(ctx context.Context, it intent) (bool, error) {
+	if s.pool == nil {
+		return false, nil // test-only Store without a pool: no commit proof
+	}
+	evPath := it.path
+	if it.op == "rename" {
+		evPath = it.toPath
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var n int
+	err := s.pool.QueryRow(dctx,
+		`SELECT 1 FROM file_event
+		  WHERE scope=$1 AND path=$2 AND op=$3 AND version=$4 LIMIT 1`,
+		it.scope, evPath, it.op, it.version).Scan(&n)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// settleDelete judges whether the staged object at rel may be
+// discarded. Two object classes reach here: a declared displacement
+// (wantFP3 = fp3 of the object the intent was authorized to destroy —
+// authorized only if its effect committed, needCommit=true) and the
+// intent's own staged bytes (wantSHA = its expected hash, safe to drop
+// whenever unrecorded, needCommit=false).
+//
+// The rule: never delete an object that a version row still records
+// unless that object is still present at its recorded home (a surplus
+// link then loses nothing); a displaced-object delete additionally
+// requires the intent's own journaled apply event. Both checks are
+// re-evaluated after the object is captured at a sealed name, where it
+// is immobilized and invisible to apply — so the checks bind to effect
+// time, and a stale decision from a retired pass cannot outlive a row
+// re-registration. DB uncertainty and absent commit evidence fail
+// closed: the object stays parked at the sealed name, enumerable for
+// the next pass.
+func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
+	rel string, st FileInfo, tombstoned bool, wantFP3, wantSHA string, needCommit bool) {
+	st3 := fp3(st.Fingerprint)
+	// Decision-time screen: still recorded and absent from its recorded
+	// home means this object is recorded content parked here by a
+	// delayed effect — restore it, never delete.
+	if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+		return // row set unverifiable — preserve
+	} else if found {
+		dst, serr := view.Stat(it.scope, home)
+		if serr != nil || fp3(dst.Fingerprint) != st3 {
+			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
+			return
+		}
+	}
+	// Unrecorded (or still present at its recorded home). The veto below
+	// runs after the sealed capture, so a row written while the object
+	// was still public is caught at effect time rather than here.
+	err := view.RemoveStagedVeto(it.scope, rel, wantFP3, wantSHA, func() (bool, error) {
+		home, found, derr := s.recordedAt(ctx, it.scope, st3)
+		if derr != nil {
+			return true, derr
+		}
+		if found {
+			// Deletion is safe only when the recorded home still holds
+			// the object — the staged name is then a surplus link (e.g.
+			// an exclusive-create linkat leftover). Otherwise the object
+			// is displaced recorded content: preserve it for the next
+			// pass's restore, which re-checks at decision time.
+			dst, serr := view.Stat(it.scope, home)
+			if serr != nil || fp3(dst.Fingerprint) != st3 {
+				return true, nil
+			}
+		}
+		if !needCommit {
+			return false, nil
+		}
+		ok, derr := s.intentApplied(ctx, it)
+		if derr != nil || !ok {
+			return true, derr
+		}
+		return false, nil
+	})
+	_ = err // mismatch or veto leaves the object parked at the sealed name
+}
+
 // settleStaged finishes what an interrupted verified effect left behind
 // at the intent's staging slot, then re-judges any crash-orphaned
 // quarantine objects from a prior pass. Every branch is non-destructive
@@ -1222,15 +1349,21 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 	case "write", "mkdir":
 		if it.expectSHA != "" && it.expectSHA != "dir" && st.Kind == "file" {
 			if h, herr := view.Hash(it.scope, rel); herr == nil && h == it.expectSHA {
-				// Our own unpublished bytes — safe to discard.
-				_ = view.RemoveStaged(it.scope, rel, "", it.expectSHA)
+				// Our own unpublished bytes — safe to discard unless a
+				// version row records this very object (a delayed effect
+				// can park recorded content whose bytes happen to match).
+				s.settleDelete(ctx, it, view, rel, st, tombstoned, "", it.expectSHA, false)
 				return
 			}
 		}
 		if it.dstFP != "" && st3 == fp3(it.dstFP) {
-			// Exactly the object the write was allowed to displace —
-			// the exchange committed; finish the intended discard.
-			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			// The object the write was allowed to displace — but a
+			// fingerprint match alone cannot prove the exchange
+			// committed: a delayed drain or swap can park this recorded
+			// object here without the effect ever landing (F-3). Delete
+			// only with row-level proof it is unrecorded AND the intent's
+			// own apply event journaled.
+			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
 		// The staged slot holds a foreign object the effect displaced.
@@ -1248,8 +1381,11 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 				}
 				if view.SwapStaged(it.scope, rel, it.path) == nil {
 					if h2, herr2 := view.Hash(it.scope, rel); herr2 == nil && h2 == it.expectSHA {
-						// Our stale bytes came back — discard them.
-						_ = view.RemoveStaged(it.scope, rel, "", it.expectSHA)
+						// Our stale bytes came back — discard them
+						// unless a row records this object.
+						if st2, serr := view.Stat(it.scope, rel); serr == nil {
+							s.settleDelete(ctx, it, view, rel, st2, tombstoned, "", it.expectSHA, false)
+						}
 					}
 					// Otherwise the slot now holds a racing writer's
 					// object — leave it parked; the name correctly holds
@@ -1261,17 +1397,21 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		s.restoreStaged(ctx, it, view, rel, it.path, st, tombstoned)
 	case "remove":
 		if it.dstFP != "" && st3 == fp3(it.dstFP) {
-			// The captured object is the one the remove was allowed to
-			// delete — the removal committed; complete it.
-			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			// The object the remove was allowed to delete — but a
+			// fingerprint match alone cannot prove the removal
+			// committed (F-3): require row-level proof it is unrecorded
+			// and the intent's own apply event journaled.
+			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
 		s.restoreStaged(ctx, it, view, rel, it.path, st, tombstoned)
 	case "rename":
 		if it.dstFP != "" && st3 == fp3(it.dstFP) {
-			// The displaced destination object — deleting it was part of
-			// the committed rename; finish it.
-			_ = view.RemoveStaged(it.scope, rel, st3, "")
+			// The displaced destination object — deleting it was part
+			// of the rename only if the rename committed (F-3): require
+			// row-level proof it is unrecorded and the intent's own
+			// apply event journaled.
+			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
 		// A foreign object parked at the slot came from either the
@@ -1539,6 +1679,10 @@ func (v funcView) SwapStaged(scope, staged, name string) error {
 	return ErrUnavailable
 }
 func (v funcView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
+	return ErrUnavailable
+}
+func (v funcView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
+	veto func() (bool, error)) error {
 	return ErrUnavailable
 }
 func (v funcView) ListStaged(scope, dir, prefix string) ([]string, error) {

@@ -1183,6 +1183,11 @@ func (v *rootView) SwapStaged(scope, staged, name string) error {
 // unlinked there. A mismatched capture stays parked at the sealed
 // name — bytes are preserved for a later pass rather than destroyed.
 func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
+	return v.RemoveStagedVeto(scope, path, wantFP3, wantSHA, nil)
+}
+
+func (v *rootView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
+	veto func() (bool, error)) error {
 	sfd, err := scopeDirFrom(v.rfd, scope, false)
 	if err != nil {
 		return err
@@ -1234,6 +1239,21 @@ func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 		// Captured something other than the verified object — leave it
 		// parked at the sealed quarantine name.
 		return ErrConflict
+	}
+	if veto != nil {
+		// The object is captured and immobilized at the sealed name —
+		// nothing can write into it and a move-out leaves it empty for
+		// the unlink below. The veto is evaluated at this effect-time
+		// point so a check consulting durable state (e.g. "does a row
+		// still record this object?") cannot be invalidated by a delayed
+		// syscall that was decided before the state changed.
+		keep, verr := veto()
+		if verr != nil {
+			return verr
+		}
+		if keep {
+			return ErrConflict
+		}
 	}
 	if removeStagedPreUnlinkHook != nil {
 		removeStagedPreUnlinkHook()

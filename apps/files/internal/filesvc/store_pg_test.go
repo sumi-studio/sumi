@@ -1843,3 +1843,428 @@ func TestPGReconcileDrainsSealedBaseSlotOccupied(t *testing.T) {
 		t.Fatalf("squatter lost after second pass: %q", got)
 	}
 }
+
+// --- F-3: discard authority -------------------------------------------
+//
+// The staged-object fingerprint matching an intent's dst_fp is NOT
+// commit evidence: a delayed drain or swap can park the recorded object
+// into the intent's namespace after the intent failed or was
+// tombstoned. Deleting on the fingerprint match alone destroyed
+// acknowledged content while its version row still recorded it. The
+// repaired rule: a row recording the object (and absent from its
+// recorded home) forces restore; otherwise deletion additionally
+// requires the intent's own journaled apply event, re-verified after
+// the object is captured at a sealed name.
+
+// insertEvent writes the file_event row an intent's apply would have
+// journaled — positive commit evidence for composed dead-intent states.
+func insertEvent(t *testing.T, s *Store, scope, path, fromPath, op string, version int64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), s.dbTimeout)
+	defer cancel()
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO file_event (scope, path, from_path, op, version)
+		 VALUES ($1,$2,$3,$4,$5)`, scope, path, fromPath, op, version); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+}
+
+// The witnessed F-3 shape through real Reconcile + real rows: a dead
+// write intent's declared occupant (still the recorded content for its
+// name) is parked at a -p- name by a delayed drain, and a squatter
+// holds the path. The old rule deleted the recorded object on the
+// fingerprint match; the repair restores it to its recorded home and
+// preserves the squatter.
+func TestPGReconcilePreservesRecordedDstFPObject(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	// Acknowledged O0 at a.txt — row v records its fingerprint.
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write O0: %v", err)
+	}
+	fp0, err := root.stat("ws", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A dead intent declared when O0 occupied a.txt: dst_fp = O0's fp.
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 70, preFP: fp0.Fingerprint, dstFP: fp0.Fingerprint,
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	// The transient post-exchange shape plus a delayed drain landing:
+	// O0 parks at a -p- name; the path holds foreign content.
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot+"-p-ab12cd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("squatter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	// Recorded O0 must be restored, never deleted.
+	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
+		t.Fatalf("a.txt = %q — recorded content lost to fingerprint-match delete", got)
+	}
+	// The squatter is preserved at an enumerable parked name.
+	if where := scanDirFor(t, dir, "ws", []byte("squatter")); where == "" {
+		t.Fatal("squatter bytes destroyed — foreign objects must be preserved")
+	}
+	// Convergence: further passes keep O0 at its name.
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
+		t.Fatalf("a.txt = %q after second pass", got)
+	}
+}
+
+// The same shape for a tombstoned intent: resolved intents are
+// re-judged on the hot tombstone scan, and the recorded object must
+// still be restored rather than deleted.
+func TestPGReconcilePreservesRecordedDstFPTombstoned(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write O0: %v", err)
+	}
+	fp0, err := root.stat("ws", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 71, preFP: fp0.Fingerprint, dstFP: fp0.Fingerprint,
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	// Tombstone the intent — resolved without its apply (e.g. a parked
+	// undo forced it retained as evidence).
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET resolved_at=now() WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot+"-p-ab12cd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("squatter"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
+		t.Fatalf("a.txt = %q — tombstoned intent destroyed recorded content", got)
+	}
+}
+
+// A committed intent's discard still progresses: the displaced object
+// is no longer recorded (its row was superseded by the apply) and the
+// intent's own apply event is journaled — the delete is authorized.
+func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write O0: %v", err)
+	}
+	fp0, err := root.stat("ws", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 72, preFP: fp0.Fingerprint, dstFP: fp0.Fingerprint,
+		expectSHA: sha("v1"), at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	// Compose the committed shape: O0 displaced to the slot, v1 at the
+	// path, the row applied to v72 with the journaled apply event.
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fp1, err := root.stat("ws", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_version SET version=72, fp=$3, updated=now()
+		 WHERE scope=$1 AND path=$2`, "ws", "a.txt", fp1.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	insertEvent(t, s, "ws", "a.txt", "", "write", 72)
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
+		t.Fatalf("a.txt = %q, want committed v1", got)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); where != "" {
+		t.Fatalf("displaced O0 still parked at %q — committed discard did not progress", where)
+	}
+}
+
+// An uncommitted intent whose declared object is no longer recorded
+// anywhere still cannot delete it: without the apply event the object
+// is unattributable foreign content — preserved parked. Once the
+// intent's commit IS journaled (a roll-forward applied it), the next
+// pass completes the authorized discard.
+func TestPGReconcileUncommittedDstFPPreserved(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A dead write intent; the object it declared is parked at the slot
+	// but NO row records it and no event proves the intent committed.
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 73, preFP: "0:0:0:0", dstFP: "",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	if err := os.WriteFile(dir+"/ws/"+slot, []byte("unrecorded"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fpX, err := root.stat("ws", slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET dst_fp=$2 WHERE id=$1`, id, fpX.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	// Not recorded + not committed → preserved at a sealed name, not
+	// deleted to "finish" a discard that never happened.
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" {
+		t.Fatal("unrecorded object deleted without commit evidence")
+	}
+	// When commit evidence later appears (a roll-forward applied it),
+	// the discard completes.
+	insertEvent(t, s, "ws", "a.txt", "", "write", 73)
+	s.Reconcile(ctx)
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where != "" {
+		t.Fatalf("object still parked at %q after commit evidence landed", where)
+	}
+}
+
+// Remove intents get the same authority rule: the captured object is
+// the one the remove was allowed to delete only if the removal
+// committed. While the row still records it, the object is restored to
+// its name — never deleted.
+func TestPGReconcileRemoveRecordedDstFP(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	if _, _, err = s.WithWrite(ctx, "ws", "a.txt", "write",
+		IfVersion{Mode: "any"}, sha("O0"), probeOf("a.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "a.txt", []byte("O0"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write O0: %v", err)
+	}
+	fp0, err := root.stat("ws", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "remove", path: "a.txt",
+		version: 74, preFP: fp0.Fingerprint, dstFP: fp0.Fingerprint,
+		at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	// The dead remove captured O0 but never committed the unlink — the
+	// row still records it at a.txt.
+	if err := os.Rename(dir+"/ws/a.txt", dir+"/ws/"+slot); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/a.txt"); got != "O0" {
+		t.Fatalf("a.txt = %q — uncommitted remove destroyed recorded content", got)
+	}
+}
+
+// Rename: the displaced DESTINATION object is judged against the rows
+// too — its recorded home is the destination path (or wherever its row
+// now lives), not the source. An uncommitted rename must restore, not
+// delete, the recorded destination object.
+func TestPGReconcileRenameRecordedDstFP(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(func(context.Context) (ReconView, error) { return root.pin(false) })
+	probeOf := func(path string) FPProbe {
+		return func() (FileInfo, bool, error) {
+			info, err := root.stat("ws", path)
+			if errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotDir) {
+				return FileInfo{}, false, nil
+			}
+			return info, err == nil, err
+		}
+	}
+	if _, _, err = s.WithWrite(ctx, "ws", "new.txt", "write",
+		IfVersion{Mode: "any"}, sha("D0"), probeOf("new.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			return root.atomicWrite("ws", "new.txt", []byte("D0"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		}); err != nil {
+		t.Fatalf("write D0: %v", err)
+	}
+	fpD, err := root.stat("ws", "new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "rename",
+		path: "old.txt", toPath: "new.txt",
+		version: 75, dstFP: fpD.Fingerprint,
+		at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	// The dead rename captured the destination object but never
+	// committed; the row still records D0 at new.txt.
+	if err := os.Rename(dir+"/ws/new.txt", dir+"/ws/"+slot); err != nil {
+		t.Fatal(err)
+	}
+	s.Reconcile(ctx)
+	if got := durRead(t, dir, "ws/new.txt"); got != "D0" {
+		t.Fatalf("new.txt = %q — uncommitted rename destroyed recorded destination content", got)
+	}
+}
+
+// Database-read failure must not authorize deletion: with the store's
+// pool closed, the row check cannot answer — the object is preserved.
+func TestPGReconcileDBErrorPreservesDstFP(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id := insertIntent(t, s, intent{
+		owner: "dead-inst", scope: "ws", op: "write", path: "a.txt",
+		version: 76, preFP: "0:0:0:0", dstFP: "",
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour),
+	})
+	slot := opStagePrefix + strconv.FormatInt(id, 10)
+	if err := os.WriteFile(dir+"/ws/"+slot, []byte("maybe-recorded"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fpX, err := root.stat("ws", slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
+		path: "a.txt", version: 76, dstFP: fpX.Fingerprint,
+		expectSHA: sha("stale"), at: time.Now().Add(-time.Hour)}
+	view, err := root.pin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	s.pool.Close() // the row set is unverifiable
+	s.settleStaged(ctx, it, view, false)
+	if where := scanDirFor(t, dir, "ws", []byte("maybe-recorded")); where == "" {
+		t.Fatal("object deleted while the version rows were unverifiable")
+	}
+}

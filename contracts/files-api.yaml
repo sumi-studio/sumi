@@ -122,7 +122,18 @@ info:
     the displaced object into the intent's private .filesv-op-<id> slot
     by exchange; a remove moves it there by rename. The object is
     discarded only when its identity still matches the fingerprint the
-    intent declared — and every delete goes through the same discipline:
+    intent declared AND durable state proves the discard is authorized:
+    a matching fingerprint alone is not commit evidence, because a
+    delayed drain or swap can park the recorded object into the intent's
+    namespace without its effect ever landing. The reconciler deletes a
+    displaced object only when no file_version row still records its
+    fingerprint — recorded content absent from its recorded home is
+    restored instead — and the intent's own apply event is journaled in
+    file_event (proof this intent committed; tombstoned or uncommitted
+    intents preserve the object). Both checks are re-evaluated while
+    the object is captured at a sealed name, and database-read failure
+    always fails closed toward preservation.
+    Every delete goes through the same discipline:
     the object is captured to a per-call quarantine name
     (.filesv-op-<id>-q-<random>), re-verified there, and unlinked only
     on a match. Quarantine names are SEALED: they are created by the
