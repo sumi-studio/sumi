@@ -247,11 +247,13 @@ func authSettlersDone(s *Store) bool {
 }
 
 // authSettle runs ordinary passes after interference has stopped, with the
-// tombstone scan clock reset to stand in for its interval elapsing.
+// tombstone scan and orphan-sweep clocks reset to stand in for their
+// intervals elapsing.
 func authSettle(t *testing.T, s *Store) {
 	t.Helper()
 	for i := 0; i < 3; i++ {
 		s.lastTombScan.Store(0)
+		s.lastStageSweep.Store(0)
 		s.Reconcile(context.Background())
 	}
 }

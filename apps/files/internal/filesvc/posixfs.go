@@ -1654,12 +1654,22 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 			// back on its name; if the name is already re-occupied it
 			// stays parked for the reconciler. The rename itself
 			// committed either way.
-			unix.Renameat2(int(srcPfd.Fd()), stage,
+			if p.faultHook != nil {
+				p.faultHook("rename.preRestore")
+			}
+			rerr := unix.Renameat2(int(srcPfd.Fd()), stage,
 				int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE)
 			syncDir(dstPfd)
 			info, serr := p.stat(scope, to)
 			if serr != nil {
 				return FileInfo{}, true, serr
+			}
+			if rerr != nil {
+				// The captured foreign object stayed parked at the
+				// staging slot. The commit stands, but the caller must
+				// keep the intent — deleting its row would leave the
+				// parked object under a namespace no pass enumerates.
+				return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 			}
 			return info, true, nil
 		}

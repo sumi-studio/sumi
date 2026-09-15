@@ -80,6 +80,7 @@ type Store struct {
 	reconcile        chan struct{}
 	lastTombScan     atomic.Int64 // unix nanos of the last hot tombstone re-judgment
 	lastTombScanCold atomic.Int64 // unix nanos of the last cold tombstone re-judgment
+	lastStageSweep   atomic.Int64 // unix nanos of the last orphan staged sweep
 }
 
 // StatFn stats a scope-relative path — injected by the service so the
@@ -169,6 +170,21 @@ const tombstoneScanInterval = 30 * time.Second
 // A late effect lands worst-case within one interval of landing.
 const tombstoneColdAge = 24 * time.Hour
 const tombstoneColdScanInterval = time.Hour
+
+// stageSweepInterval is the cadence of the orphan staging sweep — the
+// backstop for recorded objects parked under .filesv-op-* names whose
+// intent row no longer exists. settleStaged discovers a staged
+// namespace only through its file_op row, so a delayed
+// MoveStaged/SwapStaged deposit — decided while the intent lived — can
+// land under a dead namespace at any time; no intent-keyed pass ever
+// lists the name again. The sweep runs on this interval against scopes
+// that still carry rows; a late deposit is found by the first pass that
+// completes after it lands. That is a cadence, not a bound: a pass can
+// be skipped or delayed by competing reconcile work or errors, so no
+// fixed convergence time is claimed. Per-scope cost is a full
+// recursive directory enumeration — every entry, not only staged
+// names — bounded by depth 32.
+const stageSweepInterval = 30 * time.Second
 
 func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
@@ -586,11 +602,20 @@ func (s *Store) runFs(it intent, fn func(intent) (FileInfo, bool, error)) <-chan
 			// Clean them WITHOUT an event: we observed absence, we did
 			// not cause it (observed-absence vs performed-removal).
 			s.dropIntentGhosts(context.Background(), it, true)
-		case !committed && errors.Is(ferr, errUndoParked):
-			// A verified effect displaced foreign bytes and could not
-			// fully restore the pre-effect shape — the parked object is
-			// live evidence; retain the intent for the reconciler.
-			s.tombstoneIntent(context.Background(), it)
+		case errors.Is(ferr, errUndoParked):
+			if !committed {
+				// A verified effect displaced foreign bytes and could not
+				// fully restore the pre-effect shape — the parked object is
+				// live evidence; retain the intent for the reconciler.
+				s.tombstoneIntent(context.Background(), it)
+			} else {
+				// The effect committed but a foreign object stayed parked
+				// at the intent's staging slot: journal the commit AND keep
+				// the intent as a tombstone — deleting the row now would
+				// leave the parked object under a namespace no pass ever
+				// enumerates.
+				settleErr = s.applyRetained(it, info, intentSHA(it))
+			}
 		case !committed && fsErrDefinitive(ferr):
 			// Rejected before commit — provably no fs effect.
 			s.dropIntent(context.Background(), it)
@@ -603,15 +628,20 @@ func (s *Store) runFs(it intent, fn func(intent) (FileInfo, bool, error)) <-chan
 			s.kickReconcile()
 		}
 		if ferr == nil {
-			sha := it.expectSHA
-			if it.op == "mkdir" {
-				sha = "" // "dir" is a kind marker, not a content hash
-			}
-			settleErr = s.applyUntilSettled(it, info, sha)
+			settleErr = s.applyUntilSettled(it, info, intentSHA(it))
 		}
 		ch <- fsResult{info, ferr, settleErr}
 	}()
 	return ch
+}
+
+// intentSHA is the content hash a successful apply commits for this
+// intent: the declared payload for content ops, empty for mkdir.
+func intentSHA(it intent) string {
+	if it.op == "mkdir" {
+		return "" // "dir" is a kind marker, not a content hash
+	}
+	return it.expectSHA
 }
 
 // applyUntilSettled persists a filesystem commit THIS process observed:
@@ -639,6 +669,41 @@ func (s *Store) applyUntilSettled(it intent, info FileInfo, sha string) error {
 		}
 		if attempt == 0 {
 			log.Printf("store: apply of intent %d (%s %s/%s) failed: %v — retrying",
+				it.id, it.op, it.scope, it.path, err)
+		}
+		select {
+		case <-s.done:
+			return err
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// applyRetained journals a filesystem commit this process observed AND
+// keeps the intent as a tombstone — the fs call reported recovery
+// residue parked at the intent's staging slot (errUndoParked with
+// committed=true). Deleting the intent row would orphan that namespace:
+// settleStaged enumerates staged names through the intent row, so a
+// deleted intent leaves parked content undiscoverable. The tombstone
+// keeps the slot enumerable until a pass settles it; the orphan sweep
+// is the backstop once the row is eventually resolved away.
+func (s *Store) applyRetained(it intent, info FileInfo, sha string) error {
+	backoff := 200 * time.Millisecond
+	for attempt := 0; ; attempt++ {
+		err := s.apply(context.Background(), it, info, sha, true)
+		if err == nil || errors.Is(err, errIntentSettled) || errors.Is(err, errNotJournaled) {
+			return nil
+		}
+		if errors.Is(err, errForeignOwner) {
+			log.Printf("store: retained apply of intent %d (%s %s/%s): %v — left for the owning instance",
+				it.id, it.op, it.scope, it.path, err)
+			return err
+		}
+		if attempt == 0 {
+			log.Printf("store: retained apply of intent %d (%s %s/%s) failed: %v — retrying",
 				it.id, it.op, it.scope, it.path, err)
 		}
 		select {
@@ -1488,7 +1553,16 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
-		// The staged slot holds a foreign object the effect displaced.
+		// The staged slot holds a foreign object. A version row may
+		// record it at a DIFFERENT path than this intent's — the row is
+		// authoritative for where recorded content belongs, so route it
+		// home before considering this intent's own name.
+		if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+			return // row set unverifiable — preserve, never misplace
+		} else if found && home != it.path {
+			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
+			return
+		}
 		// If the path still carries THIS op's staged bytes, finish the
 		// undo the dead process could not: exchange restores the
 		// displaced object to its name; whatever comes back is inspected
@@ -1516,7 +1590,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 					}
 				}
 				if _, base := splitRel(rel); isSealedName(base) {
-					s.drainSealed(view, it, rel, it.path)
+					s.drainSealed(view, it.scope, stageRel(it), rel, it.path)
 					return
 				}
 				if view.SwapStaged(it.scope, rel, it.path) == nil {
@@ -1544,7 +1618,15 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
-		s.restoreStaged(ctx, it, view, rel, it.path, st, tombstoned)
+		// Recorded content parked under a remove intent belongs at its
+		// recorded home — which need not be this intent's path.
+		dest := it.path
+		if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
+			return
+		} else if found {
+			dest = home
+		}
+		s.restoreStaged(ctx, it, view, rel, dest, st, tombstoned)
 	case "rename":
 		if it.dstFP != "" && st3 == fp3(it.dstFP) {
 			// The displaced destination object — deleting it was part
@@ -1563,13 +1645,20 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 	}
 }
 
-// stagedHome picks the name a parked rename-residual belongs to: the
+// stagedHome picks the name a parked rename-residual belongs to: a
+// version row recording this exact object names its true home — which
+// may be a path unrelated to this intent's source and destination.
+// Only unrecorded residue falls back to the intent's own names: the
 // destination when it matches the destination's recorded fingerprint,
-// the source when it matches the source row, else the source name —
-// the object was captured there, so restoring the source name recovers
-// the pre-effect shape.
+// else the source name — the object was captured there, so restoring
+// the source name recovers the pre-effect shape.
 func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
 	st3 := fp3(st.Fingerprint)
+	if home, found, err := s.recordedAt(ctx, it.scope, st3); err != nil {
+		return "" // row set unverifiable — leave parked
+	} else if found {
+		return home
+	}
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	var rowFP string
@@ -1590,6 +1679,10 @@ func (s *Store) stagedHome(ctx context.Context, it intent, st FileInfo) string {
 // else — unverifiable name, recorded content already in place, resolved
 // intent with a foreign object — stays parked.
 func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, rel, destPath string, st FileInfo, tombstoned bool) {
+	s.restoreStagedTo(ctx, it.scope, stageRel(it), view, rel, destPath, st, tombstoned)
+}
+
+func (s *Store) restoreStagedTo(ctx context.Context, scope, parkBase string, view ReconView, rel, destPath string, st FileInfo, tombstoned bool) {
 	if destPath == "" {
 		return
 	}
@@ -1597,10 +1690,10 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 	var rowFP string
 	rerr := s.pool.QueryRow(dctx,
 		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
-		it.scope, destPath).Scan(&rowFP)
+		scope, destPath).Scan(&rowFP)
 	cancel()
 	rowMatch := rerr == nil && fp3(rowFP) == fp3(st.Fingerprint)
-	dst, derr := view.Stat(it.scope, destPath)
+	dst, derr := view.Stat(scope, destPath)
 	switch {
 	case derr == nil:
 		// Occupied: only a proven recorded object swaps back — never
@@ -1611,13 +1704,13 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 			// The occupant may be a live writer's fresh object whose row
 			// has not committed yet; moving it now would only churn it
 			// into this namespace. Retry once those writers settle.
-			if busy, berr := s.recordersActive(ctx, it.scope); berr != nil || busy {
+			if busy, berr := s.recordersActive(ctx, scope); berr != nil || busy {
 				return
 			}
 			if _, base := splitRel(rel); isSealedName(base) {
-				s.drainSealed(view, it, rel, destPath)
+				s.drainSealed(view, scope, parkBase, rel, destPath)
 			} else {
-				_ = view.SwapStaged(it.scope, rel, destPath)
+				_ = view.SwapStaged(scope, rel, destPath)
 			}
 		}
 	case absentVerdict(derr):
@@ -1625,11 +1718,11 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 		case rowMatch:
 			// The parked object IS the recorded content for the empty
 			// name — restore it.
-			_ = view.MoveStaged(it.scope, rel, destPath)
+			_ = view.MoveStaged(scope, rel, destPath)
 		case errors.Is(rerr, pgx.ErrNoRows) && !tombstoned:
 			// Unresolved intent, empty name, no recorded row — restoring
 			// recovers the pre-effect shape.
-			_ = view.MoveStaged(it.scope, rel, destPath)
+			_ = view.MoveStaged(scope, rel, destPath)
 		}
 	default:
 		// unverifiable — leave parked
@@ -1646,11 +1739,151 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 // parked — bytes are preserved and the next pass retries with a fresh
 // park name, so convergence requires only finite interference, never a
 // free base slot. Nothing is deleted here.
-func (s *Store) drainSealed(view ReconView, it intent, rel, name string) {
-	if view.MoveStaged(it.scope, name, stageRel(it)+"-p-"+randHex(6)) != nil {
+func (s *Store) drainSealed(view ReconView, scope, parkBase, rel, name string) {
+	if view.MoveStaged(scope, name, parkBase+"-p-"+randHex(6)) != nil {
 		return
 	}
-	_ = view.MoveStaged(it.scope, rel, name)
+	_ = view.MoveStaged(scope, rel, name)
+}
+
+// sweepOrphanStaged re-homes recorded objects parked under staging names
+// whose intent row no longer exists. settleStaged enumerates an intent's
+// namespace only while its file_op row survives; a delayed
+// MoveStaged/SwapStaged/drainSealed deposit — decided while the intent
+// lived — can land after the row is gone, and no intent-keyed pass ever
+// lists the name again. This sweep walks every scope that still has
+// version or intent rows (a scope with no rows can hold only unrecorded
+// residue, which is preserved anyway) and restores each orphaned staged
+// object that a version row still records to its recorded home. Objects
+// nobody records stay parked: unknown foreign bytes are never collected.
+func (s *Store) sweepOrphanStaged(ctx context.Context, view ReconView) {
+	if s.pool == nil {
+		return
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	rows, err := s.pool.Query(dctx,
+		`SELECT scope FROM file_version
+		 UNION SELECT scope FROM file_op WHERE root=$1`, s.rootID)
+	if err != nil {
+		cancel()
+		return
+	}
+	var scopes []string
+	for rows.Next() {
+		var sc string
+		if err := rows.Scan(&sc); err == nil {
+			scopes = append(scopes, sc)
+		}
+	}
+	rows.Close()
+	cancel()
+	for _, scope := range scopes {
+		if s.deposed.Load() {
+			return
+		}
+		// No scope mutex here: intent ids are never reused, so a
+		// namespace whose file_op row is absent stays orphaned for the
+		// whole sweep — a live declare cannot resurrect it — and the
+		// per-object checks (recordersActive, row match, NOREPLACE
+		// moves) already fence against in-flight settlers. Taking the
+		// scope lock would let an in-flight op stall a pass that only
+		// touches dead namespaces.
+		s.settleOrphanDir(ctx, scope, view, "", 0)
+	}
+}
+
+// settleOrphanDir walks one directory for orphaned staged objects,
+// recursing into subdirectories. It enumerates every entry — staged
+// names are found by prefix, directories by stat — so its cost is the
+// scope's entry count, not the number of parked objects. Depth is
+// bounded — a symlink loop resolves through the pinned root and cannot
+// escape the scope, but a cyclic name chain must not loop the pass
+// forever.
+func (s *Store) settleOrphanDir(ctx context.Context, scope string, view ReconView, dir string, depth int) {
+	if depth > 32 {
+		return
+	}
+	names, err := view.ListStaged(scope, dir, "")
+	if err != nil {
+		return
+	}
+	for _, n := range names {
+		rel := n
+		if dir != "" {
+			rel = dir + "/" + n
+		}
+		if strings.HasPrefix(n, opStagePrefix) {
+			s.settleOrphanStaged(ctx, scope, view, rel, n)
+			continue
+		}
+		if strings.HasPrefix(n, stagingPrefix) {
+			continue // live write-staging name — never parked evidence
+		}
+		st, serr := view.Stat(scope, rel)
+		if serr == nil && st.Kind == "dir" {
+			s.settleOrphanDir(ctx, scope, view, rel, depth+1)
+		}
+	}
+}
+
+// settleOrphanStaged handles one staged name whose owning intent may be
+// gone. A numeric id names a live or tombstoned intent's namespace:
+// while its file_op row exists the intent's own settleStaged owns it.
+// Only a name with no surviving intent row is an orphan, and only an
+// orphan that a version row still records is moved — restored to its
+// recorded home. Everything else (unverifiable row set, unrecorded
+// bytes) stays parked.
+func (s *Store) settleOrphanStaged(ctx context.Context, scope string, view ReconView, rel, name string) {
+	rest := name[len(opStagePrefix):]
+	if idStr, _, _ := strings.Cut(rest, "-"); idStr != "" {
+		if id, perr := strconv.ParseInt(idStr, 10, 64); perr == nil {
+			dctx, cancel := s.dbCtx(ctx)
+			var one int
+			qerr := s.pool.QueryRow(dctx,
+				`SELECT 1 FROM file_op WHERE id=$1`, id).Scan(&one)
+			cancel()
+			if qerr == nil {
+				return // the intent row still enumerates this namespace
+			}
+			if !errors.Is(qerr, pgx.ErrNoRows) {
+				return // unverifiable — preserve
+			}
+		}
+	}
+	st, err := view.Stat(scope, rel)
+	if err != nil {
+		return
+	}
+	st3 := fp3(st.Fingerprint)
+	home, found, derr := s.recordedAt(ctx, scope, st3)
+	if derr != nil || !found {
+		return // unrecorded or unverifiable — retained, never collected
+	}
+	if dst, serr := view.Stat(scope, home); serr == nil && fp3(dst.Fingerprint) == st3 {
+		return // still present at its recorded home — surplus link, leave it
+	}
+	s.restoreStagedTo(ctx, scope, orphanParkBase(rel), view, rel, home, st, true)
+}
+
+// orphanParkBase picks the sibling park base for a squatter displaced
+// while restoring an orphan. A numeric intent id keeps the deposit
+// attributable to its (dead) namespace; any other staged name parks
+// under a generic orphan tag in the same directory. The name stays
+// enumerable: every .filesv-op-* name is re-judged by later sweeps.
+func orphanParkBase(rel string) string {
+	dir, base := splitRel(rel)
+	park := opStagePrefix + "orphan"
+	if rest, ok := strings.CutPrefix(base, opStagePrefix); ok {
+		if idStr, _, _ := strings.Cut(rest, "-"); idStr != "" {
+			if _, err := strconv.ParseInt(idStr, 10, 64); err == nil {
+				park = opStagePrefix + idStr
+			}
+		}
+	}
+	if dir != "" {
+		return dir + "/" + park
+	}
+	return park
 }
 
 func (s *Store) kickReconcile() {
@@ -1941,6 +2174,16 @@ func (s *Store) Reconcile(ctx context.Context) int {
 			}
 		}
 	}
+	// Orphan staging sweep on its own cadence: a staged deposit decided
+	// while its intent lived can land after the intent row resolved — no
+	// intent-keyed pass ever lists that namespace again. The sweep is the
+	// discovery path for recorded objects parked under dead namespaces;
+	// a single post-settlement pass is not enough because the deposit
+	// itself may be arbitrarily delayed.
+	if now2 := time.Now().UnixNano(); now2-s.lastStageSweep.Load() >= stageSweepInterval.Nanoseconds() {
+		s.lastStageSweep.Store(now2)
+		s.sweepOrphanStaged(ctx, view)
+	}
 	return settled
 }
 
@@ -2191,36 +2434,91 @@ func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, content
 // not a claim that the service performed a rename. Rows without evidence
 // stay put and surface through the live-fingerprint comparison (404 at
 // the recorded path / version 0 at the destination) like any external
-// change. There is no version guard: rows minted after the intent are
-// judged on the same evidence, which subsumes the earlier "rescue".
+// change. There is no intent-age version cutoff: rows minted after the
+// intent are also eligible, provided their decision-time versions still
+// match when locked below. This subsumes the earlier "rescue".
 //
 // srcAbsent short-circuits the per-row source stat when the whole source
 // path is already known absent (every descendant path is then absent as
 // addressed). A non-nil error means some member could not be observed —
 // retry next pass, no verdict.
+//
+// The evidence above is gathered BEFORE the transaction; a same-scope
+// settler can commit between observation and tx start (the scope mutex
+// does not cover an in-flight fs goroutine's apply), or while a FOR
+// UPDATE inside the tx waits. Every move is therefore serialized on
+// row locks and fully revalidated before it writes:
+//
+//   - the destination row is locked FIRST; the locked (version, fp)
+//     must equal the decision-time read — a row that appeared, changed,
+//     or disappeared since belongs to a different committed decision
+//     and is never deleted;
+//   - the destination object is re-stat'd AFTER that lock, so a commit
+//     landing during the lock wait is judged against the bytes it
+//     actually left;
+//   - the source row is locked and must still hold the observed
+//     version+fp;
+//   - only then do the DELETE/UPDATE/event run. A skipped move writes
+//     nothing: no row is mutated and no event is published for it.
+//
+// The recordersActive screen ahead of the tx also defers judgment while
+// a same-scope settler may still be committing rows for in-flight
+// evidence — a skipped pass re-judges next sweep.
 func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, view ReconView, srcAbsent bool) (int, error) {
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	rows, err := s.pool.Query(dctx,
-		`SELECT path, fp FROM file_version
+		`SELECT path, fp, version FROM file_version
 		 WHERE scope=$1 AND (path=$2 OR starts_with(path, $2||'/'))
 		 ORDER BY path`,
 		it.scope, it.path)
 	if err != nil {
 		return 0, err
 	}
-	type member struct{ p, fp string }
+	type member struct {
+		p, fp string
+		ver   int64
+	}
 	var members []member
 	for rows.Next() {
 		var m member
-		if rows.Scan(&m.p, &m.fp) == nil {
+		if rows.Scan(&m.p, &m.fp, &m.ver) == nil {
 			members = append(members, m)
 		}
 	}
 	rows.Close()
-	cancel()
 
-	type move struct{ from, to, fp, sha string }
+	// liveFP is the destination object's full fingerprint as observed
+	// during evidence; the in-tx recheck requires the SAME fingerprint —
+	// any change means a different object owns the name now. dstExisted/
+	// dstVer/dstFP capture the destination ROW the decision observed (or
+	// its absence); the locked row must match exactly before the move may
+	// write — a row that appeared, changed, or disappeared since belongs
+	// to a different committed decision.
+	type move struct {
+		from, to, fp, sha, liveFP string
+		srcVer                    int64
+		srcRowFP                  string
+		dstExisted                bool
+		dstVer                    int64
+		dstFP                     string
+	}
+	// dstRow reads the destination row's identity at decision time —
+	// the baseline the in-tx locked row is compared against.
+	dstRow := func(path string) (bool, int64, string, error) {
+		var v int64
+		var f string
+		err := s.pool.QueryRow(dctx,
+			`SELECT version, fp FROM file_version WHERE scope=$1 AND path=$2`,
+			it.scope, path).Scan(&v, &f)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, 0, "", nil
+		}
+		if err != nil {
+			return false, 0, "", err
+		}
+		return true, v, f, nil
+	}
 	var moves []move
 	for _, m := range members {
 		dest := it.toPath + m.p[len(it.path):]
@@ -2253,7 +2551,13 @@ func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, vi
 			if h != it.expectSHA {
 				continue
 			}
-			moves = append(moves, move{m.p, dest, toInfo.Fingerprint, it.expectSHA})
+			ex, dv, df, derr := dstRow(dest)
+			if derr != nil {
+				return 0, derr
+			}
+			moves = append(moves, move{from: m.p, to: dest, fp: toInfo.Fingerprint,
+				sha: it.expectSHA, liveFP: toInfo.Fingerprint, srcVer: m.ver, srcRowFP: m.fp,
+				dstExisted: ex, dstVer: dv, dstFP: df})
 			continue
 		}
 		if m.fp == "" || strings.HasPrefix(m.fp, "diverged:") {
@@ -2269,9 +2573,23 @@ func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, vi
 		if st.Fingerprint != m.fp {
 			continue
 		}
-		moves = append(moves, move{m.p, dest, m.fp, ""})
+		ex, dv, df, derr := dstRow(dest)
+		if derr != nil {
+			return 0, derr
+		}
+		moves = append(moves, move{from: m.p, to: dest, fp: m.fp,
+			liveFP: st.Fingerprint, srcVer: m.ver, srcRowFP: m.fp,
+			dstExisted: ex, dstVer: dv, dstFP: df})
 	}
 	if len(moves) == 0 {
+		return 0, nil
+	}
+	cancel()
+	// A same-scope settler mid-apply can still commit rows that the
+	// evidence just read — defer rather than act on a half-visible state.
+	if busy, berr := s.recordersActive(ctx, it.scope); berr != nil {
+		return 0, berr
+	} else if busy {
 		return 0, nil
 	}
 
@@ -2285,20 +2603,101 @@ func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, vi
 	if err := s.checkOwnerTx(tctx, tx); err != nil {
 		return 0, err
 	}
+	moved := 0
 	for _, mv := range moves {
-		// A row already at the destination path describes an object that
-		// is provably not there any more (the relocated one is).
-		if _, err := tx.Exec(tctx,
-			`DELETE FROM file_version WHERE scope=$1 AND path=$2`, it.scope, mv.to); err != nil {
-			return 0, err
+		// Every judgment used pre-transaction evidence; a same-scope
+		// settler can commit between it and any point in this tx. The
+		// destination row lock is the serialization point: taken FIRST,
+		// it freezes the row so every comparison below — against
+		// decision-time row evidence and against the post-lock live
+		// object — describes one consistent instant. Only after BOTH
+		// rows are validated under their locks may this move write: a
+		// skipped relocation must not mutate either row or publish an
+		// event (a dest DELETE staged before a source check would still
+		// commit with the tx).
+		var dver int64
+		var dfp string
+		dExists := true
+		derr := tx.QueryRow(tctx,
+			`SELECT version, fp FROM file_version WHERE scope=$1 AND path=$2 FOR UPDATE`,
+			it.scope, mv.to).Scan(&dver, &dfp)
+		switch {
+		case errors.Is(derr, pgx.ErrNoRows):
+			dExists = false
+		case derr != nil:
+			return 0, derr
 		}
-		if _, err := tx.Exec(tctx,
+		if dExists != mv.dstExisted || (dExists && (dver != mv.dstVer || dfp != mv.dstFP)) {
+			// The destination row appeared, changed, or disappeared
+			// between the decision and its lock — it belongs to a
+			// different committed decision and is never touched by
+			// this stale evidence.
+			continue
+		}
+		// Re-observe the destination object AFTER the row lock, not
+		// before: a commit that lands while the FOR UPDATE waits is
+		// judged against the bytes it actually left, so new
+		// acknowledged content can never be misclassified as the
+		// displaced stale object the evidence saw.
+		live, lerr := view.Stat(it.scope, mv.to)
+		if lerr != nil {
+			if absentVerdict(lerr) {
+				continue // object gone since evidence — re-judge next pass
+			}
+			return 0, lerr
+		}
+		if live.Fingerprint != mv.liveFP {
+			continue // a different object owns the name now
+		}
+		if dExists && fp3(dfp) == fp3(live.Fingerprint) {
+			// The row already records the object actually present —
+			// deleting it would orphan a correct record.
+			continue
+		}
+		var sver int64
+		var sfp string
+		serr := tx.QueryRow(tctx,
+			`SELECT version, fp FROM file_version WHERE scope=$1 AND path=$2 FOR UPDATE`,
+			it.scope, mv.from).Scan(&sver, &sfp)
+		switch {
+		case errors.Is(serr, pgx.ErrNoRows):
+			continue // source row gone — drifted
+		case serr != nil:
+			return 0, serr
+		case sver != mv.srcVer || sfp != mv.srcRowFP:
+			continue // source row drifted — no longer the observed member
+		}
+		// All evidence revalidated under locks — only now may the move
+		// write. The locked dest row (if any) records an object provably
+		// absent from the path: the displaced one the relocated object
+		// replaces. Its delete is keyed to the evidence identity as a
+		// final assertion of the comparison already made under the lock.
+		if dExists {
+			dtag, err := tx.Exec(tctx,
+				`DELETE FROM file_version WHERE scope=$1 AND path=$2 AND version=$3 AND fp=$4`,
+				it.scope, mv.to, mv.dstVer, mv.dstFP)
+			if err != nil {
+				return 0, err
+			}
+			if dtag.RowsAffected() != 1 {
+				return 0, fmt.Errorf("relocate: destination row %s/%s changed under lock", it.scope, mv.to)
+			}
+		}
+		tag, err := tx.Exec(tctx,
 			`UPDATE file_version SET path=$3, fp=$4,
 			        content_sha = CASE WHEN $5 <> '' THEN $5 ELSE content_sha END,
 			        updated = now()
-			 WHERE scope=$1 AND path=$2`,
-			it.scope, mv.from, mv.to, mv.fp, mv.sha); err != nil {
+			 WHERE scope=$1 AND path=$2 AND version=$6 AND fp=$7`,
+			it.scope, mv.from, mv.to, mv.fp, mv.sha, mv.srcVer, mv.srcRowFP)
+		if err != nil {
 			return 0, err
+		}
+		if tag.RowsAffected() != 1 {
+			// The source row is locked and was just verified — zero
+			// rows means a logic violation, not drift. Roll back the
+			// whole pass rather than let the dest delete outlive a
+			// skipped re-key.
+			return 0, fmt.Errorf("relocate: source row %s/%s changed under lock", it.scope, mv.from)
 		}
 		if _, err := tx.Exec(tctx,
 			`INSERT INTO file_event (scope, path, from_path, op, version)
@@ -2306,11 +2705,14 @@ func (s *Store) relocateRows(ctx context.Context, it intent, toInfo FileInfo, vi
 			it.scope, mv.from, mv.to); err != nil {
 			return 0, err
 		}
+		moved++
 	}
 	if err := tx.Commit(tctx); err != nil {
 		return 0, err
 	}
-	log.Printf("reconcile: rename %s/%s -> %s: relocated %d recorded object(s) by fingerprint evidence; no rename claimed",
-		it.scope, it.path, it.toPath, len(moves))
-	return len(moves), nil
+	if moved > 0 {
+		log.Printf("reconcile: rename %s/%s -> %s: relocated %d recorded object(s) by fingerprint evidence; no rename claimed",
+			it.scope, it.path, it.toPath, moved)
+	}
+	return moved, nil
 }

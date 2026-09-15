@@ -980,7 +980,7 @@ func TestSealedDrainConvergesWithOccupiedBaseSlot(t *testing.T) {
 	r1done := make(chan struct{})
 	go func() {
 		defer close(r1done)
-		s1.drainSealed(gv, it, qrel, "f.txt")
+		s1.drainSealed(gv, it.scope, stageRel(it), qrel, "f.txt")
 	}()
 	select {
 	case <-gv.waiting:
@@ -999,7 +999,7 @@ func TestSealedDrainConvergesWithOccupiedBaseSlot(t *testing.T) {
 	}
 	defer v2.Close()
 	var s2 Store
-	s2.drainSealed(v2, it, qrel, "f.txt")
+	s2.drainSealed(v2, it.scope, stageRel(it), qrel, "f.txt")
 	if got := durRead(t, dir, "ws/f.txt"); got != string(V1) {
 		t.Fatalf("f.txt = %q — occupied base slot must not stall the drain", got)
 	}
