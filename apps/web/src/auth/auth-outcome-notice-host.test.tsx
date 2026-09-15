@@ -40,7 +40,7 @@ vi.mock("./auth-context", () => ({
   useAuth: () => ({
     canUseDirectChat: true,
     dismissOutcomeNotice: authMocks.dismissOutcomeNotice,
-    emailLinkCallbackPending: false,
+    emailLinkPending: false,
     outcomeNotice: authMocks.outcomeNotice,
   }),
 }));

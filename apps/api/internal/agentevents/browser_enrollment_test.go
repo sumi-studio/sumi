@@ -38,7 +38,7 @@ func TestEnrollmentAdminAndCSRFBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, s)
+	csrf, csrfCookie, _ := obtainCSRF(t, s)
 	mux := http.NewServeMux()
 	s.RegisterRoutes(mux)
 	request := func(authorized, withCSRF bool, origin string) *httptest.ResponseRecorder {
@@ -88,7 +88,7 @@ func TestAuthAllocationBudgetBeforeStoreAndForwardedHeaders(t *testing.T) {
 	s, _ := newTestBrowserAuthServer(t, &fakeFirebaseVerifier{}, &fakeBindingResolver{})
 	store := &fakeEnrollmentInvites{}
 	s.EnrollmentInvitations = store
-	csrf, cookie := obtainCSRF(t, s)
+	csrf, cookie, _ := obtainCSRF(t, s)
 	for i := 0; i < 61; i++ {
 		r := httptest.NewRequest("POST", "/auth/invitations/inspect", strings.NewReader(`{"token":"opaque"}`))
 		r.RemoteAddr = "192.0.2.1:8000"

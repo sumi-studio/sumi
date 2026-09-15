@@ -18,6 +18,7 @@ type kosekiAuthFlowController struct {
 	store     *koseki.Store
 	tenantID  string
 	providers firebaseProviderLifecycle
+	email     *emailCodeController
 	clock     func() time.Time
 }
 
@@ -25,6 +26,9 @@ type firebaseProviderAccount struct {
 	UID              string
 	ProviderSubjects map[string]string
 	EmailProvider    bool
+	// EmailVerified means Firebase resolves the verified address to this UID,
+	// so a Sumi email-code proof can sign in again without a password provider.
+	EmailVerified bool
 }
 
 type firebaseProviderLifecycle interface {
@@ -37,19 +41,25 @@ func newKosekiAuthFlowController(store *koseki.Store, tenantID string, providers
 }
 
 func (c *kosekiAuthFlowController) Start(ctx context.Context, request agentevents.StartBrowserAuthFlowRequest) (agentevents.BrowserAuthFlowResult, error) {
-	channel, expectedProvider, normalizedEmail := koseki.ChannelProvider, request.Provider, ""
-	if request.Provider == "email_link" {
-		channel, expectedProvider = koseki.ChannelEmailLink, "password"
-		var err error
-		normalizedEmail, err = koseki.NormalizeEmail(request.Email)
-		if err != nil {
-			return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserAuthFlowInvalid
+	switch request.Provider {
+	case "email_code":
+		if c.email == nil {
+			return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserEmailUnavailable
 		}
+		return c.email.start(ctx, request)
+	case "google.com", "github.com":
+	default:
+		// Firebase email-link sending was replaced by Sumi email codes.
+		return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserAuthFlowInvalid
+	}
+	if request.Email != "" {
+		return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserAuthFlowInvalid
 	}
 	flow, err := c.store.StartAuthFlow(ctx, koseki.StartAuthFlowRequest{
-		InviteToken: request.InviteToken, Intent: koseki.AuthIntent(request.Intent), Channel: channel,
-		ExpectedProvider: expectedProvider, NormalizedEmail: normalizedEmail,
-		Continuation: request.Continuation, Nonce: request.Nonce, TTL: authFlowTTL,
+		InviteToken: request.InviteToken, Intent: koseki.AuthIntent(request.Intent), Channel: koseki.ChannelProvider,
+		ExpectedProvider: request.Provider,
+		Continuation:     request.Continuation, Nonce: request.Nonce,
+		BrowserEpochHash: request.BrowserEpochHash, TTL: authFlowTTL,
 	})
 	if err != nil {
 		return agentevents.BrowserAuthFlowResult{}, mapFlowError(err)
@@ -85,6 +95,51 @@ func (c *kosekiAuthFlowController) Status(ctx context.Context, request agenteven
 	return c.flowResult(flow), nil
 }
 
+// AuthFlowEpoch exposes the flow's browser-epoch binding to session admission.
+func (c *kosekiAuthFlowController) AuthFlowEpoch(ctx context.Context, flowID string) (string, error) {
+	epoch, err := c.store.AuthFlowEpochHash(ctx, flowID)
+	if err != nil {
+		return "", mapFlowError(err)
+	}
+	return epoch, nil
+}
+
+// AuthFlowForNonce authenticates a flow-scoped discard: only the browser that
+// holds the nonce may cancel this flow's issuance authority.
+func (c *kosekiAuthFlowController) AuthFlowForNonce(ctx context.Context, flowID, nonce string) (agentevents.BrowserFlowRef, error) {
+	ref, err := c.store.BrowserFlowRefForNonce(ctx, flowID, nonce)
+	if err != nil {
+		return agentevents.BrowserFlowRef{}, mapFlowError(err)
+	}
+	return browserFlowRefFromKoseki(ref), nil
+}
+
+// OpenBrowserFlows enumerates the epoch's unclosed flows for logout closure.
+func (c *kosekiAuthFlowController) OpenBrowserFlows(ctx context.Context, epochHash string) ([]agentevents.BrowserFlowRef, error) {
+	refs, err := c.store.OpenBrowserFlows(ctx, epochHash)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agentevents.BrowserFlowRef, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, browserFlowRefFromKoseki(ref))
+	}
+	return out, nil
+}
+
+// CloseFlows mirrors the committed session-store closure. Issuance is fenced
+// by the session store, not this column.
+func (c *kosekiAuthFlowController) CloseFlows(ctx context.Context, flowIDs []string) error {
+	return c.store.CloseAuthFlows(ctx, flowIDs)
+}
+
+func browserFlowRefFromKoseki(ref koseki.BrowserFlowRef) agentevents.BrowserFlowRef {
+	return agentevents.BrowserFlowRef{
+		FlowID: ref.FlowID, HumanID: ref.HumanID, EpochHash: ref.EpochHash,
+		ExpiresAt: ref.ExpiresAt, Closed: ref.ClosedAt != nil,
+	}
+}
+
 func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.BrowserAuthFlowResult {
 	result := agentevents.BrowserAuthFlowResult{
 		FlowID: flow.FlowID, Continuation: flow.Continuation, ExpiresAt: flow.ExpiresAt,
@@ -94,6 +149,7 @@ func (c *kosekiAuthFlowController) flowResult(flow koseki.AuthFlow) agentevents.
 		return result
 	}
 	result.Outcome = flow.TerminalOutcome
+	result.HumanID = flow.HumanID
 	result.Claims = agentevents.UserSessionClaims{TenantID: c.tenantID, UserID: flow.HumanID, PersonalityAgentID: flow.AgentID}
 	return result
 }
@@ -102,6 +158,7 @@ func verifiedKosekiIdentity(identity agentevents.FirebaseIdentity) (koseki.Verif
 	verified := koseki.VerifiedIdentity{
 		FirebaseUID: identity.UID, EmailVerified: identity.EmailVerified,
 		SignInProvider: identity.SignInProvider, DisplayName: identity.DisplayName,
+		IssuedAt: identity.IssuedAt,
 	}
 	if identity.Email != "" {
 		email, err := koseki.NormalizeEmail(identity.Email)
@@ -159,6 +216,10 @@ func validProviderUnlinkReauth(identity agentevents.FirebaseIdentity, targetProv
 		return len(identity.ProviderSubjects[identity.SignInProvider]) == 1
 	case "password":
 		return identity.EmailVerified && identity.Email != "" && len(identity.ProviderSubjects["email"]) == 1
+	case koseki.EmailCodeSignInProvider:
+		// Sumi mints custom tokens only after a mailbox proof, so a recent
+		// custom sign-in is a recent email proof for this principal.
+		return identity.EmailVerified && identity.Email != ""
 	default:
 		return false
 	}
@@ -197,7 +258,9 @@ func (c *kosekiAuthFlowController) runProviderUnlink(ctx context.Context, claims
 		return agentevents.ProviderOperationResult{}, agentevents.ErrBrowserAuthProviderUnavailable
 	}
 	usableMethods := supportedProviderMethodCount(account)
-	if account.EmailProvider && emailLinkProof {
+	// A verified Firebase address is a sign-in method only while Sumi email-code
+	// sign-in is enabled; it then resolves that address to this UID.
+	if (account.EmailProvider || (account.EmailVerified && c.email != nil)) && emailLinkProof {
 		usableMethods++
 	}
 	if usableMethods <= 1 {
@@ -401,7 +464,29 @@ func validProviderFailureOutcome(outcome string) bool {
 }
 
 func mapFlowError(err error) error {
+	var mismatch *koseki.EmailCodeMismatchError
+	var limited *koseki.EmailSendLimitedError
 	switch {
+	case errors.As(err, &mismatch):
+		return &agentevents.BrowserEmailCodeMismatchError{AttemptsRemaining: mismatch.AttemptsRemaining}
+	case errors.As(err, &limited):
+		return &agentevents.BrowserEmailSendLimitedError{RetryAt: limited.RetryAt}
+	case errors.Is(err, koseki.ErrEmailCodeLocked):
+		return agentevents.ErrBrowserEmailCodeLocked
+	case errors.Is(err, koseki.ErrEmailChallengeSuperseded):
+		return agentevents.ErrBrowserEmailSuperseded
+	case errors.Is(err, koseki.ErrEmailChallengeExpired):
+		return agentevents.ErrBrowserEmailExpired
+	case errors.Is(err, koseki.ErrEmailChallengeConsumed):
+		return agentevents.ErrBrowserEmailConsumed
+	case errors.Is(err, koseki.ErrEmailLinkInvalid):
+		return agentevents.ErrBrowserEmailLinkInvalid
+	case errors.Is(err, koseki.ErrEmailLinkAdoptionRequired):
+		return agentevents.ErrBrowserEmailAdoptionRequired
+	case errors.Is(err, koseki.ErrEmailFlowContinuedElsewhere):
+		return agentevents.ErrBrowserEmailContinuedElsewhere
+	case errors.Is(err, koseki.ErrEmailChallengeUnavailable):
+		return agentevents.ErrBrowserEmailUnavailable
 	case errors.Is(err, koseki.ErrEnrollmentInvite):
 		return agentevents.ErrBrowserEnrollmentInvite
 	case errors.Is(err, koseki.ErrAuthFlowExpired):

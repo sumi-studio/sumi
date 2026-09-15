@@ -90,7 +90,10 @@ func firebaseProviderAccountFromUser(user *firebaseauth.UserRecord, expectedUID 
 	if user == nil || user.UserInfo == nil || user.UID == "" || user.UID != expectedUID {
 		return firebaseProviderAccount{}, errors.New("firebase provider account identity mismatch")
 	}
-	account := firebaseProviderAccount{UID: user.UID, ProviderSubjects: make(map[string]string, 2)}
+	account := firebaseProviderAccount{
+		UID: user.UID, ProviderSubjects: make(map[string]string, 2),
+		EmailVerified: user.EmailVerified && user.Email != "",
+	}
 	for _, provider := range user.ProviderUserInfo {
 		if provider == nil {
 			continue
@@ -243,7 +246,13 @@ func browserAuthServerFromEnvWithDB(
 		bindings = resolver
 	}
 
-	app, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: projectID})
+	// Custom tokens are signed locally with a service-account JSON key, or via
+	// IAM signBlob for SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID or the metadata
+	// server account. The Auth emulator accepts unsigned tokens.
+	app, err := firebase.NewApp(ctx, &firebase.Config{
+		ProjectID:        projectID,
+		ServiceAccountID: strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID")),
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("initialize Firebase Admin SDK: %w", err)
 	}
@@ -253,6 +262,7 @@ func browserAuthServerFromEnvWithDB(
 	}
 	var verifierClient firebaseIDTokenClient = client
 	var providerClient firebaseProviderUserClient = client
+	var emailPrincipalClient firebaseEmailPrincipalClient = client
 	if firebaseTenantID != "" {
 		tenantClient, err := client.TenantManager.AuthForTenant(firebaseTenantID)
 		if err != nil {
@@ -260,6 +270,7 @@ func browserAuthServerFromEnvWithDB(
 		}
 		verifierClient = tenantClient
 		providerClient = tenantClient
+		emailPrincipalClient = tenantClient
 	}
 
 	secureCookies := true
@@ -307,11 +318,25 @@ func browserAuthServerFromEnvWithDB(
 			}
 			server.EnrollmentAdmins[id] = true
 		}
-		server.Flows = newKosekiAuthFlowController(
+		controller := newKosekiAuthFlowController(
 			registrationStore,
 			strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID")),
 			&firebaseAdminProviderLifecycle{client: providerClient},
 		)
+		emailConfig, err := emailAuthConfigFromEnv(allowedOrigins, secureCookies)
+		if err != nil {
+			return nil, false, err
+		}
+		if emailConfig != nil {
+			registrationStore.EmailChallengeKey = emailConfig.key
+			controller.email = &emailCodeController{
+				store:    registrationStore,
+				firebase: emailPrincipalClient,
+				delivery: newEmailDeliveryWorker(registrationStore, emailConfig.sender, emailConfig.linkOrigin),
+			}
+			server.EmailFlows = controller.email
+		}
+		server.Flows = controller
 	}
 	return server, true, nil
 }
