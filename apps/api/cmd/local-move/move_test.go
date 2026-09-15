@@ -310,7 +310,7 @@ func TestSessionCancelledBeforeSealing(t *testing.T) {
 	c := setupMove(t)
 	uid := "fixture-early-" + c.pid[24:]
 	sid, moveURL := c.newSession(uid)
-	if _, err := c.sessions.CancelBySubject(c.ctx, sid, transfersession.Subject{Provider: "firebase", Subject: uid}); err != nil {
+	if _, err := c.sessions.CancelBySubject(c.ctx, sid, transfersession.Subject{Provider: "firebase", Subject: uid}, ""); err != nil {
 		t.Fatal(err)
 	}
 	m, out := c.mover()

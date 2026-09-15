@@ -228,6 +228,14 @@ type Created struct {
 // in an existing account is a separate product decision — and a credential
 // with an open session, whose id is reported so that session can be
 // continued or cancelled.
+//
+// Create is not idempotent and never cancels anything: the grant exists only
+// in its answer. When that answer is lost, the retry is refused with the open
+// session, and the registrant decides from its status (see
+// docs/local-cloud-move.md, "A lost move URL"): a session that is still
+// awaiting_bundle can be replaced with CancelBySubject(expect
+// awaiting_bundle) and a new Create; one whose secretary arrived needs no
+// grant to finish.
 func (s *Service) Create(ctx context.Context, subj Subject) (Created, string, error) {
 	if !subj.valid() {
 		return Created{}, "", fmt.Errorf("%w: unsupported credential subject", ErrBadRequest)
@@ -385,7 +393,7 @@ func (s *Service) CancelByGrant(ctx context.Context, sessionID, grant, personaID
 	if (personaID == "") != (transferKey == "") {
 		return View{}, fmt.Errorf("%w: persona_id and transfer_key are given together", ErrBadRequest)
 	}
-	if err := s.cancel(ctx, sessionID); errors.Is(err, ErrConflict) {
+	if err := s.cancel(ctx, sessionID, ""); errors.Is(err, ErrConflict) {
 		v, verr := s.reconciledView(ctx, sessionID, true)
 		if verr != nil {
 			return View{}, verr
@@ -414,12 +422,19 @@ func (s *Service) CancelByGrant(ctx context.Context, sessionID, grant, personaID
 	return s.reconciledView(ctx, sessionID, true)
 }
 
-// CancelBySubject is the registering browser's cancel.
-func (s *Service) CancelBySubject(ctx context.Context, sessionID string, subj Subject) (View, error) {
+// CancelBySubject is the registering browser's cancel. expectStatus, when
+// set, is the open status the person was shown ("awaiting_bundle" or
+// "staged"): the cancel commits only if the session is still in it, so
+// replacing a move URL nobody used can never discard a secretary that arrived
+// meanwhile. A session that is already closed answers its view unchanged.
+func (s *Service) CancelBySubject(ctx context.Context, sessionID string, subj Subject, expectStatus string) (View, error) {
+	if expectStatus != "" && expectStatus != StatusAwaitingBundle && expectStatus != StatusStaged {
+		return View{}, fmt.Errorf("%w: expect_status must be awaiting_bundle or staged", ErrBadRequest)
+	}
 	if _, err := s.ownSubject(ctx, sessionID, subj); err != nil {
 		return View{}, err
 	}
-	err := s.cancel(ctx, sessionID)
+	err := s.cancel(ctx, sessionID, expectStatus)
 	if err != nil && !errors.Is(err, ErrConflict) {
 		return View{}, err
 	}
@@ -434,7 +449,12 @@ func (s *Service) CancelBySubject(ctx context.Context, sessionID string, subj Su
 // same lock ClaimInTx holds through the account transaction: a cancel either
 // commits before the claim (which then refuses) or sees provisioned and
 // refuses itself. Retiring the staged copy follows in Reconcile.
-func (s *Service) cancel(ctx context.Context, sessionID string) error {
+//
+// An awaiting session whose import already committed counts as staged, so an
+// expectation of awaiting_bundle cannot pass a secretary that arrived before
+// the session caught up. An import still running is not visible yet; if the
+// cancel wins, that stage is retired and its source keeps authority.
+func (s *Service) cancel(ctx context.Context, sessionID, expectStatus string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -445,10 +465,23 @@ func (s *Service) cancel(ctx context.Context, sessionID string) error {
 		sessionID).Scan(&status); err != nil {
 		return err
 	}
+	if status == StatusAwaitingBundle {
+		var arrived bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM core_transfers
+			WHERE direction = 'import' AND transfer_id = $1 AND status = 'staged')`, sessionID).Scan(&arrived); err != nil {
+			return err
+		}
+		if arrived {
+			status = StatusStaged
+		}
+	}
 	switch status {
 	case StatusProvisioned, StatusActivated:
 		return fmt.Errorf("%w: the account was already created with this secretary (%s)", ErrConflict, status)
 	case StatusAwaitingBundle, StatusStaged:
+		if expectStatus != "" && expectStatus != status {
+			return fmt.Errorf("%w: the session is %s now, not %s; nothing was cancelled", ErrConflict, status, expectStatus)
+		}
 		if _, err := tx.Exec(ctx, `UPDATE transfer_sessions SET status = 'cancelled', updated_at = now()
 			WHERE session_id = $1`, sessionID); err != nil {
 			return err

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -41,44 +42,39 @@ func TestCarriedInputRunsOnceOnDestinationCore(t *testing.T) {
 	c := setupMove(t)
 	ctx := c.ctx
 
-	bin := filepath.Join(t.TempDir(), "sumi-local-move")
-	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	// The command runs as its own process, built with the movefailpoint tag
+	// so the first resume is killed right after the source Complete commits.
+	bin := buildFailpointMove(t)
 	uid := "fixture-core-" + c.pid[24:]
 	sid, moveURL := c.newSession(uid)
 	grant := moveURL[strings.Index(moveURL, "#grant=")+7:]
-	cli := func(stdin string, args ...string) (int, string) {
-		cmd := exec.CommandContext(ctx, bin, args...)
-		cmd.Env = append(os.Environ(), "SUMI_LOCAL_HOME="+c.home,
-			"SUMI_DB_URL="+c.local.pool.Config().ConnString(), "SUMI_PERSONA_ID="+c.pid)
-		cmd.Stdin = strings.NewReader(stdin)
-		out, err := cmd.CombinedOutput()
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode(), string(out)
-		}
-		if err != nil {
-			t.Fatalf("run %v: %v", args, err)
-		}
-		return 0, string(out)
-	}
 
-	code, out := cli(moveURL+"\n", "start", "--wait", "0")
-	record("cli-start.txt", out)
-	if code != exitPending || strings.Contains(out, grant) || !strings.Contains(out, "waiting for the registration") {
-		t.Fatalf("start: exit %d\n%s", code, out)
+	r := c.run(bin, nil, moveURL+"\n", "start", "--wait", "0")
+	record("cli-start.txt", r.out)
+	if r.code != exitPending || strings.Contains(r.out, grant) || !strings.Contains(r.out, "waiting for the registration") {
+		t.Fatalf("start: %+v", r)
 	}
 	c.provision(uid, sid)
-	code, out = cli("", "resume")
-	record("cli-resume.txt", out)
-	if code != exitDone || !strings.Contains(out, "moved to Sumi Cloud") {
-		t.Fatalf("resume: exit %d\n%s", code, out)
+	r = c.run(bin, []string{"SUMI_LOCAL_MOVE_FAILPOINT=after-complete"}, "", "resume")
+	record("cli-resume-killed-after-complete.txt", fmt.Sprintf("killed=%t exit=%d\n%s", r.killed, r.code, r.out))
+	if !r.killed {
+		t.Fatalf("resume was not stopped at the failpoint: %+v", r)
 	}
-	code, out = cli("", "status")
-	record("cli-status.txt", out)
-	if code != exitDone || !strings.Contains(out, "Local authority transferred") || !strings.Contains(out, "not carried: files") {
-		t.Fatalf("status: exit %d\n%s", code, out)
+	if o, _ := c.recordedOutcome(); o != "" {
+		t.Fatalf("the stopped process recorded %q", o)
+	}
+	r = c.run(bin, nil, "", "resume")
+	record("cli-resume.txt", r.out)
+	if r.code != exitDone || !strings.Contains(r.out, "moved to Sumi Cloud") {
+		t.Fatalf("resume: %+v", r)
+	}
+	r = c.run(bin, nil, "", "status")
+	record("cli-status.txt", r.out)
+	if r.code != exitDone || !strings.Contains(r.out, "Local authority transferred") || !strings.Contains(r.out, "not carried: files") {
+		t.Fatalf("status: %+v", r)
+	}
+	if exports, _, _, _, _ := c.source(sid); exports != 1 {
+		t.Fatalf("the source sealed %d transfers", exports)
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.srv.URL+"/internal/core/personas",

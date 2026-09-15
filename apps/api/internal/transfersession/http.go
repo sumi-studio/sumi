@@ -129,7 +129,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	created, open, err := s.svc.Create(r.Context(), subj)
 	if errors.Is(err, ErrOpenSession) {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "session_id": open})
+		// The open session's status is what the registrant decides a lost
+		// move URL from; the grant is never repeated.
+		v, verr := s.svc.reconciledView(r.Context(), open, false)
+		if verr != nil {
+			s.writeErr(w, verr, nil)
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "session_id": open, "session": v})
 		return
 	}
 	if err != nil {
@@ -209,15 +216,18 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, v)
 		return
 	}
-	var fb flowBody
-	if !decode(w, r, &fb) {
+	var body struct {
+		flowBody
+		ExpectStatus string `json:"expect_status"`
+	}
+	if !decode(w, r, &body) {
 		return
 	}
-	subj, ok := s.subject(w, r, fb)
+	subj, ok := s.subject(w, r, body.flowBody)
 	if !ok {
 		return
 	}
-	v, err := s.svc.CancelBySubject(r.Context(), id, subj)
+	v, err := s.svc.CancelBySubject(r.Context(), id, subj, body.ExpectStatus)
 	if err != nil {
 		s.writeErr(w, err, &v)
 		return

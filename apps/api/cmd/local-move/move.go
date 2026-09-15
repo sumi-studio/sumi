@@ -29,7 +29,34 @@ var (
 	errGrantRejected = errors.New("Cloud rejected the move grant for this session")
 	errUnreachable   = errors.New("Cloud is unreachable")
 	errHeaderDone    = errors.New("header captured")
+
+	// beforeComplete and afterComplete are failpoints around the source
+	// Complete transaction. They do nothing unless the binary is built with
+	// the movefailpoint tag (failpoint.go), which tests use to stop the real
+	// process there.
+	beforeComplete = func() {}
+	afterComplete  = func() {}
 )
+
+const (
+	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried."
+	msgAborted     = "The move was cancelled. The secretary is active on Local again."
+)
+
+// ledgerOutcome is what the Local ledger alone proves about a sealed move.
+// The source commits completed only with Cloud's activation proof and aborted
+// only with its retirement proof, so a command stopped after that commit and
+// before recording anything itself finishes from here — without Cloud and
+// without the state file's outcome.
+func ledgerOutcome(status string) (outcome, message string) {
+	switch status {
+	case "completed":
+		return "transferred", msgTransferred
+	case "aborted":
+		return "aborted", msgAborted
+	}
+	return "", ""
+}
 
 // parseMoveURL splits a move URL into the session resource URL and the grant
 // from its fragment. The session resource is the destination: its origin and
@@ -254,11 +281,25 @@ func (m *mover) Resume(ctx context.Context) int {
 // drive advances the move until it finishes, needs the person to finish the
 // Cloud registration, or cannot reach Cloud. Every decision re-reads the
 // Local ledger and the Cloud session, so it is safe to repeat after any
-// interruption.
+// interruption. The Local ledger is read first: a move whose Complete or
+// Abort already committed finishes without asking Cloud again.
 func (m *mover) drive(ctx context.Context, st *moveState) int {
 	waitStart := time.Now()
 	uploads := 0
 	for {
+		exp, err := m.src.Status(ctx, "export", st.SessionID)
+		sealed := err == nil
+		if err != nil && !errors.Is(err, portable.ErrTransferNotFound) {
+			return m.fail(err)
+		}
+		if sealed {
+			if exp.PersonaID != m.personaID {
+				return m.fail(fmt.Errorf("transfer %s on this Local placement belongs to secretary %s, not %s; nothing was changed", st.SessionID, exp.PersonaID, m.personaID))
+			}
+			if outcome, msg := ledgerOutcome(exp.Status); outcome != "" {
+				return m.finish(st, outcome, "%s", msg)
+			}
+		}
 		v, err := m.fetch(ctx, st)
 		if err != nil {
 			return m.stopped(ctx, err)
@@ -266,8 +307,7 @@ func (m *mover) drive(ctx context.Context, st *moveState) int {
 		if err := m.checkDestination(st, v); err != nil {
 			return m.fail(err)
 		}
-		exp, err := m.src.Status(ctx, "export", st.SessionID)
-		if errors.Is(err, portable.ErrTransferNotFound) {
+		if !sealed {
 			switch v.Status {
 			case transfersession.StatusAwaitingBundle:
 				if code, done := m.seal(ctx, st, v); done {
@@ -280,16 +320,6 @@ func (m *mover) drive(ctx context.Context, st *moveState) int {
 			default:
 				return m.fail(fmt.Errorf("Cloud reports the session %s, but this Local placement never sealed transfer %s; nothing was changed", v.Status, st.SessionID))
 			}
-		}
-		if err != nil {
-			return m.fail(err)
-		}
-		switch exp.Status {
-		case "completed":
-			return m.finish(st, "transferred",
-				"Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried.")
-		case "aborted":
-			return m.finish(st, "aborted", "The move was cancelled. The secretary is active on Local again.")
 		}
 		if exp.DestinationID != v.DestinationPlacementID {
 			return m.fail(fmt.Errorf("this secretary was sealed for placement %s, but the session reports %s; nothing was aborted and the secretary stays sealed", exp.DestinationID, v.DestinationPlacementID))
@@ -325,9 +355,16 @@ func (m *mover) drive(ctx context.Context, st *moveState) int {
 				return m.stopped(ctx, err)
 			}
 		case transfersession.StatusActivated:
+			beforeComplete()
 			if _, err := m.src.Complete(ctx, m.personaID, st.SessionID, v.ActivateProof); err != nil {
+				// The commit can land even when its answer does not; the
+				// ledger decides.
+				if rec, lerr := m.src.Status(context.WithoutCancel(ctx), "export", st.SessionID); lerr == nil && rec.Status == "completed" {
+					continue
+				}
 				return m.fail(fmt.Errorf("complete the move with Cloud's activation proof: %w", err))
 			}
+			afterComplete()
 		case transfersession.StatusCancelled, transfersession.StatusExpired:
 			if v.RetireProof != "" {
 				if _, err := m.src.Abort(ctx, m.personaID, st.SessionID, v.RetireProof); err != nil {
@@ -618,11 +655,8 @@ func (m *mover) Cancel(ctx context.Context) int {
 	if err != nil {
 		return m.fail(err)
 	}
-	switch exp.Status {
-	case "completed":
-		return m.finish(st, "transferred", "This move already completed; Sumi is in Sumi Cloud.")
-	case "aborted":
-		return m.finish(st, "aborted", "The move was cancelled. The secretary is active on Local again.")
+	if outcome, msg := ledgerOutcome(exp.Status); outcome != "" {
+		return m.finish(st, outcome, "This move already finished. %s", msg)
 	}
 	key, err := m.transferKey(ctx, st)
 	if err != nil {
@@ -658,7 +692,9 @@ func (m *mover) Cancel(ctx context.Context) int {
 	}
 }
 
-// Status reports without changing anything and without taking the lock.
+// Status reports where the move stands. The only thing it changes is the
+// state file's outcome when the Local ledger already proves one and no other
+// invocation holds the lock.
 func (m *mover) Status(ctx context.Context) int {
 	st, code := m.current()
 	if st == nil {
@@ -668,12 +704,19 @@ func (m *mover) Status(ctx context.Context) int {
 		m.say("Secretary %s: Local authority %s", m.personaID, ps.Persona.Authority)
 	}
 	m.say("Move session: %s", st.SessionURL)
-	if st.Outcome != "" {
-		m.say("Outcome: %s", st.Outcome)
+	exp, expErr := m.src.Status(ctx, "export", st.SessionID)
+	outcome := st.Outcome
+	if outcome == "" && expErr == nil && exp.PersonaID == m.personaID {
+		if outcome, _ = ledgerOutcome(exp.Status); outcome != "" {
+			m.recordOutcome(st.SessionID, outcome)
+		}
 	}
-	if exp, err := m.src.Status(ctx, "export", st.SessionID); err == nil {
+	if outcome != "" {
+		m.say("Outcome: %s", outcome)
+	}
+	if expErr == nil {
 		m.say("Local transfer: %s (sealed %s)", exp.Status, exp.SealedAt.Local().Format(time.RFC1123))
-	} else if errors.Is(err, portable.ErrTransferNotFound) {
+	} else if errors.Is(expErr, portable.ErrTransferNotFound) {
 		m.say("Local transfer: not sealed")
 	}
 	v, _, err := m.call(ctx, http.MethodGet, st.SessionURL, st.Grant, nil, "")
@@ -691,4 +734,20 @@ func (m *mover) Status(ctx context.Context) int {
 	}
 	m.say("Only core state moves. Model connections are never carried: choose one in Sumi Cloud before the secretary can answer there.")
 	return exitDone
+}
+
+// recordOutcome writes an outcome the Local ledger proves, if no running
+// invocation holds the lock (that one records it itself).
+func (m *mover) recordOutcome(sessionID, outcome string) {
+	release, err := m.lock()
+	if err != nil {
+		return
+	}
+	defer release()
+	cur, err := m.load()
+	if err != nil || cur == nil || cur.SessionID != sessionID || cur.Outcome != "" {
+		return
+	}
+	cur.Outcome = outcome
+	_ = m.save(cur)
 }
