@@ -16,6 +16,7 @@ export const originRoutes = Object.freeze({
   exact: Object.freeze([
     "/health",
     "/api/model-connections",
+    "/api/usage",
     "/workspaces",
     "/app-installations",
     "/feedback/bootstrap",
@@ -27,6 +28,7 @@ export const originRoutes = Object.freeze({
   prefixes: Object.freeze([
     "/auth/",
     "/api/model-connections/",
+    "/api/usage/",
     "/direct-chat/",
     "/messaging/",
     "/feedback/threads/",

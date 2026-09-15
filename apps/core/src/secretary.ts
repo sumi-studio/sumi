@@ -5,8 +5,8 @@ import {
   estTextTokens,
   evictToBudget,
   inputMarker,
-  renderJournalContext,
   renderedViewTokens,
+  renderJournalContext,
   runMemoryPreparation,
 } from "./memory.ts";
 import {
@@ -39,6 +39,7 @@ import type {
   TurnPlan,
   WriterLease,
 } from "./types.ts";
+import { BudgetWaitError } from "./usage.ts";
 
 export interface SecretaryConfig {
   personaId: string;
@@ -127,7 +128,8 @@ const PROVIDER_RETRY_BUDGET_MS = 30 * 60_000;
  * provider retry window (repair F4).
  */
 function activeAgeMs(input: Input): number {
-  let active = Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
+  let active =
+    Date.now() - Date.parse(input.created_at) - (input.waited_ms ?? 0);
   // A still-waiting input cannot be claimed — but a store that exposes
   // waiting_since without having requeued yet is counted honestly too.
   if (input.waiting_since) {
@@ -582,8 +584,7 @@ export class Secretary {
     // the shelf's end, expressed on the wall clock the host arms against.
     // Until then the host's ordinary heartbeat carries the re-probe.
     const paused =
-      Date.now() +
-      Math.max(0, this.memoryModelPausedUntil - performance.now());
+      Date.now() + Math.max(0, this.memoryModelPausedUntil - performance.now());
     if (this.memoryShape.claimable > 0) return Math.max(Date.now(), paused);
     const next = this.memoryShape.next_claimable_at;
     return next ? Math.max(Date.parse(next), paused) : null;
@@ -1092,6 +1093,9 @@ export class Secretary {
         for await (const ev of this.cfg.provider.stream({
           personaId,
           turnId: turn.turn_id,
+          generation: gen,
+          phase: "turn",
+          inputId: input.input_id,
           round,
           messages: sendMessages,
           tools: await this.advertisedSpecs(),
@@ -1104,6 +1108,31 @@ export class Secretary {
         break;
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
+        if (e instanceof BudgetWaitError) {
+          // Budget admission denied the call: no provider request was
+          // sent and nothing this round produced is journaled — the
+          // resuming attempt re-plans the round and journals once. The
+          // turn commits 'await' carrying the denied funding; the input
+          // parks until a budget or funding change requeues it, exactly
+          // like an approval wait, and spends no attempt.
+          await this.commitTurnFinal(turn, {
+            outcome: "await",
+            events: [],
+            wait: {
+              kind: "budget",
+              funding: e.wait.funding,
+              estimate: e.wait.estimate,
+            },
+          });
+          this.log("turn awaiting budget", {
+            turn_id: turn.turn_id,
+            input_id: input.input_id,
+            funding: e.wait.funding,
+            needed_minor: e.wait.needed_minor,
+            currency: e.wait.currency,
+          });
+          return { failed: true, retryable: false };
+        }
         // Provider error text is untrusted bytes: a poisoned message (e.g.
         // one containing NUL) must not make the failure itself unpersistable.
         const msg = stripNul(e instanceof Error ? e.message : String(e));
@@ -1493,8 +1522,7 @@ export function assemble(
           placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
           messageId: p.message_id,
           attention: input.attention,
-          change:
-            typeof p.message_change === "string" ? p.message_change : "",
+          change: typeof p.message_change === "string" ? p.message_change : "",
         });
   messages.push({ role: "user", content: `${who} ${text}` });
   return messages;
@@ -1502,7 +1530,7 @@ export function assemble(
 
 /** Strip bytes the durable store cannot persist (PG text/jsonb reject NUL). */
 function stripNul(s: string): string {
-  return s.replace(/\u0000/g, "");
+  return s.replaceAll("\u0000", "");
 }
 
 function stripNulDeep(v: unknown): unknown {

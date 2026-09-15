@@ -45,6 +45,20 @@ export interface ModelRequest {
   personaId: string;
   turnId: string;
   /**
+   * The writer generation owning this call. Usage admission is fenced on
+   * it — a metered provider refuses a call without one, so spend can
+   * never be reserved by a dead writer. Unmetered providers ignore it.
+   */
+  generation?: number;
+  /**
+   * Which durable work the call serves — 'turn' for a decision round,
+   * 'memory' for a preparation branch. Metering attributes the recorded
+   * fact by phase; providers that do not meter ignore it. Default 'turn'.
+   */
+  phase?: "turn" | "memory";
+  /** The input a 'turn' call serves — recorded on its usage fact. */
+  inputId?: string;
+  /**
    * Which model consultation this is within the turn: 0 is the initial
    * decision; each round whose tool calls have been durably executed is
    * fed back as messages and consulted as the next round.
@@ -67,6 +81,17 @@ export interface ModelProvider {
    * without a selection layer omit it entirely (always assumed usable).
    */
   probe?(): Promise<void>;
+  /**
+   * The maximum output tokens this provider will actually send on the
+   * wire for the next request, when one is configured — the value the
+   * request will carry (e.g. chat `max_tokens`, Responses
+   * `max_output_tokens`, Anthropic `max_tokens`), including adapter
+   * defaults the protocol requires. `undefined` means no wire bound:
+   * metering then admits the call as honestly unbounded rather than
+   * claiming a cap that was never sent. Providers without a configured
+   * bound omit this method.
+   */
+  outputBound?(): number | undefined;
 }
 
 /**

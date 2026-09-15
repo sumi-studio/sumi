@@ -4,6 +4,7 @@ import type {
   ClaimedMemoryChunk,
   CommitRequest,
   Event,
+  FundingRef,
   Job,
   JobTerminalReport,
   LoadResult,
@@ -18,6 +19,9 @@ import type {
   Schedule,
   Turn,
   TurnPlan,
+  UsageAdmitResult,
+  UsageEstimate,
+  UsageFact,
   WriterLease,
 } from "./types.ts";
 
@@ -77,6 +81,54 @@ export interface StateClient {
     generation: number,
   ): Promise<void>;
   recover(persona: string, generation: number): Promise<RecoverResult>;
+  /**
+   * Reserve priced-estimate spend for one provider call, under the
+   * writer's generation, before any request bytes are sent. Replaying the
+   * same admit (lost response) returns the held reservation rather than
+   * double-reserving. A denial creates nothing durable — the caller
+   * commits the wait itself at turn commit or reshelves the chunk.
+   */
+  admitUsage(
+    persona: string,
+    generation: number,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      estimate: UsageEstimate;
+    },
+  ): Promise<UsageAdmitResult>;
+  /**
+   * Record one call's resolved usage. Deliberately not writer-fenced: the
+   * spend already happened and a replaced writer must still be able to
+   * report it. Idempotent on fact_id — an identical redelivery replays
+   * the stored fact; a conflicting payload under a known fact_id is a
+   * 409 contract violation (a genuinely additional call must carry a
+   * fresh fact_id).
+   */
+  recordUsage(
+    persona: string,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      status: "reported" | "unknown" | "not_sent";
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cachedTokens?: number | null;
+      quantities?: Record<string, unknown>;
+    },
+  ): Promise<{ fact: UsageFact; created: boolean }>;
+  /** The persona's usage ledger, oldest first. */
+  listUsageFacts(persona: string, limit?: number): Promise<UsageFact[]>;
   loadTurn(
     persona: string,
     generation: number,
@@ -213,17 +265,19 @@ export interface StateClient {
     failure: { error: string; retryable: boolean },
   ): Promise<MemoryChunk>;
   /**
-   * Return a claimed chunk to the shelf because the model layer was
-   * unavailable before any request was evaluated — an unbound selection,
-   * a missing credential, a binding-lookup outage. Records no verdict
-   * and spends no attempts or interruptions; the chunk waits out a short
-   * pacing, then proceeds once a usable binding exists.
+   * Return a claimed chunk to the shelf when no model request could be
+   * evaluated — an unbound selection, a missing credential, a
+   * binding-lookup outage, or a denied budget admission. Records no
+   * verdict and spends no attempts or interruptions; the chunk waits out
+   * a short pacing (delayMs, or the service default), then proceeds once
+   * a usable binding exists. A funding or model-selection change clears
+   * budget pacing early.
    */
   reshelveMemoryChunk(
     persona: string,
     generation: number,
     chunkSeq: number,
-    pause: { reason: string },
+    pause: { reason: string; delayMs?: number },
   ): Promise<MemoryChunk>;
   outbox(
     persona: string,
@@ -419,6 +473,79 @@ export class HttpStateClient implements StateClient {
         generation,
       },
     );
+  }
+  admitUsage(
+    persona: string,
+    generation: number,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      estimate: UsageEstimate;
+    },
+  ) {
+    return this.call<UsageAdmitResult>(
+      "POST",
+      `/internal/core/personas/${persona}/usage/admit`,
+      {
+        generation,
+        fact_id: req.factId,
+        kind: req.kind,
+        phase: req.phase,
+        turn_id: req.turnId,
+        input_id: req.inputId,
+        round: req.round ?? 0,
+        funding: req.funding,
+        estimate: req.estimate,
+      },
+    );
+  }
+  recordUsage(
+    persona: string,
+    req: {
+      factId: string;
+      kind: string;
+      phase: string;
+      turnId?: string;
+      inputId?: string;
+      round?: number;
+      funding: FundingRef;
+      status: "reported" | "unknown" | "not_sent";
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cachedTokens?: number | null;
+      quantities?: Record<string, unknown>;
+    },
+  ) {
+    return this.call<{ fact: UsageFact; created: boolean }>(
+      "POST",
+      `/internal/core/personas/${persona}/usage/record`,
+      {
+        fact_id: req.factId,
+        kind: req.kind,
+        phase: req.phase,
+        turn_id: req.turnId,
+        input_id: req.inputId,
+        round: req.round ?? 0,
+        funding: req.funding,
+        status: req.status,
+        input_tokens: req.inputTokens ?? null,
+        output_tokens: req.outputTokens ?? null,
+        cached_tokens: req.cachedTokens ?? null,
+        quantities: req.quantities ?? {},
+      },
+    );
+  }
+  async listUsageFacts(persona: string, limit = 100) {
+    const res = await this.call<{ facts: UsageFact[] }>(
+      "GET",
+      `/internal/core/personas/${persona}/usage/facts?limit=${limit}`,
+    );
+    return res.facts;
   }
   loadTurn(
     persona: string,
@@ -620,12 +747,12 @@ export class HttpStateClient implements StateClient {
     persona: string,
     generation: number,
     chunkSeq: number,
-    pause: { reason: string },
+    pause: { reason: string; delayMs?: number },
   ) {
     const res = await this.call<{ chunk: MemoryChunk }>(
       "POST",
       `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/reshelve`,
-      { generation, reason: pause.reason },
+      { generation, reason: pause.reason, delay_ms: pause.delayMs },
     );
     return res.chunk;
   }

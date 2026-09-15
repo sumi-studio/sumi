@@ -14,7 +14,14 @@ import type {
   ChatGPTLogin,
   ModelConnectionsAPI,
 } from "../lib/model-connections";
+import type { UsageAPI } from "../lib/usage";
 import { ModelProviderSettings } from "./model-provider-settings";
+
+const usageAPI: UsageAPI = {
+  overview: async () => ({ sources: [], waits: [] }),
+  setBudget: vi.fn(),
+  clearBudget: vi.fn(),
+};
 
 const connectionsAPI = {
   list: async () => ({
@@ -102,6 +109,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -131,6 +139,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -141,6 +150,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open={false}
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -157,6 +167,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -175,6 +186,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -184,6 +196,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open={false}
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -198,6 +211,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -237,6 +251,7 @@ describe("ChatGPT model settings", () => {
         key="old-owner"
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={old}
       />,
     );
@@ -246,6 +261,7 @@ describe("ChatGPT model settings", () => {
         key="new-owner"
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={current}
       />,
     );
@@ -267,6 +283,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );
@@ -299,6 +316,7 @@ describe("ChatGPT model settings", () => {
         connectionsAPI={connectionsAPI}
         open
         onOpenChange={vi.fn()}
+        usageAPI={usageAPI}
         api={api}
       />,
     );

@@ -75,6 +75,18 @@ export class AnthropicProvider implements ModelProvider {
     this.fetchImpl = fetchImpl;
   }
 
+  /**
+   * The output bound the next request will actually send — the Messages
+   * API requires max_tokens, so this wire is always bounded (the
+   * configured value, an `extra` override, or the adapter default).
+   */
+  outputBound(): number | undefined {
+    const extra = this.cfg.extra;
+    const overridden =
+      extra !== undefined ? numOr(extra.max_tokens) : undefined;
+    return overridden ?? this.cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     assertExtraHeaders(this.cfg.headers);
     const tools = wireTools(request.tools);
@@ -348,4 +360,8 @@ function toMessages(
     ...(system.length ? { system: system.join("\n\n") } : {}),
     messages: out,
   };
+}
+
+function numOr(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
 }
