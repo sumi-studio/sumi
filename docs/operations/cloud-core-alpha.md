@@ -45,7 +45,7 @@ person ─ browser ─ sumi-alpha Worker ─ VPC Service sumi-alpha-api ─ tunn
 | `SUMI_CORE_STATE_TOKEN` | API env | Admin credential for core state. Mounts `/internal/core`. It is not given to the Worker. |
 | `SUMI_CORE_RUNTIME_TOKEN` | API env and Worker secret (same value) | Accesses any persona's scoped state routes. It cannot create personas, bind humans, decide approvals or transfer. |
 | `SUMI_CORE_WAKE_URL` | API env | `https://sumi-core-alpha.<workers.dev subdomain>.workers.dev` |
-| `SUMI_CORE_WAKE_TOKEN` | API env and Worker secret (same value) | Bearer for `/personas/:id/wake` and `/health/state` |
+| `SUMI_CORE_WAKE_TOKEN` | API env and Worker secret (same value) | Bearer for `/personas/:id/wake`, `/personas/:id/check` and `/health/state` |
 
 Tokens must be at least 32 characters. The runtime token must differ from the
 state token. Keep them in files with `0600` permissions outside the repository.
@@ -77,8 +77,9 @@ node node_modules/wrangler/bin/wrangler.js deploy --env alpha
 node node_modules/wrangler/bin/wrangler.js secret put SUMI_CORE_RUNTIME_TOKEN --env alpha < "$d/runtime-token"
 node node_modules/wrangler/bin/wrangler.js secret put SUMI_CORE_WAKE_TOKEN --env alpha < "$d/wake-token"
 
-# Before the API change: the Worker is up, wake is refused, and Cloudflare reaches the API through the VPC Service.
-node ../../scripts/operations/cloud-core-probe.mjs --core "$CORE_URL" --wake-token-file "$d/wake-token"
+# Before the API release: only liveness is checkable — no persona exists
+# yet, so the readiness probe cannot run. curl /health is enough here.
+curl -s "$CORE_URL/health"
 ```
 
 Next, release the API with the four environment variables from the files
@@ -89,9 +90,12 @@ node ../../scripts/operations/cloud-core-probe.mjs --core "$CORE_URL" --wake-tok
   --state http://100.116.25.99:8080 --runtime-token-file "$d/runtime-token" --persona "$PERSONA_ID"
 ```
 
-`--persona` must name a persona that already exists in core state (one is
+`--persona` is required — without it the script exits before printing a
+result, so a probe that never reached a Durable Object can never print
+PASS. It must name a persona that already exists in core state (one is
 created when Messaging attention first lands for an agent, or via
-`POST /internal/core/personas` with the state token). The `do-runtime-auth`
+`POST /internal/core/personas` with the state token); the probe never
+picks or creates one itself. The `do-runtime-auth`
 check is the essential one here: inside the Durable Object it reads that
 persona's state through the `SUMI_STATE` binding with the Worker's
 *installed* `SUMI_CORE_RUNTIME_TOKEN`. A wrong secret there — a file
@@ -135,10 +139,13 @@ What the sweep's fixed bounds mean in practice:
   secretary (no alarm yet) can therefore wait up to ~5 minutes for its next
   wake once the gap has grown; a secretary that was already running keeps
   its 30s alarm and is not affected.
-- Candidate selection is bounded (200 rows per sweep) and fair: personas
-  inside their re-wake gap sort behind eligible ones, so any number of
-  stalled personas cannot starve a newer one — worst case, all pending
-  personas are reached within `ceil(awaiting/200)` sweeps.
+- Candidate selection is bounded (200 rows per sweep) and rotates: each
+  sweep continues after the previous page's last persona id, wrapping at
+  the end of the set. Every awaiting persona is therefore *selected*
+  within `ceil(awaiting/200)` sweeps no matter how long batches take —
+  application backoff can delay a wake but can never hold the head of the
+  queue and starve later personas. A persona is woken when selected and
+  due: its re-wake gap elapsed, or its pending work changed.
 
 ## Platform assumptions verified against primary documentation
 

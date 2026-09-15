@@ -268,6 +268,70 @@ func TestRuntimeWakerDoesNotStarveLaterPersonas(t *testing.T) {
 	}
 }
 
+// The disputed starvation window: when a full candidate batch stays
+// in-flight longer than MaxGap, every mark expires before the next sweep —
+// nothing is deferred and the same oldest prefix can fill the bounded
+// result forever. Scaled proportionally (300 permanently pending personas,
+// 40ms wake latency, a 150ms MaxGap under a ~1s batch) so the condition
+// actually holds; the 1h gap in the test above masks it.
+func TestRuntimeWakerRotatesFairlyUnderSlowSweeps(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	rec := &wakeRecorder{}
+	rec.status.Store(200)
+	// Each wake occupies a concurrency slot long enough that a full batch
+	// (~200/8 * 40ms = 1s) outlasts MaxGap.
+	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer "+testWakeToken {
+			t.Errorf("wake without the configured bearer")
+		}
+		rec.mu.Lock()
+		rec.calls = append(rec.calls, req.Method+" "+req.URL.Path)
+		rec.mu.Unlock()
+		time.Sleep(40 * time.Millisecond)
+		w.WriteHeader(int(rec.status.Load()))
+	}))
+	defer host.Close()
+	waker, err := NewRuntimeWaker(srv.Store(), host.URL, testWakeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waker.MinGap = 30 * time.Millisecond
+	waker.MaxGap = 150 * time.Millisecond
+	ctx := context.Background()
+
+	const stalled = 300 // over the 200-row sweep batch
+	var last string
+	for range stalled {
+		p := pid(t)
+		if r := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+p+`"}`); r.Code != 201 {
+			t.Fatalf("create persona: %d %s", r.Code, r.Body)
+		}
+		body := `{"input_id":"in-` + p + `","kind":"message","payload":{"text":"hi"}}`
+		if r := do(t, mux, "POST", "/internal/core/personas/"+p+"/inputs", testAdminSecret, body); r.Code != 201 {
+			t.Fatalf("submit: %d %s", r.Code, r.Body)
+		}
+		last = p
+	}
+	// Each sweep's batch outlives every mark's gap. A fair selection still
+	// reaches all 300 personas; a selection that keeps preferring the
+	// oldest 200 never reaches the last 100.
+	for range 4 {
+		waker.Sweep(ctx)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	woken := map[string]int{}
+	for _, c := range rec.calls {
+		woken[strings.TrimSuffix(strings.TrimPrefix(c, "POST /personas/"), "/wake")]++
+	}
+	if woken[last] == 0 {
+		t.Fatalf("newest persona never woken across 4 slow sweeps; %d of %d personas were reached", len(woken), stalled)
+	}
+	if len(woken) != stalled {
+		t.Fatalf("only %d of %d stalled personas were ever selected", len(woken), stalled)
+	}
+}
+
 func jsonInt(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)

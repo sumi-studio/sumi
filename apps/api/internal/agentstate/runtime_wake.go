@@ -37,15 +37,15 @@ type AwaitingRuntime struct {
 }
 
 // PersonasAwaitingRuntime lists active personas whose work needs a runtime
-// and whose writer lease is absent or expired, oldest persona first.
+// and whose writer lease is absent or expired.
 //
-// deferred names personas the caller already woke inside their re-wake gap;
-// they sort behind every eligible persona instead of consuming the limit. A
-// bounded result can therefore never starve a later persona: however many
-// stalled personas sit ahead, the first `limit` rows are the ones that can
-// be woken now, and a deferred persona that reappears in the tail is simply
-// skipped again (or woken at once if its pending work moved).
-func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int, deferred []string) ([]AwaitingRuntime, error) {
+// after is a rotation cursor: rows with persona_id > after sort first, then
+// the result wraps to the smallest ids. The caller advances the cursor to
+// the last returned id ("" restarts from the beginning), so a bounded
+// result walks the whole awaiting set over consecutive calls instead of
+// always returning the same oldest prefix — application-level backoff can
+// then never starve later personas, however long a batch takes.
+func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int, after string) ([]AwaitingRuntime, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -67,8 +67,8 @@ func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int, deferred
 				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now()))
 		  AND NOT EXISTS (SELECT 1 FROM core_writer_leases l
 				WHERE l.persona_id = p.persona_id AND l.expires_at > now())
-		ORDER BY COALESCE(p.persona_id = ANY($2::text[]), false), p.persona_id
-		LIMIT $1`, limit, deferred)
+		ORDER BY (p.persona_id > $2::text) DESC, p.persona_id
+		LIMIT $1`, limit, after)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +100,9 @@ type RuntimeWaker struct {
 
 	mu    sync.Mutex
 	marks map[string]wakeMark
+	// cursor is the rotation position handed to PersonasAwaitingRuntime;
+	// only Sweep touches it, so it needs no lock.
+	cursor string
 }
 
 type wakeMark struct {
@@ -185,23 +188,24 @@ func (w *RuntimeWaker) Run(ctx context.Context) {
 // Sweep runs one pass and returns how many wakes it sent successfully.
 func (w *RuntimeWaker) Sweep(ctx context.Context) int {
 	now := time.Now()
-	w.mu.Lock()
-	// Personas still inside their re-wake gap sort behind eligible ones in
-	// the candidate query, so stalled work cannot fill the bounded result
-	// and starve personas that have never been woken.
-	var deferred []string
-	for id, m := range w.marks {
-		if now.Sub(m.at) < m.gap {
-			deferred = append(deferred, id)
-		}
-	}
-	w.mu.Unlock()
-	awaiting, err := w.store.PersonasAwaitingRuntime(ctx, 200, deferred)
+	const limit = 200
+	awaiting, err := w.store.PersonasAwaitingRuntime(ctx, limit, w.cursor)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("core wake: pending-work query failed: %v", err)
 		}
 		return 0
+	}
+	// Advance the rotation cursor. A short page or a last row at or below
+	// the old cursor means the result wrapped past the end — the whole
+	// awaiting set was covered this rotation, so restart at the beginning.
+	// Otherwise the next sweep continues after the last id returned.
+	// Skipped (in-gap) rows still advance the cursor: fairness lives in
+	// selection, so a stalled prefix cannot hold the head of the queue.
+	if n := len(awaiting); n == 0 || n < limit || awaiting[n-1].PersonaID <= w.cursor {
+		w.cursor = ""
+	} else {
+		w.cursor = awaiting[n-1].PersonaID
 	}
 	w.mu.Lock()
 	seen := make(map[string]bool, len(awaiting))
@@ -219,10 +223,11 @@ func (w *RuntimeWaker) Sweep(ctx context.Context) int {
 		w.marks[a.PersonaID] = wakeMark{at: now, progress: a.Progress, gap: gap, failed: m.failed}
 		due = append(due, a)
 	}
-	// A persona that left the list got a live writer or finished its work.
-	// Its mark is dropped once the gap has passed: keeping it while the gap
-	// runs preserves the backoff of a still-awaiting persona the limit
-	// pushed out of this batch, and an expired mark only resets its gap.
+	// A persona that left the page is either out of the rotation window or
+	// done working — the bounded result cannot tell which. Its mark is kept
+	// while its gap runs (still enforcing backoff when the cursor returns)
+	// and dropped once the gap has passed, where the persona was due anyway;
+	// a fresh mark just restarts the doubling.
 	for id, m := range w.marks {
 		if !seen[id] && now.Sub(m.at) >= m.gap {
 			delete(w.marks, id)
