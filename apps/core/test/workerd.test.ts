@@ -11,8 +11,9 @@ import type {
   ModelRequest,
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
-import { Secretary } from "../src/secretary.ts";
-import type { StateClient } from "../src/state-client.ts";
+import { SelectedModelProvider } from "../src/host/provider-env.ts";
+import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
+import { StateError, type StateClient } from "../src/state-client.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000002";
 
@@ -42,15 +43,18 @@ const fakeEnv = { SUMI_STATE_URL: "http://unused", SECRETARY: {} as never };
 class TestObject extends SecretaryObject {
   private readonly state: StateClient;
   private readonly provider: ModelProvider;
+  private readonly cfgOver: Partial<SecretaryConfig>;
   constructor(
     ctx: ConstructorParameters<typeof SecretaryObject>[0],
     env: ConstructorParameters<typeof SecretaryObject>[1],
     state: StateClient,
     provider: ModelProvider = new MockProvider(),
+    cfgOver: Partial<SecretaryConfig> = {},
   ) {
     super(ctx, env);
     this.state = state;
     this.provider = provider;
+    this.cfgOver = cfgOver;
   }
   protected override newSecretary(personaId: string): Secretary {
     return new Secretary({
@@ -65,6 +69,7 @@ class TestObject extends SecretaryObject {
       scheduleEveryMs: 1,
       memoryPreparationTimeoutMs: this.memoryPreparationTimeoutMs(),
       idgen: () => crypto.randomUUID(),
+      ...this.cfgOver,
     });
   }
 }
@@ -293,9 +298,9 @@ test("alarm drain keeps a branch alive past the turn budget and shelves its resu
   const obj = new TestObject(ctx as never, env as never, state, provider);
   await twoExchanges(state, obj, ctx);
 
-  const t0 = Date.now();
+  const t0 = performance.now(); // monotonic — the host clock may step
   await obj.alarm();
-  const took = Date.now() - t0;
+  const took = performance.now() - t0;
   const c = state.memoryChunks[0]!;
   assert.equal(c.status, "prepared", JSON.stringify(c));
   assert.equal(c.attempts, 0);
@@ -329,5 +334,138 @@ test("alarm drain records a hanging branch as a retryable timeout and re-arms fo
   assert.ok(
     armedIn > 0 && armedIn <= 1_500,
     `re-armed for the retry, not the 30s heartbeat: ${armedIn}ms`,
+  );
+});
+
+/**
+ * An unbound selection with pending memory must not keep the DO on the 1s
+ * memory-wake floor: the branch pauses and the alarm rests on the shelf
+ * cadence until a usable binding exists, then the same chunk proceeds.
+ */
+test("unbound binding shelves memory work; a repaired binding resumes it", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  let bindingLookups = 0;
+  const realBinding = state.modelBinding.bind(state);
+  state.modelBinding = (p) => {
+    bindingLookups++;
+    return realBinding(p);
+  };
+  const provider = new SelectedModelProvider({
+    state,
+    persona: PERSONA,
+    fallback: new MockProvider(),
+    timeoutMs: 5_000,
+  });
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state, provider, {
+    memoryUnavailablePauseMs: 2_000,
+  });
+
+  // Bound while the exchanges land and the chunk seals.
+  await twoExchanges(state, obj, ctx);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "sealed");
+
+  // Now the destination-window state: the selection cannot produce a call.
+  state.setModelBinding(PERSONA, {
+    selection: "needs_rebinding",
+    intent: { kind: "api", model: "m" },
+    reason: "carried model intent needs a destination selection",
+  } as never);
+
+  const probesBefore = bindingLookups;
+  const alarmStart = Date.now();
+  await obj.alarm();
+  assert.equal(bindingLookups, probesBefore + 1, "one probe, not a claim");
+  const after = state.memoryChunks[0]!;
+  assert.equal(after.status, "sealed", "the pause records no verdict");
+  assert.equal(after.attempts, 0);
+  assert.equal(after.interruptions, 0);
+  // Measured from before the drain: the alarm fired at start+shelf, not
+  // the 1s memory-wake floor.
+  const armedIn = ctx.alarmAt()! - alarmStart;
+  assert.ok(
+    armedIn > 1_500,
+    `unbound memory re-arms on the shelf cadence, not the 1s floor: ${armedIn}ms`,
+  );
+
+  // A second alarm inside the shelf runs an ordinary drain — no probe,
+  // no claim — and ordinary work still wakes promptly.
+  await obj.alarm();
+  assert.equal(bindingLookups, probesBefore + 1, "shelved: no re-probe");
+  assert.equal(state.memoryChunks[0]!.status, "sealed");
+  state.addInput(PERSONA, "in-while-paused", "hello while unbound");
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  assert.notEqual(
+    state.inputs.find((i) => i.input_id === "in-while-paused")!.status,
+    "queued",
+    "the drain still processed the input (its own binding verdict is separate)",
+  );
+
+  // The human binds a usable selection; once the shelf expires the next
+  // ordinary wake re-probes and the same chunk prepares.
+  state.setModelBinding(PERSONA, { selection: "unset" });
+  await sleep(2_100); // past the shelf — monotonic in-process deadline
+  await obj.alarm();
+  await settle(ctx);
+  const done = state.memoryChunks[0]!;
+  assert.ok(
+    done.status === "prepared" || done.status === "kept",
+    `the same chunk was worked, not burned: ${JSON.stringify(done)}`,
+  );
+  assert.equal(done.attempts, 0, "the pause never spent an attempt");
+  assert.equal(done.interruptions, 0);
+});
+
+/**
+ * A binding that dies between the preflight probe and the call resolves
+ * the same `unavailable` error at stream time: the claimed chunk is
+ * reshelved with its budgets intact and the wake rests on the shelf —
+ * not paced to the reshelve's 200ms.
+ */
+test("binding dying mid-call reshelves and shelves the wake", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const realBinding = state.modelBinding.bind(state);
+  let lookups = 0;
+  const provider = new SelectedModelProvider({
+    state,
+    persona: PERSONA,
+    fallback: new MockProvider(),
+    timeoutMs: 5_000,
+  });
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state, provider, {
+    memoryUnavailablePauseMs: 2_000,
+  });
+  await twoExchanges(state, obj, ctx);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  assert.equal(state.memoryChunks[0]!.status, "sealed");
+
+  // Arm the dying binding only now: the probe sees it usable, the stream's
+  // own resolve then gets the outage — the call-time race.
+  state.modelBinding = (p) => {
+    lookups++;
+    if (lookups === 1) return realBinding(p);
+    return Promise.reject(new StateError(503, "state service restarting"));
+  };
+  const alarmStart = Date.now();
+  await obj.alarm();
+  const c = state.memoryChunks[0]!;
+  assert.equal(c.status, "sealed", "reshelved, not failed");
+  assert.equal(c.attempts, 0, "the mid-call outage spent no attempt");
+  assert.equal(c.interruptions, 0);
+  assert.match(c.last_error ?? "", /selection lookup failed/);
+  const armedIn = ctx.alarmAt()! - alarmStart;
+  assert.ok(
+    armedIn > 1_500,
+    `reshelve's short pacing does not re-arm the alarm: ${armedIn}ms`,
   );
 });

@@ -214,6 +214,7 @@ test("an unbound selection leaves claimable chunks for later", async () => {
     contextLimit: 5_000,
     pollIntervalMs: 1,
     scheduleEveryMs: 60_000,
+    memoryUnavailablePauseMs: 40,
     idgen: () => crypto.randomUUID(),
   };
   const s = new Secretary(cfg);
@@ -227,8 +228,14 @@ test("an unbound selection leaves claimable chunks for later", async () => {
   assert.equal(c.attempts, 0);
   assert.equal(fallback.calls, 0);
 
-  // A usable selection: the next tick's preparation proceeds normally.
+  // While shelved, a tick does not even probe the selection again.
+  const probes = state.modelBindingCalls;
+  assert.equal(await s.step(), "idle");
+  assert.equal(state.modelBindingCalls, probes, "shelved tick must not probe");
+
+  // A usable selection after the shelf: preparation proceeds normally.
   state.setModelBinding(PERSONA, { selection: "unset" });
+  await new Promise((r) => setTimeout(r, 60));
   assert.equal(await s.step(), "idle");
   for (let i = 0; i < 2_000 && s.memoryBusy; i++) {
     await new Promise((r) => setTimeout(r, 2));
