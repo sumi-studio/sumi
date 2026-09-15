@@ -206,8 +206,10 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 	// Intents are only the recorded selection at append. Reply attention,
 	// poll-vote reports, reminders and mentions added by an earlier edit all
 	// landed delivery rows without an intent — every secretary the message
-	// already reached through a supported path keeps its view current. A
-	// suppressed row was proven undeliverable here, so it earns no attempt.
+	// may have reached through a supported path stays a candidate. Whether a
+	// view was actually established is decided at delivery
+	// (authorizeAttentionSource): a still-pending row makes the change wait
+	// for its outcome, a suppressed one was proven undeliverable here.
 	rows, err = tx.Query(ctx, `
 		SELECT DISTINCT ON (personality_agent_id)
 		       personality_agent_id, COALESCE(payload->>'reason','')
@@ -672,6 +674,7 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	// Admit, so revocation either wins before admission or follows a lawful receipt.
 	sourceErr := scoped.authorizeAttentionSource(ctx, tx, item)
 	event := item.event
+	downgraded := false
 	if errors.Is(sourceErr, errReplyDesignationGone) {
 		// The frozen row keeps what was issued; the admitted input carries
 		// the designation the parent still justifies — none. The correction
@@ -680,6 +683,7 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		// retry after a lost receipt a deduplication, not a conflict.
 		event.ReplyToMessageID, event.ReplyRequired = "", false
 		sourceErr = nil
+		downgraded = true
 	}
 	if sourceErr != nil && !attentionSourceUnavailable(sourceErr) {
 		return "", sourceErr
@@ -698,6 +702,13 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	}
 	key := "attention:" + item.event.PersonalityAgentID + ":" + item.event.EventID
 	receipt, found, err := delivery.Lookup(ctx, key, event)
+	if errors.Is(err, errAttentionInputConflict) && downgraded {
+		// The stored input may carry the designation held at its own lawful
+		// admission — the parent dying afterwards does not unmake it. Both
+		// variants are this event's content; only a match on neither is a
+		// real conflict.
+		receipt, found, err = delivery.Lookup(ctx, key, item.event)
+	}
 	if err != nil {
 		if reason, terminal := terminalDeliveryReason(err); terminal {
 			return suppressAttention(ctx, tx, item.event.EventID, reason)
@@ -710,7 +721,11 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
 	}
 	if sourceErr != nil {
-		return suppressAttention(ctx, tx, item.event.EventID, "source_unavailable")
+		reason := "source_unavailable"
+		if errors.Is(sourceErr, errNoEstablishedView) {
+			reason = "no_prior_view"
+		}
+		return suppressAttention(ctx, tx, item.event.EventID, reason)
 	}
 	if !mayAdmit {
 		return "ready", tx.Commit(ctx)
@@ -731,6 +746,18 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 // event was issued. The update itself still stands on the recipient's
 // existing view, so it is delivered without the designation.
 var errReplyDesignationGone = errors.New("reply designation no longer stands")
+
+// errNoEstablishedView marks a change event with no basis: the recipient has
+// no reason selecting them now, is not the author, and no earlier delivery
+// for this message actually reached them. A correction reports against a
+// view that does not exist — there is nothing to update.
+var errNoEstablishedView = errors.New("recipient has no established view of the message")
+
+// errPriorDeliveryPending leaves the basis undecided: an earlier delivery row
+// for this recipient and message is still in flight. The change event retries
+// and resolves with that row's outcome — admitted establishes the view,
+// suppression retires it.
+var errPriorDeliveryPending = errors.New("prior delivery for this message is still pending")
 
 func commitAttentionReceipt(ctx context.Context, tx pgx.Tx, eventID string, receipt AgentAttentionReceipt) (string, error) {
 	if receipt.CommandID == "" || receipt.Seq == 0 || receipt.Seq > 9007199254740991 {
@@ -779,6 +806,41 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 	}
 	if message.Seq < access.VisibleFromSeq {
 		return ErrMessageNotFound
+	}
+	if item.event.Change != "" && item.event.Reason == "" && message.Author != s.Scope.Actor {
+		// A change event updates a view the recipient already holds; it is
+		// not a first contact. The basis is a delivery row that actually
+		// reached them — admitted, or its durable input when the receipt
+		// acknowledgement was lost — or the recipient's own engagement
+		// (a reply-later mark or poll vote proves the message was seen).
+		// An in-flight earlier delivery leaves the question undecided:
+		// retry until that row resolves rather than decide on it. A
+		// suppressed or absent original means there is no view to correct.
+		var established, pending bool
+		err := tx.QueryRow(ctx, `
+			SELECT
+			  EXISTS (SELECT 1 FROM agent_attention_deliveries d
+			          WHERE d.message_id=$1 AND d.personality_agent_id=$2 AND d.event_id<>$3
+			            AND (d.admitted_at IS NOT NULL
+			                 OR d.source_kind IN ('reply_later_due','messaging_poll_vote')
+			                 OR EXISTS (SELECT 1 FROM core_inputs ci
+			                            WHERE ci.input_id='messaging:'||d.event_id::text))),
+			  EXISTS (SELECT 1 FROM agent_attention_deliveries d
+			          WHERE d.message_id=$1 AND d.personality_agent_id=$2 AND d.event_id<>$3
+			            AND d.admitted_at IS NULL AND d.suppressed_at IS NULL
+			            AND d.available_at < $4
+			            AND d.source_kind IN ('messaging_message','messaging_mention'))`,
+			item.event.MessageID, item.event.PersonalityAgentID, item.event.EventID,
+			item.event.OccurredAt).Scan(&established, &pending)
+		if err != nil {
+			return err
+		}
+		if !established {
+			if pending {
+				return errPriorDeliveryPending
+			}
+			return errNoEstablishedView
+		}
 	}
 	if item.event.ReplyRequired ||
 		(item.event.Change == AttentionChangeEdited && item.event.ReplyToMessageID != "") {
@@ -839,6 +901,7 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 func attentionSourceUnavailable(err error) bool {
 	return errors.Is(err, ErrPlaceNotFound) || errors.Is(err, ErrMessageNotFound) ||
 		errors.Is(err, ErrMarkerNotFound) || errors.Is(err, ErrPollNotFound) || errors.Is(err, ErrMessageDeleted) ||
+		errors.Is(err, errNoEstablishedView) ||
 		errors.Is(err, applicationapps.ErrInstallationNotFound) ||
 		errors.Is(err, applicationapps.ErrAppDisabled) || errors.Is(err, applicationapps.ErrAuthorityEpochStale)
 }

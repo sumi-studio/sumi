@@ -221,7 +221,7 @@ func TestEditDowngradeReconcilesAfterLostReceipt(t *testing.T) {
 	drainAttention(t, ctx, w, delivery, 1, 0)
 	// The core appended the input; the delivery-row acknowledgement is lost.
 	if _, err := w.store.core.pool.Exec(ctx, `
-		UPDATE agent_attention_deliveries SET admitted_at=NULL, admitted_command_id=NULL,
+		UPDATE agent_attention_deliveries SET admitted_at=NULL, admitted_command_id=NULL, available_at=now(), next_attempt_at=now(),
 		admitted_command_seq=NULL WHERE message_id=$1 AND payload->>'change'='edited'`,
 		reply.MessageID); err != nil {
 		t.Fatalf("simulate lost receipt: %v", err)
@@ -465,4 +465,356 @@ func TestChangeDeliveryDesignationBoundaries(t *testing.T) {
 			t.Fatalf("edit to muted recipient = %s %+v", update.Attention, update.Payload)
 		}
 	})
+}
+
+// F1 closure: the edit event was admitted while the parent stood — with its
+// reply designation — but the delivery-row acknowledgement was lost. After the
+// parent is deleted, the retry derives the downgraded event, yet the stored
+// input is the lawful designated variant. Reconciliation must match either
+// lawful variant, commit the receipt, and never record a false input_conflict
+// on the delivery's own earlier admission.
+func TestDesignatedAdmitLostReceiptReconcilesAfterParentDelete(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	pa := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "セクレタリーの質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答します", ReplyTo: question.MessageID, ClientNonce: "f1-dl"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後の回答", reply.Revision); err != nil {
+		t.Fatalf("edit while parent live: %v", err)
+	}
+	// Parent still stands: the edit admits WITH its designation.
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	inputs := coreInputsFor(t, ctx, w, w.agent.ID)
+	if len(inputs) != 2 || inputs[1].Payload["reply_to_message_id"] != question.MessageID || inputs[1].Attention != "reply" {
+		t.Fatalf("designated edit admission = %+v", inputs)
+	}
+	// Lose the delivery-row acknowledgement; then the parent dies.
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE agent_attention_deliveries SET admitted_at=NULL, admitted_command_id=NULL, available_at=now(), next_attempt_at=now(),
+		admitted_command_seq=NULL WHERE message_id=$1 AND payload->>'change'='edited'`,
+		reply.MessageID); err != nil {
+		t.Fatalf("simulate lost receipt: %v", err)
+	}
+	if _, err := pa.DeleteMessage(ctx, ch.PlaceID, question.MessageID); err != nil {
+		t.Fatalf("delete parent after admission: %v", err)
+	}
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil || stats.Admitted != 1 || stats.Suppressed != 0 || stats.Retried != 0 {
+		t.Fatalf("reconcile drain = %+v %v, want admitted=1", stats, err)
+	}
+	// The receipt for the lawful earlier admission is committed — the row is
+	// admitted, not falsely suppressed.
+	var admitted, suppressed bool
+	var suppressionReason, commandID string
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT admitted_at IS NOT NULL, suppressed_at IS NOT NULL,
+		       COALESCE(suppression_reason,''), COALESCE(admitted_command_id::text,'')
+		FROM agent_attention_deliveries
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID).
+		Scan(&admitted, &suppressed, &suppressionReason, &commandID); err != nil {
+		t.Fatalf("receipt row: %v", err)
+	}
+	if !admitted || suppressed || suppressionReason != "" || commandID == "" {
+		t.Fatalf("receipt = admitted:%v suppressed:%v reason:%q command:%q — "+
+			"the lawful designated admission must reconcile, not conflict",
+			admitted, suppressed, suppressionReason, commandID)
+	}
+	// No duplicate admission: the input count is unchanged, and the delivered
+	// designated input is left as the secretary saw it.
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 2 {
+		t.Fatalf("inputs = %d, want the 2 already admitted", n)
+	}
+	// The recipient holds a live view of the corrected reply: a later edit and
+	// the tombstone must still reach it.
+	var rev int64
+	if err := w.store.core.pool.QueryRow(ctx, `SELECT revision FROM messages WHERE message_id=$1`, reply.MessageID).Scan(&rev); err != nil {
+		t.Fatalf("revision: %v", err)
+	}
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正その2", rev); err != nil {
+		t.Fatalf("second edit: %v", err)
+	}
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	if _, err := replier.DeleteMessage(ctx, ch.PlaceID, reply.MessageID); err != nil {
+		t.Fatalf("delete reply: %v", err)
+	}
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 4 {
+		t.Fatalf("final inputs = %d, want 4 (original, edit1, edit2, tombstone)", n)
+	}
+}
+
+// F1 boundary: the either-variant reconcile must not weaken the real
+// input_conflict guard — a stored input under this event id carrying foreign
+// content is still a terminal conflict, not an admission.
+func TestLostReceiptForeignContentStillConflicts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	pa := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "f1-fc"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正", reply.Revision); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	drainAttention(t, ctx, w, delivery, 1, 0)
+	// Lose the receipt, corrupt the stored input under this event id, then the
+	// parent dies — the retry must still see a foreign-content conflict.
+	var eventID string
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT event_id::text FROM agent_attention_deliveries
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID).Scan(&eventID); err != nil {
+		t.Fatalf("event id: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE agent_attention_deliveries SET admitted_at=NULL, admitted_command_id=NULL, available_at=now(), next_attempt_at=now(),
+		admitted_command_seq=NULL WHERE event_id=$1`, eventID); err != nil {
+		t.Fatalf("lose receipt: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE core_inputs SET payload='{"kind":"unrelated","text":"foreign"}'::jsonb
+		WHERE input_id=$1`, "messaging:"+eventID); err != nil {
+		t.Fatalf("corrupt input: %v", err)
+	}
+	if _, err := pa.DeleteMessage(ctx, ch.PlaceID, question.MessageID); err != nil {
+		t.Fatalf("delete parent: %v", err)
+	}
+	dumpDeliveries(t, ctx, w, reply.MessageID)
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil || stats.Admitted != 0 || stats.Suppressed != 1 || stats.Retried != 0 {
+		t.Fatalf("conflict drain = %+v %v, want suppressed=1", stats, err)
+	}
+	var reason string
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT suppression_reason FROM agent_attention_deliveries WHERE event_id=$1`,
+		eventID).Scan(&reason); err != nil {
+		t.Fatalf("suppression: %v", err)
+	}
+	if reason != "input_conflict" {
+		t.Fatalf("suppression_reason = %q, want input_conflict — foreign content must stay terminal", reason)
+	}
+}
+
+// F2 closure: a pending original delivery row alone does not establish that
+// the recipient saw the message. The change event waits on the in-flight
+// original rather than deciding on a pending row, and resolves with its
+// outcome — suppressed original retires the change with no_prior_view, an
+// admitted one delivers the correction.
+func TestChangeDeliveryWaitsOnPendingOriginal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "f2-wait"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後", reply.Revision); err != nil {
+		t.Fatalf("edit before first drain: %v", err)
+	}
+	// Push the original's attempt into the future so the drain selects only
+	// the edit: the edit must wait — retry, not admit, not suppress. The edit
+	// row's own schedule is pinned against insert/drain clock skew.
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE agent_attention_deliveries SET next_attempt_at=now()+interval '1 hour'
+		WHERE message_id=$1 AND payload->>'change' IS NULL`, reply.MessageID); err != nil {
+		t.Fatalf("defer original: %v", err)
+	}
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE agent_attention_deliveries SET available_at=now(), next_attempt_at=now()
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID); err != nil {
+		t.Fatalf("schedule edit: %v", err)
+	}
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if stats.Retried != 1 || stats.Admitted != 0 || stats.Suppressed != 0 {
+		t.Fatalf("wait drain = %+v err=%v, want retried=1 only", stats, err)
+	}
+	var editPending bool
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT admitted_at IS NULL AND suppressed_at IS NULL FROM agent_attention_deliveries
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID).Scan(&editPending); err != nil {
+		t.Fatalf("edit row: %v", err)
+	}
+	if !editPending {
+		t.Fatal("edit row must stay pending while the original is undecided")
+	}
+	// The original resolves — the change follows it as an ordinary update.
+	if _, err := w.store.core.pool.Exec(ctx, `
+		UPDATE agent_attention_deliveries SET next_attempt_at=now() WHERE message_id=$1`,
+		reply.MessageID); err != nil {
+		t.Fatalf("undefer: %v", err)
+	}
+	stats, err = w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil || stats.Admitted != 2 || stats.Suppressed != 0 || stats.Retried != 0 {
+		t.Fatalf("resolve drain = %+v %v, want admitted=2", stats, err)
+	}
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 2 {
+		t.Fatalf("inputs = %d, want original + correction", n)
+	}
+}
+
+// F2 closure: the same drain resolves the original first — a reply-only
+// recipient whose original admits sees the correction as an ordinary follow-up,
+// no waiting needed.
+func TestChangeFollowsSameDrainAdmission(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "セクレタリーへの質問2")
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "f2-same"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後", reply.Revision); err != nil {
+		t.Fatalf("edit before drain: %v", err)
+	}
+	// One drain: the earlier original admits first, establishing the view the
+	// correction then updates — order inside the batch makes the basis real.
+	drainAttention(t, ctx, w, delivery, 2, 0)
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 2 {
+		t.Fatalf("inputs = %d, want original + correction", n)
+	}
+}
+
+// F2 closure: the original is suppressed before any admission and the edit
+// names no current reason — there is no view to correct, so the change
+// suppresses with no_prior_view and the secretary hears nothing.
+func TestChangeToNeverViewedRecipientGetsNothing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	pa := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "f2-noview"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	// Edit lands while the original is still pending; then the parent dies.
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後", reply.Revision); err != nil {
+		t.Fatalf("edit before first drain: %v", err)
+	}
+	if _, err := pa.DeleteMessage(ctx, ch.PlaceID, question.MessageID); err != nil {
+		t.Fatalf("delete parent: %v", err)
+	}
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil || stats.Admitted != 0 || stats.Suppressed != 2 || stats.Retried != 0 {
+		t.Fatalf("drain = %+v %v, want suppressed=2", stats, err)
+	}
+	var reason string
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT suppression_reason FROM agent_attention_deliveries
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID).Scan(&reason); err != nil {
+		t.Fatalf("edit suppression: %v", err)
+	}
+	if reason != "no_prior_view" {
+		t.Fatalf("edit suppression_reason = %q, want no_prior_view", reason)
+	}
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 0 {
+		t.Fatalf("recipient with no established view received %d inputs, want 0", n)
+	}
+}
+
+// F2 boundary: once the original is suppressed, a later edit issues no event
+// at all for that recipient — the suppressed row earns no candidate.
+func TestEditAfterSuppressedOriginalIssuesNothing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newChangeDeliveryWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	delivery, _ := newSharedIntakeDelivery(t, w)
+	if _, err := w.store.SetNotificationSetting(ctx, w.agent, NotifyLevelMentions, nil, nil); err != nil {
+		t.Fatalf("level: %v", err)
+	}
+	pa := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.agent)
+	question := w.send(t, ctx, ch.PlaceID, w.agent, "質問")
+	replier := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanB)
+	reply, _, err := replier.AppendMessage(ctx, AppendInput{PlaceID: ch.PlaceID, Content: "回答", ReplyTo: question.MessageID, ClientNonce: "f2-post"})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if _, err := pa.DeleteMessage(ctx, ch.PlaceID, question.MessageID); err != nil {
+		t.Fatalf("delete parent: %v", err)
+	}
+	// The pending original suppresses — no view was ever established.
+	drainAttention(t, ctx, w, delivery, 0, 1)
+	if _, err := replier.EditMessage(ctx, ch.PlaceID, reply.MessageID, "訂正後", reply.Revision); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	var rows int
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_attention_deliveries
+		WHERE message_id=$1 AND payload->>'change'='edited'`, reply.MessageID).Scan(&rows); err != nil {
+		t.Fatalf("edit rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("edit issued %d delivery rows to a recipient who never saw the message", rows)
+	}
+	drainAttention(t, ctx, w, delivery, 0, 0)
+	if n := len(coreInputsFor(t, ctx, w, w.agent.ID)); n != 0 {
+		t.Fatalf("inputs = %d, want 0", n)
+	}
+}
+
+// dumpDeliveries logs every delivery row for one message so a failing run
+// still records the observed suppression/admission state.
+func dumpDeliveries(t *testing.T, ctx context.Context, w world, messageID string) {
+	t.Helper()
+	rows, err := w.store.core.pool.Query(ctx, `
+		SELECT event_id, COALESCE(payload->>'change',''), admitted_at IS NOT NULL,
+		       suppressed_at IS NOT NULL, COALESCE(suppression_reason,''),
+		       COALESCE(payload->>'reply_to_message_id',''),
+		       EXISTS (SELECT 1 FROM core_inputs ci WHERE ci.input_id='messaging:'||event_id::text)
+		FROM agent_attention_deliveries
+		WHERE message_id=$1 ORDER BY available_at, event_id`, messageID)
+	if err != nil {
+		t.Fatalf("delivery rows: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, change, reason, replyTo string
+		var admitted, suppressed, inputExists bool
+		if err := rows.Scan(&id, &change, &admitted, &suppressed, &reason, &replyTo, &inputExists); err != nil {
+			t.Fatalf("scan delivery row: %v", err)
+		}
+		t.Logf("delivery %s change=%q admitted=%v suppressed=%v reason=%q reply_to=%q input=%v",
+			id, change, admitted, suppressed, reason, replyTo, inputExists)
+	}
 }
