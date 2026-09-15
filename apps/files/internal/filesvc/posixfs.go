@@ -1187,7 +1187,7 @@ func (v *rootView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 }
 
 func (v *rootView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
-	veto func() (bool, error)) error {
+	veto func(captured FileInfo) (bool, error)) error {
 	sfd, err := scopeDirFrom(v.rfd, scope, false)
 	if err != nil {
 		return err
@@ -1244,10 +1244,11 @@ func (v *rootView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
 		// The object is captured and immobilized at the sealed name —
 		// nothing can write into it and a move-out leaves it empty for
 		// the unlink below. The veto is evaluated at this effect-time
-		// point so a check consulting durable state (e.g. "does a row
-		// still record this object?") cannot be invalidated by a delayed
-		// syscall that was decided before the state changed.
-		keep, verr := veto()
+		// point, on the CAPTURED object's identity (a hash-only match can
+		// capture a different inode than the caller verified), so a check
+		// consulting durable state cannot be invalidated by a delayed
+		// syscall decided before the state changed.
+		keep, verr := veto(st)
 		if verr != nil {
 			return verr
 		}

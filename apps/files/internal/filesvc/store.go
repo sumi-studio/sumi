@@ -72,7 +72,7 @@ type Store struct {
 	closeOnce sync.Once
 
 	scopeMu          sync.Map                                 // scope string -> *sync.Mutex
-	inflight         sync.Map                                 // intent id -> struct{} — fs goroutines executing in this process
+	inflight         sync.Map                                 // intent id -> scope — fs goroutines (settlers) executing in this process
 	statFn           StatFn                                   // set by the service once the fs root exists
 	hashFn           HashFn                                   // content probe for expected-outcome verification
 	fsCheck          func() error                             // when set, verdict that the fs root is trustworthy (canonical mount live)
@@ -124,15 +124,17 @@ type ReconView interface {
 	RemoveStaged(scope, path, wantFP3, wantSHA string) error
 	// RemoveStagedVeto is RemoveStaged with a veto evaluated after the
 	// object is captured at the sealed name — the last moment a check
-	// can still bind to the object about to be unlinked. While captured,
-	// the object cannot be observed at any public path, so a veto
-	// consulting durable state (the version rows) answers at effect
-	// time: a stale decision made before the state changed cannot
-	// outlive a row that now records the object. keep=true parks the
+	// can still bind to the object about to be unlinked. The veto
+	// receives the CAPTURED object's FileInfo (a hash-only match can
+	// capture a different inode than the caller statted). While
+	// captured, the object cannot be observed at any public path: a row
+	// can still come to record it only by committing an observation made
+	// before the capture, which the veto must exclude (Store's
+	// recordersActive) before consulting the version rows. keep=true parks the
 	// object at the sealed name (enumerable for the next pass) and
 	// reports ErrConflict; a veto error does the same with that error.
 	// A nil veto behaves exactly as RemoveStaged.
-	RemoveStagedVeto(scope, path, wantFP3, wantSHA string, veto func() (bool, error)) error
+	RemoveStagedVeto(scope, path, wantFP3, wantSHA string, veto func(captured FileInfo) (bool, error)) error
 	// ListStaged returns base names in dir (a path beneath the scope root)
 	// beginning with prefix — used to find crash-orphaned quarantine
 	// objects left by a reconciler that died mid-delete.
@@ -875,7 +877,7 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 	// can ever observe a committed own-intent that is not registered as
 	// in-flight and misjudge it as abandoned (F-RA-4/f122). If commit
 	// fails the intent never existed, so the mark is removed.
-	s.inflight.Store(it.id, struct{}{})
+	s.inflight.Store(it.id, scope)
 	if err := tx.Commit(ctx); err != nil {
 		s.inflight.Delete(it.id)
 		return intent{}, err
@@ -893,6 +895,11 @@ func divergedFP(expect string) string { return "diverged:" + expect }
 // intent row; the apply is a no-op duplicate.
 var errIntentSettled = errors.New("intent already settled")
 
+// errNotJournaled: a diverged apply found nothing new to record — the row
+// already carries the observation or a newer version superseded it. The
+// intent is resolved (tombstoned); no row or event was written.
+var errNotJournaled = errors.New("diverged observation already recorded or superseded")
+
 // apply records the version-row effects + event and clears the intent, in
 // one tx. It uses only values settled at declare/fs time — no re-checks —
 // so it is safe to re-run from the reconciler.
@@ -902,7 +909,10 @@ var errIntentSettled = errors.New("intent already settled")
 // stale selected intent can never re-delete or re-move rows a first apply
 // already produced (f79/B-F1). The store_meta owner check fences a zombie
 // process whose lock session died: its apply aborts and the intent stays
-// for the live owner to settle.
+// for the live owner to settle. The owner row is held FOR SHARE until
+// commit, so bindRoot's UPDATE waits for every in-flight row writer: no
+// tx that read the previous owner can commit after a new owner binds
+// (the ordering recordersActive relies on).
 // contentSHA is the content hash of the minted state when known (writes:
 // the bytes written; reconciled writes: the observed hash; proven file
 // renames: the verified source hash). It feeds the declare-time evidence
@@ -910,7 +920,13 @@ var errIntentSettled = errors.New("intent already settled")
 // keepIntent retains the intent as a tombstone instead of deleting it —
 // used when the reconciler recorded a DIVERGED outcome: the observed
 // content is foreign, but the declared effect may still land later. The
-// row carries the only evidence that can re-attribute it.
+// row carries the only evidence that can re-attribute it. Such an apply
+// journals an observation, not an effect this op performed: it writes
+// the event only when the version row actually changes (otherwise the
+// row already carries the observation or a newer version superseded it,
+// and errNotJournaled is returned after resolving the intent), and a
+// tombstone keeps its original resolved_at so re-judgment never re-arms
+// the path's pending_settlement window.
 func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, keepIntent bool) error {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
@@ -922,7 +938,7 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 
 	var owner string
 	if err := tx.QueryRow(ctx,
-		`SELECT owner FROM store_meta WHERE id`).Scan(&owner); err != nil {
+		`SELECT owner FROM store_meta WHERE id FOR SHARE`).Scan(&owner); err != nil {
 		return err
 	}
 	if owner != s.owner {
@@ -930,7 +946,7 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 	}
 	if keepIntent {
 		tag, kerr := tx.Exec(ctx,
-			`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error='' WHERE id=$1`, it.id)
+			`UPDATE file_op SET resolved_at=COALESCE(resolved_at, now()), stalled_at=NULL, last_error='' WHERE id=$1`, it.id)
 		if kerr != nil {
 			return kerr
 		}
@@ -949,6 +965,7 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 		}
 	}
 
+	rowWrites := int64(1)
 	switch it.op {
 	case "remove":
 		// Version-guarded like rename: a row committed after this intent
@@ -1001,16 +1018,32 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 		// write already applied a newer version (e.g. this intent sat
 		// pending while a subsequent op committed), the existing row
 		// reflects newer disk state and wins.
-		if _, err := tx.Exec(ctx,
+		tag, uerr := tx.Exec(ctx,
 			`INSERT INTO file_version (scope, path, version, fp, updated, content_sha)
 			 VALUES ($1,$2,$3,$4,now(),$5)
 			 ON CONFLICT (scope,path) DO UPDATE
 			 SET version=EXCLUDED.version, fp=EXCLUDED.fp, updated=now(),
 			     content_sha=EXCLUDED.content_sha
 			 WHERE file_version.version < EXCLUDED.version`,
-			it.scope, it.path, it.version, info.Fingerprint, contentSHA); err != nil {
+			it.scope, it.path, it.version, info.Fingerprint, contentSHA)
+		if uerr != nil {
+			return uerr
+		}
+		rowWrites = tag.RowsAffected()
+	}
+	if rowWrites == 0 {
+		// The row already carries this state or a newer version
+		// superseded it (a tombstone re-judged after a successor wrote
+		// the same bytes, or a repeated diverged observation). An event
+		// now would announce a version the row does not hold and forge
+		// commit evidence for intentApplied — resolve without one.
+		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
+		if keepIntent {
+			return errNotJournaled
+		}
+		return nil
 	}
 	if it.op == "rename" {
 		_, err = tx.Exec(ctx,
@@ -1034,11 +1067,12 @@ var errForeignOwner = errors.New("store owned by another instance")
 // checkOwnerTx verifies inside the tx that store_meta still names this
 // instance. Every destructive settlement path is fenced by it — a deposed
 // process must never delete intents or version rows a live successor
-// would roll forward (f103/B-F-B).
+// would roll forward (f103/B-F-B). Like apply, it holds the owner row FOR
+// SHARE until the tx ends, so a rebind waits for the fenced writer.
 func (s *Store) checkOwnerTx(ctx context.Context, tx pgx.Tx) error {
 	var owner string
 	if err := tx.QueryRow(ctx,
-		`SELECT owner FROM store_meta WHERE id`).Scan(&owner); err != nil {
+		`SELECT owner FROM store_meta WHERE id FOR SHARE`).Scan(&owner); err != nil {
 		return err
 	}
 	if owner != s.owner {
@@ -1221,13 +1255,16 @@ func (s *Store) recordedAt(ctx context.Context, scope, st3 string) (string, bool
 	return home, true, nil
 }
 
-// intentApplied reports whether this intent's own apply journaled its
-// file_event row — the only positive proof that its filesystem effect
-// committed AND was recorded (apply writes the event in the same
-// transaction as the version-row effect). A matching staged fingerprint
-// cannot prove commit: a delayed drain or swap can park the recorded
-// object into the intent's namespace without its effect ever landing
-// (F-3). Rename's event is journaled at the destination path.
+// intentApplied reports whether this intent's effect committed and was
+// recorded: its apply journaled the file_event row AND removed the intent
+// row, in one transaction. The event alone is not that proof — a diverged
+// roll-forward journals an event while retaining the intent as a
+// tombstone, and it records an observation of foreign content, not an
+// effect this op performed. Nor is a matching staged fingerprint: a
+// delayed drain or swap can park an object into the intent's namespace
+// without its effect ever landing (F-3). Both facts are read in one
+// statement, from one snapshot. Rename's event is journaled at the
+// destination path.
 func (s *Store) intentApplied(ctx context.Context, it intent) (bool, error) {
 	if s.pool == nil {
 		return false, nil // test-only Store without a pool: no commit proof
@@ -1241,12 +1278,87 @@ func (s *Store) intentApplied(ctx context.Context, it intent) (bool, error) {
 	var n int
 	err := s.pool.QueryRow(dctx,
 		`SELECT 1 FROM file_event
-		  WHERE scope=$1 AND path=$2 AND op=$3 AND version=$4 LIMIT 1`,
-		it.scope, evPath, it.op, it.version).Scan(&n)
+		  WHERE scope=$1 AND path=$2 AND op=$3 AND version=$4
+		    AND NOT EXISTS (SELECT 1 FROM file_op WHERE id=$5)
+		  LIMIT 1`,
+		it.scope, evPath, it.op, it.version, it.id).Scan(&n)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// discardVetoHook is a test-only seam between the discard veto's
+// recordersActive read and its row read — the position an apply
+// committing between the two reads lands in. Production never sets it.
+var discardVetoHook func()
+
+// recordersActive reports whether a row writer outside the calling
+// reconcile pass may still commit a version row for an object it observed
+// at a public path before this call. Every row writer (apply,
+// relocateRows) is owner-fenced inside its tx and holds the store_meta
+// row FOR SHARE until commit, so bindRoot waits for in-flight writers:
+//
+//   - store_meta names another instance: a successor may record objects
+//     this pass cannot see — true.
+//   - store_meta names this instance: every other instance's row write
+//     committed before this read, and any later owner binds after it and
+//     observes the filesystem only after it. What remains is this
+//     instance's own writers. Reconcile passes hold the scope mutex the
+//     caller holds, but a settler goroutine outlives its caller's
+//     opTimeout and applies without it (f82) — true while a settler of
+//     this scope is still running. Its inflight mark is removed only
+//     after its apply returns, so a settler absent here has committed
+//     already or never will.
+//
+// Callers read this BEFORE the row set, so an apply committing between
+// the two reads is seen by one of them. This holds for a pass that
+// entered before its store was deposed: the check is a DB fact, not the
+// deposed flag. Objects move only within a scope, so other scopes'
+// settlers are irrelevant. A DB error reports (true, err).
+func (s *Store) recordersActive(ctx context.Context, scope string) (bool, error) {
+	if s.pool == nil {
+		return false, nil // test-only Store without a pool: no row writers exist
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var owner string
+	if err := s.pool.QueryRow(dctx,
+		`SELECT owner FROM store_meta WHERE id`).Scan(&owner); err != nil {
+		return true, err
+	}
+	if owner != s.owner {
+		return true, nil
+	}
+	busy := false
+	s.inflight.Range(func(_, v any) bool {
+		if sc, ok := v.(string); !ok || sc == scope {
+			busy = true
+			return false
+		}
+		return true
+	})
+	return busy, nil
+}
+
+// recordedFP returns the fingerprint the path's version row records;
+// found=false when no row exists. A non-nil error means unverifiable.
+func (s *Store) recordedFP(ctx context.Context, scope, path string) (fp string, found bool, err error) {
+	if s.pool == nil {
+		return "", false, nil
+	}
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	err = s.pool.QueryRow(dctx,
+		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, path).Scan(&fp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return fp, true, nil
 }
 
 // settleDelete judges whether the staged object at rel may be
@@ -1256,16 +1368,18 @@ func (s *Store) intentApplied(ctx context.Context, it intent) (bool, error) {
 // intent's own staged bytes (wantSHA = its expected hash, safe to drop
 // whenever unrecorded, needCommit=false).
 //
-// The rule: never delete an object that a version row still records
-// unless that object is still present at its recorded home (a surplus
-// link then loses nothing); a displaced-object delete additionally
-// requires the intent's own journaled apply event. Both checks are
-// re-evaluated after the object is captured at a sealed name, where it
-// is immobilized and invisible to apply — so the checks bind to effect
-// time, and a stale decision from a retired pass cannot outlive a row
-// re-registration. DB uncertainty and absent commit evidence fail
-// closed: the object stays parked at the sealed name, enumerable for
-// the next pass.
+// The rule: never delete an object that a version row records — or may
+// still come to record — unless that object is still present at its
+// recorded home (a surplus link then loses nothing); a displaced-object
+// delete additionally requires intentApplied. The checks that authorize
+// the unlink run in the veto, after the object is captured at a sealed
+// name. From then on no public path shows it, so the only rows that can
+// still come to record it are commits of observations made before the
+// capture; recordersActive excludes those writers and is read before the
+// row set. The veto judges the CAPTURED object's identity — a hash-only
+// match need not be the inode this pass statted. DB uncertainty, active
+// recorders and absent commit evidence fail closed: the object stays
+// parked at the sealed name, enumerable for the next pass.
 func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 	rel string, st FileInfo, tombstoned bool, wantFP3, wantSHA string, needCommit bool) {
 	st3 := fp3(st.Fingerprint)
@@ -1281,34 +1395,42 @@ func (s *Store) settleDelete(ctx context.Context, it intent, view ReconView,
 			return
 		}
 	}
-	// Unrecorded (or still present at its recorded home). The veto below
-	// runs after the sealed capture, so a row written while the object
-	// was still public is caught at effect time rather than here.
-	err := view.RemoveStagedVeto(it.scope, rel, wantFP3, wantSHA, func() (bool, error) {
-		home, found, derr := s.recordedAt(ctx, it.scope, st3)
-		if derr != nil {
-			return true, derr
-		}
-		if found {
-			// Deletion is safe only when the recorded home still holds
-			// the object — the staged name is then a surplus link (e.g.
-			// an exclusive-create linkat leftover). Otherwise the object
-			// is displaced recorded content: preserve it for the next
-			// pass's restore, which re-checks at decision time.
-			dst, serr := view.Stat(it.scope, home)
-			if serr != nil || fp3(dst.Fingerprint) != st3 {
-				return true, nil
+	// Unrecorded (or still present at its recorded home) as of this
+	// pass's stat — not yet authority to delete.
+	err := view.RemoveStagedVeto(it.scope, rel, wantFP3, wantSHA,
+		func(captured FileInfo) (bool, error) {
+			busy, derr := s.recordersActive(ctx, it.scope)
+			if discardVetoHook != nil {
+				discardVetoHook()
 			}
-		}
-		if !needCommit {
+			if derr != nil || busy {
+				return true, derr
+			}
+			cap3 := fp3(captured.Fingerprint)
+			home, found, derr := s.recordedAt(ctx, it.scope, cap3)
+			if derr != nil {
+				return true, derr
+			}
+			if found {
+				// Deletion is safe only when the recorded home still
+				// holds the object — the staged name is then a surplus
+				// link (e.g. an exclusive-create linkat leftover).
+				// Otherwise it is displaced recorded content: preserve
+				// it for the next pass's restore.
+				dst, serr := view.Stat(it.scope, home)
+				if serr != nil || fp3(dst.Fingerprint) != cap3 {
+					return true, nil
+				}
+			}
+			if !needCommit {
+				return false, nil
+			}
+			ok, derr := s.intentApplied(ctx, it)
+			if derr != nil || !ok {
+				return true, derr
+			}
 			return false, nil
-		}
-		ok, derr := s.intentApplied(ctx, it)
-		if derr != nil || !ok {
-			return true, derr
-		}
-		return false, nil
-	})
+		})
 	_ = err // mismatch or veto leaves the object parked at the sealed name
 }
 
@@ -1361,8 +1483,8 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 			// fingerprint match alone cannot prove the exchange
 			// committed: a delayed drain or swap can park this recorded
 			// object here without the effect ever landing (F-3). Delete
-			// only with row-level proof it is unrecorded AND the intent's
-			// own apply event journaled.
+			// only with row-level proof it is unrecorded AND proof the
+			// intent's own apply committed (intentApplied).
 			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
@@ -1375,6 +1497,24 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		// unsealed base slot, then move the sealed object onto the name.
 		if it.expectSHA != "" && it.expectSHA != "dir" {
 			if h, herr := view.Hash(it.scope, it.path); herr == nil && h == it.expectSHA {
+				// The path's content hashes to our expected bytes, but
+				// the object need not be ours: a successor may have
+				// written the same bytes there (174). Swapping would move
+				// that object out of its public name toward a discard.
+				// Leave the name alone — the slot object stays parked —
+				// while another writer may still be committing a row for
+				// it, or when a row already records the live object.
+				if busy, derr := s.recordersActive(ctx, it.scope); derr != nil || busy {
+					return
+				}
+				if rowFP, found, rerr := s.recordedFP(ctx, it.scope, it.path); rerr != nil {
+					return
+				} else if found {
+					if live, lerr := view.Stat(it.scope, it.path); lerr != nil ||
+						fp3(rowFP) == fp3(live.Fingerprint) {
+						return
+					}
+				}
 				if _, base := splitRel(rel); isSealedName(base) {
 					s.drainSealed(view, it, rel, it.path)
 					return
@@ -1400,7 +1540,7 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 			// The object the remove was allowed to delete — but a
 			// fingerprint match alone cannot prove the removal
 			// committed (F-3): require row-level proof it is unrecorded
-			// and the intent's own apply event journaled.
+			// and proof the intent's own apply committed (intentApplied).
 			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
@@ -1409,8 +1549,8 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 		if it.dstFP != "" && st3 == fp3(it.dstFP) {
 			// The displaced destination object — deleting it was part
 			// of the rename only if the rename committed (F-3): require
-			// row-level proof it is unrecorded and the intent's own
-			// apply event journaled.
+			// row-level proof it is unrecorded and proof the intent's
+			// own apply committed (intentApplied).
 			s.settleDelete(ctx, it, view, rel, st, tombstoned, st3, "", true)
 			return
 		}
@@ -1468,6 +1608,12 @@ func (s *Store) restoreStaged(ctx context.Context, it intent, view ReconView, re
 		// sealed rel cannot receive the displaced squatter, so drain
 		// through the unsealed base slot instead.
 		if rowMatch && fp3(dst.Fingerprint) != fp3(rowFP) {
+			// The occupant may be a live writer's fresh object whose row
+			// has not committed yet; moving it now would only churn it
+			// into this namespace. Retry once those writers settle.
+			if busy, berr := s.recordersActive(ctx, it.scope); berr != nil || busy {
+				return
+			}
 			if _, base := splitRel(rel); isSealedName(base) {
 				s.drainSealed(view, it, rel, destPath)
 			} else {
@@ -1682,7 +1828,7 @@ func (v funcView) RemoveStaged(scope, path, wantFP3, wantSHA string) error {
 	return ErrUnavailable
 }
 func (v funcView) RemoveStagedVeto(scope, path, wantFP3, wantSHA string,
-	veto func() (bool, error)) error {
+	veto func(captured FileInfo) (bool, error)) error {
 	return ErrUnavailable
 }
 func (v funcView) ListStaged(scope, dir, prefix string) ([]string, error) {
@@ -1984,46 +2130,40 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 				// and overwrite the foreign content, and the intent is
 				// the only evidence that can re-attribute them.
 				info.Fingerprint = divergedFP(it.expectSHA)
-				if tombstoned && s.fpRecorded(ctx, it.scope, it.path, info.Fingerprint) {
-					return false // divergence already journaled; stay tombstoned
-				}
-				log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)
-				return s.applyKeep(ctx, it, info, contentSHA)
+				return s.applyKeep(ctx, it, info, contentSHA, tombstoned)
 			}
 		}
 		if err := s.apply(ctx, it, info, contentSHA, false); err != nil {
 			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 			return false
 		}
+		// The apply journaled this intent's commit and removed its row in
+		// one tx — the evidence intentApplied requires. Finish discarding
+		// what the verified effect left behind now: with the row gone, no
+		// later pass enumerates this intent's slot.
+		s.settleStaged(ctx, it, view, true)
 		return true
 	}
 }
 
 // applyKeep records the observed (diverged) outcome AND retains the
 // intent as a tombstone — the declared write may still be in flight.
-func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, contentSHA string) bool {
-	if err := s.apply(ctx, it, info, contentSHA, true); err != nil {
-		if !errors.Is(err, errIntentSettled) {
-			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
-		}
-		return false
+// Re-judging a tombstone whose observation is already recorded, or whose
+// path a newer version superseded, writes nothing (apply's in-tx row
+// guard): no stale event, no resolved_at refresh. Returns whether this
+// call settled anything.
+func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, contentSHA string, tombstoned bool) bool {
+	err := s.apply(ctx, it, info, contentSHA, true)
+	switch {
+	case err == nil:
+		log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)
+		return true
+	case errors.Is(err, errNotJournaled):
+		return !tombstoned // a pending intent was resolved without a new record
+	case !errors.Is(err, errIntentSettled):
+		log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 	}
-	return true
-}
-
-// fpRecorded reports whether the version row already carries fp — used to
-// keep a diverged tombstone idempotent: the same foreign content is
-// recorded once, never re-minted every scan.
-func (s *Store) fpRecorded(ctx context.Context, scope, path, fp string) bool {
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	var cur string
-	if err := s.pool.QueryRow(dctx,
-		`SELECT fp FROM file_version WHERE scope=$1 AND path=$2`,
-		scope, path).Scan(&cur); err != nil {
-		return false
-	}
-	return cur == fp
+	return false
 }
 
 // relocateRows re-keys version rows from a rename intent's source subtree

@@ -2067,10 +2067,12 @@ func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
 }
 
 // An uncommitted intent whose declared object is no longer recorded
-// anywhere still cannot delete it: without the apply event the object
-// is unattributable foreign content — preserved parked. Once the
-// intent's commit IS journaled (a roll-forward applied it), the next
-// pass completes the authorized discard.
+// anywhere still cannot delete it: without commit proof the object is
+// unattributable foreign content — preserved parked. An event while the
+// intent row is retained is NOT that proof (a diverged roll-forward
+// journals exactly that shape). Once the intent's own effect is
+// observed and its roll-forward apply commits (event + intent row
+// removed in one tx), the same pass completes the authorized discard.
 func TestPGReconcileUncommittedDstFPPreserved(t *testing.T) {
 	dsn := pgDSN(t)
 	resetTables(t, dsn)
@@ -2110,12 +2112,27 @@ func TestPGReconcileUncommittedDstFPPreserved(t *testing.T) {
 	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" {
 		t.Fatal("unrecorded object deleted without commit evidence")
 	}
-	// When commit evidence later appears (a roll-forward applied it),
-	// the discard completes.
+	// An event alongside the retained (tombstoned) intent row proves
+	// nothing about commit — still preserved.
 	insertEvent(t, s, "ws", "a.txt", "", "write", 73)
+	s.lastTombScan.Store(0)
 	s.Reconcile(ctx)
+	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where == "" {
+		t.Fatal("object deleted on an event whose intent row was retained")
+	}
+	// The intent's effect lands late: its bytes appear at the path, the
+	// tombstone rolls forward (apply removes the intent row with its
+	// event), and the authorized discard completes in the same pass.
+	if err := os.WriteFile(dir+"/ws/a.txt", []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.lastTombScan.Store(0)
+	s.Reconcile(ctx)
+	if n := intentCount(t, s); n != 0 {
+		t.Fatalf("roll-forward did not settle the intent: %d rows", n)
+	}
 	if where := scanDirFor(t, dir, "ws", []byte("unrecorded")); where != "" {
-		t.Fatalf("object still parked at %q after commit evidence landed", where)
+		t.Fatalf("object still parked at %q after the intent's apply committed", where)
 	}
 }
 

@@ -126,13 +126,22 @@ info:
     a matching fingerprint alone is not commit evidence, because a
     delayed drain or swap can park the recorded object into the intent's
     namespace without its effect ever landing. The reconciler deletes a
-    displaced object only when no file_version row still records its
+    displaced object only when no file_version row records its
     fingerprint — recorded content absent from its recorded home is
-    restored instead — and the intent's own apply event is journaled in
-    file_event (proof this intent committed; tombstoned or uncommitted
-    intents preserve the object). Both checks are re-evaluated while
-    the object is captured at a sealed name, and database-read failure
-    always fails closed toward preservation.
+    restored instead — and the intent's own roll-forward committed: its
+    file_event row exists AND its intent row is gone, both written by
+    one transaction. An event alone is not commit proof (a diverged
+    outcome journals an event while the intent is kept as a tombstone),
+    so tombstoned or uncommitted intents preserve the object. These
+    checks run while the object is captured at a sealed name, and only
+    after excluding writers that could still record it from an earlier
+    public observation: deletion waits while another instance owns the
+    store or while an operation of this instance in the same scope is
+    still settling (a request that timed out keeps settling in the
+    background). A diverged outcome is journaled once; re-judging a
+    tombstone that is already recorded or superseded by a newer version
+    writes no event and does not extend the pending_settlement window.
+    Database-read failure always fails closed toward preservation.
     Every delete goes through the same discipline:
     the object is captured to a per-call quarantine name
     (.filesv-op-<id>-q-<random>), re-verified there, and unlinked only
