@@ -177,6 +177,14 @@ func (s *ScopedStore) appendScopedInTx(ctx context.Context, tx pgx.Tx, in Append
 			return Message{}, false, ErrMessageNotFound
 		}
 	}
+	// Admission bounds new durable mutations only. The nonce replay above
+	// already returned the committed receipt, so a retried send reaches it
+	// even while the new-operation bucket is empty; a refused send holds no
+	// token, allocates no seq, and writes no row — this transaction rolls
+	// back.
+	if err := s.Store.admission.admitMutation(s.Scope); err != nil {
+		return Message{}, false, err
+	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
 		UPDATE places SET last_seq = last_seq + 1
