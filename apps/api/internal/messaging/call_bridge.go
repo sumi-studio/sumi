@@ -525,31 +525,34 @@ func (c *CallService) RevokePlaceCallSessions(ctx context.Context, personaID, pl
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var session CallSession
 			if err := rows.Scan(callSessionScan(&session)...); err != nil {
+				rows.Close()
 				return err
 			}
 			revoked = append(revoked, session)
 		}
-		return rows.Err()
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// The disposition change commits with the revocation: a crash or
+		// error here rolls the session rows back too, so a revoked session
+		// can never leave intended/dequeued/emitting speech non-terminal
+		// forever. (Drain the RETURNING cursor before issuing more SQL on
+		// this tx.)
+		for _, session := range revoked {
+			if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "session_revoked"); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 	for _, session := range revoked {
-		tx, err := c.Server.Store.pool.Begin(ctx)
-		if err != nil {
-			continue
-		}
-		if err := sweepCallUtterancesInTx(ctx, tx, session.SessionID, "session_revoked"); err != nil {
-			_ = tx.Rollback(context.Background())
-			continue
-		}
-		if err := tx.Commit(ctx); err != nil {
-			continue
-		}
 		c.notifyCallEnded(ctx, session)
 	}
 	return nil

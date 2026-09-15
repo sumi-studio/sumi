@@ -93,6 +93,21 @@ func applyCallEffect(t *testing.T, ctx context.Context, pool *pgxpool.Pool, effe
 	return result
 }
 
+// applyCallEffectErr runs the effect and returns its error for tests that
+// expect refusal; a successful apply is committed and reported as a nil
+// error.
+func applyCallEffectErr(ctx context.Context, pool *pgxpool.Pool, effect agentstate.ToolEffect, personaID string, request map[string]any) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := effect.Apply(ctx, tx, personaID, "idem-"+personaID, request); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func callSessionRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sessionID string) CallSession {
 	t.Helper()
 	var s CallSession
@@ -502,9 +517,11 @@ func TestCallSayBeforeClaimIsAdoptedByFirstClaim(t *testing.T) {
 	}
 }
 
-// Speech committed while a session is interrupted carries the superseded
-// epoch: it may already have been partially heard, so the next claim records
-// it expired rather than replaying it.
+// Speech committed while a session's epoch is already superseded can never
+// be delivered — the next claim bumps the epoch and expires the row. The say
+// is refused honestly rather than queued as 'awaiting_claim', and the model
+// can act on the failure: after the successor claim lands, a fresh say
+// commits under the live epoch. No speech from a dead claim is replayed.
 func TestCallSayOnInterruptedExpiresAtReclaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -520,24 +537,55 @@ func TestCallSayOnInterruptedExpiresAtReclaim(t *testing.T) {
 		session.SessionID); err != nil {
 		t.Fatalf("expire claim: %v", err)
 	}
-	// A say while the session is still claimed-but-lapsed in the model's
-	// view lands under the epoch that may already have been heard.
-	say := applyCallEffect(t, ctx, pool, calls.CallSayEffect(), w.agent.ID,
+	// Variant A: the session still reads claimed-but-lapsed. The say must be
+	// refused, not committed as a doomed 'awaiting_claim' intent.
+	err := applyCallEffectErr(ctx, pool, calls.CallSayEffect(), w.agent.ID,
 		map[string]any{"session_id": session.SessionID, "text": "said into a dead claim"})
-	utterance, _ := say["utterance"].(CallUtterance)
-	if say["awaiting_claim"] != true {
-		t.Fatalf("interrupted say lacks awaiting_claim: %v", say)
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("say on lapsed claim = %v, want ErrBadRequest", err)
 	}
+
+	// Variant B: the lapse is swept first, leaving 'interrupted'.
 	reclaimed, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-b", 30*time.Second, 4)
 	if err != nil || len(reclaimed) != 1 || reclaimed[0].Epoch != 2 {
 		t.Fatalf("reclaim: %v %+v", err, reclaimed)
 	}
-	u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
-	if u.Status != CallUtteranceExpired {
-		t.Fatalf("stale-epoch utterance = %+v", u)
+	if _, err := pool.Exec(ctx,
+		`UPDATE call_sessions SET status='interrupted', claimed_by=NULL, claim_expires_at=NULL WHERE session_id=$1`,
+		session.SessionID); err != nil {
+		t.Fatalf("interrupt: %v", err)
 	}
-	pending, err := calls.PendingCallUtterances(ctx, w.agent.ID, session.SessionID, "runner-b", 2)
-	if err != nil || len(pending) != 0 {
+	err = applyCallEffectErr(ctx, pool, calls.CallSayEffect(), w.agent.ID,
+		map[string]any{"session_id": session.SessionID, "text": "said while interrupted"})
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("say on interrupted = %v, want ErrBadRequest", err)
+	}
+
+	// Nothing was committed on either doomed attempt.
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM call_utterances WHERE session_id=$1`,
+		session.SessionID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("doomed say committed rows: n=%d err=%v", n, err)
+	}
+	// Actionable outcome: once a claim again holds the epoch, a fresh say
+	// commits and is deliverable.
+	reclaimed, err = calls.ClaimCallSessions(ctx, w.agent.ID, "runner-c", 30*time.Second, 4)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].Epoch != 3 {
+		t.Fatalf("second reclaim: %v %+v", err, reclaimed)
+	}
+	say := applyCallEffect(t, ctx, pool, calls.CallSayEffect(), w.agent.ID,
+		map[string]any{"session_id": session.SessionID, "text": "said after reclaim"})
+	if say["awaiting_claim"] == true {
+		t.Fatalf("post-reclaim say still claims awaiting_claim: %v", say)
+	}
+	utterance, _ := say["utterance"].(CallUtterance)
+	u := callUtteranceRow(t, ctx, pool, utterance.UtteranceID)
+	if u.Status != CallUtteranceIntended || u.SessionEpoch != 3 {
+		t.Fatalf("post-reclaim utterance = %+v", u)
+	}
+	pending, err := calls.PendingCallUtterances(ctx, w.agent.ID, session.SessionID, "runner-c", 3)
+	if err != nil || len(pending) != 1 || pending[0].UtteranceID != utterance.UtteranceID {
 		t.Fatalf("successor pending: %v %+v", err, pending)
 	}
 }
@@ -1074,4 +1122,84 @@ func TestSealCutsCallBridgeAuthorityOverHTTP(t *testing.T) {
 		t.Fatalf("post-seal HTTP claim = %d, want 409", res.StatusCode)
 	}
 	_ = res.Body.Close()
+}
+
+// Revocation and its speech sweep are one transaction: an injected failure
+// at the sweep boundary leaves NO acknowledged revocation behind — the
+// session row rolls back with the utterances, so nothing is left revoked
+// with permanently non-terminal speech. Once the fault clears, the same
+// call completes both halves atomically.
+func TestRevokeKeepsSpeechAndSessionAtomic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w, calls, _, dm := newCallSessionWorld(t, ctx)
+	pool := w.store.core.pool
+
+	session := joinCallSession(t, ctx, calls, pool, w.agent.ID, dm.PlaceID)
+	if _, err := calls.ClaimCallSessions(ctx, w.agent.ID, "runner-a", 30*time.Second, 4); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := calls.ReportCallSessionStatus(ctx, w.agent.ID, session.SessionID, "runner-a", 1, CallSessionActive, "connected"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	// One still-intended utterance and one mid-flight (dequeued) one, so
+	// both terminal outcomes are witnessed.
+	intended := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "never picked up")
+	dequeued := sayCallUtterance(t, ctx, calls, pool, w.agent.ID, session.SessionID, "mid flight")
+	if _, err := calls.ReportUtteranceDisposition(ctx, w.agent.ID, session.SessionID,
+		dequeued.UtteranceID, "runner-a", 1, CallUtteranceDequeued, nil); err != nil {
+		t.Fatalf("dequeue: %v", err)
+	}
+
+	// Inject a fault inside the sweep half of the revocation transaction.
+	if _, err := pool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION fail_utterance_sweep() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'injected sweep failure'; END; $$ LANGUAGE plpgsql;
+		CREATE TRIGGER fail_utterance_sweep BEFORE UPDATE ON call_utterances
+			FOR EACH ROW EXECUTE FUNCTION fail_utterance_sweep()`); err != nil {
+		t.Fatalf("install trigger: %v", err)
+	}
+	err := calls.RevokePlaceCallSessions(ctx, w.agent.ID, dm.PlaceID, "removed_by_member")
+	if err == nil {
+		t.Fatal("revoke under injected sweep fault succeeded")
+	}
+	// Atomicity witness: no acknowledged revocation exists — the session is
+	// still live and both utterances remain in their pre-revoke states.
+	row := callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionActive || row.ClaimedBy != "runner-a" {
+		t.Fatalf("session after failed revoke = %+v, want still claimed", row)
+	}
+	if u := callUtteranceRow(t, ctx, pool, intended.UtteranceID); u.Status != CallUtteranceIntended {
+		t.Fatalf("intended utterance after failed revoke = %+v", u)
+	}
+	if u := callUtteranceRow(t, ctx, pool, dequeued.UtteranceID); u.Status != CallUtteranceDequeued {
+		t.Fatalf("dequeued utterance after failed revoke = %+v", u)
+	}
+
+	// Fault cleared: revocation now completes both halves in one commit.
+	if _, err := pool.Exec(ctx, `DROP TRIGGER fail_utterance_sweep ON call_utterances`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	if err := calls.RevokePlaceCallSessions(ctx, w.agent.ID, dm.PlaceID, "removed_by_member"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	row = callSessionRow(t, ctx, pool, session.SessionID)
+	if row.Status != CallSessionRevoked || row.EndReason != "removed_by_member" {
+		t.Fatalf("session after revoke = %+v", row)
+	}
+	// 'intended' was never handed to media → expired; 'dequeued' may have
+	// been partially emitted → unknown. Neither claims a listener heard it.
+	if u := callUtteranceRow(t, ctx, pool, intended.UtteranceID); u.Status != CallUtteranceExpired {
+		t.Fatalf("intended utterance after revoke = %+v", u)
+	}
+	if u := callUtteranceRow(t, ctx, pool, dequeued.UtteranceID); u.Status != CallUtteranceUnknown {
+		t.Fatalf("dequeued utterance after revoke = %+v", u)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM call_utterances
+		 WHERE session_id=$1 AND status IN ('intended','dequeued','emitting')`,
+		session.SessionID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("non-terminal speech on revoked session: n=%d err=%v", n, err)
+	}
 }

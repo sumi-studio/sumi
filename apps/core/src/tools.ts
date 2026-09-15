@@ -224,7 +224,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "call.say",
     description:
-      "Speak aloud in a call you have joined. Commits your words as durable intent; the media bridge renders them to audio and records what is known about playback (started, finished, interrupted). A recorded 'emitted' disposition means the audio was rendered to the room — never a claim that anyone heard it. If the bridge dies mid-utterance the record stays honest rather than replaying into a later call.",
+      "Speak aloud in a call you have joined. Commits your words as durable intent; the media bridge renders them to audio and records what is known about playback (started, finished, interrupted). A recorded 'emitted' disposition means the audio was rendered to the room — never a claim that anyone heard it. If the bridge dies mid-utterance the record stays honest rather than replaying into a later call. The call fails rather than queueing undeliverable speech when the session is ending or its claim is dead — retry only once call.state shows the session live again.",
     parameters: {
       type: "object",
       properties: {

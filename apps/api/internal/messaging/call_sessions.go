@@ -314,6 +314,20 @@ func (c *CallService) applyCallSay(ctx context.Context, tx pgx.Tx, personaID, _ 
 		// than queueing intent that can only ever expire.
 		return nil, fmt.Errorf("%w: session %s is ending; speech cannot be committed", agentstate.ErrBadRequest, sessionID)
 	}
+	if session.Status == CallSessionInterrupted ||
+		(session.Epoch > 0 && (session.ClaimExpiresAt == nil ||
+			!session.ClaimExpiresAt.After(c.now()))) {
+		// An utterance committed now is stamped this session's epoch, but
+		// that epoch is already superseded: the session is interrupted, or
+		// its nonzero-epoch claim is gone/dead, so the next claim bumps the
+		// epoch and records every pending row expired. Queueing intent that
+		// can only ever expire would lie about deliverability — refuse so
+		// the model gets an actionable failure and may re-say once a live
+		// claim exists again. Epoch 0 is the deliberate exception: speech
+		// committed before any claim is adopted into the first claim's
+		// epoch and delivered once.
+		return nil, fmt.Errorf("%w: session %s has no live claim on its current epoch; speech cannot be committed", agentstate.ErrBadRequest, sessionID)
+	}
 	var utterance CallUtterance
 	err = tx.QueryRow(ctx, `
 		INSERT INTO call_utterances (utterance_id, session_id, session_epoch, seq, text, status)
