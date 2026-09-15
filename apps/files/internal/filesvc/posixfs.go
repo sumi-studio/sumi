@@ -1413,18 +1413,48 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// displaced object). A foreign capture stays parked at the sealed
 	// name: the fs commit stands but the intent must survive for the
 	// reconciler to settle the parked object.
+	//
+	// commitInfo returns the committed object's observed identity only
+	// when the name provably still holds the object this op published
+	// (fp3 == our3, captured before the publish). A late stat that
+	// observes a different writer's object — or no verifiable identity
+	// at all — must not be journaled as this version's content: the
+	// caller reports a plain committed error and the intent stays
+	// unresolved, so the reconciler settles the commit by observation
+	// (hash/fp3-verified) instead of recording foreign bytes or fp="".
+	commitInfo := func() (FileInfo, error) {
+		info, serr := p.stat(scope, path)
+		if serr != nil {
+			return FileInfo{}, serr
+		}
+		if ourErr != nil || fp3(info.Fingerprint) != our3 {
+			return FileInfo{}, ErrExternalChange
+		}
+		return info, nil
+	}
 	commit := func(want3 string) (FileInfo, bool, error) {
+		if p.faultHook != nil {
+			p.faultHook("write.preSlotDelete")
+		}
 		if _, derr := quarantineDelete(pfd, tmp, want3); derr != nil {
 			if errors.Is(derr, ErrConflict) {
-				return FileInfo{}, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+				// Foreign bytes are parked at a sealed name; the
+				// publish committed. Journal only an identity verified
+				// against our own object.
+				if info, verr := commitInfo(); verr == nil {
+					return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+				} else {
+					return FileInfo{}, true, verr
+				}
 			}
 			return FileInfo{}, true, derr
 		}
 		syncDir(pfd)
-		info, serr := p.stat(scope, path)
-		if serr != nil {
-			// The publish committed; only the observation failed.
-			return FileInfo{}, true, serr
+		info, verr := commitInfo()
+		if verr != nil {
+			// The publish committed; the observation failed or the name
+			// already holds a different writer's object.
+			return FileInfo{}, true, verr
 		}
 		return info, true, nil
 	}
@@ -1587,6 +1617,24 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 		// would relocate foreign content under the op's authority.
 		return FileInfo{}, false, ErrExternalChange
 	}
+	// committedInfo returns the moved object's observed identity only
+	// when the destination provably still holds the object this rename
+	// moved (fp3 == src3, captured before the exchange). A stat that
+	// observes a different writer's object — or fails — yields no
+	// identity this commit may journal: callers report the commit with
+	// a plain error and the intent stays unresolved, so the reconciler
+	// settles it by observation rather than recording foreign bytes or
+	// fp="" as this version's content.
+	committedInfo := func() (FileInfo, error) {
+		info, serr := p.stat(scope, to)
+		if serr != nil {
+			return FileInfo{}, serr
+		}
+		if fp3(info.Fingerprint) != src3 {
+			return FileInfo{}, ErrExternalChange
+		}
+		return info, nil
+	}
 	var flags uint
 	switch {
 	case noReplace || dstFP == "":
@@ -1603,7 +1651,7 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 	}
 	if flags&unix.RENAME_NOREPLACE != 0 {
 		syncDir(dstPfd)
-		info, serr := p.stat(scope, to)
+		info, serr := committedInfo()
 		if serr != nil {
 			return FileInfo{}, true, serr
 		}
@@ -1660,7 +1708,7 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 			rerr := unix.Renameat2(int(srcPfd.Fd()), stage,
 				int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE)
 			syncDir(dstPfd)
-			info, serr := p.stat(scope, to)
+			info, serr := committedInfo()
 			if serr != nil {
 				return FileInfo{}, true, serr
 			}
@@ -1677,10 +1725,13 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 		// retired reconciler decided while the slot held foreign bytes —
 		// the delete must happen under a sealed name: capture stage→-q,
 		// re-verify, unlink only the declared object.
+		if p.faultHook != nil {
+			p.faultHook("rename.preQuarantine")
+		}
 		qname, uerr := quarantineDelete(srcPfd, stage, fp3(dstFP))
 		if uerr == nil {
 			syncDir(dstPfd)
-			info, serr := p.stat(scope, to)
+			info, serr := committedInfo()
 			if serr != nil {
 				return FileInfo{}, true, serr
 			}
@@ -1690,7 +1741,11 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 			// A foreign object reached the slot between the verify and
 			// the sealed capture — it is parked, not destroyed. The
 			// rename committed; the intent survives for the reconciler.
-			return FileInfo{}, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
+			info, serr := committedInfo()
+			if serr != nil {
+				return FileInfo{}, true, serr
+			}
+			return info, true, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 		}
 		if !errors.Is(uerr, unix.ENOTEMPTY) && !errors.Is(uerr, unix.EEXIST) {
 			return FileInfo{}, true, uerr
@@ -1701,7 +1756,11 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, dstFP, srcFP,
 		// ENOTEMPTY would have.
 		if unix.Renameat2(int(srcPfd.Fd()), qname,
 			int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE) != nil {
-			return FileInfo{}, true, fmt.Errorf("%w: %w", ErrNotEmpty, errUndoParked)
+			info, serr := committedInfo()
+			if serr != nil {
+				return FileInfo{}, true, serr
+			}
+			return info, true, fmt.Errorf("%w: %w", ErrNotEmpty, errUndoParked)
 		}
 		fail = ErrNotEmpty
 	}

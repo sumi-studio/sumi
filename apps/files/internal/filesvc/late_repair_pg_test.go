@@ -903,3 +903,326 @@ func TestLateRepairRelocateLockWaitCommitKeepsRow(t *testing.T) {
 		t.Fatalf("fresh write after skipped relocate: %v", err)
 	}
 }
+
+// ─── Finding 194: committed-but-parked identity ─────────────────────────
+//
+// The committed+errUndoParked fs paths used to return FileInfo{} and
+// applyRetained journaled fp="": the version row could never identify
+// the acknowledged object (recordedAt blind), and reads reported
+// foreign bytes as clean. Required: a committed row journals only an
+// identity verified bound to the object this op published — fp3 of the
+// observed object must equal the triple captured before the publish —
+// or the intent stays unresolved for the reconciler's hash/fp3-verified
+// observation settle. Never fp="", never a late stat that could name a
+// different writer's object.
+
+// IW5 — review LW5: a committed write whose slot cleanup captured a
+// foreign object (delayed deposit lands at the enumerable slot inside
+// the commit window — composed via the write.preSlotDelete seam, the
+// position a retired pass's delayed swap occupies). Required: the
+// journaled row records the committed object's real fingerprint, the
+// intent is retained as a tombstone, and the foreign capture survives.
+func TestLateRepairCommitParkedJournalsIdentity(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("OLD"), authProbe(root, "f.txt"),
+		authWriteFn(root, "f.txt", "OLD")); err != nil {
+		t.Fatalf("write OLD: %v", err)
+	}
+	var id int64
+	root.faultHook = func(tag string) {
+		if tag != "write.preSlotDelete" {
+			return
+		}
+		// A delayed swap (decided by a retired pass while the slot held
+		// the displaced object) lands foreign bytes at the enumerable
+		// slot between the exchange and the cleanup capture.
+		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
+			panic(err)
+		}
+		slot := opStagePrefix + strconv.FormatInt(id, 10)
+		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
+			panic(err)
+		}
+	}
+	_, _, werr := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			id = it.id
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		})
+	root.faultHook = nil
+	if werr == nil || !errors.Is(werr, ErrExternalChange) {
+		t.Fatalf("write with parked capture = %v, want external_change", werr)
+	}
+	if got, _ := authReadOpt(dir, "ws/f.txt"); got != "W2" {
+		t.Fatalf("f.txt = %q, want committed W2", got)
+	}
+	live := durFP(t, root, "ws", "f.txt")
+	_, fp, found := authRow(t, s, "f.txt")
+	if !found {
+		t.Fatal("no row for committed write")
+	}
+	if fp == "" || fp3(fp) != fp3(live) {
+		t.Fatalf("committed+parked write journaled fp=%q (live object %s) — "+
+			"the record must identify the acknowledged object", fp, live)
+	}
+	var resolved bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT resolved_at IS NOT NULL FROM file_op WHERE id=$1`, id).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if !resolved {
+		t.Fatal("committed+parked intent must be tombstoned, not pending")
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("FOREIGN-X")); where == "" {
+		t.Fatal("foreign capture destroyed — quarantine must park, never unlink")
+	}
+}
+
+// IW5b — review LW5b: the retained tombstone's re-judgment must not
+// exchange the foreign capture onto the public path and delete the
+// acknowledged object. The same-sha undo branch may only swap when no
+// version row claims the name at all.
+func TestLateRepairCommitParkedForeignPreserved(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("OLD"), authProbe(root, "f.txt"),
+		authWriteFn(root, "f.txt", "OLD")); err != nil {
+		t.Fatalf("write OLD: %v", err)
+	}
+	var id int64
+	root.faultHook = func(tag string) {
+		if tag != "write.preSlotDelete" {
+			return
+		}
+		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
+			panic(err)
+		}
+		slot := opStagePrefix + strconv.FormatInt(id, 10)
+		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
+			panic(err)
+		}
+	}
+	_, _, werr := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			id = it.id
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		})
+	root.faultHook = nil
+	if werr == nil || !errors.Is(werr, ErrExternalChange) {
+		t.Fatalf("write with parked capture = %v, want external_change", werr)
+	}
+	if got, _ := authReadOpt(dir, "ws/f.txt"); got != "W2" {
+		t.Fatalf("f.txt = %q, want committed W2", got)
+	}
+	fpW := durFP(t, root, "ws", "f.txt")
+
+	// Tombstone re-judgment — the ordinary hot scan.
+	authSettle(t, s)
+
+	if got, ok := authReadOpt(dir, "ws/f.txt"); !ok || got != "W2" {
+		where := scanDirFor(t, dir, "ws", []byte("W2"))
+		t.Fatalf("acknowledged W2 displaced: f.txt=%q present=%v, W2 bytes at %q — "+
+			"the tombstone settle must not install the foreign capture", got, ok, where)
+	}
+	if v, fp, found := authRow(t, s, "f.txt"); !found || fp3(fp) != fp3(fpW) {
+		t.Fatalf("row(f.txt) = (%d,%q,found=%v), want the acknowledged object's %q",
+			v, fp, found, fpW)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("FOREIGN-X")); where == "" {
+		t.Fatal("foreign capture deleted by the settle pass")
+	}
+	// Progress: a fresh write still succeeds after the parked residue.
+	if _, _, err := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("W3"), authProbe(root, "f.txt"),
+		authWriteFn(root, "f.txt", "W3")); err != nil {
+		t.Fatalf("fresh write after parked settle: %v", err)
+	}
+}
+
+// IW5c — the rename committed+parked site: a foreign object reaching
+// the staging slot between the post-exchange verify and the sealed
+// capture (rename.preQuarantine) parks at the -q name. The committed
+// rename must journal the moved object's real identity, not fp="".
+func TestLateRepairRenameSealConflictJournalsIdentity(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range [][2]string{{"old.txt", "S"}, {"new.txt", "D"}} {
+		if _, _, err := s.WithWrite(ctx, "ws", w[0], "write",
+			IfVersion{Mode: "any"}, sha(w[1]), authProbe(root, w[0]),
+			authWriteFn(root, w[0], w[1])); err != nil {
+			t.Fatalf("write %s: %v", w[0], err)
+		}
+	}
+	var id int64
+	root.faultHook = func(tag string) {
+		if tag != "rename.preQuarantine" {
+			return
+		}
+		// Foreign bytes claim the captured slot between the identity
+		// verify and the sealed capture — replacing the declared-
+		// displaced object, whose discard was authorized anyway.
+		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-Q"), 0o644); err != nil {
+			panic(err)
+		}
+		slot := opStagePrefix + strconv.FormatInt(id, 10)
+		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
+			panic(err)
+		}
+	}
+	_, _, rerr := s.Rename(ctx, "ws", "old.txt", "new.txt",
+		IfVersion{Mode: "any"}, authProbe(root, "new.txt"), authProbe(root, "old.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			id = it.id
+			return root.rename("ws", "old.txt", "new.txt", false,
+				it.dstFP, it.preFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		})
+	root.faultHook = nil
+	if rerr == nil || !errors.Is(rerr, ErrExternalChange) {
+		t.Fatalf("rename with parked seal capture = %v, want external_change", rerr)
+	}
+	if got, _ := authReadOpt(dir, "ws/new.txt"); got != "S" {
+		t.Fatalf("new.txt = %q, want committed moved object S", got)
+	}
+	live := durFP(t, root, "ws", "new.txt")
+	v, fp, found := authRow(t, s, "new.txt")
+	if !found || fp == "" || fp3(fp) != fp3(live) {
+		t.Fatalf("committed+parked rename journaled (%d,%q,found=%v) — "+
+			"must record the moved object's real identity %q", v, fp, found, live)
+	}
+	var resolved bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT resolved_at IS NOT NULL FROM file_op WHERE id=$1`, id).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if !resolved {
+		t.Fatal("committed+parked intent must be tombstoned")
+	}
+	authSettle(t, s)
+	if got, ok := authReadOpt(dir, "ws/new.txt"); !ok || got != "S" {
+		t.Fatalf("settle displaced the acknowledged rename: new.txt=%q", got)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("FOREIGN-Q")); where == "" {
+		t.Fatal("foreign sealed-capture object destroyed")
+	}
+}
+
+// IW5d — the unverifiable-identity case: the commit landed but a racer
+// displaced the committed object before the post-commit stat, AND the
+// slot holds a foreign deposit. The op can return no defensible
+// identity — it must NOT journal fp="" and must NOT mislabel the
+// racer's bytes as its own: the intent stays unresolved and the
+// reconciler settles the commit by observation (diverged fingerprint,
+// never a clean row over foreign bytes).
+func TestLateRepairCommitParkedUnverifiedIdentity(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := newPGStore(t, dsn, dir)
+	s.SetReconcileView(authPinned(root, nil))
+	if err := os.MkdirAll(dir+"/ws", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("OLD"), authProbe(root, "f.txt"),
+		authWriteFn(root, "f.txt", "OLD")); err != nil {
+		t.Fatalf("write OLD: %v", err)
+	}
+	var id int64
+	root.faultHook = func(tag string) {
+		if tag != "write.preSlotDelete" {
+			return
+		}
+		if err := os.WriteFile(dir+"/ws/.filesv-tmp-inj", []byte("FOREIGN-X"), 0o644); err != nil {
+			panic(err)
+		}
+		slot := opStagePrefix + strconv.FormatInt(id, 10)
+		if err := os.Rename(dir+"/ws/.filesv-tmp-inj", dir+"/ws/"+slot); err != nil {
+			panic(err)
+		}
+		// A racing writer's object claims the public name before the
+		// post-commit observation — the committed W2 object is gone.
+		if err := os.WriteFile(dir+"/ws/f.txt", []byte("RACER"), 0o644); err != nil {
+			panic(err)
+		}
+	}
+	_, _, werr := s.WithWrite(ctx, "ws", "f.txt", "write",
+		IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "f.txt"),
+		func(it intent) (FileInfo, bool, error) {
+			id = it.id
+			return root.atomicWrite("ws", "f.txt", []byte("W2"), false,
+				it.dstFP, opStagePrefix+strconv.FormatInt(it.id, 10))
+		})
+	root.faultHook = nil
+	if werr == nil || !errors.Is(werr, ErrExternalChange) {
+		t.Fatalf("unverifiable commit = %v, want external_change", werr)
+	}
+	// No committed row may claim the acknowledged object without a
+	// verifiable identity: the intent must not have journaled fp="".
+	if _, fp, found := authRow(t, s, "f.txt"); found && fp == "" {
+		t.Fatal("journaled fp=\"\" — an unverifiable commit must stay unresolved")
+	}
+	// The committed object was displaced before observation — the
+	// reconciler settles the intent by disk verdict: the racer's
+	// content is recorded as divergent, never clean.
+	authSettle(t, s)
+	v, fp, found := authRow(t, s, "f.txt")
+	if !found {
+		t.Fatal("settle produced no row for the committed write")
+	}
+	live := durFP(t, root, "ws", "f.txt")
+	if fp3(fp) == fp3(live) && fp != "" {
+		// Recording the racer's object under this op's version is only
+		// honest if the row marks the divergence — a clean fp here
+		// attributes foreign bytes to this version.
+		t.Fatalf("row(f.txt) = (%d,%q) cleanly records the racer's object %q",
+			v, fp, live)
+	}
+	if where := scanDirFor(t, dir, "ws", []byte("FOREIGN-X")); where == "" {
+		t.Fatal("foreign capture destroyed")
+	}
+}

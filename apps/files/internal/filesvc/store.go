@@ -691,6 +691,18 @@ func (s *Store) applyUntilSettled(it intent, info FileInfo, sha string) error {
 // keeps the slot enumerable until a pass settles it; the orphan sweep
 // is the backstop once the row is eventually resolved away.
 func (s *Store) applyRetained(it intent, info FileInfo, sha string) error {
+	if info.Fingerprint == "" {
+		// The commit was reported without a verifiable identity for the
+		// acknowledged object. Journaling fp="" would defeat recordedAt
+		// (a displaced recorded object could never be routed home) and
+		// suppress divergence reporting (recordedFP=="" reads as clean).
+		// Keep the intent as an unapplied tombstone instead: re-judgment
+		// settles the committed effect by disk observation, which only
+		// journals hash/fp3-verified identities, and the staged
+		// namespace stays enumerable for the parked residue.
+		s.tombstoneIntent(context.Background(), it)
+		return nil
+	}
 	backoff := 200 * time.Millisecond
 	for attempt := 0; ; attempt++ {
 		err := s.apply(context.Background(), it, info, sha, true)
@@ -1554,12 +1566,13 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 			return
 		}
 		// The staged slot holds a foreign object. A version row may
-		// record it at a DIFFERENT path than this intent's — the row is
-		// authoritative for where recorded content belongs, so route it
-		// home before considering this intent's own name.
+		// record it — the row is authoritative for where recorded
+		// content belongs, so route it home (its home may be this
+		// intent's own path: restoreStaged swaps only when the row
+		// records this very object there, never a bare name).
 		if home, found, derr := s.recordedAt(ctx, it.scope, st3); derr != nil {
 			return // row set unverifiable — preserve, never misplace
-		} else if found && home != it.path {
+		} else if found {
 			s.restoreStaged(ctx, it, view, rel, home, st, tombstoned)
 			return
 		}
@@ -1581,6 +1594,16 @@ func (s *Store) settleStagedOne(ctx context.Context, it intent, view ReconView, 
 				if busy, derr := s.recordersActive(ctx, it.scope); derr != nil || busy {
 					return
 				}
+				// The slot object is unrecorded (recorded objects route
+				// home above). The row check asks whether the NAME's
+				// record still describes what sits there: a current row
+				// (fp3 matches the live object) means a successor owns
+				// the name — never displace acknowledged content. A
+				// stale row records an object already displaced from the
+				// name; the swap then only moves the live object into
+				// the slot, where settleDelete's recordedAt screen —
+				// and the discard veto for in-flight writers — decide
+				// whether it may be discarded. Never a bare hash match.
 				if rowFP, found, rerr := s.recordedFP(ctx, it.scope, it.path); rerr != nil {
 					return
 				} else if found {
