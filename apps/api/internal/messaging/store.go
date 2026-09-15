@@ -77,6 +77,9 @@ type Store struct {
 	blobs            AttachmentBlobs
 	attachmentPolicy AttachmentPolicy
 	missingBlobScan  attachmentMissingBlobScan
+	// admission bounds new durable mutations and live sockets for this
+	// process. Single-process and volatile: it resets on restart.
+	admission *operationAdmission
 }
 
 type attachmentMissingBlobScan struct {
@@ -88,7 +91,8 @@ type attachmentMissingBlobScan struct {
 // New returns a Store backed by the given pool. The pool must be connected to
 // a database with migrations applied (0002 for the 戸籍, 0008 for messaging).
 func New(pool *pgxpool.Pool, workspaces WorkspaceAuthority, apps AppAuthority) *Store {
-	return &Store{pool: pool, workspaces: workspaces, apps: apps}
+	return &Store{pool: pool, workspaces: workspaces, apps: apps,
+		admission: newOperationAdmission()}
 }
 
 // Workspace is the Discord-shaped server: channels live directly under it.
