@@ -41,8 +41,14 @@ type AgentAttentionEvent struct {
 	Actor              AgentAttentionActor `json:"actor"`
 	Place              AgentAttentionPlace `json:"place"`
 	MessageID          string              `json:"message_id"`
-	// ReplyRequired is an outbox-only authorization condition. DM/mention
-	// delivery does not depend on the continued existence of the parent.
+	// ReplyRequired is an outbox-only authorization condition on an original
+	// reply event, which has no other basis to reach its recipient: delivery
+	// suppresses it when the parent stops standing before admission.
+	// DM/mention delivery does not depend on the continued existence of the
+	// parent. A change event never sets it — the update rides on the
+	// recipient's existing view, so delivery re-authorizes its reply_to and
+	// retires the designation instead of suppressing the correction (see
+	// authorizeAttentionSource).
 	ReplyRequired    bool   `json:"reply_required,omitempty"`
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	// Change marks a mutation of an already-posted message (edited/deleted);
@@ -171,8 +177,10 @@ func (s *ScopedStore) issueAgentMessage(ctx context.Context, tx pgx.Tx, place Pl
 // their view stale would let them keep answering a message that no longer
 // exists, or never learn their own message was removed. An edit additionally
 // reaches members its new content selects for the first time: a mention added
-// by an edit is a real call for attention, and the new reason refines a
-// recorded recipient's stale one. A deletion has no new content to select on.
+// by an edit is a real call for attention, and a recorded recipient's reason
+// is re-derived from the current selection rather than replayed — an edit
+// that removed what selected them leaves no reason behind. A deletion has no
+// new content to select on.
 func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, place Place, message Message, change string, changedAt time.Time) error {
 	recipients := map[string]NotificationDecision{}
 	rows, err := tx.Query(ctx, `
@@ -254,9 +262,22 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		if err != nil {
 			return err
 		}
+		selected := make(map[string]bool, len(decisions))
 		for _, decision := range decisions {
 			if decision.Participant.Kind == KindPersonalityAgent {
 				recipients[decision.Participant.Key()] = decision
+				selected[decision.Participant.Key()] = true
+			}
+		}
+		// A recorded reason names how the original view reached the
+		// recipient, not what this update asks of them: an edit that dropped
+		// the mention or keyword — or a mute applied since — must not keep
+		// demanding attention on the old basis. Only current selection is a
+		// live reason on a change event.
+		for key, decision := range recipients {
+			if !selected[key] && decision.Reason != "" {
+				decision.Reason = ""
+				recipients[key] = decision
 			}
 		}
 	}
@@ -289,13 +310,12 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 		event.Change, event.Reason = change, decision.Reason
 		event.OccurredAt = changedAt
 		if addressed && addressee.Author == decision.Participant {
+			// The designation is what the parent justifies at issue time;
+			// delivery re-checks it against the parent as it stands then
+			// (authorizeAttentionSource) — a parent deleted or moved outside
+			// the recipient's tenure meanwhile retires the designation
+			// without suppressing the correction itself.
 			event.ReplyToMessageID = message.ReplyTo
-			// Mirror the append rule: reply attention is re-authorized
-			// against the parent only when it stands on its own (an
-			// independent notification reason already survives the
-			// parent's disappearance). A tombstone never depends on the
-			// parent still being there.
-			event.ReplyRequired = change == AttentionChangeEdited && decision.Reason == ""
 		}
 		if change == AttentionChangeDeleted {
 			event.Content = ""
@@ -651,6 +671,16 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	// Match ordinary source mutation lock order. Source locks remain held through
 	// Admit, so revocation either wins before admission or follows a lawful receipt.
 	sourceErr := scoped.authorizeAttentionSource(ctx, tx, item)
+	event := item.event
+	if errors.Is(sourceErr, errReplyDesignationGone) {
+		// The frozen row keeps what was issued; the admitted input carries
+		// the designation the parent still justifies — none. The correction
+		// itself stays authorized by the recipient's existing view, and
+		// re-deriving the same effective event on every attempt keeps a
+		// retry after a lost receipt a deduplication, not a conflict.
+		event.ReplyToMessageID, event.ReplyRequired = "", false
+		sourceErr = nil
+	}
 	if sourceErr != nil && !attentionSourceUnavailable(sourceErr) {
 		return "", sourceErr
 	}
@@ -667,7 +697,7 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 		return "", nil
 	}
 	key := "attention:" + item.event.PersonalityAgentID + ":" + item.event.EventID
-	receipt, found, err := delivery.Lookup(ctx, key, item.event)
+	receipt, found, err := delivery.Lookup(ctx, key, event)
 	if err != nil {
 		if reason, terminal := terminalDeliveryReason(err); terminal {
 			return suppressAttention(ctx, tx, item.event.EventID, reason)
@@ -685,7 +715,7 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	if !mayAdmit {
 		return "ready", tx.Commit(ctx)
 	}
-	receipt, err = delivery.Admit(ctx, key, item.event)
+	receipt, err = delivery.Admit(ctx, key, event)
 	if err != nil {
 		if reason, terminal := terminalDeliveryReason(err); terminal {
 			return suppressAttention(ctx, tx, item.event.EventID, reason)
@@ -694,6 +724,13 @@ func (s *Store) attemptAgentAttention(ctx context.Context, delivery AgentAttenti
 	}
 	return commitAttentionReceipt(ctx, tx, item.event.EventID, receipt)
 }
+
+// errReplyDesignationGone is a delivery-time fact about the event's reply
+// designation, not a failure of the delivery's own authorization: the parent
+// an edit names was deleted or fell outside the recipient's tenure after the
+// event was issued. The update itself still stands on the recipient's
+// existing view, so it is delivered without the designation.
+var errReplyDesignationGone = errors.New("reply designation no longer stands")
 
 func commitAttentionReceipt(ctx context.Context, tx pgx.Tx, eventID string, receipt AgentAttentionReceipt) (string, error) {
 	if receipt.CommandID == "" || receipt.Seq == 0 || receipt.Seq > 9007199254740991 {
@@ -743,12 +780,28 @@ func (s *ScopedStore) authorizeAttentionSource(ctx context.Context, tx pgx.Tx, i
 	if message.Seq < access.VisibleFromSeq {
 		return ErrMessageNotFound
 	}
-	if item.event.ReplyRequired {
+	if item.event.ReplyRequired ||
+		(item.event.Change == AttentionChangeEdited && item.event.ReplyToMessageID != "") {
+		// The reply designation is re-authorized against the parent as it
+		// stands now, under the same locks a mutation takes. An original
+		// reply has no other basis to reach this recipient, so it
+		// suppresses when the parent stops standing. An edit already has
+		// the recipient's view, so the same failure only retires the
+		// designation — the correction still delivers as an ordinary
+		// update. A tombstone's reply_to is provenance for the deletion it
+		// reports and is never re-checked.
+		parentGone := true
 		parent, err := lockMessageScoped(ctx, tx, s.Scope.WorkspaceID, place.PlaceID, item.event.ReplyToMessageID)
-		if err != nil {
+		if err == nil {
+			parentGone = parent.Deleted || parent.Seq < access.VisibleFromSeq ||
+				parent.Author != s.Scope.Actor || message.ReplyTo != parent.MessageID
+		} else if !errors.Is(err, ErrMessageNotFound) {
 			return err
 		}
-		if parent.Deleted || parent.Seq < access.VisibleFromSeq || parent.Author != s.Scope.Actor || message.ReplyTo != parent.MessageID {
+		if parentGone {
+			if item.event.Change == AttentionChangeEdited {
+				return errReplyDesignationGone
+			}
 			return ErrMessageNotFound
 		}
 	}
