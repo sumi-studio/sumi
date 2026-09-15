@@ -15,6 +15,8 @@ import {
   parseCallEnvelope,
   redirectRefusal,
   requestDeadline,
+  requestHeaders,
+  SUMI_USER_AGENT,
   sanitizeToolName,
   sseEvents,
   wireTools,
@@ -44,6 +46,13 @@ export interface ResponsesConfig {
    * can make a lower-cap model fail every request.
    */
   maxOutputTokens?: number;
+  /**
+   * When set, the request carries this header with the persona's stable
+   * identity (request.personaId) — e.g. x-opencode-session, which
+   * OpenCode Go requires on every endpoint for routing. Applied after
+   * `headers` so the live identity always wins over a static value.
+   */
+  sessionHeader?: string;
 }
 
 /**
@@ -85,11 +94,17 @@ export class OpenAIResponsesProvider implements ModelProvider {
           `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
           {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${this.cfg.apiKey}`,
-              "Content-Type": "application/json",
-              ...this.cfg.headers,
-            },
+            headers: requestHeaders(
+              {
+                Authorization: `Bearer ${this.cfg.apiKey}`,
+                "Content-Type": "application/json",
+                "User-Agent": SUMI_USER_AGENT,
+              },
+              this.cfg.headers,
+              this.cfg.sessionHeader
+                ? { header: this.cfg.sessionHeader, value: request.personaId }
+                : undefined,
+            ),
             signal: deadline.signal,
             // Never follow a redirect: this request carries credentials
             // and fetch forwards x-api-key/extra headers cross-origin.
