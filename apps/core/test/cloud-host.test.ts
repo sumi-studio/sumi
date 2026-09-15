@@ -56,6 +56,23 @@ test("wake requires the configured bearer before any Durable Object is reached",
   );
   assert.equal(bad.status, 400);
   assert.equal(reached.length, 1);
+  // The check route sits behind the same gate.
+  assert.equal(
+    (
+      await worker.fetch(post(`${PUBLIC}/personas/${PERSONA}/check`), env as never)
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await worker.fetch(
+        post(`${PUBLIC}/personas/not-a-persona/check`, WAKE),
+        env as never,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(reached.length, 1, "check refusals never reach a DO");
   // Liveness stays public; state reachability does not.
   assert.equal(
     (await worker.fetch(new Request(`${PUBLIC}/health`), env as never)).status,
@@ -169,7 +186,7 @@ async function firstStateCall(extra: Record<string, unknown>) {
             url: input,
             auth: new Headers(init?.headers).get("Authorization"),
           });
-          // A definite refusal ends the drain at once.
+          // A definite refusal fails the wake's startup gate at once.
           return Response.json({ error: "unauthorized" }, { status: 401 });
         },
       },
@@ -181,10 +198,14 @@ async function firstStateCall(extra: Record<string, unknown>) {
       method: "POST",
     }),
   );
-  assert.equal(res.status, 200);
+  assert.equal(res.status, 503);
+  assert.equal(
+    ((await res.json()) as { reason?: string }).reason,
+    "unauthorized",
+  );
   await Promise.all(ctx.waits.splice(0));
   const first = calls[0];
-  assert.ok(first, "the drain made no state call");
+  assert.ok(first, "the startup gate made no state call");
   return first;
 }
 
@@ -203,6 +224,145 @@ test("a persona-specific token binding still takes precedence over the runtime c
     [`SUMI_PERSONA_TOKEN_${PERSONA.replaceAll("-", "_")}`]: "core_persona",
   });
   assert.equal(call.auth, "Bearer core_persona");
+});
+
+/**
+ * Enough of the state service for a DO startup + drain to idle: lease
+ * acquire/renew/release, recover, dispatch, loadTurn. `authorize` decides
+ * whether the presented bearer is accepted — a wrong installed secret is
+ * the reviewed failure shape.
+ */
+function stateStub(opts: { accept: (auth: string | null) => boolean }) {
+  const calls: { url: string; auth: string | null }[] = [];
+  const fetcher = async (input: string, init?: RequestInit) => {
+    const url = String(input);
+    const auth = new Headers(init?.headers).get("Authorization");
+    calls.push({ url, auth });
+    if (!opts.accept(auth))
+      return Response.json({ error: "unauthorized" }, { status: 401 });
+    if (url.endsWith("/state"))
+      return Response.json({ persona: { persona_id: PERSONA } });
+    if (url.endsWith("/writer/acquire") || url.endsWith("/writer/renew"))
+      return Response.json({
+        persona_id: PERSONA,
+        holder_id: "workerd-test",
+        generation: 1,
+        acquired_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 30_000).toISOString(),
+      });
+    if (url.endsWith("/recover"))
+      return Response.json({ interrupted_turns: [], requeued_inputs: [] });
+    if (url.endsWith("/schedules/dispatch"))
+      return Response.json({ fired: [] });
+    if (url.endsWith("/turns/load"))
+      return Response.json({ turn: null, input: null });
+    if (url.endsWith("/writer/release"))
+      return Response.json({ released: true });
+    return Response.json({});
+  };
+  return { calls, fetcher };
+}
+
+const checkReq = (p = PERSONA) =>
+  new Request(`https://do.internal/personas/${p}/check`, { method: "POST" });
+
+test("check: the DO authenticates to a persona-scoped route through the binding", async () => {
+  const stub = stateStub({ accept: (a) => a === `Bearer ${RUNTIME}` });
+  const ctx = doCtx();
+  const obj = new SecretaryObject(
+    ctx as never,
+    {
+      SUMI_STATE_URL: "http://state.invalid:8080",
+      SUMI_CORE_RUNTIME_TOKEN: RUNTIME,
+      SUMI_STATE: { fetch: stub.fetcher },
+      SECRETARY: {} as never,
+    } as never,
+  );
+  const res = await obj.fetch(checkReq());
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { ok: boolean; via: string };
+  assert.deepEqual({ ok: body.ok, via: body.via }, { ok: true, via: "binding" });
+  assert.deepEqual(stub.calls, [
+    {
+      url: `http://state.invalid:8080/internal/core/personas/${PERSONA}/state`,
+      auth: `Bearer ${RUNTIME}`,
+    },
+  ]);
+  // No alarm, no stored persona: a check starts nothing.
+  assert.equal(ctx.waits.length, 0);
+});
+
+test("check: a wrong installed secret surfaces as 503 unauthorized", async () => {
+  const stub = stateStub({ accept: (a) => a === "Bearer the-right-one" });
+  const ctx = doCtx();
+  const obj = new SecretaryObject(
+    ctx as never,
+    {
+      SUMI_STATE_URL: "http://state.invalid:8080",
+      SUMI_CORE_RUNTIME_TOKEN: RUNTIME,
+      SUMI_STATE: { fetch: stub.fetcher },
+      SECRETARY: {} as never,
+    } as never,
+  );
+  const res = await obj.fetch(checkReq());
+  assert.equal(res.status, 503);
+  const body = (await res.json()) as { reason: string; state_status: number };
+  assert.equal(body.reason, "unauthorized");
+  assert.equal(body.state_status, 401);
+});
+
+test("check: no credential at all is 503 no_credential, without a state call", async () => {
+  const stub = stateStub({ accept: () => true });
+  const obj = new SecretaryObject(
+    doCtx() as never,
+    {
+      SUMI_STATE_URL: "http://state.invalid:8080",
+      SUMI_STATE: { fetch: stub.fetcher },
+      SECRETARY: {} as never,
+    } as never,
+  );
+  const res = await obj.fetch(checkReq());
+  assert.equal(res.status, 503);
+  assert.equal(((await res.json()) as { reason: string }).reason, "no_credential");
+  assert.equal(stub.calls.length, 0);
+});
+
+test("wake answers 503 while the runtime credential fails and 200 once it works", async () => {
+  let accept = false;
+  const stub = stateStub({ accept: () => accept });
+  const ctx = doCtx();
+  const obj = new SecretaryObject(
+    ctx as never,
+    {
+      SUMI_STATE_URL: "http://state.invalid:8080",
+      SUMI_CORE_RUNTIME_TOKEN: RUNTIME,
+      SUMI_STATE: { fetch: stub.fetcher },
+      SECRETARY: {} as never,
+    } as never,
+  );
+  const wake = () =>
+    obj.fetch(
+      new Request(`https://do.internal/personas/${PERSONA}/wake`, {
+        method: "POST",
+      }),
+    );
+  const refused = await wake();
+  assert.equal(refused.status, 503);
+  assert.equal(
+    ((await refused.json()) as { reason: string }).reason,
+    "unauthorized",
+  );
+  assert.notEqual(
+    await ctx.storage.getAlarm(),
+    null,
+    "a failed wake still arms the heartbeat so the DO retries",
+  );
+  // The credential now authenticates: the same DO starts and drains.
+  accept = true;
+  const ok = await wake();
+  assert.equal(ok.status, 200);
+  assert.equal(((await ok.json()) as { ok: boolean }).ok, true);
+  await Promise.all(ctx.waits.splice(0));
 });
 
 test("SUMI_MODEL_PROVIDER=none: an unselected persona is unavailable, never answered", async () => {

@@ -412,7 +412,7 @@ summary.core_config = coreConfig;
 
 const persistDir = join(OUT, "wrangler-state");
 let workerStarts = 0;
-async function startWorker() {
+async function startWorker(runtimeToken = RUNTIME) {
   workerStarts++;
   const out = openSync(join(OUT, `workerd-${workerStarts}.log`), "a");
   worker = spawn(
@@ -434,7 +434,7 @@ async function startWorker() {
       "--persist-to",
       persistDir,
       "--var",
-      `SUMI_CORE_RUNTIME_TOKEN:${RUNTIME}`,
+      `SUMI_CORE_RUNTIME_TOKEN:${runtimeToken}`,
       "--var",
       `SUMI_CORE_WAKE_TOKEN:${WAKE}`,
       "--show-interactive-dev-session=false",
@@ -555,8 +555,16 @@ await startWorker();
     headers: { Authorization: `Bearer ${WAKE}` },
   });
   const stateBody = await stateRes.json();
+  const checkNoAuth = (
+    await fetch(`${WORKER}/personas/${SELECTED}/check`, { method: "POST" })
+  ).status;
+  const checkRes = await fetch(`${WORKER}/personas/${SELECTED}/check`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WAKE}` },
+  });
+  const checkBody = await checkRes.json();
   log(
-    `S0 routes: wake no-auth=${noAuth} wrong=${wrong} bad-persona=${badPersona}; /health/state no-auth=${stateNoAuth} auth=${stateRes.status} ${JSON.stringify(stateBody)}`,
+    `S0 routes: wake no-auth=${noAuth} wrong=${wrong} bad-persona=${badPersona}; /health/state no-auth=${stateNoAuth} auth=${stateRes.status} ${JSON.stringify(stateBody)}; /check no-auth=${checkNoAuth} auth=${checkRes.status} ${JSON.stringify(checkBody)}`,
   );
   assert(noAuth === 401 && wrong === 401, "wake must require the bearer");
   assert(badPersona === 400, "malformed persona must be refused");
@@ -566,12 +574,20 @@ await startWorker();
     "/health/state through the binding",
     stateBody,
   );
+  assert(checkNoAuth === 401, "check must require the bearer");
+  assert(
+    checkRes.status === 200 && checkBody.via === "binding",
+    "the DO authenticates to a persona-scoped route through the binding with its installed secret",
+    checkBody,
+  );
   summary.scenarios.routes = {
     wake_no_auth: noAuth,
     wake_wrong_token: wrong,
     wake_bad_persona: badPersona,
     state_health_no_auth: stateNoAuth,
     state_health: stateBody,
+    check_no_auth: checkNoAuth,
+    check: checkBody,
   };
 }
 
@@ -774,6 +790,85 @@ await startWorker();
     runtime_decision_status: byRuntime.status,
     completed_ms_after_decision: Date.now() - decidedAt,
     notes: notes.length,
+  };
+}
+
+// --- S7: a wrong Worker runtime secret is a visible failure, then recovers ---
+// The reviewed gap: a mismatched SUMI_CORE_RUNTIME_TOKEN left every input
+// queued while /health/state (unauthenticated) still passed. Now the DO
+// check route reports it and the wake answers 503 the Go sweep logs.
+{
+  // No live writer may hold the lease, or the sweep correctly skips the
+  // persona and no wake would be attempted at all.
+  await waitFor(
+    "writer released before the credential test",
+    async () => {
+      const st = await sreq("GET", `${P(SELECTED)}/state`, ADMIN);
+      const exp = st.json?.lease?.expires_at;
+      return !exp || Date.parse(exp) <= Date.now();
+    },
+    60_000,
+  );
+  await stopWorker();
+  const WRONG = secret("wrong-runtime");
+  await startWorker(WRONG);
+  const logOffset = readFileSync(stateLog, "utf8").length;
+  const { inputId } = await submit(SELECTED, "MSG-wrong-secret hello");
+
+  // The deployment probe's essential check sees the mismatch inside the DO.
+  const badCheck = await fetch(`${WORKER}/personas/${SELECTED}/check`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WAKE}` },
+  });
+  const badCheckBody = await badCheck.json();
+  assert(
+    badCheck.status === 503 && badCheckBody.reason === "unauthorized",
+    "check must report the installed secret's refusal",
+    badCheckBody,
+  );
+  // The Go sweep's wake must fail visibly — 503, not a silent 200.
+  await waitFor(
+    "a failed wake logged with the host's 503",
+    async () =>
+      /not woken \(will retry\): core host answered 503/.test(
+        wakeLogSince(logOffset),
+      ),
+    30_000,
+  );
+  await sleep(1_500);
+  const stuck = await inputRow(SELECTED, inputId);
+  assert(
+    stuck?.input?.status === "queued" &&
+      forInput(await outbox(SELECTED), inputId, "turn_completed").length === 0,
+    "input must wait queued while the credential is wrong",
+    stuck,
+  );
+
+  // Correcting the Worker's secret recovers without touching the input.
+  await stopWorker();
+  await startWorker();
+  const fixedAt = Date.now();
+  await completedOnce(SELECTED, inputId, "MSG-wrong-secret", 90_000);
+  const goodCheck = await fetch(`${WORKER}/personas/${SELECTED}/check`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WAKE}` },
+  });
+  const goodCheckBody = await goodCheck.json();
+  assert(
+    goodCheck.status === 200 && goodCheckBody.via === "binding",
+    "check passes once the installed secret matches",
+    goodCheckBody,
+  );
+  const lines = wakeLogSince(logOffset).split("\n").filter(Boolean);
+  log(
+    `S7 wrong secret: wake 503 logged, input stayed queued, replied ${Date.now() - fixedAt}ms after correction`,
+  );
+  summary.scenarios.wrong_runtime_secret = {
+    check_while_wrong: badCheckBody,
+    wake_log: lines.slice(0, 3).concat(lines.slice(-3)),
+    input_status_while_wrong: stuck?.input?.status,
+    recovered_ms_after_fix: Date.now() - fixedAt,
+    check_after_fix: goodCheckBody,
   };
 }
 

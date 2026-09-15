@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -36,8 +37,15 @@ type AwaitingRuntime struct {
 }
 
 // PersonasAwaitingRuntime lists active personas whose work needs a runtime
-// and whose writer lease is absent or expired.
-func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int) ([]AwaitingRuntime, error) {
+// and whose writer lease is absent or expired, oldest persona first.
+//
+// deferred names personas the caller already woke inside their re-wake gap;
+// they sort behind every eligible persona instead of consuming the limit. A
+// bounded result can therefore never starve a later persona: however many
+// stalled personas sit ahead, the first `limit` rows are the ones that can
+// be woken now, and a deferred persona that reappears in the tail is simply
+// skipped again (or woken at once if its pending work moved).
+func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int, deferred []string) ([]AwaitingRuntime, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -59,8 +67,8 @@ func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int) ([]Await
 				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now()))
 		  AND NOT EXISTS (SELECT 1 FROM core_writer_leases l
 				WHERE l.persona_id = p.persona_id AND l.expires_at > now())
-		ORDER BY p.persona_id
-		LIMIT $1`, limit)
+		ORDER BY COALESCE(p.persona_id = ANY($2::text[]), false), p.persona_id
+		LIMIT $1`, limit, deferred)
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +140,10 @@ func RuntimeWakerFromEnv(store *Store, getenv func(string) string) (*RuntimeWake
 
 func NewRuntimeWaker(store *Store, baseURL, token string) (*RuntimeWaker, error) {
 	u, err := url.Parse(baseURL)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("%s must be an absolute http(s) URL without query", RuntimeWakeURLEnv)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		// The message must not echo the URL: a userinfo password in it is
+		// exactly the secret this check exists to keep out of logs.
+		return nil, fmt.Errorf("%s must be an absolute http(s) URL without query, fragment or userinfo", RuntimeWakeURLEnv)
 	}
 	if len(token) < minRuntimeSecretLen {
 		return nil, fmt.Errorf("%s must be at least %d characters", RuntimeWakeTokenEnv, minRuntimeSecretLen)
@@ -174,14 +184,25 @@ func (w *RuntimeWaker) Run(ctx context.Context) {
 
 // Sweep runs one pass and returns how many wakes it sent successfully.
 func (w *RuntimeWaker) Sweep(ctx context.Context) int {
-	awaiting, err := w.store.PersonasAwaitingRuntime(ctx, 200)
+	now := time.Now()
+	w.mu.Lock()
+	// Personas still inside their re-wake gap sort behind eligible ones in
+	// the candidate query, so stalled work cannot fill the bounded result
+	// and starve personas that have never been woken.
+	var deferred []string
+	for id, m := range w.marks {
+		if now.Sub(m.at) < m.gap {
+			deferred = append(deferred, id)
+		}
+	}
+	w.mu.Unlock()
+	awaiting, err := w.store.PersonasAwaitingRuntime(ctx, 200, deferred)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("core wake: pending-work query failed: %v", err)
 		}
 		return 0
 	}
-	now := time.Now()
 	w.mu.Lock()
 	seen := make(map[string]bool, len(awaiting))
 	var due []AwaitingRuntime
@@ -198,10 +219,12 @@ func (w *RuntimeWaker) Sweep(ctx context.Context) int {
 		w.marks[a.PersonaID] = wakeMark{at: now, progress: a.Progress, gap: gap, failed: m.failed}
 		due = append(due, a)
 	}
-	// A persona that left the list got a live writer or finished its work:
-	// its next pending work is woken immediately.
-	for id := range w.marks {
-		if !seen[id] {
+	// A persona that left the list got a live writer or finished its work.
+	// Its mark is dropped once the gap has passed: keeping it while the gap
+	// runs preserves the backoff of a still-awaiting persona the limit
+	// pushed out of this batch, and an expired mark only resets its gap.
+	for id, m := range w.marks {
+		if !seen[id] && now.Sub(m.at) >= m.gap {
 			delete(w.marks, id)
 		}
 	}
@@ -259,6 +282,13 @@ func (w *RuntimeWaker) wake(ctx context.Context, personaID string) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		// The body names why the host refused (e.g. its runtime credential
+		// was rejected); bound it so a hostile or buggy host cannot flood
+		// the log. The bearer is never in it — it travels in the header.
+		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		if detail := strings.TrimSpace(string(snippet)); detail != "" {
+			return fmt.Errorf("core host answered %d: %s", res.StatusCode, detail)
+		}
 		return fmt.Errorf("core host answered %d", res.StatusCode)
 	}
 	return nil

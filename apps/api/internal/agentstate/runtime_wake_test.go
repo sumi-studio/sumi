@@ -65,6 +65,8 @@ func TestRuntimeWakerFromEnv(t *testing.T) {
 		{RuntimeWakeURLEnv: "ftp://core.example", RuntimeWakeTokenEnv: testWakeToken},
 		{RuntimeWakeURLEnv: "core.example", RuntimeWakeTokenEnv: testWakeToken},
 		{RuntimeWakeURLEnv: "https://core.example", RuntimeWakeTokenEnv: "short"},
+		// Userinfo would log the password via Target() — refused outright.
+		{RuntimeWakeURLEnv: "https://ops:s3cret-pass@core.example/base/", RuntimeWakeTokenEnv: testWakeToken},
 	}
 	for _, m := range bad {
 		if _, err := RuntimeWakerFromEnv(nil, env(m)); err == nil {
@@ -184,6 +186,85 @@ func TestRuntimeWakerWakesPendingWorkWithoutLiveWriter(t *testing.T) {
 		if strings.Contains(c, idle) {
 			t.Fatalf("idle persona woken: %v", rec.calls)
 		}
+	}
+}
+
+// More awaiting personas than the per-sweep candidate limit must not starve
+// the later ones: personas already woken inside their re-wake gap sort
+// behind eligible candidates, so each sweep reaches work that has never
+// been woken instead of re-listing the same stalled prefix.
+func TestRuntimeWakerDoesNotStarveLaterPersonas(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	rec := &wakeRecorder{}
+	rec.status.Store(200)
+	host := httptest.NewServer(rec.handler(t))
+	defer host.Close()
+	waker, err := NewRuntimeWaker(srv.Store(), host.URL, testWakeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stalled personas stay deferred for the whole test.
+	waker.MinGap = time.Hour
+	waker.MaxGap = time.Hour
+	ctx := context.Background()
+
+	const stalled = 205 // over the 200-row sweep batch
+	woken := map[string]int{}
+	countWakes := func() {
+		t.Helper()
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		for _, c := range rec.calls {
+			woken[strings.TrimSuffix(strings.TrimPrefix(c, "POST /personas/"), "/wake")]++
+		}
+		rec.calls = nil
+	}
+	mk := func() string {
+		t.Helper()
+		p := pid(t)
+		if r := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+p+`"}`); r.Code != 201 {
+			t.Fatalf("create persona: %d %s", r.Code, r.Body)
+		}
+		body := `{"input_id":"in-` + p + `","kind":"message","payload":{"text":"hi"}}`
+		if r := do(t, mux, "POST", "/internal/core/personas/"+p+"/inputs", testAdminSecret, body); r.Code != 201 {
+			t.Fatalf("submit: %d %s", r.Code, r.Body)
+		}
+		return p
+	}
+	for range stalled {
+		mk()
+	}
+	if n := waker.Sweep(ctx); n != 200 {
+		t.Fatalf("first sweep sent %d, want the 200-row batch", n)
+	}
+	countWakes()
+	if n := waker.Sweep(ctx); n != 5 {
+		t.Fatalf("second sweep sent %d, want the 5 remaining personas", n)
+	}
+	countWakes()
+	if len(woken) != stalled {
+		t.Fatalf("personas woken = %d, want %d", len(woken), stalled)
+	}
+	// Every persona was woken exactly once; the deferred prefix was skipped,
+	// not re-woken.
+	for p, n := range woken {
+		if n != 1 {
+			t.Fatalf("persona %s woken %d times", p, n)
+		}
+	}
+	if n := waker.Sweep(ctx); n != 0 {
+		t.Fatalf("stalled personas re-woken inside their gap: %d", n)
+	}
+	countWakes()
+	// A persona created after all the stalled ones is woken on the very
+	// next sweep — the tail of the candidate list is reachable.
+	fresh := mk()
+	if n := waker.Sweep(ctx); n != 1 {
+		t.Fatalf("new persona behind stalled work sent %d, want 1", n)
+	}
+	countWakes()
+	if woken[fresh] != 1 {
+		t.Fatalf("newest persona was not woken: %v", woken[fresh])
 	}
 }
 

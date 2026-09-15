@@ -14,11 +14,18 @@
  *                 (refused before any Durable Object exists)
  *   state-path    GET /health/state with the wake bearer answers 200 via the
  *                 SUMI_STATE binding: Cloudflare → VPC Service → tunnel → API
+ *   do-runtime-auth (with --persona) POST /personas/<id>/check with the wake
+ *                 bearer: inside the Durable Object, the Worker's installed
+ *                 runtime secret must authenticate a persona-scoped state
+ *                 read through the SUMI_STATE binding. This is the check
+ *                 that catches a mismatched SUMI_CORE_RUNTIME_TOKEN, which
+ *                 health/state-path cannot see (unauthenticated route).
  * API checks (with --state; run where that address is reachable):
  *   runtime-scope the runtime credential reads a persona's state (needs
  *                 --persona) and is refused on persona creation (401)
  * Optional wake (with --persona): POST that persona's wake with the bearer;
- * it drains whatever is already queued and sends nothing new.
+ * it waits for the DO to start (lease + recovery, not a turn) and answers
+ * 503 if the runtime cannot start.
  *
  * Tokens are read from files and never printed. Exit 1 on any failed check.
  */
@@ -150,6 +157,21 @@ if (a.state) {
   );
 }
 if (a.persona) {
+  await check("do-runtime-auth", async () => {
+    const r = expect(
+      await call(`${core}/personas/${a.persona}/check`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${wake}` },
+      }),
+      200,
+      "DO authenticated state read",
+    );
+    if (r.body?.via !== "binding")
+      throw new Error(
+        `DO reached state via ${r.body?.via ?? "?"}, not the binding`,
+      );
+    return { status: r.status, body: { ok: r.body?.ok, via: r.body?.via } };
+  });
   await check("wake-persona", async () =>
     expect(
       await call(`${core}/personas/${a.persona}/wake`, {
