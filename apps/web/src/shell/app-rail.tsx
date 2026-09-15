@@ -17,6 +17,7 @@ import {
   LayoutGrid,
   MessageSquarePlus,
 } from "lucide-react";
+import { CoreApprovalsInbox } from "../approvals/inbox";
 import { preissuedSessionMode, useAuth } from "../auth/auth-context";
 import { SettingsPopover } from "../components/app-navigation";
 import {
@@ -243,6 +244,9 @@ export function AppRail({
         ) : null}
       </nav>
       <div className="mt-auto flex flex-col items-center gap-1 px-1 pb-3">
+        {authenticated && user ? (
+          <CoreApprovalsInbox accountID={user.id} />
+        ) : null}
         {feedbackEnabled && onReportFeedback && (
           <RailButton
             label="この画面からフィードバック（Alt + Shift + F）"

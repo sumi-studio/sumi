@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { useCoreApprovals } from "../approvals/store";
 import { secureRandomUUID } from "../lib/random-uuid";
 import { ApiMessagingBackend, MessagingAPIError } from "./api-backend";
 import { sanitizeAttachmentFilenameForDisplay } from "./attachment-display";
@@ -1989,6 +1990,10 @@ export const useMessaging = create<MessagingState>((set, get) => {
   ) => {
     if (event.type === "call_state") {
       useCall.getState().applyCallState(event.call);
+      return;
+    }
+    if (event.type === "core_approval_changed") {
+      void useCoreApprovals.getState().refresh();
       return;
     }
     if (event.type === "reaction_updated") {
