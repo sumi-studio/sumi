@@ -466,6 +466,8 @@ interface MessagingState {
   employedAgents: ParticipantRef[];
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
+  /** window間の未ロード区間を埋めているfetch。値は各行のbeforeSeq。 */
+  loadingGapsByPlace: Record<PlaceKey, number[]>;
   activePlaceKey: PlaceKey | null;
   /**
    * 編集セッション。対象IDと書きかけの本文は仮想リストの行の外——ここ——に置く。
@@ -524,7 +526,16 @@ interface MessagingState {
   /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
   duplicateChannel(channelId: string): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
-  loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
+  /**
+   * "found": 対象(またはそのtombstone)を含む周辺が読めた。
+   * "missing": 取得は完了したがseqが履歴に存在しない。
+   * "cancelled": place保持やtransportの切替で打ち切られた。呼び出し側は
+   * 取消しを「失敗」として表示してはいけない。
+   */
+  loadPlaceAround(
+    key: PlaceKey,
+    seq: number,
+  ): Promise<"found" | "missing" | "cancelled">;
   setDraft(key: PlaceKey, draft: string, transportGeneration?: number): void;
   setDraftSelection(
     key: PlaceKey,
@@ -573,6 +584,17 @@ interface MessagingState {
   toggleReaction(message: Message, emoji: string): void;
   votePoll(message: Message, optionIds: string[]): Promise<void>;
   loadOlder(key: PlaceKey): Promise<void>;
+  /**
+   * gap行からの途中履歴の補填。結果を呼び出し側へ返す:
+   * - "filled": 未取得区間がmergeされた
+   * - "failed": 現在の要求のままfetchが失敗した——呼び出し側は再試行を提示してよい
+   * - "cancelled": place/sessionの差し替えや無効な引数で要求が無効化された。
+   *   失敗として見せてはいけない。
+   */
+  loadGap(
+    key: PlaceKey,
+    beforeSeq: number,
+  ): Promise<"filled" | "failed" | "cancelled">;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
 }
@@ -2366,6 +2388,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   const PAGE_SIZE = 50;
+  /** loadPlaceAroundでtargetより新しい側に含める件数。target中心の1頁にする。 */
+  const AROUND_NEWER = 24;
 
   /**
    * この場所の履歴を持ったと宣言する。cursorはbackendが握手に載せ、切断中の
@@ -2409,17 +2433,25 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (
         !(key in state.messagesByPlace) &&
         !(key in state.hasMoreByPlace) &&
-        !(key in state.loadingOlderByPlace)
+        !(key in state.loadingOlderByPlace) &&
+        !(key in state.loadingGapsByPlace)
       ) {
         return {};
       }
       const messagesByPlace = { ...state.messagesByPlace };
       const hasMoreByPlace = { ...state.hasMoreByPlace };
       const loadingOlderByPlace = { ...state.loadingOlderByPlace };
+      const loadingGapsByPlace = { ...state.loadingGapsByPlace };
       delete messagesByPlace[key];
       delete hasMoreByPlace[key];
       delete loadingOlderByPlace[key];
-      return { messagesByPlace, hasMoreByPlace, loadingOlderByPlace };
+      delete loadingGapsByPlace[key];
+      return {
+        messagesByPlace,
+        hasMoreByPlace,
+        loadingOlderByPlace,
+        loadingGapsByPlace,
+      };
     });
   };
 
@@ -2821,6 +2853,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",
@@ -3431,13 +3464,15 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     async loadPlaceAround(key, seq) {
       const place = parsePlaceKey(key);
-      if (!place || !Number.isSafeInteger(seq) || seq < 1) return false;
+      if (!place || !Number.isSafeInteger(seq) || seq < 1) return "cancelled";
+      // tombstoneは「読み込み済み」ではない。検索とクリックの隙間に削除された
+      // 対象が配列に残っていても、周辺文脈を取りに行って削除標識として出す。
       if (
         (get().messagesByPlace[key] ?? []).some(
-          (message) => message.seq === seq,
+          (message) => message.seq === seq && !message.deleted,
         )
       ) {
-        return true;
+        return "found";
       }
       const request = beginMessagingBackendRequest();
       // permalink由来の追加取得も、いま開いて保持している場所へしか足さない。
@@ -3447,35 +3482,56 @@ export const useMessaging = create<MessagingState>((set, get) => {
         holdGeneration === undefined ||
         !holdsPlaceGeneration(key, holdGeneration)
       ) {
-        return false;
+        return "cancelled";
       }
+      // 1ページをtarget中心に取る。seq直前だけを取ると「直後の会話」が読めず、
+      // newest pageとの間に断絶だけが残る。前後を両方含め、残った未ロード区間は
+      // gap行として明示する（timeline.ts buildRows参照）。
       const messages = await request.wait((backend) =>
-        backend.fetchMessages(place, { beforeSeq: seq + 1, limit: 50 }),
+        backend.fetchMessages(place, {
+          beforeSeq: seq + AROUND_NEWER + 1,
+          limit: PAGE_SIZE,
+        }),
       );
       if (
         !messages ||
         !request.isCurrent() ||
         !holdsPlaceGeneration(key, holdGeneration)
       ) {
-        return false;
+        return "cancelled";
       }
       rememberKnownMessages(key, messages, get().lastReadByPlace[key] ?? 0);
-      set((state) => ({
-        messagesByPlace: {
-          ...state.messagesByPlace,
-          [key]: mergeMessagesWithOrphanPolls(
-            key,
-            state.messagesByPlace[key] ?? [],
-            messages,
-            "snapshot",
-          ),
-        },
-      }));
+      set((state) => {
+        const merged = mergeMessagesWithOrphanPolls(
+          key,
+          state.messagesByPlace[key] ?? [],
+          messages,
+          "snapshot",
+        );
+        return {
+          messagesByPlace: {
+            ...state.messagesByPlace,
+            [key]: merged,
+          },
+          // seqは密——先頭が1ならこれより古い履歴は無い。離れたwindowが併存
+          // していても「まだ古いものがあるか」は正確に分かる。
+          ...(merged[0]?.seq === 1
+            ? {
+                hasMoreByPlace: {
+                  ...state.hasMoreByPlace,
+                  [key]: false,
+                },
+              }
+            : {}),
+        };
+      });
       holdPlace(
         place,
         messages.reduce((head, message) => Math.max(head, message.seq), 0),
       );
-      return messages.some((message) => message.seq === seq);
+      return messages.some((message) => message.seq === seq)
+        ? "found"
+        : "missing";
     },
 
     setDraft(key, text, transportGeneration) {
@@ -4249,6 +4305,94 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
     },
 
+    async loadGap(key, beforeSeq) {
+      const state = get();
+      const place = parsePlaceKey(key);
+      const current = state.messagesByPlace[key];
+      if (!place || !current || current.length === 0) return "cancelled";
+      if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 2) return "cancelled";
+      if ((state.loadingGapsByPlace[key] ?? []).includes(beforeSeq))
+        return "cancelled";
+      const holdGeneration = placeHoldGenerations.get(key);
+      if (
+        holdGeneration === undefined ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
+        return "cancelled";
+      }
+      set((entry) => ({
+        loadingGapsByPlace: {
+          ...entry.loadingGapsByPlace,
+          [key]: [...(entry.loadingGapsByPlace[key] ?? []), beforeSeq],
+        },
+      }));
+      const request = beginMessagingBackendRequest();
+      try {
+        // Keep the loaded windows and the gap row if the request fails; the
+        // row stays clickable so the person can retry. A rejection while the
+        // request is still current is a real failure the caller may report;
+        // anything that settled after the context was replaced is cancelled,
+        // not failed.
+        let missing: Message[] | undefined;
+        try {
+          missing = await request.wait((backend) =>
+            backend.fetchMessages(place, {
+              beforeSeq,
+              limit: PAGE_SIZE,
+            }),
+          );
+        } catch {
+          return request.isCurrent() &&
+            holdsPlaceGeneration(key, holdGeneration)
+            ? "failed"
+            : "cancelled";
+        }
+        if (
+          !missing ||
+          !request.isCurrent() ||
+          !holdsPlaceGeneration(key, holdGeneration)
+        ) {
+          return "cancelled";
+        }
+        rememberKnownMessages(key, missing, get().lastReadByPlace[key] ?? 0);
+        set((entry) => {
+          const merged = mergeMessagesWithOrphanPolls(
+            key,
+            entry.messagesByPlace[key] ?? [],
+            missing,
+            "snapshot",
+          );
+          return {
+            messagesByPlace: {
+              ...entry.messagesByPlace,
+              [key]: merged,
+            },
+            // 埋めた区間が履歴の底まで届けば、これより古い履歴は無い。
+            ...(merged[0]?.seq === 1
+              ? {
+                  hasMoreByPlace: {
+                    ...entry.hasMoreByPlace,
+                    [key]: false,
+                  },
+                }
+              : {}),
+          };
+        });
+        return "filled";
+      } finally {
+        if (request.isCurrent() && holdsPlaceGeneration(key, holdGeneration)) {
+          set((entry) => ({
+            loadingGapsByPlace: {
+              ...entry.loadingGapsByPlace,
+              [key]: (entry.loadingGapsByPlace[key] ?? []).filter(
+                (seq) => seq !== beforeSeq,
+              ),
+            },
+          }));
+        }
+      }
+    },
+
     resolveReplyLater(markerId) {
       const request = beginMessagingBackendRequest();
       void request
@@ -4396,6 +4540,7 @@ export function suspendMessagingTransport(): void {
     transportGeneration: messagingSessionGeneration,
     startingDM: null,
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     // A request may have committed before its response was lost. Keep its
     // nonce/intent for the existing explicit retry instead of dropping it.
     pendingByPlace: Object.fromEntries(
@@ -4487,6 +4632,7 @@ function resetMessagingRuntime(
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",

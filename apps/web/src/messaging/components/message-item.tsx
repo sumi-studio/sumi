@@ -372,9 +372,11 @@ export const MessageItem = memo(function MessageItem({
             {replyAuthor.displayName}
           </span>
           <span className="truncate">
-            {replyTarget.content ||
-              replyTarget.poll?.question ||
-              "添付ファイル"}
+            {replyTarget.deleted
+              ? "削除されたメッセージ"
+              : replyTarget.content ||
+                replyTarget.poll?.question ||
+                "添付ファイル"}
           </span>
         </button>
       ) : null}

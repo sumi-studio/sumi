@@ -11,12 +11,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EMPTY_COMPOSER_DRAFT } from "../composer-draft";
-import type { PlaceKey } from "../model";
+import type { Message, PlaceKey } from "../model";
 import { bindMessagingSessionIdentity, useMessaging } from "../store";
 import { MessagingScreen } from "./messaging-screen";
 
 const mocks = vi.hoisted(() => ({
   placeNavigate: vi.fn(),
+  jumpToSeq: vi.fn(),
+  jumpToMessage: vi.fn(),
   jump: { placeKey: "channel:channel-b", seq: 1 } as {
     placeKey: PlaceKey;
     seq: number;
@@ -51,7 +53,17 @@ vi.mock("./connection-banner", () => ({ ConnectionBanner: () => null }));
 vi.mock("./member-list", () => ({
   MemberList: () => <aside data-testid="member-list" />,
 }));
-vi.mock("./message-list", () => ({ MessageList: () => null }));
+vi.mock("./message-list", () => ({
+  MessageList: ({ handleRef }: { handleRef?: { current: unknown } }) => {
+    if (handleRef) {
+      handleRef.current = {
+        jumpToSeq: mocks.jumpToSeq,
+        jumpToMessage: mocks.jumpToMessage,
+      };
+    }
+    return null;
+  },
+}));
 vi.mock("./composer", () => ({ Composer: () => null }));
 
 const SELF = { kind: "human", humanId: "human-a" } as const;
@@ -143,6 +155,8 @@ describe("MessagingScreen route-owned current place", () => {
   afterEach(() => {
     cleanup();
     mocks.placeNavigate.mockReset();
+    mocks.jumpToSeq.mockReset();
+    mocks.jumpToMessage.mockReset();
     vi.unstubAllGlobals();
     Reflect.deleteProperty(navigator, "serviceWorker");
     useMessaging.setState({
@@ -518,5 +532,165 @@ describe("MessagingScreen route-owned current place", () => {
     expect(
       screen.getByRole("button", { name: "許可する" }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("MessagingScreen jump outcome", () => {
+  const TARGET_MESSAGE: Message = {
+    messageId: "jump-target-9",
+    place: { kind: "channel", channelId: "channel-b" },
+    seq: 9,
+    author: SELF,
+    content: "対象メッセージ",
+    mentions: [],
+    urgency: "normal",
+    reactions: [],
+    attachments: [],
+    poll: null,
+    replyTo: null,
+    createdAt: 1,
+    editedAt: null,
+    deleted: false,
+  };
+
+  beforeEach(() => {
+    bindMessagingSessionIdentity(null);
+    bindMessagingSessionIdentity("human-a");
+    mocks.jump = { placeKey: CHANNEL_B, seq: 9 };
+    seedCurrentPlace();
+  });
+
+  afterEach(() => {
+    cleanup();
+    mocks.placeNavigate.mockReset();
+    mocks.jumpToSeq.mockReset();
+    mocks.jumpToMessage.mockReset();
+    useMessaging.setState({
+      init: realInit,
+      selectPlace: realSelectPlace,
+      loadPlaceAround: realLoadPlaceAround,
+      loadThread: realLoadThread,
+      loadThreads: realLoadThreads,
+    });
+    bindMessagingSessionIdentity(null);
+  });
+
+  it("reports a failed jump in context and retries to the same target", async () => {
+    const loadPlaceAround = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue("found" as const);
+    useMessaging.setState({
+      loadPlaceAround,
+      messagesByPlace: { [CHANNEL_B]: [{ ...TARGET_MESSAGE }] },
+    });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
+
+    // 旧実装はrejectionを握り潰してpendingJumpを解決しなかった。
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "そのメッセージへ移動できませんでした",
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+    await waitFor(() =>
+      expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 9),
+    );
+    await waitFor(() => expect(mocks.jumpToSeq).toHaveBeenCalledWith(9));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("reports a genuinely missing target without offering a retry", async () => {
+    const loadPlaceAround = vi.fn().mockResolvedValue("missing" as const);
+    useMessaging.setState({ loadPlaceAround });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "そのメッセージは存在しないか、アクセスできません",
+      ),
+    );
+    expect(
+      screen.queryByRole("button", { name: "再試行" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale failure after a newer jump replaced it", async () => {
+    let rejectFirst!: (reason: unknown) => void;
+    const loadPlaceAround = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<"found">((_, no) => {
+            rejectFirst = no;
+          }),
+      )
+      .mockResolvedValue("found" as const);
+    useMessaging.setState({
+      loadPlaceAround,
+      messagesByPlace: { [CHANNEL_B]: [{ ...TARGET_MESSAGE }] },
+    });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
+    await waitFor(() =>
+      expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 9),
+    );
+
+    // 同じ場所へ別のjumpを要求してから、古いfetchを失敗させる。
+    mocks.jump = { placeKey: CHANNEL_B, seq: 5 };
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    await waitFor(() =>
+      expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 5),
+    );
+    await act(async () => rejectFirst(new Error("late failure")));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // 新しいjumpはseq5を待ち続ける。後続で到着すれば普通にjumpする。
+    act(() => {
+      useMessaging.setState({
+        messagesByPlace: {
+          [CHANNEL_B]: [
+            { ...TARGET_MESSAGE },
+            { ...TARGET_MESSAGE, messageId: "jump-target-5", seq: 5 },
+          ],
+        },
+      });
+    });
+    await waitFor(() => expect(mocks.jumpToSeq).toHaveBeenCalledWith(5));
+  });
+
+  it("drops the outcome when the transport generation replaced the jump", async () => {
+    let rejectFirst!: (reason: unknown) => void;
+    const loadPlaceAround = vi.fn().mockImplementationOnce(
+      () =>
+        new Promise<"found">((_, no) => {
+          rejectFirst = no;
+        }),
+    );
+    useMessaging.setState({ loadPlaceAround });
+    const view = render(<MessagingScreen placeKey={CHANNEL_A} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "jump to old result" }));
+    view.rerender(<MessagingScreen placeKey={CHANNEL_B} />);
+    await waitFor(() =>
+      expect(loadPlaceAround).toHaveBeenCalledWith(CHANNEL_B, 9),
+    );
+
+    const generation = useMessaging.getState().transportGeneration;
+    act(() => {
+      useMessaging.setState({ transportGeneration: generation + 1 });
+    });
+    await act(async () => rejectFirst(new Error("stale transport")));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
