@@ -24,6 +24,7 @@ import {
 import type { ComponentType } from "react";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/auth-context";
+import { peekPendingProviderRedirect } from "../auth/provider-redirect";
 import { ProviderSettings } from "../auth/provider-settings";
 import {
   canonicalizeSumiDisplayName,
@@ -39,8 +40,8 @@ import {
 import { refreshMessagingMemberProfiles } from "../messaging/store";
 import { ParticipantAppsMenu } from "../participant/app-menu";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
-import { ModelProviderSettings } from "./model-provider-settings";
 import { EnrollmentInvitations } from "./enrollment-invitations";
+import { ModelProviderSettings } from "./model-provider-settings";
 
 const THEME_OPTIONS: Array<{
   id: ThemePreference;
@@ -87,6 +88,16 @@ export function SettingsPopover() {
   });
   const [savingProfile, setSavingProfile] = useState(false);
   const humanID = authenticated ? (user?.id ?? null) : null;
+
+  // A provider-redirect return resumes its pending change inside this
+  // popover; reopen it for the receipt's Human so the person lands back on
+  // the original action instead of a hidden pending state.
+  useEffect(() => {
+    const redirect = peekPendingProviderRedirect();
+    if (redirect && humanID && redirect.humanId === humanID) {
+      setSettingsOpen(true);
+    }
+  }, [humanID]);
 
   const profileOwner = useRef(humanID);
   useEffect(() => {
@@ -477,9 +488,6 @@ function ThemePicker() {
   return (
     <Popover>
       <PopoverTrigger
-        openOnHover
-        delay={0}
-        closeDelay={120}
         render={
           <Button
             variant="ghost"

@@ -52,6 +52,11 @@ import {
   takeAuthOutcomeNotice,
 } from "./auth-outcome-notice-state";
 import {
+  publishSessionEnded,
+  subscribeSessionEnded,
+} from "./auth-session-broadcast";
+import { noteAuthTeardown } from "./auth-transition";
+import {
   beginSameEmailCredentialRecovery,
   completeSameEmailCredentialRecovery,
   isSameEmailCredentialCollision,
@@ -75,6 +80,7 @@ import {
 } from "./email-code-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import { clearPendingProviderRedirect } from "./provider-redirect";
 import {
   beginRedirectSignIn,
   hasPendingRedirectSignIn,
@@ -245,6 +251,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [sessionSuspended, setSessionSuspended] = useState(false);
   const logoutPending = useRef(false);
   const sessionRevalidationRequired = useRef(false);
+  // BroadcastChannel reaches other contexts on this origin — including this
+  // page's own subscription — so the sender token lets us skip our own echo.
+  const authBroadcastSender = useRef(
+    globalThis.crypto?.randomUUID?.() ??
+      `auth-${Math.random().toString(36).slice(2)}`,
+  ).current;
   const [confirmation, setConfirmation] =
     useState<PendingAuthConfirmation | null>(() => loadPendingConfirmation());
   const [outcomeNotice, setOutcomeNotice] = useState<AuthOutcomeNotice | null>(
@@ -1591,6 +1603,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [updateProfile],
   );
 
+  /**
+   * The local half of a committed session end, shared by explicit logout and
+   * a logout another tab announced. The caller must already have established
+   * that the server session is gone; generation claiming stays with the
+   * caller. Every pending flow is dropped locally so nothing can replay it
+   * into a session.
+   */
+  const teardownSessionState = useCallback((): boolean => {
+    const pendingFlows = listPendingEmailFlows();
+    let authorityCleared = true;
+    flushSync(() => {
+      authorityCleared = clearDirectChatAuthority();
+      sessionRevalidationRequired.current = false;
+      setSessionSuspended(false);
+      serverSession.current = { authenticated: false };
+      setSession({ authenticated: false });
+      setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
+      clearPendingConfirmation();
+      setConfirmation(null);
+      for (const flow of pendingFlows) {
+        clearPendingEmailFlow(flow.state);
+      }
+      if (emailCodeFlow) {
+        clearActiveEmailFlowState(emailCodeFlow.state);
+      }
+      setEmailCodeFlow(null);
+      setEmailChallenge(null);
+      clearPendingEmailLink();
+      setEmailLinkPending(false);
+      clearPendingRedirectFlow();
+      clearPendingProviderRedirect();
+      emailCompletionRecoveries.current.clear();
+      setAccountSwitch(null);
+      setCredentialRecoveryEmailSent(false);
+      clearAuthOutcomeNotice();
+      setOutcomeNotice(null);
+    });
+    return authorityCleared;
+  }, [emailCodeFlow]);
+
   const logout = useCallback(async () => {
     if (logoutPending.current) return;
     const generation = nextGeneration();
@@ -1631,38 +1683,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw error;
     }
     logoutPending.current = false;
+    // The server session ended: other live tabs of this browser must drop the
+    // same identity rather than keep showing a session that no longer exists.
+    publishSessionEnded(authBroadcastSender);
     startPushSubscriptionLogoutCleanup();
     let authorityCleared = true;
     if (isCurrentGeneration(generation)) {
       // Server logout is the authority transition. Commit it before touching
       // optional Firebase/emulator display-state cleanup, which may throw
-      // synchronously during setup. Every pending flow the server just
-      // closed is dropped locally so nothing can replay it into a session.
-      const pendingFlows = listPendingEmailFlows();
-      flushSync(() => {
-        authorityCleared = clearDirectChatAuthority();
-        sessionRevalidationRequired.current = false;
-        setSessionSuspended(false);
-        serverSession.current = { authenticated: false };
-        setSession({ authenticated: false });
-        setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
-        clearPendingConfirmation();
-        setConfirmation(null);
-        for (const flow of pendingFlows) {
-          clearPendingEmailFlow(flow.state);
-        }
-        if (emailCodeFlow) {
-          clearActiveEmailFlowState(emailCodeFlow.state);
-        }
-        setEmailCodeFlow(null);
-        setEmailChallenge(null);
-        clearPendingEmailLink();
-        setEmailLinkPending(false);
-        clearPendingRedirectFlow();
-        emailCompletionRecoveries.current.clear();
-        setAccountSwitch(null);
-        setCredentialRecoveryEmailSent(false);
-      });
+      // synchronously during setup.
+      authorityCleared = teardownSessionState();
     }
     await signOutFirebaseBestEffort();
     if (!authorityCleared) {
@@ -1670,12 +1700,72 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [
     confirmation,
-    emailCodeFlow,
     isCurrentGeneration,
     nextGeneration,
     refreshSession,
     serializeSessionMutation,
+    teardownSessionState,
   ]);
+
+  /**
+   * Another live tab of this browser ended the session. Verify the jar's real
+   * state before acting: a sign-in that already replaced the session wins and
+   * is adopted; otherwise run the same local teardown a local logout
+   * performs, including the Firebase sign-out a delayed provider lookup can
+   * otherwise reinstall.
+   */
+  const honourRemoteSessionEnd = useCallback(async () => {
+    if (preissuedSessionMode || !authOriginAllowed) return;
+    // A local explicit logout already owns the same teardown.
+    if (logoutPending.current) return;
+    await serializeSessionMutation(async () => {
+      let live: SumiSessionStatus;
+      try {
+        live = await getSumiSession();
+      } catch {
+        // The broadcast proves the old session ended, but a read we cannot
+        // complete cannot establish what replaced it. Drop this tab's local
+        // authority while keeping the shared Firebase identity — it may now
+        // belong to a newer session this read could not see; the next
+        // successful read adopts or clears it.
+        nextGeneration();
+        teardownSessionState();
+        return;
+      }
+      if (live.authenticated) {
+        if (
+          serverSession.current.authenticated &&
+          serverSession.current.user.id === live.user.id
+        ) {
+          return;
+        }
+        // The jar's newer session — another tab already signed in again or
+        // switched — is adopted instead of torn down.
+        flushSync(() => {
+          bindDirectChatAuthority(live.authorityBindingId);
+          sessionRevalidationRequired.current = false;
+          setSessionSuspended(false);
+          serverSession.current = live;
+          setSession(live);
+          setSessionState("authenticated");
+        });
+        return;
+      }
+      // Claim the generation exactly as an explicit logout does, so in-flight
+      // completions cannot republish the ended identity, then run the same
+      // local teardown.
+      nextGeneration();
+      teardownSessionState();
+      await signOutFirebaseBestEffort();
+    });
+  }, [nextGeneration, serializeSessionMutation, teardownSessionState]);
+
+  useEffect(() => {
+    if (preissuedSessionMode || !authOriginAllowed) return;
+    return subscribeSessionEnded(authBroadcastSender, () => {
+      void honourRemoteSessionEnd();
+    });
+  }, [honourRemoteSessionEnd]);
 
   const user = useMemo<AuthUser | null>(() => {
     if (sessionState === "preissued" && preissuedUserID) {
@@ -1842,6 +1932,10 @@ function firebaseAccount(user: {
 async function signOutFirebaseBestEffort(): Promise<void> {
   try {
     const auth = getFirebaseAuth();
+    // Mark the identity being torn down before awaiting so an in-flight
+    // provider operation that still holds this account can honour the
+    // transition instead of persisting it again.
+    noteAuthTeardown(auth.currentUser?.uid);
     await signOut(auth).catch(() => undefined);
   } catch {
     // Firebase is cleanup-only after Sumi authority has ended.
