@@ -705,6 +705,7 @@ func TestApprovedGrantWithoutEffectSettlesFailed(t *testing.T) {
 		internal         bool
 		requiresApproval bool
 		elevatedOnly     bool
+		readOnly         bool
 	}{internal: true, elevatedOnly: true}
 	t.Cleanup(func() { delete(toolAuthority, "phantom.gated") })
 

@@ -47,7 +47,9 @@ type workspaceQuerier interface {
 // the agentstate store; the core then advertises them to the model.
 func (s *Store) CoreInvitationToolEffects() map[string]agentstate.ToolEffect {
 	return map[string]agentstate.ToolEffect{
-		WorkspaceInvitationListTool:   {Apply: s.applyInvitationList},
+		// list is a pure read; accept joins a workspace — a mutation that
+		// must stay hedged in the terminal-failure notice.
+		WorkspaceInvitationListTool:   {Apply: s.applyInvitationList, ReadOnly: agentstate.AlwaysReadOnly},
 		WorkspaceInvitationAcceptTool: {Apply: s.applyInvitationAccept},
 	}
 }

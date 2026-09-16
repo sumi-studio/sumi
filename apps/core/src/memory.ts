@@ -174,6 +174,54 @@ export function inputMarker(p: InputProvenance): string {
   return `[${who}${where}${refs}${change}${hint}]`;
 }
 
+const formatByteSize = (n: number): string =>
+  n >= 1_048_576
+    ? `${(n / 1_048_576).toFixed(1)} MiB`
+    : n >= 1024
+      ? `${(n / 1024).toFixed(1)} KiB`
+      : `${n} B`;
+
+/**
+ * Render the attachment metadata an input carries as readable lines, or ""
+ * when there are none. Metadata is the delivered view — it never grants byte
+ * access — so each line names the attachment_id the model would pass to
+ * messaging.open_attachment (with the input's place_id and message_id) to
+ * actually read the file.
+ */
+export function attachmentLines(raw: unknown): string {
+  if (!Array.isArray(raw) || raw.length === 0) return "";
+  const lines = raw.map((a) => {
+    const o = (a ?? {}) as Record<string, unknown>;
+    const name = str(o.filename) || "attachment";
+    const mime = str(o.mime);
+    const size =
+      typeof o.size_bytes === "number"
+        ? `, ${formatByteSize(o.size_bytes)}`
+        : "";
+    const spoiler = o.spoiler === true ? ", spoiler" : "";
+    const alt = str(o.alt);
+    const id = str(o.attachment_id);
+    return (
+      `- ${name}${mime ? ` (${mime}` : ""}${mime ? ")" : ""}${size}${spoiler}` +
+      `${alt ? ` — ${alt}` : ""}${id ? ` [attachment_id=${id}]` : ""}`
+    );
+  });
+  return `[${raw.length} attachment${raw.length === 1 ? "" : "s"} — bytes via messaging.open_attachment]\n${lines.join("\n")}`;
+}
+
+/**
+ * The body text an input presents: its text plus any attachment lines. An
+ * attachment-only message still produces a meaningful body, so the wake is
+ * never content-free. "" when the input truly carries nothing readable —
+ * callers keep their existing fallback for that case.
+ */
+export function inputBodyText(p: Record<string, unknown>): string {
+  const text = typeof p.text === "string" ? p.text : "";
+  const attachments = attachmentLines(p.attachments);
+  if (text !== "" && attachments !== "") return `${text}\n${attachments}`;
+  return attachments !== "" ? attachments : text;
+}
+
 /** Map one journal event to the model-visible message, or null for kinds
  * with no context rendering (e.g. internal bookkeeping). */
 export function eventMessage(ev: Event): ChatMessage | null {
@@ -194,7 +242,7 @@ export function eventMessage(ev: Event): ChatMessage | null {
               attention: str(p.attention),
               change: str(p.message_change),
             });
-      return { role: "user", content: `${who} ${String(p.text ?? "")}` };
+      return { role: "user", content: `${who} ${inputBodyText(p)}` };
     }
     case "assistant_message":
       return { role: "assistant", content: String(p.text ?? "") };

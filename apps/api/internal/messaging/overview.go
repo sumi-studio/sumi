@@ -15,6 +15,13 @@ type overviewWire struct {
 }
 
 func (s *Server) buildOverview(ctx context.Context, store *ScopedStore) (overviewWire, error) {
+	return buildOverviewWire(ctx, store)
+}
+
+// buildOverviewWire projects the shared overview the browser bootstrap and
+// every non-HTTP lane serve: one scope's view of the workspace, places,
+// members, cursors, and unread summaries.
+func buildOverviewWire(ctx context.Context, store *ScopedStore) (overviewWire, error) {
 	viewer := store.Scope.Actor
 	summaries, err := store.UnreadSummaries(ctx)
 	if err != nil {

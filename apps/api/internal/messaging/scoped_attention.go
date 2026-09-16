@@ -12,7 +12,7 @@ import (
 )
 
 func (s *ScopedStore) NotificationSettingFor(ctx context.Context) (NotificationSetting, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return NotificationSetting{}, fmt.Errorf("begin scoped notification-setting read: %w", err)
 	}
@@ -77,7 +77,7 @@ func (s *ScopedStore) SetNotificationSetting(ctx context.Context, defaultLevel s
 	if err != nil {
 		return NotificationSetting{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return NotificationSetting{}, fmt.Errorf("begin set scoped notification setting: %w", err)
 	}
@@ -156,7 +156,7 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 	if utf8.RuneCountInString(note) > MaxStatusNoteChars {
 		return ParticipantStatus{}, fmt.Errorf("note exceeds %d characters", MaxStatusNoteChars)
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return ParticipantStatus{}, fmt.Errorf("begin set scoped status: %w", err)
 	}
@@ -211,7 +211,7 @@ func (s *ScopedStore) SetStatus(ctx context.Context, status, note string, expire
 }
 
 func (s *ScopedStore) StatusesVisibleTo(ctx context.Context) ([]ParticipantStatus, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped statuses read: %w", err)
 	}
@@ -262,7 +262,7 @@ func (s *ScopedStore) ParticipantVisible(ctx context.Context, target Participant
 	if err := target.Validate(); err != nil {
 		return false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -291,7 +291,7 @@ func (s *ScopedStore) CreateReplyLater(ctx context.Context, placeID, messageID, 
 	if utf8.RuneCountInString(note) > MaxReplyLaterNoteChars || remindAt.IsZero() {
 		return ReplyLaterMarker{}, false, errors.New("invalid reply-later marker")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return ReplyLaterMarker{}, false, fmt.Errorf("begin scoped reply-later: %w", err)
 	}
@@ -343,7 +343,7 @@ func (s *ScopedStore) CreateReplyLater(ctx context.Context, placeID, messageID, 
 }
 
 func (s *ScopedStore) ResolveReplyLater(ctx context.Context, markerID string) (ReplyLaterMarker, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return ReplyLaterMarker{}, err
 	}
@@ -389,7 +389,7 @@ func (s *ScopedStore) ResolveReplyLater(ctx context.Context, markerID string) (R
 }
 
 func (s *ScopedStore) ReplyLaterMarkersFor(ctx context.Context) ([]ReplyLaterMarker, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +553,7 @@ func (s *ScopedStore) notificationDecisionsForMembersScoped(ctx context.Context,
 }
 
 func (s *ScopedStore) NotificationDecisionsFor(ctx context.Context, place Place, message Message) ([]NotificationDecision, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +589,7 @@ func (s *ScopedStore) NotificationDecisionsFor(ctx context.Context, place Place,
 }
 
 func (s *ScopedStore) NotificationIntentsForMessage(ctx context.Context, messageID string) ([]NotificationDecision, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, err
 	}

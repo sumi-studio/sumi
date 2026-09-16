@@ -223,6 +223,26 @@ func coreInputFromEvent(event AgentAttentionEvent) *agentstate.Input {
 	if event.Content != "" {
 		payload["text"] = event.Content
 	}
+	if len(event.Attachments) > 0 {
+		// The attachment metadata is part of the delivered view: an
+		// attachment-only message must not arrive as an empty input.
+		attachments := make([]map[string]any, len(event.Attachments))
+		for i, a := range event.Attachments {
+			attachments[i] = map[string]any{
+				"attachment_id": a.AttachmentID,
+				"filename":      a.Filename,
+				"mime":          a.MIME,
+				"size_bytes":    a.SizeBytes,
+				"sha256":        a.SHA256,
+				"position":      a.Position,
+				"spoiler":       a.Spoiler,
+			}
+			if a.Alt != "" {
+				attachments[i]["alt"] = a.Alt
+			}
+		}
+		payload["attachments"] = attachments
+	}
 	if event.Reason != "" {
 		payload["reason"] = event.Reason
 	}
@@ -288,11 +308,26 @@ func (d *CoreAttentionDelivery) applySend(ctx context.Context, tx pgx.Tx, person
 	placeID, _ := request["place_id"].(string)
 	content, _ := request["content"].(string)
 	replyTo, _ := request["reply_to"].(string)
+	urgency, _ := request["urgency"].(string)
 	appendIn := AppendInput{
 		PlaceID:     placeID,
 		Content:     content,
+		Urgency:     urgency,
 		ReplyTo:     replyTo,
-		ClientNonce: coreSendNonce(idemKey),
+		ClientNonce: coreToolNonce(MessagingCoreTool, idemKey),
+	}
+	if ids, ok := request["attachments"]; ok {
+		list, isList := ids.([]any)
+		if !isList {
+			return nil, fmt.Errorf("%w: attachments must be a list of attachment ids", agentstate.ErrBadRequest)
+		}
+		for _, raw := range list {
+			id, isString := raw.(string)
+			if !isString {
+				return nil, fmt.Errorf("%w: attachments must be a list of attachment ids", agentstate.ErrBadRequest)
+			}
+			appendIn.AttachmentIDs = append(appendIn.AttachmentIDs, id)
+		}
 	}
 	if err := normalizeAppendInput(&appendIn); err != nil {
 		// Admission-time request rules are deterministic — replaying the same
@@ -300,30 +335,34 @@ func (d *CoreAttentionDelivery) applySend(ctx context.Context, tx pgx.Tx, person
 		// instead of retrying.
 		return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, err)
 	}
-	scoped, err := d.scopeForCoreSend(ctx, tx, personaID, placeID)
+	scoped, err := d.scopeForCorePlace(ctx, tx, personaID, placeID)
 	if err != nil {
-		return nil, sendFailure(err)
+		return nil, coreEffectFailure(err)
 	}
 	message, created, err := scoped.appendScopedInTx(ctx, tx, appendIn)
 	if err != nil {
-		return nil, sendFailure(err)
+		return nil, coreEffectFailure(err)
 	}
-	return map[string]any{
+	response := map[string]any{
 		"message_id": message.MessageID,
 		"place_id":   message.PlaceID,
 		"seq":        message.Seq,
 		"created":    created,
 		"reply_to":   message.ReplyTo,
 		"created_at": message.CreatedAt.UTC().Format(time.RFC3339Nano),
-	}, nil
+	}
+	if len(message.Attachments) > 0 {
+		response["attachments"] = wireJSON(attachmentsToWire(message.Attachments))
+	}
+	return response, nil
 }
 
-// scopeForCoreSend resolves the Messaging scope for a secretary send inside
-// the caller's transaction: place → workspace → the workspace's current
-// enabled installation. The send rides the installation's live authority
-// epoch, never a frozen event's — a disabled or reinstalled app cannot
-// authorize a new post.
-func (d *CoreAttentionDelivery) scopeForCoreSend(ctx context.Context, tx pgx.Tx, personaID, placeID string) (*ScopedStore, error) {
+// scopeForCorePlace resolves the Messaging scope for a place-addressed core
+// tool call inside the caller's transaction: place → workspace → the
+// workspace's current enabled installation. The effect rides the
+// installation's live authority epoch, never a frozen event's — a disabled
+// or reinstalled app cannot authorize a new call.
+func (d *CoreAttentionDelivery) scopeForCorePlace(ctx context.Context, tx pgx.Tx, personaID, placeID string) (*ScopedStore, error) {
 	if !canonicalid.IsUUIDv7(placeID) {
 		return nil, ErrPlaceNotFound
 	}
@@ -336,9 +375,19 @@ func (d *CoreAttentionDelivery) scopeForCoreSend(ctx context.Context, tx pgx.Tx,
 	if err != nil {
 		return nil, err
 	}
+	return d.scopeForCoreWorkspace(ctx, tx, personaID, workspaceID)
+}
+
+// scopeForCoreWorkspace resolves the Messaging scope for a
+// workspace-addressed core tool call — overview, search, DM/channel
+// creation, notification settings — where no place names the workspace.
+func (d *CoreAttentionDelivery) scopeForCoreWorkspace(ctx context.Context, tx pgx.Tx, personaID, workspaceID string) (*ScopedStore, error) {
+	if !canonicalid.IsUUIDv7(workspaceID) {
+		return nil, ErrInvalidScope
+	}
 	var installationID string
 	var epoch int64
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT installation_id::text, authority_epoch
 		FROM app_installations
 		WHERE owner_kind = 'workspace' AND owner_id = $1
@@ -375,7 +424,7 @@ func (d *CoreAttentionDelivery) afterSendCommit(ctx context.Context, personaID s
 		return
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	scoped, err := d.scopeForCoreSend(ctx, tx, personaID, placeID)
+	scoped, err := d.scopeForCorePlace(ctx, tx, personaID, placeID)
 	if err != nil {
 		return
 	}
@@ -390,34 +439,57 @@ func (d *CoreAttentionDelivery) afterSendCommit(ctx context.Context, personaID s
 	if err != nil {
 		return
 	}
+	// Mentions, attachments, and polls ride the live event — the same parts
+	// every other send lane publishes — so recipients render the full
+	// message without a reload.
+	parts := []Message{message}
+	if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
+		return
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return
 	}
-	publishMessageCreated(ctx, scoped, d.Hub, place, message)
+	publishMessageCreated(ctx, scoped, d.Hub, place, parts[0])
 }
 
-// coreSendNonce derives the send's client nonce from the operation's
-// server-owned idempotency identity (input + plan position). A replayed
-// claim replays the identical request under the identical nonce, so the
-// append dedup path and the operation ledger agree on one message.
-func coreSendNonce(idemKey string) string {
-	sum := sha256.Sum256([]byte(MessagingCoreTool + ":" + idemKey))
+// coreToolNonce derives a delegated Messaging effect's client nonce from the
+// operation's server-owned idempotency identity (input + plan position). A
+// replayed claim replays the identical request under the identical nonce, so
+// the domain's dedup receipts and the operation ledger agree on one
+// mutation — one message, one created place, one finalized upload.
+func coreToolNonce(tool, idemKey string) string {
+	sum := sha256.Sum256([]byte(tool + ":" + idemKey))
 	return "core:" + hex.EncodeToString(sum[:20])
 }
 
-// sendFailure classifies effect errors for the operation ledger: known
+// coreEffectFailure classifies effect errors for the operation ledger: known
 // Messaging/app rejections are deterministic — they surface to the model as
 // a tool result (400) instead of leaving the turn to retry the same claim.
 // Anything unrecognized stays transient — storage outages must retry.
-func sendFailure(err error) error {
+func coreEffectFailure(err error) error {
+	var conflict *messageRevisionConflictError
 	switch {
 	case errors.Is(err, ErrPlaceNotFound), errors.Is(err, ErrMessageNotFound),
+		errors.Is(err, ErrWorkspaceNotFound), errors.Is(err, ErrNotAMember),
+		errors.Is(err, ErrParticipantNotFound), errors.Is(err, ErrSeqBeyondLatest),
 		errors.Is(err, ErrForbidden), errors.Is(err, ErrNotAuthor),
-		errors.Is(err, ErrIdempotencyConflict), errors.Is(err, ErrInvalidPoll),
+		errors.Is(err, ErrNotReachable), errors.Is(err, ErrIdempotencyConflict),
+		errors.Is(err, ErrInvalidPoll), errors.Is(err, ErrMessageDeleted),
 		errors.Is(err, ErrTooManyAttachments), errors.Is(err, ErrInvalidScope),
+		errors.Is(err, ErrInvalidChannelName), errors.Is(err, ErrEmptyChannelUpdate),
+		errors.Is(err, ErrNotAChannel), errors.Is(err, ErrNotThreadable),
+		errors.Is(err, ErrInvalidNotificationSetting),
+		errors.Is(err, ErrAttachmentNotFound), errors.Is(err, ErrAttachmentTooLarge),
+		errors.Is(err, ErrAttachmentEmpty), errors.Is(err, ErrAttachmentNonce),
+		errors.Is(err, ErrAttachmentQuotaExceeded), errors.Is(err, ErrAttachmentDraftLimit),
+		errors.Is(err, ErrAttachmentUploadConflict), errors.Is(err, ErrAttachmentUploadExpired),
+		errors.Is(err, ErrAttachmentUploadInProgress), errors.Is(err, ErrAttachmentSizeMismatch),
+		errors.Is(err, ErrAttachmentsUnavailable), errors.Is(err, ErrAttachmentAlreadySent),
 		errors.Is(err, applicationapps.ErrInstallationNotFound),
 		errors.Is(err, applicationapps.ErrAppDisabled),
 		errors.Is(err, applicationapps.ErrAuthorityEpochStale):
+		return fmt.Errorf("%w: %v", agentstate.ErrBadRequest, err)
+	case errors.As(err, &conflict):
 		return fmt.Errorf("%w: %v", agentstate.ErrBadRequest, err)
 	}
 	var pgErr *pgconn.PgError
