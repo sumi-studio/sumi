@@ -3446,9 +3446,11 @@ export const useMessaging = create<MessagingState>((set, get) => {
     async loadPlaceAround(key, seq) {
       const place = parsePlaceKey(key);
       if (!place || !Number.isSafeInteger(seq) || seq < 1) return false;
+      // tombstoneは「読み込み済み」ではない。検索とクリックの隙間に削除された
+      // 対象が配列に残っていても、周辺文脈を取りに行って削除標識として出す。
       if (
         (get().messagesByPlace[key] ?? []).some(
-          (message) => message.seq === seq,
+          (message) => message.seq === seq && !message.deleted,
         )
       ) {
         return true;

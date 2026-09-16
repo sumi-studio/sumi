@@ -44,6 +44,7 @@ function estimateRowSize(row: ListRow): number {
   if (row.kind === "date") return 36;
   if (row.kind === "unread") return 24;
   if (row.kind === "gap") return 40;
+  if (row.kind === "deleted") return 28;
   return row.grouped ? 30 : 62;
 }
 
@@ -127,6 +128,9 @@ export function MessageList({
   const [atEnd, setAtEnd] = useState(true);
   const atEndRef = useRef(true);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  // 検索結果やpermalinkから辿った対象が削除済みだったとき、そのseq位置に出す
+  // 標識。placeを離れたり別の対象へjumpしたら消す。
+  const [deletedMarkerSeq, setDeletedMarkerSeq] = useState<number | null>(null);
   const highlightTimer = useRef<number | null>(null);
   const visibleIdsRef = useRef<string[]>([]);
   const positionedPlaceRef = useRef<string | null>(null);
@@ -149,11 +153,20 @@ export function MessageList({
       unreadLineSeq,
       self,
       now: Date.now(),
+      deletedTargetSeq: deletedMarkerSeq,
     });
     return hasMore
       ? ([{ id: "__older__", kind: "older" } as OlderRow, ...built] as const)
       : built;
-  }, [messages, pending, selfKey, unreadLineSeq, self, hasMore]);
+  }, [
+    messages,
+    pending,
+    selfKey,
+    unreadLineSeq,
+    self,
+    hasMore,
+    deletedMarkerSeq,
+  ]);
 
   const messagesById = useMemo(() => {
     const map = new Map<string, Message>();
@@ -182,6 +195,7 @@ export function MessageList({
   }, [replyLaterById, selfKey, membersByKey]);
 
   const flashMessage = useCallback((messageId: string) => {
+    setDeletedMarkerSeq(null);
     virtualizerRef.current?.scrollToMessage(messageId, {
       align: "center",
       behavior: "auto",
@@ -194,17 +208,66 @@ export function MessageList({
     );
   }, []);
 
+  // 削除済みのjump対象は行として存在しないので、tombstone位置に「削除されて
+  // います」標識を出してそこへ運ぶ。標識行は次のrenderでitemsに入るため、
+  // scrollはeffect側で行う（下のuseEffect参照）。
+  const markDeletedTarget = useCallback((seq: number) => {
+    setHighlightedId(null);
+    if (highlightTimer.current) window.clearTimeout(highlightTimer.current);
+    setDeletedMarkerSeq(seq);
+  }, []);
+
   useImperativeHandle(
     handleRef,
     () => ({
-      jumpToMessage: flashMessage,
+      jumpToMessage: (messageId) => {
+        const message = messagesById.get(messageId);
+        if (message?.deleted) {
+          markDeletedTarget(message.seq);
+          return;
+        }
+        flashMessage(messageId);
+      },
       jumpToSeq: (seq) => {
         const id = seqToId.get(seq);
-        if (id) flashMessage(id);
+        if (!id) return;
+        if (messagesById.get(id)?.deleted) {
+          markDeletedTarget(seq);
+          return;
+        }
+        flashMessage(id);
       },
     }),
-    [flashMessage, seqToId],
+    [flashMessage, markDeletedTarget, messagesById, seqToId],
   );
+
+  // 削除標識行がitemsに入ったあと、その行へviewportを運ぶ。tombstone自体が
+  // jump後のfetchで届くこともあるので、標識行が現れるまでscrollを持ち越す。
+  const deletedScrollDoneRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (deletedMarkerSeq === null) {
+      deletedScrollDoneRef.current = null;
+      return;
+    }
+    if (deletedScrollDoneRef.current === deletedMarkerSeq) return;
+    if (!rows.some((row) => row.id === `deleted:${deletedMarkerSeq}`)) return;
+    deletedScrollDoneRef.current = deletedMarkerSeq;
+    const frame = window.requestAnimationFrame(() => {
+      virtualizerRef.current?.scrollToMessage(`deleted:${deletedMarkerSeq}`, {
+        align: "center",
+        behavior: "auto",
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [deletedMarkerSeq, rows]);
+
+  // placeを離れたら削除標識は消す（render中のstate調整。effectだと同一
+  // placeのjump後にも遅れて消えかねない）。
+  const previousPlaceKeyRef = useRef(activePlaceKey);
+  if (previousPlaceKeyRef.current !== activePlaceKey) {
+    previousPlaceKeyRef.current = activePlaceKey;
+    setDeletedMarkerSeq(null);
+  }
 
   // 現在位置をplaceごとに記憶し続ける（自前実装。routerの要素復元は
   // 「直前ページの位置を新placeへ引き継ぐ」仕様が仮想リストと衝突するため不使用）。
@@ -385,7 +448,16 @@ export function MessageList({
       if (!activePlaceKey) return;
       // 直前の読み込み済みmessageへanchorする——挿入された区間はその直下に
       // 現れるので、人は読み続けたところからそのまま新しい文脈へ進める。
-      const anchorId = seqToId.get(afterSeq);
+      // afterSeqがtombstone（描画されない）のこともある。そのときは出ている
+      // 削除標識、なければ同じ側で最も近い描画済み行へanchorする。
+      let anchorId =
+        deletedMarkerSeq === afterSeq ? `deleted:${afterSeq}` : undefined;
+      if (!anchorId) {
+        for (const message of messages ?? []) {
+          if (message.seq > afterSeq) break;
+          if (!message.deleted) anchorId = message.messageId;
+        }
+      }
       await loadGap(activePlaceKey, beforeSeq);
       if (anchorId) {
         window.requestAnimationFrame(() => {
@@ -396,7 +468,7 @@ export function MessageList({
         });
       }
     },
-    [activePlaceKey, seqToId, loadGap],
+    [activePlaceKey, messages, deletedMarkerSeq, loadGap],
   );
 
   const renderRow = useCallback(
@@ -410,15 +482,22 @@ export function MessageList({
               type="button"
               disabled={loading}
               aria-busy={loading}
-              onClick={() =>
-                void loadGapAnchored(row.afterSeq, row.beforeSeq)
-              }
+              onClick={() => void loadGapAnchored(row.afterSeq, row.beforeSeq)}
               className="rounded-full border border-border bg-background px-3 py-1 text-[12px] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
             >
-              {loading
-                ? "読み込み中…"
-                : `途中の${row.missingCount}件を読み込む`}
+              {loading ? "読み込み中…" : "この間の会話を読み込む"}
             </button>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        );
+      }
+      if (row.kind === "deleted") {
+        return (
+          <div className="flex items-center gap-3 px-4 py-1.5 sm:px-6">
+            <span className="h-px flex-1 bg-border" />
+            <span className="text-[11px] text-muted-foreground">
+              このメッセージは削除されています
+            </span>
             <span className="h-px flex-1 bg-border" />
           </div>
         );

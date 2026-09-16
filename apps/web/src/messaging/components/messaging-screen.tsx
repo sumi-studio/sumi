@@ -586,7 +586,16 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     ) {
       return;
     }
-    void loadPlaceAround(pendingJump.placeKey, pendingJump.seq);
+    void Promise.resolve(
+      loadPlaceAround(pendingJump.placeKey, pendingJump.seq),
+    ).then((found) => {
+      // seq自体が履歴に存在しない（lastSeqより先等）場合はここで終える。
+      // 残したままだとpendingJumpが未解決のまま残り、以後の同じseqへのjumpが
+      // 発火しなくなる。削除済みはtombstoneが返るのでfound=true側に来る。
+      if (!found) {
+        setPendingJump((current) => (current === pendingJump ? null : current));
+      }
+    });
   }, [pendingJump, activePlaceKey, loadPlaceAround, transportGeneration]);
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。

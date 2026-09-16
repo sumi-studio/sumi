@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 import {
   buildWorkspaceBrowserStack,
   removeWorkspaceBrowserBuild,
@@ -25,6 +25,9 @@ const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
 const oldNeedle = "quartz-needle-e2e-old-message";
 const japaneseNeedle = "検証用の日本語メッセージ星印";
 const deletedNeedle = "deleted-needle-e2e-message";
+const vanishingNeedle = "vanishing-needle-e2e-target";
+const liveTailProbe = "live-tail-probe-e2e";
+const liveFollowControl = "live-follow-control-e2e";
 const dmSecret = "dm-secret-e2e-token";
 const threadNeedle = "thread-needle-e2e-message";
 
@@ -101,8 +104,18 @@ test("Human searches shared messages and reaches the original message", async ({
     );
     await sendMessage(post, channelID, `${japaneseNeedle} の続き`);
     const doomed = await sendMessage(post, channelID, deletedNeedle);
+    // Deleted between result and click later; seq 4 sits outside the newest
+    // page so the jump must fetch a window whose target is already a tombstone.
+    const vanishingMessageID = await sendMessage(
+      post,
+      channelID,
+      `${vanishingNeedle} body`,
+    );
+    const fillerIDs: string[] = [];
     for (let index = 0; index < 80; index++) {
-      await sendMessage(post, channelID, `filler message ${index}`);
+      fillerIDs.push(
+        await sendMessage(post, channelID, `filler message ${index}`),
+      );
     }
     const thread = await post(`/messaging/places/${channelID}/threads`, {
       name: "検証スレッド",
@@ -124,6 +137,15 @@ test("Human searches shared messages and reaches the original message", async ({
       { headers: { Origin: stack.webURL } },
     );
     expect(deleted.status()).toBe(200);
+    // seq 35 (`filler message 30`) is the oldest row of the newest page after
+    // reload — deleting it puts a tombstone exactly on the boundary between
+    // the jump window and the loaded page, where the omitted range must not
+    // be hidden.
+    const boundaryDeleted = await api.delete(
+      `${stack.apiURL}/messaging/places/${channelID}/messages/${fillerIDs[30]}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(boundaryDeleted.status()).toBe(200);
 
     await mkdir(artifactDirectory, { recursive: true });
     await writeFile(
@@ -169,19 +191,40 @@ test("Human searches shared messages and reaches the original message", async ({
     // the actual following conversation, not a disconnected window. seq 2
     // (the Japanese message) must already be readable next to the target.
     const viewport = page.locator('[data-slot="conversation-viewport"]');
-    await expect(
-      viewport.locator(`[data-message-id="${needleMessageID}"]`),
-    ).toBeVisible();
+    const needleRow = viewport.locator(
+      `[data-message-id="${needleMessageID}"]`,
+    );
+    await expect(needleRow).toBeVisible();
     await expect(
       viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
     ).toBeVisible();
     await artifact("02-jumped-to-old-message.png");
 
-    // Between the jump window (seq 1..25) and the newest page (seq 34..83)
-    // the unloaded range must surface as a truthful, pageable marker — never
-    // as silently adjacent rows. Scroll down until it mounts.
+    // The jump must hold past the follow backstop's re-arm window (~1s):
+    // DOM presence alone passes while the viewport has already been pulled
+    // back to the newest message, so measure the real intersection.
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(needleRow, viewport);
+    await artifact("03-jump-held.png");
+
+    // A live arrival while reading history must not drag the viewport to the
+    // end either — the newest row stays unmounted and the needle stays put.
+    // The realtime append lands over the already-proven socket path; give it
+    // a short beat before asserting the viewport did not move.
+    await sendMessage(post, channelID, `${liveTailProbe} while reading`);
+    await page.waitForTimeout(800);
+    await expect(
+      viewport.getByText(`${liveTailProbe} while reading`, { exact: true }),
+    ).toHaveCount(0);
+    await expectRowInViewport(needleRow, viewport);
+
+    // Between the jump window (seq 1..25) and the newest page (seq 35..84,
+    // whose first row is a tombstone) the unloaded range must surface as a
+    // truthful, pageable marker — never as silently adjacent rows. The
+    // boundary tombstone must not suppress it.
     const gapButton = page.getByRole("button", {
-      name: /途中の\d+件を読み込む/,
+      name: "この間の会話を読み込む",
+      exact: true,
     });
     for (let scrolls = 0; scrolls < 30; scrolls += 1) {
       if ((await gapButton.count()) > 0) break;
@@ -190,8 +233,8 @@ test("Human searches shared messages and reaches the original message", async ({
       });
       await page.waitForTimeout(120);
     }
-    await expect(gapButton).toHaveText("途中の8件を読み込む");
-    await artifact("03-gap-row.png");
+    await expect(gapButton).toBeVisible();
+    await artifact("04-gap-row.png");
 
     // Clicking fills the missing range: the windows join into one contiguous
     // history anchored where the person was reading.
@@ -200,7 +243,22 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(
       page.getByText("filler message 24", { exact: true }),
     ).toBeVisible();
-    await artifact("04-gap-filled.png");
+    await artifact("05-gap-filled.png");
+
+    // Follow-latest control: returning to the end must still follow live
+    // arrivals — the fix may not just disable following. Wait for the smooth
+    // flight to actually land (the pill detaches at end) before posting, so a
+    // mid-flight append can't leave the pinned index one row stale.
+    const toLatest = page.getByRole("button", { name: "最新へ" });
+    await toLatest.click();
+    await expect(toLatest).toHaveCount(0);
+    await sendMessage(post, channelID, `${liveFollowControl} at latest`);
+    const liveRow = viewport.getByText(`${liveFollowControl} at latest`, {
+      exact: true,
+    });
+    await expect(liveRow).toBeVisible();
+    await expectRowInViewport(liveRow, viewport);
+    await artifact("06-follow-latest.png");
 
     await search.fill("日本語メッセージ");
     await expect(
@@ -214,13 +272,13 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(
       viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
     ).toBeVisible();
-    await artifact("05-japanese-result.png");
+    await artifact("07-japanese-result.png");
 
     await search.fill("zzz-no-match-token");
     await expect(
       page.getByText("一致するメッセージはありません", { exact: true }),
     ).toBeVisible();
-    await artifact("06-no-results.png");
+    await artifact("08-no-results.png");
 
     // Deleted content must not come back through search.
     await search.fill(deletedNeedle);
@@ -235,10 +293,8 @@ test("Human searches shared messages and reaches the original message", async ({
       .filter({ hasText: threadNeedle });
     await expect(threadHit).toBeVisible();
     await threadHit.click();
-    await expect(
-      viewport.getByText(`${threadNeedle} in-thread`),
-    ).toBeVisible();
-    await artifact("07-thread-result.png");
+    await expect(viewport.getByText(`${threadNeedle} in-thread`)).toBeVisible();
+    await artifact("09-thread-result.png");
 
     // A Human participant can still find and reach DM history.
     await search.fill(dmSecret);
@@ -246,7 +302,31 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(dmHit).toBeVisible();
     await dmHit.click();
     await expect(viewport.getByText(`${dmSecret} body`)).toBeVisible();
-    await artifact("08-dm-result.png");
+    await artifact("10-dm-result.png");
+
+    // A result deleted between search and click must still land truthfully:
+    // the jump resolves to a deletion marker at the target's position with
+    // its context — not a silently dropped jump.
+    await page.getByRole("button", { name: "search-general" }).click();
+    await search.fill("vanishing-needle");
+    const vanishingHit = page
+      .getByRole("button")
+      .filter({ hasText: vanishingNeedle });
+    await expect(vanishingHit).toBeVisible();
+    const vanish = await api.delete(
+      `${stack.apiURL}/messaging/places/${channelID}/messages/${vanishingMessageID}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(vanish.status()).toBe(200);
+    await vanishingHit.click();
+    const deletedMarker = viewport.getByText(
+      "このメッセージは削除されています",
+      { exact: true },
+    );
+    await expect(deletedMarker).toBeVisible();
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(deletedMarker, viewport);
+    await artifact("11-deleted-target.png");
 
     // Rapid query switching must not resurrect the previous result list.
     await page.getByRole("button", { name: "search-general" }).click();
@@ -266,6 +346,25 @@ test("Human searches shared messages and reaches the original message", async ({
     await stack.stop();
   }
 });
+
+// `toBeVisible` only means "mounted" for a virtualized list — overscan mounts
+// rows outside the viewport. A landed jump must be measured by real
+// intersection with the scroll viewport.
+async function expectRowInViewport(row: Locator, viewport: Locator) {
+  await expect(row).toBeVisible();
+  const box = await row.boundingBox();
+  const frame = await viewport.boundingBox();
+  expect(box, "row must have a layout box").not.toBeNull();
+  expect(frame, "viewport must have a layout box").not.toBeNull();
+  if (!box || !frame) return;
+  expect(
+    box.y + box.height,
+    "row must intersect the viewport vertically",
+  ).toBeGreaterThan(frame.y);
+  expect(box.y, "row must intersect the viewport vertically").toBeLessThan(
+    frame.y + frame.height,
+  );
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -294,7 +393,9 @@ async function createWorkspace(page: Page, name: string) {
   await page.getByRole("button", { name: "作成して開く" }).click();
   const response = await responsePromise;
   expect(response.status()).toBe(201);
-  return { workspaceID: asString(asRecord(await response.json()).workspace_id) };
+  return {
+    workspaceID: asString(asRecord(await response.json()).workspace_id),
+  };
 }
 
 async function installMessaging(page: Page) {
@@ -322,7 +423,9 @@ async function createChannel(page: Page, channel: string): Promise<string> {
       response.request().method() === "POST" &&
       new URL(response.url()).pathname === "/messaging/channels",
   );
-  await dialog.getByRole("textbox", { name: "名前", exact: true }).fill(channel);
+  await dialog
+    .getByRole("textbox", { name: "名前", exact: true })
+    .fill(channel);
   await dialog.getByRole("button", { name: "作成", exact: true }).click();
   const response = await responsePromise;
   expect(response.status()).toBe(201);
@@ -330,7 +433,10 @@ async function createChannel(page: Page, channel: string): Promise<string> {
 }
 
 async function sendMessage(
-  post: (path: string, data: Record<string, unknown>) => Promise<{
+  post: (
+    path: string,
+    data: Record<string, unknown>,
+  ) => Promise<{
     status(): number;
     headers(): Record<string, string>;
     json(): Promise<unknown>;
@@ -354,9 +460,7 @@ async function sendMessage(
     await new Promise((resolve) =>
       setTimeout(
         resolve,
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : 500,
+        Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
       ),
     );
   }

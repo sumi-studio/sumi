@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MockMessagingServer } from "./mock-server";
-import type { Message } from "./model";
+import type { Message, ServerEvent } from "./model";
 import {
   bindMessagingSessionIdentity,
   installMessagingBackend,
@@ -11,13 +11,13 @@ import { buildRows } from "./timeline";
 const key = "thread:history-thread" as const;
 const place = { kind: "thread", threadId: "history-thread" } as const;
 
-function message(seq: number): Message {
+function message(seq: number, deleted = false): Message {
   return {
     messageId: `history-${seq}`,
     place,
     seq,
     author: { kind: "human", humanId: "self" },
-    content: `Message ${seq}`,
+    content: deleted ? "" : `Message ${seq}`,
     mentions: [],
     urgency: "normal",
     reactions: [],
@@ -26,7 +26,7 @@ function message(seq: number): Message {
     replyTo: null,
     createdAt: seq,
     editedAt: null,
-    deleted: false,
+    deleted,
   };
 }
 
@@ -42,7 +42,7 @@ function deferred<T>() {
 
 let session = 0;
 
-async function openHistory() {
+async function openHistory(newestPage?: Message[]) {
   bindMessagingSessionIdentity(`history-test-${++session}`);
   const server = new MockMessagingServer();
   const snapshot = await server.bootstrap();
@@ -64,19 +64,28 @@ async function openHistory() {
       },
     ],
   });
-  const page = Array.from({ length: 50 }, (_, index) => message(index + 51));
+  const page =
+    newestPage ?? Array.from({ length: 50 }, (_, index) => message(index + 51));
   const fetch = vi.spyOn(server, "fetchMessages").mockResolvedValue(page);
   // Avoid unrelated connection resyncs; this test drives the history API only.
   vi.spyOn(server, "subscribeConnection").mockReturnValue(() => {});
+  let emit: (event: ServerEvent) => void = () => {};
+  const realSubscribe = server.subscribe.bind(server);
+  vi.spyOn(server, "subscribe").mockImplementation((listener, options) => {
+    emit = listener;
+    return realSubscribe(listener, options);
+  });
   installMessagingBackend(server);
   useMessaging.getState().init();
   await vi.waitFor(() => expect(useMessaging.getState().ready).toBe(true));
   useMessaging.getState().selectPlace(key);
   await vi.waitFor(() =>
-    expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(50),
+    expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(
+      page.length,
+    ),
   );
   fetch.mockClear();
-  return { fetch, page };
+  return { fetch, page, emit: (event: ServerEvent) => emit(event) };
 }
 
 afterEach(() => {
@@ -208,9 +217,7 @@ describe("search-result jump windows", () => {
     await useMessaging.getState().loadGap(key, 51);
     expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 51, limit: 50 });
     expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
-    expect(
-      timelineRows().filter((row) => row.kind === "gap"),
-    ).toHaveLength(0);
+    expect(timelineRows().filter((row) => row.kind === "gap")).toHaveLength(0);
 
     // A repeated jump into the now-cached target does not refetch.
     fetch.mockClear();
@@ -236,13 +243,101 @@ describe("search-result jump windows", () => {
     ]);
     expect(useMessaging.getState().loadingGapsByPlace[key]).toEqual([]);
     expect(
-      timelineRows().some(
-        (row) => row.kind === "gap" && row.beforeSeq === 51,
-      ),
+      timelineRows().some((row) => row.kind === "gap" && row.beforeSeq === 51),
     ).toBe(true);
 
     fetch.mockResolvedValueOnce(range(45, 50));
     await useMessaging.getState().loadGap(key, 51);
     expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
+  });
+
+  it("keeps the omitted range reachable when a tombstone lands inside it live", async () => {
+    const { fetch, emit } = await openHistory();
+    fetch.mockResolvedValueOnce(range(1, 44));
+    await useMessaging.getState().loadPlaceAround(key, 20);
+    expect(
+      timelineRows()
+        .filter((row) => row.kind === "gap")
+        .map((row) => row.kind === "gap" && [row.afterSeq, row.beforeSeq]),
+    ).toEqual([[44, 51]]);
+
+    // Someone deletes seq 47 — a message this client never loaded. The event
+    // upserts a tombstone into the middle of the unloaded range.
+    emit({ type: "message_deleted", message: message(47, true) });
+    await vi.waitFor(() =>
+      expect(
+        useMessaging.getState().messagesByPlace[key].map((m) => m.seq),
+      ).toContain(47),
+    );
+
+    // Both halves of the interrupted range must stay reachable: two gap rows,
+    // not silently adjacent windows around an invisible tombstone.
+    expect(
+      timelineRows()
+        .filter((row) => row.kind === "gap")
+        .map((row) => row.kind === "gap" && [row.afterSeq, row.beforeSeq]),
+    ).toEqual([
+      [44, 47],
+      [47, 51],
+    ]);
+  });
+
+  it("surfaces the omitted range when the newest page starts with a tombstone", async () => {
+    // Newest page's first row was deleted before it was ever loaded: the
+    // window boundary itself is a tombstone. The gap row must still be
+    // emitted — this is the boundary case that hid 45..50 entirely.
+    const { fetch } = await openHistory([message(51, true), ...range(52, 100)]);
+    fetch.mockResolvedValueOnce(range(1, 44));
+    await expect(
+      useMessaging.getState().loadPlaceAround(key, 20),
+    ).resolves.toBe(true);
+
+    expect(
+      timelineRows()
+        .filter((row) => row.kind === "gap")
+        .map((row) => row.kind === "gap" && [row.afterSeq, row.beforeSeq]),
+    ).toEqual([[44, 51]]);
+
+    // And the range is actually reachable through the boundary tombstone.
+    fetch.mockResolvedValueOnce(range(45, 50));
+    await useMessaging.getState().loadGap(key, 51);
+    expect(
+      useMessaging.getState().messagesByPlace[key].map((m) => m.seq),
+    ).toEqual(range(1, 100).map((m) => m.seq));
+  });
+
+  it("still fetches context for a search target that is already a tombstone", async () => {
+    // The hit at seq 20 was deleted between search and click; its tombstone
+    // arrived live. Treating the tombstone as "already loaded" would skip the
+    // fetch entirely and leave the jump with no context and no outcome.
+    const { fetch, emit } = await openHistory();
+    emit({ type: "message_deleted", message: message(20, true) });
+    await vi.waitFor(() =>
+      expect(
+        useMessaging.getState().messagesByPlace[key].map((m) => m.seq),
+      ).toContain(20),
+    );
+    fetch.mockClear();
+
+    fetch.mockResolvedValueOnce(
+      range(1, 44).map((m) => (m.seq === 20 ? message(20, true) : m)),
+    );
+    await expect(
+      useMessaging.getState().loadPlaceAround(key, 20),
+    ).resolves.toBe(true);
+    // Context was fetched even though the tombstone was already present.
+    expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 45, limit: 50 });
+    // The tombstone's neighbors are loaded; a deleted-target marker can be
+    // rendered at seq 20 and the jump settles on it.
+    const rows = buildRows({
+      messages: useMessaging.getState().messagesByPlace[key],
+      pending: [],
+      selfKey: "human:self",
+      unreadLineSeq: null,
+      self: { kind: "human", humanId: "self" },
+      now: 1_000,
+      deletedTargetSeq: 20,
+    });
+    expect(rows.some((row) => row.id === "deleted:20")).toBe(true);
   });
 });
