@@ -2,7 +2,6 @@
 
 import "@testing-library/jest-dom/vitest";
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -231,7 +230,9 @@ describe("LoginScreen email link", () => {
     fireEvent.click(proceed);
 
     await waitFor(() =>
-      expect(state.continueEmailLink).toHaveBeenCalledWith(inspected, true),
+      expect(state.continueEmailLink).toHaveBeenCalledWith(inspected, true, {
+        switchFromUserId: undefined,
+      }),
     );
   });
 
@@ -260,41 +261,44 @@ describe("LoginScreen email link", () => {
     expect(state.logout).not.toHaveBeenCalled();
   });
 
-  it("logs out before completing a chosen account switch", async () => {
-    let finishLogout!: () => void;
+  it("completes a chosen account switch through the consented resolve, without logging out", async () => {
     const inspected = inspection({
       session: "other_account",
       sameBrowser: false,
     });
+    // The real continueEmailLink throws link_invalid once logout clears the
+    // pending link; model that coupling so this test fails if the click path
+    // ever logs out before completing the link again.
+    let linkCleared = false;
     const state = authState({
       authenticated: true,
+      user: { id: "human-current" },
       emailLinkPending: true,
       inspectEmailLink: vi.fn().mockResolvedValue(inspected),
-      logout: vi.fn(
-        () =>
-          new Promise<void>((resolve) => {
-            finishLogout = resolve;
-          }),
-      ),
+      logout: vi.fn(async () => {
+        linkCleared = true;
+      }),
+      continueEmailLink: vi.fn(async () => {
+        if (linkCleared) throw new AuthAPIError("link_invalid", 404);
+      }),
       sessionState: "authenticated",
     });
     loginMocks.useAuth.mockImplementation(() => state);
-    const { rerender } = render(<LoginScreen />);
+    render(<LoginScreen />);
 
     fireEvent.click(
       await screen.findByRole("button", {
         name: "現在のセッションを終了して切り替える",
       }),
     );
-    state.authenticated = false;
-    state.sessionState = "unauthenticated";
-    rerender(<LoginScreen />);
 
-    expect(state.continueEmailLink).not.toHaveBeenCalled();
-    await act(async () => finishLogout());
     await waitFor(() =>
-      expect(state.continueEmailLink).toHaveBeenCalledWith(inspected, true),
+      expect(state.continueEmailLink).toHaveBeenCalledWith(inspected, true, {
+        switchFromUserId: "human-current",
+      }),
     );
+    expect(state.logout).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(state.inspectEmailLink).toHaveBeenCalledTimes(1);
   });
 
