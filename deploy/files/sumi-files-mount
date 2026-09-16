@@ -108,22 +108,45 @@ mount_fstype() {
     END { if (fstype != "") print fstype }' /proc/self/mountinfo
 }
 
+# Bounded probe of the existing mount at the mountpoint. Prints one verdict:
+#   live         — stat succeeded; a live filesystem answered
+#   dead         — stat failed with ENOTCONN: the FUSE client is gone and the
+#                  mount is a disconnected corpse
+#   unresponsive — stat timed out or failed any other way; the mount cannot be
+#                  classified and must not be touched
+# The probe runs under LC_ALL=C so the ENOTCONN diagnostic is not localized.
+probe_mount() {
+  local out rc
+  out="$(LC_ALL=C timeout 5 stat -- "$mnt" 2>&1)" && { echo live; return; }
+  rc=$?
+  if (( rc != 124 )) && [[ "$out" == *"Transport endpoint is not connected"* ]]; then
+    echo dead
+  else
+    echo unresponsive
+  fi
+}
+
 fstype="$(mount_fstype)"
 if [[ -n "$fstype" ]]; then
-  if timeout 5 stat -- "$mnt" >/dev/null 2>&1; then
+  verdict="$(probe_mount)"
+  if [[ "$verdict" == live ]]; then
     echo "refused: $mnt is already a mountpoint; unmount it first" >&2
     exit 2
   fi
-  # A killed JuiceFS client leaves the FUSE mount registered but dead: every
-  # lookup answers ENOTCONN and systemd never ran ExecStop. Such a corpse is
-  # safe to remove only while it is still dead and only when it really is a
-  # JuiceFS mount — never unmount a live filesystem or another driver's dead
-  # mount that happens to occupy the path.
   if [[ "$fstype" != "fuse.juicefs" ]]; then
     echo "refused: $mnt holds an unresponsive $fstype mount; unmount it first" >&2
     exit 2
   fi
-  if timeout 5 stat -- "$mnt" >/dev/null 2>&1 || [[ "$(mount_fstype)" != "fuse.juicefs" ]]; then
+  # A killed JuiceFS client leaves the FUSE mount registered but dead: every
+  # lookup answers ENOTCONN and systemd never ran ExecStop. Only that proven
+  # disconnection is safe to remove: a slow or stalled client answers with a
+  # timeout or another error, and unmounting a merely unresponsive mount would
+  # detach a live filesystem that may recover on its own.
+  if [[ "$verdict" != dead ]]; then
+    echo "refused: $mnt did not answer but is not proven disconnected; unmount it manually only if the client is known dead" >&2
+    exit 2
+  fi
+  if [[ "$(mount_fstype)" != "fuse.juicefs" || "$(probe_mount)" != dead ]]; then
     echo "refused: $mnt changed state during recovery; unmount it first" >&2
     exit 2
   fi

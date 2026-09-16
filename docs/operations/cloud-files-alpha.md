@@ -58,7 +58,7 @@ person/secretary ─ (caller with a scope token) ─ filesvc :8780 (WSL origin, 
 | `apps/files/cmd/filesvc` | Scoped file API. |
 | `apps/files/objstore` | `sumi-fabric-obj`: S3-compatible object store on a SQLite Durable Object. Verifies AWS SigV4 (header form). |
 | `deploy/files/sumi-files-format` | Creates the volume once; refuses an already formatted database; prints the UUID. |
-| `deploy/files/sumi-files-mount` | Runs one JuiceFS client with the required flags. Refuses a metadata database holding a different volume UUID, a live existing mount, or an unresponsive non-JuiceFS mount; removes a dead JuiceFS corpse before mounting; keeps the mountpoint's parent private to the client uid. |
+| `deploy/files/sumi-files-mount` | Runs one JuiceFS client with the required flags. Refuses a metadata database holding a different volume UUID, a live existing mount, a non-JuiceFS mount, or a JuiceFS mount that is merely unresponsive; removes a JuiceFS corpse only when a bounded `stat` proves disconnection (ENOTCONN); keeps the mountpoint's parent private to the client uid. |
 | `deploy/files/sumi-files-check` | Passes only for a live `fuse.juicefs` mount of the pinned volume root with zero metadata cache; with a scope, prints the directory to bind. |
 | `deploy/files/sumi-files-executor-launch` / `sumi-files-executor-stop` | Thin drivers around `deploy/agent/supervisor` `prepare`/`activate`/`stop` for one scope (the compact PAID). |
 | `deploy/files/systemd/sumi-files-mount@.service` | Volume client unit (`service` instance on the origin as a user unit; `executor` instance on executor hosts as a system unit). |
@@ -276,7 +276,7 @@ an API write and a Linux write cross between two JuiceFS clients.
 3. `systemctl restart sumi-files-mount@executor.service`: the executor unit
    restarts with it and sees the same files. `kill -9` the client: the mount
    unit restarts itself — the new client removes the dead FUSE corpse
-   (verified `fuse.juicefs`, still unresponsive) and remounts — and an enabled
+   (verified `fuse.juicefs`, still answering ENOTCONN) and remounts — and an enabled
    executor unit is pulled back in by the mount's `WantedBy`, re-running
    prepare/activate with a fresh epoch. The executor never sees old files:
    while the client was dead its scope bind answered
@@ -366,8 +366,12 @@ Primary sources, read 2026-09-16:
   and `PartOf` the volume client: stopping or restarting the client stops the
   executor. On a whole-client crash (`SIGKILL`) the mount unit's
   `Restart=on-failure` brings a new client up; `sumi-files-mount` removes the
-  dead FUSE corpse itself (it refuses a live mount or an unresponsive
-  non-JuiceFS mount), `ExecStartPost` re-verifies the volume, and the mount's
+  dead FUSE corpse itself, but only when the mount is proven disconnected —
+  `fuse.juicefs` in mountinfo and a bounded `stat` answering ENOTCONN
+  ("Transport endpoint is not connected"). A live mount, a timed-out or
+  otherwise failing probe (a slow or stalled client), and any non-JuiceFS
+  mount are all refused rather than unmounted. `ExecStartPost` re-verifies
+  the volume, and the mount's
   `WantedBy` pulls enabled dependents — the executor re-launches through the
   supervisor with a new epoch, `sumi-filesvc` restarts on the origin. The
   mount's parent directory must stay private (0700, owned by the client uid):
