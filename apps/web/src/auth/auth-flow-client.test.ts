@@ -68,6 +68,7 @@ describe("Koseki browser auth-flow client", () => {
       outcome: "account_created",
       continuation: "/",
       expires_at: "2026-08-01T01:00:00Z",
+      human_id: "human-1",
     });
 
     await confirmAuthFlow({
@@ -127,6 +128,7 @@ describe("Koseki browser auth-flow client", () => {
           outcome: "account_created",
           continuation: "/",
           expires_at: "2026-08-01T01:00:00Z",
+          human_id: "human-1",
         }),
       );
     vi.stubGlobal("fetch", fetchMock);
@@ -168,7 +170,7 @@ describe("Koseki browser auth-flow client", () => {
     ]);
   });
 
-  it("logs out when a successful confirm body is malformed and status is inconclusive", async () => {
+  it("discards the flow when a successful confirm body is malformed and status is inconclusive", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(csrfResponse())
@@ -194,17 +196,19 @@ describe("Koseki browser auth-flow client", () => {
         action: "create_account",
       }),
     ).rejects.toBeInstanceOf(AuthAPIError);
+    // Scoped compensation: the ambiguous flow's authority is discarded,
+    // never the session a later sign-in choice may have established.
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/auth/csrf",
       "/auth/flows/confirm",
       "/auth/csrf",
       "/auth/flows/status",
       "/auth/csrf",
-      "/auth/logout",
+      "/auth/flows/discard",
     ]);
   });
 
-  it("assures Sumi logout when ambiguous status cannot prove the outcome", async () => {
+  it("discards the flow's authority when ambiguous status cannot prove the outcome", async () => {
     const mutationError = new TypeError("connection reset");
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -227,11 +231,11 @@ describe("Koseki browser auth-flow client", () => {
       "/auth/csrf",
       "/auth/flows/status",
       "/auth/csrf",
-      "/auth/logout",
+      "/auth/flows/discard",
     ]);
   });
 
-  it("fails closed explicitly when recovery logout also fails", async () => {
+  it("fails closed explicitly when recovery discard also fails", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(csrfResponse())

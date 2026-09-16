@@ -110,7 +110,10 @@ func newTestBrowserAuthServer(
 	return server, sessions
 }
 
-func obtainCSRF(t *testing.T, server *BrowserAuthServer) (string, *http.Cookie) {
+// obtainCSRF bootstraps a browser jar: the CSRF token and cookie plus the
+// browser epoch the CSRF route mints. Callers present the epoch cookie on
+// later requests so flows and sessions bind to one stable jar identity.
+func obtainCSRF(t *testing.T, server *BrowserAuthServer) (string, *http.Cookie, *http.Cookie) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/auth/csrf", nil)
 	req.Header.Set("Origin", browserAuthTestOrigin)
@@ -126,8 +129,8 @@ func obtainCSRF(t *testing.T, server *BrowserAuthServer) (string, *http.Cookie) 
 		t.Fatal(err)
 	}
 	cookies := recorder.Result().Cookies()
-	if len(cookies) != 2 {
-		t.Fatalf("expected CSRF cookie and legacy deletion, got %d", len(cookies))
+	if len(cookies) != 3 {
+		t.Fatalf("expected CSRF cookie, legacy deletion, and browser epoch, got %d", len(cookies))
 	}
 	if cookies[0].Name != BrowserCSRFCookie ||
 		cookies[0].HttpOnly ||
@@ -137,7 +140,15 @@ func obtainCSRF(t *testing.T, server *BrowserAuthServer) (string, *http.Cookie) 
 		cookies[0].Domain != "" {
 		t.Fatalf("unexpected CSRF cookie: %+v", cookies[0])
 	}
-	return response.Token, cookies[0]
+	if cookies[2].Name != BrowserEpochCookie ||
+		!cookies[2].HttpOnly ||
+		!cookies[2].Secure ||
+		cookies[2].SameSite != http.SameSiteLaxMode ||
+		cookies[2].Path != "/" ||
+		cookies[2].Domain != "" {
+		t.Fatalf("unexpected browser epoch cookie: %+v", cookies[2])
+	}
+	return response.Token, cookies[0], cookies[2]
 }
 
 func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
@@ -149,7 +160,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	}}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
 	server.Profiles = fakeHumanProfileReader{name: "Canonical Human"}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 
 	req := httptest.NewRequest(
 		http.MethodPost,
@@ -160,6 +171,7 @@ func TestBrowserAuthExchangesVerifiedIdentityForOpaqueSession(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CSRF-Token", csrf)
 	req.AddCookie(csrfCookie)
+	req.AddCookie(epochCookie)
 	recorder := httptest.NewRecorder()
 	server.serveSessionExchange(recorder, req)
 	if recorder.Code != http.StatusNoContent {
@@ -274,7 +286,7 @@ func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
 		t.Fatalf("pre-fence cookie verification = %v, want signature rejection", err)
 	}
 
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/auth/session",
@@ -284,6 +296,7 @@ func TestBrowserAuthExchangeReplacesPreFenceCookieWithV2Session(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-CSRF-Token", csrf)
 	request.AddCookie(csrfCookie)
+	request.AddCookie(epochCookie)
 	request.AddCookie(&http.Cookie{
 		Name:  BrowserSessionCookie,
 		Value: preFence,
@@ -360,7 +373,7 @@ func TestBrowserAuthRequiresUniqueMatchingCSRF(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{}
 	server, _ := newTestBrowserAuthServer(t, firebase, bindings)
-	csrf, cookie := obtainCSRF(t, server)
+	csrf, cookie, _ := obtainCSRF(t, server)
 
 	cases := []struct {
 		name   string
@@ -415,7 +428,7 @@ func TestBrowserAuthFailsClosedForInvalidTokenAndUnboundIdentity(t *testing.T) {
 			}
 			bindings := &fakeBindingResolver{claims: validClaims, err: tc.bindingErr}
 			server, _ := newTestBrowserAuthServer(t, firebase, bindings)
-			csrf, cookie := obtainCSRF(t, server)
+			csrf, cookie, _ := obtainCSRF(t, server)
 			req := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"token"}`))
 			req.Header.Set("Origin", browserAuthTestOrigin)
 			req.Header.Set("Content-Type", "application/json")
@@ -461,7 +474,7 @@ func TestBrowserAuthRejectsMalformedOrOversizedExchangeBeforeVerification(t *tes
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			csrf, cookie := obtainCSRF(t, server)
+			csrf, cookie, _ := obtainCSRF(t, server)
 			req := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(tc.body))
 			req.Header.Set("Origin", browserAuthTestOrigin)
 			req.Header.Set("Content-Type", "application/json")
@@ -483,20 +496,21 @@ func TestBrowserAuthLogoutClearsSessionAndCSRF(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{}
 	bindings := &fakeBindingResolver{}
 	server, _ := newTestBrowserAuthServer(t, firebase, bindings)
-	csrf, cookie := obtainCSRF(t, server)
+	csrf, cookie, epochCookie := obtainCSRF(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	req.Header.Set("Origin", browserAuthTestOrigin)
 	req.Header.Set("X-CSRF-Token", csrf)
 	req.AddCookie(cookie)
+	req.AddCookie(epochCookie)
 	recorder := httptest.NewRecorder()
 	server.serveLogout(recorder, req)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("got %d, want 204", recorder.Code)
 	}
 	cookies := recorder.Result().Cookies()
-	if len(cookies) != 3 {
-		t.Fatalf("expected session and both CSRF paths cleared, got %d", len(cookies))
+	if len(cookies) != 4 {
+		t.Fatalf("expected session, epoch, and both CSRF paths cleared, got %d", len(cookies))
 	}
 	for _, cleared := range cookies {
 		if cleared.MaxAge >= 0 {
@@ -523,12 +537,13 @@ func TestBrowserAuthLogoutRevokesSessionAndClosesOnlyItsConnections(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	req.Header.Set("Origin", browserAuthTestOrigin)
 	req.Header.Set("X-CSRF-Token", csrf)
 	req.AddCookie(csrfCookie)
+	req.AddCookie(epochCookie)
 	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: session})
 	recorder := httptest.NewRecorder()
 	server.serveLogout(recorder, req)
@@ -587,11 +602,12 @@ func TestBrowserAuthLogoutRetainsValidCookieWhenDurableRevocationIsUnavailable(t
 	}
 	logoutSession := func() *httptest.ResponseRecorder {
 		t.Helper()
-		csrf, csrfCookie := obtainCSRF(t, server)
+		csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 		logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 		logout.Header.Set("Origin", browserAuthTestOrigin)
 		logout.Header.Set("X-CSRF-Token", csrf)
 		logout.AddCookie(csrfCookie)
+		logout.AddCookie(epochCookie)
 		logout.AddCookie(&http.Cookie{
 			Name:  BrowserSessionCookie,
 			Value: session,
@@ -655,12 +671,13 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 	exchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"replacement"}`))
 	exchange.Header.Set("Origin", browserAuthTestOrigin)
 	exchange.Header.Set("Content-Type", "application/json")
 	exchange.Header.Set("X-CSRF-Token", csrf)
 	exchange.AddCookie(csrfCookie)
+	exchange.AddCookie(epochCookie)
 	exchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
 	exchangeRecorder := httptest.NewRecorder()
 	server.serveSessionExchange(exchangeRecorder, exchange)
@@ -689,35 +706,52 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 			firstClaims.authorityBindingID,
 		)
 	}
+	// A replay presenting the retired predecessor cookie is a lost-response
+	// recovery: the retired credential is non-authoritative, the fresh
+	// id_token proves the same Human, and the epoch tip is rotated into the
+	// newly issued session rather than wedging the jar.
 	replayedExchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"concurrent-replay"}`))
 	replayedExchange.Header.Set("Origin", browserAuthTestOrigin)
 	replayedExchange.Header.Set("Content-Type", "application/json")
 	replayedExchange.Header.Set("X-CSRF-Token", csrf)
 	replayedExchange.AddCookie(csrfCookie)
+	replayedExchange.AddCookie(epochCookie)
 	replayedExchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
 	replayedRecorder := httptest.NewRecorder()
 	server.serveSessionExchange(replayedRecorder, replayedExchange)
-	if replayedRecorder.Code != http.StatusServiceUnavailable || len(replayedRecorder.Result().Cookies()) != 0 {
-		t.Fatalf("retired replacement credential minted another session: %d %+v", replayedRecorder.Code, replayedRecorder.Result().Cookies())
+	if replayedRecorder.Code != http.StatusNoContent {
+		t.Fatalf("lost-response replay was refused: %d %s", replayedRecorder.Code, replayedRecorder.Body.String())
 	}
-	if _, err := sessions.VerifySession(context.Background(), second); err != nil {
-		t.Fatalf("replayed old credential invalidated replacement: %v", err)
+	replayedCookies := replayedRecorder.Result().Cookies()
+	if len(replayedCookies) != 1 {
+		t.Fatalf("replay cookies = %d, want 1", len(replayedCookies))
+	}
+	if _, err := sessions.VerifySession(context.Background(), second); err == nil {
+		t.Fatal("replayed issuance left the displaced tip authoritative")
+	}
+	replayedClaims, err := sessions.VerifySession(context.Background(), replayedCookies[0].Value)
+	if err != nil {
+		t.Fatalf("replayed session is invalid: %v", err)
+	}
+	if replayedClaims.authorityBindingID != firstClaims.authorityBindingID {
+		t.Fatal("replayed issuance changed the authority binding")
 	}
 
 	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	logout.Header.Set("Origin", browserAuthTestOrigin)
 	logout.Header.Set("X-CSRF-Token", csrf)
 	logout.AddCookie(csrfCookie)
-	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: second})
+	logout.AddCookie(epochCookie)
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: replayedCookies[0].Value})
 	logoutRecorder := httptest.NewRecorder()
 	server.serveLogout(logoutRecorder, logout)
 	if logoutRecorder.Code != http.StatusNoContent {
 		t.Fatalf("replacement logout: %d %s", logoutRecorder.Code, logoutRecorder.Body.String())
 	}
-	if _, err := sessions.VerifySession(context.Background(), second); err == nil {
+	if _, err := sessions.VerifySession(context.Background(), replayedCookies[0].Value); err == nil {
 		t.Fatal("logout left replacement session authoritative")
 	}
-	if len(closer.sessionIDs) != 2 || closer.sessionIDs[1] != secondClaims.sessionID {
+	if len(closer.sessionIDs) != 3 || closer.sessionIDs[2] != replayedClaims.sessionID {
 		t.Fatalf("replacement lifecycle closed sessions %v", closer.sessionIDs)
 	}
 }
@@ -787,7 +821,7 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	recorders := make([]*httptest.ResponseRecorder, 2)
 	requests := make([]*http.Request, 2)
 	for index, server := range servers {
-		csrf, csrfCookie := obtainCSRF(t, server)
+		csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 		request := httptest.NewRequest(
 			http.MethodPost,
 			"/auth/session",
@@ -797,6 +831,7 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-CSRF-Token", csrf)
 		request.AddCookie(csrfCookie)
+		request.AddCookie(epochCookie)
 		request.AddCookie(&http.Cookie{
 			Name:  BrowserSessionCookie,
 			Value: oldSession,
@@ -815,9 +850,11 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	}
 	wait.Wait()
 
+	// Both requests carry a fresh valid id_token for the same Human, so each
+	// mints a session on its own epoch. The shared predecessor cookie is
+	// retired exactly once — whichever admission commits first revokes it —
+	// and the loser's request simply treats the retired cookie as absent.
 	successes := 0
-	failures := 0
-	var replacement string
 	for _, recorder := range recorders {
 		switch recorder.Code {
 		case http.StatusNoContent:
@@ -826,24 +863,18 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 			if len(cookies) != 1 {
 				t.Fatalf("successful replacement cookies = %+v", cookies)
 			}
-			replacement = cookies[0].Value
-		case http.StatusServiceUnavailable:
-			failures++
-			if len(recorder.Result().Cookies()) != 0 {
-				t.Fatal("replayed replacement published a cookie")
+			if _, err := secondSessions.VerifySession(
+				context.Background(),
+				cookies[0].Value,
+			); err != nil {
+				t.Fatalf("minted replacement is invalid: %v", err)
 			}
 		default:
 			t.Fatalf("replacement status = %d", recorder.Code)
 		}
 	}
-	if successes != 1 || failures != 1 {
-		t.Fatalf("replacement outcomes: successes=%d failures=%d", successes, failures)
-	}
-	if _, err := secondSessions.VerifySession(
-		context.Background(),
-		replacement,
-	); err != nil {
-		t.Fatalf("winning replacement is invalid: %v", err)
+	if successes != 2 {
+		t.Fatalf("replacement outcomes: successes=%d, want both", successes)
 	}
 	if _, err := firstSessions.VerifySession(
 		context.Background(),
@@ -872,12 +903,13 @@ func TestBrowserAuthReplacementFailsClosedWhenOldSessionCannotBeRetired(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 	exchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"replacement"}`))
 	exchange.Header.Set("Origin", browserAuthTestOrigin)
 	exchange.Header.Set("Content-Type", "application/json")
 	exchange.Header.Set("X-CSRF-Token", csrf)
 	exchange.AddCookie(csrfCookie)
+	exchange.AddCookie(epochCookie)
 	exchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
 	recorder := httptest.NewRecorder()
 	server.serveSessionExchange(recorder, exchange)
@@ -909,11 +941,12 @@ func TestBrowserAuthDuplicateCookieLogoutRevokesEveryVerifiableSession(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	logout.Header.Set("Origin", browserAuthTestOrigin)
 	logout.Header.Set("X-CSRF-Token", csrf)
 	logout.AddCookie(csrfCookie)
+	logout.AddCookie(epochCookie)
 	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: "malformed"})
 	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
 	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: second})
@@ -931,7 +964,7 @@ func TestBrowserAuthDuplicateCookieLogoutRevokesEveryVerifiableSession(t *testin
 		t.Fatalf("closed sessions = %v, want two", closer.sessionIDs)
 	}
 	cleared := recorder.Result().Cookies()
-	if len(cleared) != 3 || cleared[0].Name != BrowserSessionCookie || cleared[0].MaxAge >= 0 {
+	if len(cleared) != 4 || cleared[0].Name != BrowserSessionCookie || cleared[0].MaxAge >= 0 {
 		t.Fatalf("logout did not clear authoritative cookie: %+v", cleared)
 	}
 }
@@ -940,7 +973,7 @@ func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
 	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{UID: "firebase-user"}}
 	bindings := &fakeBindingResolver{}
 	server, _ := newTestBrowserAuthServer(t, firebase, bindings)
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, _ := obtainCSRF(t, server)
 	duplicate := &http.Cookie{Name: BrowserSessionCookie, Value: "one"}
 
 	for _, tc := range []struct {

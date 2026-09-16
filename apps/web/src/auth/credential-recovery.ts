@@ -13,7 +13,7 @@ import type {
   RecoverableProvider,
   SerializedOAuthCredential,
 } from "./auth-flow-state";
-import { beginEmailLinkAuth } from "./email-link-auth";
+import { beginEmailCodeAuth, type EmailCodeStart } from "./email-code-auth";
 import { getFirebaseAuth } from "./firebase";
 import {
   completeProviderOperation,
@@ -29,7 +29,7 @@ export async function beginSameEmailCredentialRecovery(
   error: unknown,
   expectedProvider: RecoverableProvider,
   requestedIntent: AuthIntent,
-): Promise<void> {
+): Promise<EmailCodeStart> {
   if (
     !(error instanceof FirebaseError) ||
     error.code !== "auth/account-exists-with-different-credential"
@@ -38,7 +38,7 @@ export async function beginSameEmailCredentialRecovery(
   }
   const email = collisionEmail(error);
   const credential = extractCredential(error, expectedProvider);
-  await beginEmailLinkAuth(email, "sign_in", {
+  return beginEmailCodeAuth(email, "sign_in", {
     provider: expectedProvider,
     requestedIntent,
     credential: serializeCredential(credential, expectedProvider),

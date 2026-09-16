@@ -131,10 +131,23 @@ afterEach(() => {
 });
 
 describe("provider settings", () => {
+  it("shows a verified email-code address as a sign-in method without a password provider", () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "github.com" }],
+      email: "person@example.com",
+      emailVerified: true,
+    } as typeof settingsMocks.currentUser;
+
+    render(<ProviderSettings humanId="human-a" />);
+
+    expect(screen.getByText("メール")).toBeVisible();
+  });
+
   it("persists an identity-scoped link notice and exposes dense 44px actions", async () => {
     render(<ProviderSettings humanId="human-a" />);
 
-    expect(screen.getByText("メールリンク")).toBeVisible();
+    expect(screen.getByText("メール")).toBeVisible();
     const add = screen.getByRole("button", { name: "Googleを追加" });
     expect(add).toHaveClass("h-11");
     fireEvent.click(add);

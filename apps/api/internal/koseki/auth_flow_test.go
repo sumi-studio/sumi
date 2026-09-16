@@ -219,8 +219,19 @@ func TestAuthFlowRejectsMismatchReplayAndChangedIdempotency(t *testing.T) {
 	if err != nil || result.TerminalOutcome != OutcomeAccountCreated {
 		t.Fatalf("complete: %+v %v", result, err)
 	}
-	if _, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("uid", "bound@example.com")); !errors.Is(err, ErrAuthFlowConsumed) {
-		t.Fatalf("replay: %v", err)
+	replayed, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("uid", "bound@example.com"))
+	if err != nil || replayed.TerminalOutcome != OutcomeAccountCreated || replayed.HumanID != result.HumanID {
+		t.Fatalf("same-proof replay must recover the recorded outcome: %+v %v", replayed, err)
+	}
+	if _, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof("uid", "other@example.com")); !errors.Is(err, ErrAuthProofMismatch) {
+		t.Fatalf("replay with a different mailbox: %v", err)
+	}
+	if _, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionSignIn); !errors.Is(err, ErrAuthFlowConsumed) {
+		t.Fatalf("confirm replay with the wrong action: %v", err)
+	}
+	confirmed, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount)
+	if err != nil || confirmed.TerminalOutcome != OutcomeAccountCreated || confirmed.HumanID != result.HumanID {
+		t.Fatalf("same-action confirm replay must recover the recorded outcome: %+v %v", confirmed, err)
 	}
 	status, err := store.AuthFlowStatus(ctx, flow.FlowID, nonce)
 	if err != nil || status.TerminalOutcome != OutcomeAccountCreated || status.HumanID != result.HumanID {

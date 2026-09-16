@@ -123,6 +123,29 @@ type BrowserSessionRevocationStore interface {
 		successorExpiresAt time.Time,
 		now time.Time,
 	) error
+	AdmitBrowserSession(
+		ctx context.Context,
+		admission BrowserSessionAdmission,
+		now time.Time,
+	) (BrowserSessionAdmissionOutcome, error)
+	CheckBrowserEpoch(
+		ctx context.Context,
+		epochHash string,
+		now time.Time,
+	) error
+	CloseBrowserSessionsForLogout(
+		ctx context.Context,
+		presented []BrowserSessionIdentity,
+		epochs []string,
+		extraFlows map[string]int64,
+		now time.Time,
+	) (closedFlows []string, closedEpochs []string, retiredSessions []string, err error)
+	CloseBrowserFlow(
+		ctx context.Context,
+		flowID string,
+		retainUntil time.Time,
+		now time.Time,
+	) (retiredSessions []string, err error)
 }
 
 // BrowserSessionIssuer creates the same short-lived signed session consumed by
@@ -165,6 +188,10 @@ type BrowserSessionIdentityAuthorizer interface {
 type BrowserSessionLifecycle interface {
 	UserSessionAuthorizer
 	BrowserSessionIssuer
+	// VerifySessionLocal runs signature and claim checks without consulting
+	// the revocation store. Admission presents the result so a stale-but-signed
+	// cookie can still serve as rotation parent.
+	VerifySessionLocal(ctx context.Context, signedCookie string) (UserSessionClaims, error)
 	RevokeSession(ctx context.Context, signedCookie string) (UserSessionClaims, error)
 	RevokeSessionForLogout(
 		ctx context.Context,
@@ -176,6 +203,27 @@ type BrowserSessionLifecycle interface {
 		successorClaims UserSessionClaims,
 		ttl time.Duration,
 	) (UserSessionClaims, string, bool, error)
+	AdmitSession(
+		ctx context.Context,
+		admission BrowserSessionAdmission,
+		successorClaims UserSessionClaims,
+		ttl time.Duration,
+	) (UserSessionClaims, string, BrowserSessionAdmissionOutcome, error)
+	RevokeSessionsForLogout(
+		ctx context.Context,
+		signedCookies []string,
+		epochHashes []string,
+		extraFlows map[string]time.Time,
+	) (closedFlows []string, closedEpochs []string, retiredSessions []string, err error)
+	// CheckBrowserEpochUsable reports whether a presented epoch cookie may
+	// still name this jar. A closed or unverifiable epoch is replaced by a
+	// fresh one so the jar is not pinned to dead authority.
+	CheckBrowserEpochUsable(ctx context.Context, epochHash string) error
+	DiscardBrowserFlow(
+		ctx context.Context,
+		flowID string,
+		retainUntil time.Time,
+	) (retiredSessions []string, err error)
 }
 
 type userSessionWireClaims struct {
@@ -329,6 +377,13 @@ func (v *HMACUserSessionVerifier) signPreparedSession(
 	_, _ = mac.Write([]byte(prepared.signingInput))
 	return prepared.signingInput + "." +
 		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// VerifySessionLocal checks signature, claims, and expiry only. It never
+// consults the revocation store, so callers can present a retired cookie to
+// admission for lineage and authority evaluation.
+func (v *HMACUserSessionVerifier) VerifySessionLocal(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
+	return v.verifySignedSession(ctx, signedCookie)
 }
 
 func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCookie string) (UserSessionClaims, error) {
@@ -660,4 +715,92 @@ func (v *HMACUserSessionVerifier) RotateSession(
 	// HMAC signing itself is deterministic and cannot strand an untracked live
 	// successor after this point.
 	return current, v.signPreparedSession(successor), true, nil
+}
+
+// AdmitSession prepares a successor, commits its revocable lineage and
+// flow/epoch/Human provenance under the same exclusive durable lock, and only
+// then signs. A session that was never admitted can never be signed; a logout
+// or flow closure that commits before admission refuses issuance, and one
+// that commits after revokes the successor even when the response is lost.
+func (v *HMACUserSessionVerifier) AdmitSession(
+	ctx context.Context,
+	admission BrowserSessionAdmission,
+	successorClaims UserSessionClaims,
+	ttl time.Duration,
+) (UserSessionClaims, string, BrowserSessionAdmissionOutcome, error) {
+	prepared, err := v.prepareSession(ctx, successorClaims, ttl)
+	if err != nil {
+		return UserSessionClaims{}, "", BrowserSessionAdmissionOutcome{}, err
+	}
+	admission.Successor = prepared.claims.BrowserSessionIdentity()
+	admission.SuccessorBy = prepared.claims.UserID
+	outcome, err := v.revocations.AdmitBrowserSession(ctx, admission, v.now())
+	if err != nil {
+		return UserSessionClaims{}, "", outcome, fmt.Errorf("admit browser session: %w", err)
+	}
+	return prepared.claims, v.signPreparedSession(prepared), outcome, nil
+}
+
+// RevokeSessionsForLogout durably revokes every valid presented cookie's
+// lineage plus the epoch's live tip, closes the presented browser epoch, and
+// closes the issuing flows of everything revoked together with the browser's
+// listed pending flows. Locally invalid or expired cookies contribute
+// nothing. A durable failure must leave the credentials in the browser so
+// logout stays retryable.
+func (v *HMACUserSessionVerifier) RevokeSessionsForLogout(
+	ctx context.Context,
+	signedCookies []string,
+	epochHashes []string,
+	extraFlows map[string]time.Time,
+) (closedFlows []string, closedEpochs []string, retiredSessions []string, err error) {
+	var presented []BrowserSessionIdentity
+	seen := make(map[string]struct{})
+	for _, raw := range signedCookies {
+		claims, verifyErr := v.verifySignedSession(ctx, raw)
+		if verifyErr != nil {
+			if errors.Is(verifyErr, context.Canceled) ||
+				errors.Is(verifyErr, context.DeadlineExceeded) {
+				return nil, nil, nil, verifyErr
+			}
+			// Not ours or malformed: it needs no revocation.
+			continue
+		}
+		if !v.now().Before(claims.expiresAt) {
+			continue
+		}
+		identity := claims.BrowserSessionIdentity()
+		if _, duplicate := seen[identity.ID]; duplicate {
+			continue
+		}
+		seen[identity.ID] = struct{}{}
+		presented = append(presented, identity)
+	}
+	flows := make(map[string]int64, len(extraFlows))
+	for flowID, until := range extraFlows {
+		flows[flowID] = until.Unix()
+	}
+	return v.revocations.CloseBrowserSessionsForLogout(
+		ctx, presented, epochHashes, flows, v.now())
+}
+
+// CheckBrowserEpochUsable consults the durable store for an epoch closure.
+// Callers mint a fresh epoch on any failure, so a store error degrades to a
+// new jar name rather than a wedged cookie.
+func (v *HMACUserSessionVerifier) CheckBrowserEpochUsable(
+	ctx context.Context,
+	epochHash string,
+) error {
+	return v.revocations.CheckBrowserEpoch(ctx, epochHash, v.now())
+}
+
+// DiscardBrowserFlow closes exactly one flow's issuance authority and revokes
+// the sessions that flow already minted, without touching the browser's other
+// sessions or flows. The flow authority presents its nonce; the session store
+// is the durable barrier even when PostgreSQL's mirror update is lost.
+func (v *HMACUserSessionVerifier) DiscardBrowserFlow(
+	ctx context.Context,
+	flowID string,
+	retainUntil time.Time,
+) (retiredSessions []string, err error) {
+	return v.revocations.CloseBrowserFlow(ctx, flowID, retainUntil, v.now())
 }

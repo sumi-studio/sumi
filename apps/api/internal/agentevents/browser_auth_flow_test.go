@@ -19,6 +19,14 @@ type fakeAuthFlowController struct {
 	providerStatusCalls   int
 	providerStatusClaims  UserSessionClaims
 	providerStatusRequest ProviderOperationStatusRequest
+	flowEpoch             string
+	flowEpochErr          error
+	flowForNonce          BrowserFlowRef
+	flowForNonceErr       error
+	openFlows             []BrowserFlowRef
+	openFlowsErr          error
+	closedFlowIDs         []string
+	closeFlowsErr         error
 }
 
 func (f *fakeAuthFlowController) Start(context.Context, StartBrowserAuthFlowRequest) (BrowserAuthFlowResult, error) {
@@ -48,6 +56,19 @@ func (f *fakeAuthFlowController) StatusProviderOperation(_ context.Context, clai
 	f.providerStatusRequest = request
 	return f.providerStatusResult, f.providerStatusErr
 }
+func (f *fakeAuthFlowController) AuthFlowEpoch(context.Context, string) (string, error) {
+	return f.flowEpoch, f.flowEpochErr
+}
+func (f *fakeAuthFlowController) AuthFlowForNonce(context.Context, string, string) (BrowserFlowRef, error) {
+	return f.flowForNonce, f.flowForNonceErr
+}
+func (f *fakeAuthFlowController) OpenBrowserFlows(context.Context, string) ([]BrowserFlowRef, error) {
+	return f.openFlows, f.openFlowsErr
+}
+func (f *fakeAuthFlowController) CloseFlows(_ context.Context, flowIDs []string) error {
+	f.closedFlowIDs = append(f.closedFlowIDs, flowIDs...)
+	return f.closeFlowsErr
+}
 
 type trackingProviderStatusSessions struct {
 	*HMACUserSessionVerifier
@@ -76,12 +97,13 @@ func (s *trackingProviderStatusSessions) RevokeSessionForLogout(ctx context.Cont
 
 func postFlowJSON(t *testing.T, server *BrowserAuthServer, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	csrf, cookie := obtainCSRF(t, server)
+	csrf, cookie, epochCookie := obtainCSRF(t, server)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Origin", browserAuthTestOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CSRF-Token", csrf)
 	req.AddCookie(cookie)
+	req.AddCookie(epochCookie)
 	recorder := httptest.NewRecorder()
 	switch path {
 	case "/auth/flows":
@@ -102,9 +124,9 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 	bindings := &fakeBindingResolver{}
 	server, sessions := newTestBrowserAuthServer(t, firebase, bindings)
 	controller := &fakeAuthFlowController{
-		startResult:   BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "proof_required", ExpiresAt: time.Now().Add(time.Minute)},
-		resolveResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "confirmation_required", NextAction: "create_account"},
-		confirmResult: BrowserAuthFlowResult{FlowID: "flow-id", Outcome: "account_created", Claims: UserSessionClaims{
+		startResult:   BrowserAuthFlowResult{FlowID: "0198f0f4-9b72-7000-8000-0000000000f1", Outcome: "proof_required", ExpiresAt: time.Now().Add(time.Minute)},
+		resolveResult: BrowserAuthFlowResult{FlowID: "0198f0f4-9b72-7000-8000-0000000000f1", Outcome: "confirmation_required", NextAction: "create_account"},
+		confirmResult: BrowserAuthFlowResult{FlowID: "0198f0f4-9b72-7000-8000-0000000000f1", Outcome: "account_created", Claims: UserSessionClaims{
 			TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010", PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
 		}},
 	}
@@ -115,7 +137,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		t.Fatalf("start: %d %s", started.Code, started.Body.String())
 	}
 
-	resolved := postFlowJSON(t, server, "/auth/flows/resolve", `{"flow_id":"flow-id","nonce":"abc","id_token":"token"}`)
+	resolved := postFlowJSON(t, server, "/auth/flows/resolve", `{"flow_id":"0198f0f4-9b72-7000-8000-0000000000f1","nonce":"abc","id_token":"token"}`)
 	if resolved.Code != http.StatusOK || !strings.Contains(resolved.Body.String(), `"next_action":"create_account"`) {
 		t.Fatalf("resolve: %d %s", resolved.Code, resolved.Body.String())
 	}
@@ -123,7 +145,7 @@ func TestBrowserAuthFlowRoutesExposeSemanticOutcomes(t *testing.T) {
 		t.Fatal("confirmation-required response issued a session")
 	}
 
-	confirmed := postFlowJSON(t, server, "/auth/flows/confirm", `{"flow_id":"flow-id","nonce":"abc","action":"create_account"}`)
+	confirmed := postFlowJSON(t, server, "/auth/flows/confirm", `{"flow_id":"0198f0f4-9b72-7000-8000-0000000000f1","nonce":"abc","action":"create_account"}`)
 	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"outcome":"account_created"`) {
 		t.Fatalf("confirm: %d %s", confirmed.Code, confirmed.Body.String())
 	}
@@ -188,13 +210,14 @@ func TestProviderOperationStatusRecoversWithoutSessionOrFirebaseSideEffects(t *t
 
 	requestStatus := func() *httptest.ResponseRecorder {
 		t.Helper()
-		csrf, csrfCookie := obtainCSRF(t, server)
+		csrf, csrfCookie, epochCookie := obtainCSRF(t, server)
 		request := httptest.NewRequest(http.MethodPost, "/auth/providers/operations/status", strings.NewReader(
 			`{"operation_id":"0198f0f4-9b72-7000-8000-000000000020","nonce":"nonce-value"}`))
 		request.Header.Set("Origin", browserAuthTestOrigin)
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-CSRF-Token", csrf)
 		request.AddCookie(csrfCookie)
+		request.AddCookie(epochCookie)
 		request.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: session})
 		recorder := httptest.NewRecorder()
 		server.serveProviderOperationStatus(recorder, request)
@@ -252,7 +275,7 @@ func TestProviderOperationStatusRequiresOriginCSRFAndSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	csrf, csrfCookie := obtainCSRF(t, server)
+	csrf, csrfCookie, _ := obtainCSRF(t, server)
 	body := `{"operation_id":"0198f0f4-9b72-7000-8000-000000000020","nonce":"nonce-value"}`
 	tests := []struct {
 		name       string
@@ -316,7 +339,7 @@ func TestProviderOperationStatusUsesStrictTwoFieldJSON(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			csrf, csrfCookie := obtainCSRF(t, server)
+			csrf, csrfCookie, _ := obtainCSRF(t, server)
 			request := httptest.NewRequest(http.MethodPost, "/auth/providers/operations/status", strings.NewReader(test.body))
 			request.Header.Set("Origin", browserAuthTestOrigin)
 			request.Header.Set("Content-Type", test.contentType)
