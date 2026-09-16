@@ -381,6 +381,89 @@ func TestUploadStopsWhenTheFinalWriteSticks(t *testing.T) {
 	expect(t, m2.Resume(c.ctx), exitDone, out2, "Choose a model connection")
 }
 
+// An informational answer is not an answer to the upload: a peer that emits
+// 103 Early Hints (or any non-final bytes) while the final write is still
+// stuck has not completed the request — the transport's read loop can see
+// those bytes concurrently with the blocked write. The tail bound must keep
+// running until the call itself returns.
+func TestUploadStopsWhenEarlyBytesDoNotFinishTheWrite(t *testing.T) {
+	c := setupMove(t)
+	uid := "fixture-hints-" + c.pid[24:]
+	sid, moveURL := c.newSession(uid)
+	fillSecretary(t, c, 30, 4096)
+
+	quiet := make(chan struct{})
+	t.Cleanup(func() { close(quiet) })
+	c.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut {
+			return false
+		}
+		// Emit an interim response before reading the body, then go silent.
+		// The 103 reaches the client's read loop while the final write is
+		// still held — it is on the wire, but no final answer exists.
+		w.WriteHeader(http.StatusEarlyHints)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-quiet:
+		case <-r.Context().Done():
+		}
+		return true
+	})
+
+	m, out := c.mover()
+	m.stall = 300 * time.Millisecond
+	answerBound(m, 400*time.Millisecond)
+
+	held := make(chan struct{}, 8)
+	release := make(chan struct{})
+	tr := m.client.Transport.(*http.Transport)
+	dial := tr.DialContext
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &tailBlockConn{Conn: conn, held: held, release: release, closed: make(chan struct{})}, nil
+	}
+	t.Cleanup(func() { close(release) })
+
+	done := make(chan int, 1)
+	go func() { done <- m.Start(c.ctx, moveURL) }()
+	select {
+	case code := <-done:
+		if code != exitPending {
+			t.Fatalf("start against a 103 plus a stuck final write: %d\n%s", code, out)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("early response bytes disarmed the tail bound; the stuck final write held the command:\n%s", out)
+	}
+	if len(held) == 0 {
+		t.Fatal("the final terminator write was never exercised")
+	}
+	if !strings.Contains(out.String(), "stays sealed") {
+		t.Fatalf("output does not say where the secretary stands:\n%s", out)
+	}
+	if a := authority(t, c.local, c.pid); a != "sealed" {
+		t.Fatalf("authority after the stuck final write: %s", a)
+	}
+	if n := exportRows(t, c.local, c.pid); n != 1 {
+		t.Fatalf("export rows after the stuck final write: %d", n)
+	}
+	if s := c.sessionStatus(sid); s != "awaiting_bundle" {
+		t.Fatalf("session after the stuck final write: %s", s)
+	}
+
+	// The released stuck writes are done; a healthy command on the same
+	// recorded move finishes it.
+	c.setIntercept(nil)
+	m2, out2 := c.mover()
+	expect(t, m2.Resume(c.ctx), exitPending, out2, "waiting for the registration")
+	c.provision(uid, sid)
+	expect(t, m2.Resume(c.ctx), exitDone, out2, "Choose a model connection")
+}
+
 // A slow connection that keeps moving is not a stall: the upload finishes
 // even though it takes many silence windows' worth of time in total.
 func TestSlowButProgressingUploadIsNotCancelled(t *testing.T) {

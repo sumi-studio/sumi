@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -125,6 +124,12 @@ type mover struct {
 	state     *agentstate.Store
 	client    *http.Client
 	out       io.Writer
+	// answered is set by call when the in-flight request's Do returns with
+	// final response headers or an error. This does not prove the peer read
+	// the entire request. The upload tail watcher then hands the wait to
+	// the response-body bound. It is set on every call and only consulted
+	// while an upload is in flight.
+	answered atomic.Bool
 
 	wait        time.Duration
 	poll        time.Duration
@@ -676,18 +681,17 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 
 	body := &progress{r: pr}
 	body.last.Store(time.Now().UnixNano())
-	var stalled, tailExpired, answered atomic.Bool
+	var stalled, tailExpired atomic.Bool
 	// The body's last byte leaving the reader is not the end of the write:
 	// the transport still flushes the chunked terminator, and that write can
 	// block on a socket that stopped accepting bytes at exactly that point —
 	// while the response-header bound only arms once the write completes.
-	// From body EOF until Cloud's answer starts, the answer bound owns the
-	// wait; once the first response byte arrives the read-side bounds take
-	// over. (WroteRequest cannot mark the boundary: it fires inside the
-	// request write, before the blocking flush.)
-	uctx = httptrace.WithClientTrace(uctx, &httptrace.ClientTrace{
-		GotFirstResponseByte: func() { answered.Store(true) },
-	})
+	// Nor is the first response byte the boundary: the read loop can see a
+	// 1xx hint while the write is still stuck. The tail window ends when the
+	// call's Do returns — final response headers, or a failed attempt —
+	// which call records on m.answered. Until then the answer bound owns
+	// the wait; after it the response-body bound takes over.
+	m.answered.Store(false)
 	watch := make(chan struct{})
 	defer close(watch)
 	go func() {
@@ -709,7 +713,7 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 					}
 					continue
 				}
-				if answered.Load() {
+				if m.answered.Load() {
 					return
 				}
 				if time.Since(last) >= m.answer {
@@ -722,13 +726,15 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 	}()
 
 	v, code, err := m.call(uctx, http.MethodPut, st.SessionURL+"/bundle", st.Grant, body, "application/x-ndjson")
-	if stalled.Load() && ctx.Err() == nil {
-		return fmt.Errorf("%w: %v for %s; the secretary stays sealed and the bundle is sent again",
-			errUnreachable, errStalled, m.stall)
-	}
-	if tailExpired.Load() && !answered.Load() && ctx.Err() == nil {
-		return fmt.Errorf("%w: the bundle was sent but no answer came for %s; the secretary stays sealed and the bundle is sent again",
-			errUnreachable, m.answer)
+	if err != nil && ctx.Err() == nil {
+		if stalled.Load() {
+			return fmt.Errorf("%w: %v for %s; the secretary stays sealed and the bundle is sent again",
+				errUnreachable, errStalled, m.stall)
+		}
+		if tailExpired.Load() {
+			return fmt.Errorf("%w: the bundle was handed to the connection but no answer came for %s; the secretary stays sealed and the bundle is sent again",
+				errUnreachable, m.answer)
+		}
 	}
 	if err != nil {
 		return err
@@ -785,6 +791,7 @@ func (m *mover) call(ctx context.Context, method, target, grant string, body io.
 		req.Header.Set("Content-Type", contentType)
 	}
 	res, err := m.client.Do(req)
+	m.answered.Store(true)
 	if err != nil {
 		if ctx.Err() != nil {
 			return v, 0, ctx.Err()
