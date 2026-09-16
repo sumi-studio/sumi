@@ -230,10 +230,10 @@ function pendingFlow(): PendingEmailAuthFlow {
     flowId: "email-flow",
     nonce: "n".repeat(43),
     intent: "sign_in",
-    provider: "email_link",
+    provider: "email_code",
     email: "existing@example.com",
     expiresAt,
-    stage: "link_sent",
+    stage: "code_sent",
     credentialRecovery: {
       version: 1,
       provider: "github.com",

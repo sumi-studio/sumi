@@ -65,6 +65,18 @@ not this host. The launcher validates and passes both endpoints, but does not
 start or expose the emulator. ADC validation is skipped only in this explicit
 emulator mode.
 
+Email sign-in (a 6-digit code first, with the emailed link as an alternative)
+is off unless all of `SUMI_AUTH_EMAIL_CHALLENGE_KEY` (base64, at least 32
+bytes), `SUMI_AUTH_EMAIL_CHALLENGE_KEY_ID`, `SUMI_AUTH_EMAIL_SENDER` and
+`SUMI_AUTH_EMAIL_LINK_ORIGIN` (one of the allowed browser origins) are set.
+The only sender today is `dev-mailbox`, which writes each message as an
+owner-only JSON file under the absolute `SUMI_AUTH_EMAIL_DEV_MAILBOX_DIR`
+instead of sending mail. It is accepted only with insecure local cookies or the
+Firebase Auth emulator. Changing the key or its ID ends codes and links that are
+still outstanding. With a real Firebase project, the server signs custom tokens
+with the Admin credential, or through IAM `signBlob` for
+`SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID`.
+
 Copy the template, then fill the required blanks:
 
 ```sh
@@ -485,6 +497,19 @@ including failed logout, draft recovery, a failed Messaging bootstrap and
 successful retries. Google/GitHub
 sign-in itself is not exercised, and no PersonalityAgent or model provider is
 required for this journey.
+
+The email-code sign-in journey uses the same kind of disposable database and
+emulator (project `sumi-studio`). It seeds existing accounts through
+`cmd/e2e-auth-email-seed`, reads codes and links from a temporary development
+mailbox, and covers a wrong code, resend, the link in the same browser, and
+another browser that must choose to continue:
+
+```sh
+SUMI_AUTH_EMAIL_E2E_DB_URL='postgres://user:password@127.0.0.1:5432/disposable_e2e?sslmode=disable' \
+FIREBASE_AUTH_EMULATOR_HOST='127.0.0.1:9099' \
+SUMI_AUTH_EMAIL_E2E_API_PORT=18080 SUMI_AUTH_EMAIL_E2E_WEB_PORT=15173 \
+pnpm exec playwright test e2e/email-code-auth.spec.ts
+```
 
 
 ## Linux / WSL host restart

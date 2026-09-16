@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -15,27 +17,51 @@ type StartBrowserAuthFlowRequest struct {
 	Email        string `json:"email,omitempty"`
 	Continuation string `json:"continuation"`
 	Nonce        string `json:"nonce"`
+	// BrowserEpochHash is set by the server from the browser epoch cookie,
+	// never decoded from the request body.
+	BrowserEpochHash string `json:"-"`
 }
 
 type BrowserAuthFlowResult struct {
-	FlowID       string            `json:"flow_id,omitempty"`
-	Outcome      string            `json:"outcome"`
-	NextAction   string            `json:"next_action,omitempty"`
-	Continuation string            `json:"continuation,omitempty"`
-	ExpiresAt    time.Time         `json:"expires_at,omitempty"`
-	Claims       UserSessionClaims `json:"-"`
+	FlowID       string    `json:"flow_id,omitempty"`
+	Outcome      string    `json:"outcome"`
+	NextAction   string    `json:"next_action,omitempty"`
+	Continuation string    `json:"continuation,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	// HumanID identifies the Human a terminal outcome resolved to, so the
+	// browser can compare it against its current session identity.
+	HumanID string `json:"human_id,omitempty"`
+	// EmailChallenge describes the first emailed code of an email flow.
+	EmailChallenge *EmailChallengeResult `json:"email_challenge,omitempty"`
+	Claims         UserSessionClaims     `json:"-"`
 }
 
 type ResolveBrowserAuthFlowRequest struct {
 	FlowID  string `json:"flow_id"`
 	Nonce   string `json:"nonce"`
 	IDToken string `json:"id_token"`
+	// SwitchFromUserID is the person's explicit choice to replace the
+	// currently active Human; it must equal that Human, not merely some
+	// cookie the request happened to carry.
+	SwitchFromUserID string `json:"switch_from_user_id,omitempty"`
 }
 
 type ConfirmBrowserAuthFlowRequest struct {
 	FlowID string `json:"flow_id"`
 	Nonce  string `json:"nonce"`
 	Action string `json:"action"`
+	// SwitchFromUserID mirrors ResolveBrowserAuthFlowRequest: confirming a
+	// different Human requires explicitly naming the replaced one.
+	SwitchFromUserID string `json:"switch_from_user_id,omitempty"`
+}
+
+// BrowserFlowRef is the revocation-facing view of one flow.
+type BrowserFlowRef struct {
+	FlowID    string
+	HumanID   string
+	EpochHash string
+	ExpiresAt time.Time
+	Closed    bool
 }
 
 type StartProviderOperationRequest struct {
@@ -112,6 +138,16 @@ type BrowserAuthFlowController interface {
 	CompleteProviderOperation(ctx context.Context, claims UserSessionClaims, request CompleteProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	FailProviderOperation(ctx context.Context, claims UserSessionClaims, request FailProviderOperationRequest) (ProviderOperationResult, error)
 	StatusProviderOperation(ctx context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error)
+	// AuthFlowEpoch returns the browser epoch hash bound at flow start.
+	AuthFlowEpoch(ctx context.Context, flowID string) (string, error)
+	// AuthFlowForNonce returns a flow only to its nonce authority, for the
+	// flow-scoped discard boundary.
+	AuthFlowForNonce(ctx context.Context, flowID, nonce string) (BrowserFlowRef, error)
+	// OpenBrowserFlows lists a browser epoch's unclosed flows for logout.
+	OpenBrowserFlows(ctx context.Context, epochHash string) ([]BrowserFlowRef, error)
+	// CloseFlows mirrors a committed session-store flow closure into durable
+	// flow state; issuance never consults it.
+	CloseFlows(ctx context.Context, flowIDs []string) error
 }
 
 func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +161,12 @@ func (s *BrowserAuthServer) serveStartAuthFlow(w http.ResponseWriter, r *http.Re
 	if !decodeAuthJSON(w, r, &request) {
 		return
 	}
+	epochHash, err := s.browserEpochHash(w, r, true)
+	if err != nil {
+		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		return
+	}
+	request.BrowserEpochHash = epochHash
 	result, err := s.Flows.Start(r.Context(), request)
 	if err != nil {
 		writeFlowError(w, err)
@@ -159,8 +201,8 @@ func (s *BrowserAuthServer) serveResolveAuthFlow(w http.ResponseWriter, r *http.
 		return
 	}
 	if result.Outcome == "signed_in" || result.Outcome == "account_created" {
-		if err := s.establishSession(w, r, result.Claims); err != nil {
-			writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		if err := s.establishSession(w, r, result.Claims, request.FlowID, request.SwitchFromUserID); err != nil {
+			s.writeSessionIssuanceError(w, err)
 			return
 		}
 	}
@@ -183,8 +225,8 @@ func (s *BrowserAuthServer) serveConfirmAuthFlow(w http.ResponseWriter, r *http.
 		writeFlowError(w, err)
 		return
 	}
-	if err := s.establishSession(w, r, result.Claims); err != nil {
-		writeBrowserAuthError(w, http.StatusServiceUnavailable, "authentication unavailable")
+	if err := s.establishSession(w, r, result.Claims, request.FlowID, request.SwitchFromUserID); err != nil {
+		s.writeSessionIssuanceError(w, err)
 		return
 	}
 	writeBrowserAuthJSON(w, http.StatusOK, result)
@@ -348,7 +390,51 @@ func decodeAuthJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 
 func writeFlowError(w http.ResponseWriter, err error) {
 	status, code := http.StatusBadRequest, "invalid_flow"
+	body := map[string]any{}
+	var mismatch *BrowserEmailCodeMismatchError
+	var limited *BrowserEmailSendLimitedError
 	switch {
+	case errors.As(err, &mismatch):
+		status, code = http.StatusUnprocessableEntity, "code_mismatch"
+		if mismatch.AttemptsRemaining >= 0 {
+			body["attempts_remaining"] = mismatch.AttemptsRemaining
+		}
+	case errors.As(err, &limited):
+		status, code = http.StatusTooManyRequests, "email_send_limited"
+		body["retry_at"] = limited.RetryAt.UTC()
+		seconds := int(math.Ceil(time.Until(limited.RetryAt).Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	case errors.Is(err, ErrBrowserEmailCodeLocked):
+		status, code = http.StatusConflict, "code_locked"
+	case errors.Is(err, ErrBrowserEmailSuperseded):
+		status, code = http.StatusConflict, "email_superseded"
+	case errors.Is(err, ErrBrowserEmailExpired):
+		status, code = http.StatusGone, "email_expired"
+	case errors.Is(err, ErrBrowserEmailConsumed):
+		status, code = http.StatusConflict, "email_consumed"
+	case errors.Is(err, ErrBrowserEmailLinkInvalid):
+		status, code = http.StatusNotFound, "link_invalid"
+	case errors.Is(err, ErrBrowserEmailAdoptionRequired):
+		status, code = http.StatusConflict, "link_adoption_required"
+	case errors.Is(err, ErrBrowserEmailContinuedElsewhere):
+		status, code = http.StatusConflict, "continued_in_other_browser"
+	case errors.Is(err, ErrBrowserEmailUnverifiedAccount):
+		status, code = http.StatusConflict, "email_unverified_account"
+		var unverified *BrowserEmailUnverifiedAccountError
+		if errors.As(err, &unverified) {
+			providers := unverified.SignInProviders
+			if providers == nil {
+				providers = []string{}
+			}
+			body["sign_in_providers"] = providers
+		}
+	case errors.Is(err, ErrBrowserEmailUnavailable):
+		status, code = http.StatusServiceUnavailable, "email_unavailable"
+	case errors.Is(err, ErrBrowserSessionActive):
+		status, code = http.StatusConflict, "session_active"
 	case errors.Is(err, ErrBrowserEnrollmentInvite):
 		status, code = http.StatusForbidden, "invitation_required"
 	case errors.Is(err, ErrBrowserAuthFlowExpired):
@@ -366,5 +452,6 @@ func writeFlowError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrBrowserAuthProviderUnavailable):
 		status, code = http.StatusServiceUnavailable, "provider_unavailable"
 	}
-	writeBrowserAuthJSON(w, status, map[string]string{"error": code})
+	body["error"] = code
+	writeBrowserAuthJSON(w, status, body)
 }

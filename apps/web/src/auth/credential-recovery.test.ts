@@ -15,7 +15,7 @@ const recoveryMocks = vi.hoisted(() => ({
   credentialFromJSON: vi.fn(),
   getIdToken: vi.fn(),
   linkWithCredential: vi.fn(),
-  beginEmailLinkAuth: vi.fn(),
+  beginEmailCodeAuth: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
   startProviderOperation: vi.fn(),
   completeProviderOperation: vi.fn(),
@@ -43,8 +43,8 @@ vi.mock("firebase/auth", () => ({
   linkWithCredential: recoveryMocks.linkWithCredential,
 }));
 
-vi.mock("./email-link-auth", () => ({
-  beginEmailLinkAuth: recoveryMocks.beginEmailLinkAuth,
+vi.mock("./email-code-auth", () => ({
+  beginEmailCodeAuth: recoveryMocks.beginEmailCodeAuth,
 }));
 
 vi.mock("./firebase", () => ({
@@ -67,7 +67,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   recoveryMocks.auth.currentUser = { uid: "firebase-existing" };
   recoveryMocks.createAuthFlowNonce.mockReturnValue("n".repeat(43));
-  recoveryMocks.beginEmailLinkAuth.mockResolvedValue(undefined);
+  recoveryMocks.beginEmailCodeAuth.mockResolvedValue(undefined);
   recoveryMocks.getIdToken
     .mockResolvedValueOnce("email-proof-token")
     .mockResolvedValueOnce("fresh-linked-token");
@@ -107,7 +107,7 @@ describe("same-email Firebase credential recovery", () => {
 
     await beginSameEmailCredentialRecovery(error, "github.com", "sign_up");
 
-    expect(recoveryMocks.beginEmailLinkAuth).toHaveBeenCalledWith(
+    expect(recoveryMocks.beginEmailCodeAuth).toHaveBeenCalledWith(
       "existing@example.com",
       "sign_in",
       {

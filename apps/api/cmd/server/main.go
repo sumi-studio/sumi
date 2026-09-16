@@ -111,6 +111,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startRuntimeRecovery()
 	app.startWarmReconciliation()
 	app.startPendingWorkReconciliation()
+	app.startEmailDelivery()
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()
@@ -242,6 +243,7 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 type application struct {
 	chatGPTLogin               *chatgpt.LoginService
 	chatGPTActivation          *chatGPTActivationWorker
+	emailDelivery              *emailDeliveryWorker
 	publicMux                  *http.ServeMux
 	localMux                   *http.ServeMux
 	localListener              *localControlListenerConfig
@@ -830,6 +832,7 @@ func newApplicationFromEnv() (*application, error) {
 		processOperations:          processOperations,
 		chatGPTLogin:               chatGPTLogin,
 		chatGPTActivation:          chatGPTActivation,
+		emailDelivery:              emailDeliveryWorkerFor(authServer),
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
 		coreDirectChat:             coreDirectChat,

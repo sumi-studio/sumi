@@ -34,12 +34,12 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("AuthGate email-link callback", () => {
-  it("shows the callback UI before the authenticated direct-chat fast path", () => {
+describe("AuthGate email link landing", () => {
+  it("shows the link choice before the authenticated direct-chat fast path", () => {
     gateMocks.useAuth.mockReturnValue({
       canUseDirectChat: true,
       dismissOutcomeNotice: vi.fn(),
-      emailLinkCallbackPending: true,
+      emailLinkPending: true,
       loading: false,
       outcomeNotice: null,
       sessionState: "authenticated",
@@ -64,7 +64,7 @@ describe("AuthGate Workspace authority binding", () => {
     gateMocks.useAuth.mockReturnValue({
       authorityBindingId: "binding-b",
       canUseDirectChat: true,
-      emailLinkCallbackPending: false,
+      emailLinkPending: false,
       loading: false,
       sessionState: "authenticated",
       refreshSession: vi.fn(),

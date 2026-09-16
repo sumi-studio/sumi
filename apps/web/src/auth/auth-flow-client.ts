@@ -4,12 +4,12 @@ import {
 } from "./enrollment-invitation-state";
 import {
   AuthAPIError,
-  logoutSumiSession,
   postAuthJSON,
+  postAuthNoContent,
 } from "./session-client";
 
 export type AuthIntent = "sign_in" | "sign_up";
-export type AuthFlowProvider = "email_link" | "google.com" | "github.com";
+export type AuthFlowProvider = "email_code" | "google.com" | "github.com";
 export type AuthConfirmationAction = "create_account" | "sign_in";
 
 export type AuthFlowResult =
@@ -17,6 +17,7 @@ export type AuthFlowResult =
       flowId: string;
       outcome: "proof_required";
       expiresAt: string;
+      emailChallenge?: EmailChallengeStatus;
     }
   | {
       flowId: string;
@@ -30,7 +31,23 @@ export type AuthFlowResult =
       outcome: "signed_in" | "account_created";
       continuation: string;
       expiresAt: string;
+      /** The Human the terminal outcome resolved to. */
+      humanId: string;
     };
+
+/** Sumi email proof state; never contains the code or link token. */
+export interface EmailChallengeStatus {
+  flowId: string;
+  flowStatus: string;
+  email: string;
+  flowExpiresAt: string;
+  challengeExpiresAt: string;
+  attemptsRemaining: number;
+  delivery: "" | "pending" | "sent" | "failed" | "cancelled";
+  resendAvailableAt: string;
+  /** Set once the flow resolved to a Human; absent while still pending. */
+  humanId?: string;
+}
 
 export interface StartAuthFlowRequest {
   intent: AuthIntent;
@@ -48,7 +65,7 @@ export class AuthFlowRecoveryFailedError extends AggregateError {
   ) {
     super(
       [mutationError, recoveryError, logoutError],
-      "Authentication flow response was ambiguous and recovery logout failed.",
+      "Authentication flow response was ambiguous and recovery discard failed.",
     );
     this.name = "AuthFlowRecoveryFailedError";
   }
@@ -73,7 +90,7 @@ export async function startAuthFlow(
     continuation: request.continuation,
     nonce: request.nonce,
   };
-  if (request.provider === "email_link") {
+  if (request.provider === "email_code") {
     body.email = request.email ?? "";
   }
   const invitation = readEnrollmentInvitation();
@@ -89,10 +106,13 @@ export async function resolveAuthFlow({
   flowId,
   nonce,
   idToken,
+  switchFromUserId,
 }: {
   flowId: string;
   nonce: string;
   idToken: string;
+  /** The person's explicit choice to replace this jar's active Human. */
+  switchFromUserId?: string;
 }): Promise<Exclude<AuthFlowResult, { outcome: "proof_required" }>> {
   if (!idToken || idToken.length > 12 * 1024) {
     throw new AuthAPIError("Invalid Firebase ID token.", 0);
@@ -104,6 +124,7 @@ export async function resolveAuthFlow({
         flow_id: flowId,
         nonce,
         id_token: idToken,
+        ...(switchFromUserId ? { switch_from_user_id: switchFromUserId } : {}),
       }),
     );
   } catch (error) {
@@ -127,10 +148,13 @@ export async function confirmAuthFlow({
   flowId,
   nonce,
   action,
+  switchFromUserId,
 }: {
   flowId: string;
   nonce: string;
   action: AuthConfirmationAction;
+  /** The person's explicit choice to replace this jar's active Human. */
+  switchFromUserId?: string;
 }): Promise<
   Extract<AuthFlowResult, { outcome: "signed_in" | "account_created" }>
 > {
@@ -141,6 +165,7 @@ export async function confirmAuthFlow({
         flow_id: flowId,
         nonce,
         action,
+        ...(switchFromUserId ? { switch_from_user_id: switchFromUserId } : {}),
       }),
     );
   } catch (error) {
@@ -159,6 +184,19 @@ export async function confirmAuthFlow({
   }
   clearEnrollmentInvitation();
   return result;
+}
+
+/**
+ * Cancels one flow's server-side issuance authority and revokes the sessions
+ * it already minted, by the nonce that owns it. This is the scoped
+ * compensation for an ambiguous mutation: it never disturbs a session a
+ * later, different sign-in choice established in this jar.
+ */
+export async function discardAuthFlow(
+  flowId: string,
+  nonce: string,
+): Promise<void> {
+  await postAuthNoContent("/auth/flows/discard", { flow_id: flowId, nonce });
 }
 
 async function recoverAmbiguousFlowMutation({
@@ -187,12 +225,15 @@ async function recoverAmbiguousFlowMutation({
     recoveryError = error;
   }
   try {
-    await logoutSumiSession();
-  } catch (logoutError) {
+    // Recovery could not prove the outcome, so the flow must not keep the
+    // ability to issue a session later. Discarding it revokes exactly what
+    // it may have committed — never another account's session.
+    await discardAuthFlow(flowId, nonce);
+  } catch (discardError) {
     throw new AuthFlowRecoveryFailedError(
       mutationError,
       recoveryError,
-      logoutError,
+      discardError,
     );
   }
   throw mutationError;
@@ -217,7 +258,12 @@ function parseAuthFlowResult(value: unknown): AuthFlowResult {
   const continuation = optionalString(value.continuation, 2_048);
 
   if (outcome === "proof_required" && expiresAt) {
-    return { flowId, outcome, expiresAt };
+    if (value.email_challenge === undefined) {
+      return { flowId, outcome, expiresAt };
+    }
+    const emailChallenge = parseEmailChallenge(value.email_challenge);
+    if (emailChallenge.flowId !== flowId) invalidResponse();
+    return { flowId, outcome, expiresAt, emailChallenge };
   }
   if (outcome === "confirmation_required") {
     const nextAction = value.next_action;
@@ -232,11 +278,48 @@ function parseAuthFlowResult(value: unknown): AuthFlowResult {
   if (
     (outcome === "signed_in" || outcome === "account_created") &&
     continuation &&
-    expiresAt
+    expiresAt &&
+    typeof value.human_id === "string" &&
+    value.human_id.length > 0 &&
+    value.human_id.length <= 256
   ) {
-    return { flowId, outcome, continuation, expiresAt };
+    return { flowId, outcome, continuation, expiresAt, humanId: value.human_id };
   }
   return invalidResponse();
+}
+
+export function parseEmailChallenge(value: unknown): EmailChallengeStatus {
+  if (!isObject(value)) invalidResponse();
+  const attempts = value.attempts_remaining;
+  const delivery = value.delivery;
+  if (
+    typeof attempts !== "number" ||
+    !Number.isInteger(attempts) ||
+    attempts < 0 ||
+    attempts > 5 ||
+    (delivery !== "" &&
+      delivery !== "pending" &&
+      delivery !== "sent" &&
+      delivery !== "failed" &&
+      delivery !== "cancelled")
+  ) {
+    invalidResponse();
+  }
+  return {
+    flowId: requiredString(value.flow_id, 256),
+    flowStatus: requiredString(value.flow_status, 64),
+    email: requiredString(value.email, 320),
+    flowExpiresAt: requiredString(value.flow_expires_at, 64),
+    challengeExpiresAt: requiredString(value.challenge_expires_at, 64),
+    attemptsRemaining: attempts,
+    delivery,
+    resendAvailableAt: requiredString(value.resend_available_at, 64),
+    ...(typeof value.human_id === "string" &&
+    value.human_id.length > 0 &&
+    value.human_id.length <= 256
+      ? { humanId: value.human_id }
+      : {}),
+  };
 }
 
 function requiredString(value: unknown, maxLength: number): string {

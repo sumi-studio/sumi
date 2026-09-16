@@ -1262,7 +1262,7 @@ func TestUnixLocalControlTrustChecksFailClosed(t *testing.T) {
 	})
 
 	t.Run("wrong-mode ownership lock", func(t *testing.T) {
-		parent := trustedSocketParent(t)
+		parent := trustedShortSocketParent(t)
 		socketPath := filepath.Join(parent, "control.sock")
 		lockPath := socketPath + ".owner.lock"
 		if err := os.WriteFile(lockPath, nil, 0o640); err != nil {
@@ -1281,7 +1281,7 @@ func TestUnixLocalControlTrustChecksFailClosed(t *testing.T) {
 	})
 
 	t.Run("hardlinked ownership lock", func(t *testing.T) {
-		parent := trustedSocketParent(t)
+		parent := trustedShortSocketParent(t)
 		socketPath := filepath.Join(parent, "control.sock")
 		lockPath := socketPath + ".owner.lock"
 		if err := os.WriteFile(lockPath, nil, localControlLockMode); err != nil {

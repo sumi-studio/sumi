@@ -34,10 +34,8 @@ const mocks = vi.hoisted(() => ({
   signOut: vi.fn(),
   getIdToken: vi.fn(),
   onAuthStateChanged: vi.fn(),
-  beginEmailLinkAuth: vi.fn(),
-  completeEmailLinkAuth: vi.fn(),
-  hasEmailLinkCallback: vi.fn(() => false),
-  rejectEmailLinkAuth: vi.fn(),
+  loadActiveEmailCodeFlow: vi.fn(() => null),
+  pendingEmailLink: vi.fn(() => null),
   beginSameEmailCredentialRecovery: vi.fn(),
   completeSameEmailCredentialRecovery: vi.fn(),
   getFirebaseAuth: vi.fn(() => ({})),
@@ -61,11 +59,19 @@ vi.mock("./auth-flow-client", () => ({
   createAuthFlowNonce: () => "n".repeat(43),
 }));
 
-vi.mock("./email-link-auth", () => ({
-  beginEmailLinkAuth: mocks.beginEmailLinkAuth,
-  completeEmailLinkAuth: mocks.completeEmailLinkAuth,
-  hasEmailLinkCallback: mocks.hasEmailLinkCallback,
-  rejectEmailLinkAuth: mocks.rejectEmailLinkAuth,
+vi.mock("./email-code-auth", () => ({
+  abandonEmailCodeFlow: vi.fn(),
+  beginEmailCodeAuth: vi.fn(),
+  clearPendingEmailLink: vi.fn(),
+  completeEmailLink: vi.fn(),
+  ensureEmailCompletionSession: vi.fn(),
+  finishEmailProof: vi.fn(),
+  inspectEmailLink: vi.fn(),
+  loadActiveEmailCodeFlow: mocks.loadActiveEmailCodeFlow,
+  pendingEmailLink: mocks.pendingEmailLink,
+  readEmailCodeStatus: vi.fn(),
+  resendEmailCode: vi.fn(),
+  verifyEmailCode: vi.fn(),
 }));
 
 vi.mock("./credential-recovery", async (importOriginal) => ({
