@@ -650,6 +650,16 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	if err := validateIDs(personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
+	// PlacementID takes its own pool connection, so it is read before Begin —
+	// as Seal, Retire and Import already do. A transaction that holds the
+	// transfer's advisory lock cannot wait on the pool: under saturation the
+	// lock holder would wait for a connection while every other caller holds
+	// a connection waiting for the lock, and the owed activation never
+	// commits.
+	own, err := s.PlacementID(ctx)
+	if err != nil {
+		return Receipt{}, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Receipt{}, err
@@ -707,10 +717,6 @@ func (s *Service) Activate(ctx context.Context, personaID, transferID string) (R
 	// The proof names this placement's own id — which is the ledger's
 	// destination_id for every import — so it can only ever verify as the
 	// addressed destination's evidence.
-	own, err := s.PlacementID(ctx)
-	if err != nil {
-		return Receipt{}, err
-	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, personaID); err != nil {
 		return Receipt{}, err
