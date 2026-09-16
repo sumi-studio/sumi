@@ -29,6 +29,25 @@ export type TimelineRow =
   | { id: string; kind: "unread" }
   | {
       id: string;
+      /** 読み込み済みwindow同士の間にある未ロード区間。seqは疎ではなく、
+       * tombstoneもseqを占有するので、seq差が開く＝実際に未取得がある。 */
+      kind: "gap";
+      /** gap直上（古い側）の読み込み済みseq。 */
+      afterSeq: number;
+      /** gap直下（新しい側）の読み込み済みseq。この直前までを読み込む。 */
+      beforeSeq: number;
+      missingCount: number;
+    }
+  | {
+      id: string;
+      /** 検索結果やpermalinkから辿った対象が削除済みだったとき、そのseq位置に
+       * 出す標識。tombstoneは通常描画しないが、利用者が明示的に開いた対象が
+       * 「消えた」のか「無かった」のかを区別できるようにする。 */
+      kind: "deleted";
+      seq: number;
+    }
+  | {
+      id: string;
       kind: "message";
       message: Message;
       grouped: boolean;
@@ -233,6 +252,12 @@ export interface BuildRowsInput {
   unreadLineSeq: number | null;
   self: Message["author"];
   now: number;
+  /**
+   * jump/permalinkの対象seqが削除済みだったとき、その位置に「削除されています」
+   * 標識行を出すための指定。未指定（null/undefined）ならtombstoneは通常どおり
+   * 描画しない。
+   */
+  deletedTargetSeq?: number | null;
 }
 
 /**
@@ -292,7 +317,35 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
     previousBroken = false;
   };
 
-  for (const message of input.messages) pushMessage(message, false);
+  // seqは削除済みtombstoneも占有するので、読み込み済み同士のseq差は
+  // 必ず未取得区間を意味する。windowが離れて併存する（検索jumpなど）とき、
+  // 暗黙に隣接させずgap行として明示する。tombstone自身もseqを占有するため
+  // gap判定から除外しない——除外するとwindow境界のtombstoneが未ロード区間を
+  // 隠し、その先の履歴が到達不能になる。
+  let previousSeq: number | null = null;
+  for (const message of input.messages) {
+    if (previousSeq !== null && message.seq - previousSeq > 1) {
+      rows.push({
+        id: `gap:${previousSeq}-${message.seq}`,
+        kind: "gap",
+        afterSeq: previousSeq,
+        beforeSeq: message.seq,
+        missingCount: message.seq - previousSeq - 1,
+      });
+      previousBroken = true;
+    }
+    previousSeq = message.seq;
+    if (message.deleted && message.seq === input.deletedTargetSeq) {
+      rows.push({
+        id: `deleted:${message.seq}`,
+        kind: "deleted",
+        seq: message.seq,
+      });
+      previousBroken = true;
+      continue;
+    }
+    pushMessage(message, false);
+  }
   for (const entry of input.pending) {
     pushMessage(
       {

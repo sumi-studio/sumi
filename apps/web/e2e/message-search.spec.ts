@@ -1,0 +1,663 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { expect, type Locator, type Page, test } from "@playwright/test";
+import {
+  buildWorkspaceBrowserStack,
+  removeWorkspaceBrowserBuild,
+  startWorkspaceBrowserStack,
+  type WorkspaceBrowserBuild,
+} from "./support/real-agent-stack";
+
+// Message-search end-to-end evidence on the real Workspace browser stack:
+// production API + Postgres + Vite + real Chrome. The search -> jump path is
+// exercised through the UI; bulk history is seeded through the same production
+// REST surface so the target message sits outside the initially loaded page.
+
+test.describe.configure({ timeout: 300_000 });
+test.use({ actionTimeout: 10_000 });
+
+const artifactDirectory =
+  process.env.SUMI_E2E_ARTIFACT_DIR?.trim() || "test-results/message-search";
+const humanBID = "0198f0f4-9b72-7000-8000-00000000e2e1";
+const personalityAgentID = "0198f0f4-9b72-7000-8000-000000000001";
+const oldNeedle = "quartz-needle-e2e-old-message";
+const japaneseNeedle = "検証用の日本語メッセージ星印";
+const deletedNeedle = "deleted-needle-e2e-message";
+const vanishingNeedle = "vanishing-needle-e2e-target";
+const liveTailProbe = "live-tail-probe-e2e";
+const liveFollowControl = "live-follow-control-e2e";
+const dmSecret = "dm-secret-e2e-token";
+const threadNeedle = "thread-needle-e2e-message";
+
+let build: WorkspaceBrowserBuild | undefined;
+
+test.beforeAll(async () => {
+  test.setTimeout(180_000);
+  build = await buildWorkspaceBrowserStack();
+});
+
+test.afterAll(async () => {
+  if (build) await removeWorkspaceBrowserBuild(build);
+});
+
+test("Human searches shared messages and reaches the original message", async ({
+  context,
+  page,
+}) => {
+  if (!build) throw new Error("Workspace browser binaries were not built");
+  const databaseURL = process.env.SUMI_WORKSPACE_E2E_DB_URL?.trim();
+  if (!databaseURL) {
+    throw new Error(
+      "SUMI_WORKSPACE_E2E_DB_URL must name a disposable empty Postgres database",
+    );
+  }
+  const stack = await startWorkspaceBrowserStack(build, databaseURL);
+  const artifact = async (name: string) => {
+    await mkdir(artifactDirectory, { recursive: true });
+    await page.screenshot({ path: join(artifactDirectory, name) });
+  };
+  try {
+    await stack.installSession(context);
+    await page.goto(stack.webURL);
+
+    const workspace = await createWorkspace(page, "Search Studio");
+    const installation = await installMessaging(page);
+    const scopeQuery =
+      `workspace_id=${workspace.workspaceID}` +
+      `&installation_id=${installation.installationID}` +
+      `&authority_epoch=${installation.authorityEpoch}`;
+
+    // A second Human gives the DM boundary a place the Secretary must not
+    // read. Provisioning uses the same test-only issuer binary, still scoped
+    // to this disposable database.
+    await provisionHuman(build, databaseURL, humanBID, "Workspace E2E Human B");
+    await seedMember(databaseURL, workspace.workspaceID, "human", humanBID);
+    await seedMember(
+      databaseURL,
+      workspace.workspaceID,
+      "personality_agent",
+      personalityAgentID,
+    );
+
+    await page.getByRole("button", { name: "開く", exact: true }).click();
+    await expect(
+      page.getByText("場所はまだありません", { exact: true }),
+    ).toBeVisible();
+
+    const channelID = await createChannel(page, "search-general");
+    const api = context.request;
+    const post = (path: string, data: Record<string, unknown>) =>
+      api.post(`${stack.apiURL}${path}?${scopeQuery}`, {
+        headers: { Origin: stack.webURL },
+        data,
+      });
+
+    // The needle messages sit far above the most recent page so the loaded
+    // history cannot contain them before the jump. 80 fillers leave a real
+    // unloaded range between the jump window and the newest page.
+    const needleMessageID = await sendMessage(
+      post,
+      channelID,
+      `${oldNeedle} tail`,
+    );
+    await sendMessage(post, channelID, `${japaneseNeedle} の続き`);
+    const doomed = await sendMessage(post, channelID, deletedNeedle);
+    // Deleted between result and click later; seq 4 sits outside the newest
+    // page so the jump must fetch a window whose target is already a tombstone.
+    const vanishingMessageID = await sendMessage(
+      post,
+      channelID,
+      `${vanishingNeedle} body`,
+    );
+    const fillerIDs: string[] = [];
+    for (let index = 0; index < 80; index++) {
+      fillerIDs.push(
+        await sendMessage(post, channelID, `filler message ${index}`),
+      );
+    }
+    const thread = await post(`/messaging/places/${channelID}/threads`, {
+      name: "検証スレッド",
+      client_nonce: randomUUID(),
+    });
+    expect(thread.status()).toBe(201);
+    const threadID = asString(asRecord(await thread.json()).thread_id);
+    await sendMessage(post, threadID, `${threadNeedle} in-thread`);
+    const dm = await api.post(`${stack.apiURL}/messaging/dms?${scopeQuery}`, {
+      headers: { Origin: stack.webURL },
+      data: { participant: { kind: "human", human_id: humanBID } },
+    });
+    expect(dm.status()).toBe(200);
+    const dmWire = asRecord(await dm.json());
+    const dmID = asString(dmWire.dm_id);
+    await sendMessage(post, dmID, `${dmSecret} body`);
+    const deleted = await api.delete(
+      `${stack.apiURL}/messaging/places/${channelID}/messages/${doomed}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(deleted.status()).toBe(200);
+    // seq 35 (`filler message 30`) is the oldest row of the newest page after
+    // reload — deleting it puts a tombstone exactly on the boundary between
+    // the jump window and the loaded page, where the omitted range must not
+    // be hidden.
+    const boundaryDeleted = await api.delete(
+      `${stack.apiURL}/messaging/places/${channelID}/messages/${fillerIDs[30]}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(boundaryDeleted.status()).toBe(200);
+
+    await mkdir(artifactDirectory, { recursive: true });
+    await writeFile(
+      join(artifactDirectory, "search-e2e-fixture.json"),
+      JSON.stringify(
+        {
+          workspace_id: workspace.workspaceID,
+          installation_id: installation.installationID,
+          authority_epoch: installation.authorityEpoch,
+          channel_id: channelID,
+          thread_id: threadID,
+          dm_id: dmID,
+          personality_agent_id: personalityAgentID,
+          human_b_id: humanBID,
+          old_needle: oldNeedle,
+          japanese_needle: japaneseNeedle,
+          deleted_needle: deletedNeedle,
+          dm_secret: dmSecret,
+        },
+        null,
+        2,
+      ),
+    );
+
+    await page.reload();
+    await page.getByRole("button", { name: "search-general" }).click();
+    await expect(
+      page.getByText("filler message 79", { exact: true }),
+    ).toBeVisible();
+    // Older than one page: the needle is not part of the loaded window yet.
+    await expect(page.getByText(oldNeedle, { exact: false })).toHaveCount(0);
+
+    const search = page.getByPlaceholder("検索");
+    await search.fill("quartz-needle");
+    const resultsPanel = page.getByText("「quartz-needle」の検索結果");
+    await expect(resultsPanel).toBeVisible();
+    const hit = page.getByRole("button").filter({ hasText: oldNeedle });
+    await expect(hit).toBeVisible();
+    await artifact("01-search-results.png");
+    await hit.click();
+
+    // Acceptance: the original message loads and is scrolled into view — with
+    // the actual following conversation, not a disconnected window. seq 2
+    // (the Japanese message) must already be readable next to the target.
+    const viewport = page.locator('[data-slot="conversation-viewport"]');
+    const needleRow = viewport.locator(
+      `[data-message-id="${needleMessageID}"]`,
+    );
+    await expect(needleRow).toBeVisible();
+    await expect(
+      viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
+    ).toBeVisible();
+    await artifact("02-jumped-to-old-message.png");
+
+    // The jump must hold past the follow backstop's re-arm window (~1s):
+    // DOM presence alone passes while the viewport has already been pulled
+    // back to the newest message, so measure the real intersection.
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(needleRow, viewport);
+    await artifact("03-jump-held.png");
+
+    // A live arrival while reading history must not drag the viewport to the
+    // end either — the newest row stays unmounted and the needle stays put.
+    // The realtime append lands over the already-proven socket path; give it
+    // a short beat before asserting the viewport did not move.
+    await sendMessage(post, channelID, `${liveTailProbe} while reading`);
+    await page.waitForTimeout(800);
+    await expect(
+      viewport.getByText(`${liveTailProbe} while reading`, { exact: true }),
+    ).toHaveCount(0);
+    await expectRowInViewport(needleRow, viewport);
+
+    // Between the jump window (seq 1..25) and the newest page (seq 35..84,
+    // whose first row is a tombstone) the unloaded range must surface as a
+    // truthful, pageable marker — never as silently adjacent rows. The
+    // boundary tombstone must not suppress it.
+    const gapButton = page.getByRole("button", {
+      name: "この間の会話を読み込む",
+      exact: true,
+    });
+    for (let scrolls = 0; scrolls < 30; scrolls += 1) {
+      if ((await gapButton.count()) > 0) break;
+      await viewport.evaluate((element) => {
+        element.scrollTop += element.clientHeight * 0.8;
+      });
+      await page.waitForTimeout(120);
+    }
+    await expect(gapButton).toBeVisible();
+    await artifact("04-gap-row.png");
+
+    // A transport failure on the gap fill must produce an honest in-context
+    // outcome on that row — never a silent return to the original copy — and
+    // the same row must retry successfully once transport recovers.
+    let abortNextGapFetch = true;
+    await page.route("**/messaging/places/*/messages?**", (route) => {
+      const url = route.request().url();
+      if (abortNextGapFetch && url.includes("before_seq=")) {
+        abortNextGapFetch = false;
+        void route.abort();
+        return;
+      }
+      void route.continue();
+    });
+    await gapButton.click();
+    const gapRetry = page.getByRole("button", {
+      name: "読み込めませんでした · 再試行",
+      exact: true,
+    });
+    await expect(gapRetry).toBeVisible();
+    await artifact("05-gap-fill-failed.png");
+    await page.unroute("**/messaging/places/*/messages?**");
+    await gapRetry.click();
+
+    // Clicking fills the missing range: the windows join into one contiguous
+    // history anchored where the person was reading.
+    await expect(gapButton).toHaveCount(0);
+    await expect(gapRetry).toHaveCount(0);
+    await expect(
+      page.getByText("filler message 24", { exact: true }),
+    ).toBeVisible();
+    await artifact("06-gap-filled.png");
+
+    // Follow-latest control: returning to the end must still follow live
+    // arrivals — the fix may not just disable following. Wait for the smooth
+    // flight to actually land (the pill detaches at end) before posting, so a
+    // mid-flight append can't leave the pinned index one row stale.
+    const toLatest = page.getByRole("button", { name: "最新へ" });
+    await toLatest.click();
+    await expect(toLatest).toHaveCount(0);
+    await sendMessage(post, channelID, `${liveFollowControl} at latest`);
+    const liveRow = viewport.getByText(`${liveFollowControl} at latest`, {
+      exact: true,
+    });
+    await expect(liveRow).toBeVisible();
+    await expectRowInViewport(liveRow, viewport);
+    await artifact("07-follow-latest.png");
+
+    await search.fill("日本語メッセージ");
+    await expect(
+      page.getByText("「日本語メッセージ」の検索結果"),
+    ).toBeVisible();
+    const japaneseHit = page
+      .getByRole("button")
+      .filter({ hasText: japaneseNeedle });
+    await expect(japaneseHit).toBeVisible();
+    await japaneseHit.click();
+    await expect(
+      viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
+    ).toBeVisible();
+    await artifact("08-japanese-result.png");
+
+    await search.fill("zzz-no-match-token");
+    await expect(
+      page.getByText("一致するメッセージはありません", { exact: true }),
+    ).toBeVisible();
+    await artifact("09-no-results.png");
+
+    // Deleted content must not come back through search.
+    await search.fill(deletedNeedle);
+    await expect(
+      page.getByText("一致するメッセージはありません", { exact: true }),
+    ).toBeVisible();
+
+    // A thread result must navigate into the thread place, not just name it.
+    await search.fill("thread-needle");
+    const threadHit = page
+      .getByRole("button")
+      .filter({ hasText: threadNeedle });
+    await expect(threadHit).toBeVisible();
+    await threadHit.click();
+    await expect(viewport.getByText(`${threadNeedle} in-thread`)).toBeVisible();
+    await artifact("10-thread-result.png");
+
+    // A Human participant can still find and reach DM history.
+    await search.fill(dmSecret);
+    const dmHit = page.getByRole("button").filter({ hasText: dmSecret });
+    await expect(dmHit).toBeVisible();
+    await dmHit.click();
+    await expect(viewport.getByText(`${dmSecret} body`)).toBeVisible();
+    await artifact("11-dm-result.png");
+
+    // A result deleted between search and click must still land truthfully:
+    // the jump resolves to a deletion marker at the target's position with
+    // its context — not a silently dropped jump.
+    await page.getByRole("button", { name: "search-general" }).click();
+    await search.fill("vanishing-needle");
+    const vanishingHit = page
+      .getByRole("button")
+      .filter({ hasText: vanishingNeedle });
+    await expect(vanishingHit).toBeVisible();
+    const vanish = await api.delete(
+      `${stack.apiURL}/messaging/places/${channelID}/messages/${vanishingMessageID}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(vanish.status()).toBe(200);
+    await vanishingHit.click();
+    const deletedMarker = viewport.getByText(
+      "このメッセージは削除されています",
+      { exact: true },
+    );
+    await expect(deletedMarker).toBeVisible();
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(deletedMarker, viewport);
+    await artifact("12-deleted-target.png");
+
+    // A permalink to a deleted message must resolve to the same truthful
+    // marker — not a silently dead navigation.
+    await page.goto(
+      `${stack.webURL}/w/${workspace.workspaceID}/messaging/c/${channelID}?m=4`,
+    );
+    await expect(deletedMarker).toBeVisible();
+    await page.waitForTimeout(1_000);
+    await expectRowInViewport(deletedMarker, viewport);
+    await artifact("13-deleted-permalink.png");
+
+    // A transport failure on the context fetch must produce an honest
+    // in-context outcome with a working retry — never a silently dead jump.
+    // Reload so the old needle is unloaded again, then abort only the first
+    // around-fetch.
+    await page.reload();
+    await page.getByRole("button", { name: "search-general" }).click();
+    await expect(
+      page.getByText("filler message 79", { exact: true }),
+    ).toBeVisible();
+    let abortNextAroundFetch = true;
+    await page.route("**/messaging/places/*/messages?**", (route) => {
+      const url = route.request().url();
+      if (abortNextAroundFetch && url.includes("before_seq=")) {
+        abortNextAroundFetch = false;
+        void route.abort();
+        return;
+      }
+      void route.continue();
+    });
+    await search.fill("quartz-needle");
+    const retryHit = page.getByRole("button").filter({ hasText: oldNeedle });
+    await expect(retryHit).toBeVisible();
+    await retryHit.click();
+    await expect(
+      page
+        .getByRole("alert")
+        .filter({ hasText: "そのメッセージへ移動できませんでした" }),
+    ).toBeVisible();
+    await artifact("14-jump-failed.png");
+    await page.unroute("**/messaging/places/*/messages?**");
+    await page.getByRole("button", { name: "再試行" }).click();
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(
+      viewport.locator(`[data-message-id="${needleMessageID}"]`),
+      viewport,
+    );
+    await artifact("15-jump-retried.png");
+
+    // A reply whose original was deleted must quote it truthfully — not a
+    // bogus "添付ファイル" fallback — and clicking the quote must reach the
+    // existing deletion marker instead of dead-ending. A dedicated small
+    // channel keeps the seq arithmetic above untouched; the tombstone stays
+    // inside the only loaded page.
+    const quoteChannelID = await createChannel(page, "search-quotes");
+    const aliveQuoteTargetID = await sendMessage(
+      post,
+      quoteChannelID,
+      "alive-quote-target-e2e",
+    );
+    const doomedQuoteTargetID = await sendMessage(
+      post,
+      quoteChannelID,
+      "doomed-quote-target-e2e",
+    );
+    const aliveReplyID = await sendMessage(
+      post,
+      quoteChannelID,
+      "reply-to-alive-e2e",
+      aliveQuoteTargetID,
+    );
+    const doomedReplyID = await sendMessage(
+      post,
+      quoteChannelID,
+      "reply-to-doomed-e2e",
+      doomedQuoteTargetID,
+    );
+    const doomedQuoteDelete = await api.delete(
+      `${stack.apiURL}/messaging/places/${quoteChannelID}/messages/${doomedQuoteTargetID}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(doomedQuoteDelete.status()).toBe(200);
+
+    await page.getByRole("button", { name: "search-quotes" }).click();
+    const doomedReplyRow = viewport.locator(
+      `[data-message-id="${doomedReplyID}"]`,
+    );
+    const doomedQuote = doomedReplyRow.getByTitle(/の返信元へ移動$/);
+    await expect(doomedQuote).toBeVisible();
+    await expect(doomedQuote).toContainText("削除されたメッセージ");
+    await expect(doomedQuote).not.toContainText("添付ファイル");
+    await doomedQuote.click();
+    const quoteMarker = viewport.getByText("このメッセージは削除されています", {
+      exact: true,
+    });
+    await expect(quoteMarker).toBeVisible();
+    await expectRowInViewport(quoteMarker, viewport);
+    await artifact("16-deleted-quote.png");
+
+    // An ordinary quote still shows the original text and jumps to it.
+    const aliveReplyRow = viewport.locator(
+      `[data-message-id="${aliveReplyID}"]`,
+    );
+    const aliveQuote = aliveReplyRow.getByTitle(/の返信元へ移動$/);
+    await expect(aliveQuote).toContainText("alive-quote-target-e2e");
+    await aliveQuote.click();
+    await expectRowInViewport(
+      viewport.locator(`[data-message-id="${aliveQuoteTargetID}"]`),
+      viewport,
+    );
+
+    // Rapid query switching must not resurrect the previous result list.
+    await page.getByRole("button", { name: "search-general" }).click();
+    await search.fill(oldNeedle);
+    await search.fill("zzz-no-match-token");
+    await expect(
+      page.getByText("一致するメッセージはありません", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button").filter({ hasText: oldNeedle }),
+    ).toHaveCount(0);
+  } catch (error) {
+    console.error(stack.diagnostics());
+    await artifact("99-failure.png").catch(() => undefined);
+    throw error;
+  } finally {
+    await stack.stop();
+  }
+});
+
+// `toBeVisible` only means "mounted" for a virtualized list — overscan mounts
+// rows outside the viewport. A landed jump must be measured by real
+// intersection with the scroll viewport. Poll the geometry so a follow-scroll
+// that is still landing (e.g. a live append just before the assertion) is
+// measured at its settled position rather than racing a single snapshot.
+async function expectRowInViewport(row: Locator, viewport: Locator) {
+  await expect(row).toBeVisible();
+  await expect
+    .poll(
+      async () => {
+        const box = await row.boundingBox();
+        const frame = await viewport.boundingBox();
+        if (!box || !frame) return false;
+        return box.y + box.height > frame.y && box.y < frame.y + frame.height;
+      },
+      { timeout: 5_000, message: "row must intersect the viewport" },
+    )
+    .toBe(true);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("expected a JSON object");
+  }
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  if (typeof value !== "string" || value === "") {
+    throw new Error("expected a non-empty string");
+  }
+  return value;
+}
+
+const specDirectory = dirname(fileURLToPath(import.meta.url));
+const apiDirectory = resolve(specDirectory, "../../api");
+
+async function createWorkspace(page: Page, name: string) {
+  await page.getByRole("textbox", { name: "新しいWorkspaceの名前" }).fill(name);
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/workspaces",
+  );
+  await page.getByRole("button", { name: "作成して開く" }).click();
+  const response = await responsePromise;
+  expect(response.status()).toBe(201);
+  return {
+    workspaceID: asString(asRecord(await response.json()).workspace_id),
+  };
+}
+
+async function installMessaging(page: Page) {
+  await page.getByRole("button", { name: "アプリ", exact: true }).click();
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/app-installations",
+  );
+  await page.getByRole("button", { name: "インストール" }).click();
+  const response = await responsePromise;
+  expect(response.status()).toBe(201);
+  const installation = asRecord(await response.json());
+  return {
+    installationID: asString(installation.installation_id),
+    authorityEpoch: asString(installation.authority_epoch),
+  };
+}
+
+async function createChannel(page: Page, channel: string): Promise<string> {
+  await page.getByTitle("チャンネルを作成").click();
+  const dialog = page.getByRole("dialog", { name: "チャンネルを作成" });
+  const responsePromise = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/messaging/channels",
+  );
+  await dialog
+    .getByRole("textbox", { name: "名前", exact: true })
+    .fill(channel);
+  await dialog.getByRole("button", { name: "作成", exact: true }).click();
+  const response = await responsePromise;
+  expect(response.status()).toBe(201);
+  return asString(asRecord(await response.json()).channel_id);
+}
+
+async function sendMessage(
+  post: (
+    path: string,
+    data: Record<string, unknown>,
+  ) => Promise<{
+    status(): number;
+    headers(): Record<string, string>;
+    json(): Promise<unknown>;
+  }>,
+  placeID: string,
+  content: string,
+  replyTo?: string,
+): Promise<string> {
+  // Bulk seeding can exceed the mutation admission burst (64 tokens, 4/s
+  // refill); honor Retry-After instead of failing the fixture.
+  const nonce = randomUUID();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await post(`/messaging/places/${placeID}/messages`, {
+      content,
+      client_nonce: nonce,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    });
+    if (response.status() !== 429) {
+      expect(response.status()).toBe(201);
+      return asString(asRecord(await response.json()).message_id);
+    }
+    const retryAfter = Number(response.headers()["retry-after"]);
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500,
+      ),
+    );
+  }
+  throw new Error("message send stayed rate limited");
+}
+
+async function provisionHuman(
+  stackBuild: WorkspaceBrowserBuild,
+  databaseURL: string,
+  userID: string,
+  displayName: string,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolvePromise, reject) => {
+    execFile(
+      stackBuild.sessionIssuer,
+      [],
+      {
+        env: {
+          PATH: process.env.PATH ?? "",
+          SUMI_BROWSER_SESSION_SECRET: randomBytes(48).toString("base64"),
+          SUMI_BROWSER_SESSION_AUDIENCE: "sumi:web",
+          SUMI_E2E_SESSION_TENANT_ID: `e2e-search-${randomUUID()}`,
+          SUMI_E2E_SESSION_USER_ID: userID,
+          SUMI_E2E_SESSION_PERSONALITY_AGENT_ID: personalityAgentID,
+          SUMI_E2E_SESSION_DATABASE_URL: databaseURL,
+          SUMI_E2E_SESSION_DISPLAY_NAME: displayName,
+        },
+      },
+      (error) => (error ? reject(error) : resolvePromise()),
+    );
+  });
+}
+
+async function seedMember(
+  databaseURL: string,
+  workspaceID: string,
+  kind: "human" | "personality_agent",
+  memberID: string,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  await new Promise<void>((resolvePromise, reject) => {
+    execFile(
+      "go",
+      ["run", "./cmd/e2e-seed-member"],
+      {
+        cwd: apiDirectory,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          GOPATH: process.env.GOPATH ?? "",
+          GOCACHE: process.env.GOCACHE ?? "",
+          GOMODCACHE: process.env.GOMODCACHE ?? "",
+          SUMI_E2E_SEED_DATABASE_URL: databaseURL,
+          SUMI_E2E_SEED_WORKSPACE_ID: workspaceID,
+          SUMI_E2E_SEED_MEMBER_KIND: kind,
+          SUMI_E2E_SEED_MEMBER_ID: memberID,
+        },
+      },
+      (error, _stdout, stderr) =>
+        error ? reject(new Error(stderr || error.message)) : resolvePromise(),
+    );
+  });
+}

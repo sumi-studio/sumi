@@ -138,6 +138,21 @@ describe("返信元のプレビュー", () => {
     expect(onJumpTo).toHaveBeenCalledExactlyOnceWith("m0");
   });
 
+  it("削除された返信元は削除の旨を示し、添付ファイルとは言わない", () => {
+    const target = makeMessage({
+      messageId: "m0",
+      seq: 0,
+      content: "",
+      deleted: true,
+    });
+    renderItem(makeMessage({ messageId: "m1", replyTo: "m0" }), {
+      findMessage: () => target,
+    });
+    const quote = screen.getByTitle("余白 の返信元へ移動");
+    expect(quote).toHaveTextContent("削除されたメッセージ");
+    expect(quote).not.toHaveTextContent("添付ファイル");
+  });
+
   it("本文のない返信元は「添付ファイル」と示す", () => {
     const target = makeMessage({ messageId: "m0", seq: 0, content: "" });
     renderItem(makeMessage({ messageId: "m1", replyTo: "m0" }), {

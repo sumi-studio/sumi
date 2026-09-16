@@ -406,6 +406,75 @@ describe("ConversationVirtualizer", () => {
     expect(handle.current?.isAtEnd()).toBe(false);
   });
 
+  it("does not re-arm follow while a programmatic jump is still settling", async () => {
+    const handle = createRef<ConversationVirtualizerHandle>();
+    let messages = makeMessages(100);
+    const view = render(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    const viewport = screen.getByRole("region");
+    await waitFor(() => expect(handle.current?.isAtEnd()).toBe(true));
+    await settleProgrammaticScroll();
+    const endOffset = viewport.scrollTop;
+
+    // In a real browser the virtualizer's internal offset trails the DOM
+    // write by a scroll event, so a jump stays "at end" for several reconcile
+    // frames. Emulate that window by holding the scroll application.
+    const pendingOffsets: number[] = [];
+    Object.defineProperty(viewport, "scrollTo", {
+      configurable: true,
+      value(options: ScrollToOptions | number) {
+        const top = typeof options === "number" ? options : options.top;
+        if (typeof top === "number") pendingOffsets.push(top);
+      },
+    });
+    act(() => {
+      handle.current?.scrollToMessage("message-10", { align: "center" });
+    });
+
+    // An unrelated render inside the settling window must not re-arm follow —
+    // on the buggy code this re-armed and the viewport later snapped back to
+    // the newest message about a second after the jump had landed.
+    view.rerender(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+
+    // Now the jump's scroll actually lands.
+    delete (viewport as Partial<HTMLElement>).scrollTo;
+    const target = pendingOffsets.at(-1);
+    expect(target).toBeDefined();
+    act(() => {
+      viewport.scrollTop = target ?? 0;
+      fireEvent.scroll(viewport);
+    });
+    await settleProgrammaticScroll();
+
+    // A later incoming item must not pull the viewport back to the end.
+    messages = [...messages, { id: "message-100", text: "Message 100" }];
+    view.rerender(
+      <ConversationVirtualizer
+        ref={handle}
+        items={messages}
+        estimateSize={() => 60}
+        renderItem={(message) => <p>{message.text}</p>}
+      />,
+    );
+    await settleProgrammaticScroll();
+    expect(handle.current?.isAtEnd()).toBe(false);
+    expect(viewport.scrollTop).toBeLessThan(endOffset);
+    expect(Math.abs(viewport.scrollTop - (target ?? 0))).toBeLessThan(120);
+  });
+
   it("keeps follow mode armed for non-scrolling controls inside rows", async () => {
     const handle = createRef<ConversationVirtualizerHandle>();
     const messages = makeMessages(100);

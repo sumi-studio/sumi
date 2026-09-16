@@ -255,21 +255,35 @@ export function ConversationVirtualizer<
   // end whenever a render leaves the viewport behind it. Skipped during a
   // programmatic flight so a smooth scroll isn't degraded to a snap; the
   // flight ends on arrival, on a user gesture, or after a stale timeout.
+  // The flight check runs before the isAtEnd branch too: a scrollToMessage
+  // jump starts while the viewport is still at the end, and reconciling
+  // takes several frames — during that window "at end" means "still
+  // departing", not "the user chose the latest position", so re-arming
+  // follow there would snap the settled jump back to the bottom.
   useLayoutEffect(() => {
     if (items.length === 0) return;
+    const flightIsActive =
+      flightRef.current.active &&
+      performance.now() - flightRef.current.startedAt < 1_600;
+    // A scrollToMessage jump starts while the viewport is still at the end
+    // and reconcile takes several frames — during that window "at end" means
+    // "still departing", not "the user chose the latest position". Only a
+    // non-follow flight (follow was disarmed by scrollToMessage) must keep
+    // this branch from re-arming follow or clearing the flight; a scrollToEnd
+    // flight that reports at-end has arrived and is cleared as before.
+    const nonFollowFlightActive = flightIsActive && !followRef.current;
     if (virtualizer.isAtEnd()) {
       // A gesture event fires before its scroll movement lands, so being at
       // the end right now doesn't mean the user wants to stay there. Only
       // re-arm following once the gestures have gone quiet.
-      if (performance.now() - lastGestureAtRef.current > 300) {
-        followRef.current = true;
+      if (!nonFollowFlightActive) {
+        if (performance.now() - lastGestureAtRef.current > 300) {
+          followRef.current = true;
+        }
+        flightRef.current = { active: false, startedAt: 0 };
       }
-      flightRef.current = { active: false, startedAt: 0 };
       return;
     }
-    const flightIsActive =
-      flightRef.current.active &&
-      performance.now() - flightRef.current.startedAt < 1_600;
     if (followRef.current && !flightIsActive) {
       flightRef.current = { active: true, startedAt: performance.now() };
       virtualizer.scrollToEnd({ behavior: "auto" });
