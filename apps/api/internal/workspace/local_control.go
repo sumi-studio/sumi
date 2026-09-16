@@ -276,6 +276,7 @@ func (s *Server) localInvitationList(
 	}
 	page, err := s.Store.targetedInvitationPageFor(
 		r.Context(),
+		s.Store.pool,
 		localActor(authorization),
 		after,
 	)

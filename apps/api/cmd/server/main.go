@@ -817,6 +817,19 @@ func newApplicationFromEnv() (*application, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
 		}
 	}
+	if workspaceStore != nil && coreServer != nil {
+		// The secretary's Workspace invitation list/accept on the core: the
+		// delegated effects run inside the operation-claim transaction, so a
+		// committed membership is always paired with its operation record —
+		// the same atomicity the runtime's local-control calls gave.
+		for tool, effect := range workspaceStore.CoreInvitationToolEffects() {
+			if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+				stopBackground()
+				closeOnError()
+				return nil, fmt.Errorf("register core workspace effect %s: %w", tool, err)
+			}
+		}
+	}
 	var deliverFeedbackAttention func(context.Context) error
 	var cleanupFeedbackAttachments func(context.Context) error
 	if feedbackServer != nil {
