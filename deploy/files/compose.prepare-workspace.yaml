@@ -1,0 +1,21 @@
+# Prepare-only workspace override: bind the secretary's canonical files scope
+# as /workspace for the prepare role. The supervisor adds this file to the
+# prepare graph when files scope mode is configured (SUMI_FILES_MOUNTPOINT,
+# SUMI_FILES_VOLUME_UUID, SUMI_FILES_CHECK); it is never used standalone.
+#
+# The full agent graph takes deploy/files/compose.executor-workspace.yaml
+# instead, which additionally binds the scope for the executor service.
+# Keeping a separate prepare-only file matters: the prepare graph has no
+# executor service, and a shared override that declares one would add an
+# unconfigured executor service to `prepare` runs.
+#
+# create_host_path: false keeps a missing scope directory a hard failure
+# instead of Docker silently creating a host-local workspace copy.
+services:
+  prepare:
+    volumes:
+      - type: bind
+        source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
+        target: /workspace
+        bind:
+          create_host_path: false

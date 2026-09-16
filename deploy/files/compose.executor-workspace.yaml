@@ -1,0 +1,35 @@
+# Replace the executor's host-local `workspace` volume with the secretary's
+# scope directory on the canonical files volume. The supervisor adds this file
+# to the full agent graph when files scope mode is configured
+# (SUMI_FILES_MOUNTPOINT, SUMI_FILES_VOLUME_UUID, SUMI_FILES_CHECK); the
+# prepare-only graph takes compose.prepare-workspace.yaml instead. Compose
+# merges volume entries by target path.
+#
+#   SUMI_FILES_MOUNTPOINT=<mnt> SUMI_FILES_VOLUME_UUID=<uuid> \
+#   SUMI_FILES_CHECK=<check binary> deploy/agent/supervisor <prepare|activate>
+#
+# The scope directory is <mnt>/<compact personality-agent id>, verified by
+# sumi-files-check before every launch; create_host_path: false keeps a
+# missing scope a hard failure rather than a host-local workspace copy.
+# The host's JuiceFS client must run as root (it adds allow_other), so the
+# Docker daemon and uid 10002 can reach the mount. The container receives
+# only this one directory — no metadata or object-storage credential and no
+# other scope. If the host's JuiceFS client dies and is restarted by systemd,
+# the executor unit is stopped by PartOf and started again by the mount's
+# WantedBy dependency once the mount verifies (sumi-files-executor@.service).
+services:
+  prepare:
+    volumes:
+      - type: bind
+        source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
+        target: /workspace
+        bind:
+          create_host_path: false
+  executor:
+    volumes:
+      - type: bind
+        source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
+        target: /workspace
+        read_only: false
+        bind:
+          create_host_path: false

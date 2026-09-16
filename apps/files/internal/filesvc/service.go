@@ -291,14 +291,8 @@ func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path
 		return
 	}
 	changed := ver > 0 && recordedFP != "" && recordedFP != info.Fingerprint
-	w.Header().Set("X-File-Version", strconv.FormatInt(ver, 10))
-	if changed {
-		w.Header().Set("X-External-Change", "true")
-	}
-	w.Header().Set("content-type", "application/octet-stream")
-	w.Header().Set("content-length", strconv.FormatInt(n, 10))
 	// If the backend wedges mid-read (object store down), close the file
-	// under the copy so the request cannot hang holding the socket forever.
+	// under the read so the request cannot hang holding the socket forever.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -308,8 +302,34 @@ func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path
 		case <-done:
 		}
 	}()
-	io.CopyN(w, f, n)
+	// Read the first bytes before committing a 200. On a JuiceFS root the
+	// content lives in object storage; while that is unreachable the first
+	// read fails with EIO, and a status already sent would turn the outage
+	// into a 200 with a truncated body. A failure after this prefix can
+	// still only be signalled by truncation (Content-Length is set).
+	head := make([]byte, min(n, readPrefixBytes))
+	got, rerr := io.ReadFull(f, head)
+	if rerr != nil && !errors.Is(rerr, io.ErrUnexpectedEOF) && !errors.Is(rerr, io.EOF) {
+		writeErr(w, 503, "content_unavailable",
+			"file content could not be read from storage; safe to retry")
+		return
+	}
+	w.Header().Set("X-File-Version", strconv.FormatInt(ver, 10))
+	if changed {
+		w.Header().Set("X-External-Change", "true")
+	}
+	w.Header().Set("content-type", "application/octet-stream")
+	w.Header().Set("content-length", strconv.FormatInt(n, 10))
+	if _, err := w.Write(head[:got]); err != nil {
+		return
+	}
+	io.CopyN(w, f, n-int64(got))
 }
+
+// readPrefixBytes is how much of a file handleRead reads before sending
+// the status line. One JuiceFS block is 4 MiB; the first read of any
+// uncached block already fails when object storage is unreachable.
+const readPrefixBytes = 256 << 10
 
 func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, path string) {
 	if path == "" || path == "/" {
