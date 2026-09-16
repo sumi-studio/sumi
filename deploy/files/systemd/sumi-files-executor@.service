@@ -1,0 +1,49 @@
+# Executor host (system unit, root): run one secretary's runtime through the
+# same supervisor lifecycle the provisioner drives — prepare allocates the
+# epoch and builds the workspace, activate materializes the runtime secrets
+# and starts runtime/executor/broker, stop tears the project down. There is no
+# second launch path: the unit never runs `docker compose up` itself, so the
+# Compose project (sumi-<compact PAID>), secret files, local-control contract
+# and epoch fencing are exactly the provisioning path's.
+#
+# %i is the secretary's canonical files scope — its compact personality-agent
+# id — and must equal the PAID in agent-%i.env.
+#
+#   /etc/sumi-files/executor.env    — volume client variables read by the
+#                                     mount unit (SUMI_FILES_MOUNTPOINT,
+#                                     SUMI_FILES_VOLUME_UUID, ...)
+#   /etc/sumi-files/agent-%i.env    — SUMI_PERSONALITY_AGENT_ID,
+#                                     SUMI_AGENT_COMPOSE_DIR plus the launch
+#                                     environment/secrets for the supervisor
+#   binaries: %h/.local/lib/sumi-files/sumi-files-{check,executor-launch,
+#                                     executor-stop}
+#
+# Dependency contract with the volume client:
+#   Requires+BindsTo+PartOf — the executor stops when the mount stops or dies
+#     (a held scope bind would otherwise serve ENOTCONN while looking alive).
+#   WantedBy=sumi-files-mount@executor.service — when the mount unit (re)starts
+#     and verifies, an enabled executor is started with it. This restores the
+#     executor after an ordinary client crash without a manual systemctl.
+#   Restart=on-failure — a transient prepare/activate failure retries; repeated
+#     failures trip the start limit and leave the unit failed (truthful).
+[Unit]
+Description=Sumi secretary runtime for canonical files scope %i
+Requires=sumi-files-mount@executor.service docker.service
+After=sumi-files-mount@executor.service docker.service
+BindsTo=sumi-files-mount@executor.service
+PartOf=sumi-files-mount@executor.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/sumi-files/executor.env
+EnvironmentFile=/etc/sumi-files/agent-%i.env
+ExecStart=%h/.local/lib/sumi-files/sumi-files-executor-launch %i
+ExecStop=%h/.local/lib/sumi-files/sumi-files-executor-stop %i
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target sumi-files-mount@executor.service
