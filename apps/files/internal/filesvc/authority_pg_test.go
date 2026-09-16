@@ -842,19 +842,15 @@ func TestAuthPGRollForwardDiscardsDisplaced(t *testing.T) {
 	if ver, fp, _ := authRow(t, s, "a.txt"); ver != x.version || fp3(fp) != fp3(durFP(t, root, "ws", "a.txt")) {
 		t.Fatalf("row (%d,%q) does not record the roll-forward", ver, fp)
 	}
-	if n := intentCount(t, s); n != 0 {
-		t.Fatalf("intent rows left: %d", n)
+	// The intent may remain as a resolved tombstone — evidence is never
+	// erased — but nothing stays pending.
+	if n := pendingCount(t, s); n != 0 {
+		t.Fatalf("pending intents left: %d", n)
 	}
-	if where := scanDirFor(t, dir, "ws", []byte("O0")); where != "" {
-		if pre.Oid == "" {
-			// Unbound identity on this filesystem: the displaced object
-			// must be preserved visibly, never discarded on weak
-			// evidence.
-			if !strings.Contains(where, "recovered-o") {
-				t.Fatalf("unbound displaced object at %q — want a recovered-* surface", where)
-			}
-			return
-		}
-		t.Fatalf("authorized displaced object still parked at %q", where)
+	// The displaced object is never destroyed by the reconciler: the
+	// committed row at a.txt records the product, not O0, so O0
+	// surfaces as an ordinary visible file.
+	if where := scanDirFor(t, dir, "ws", []byte("O0")); !strings.Contains(where, "recovered-o") {
+		t.Fatalf("displaced object at %q — want a recovered-* surface", where)
 	}
 }

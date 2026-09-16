@@ -120,62 +120,69 @@ info:
     Verified effects: a destructive filesystem operation never unlinks a
     public name. An overwrite or rename-over-occupied-destination moves
     the displaced object into the intent's private .filesv-op-<id> slot
-    by exchange; a remove moves it there by rename. The object is
-    discarded only when its identity still matches the fingerprint the
-    intent declared AND durable state proves the discard is authorized:
-    a matching fingerprint alone is not commit evidence, because a
-    delayed drain or swap can park the recorded object into the intent's
-    namespace without its effect ever landing. The reconciler deletes a
-    displaced object only when no file_version row records its
-    fingerprint — recorded content absent from its recorded home is
-    restored instead — and the intent's own roll-forward committed: its
-    file_event row exists AND its intent row is gone, both written by
-    one transaction. An event alone is not commit proof (a diverged
-    outcome journals an event while the intent is kept as a tombstone),
-    so tombstoned or uncommitted intents preserve the object. These
-    checks run while the object is captured at a sealed name, and only
-    after excluding writers that could still record it from an earlier
-    public observation: deletion waits while another instance owns the
-    store or while an operation of this instance in the same scope is
-    still settling (a request that timed out keeps settling in the
-    background). A diverged outcome is journaled once; re-judging a
-    tombstone that is already recorded or superseded by a newer version
-    writes no event and does not extend the pending_settlement window.
-    Database-read failure always fails closed toward preservation.
-    Every delete goes through the same discipline:
-    the object is captured to a per-call quarantine name
-    (.filesv-op-<id>-q-<random>), re-verified there, and unlinked only
-    on a match. Quarantine names are SEALED: they are created by the
-    deleting call, and no writer — actor or reconciler, live or retired —
-    may ever write into one once it exists (exchanges and restore moves
-    refuse sealed targets; a sealed object may only be moved out or
-    unlinked). A slot or public name verified for deletion can still be
-    written by a delayed effect, so identity is proven only at the sealed
-    name; a mismatched capture stays parked there, preserved for the
-    reconciler rather than destroyed.
-    When the displaced object is not the declared one (the intent is
-    stale: a successor already acknowledged a newer save, or the file
-    changed since declaration) the effect is undone non-destructively:
-    the displaced object is restored to its name, or — when a racing
-    writer holds the name — stays parked at the slot, hidden from
-    listings, excluded from the staging sweep, and retrievable. The
-    caller gets 409 external_change: honest rejection plus preserved
-    bytes.
-    A parked object is restored by the reconciler to an empty name when
-    it is the recorded content for that name (fingerprint match against
-    file_version.fp — the acknowledged ordering, never ctime). Over an
-    occupied name holding non-recorded content, a sealed parked object
-    is restored by draining: the squatter is parked at a fresh
-    enumerable .filesv-op-<id>-p-<random> name first (never written
-    into the sealed name, and never at the fixed base slot — a
-    permanently parked unattributable object there must not stall
-    recovery), then the recorded object moves onto the name. The
-    version row is version-guarded, so a stale intent can never roll a
-    newer acknowledged row back. Unknown foreign objects that match no
-    recorded row are never deleted to make room — they stay parked,
-    hidden, and enumerable, because the service holds no discard
-    authority over them; recorded content is recoverable regardless of
-    how many accumulate.
+    by exchange; a remove moves it there by rename. A publish into a
+    declared-EMPTY destination uses renameat2 RENAME_NOREPLACE, so a
+    foreign object that claims the name first is never overwritten —
+    the operation reports 409 external_change instead.
+    Every act that can populate a private name is journaled BEFORE the
+    syscall (act + scope-relative source path), and its result is
+    journaled after (ok / noeff / empty = outcome unknown). The journal
+    is the only provenance: a recorded act identifies which operation
+    populated the name and what it intended. Reconciler observations
+    (the record's seen list) are continuity evidence only — they say
+    which object was found, never who placed it.
+    The reconciler NEVER destroys a populated private occupant. Each
+    occupant is judged against its record's act, result, and the
+    intent's own declared identities (pre-state fingerprint, expected
+    hash, destination fingerprint):
+    - an occupant verified as the operation's own declared object
+      (captured source, declared displaced object, or staged body)
+      returns to its journaled public home only when the recorded row
+      there already claims that exact object — restoring makes a true
+      recorded claim truthful; otherwise it surfaces;
+    - an occupant that does not match the intent's declared evidence,
+      or whose record carries no act-bound provenance, is a foreign or
+      unattributable object: it SURFACES at a fresh public
+      recovered-<id>-<random> name with a truthful version row and a
+      `recover` event — preserved, visible, and usable, never hidden
+      forever and never deleted;
+    - an empty recorded name resolves done only when the intent's
+      destination is observed to hold its declared outcome.
+    A committed file_event, a matching content hash, fingerprint or
+    inode similarity, and the intent row's absence are all individually
+    and jointly NOT disposal authority — events and rows record what the
+    operation produced, not which bytes may be destroyed. The only
+    deletion the reconciler performs is a proven same-object duplicate:
+    a private name and a public name verified to reference the SAME
+    object (kind + durable identity) collapse to the public link.
+    Settlement destination discipline: before a captured or surfaced
+    object is moved, its destination is journaled (the record's home
+    field). If the move succeeds but the row or event commit fails —
+    or the process dies between them — the journaled home lets the next
+    pass finish bookkeeping without re-moving: destination verified to
+    hold the object -> row + recover event written, idempotently
+    (a pre-existing recover event for that scope/path/object satisfies
+    the event write). A record is marked done only on a TERMINAL
+    outcome: destination verifiably absent, verifiably occupied by a
+    different object, or verifiably holding the object with durable
+    rows. A transient stat or database failure is never terminal — the
+    record retries until the bookkeeping lands, so post-commit/pre-done
+    crashes converge without duplicating rows or events.
+    Done records are re-stat'ed: a late filesystem effect or direct
+    deposit that lands at a drained private name is captured under a
+    fresh journaled record, judged on its own provenance, and surfaced
+    if unattributable — nothing stays hidden at a name the journal
+    considers settled.
+    The orphan sweep discovers private names whose intent row is gone
+    (the journal was dropped before the syscall's effect landed, or the
+    name was deposited directly). Scopes are enumerated from the pinned
+    root's immediate children unioned with every scope holding recorded
+    state, so a deposit under a scope with no database trace is still
+    found — bounded to the owned root, never a global scan. An orphan
+    name attaches to a surviving intent when the id embedded in the
+    name matches one (only that intent's fs layer could have minted it);
+    otherwise a dedicated `recover` intent journals the name before
+    settling it.
     if_version:any means the caller requires no specific version — it
     does NOT promise the overwrite is unconditional under concurrent
     interference. The declare-time fingerprint captures exactly which
@@ -191,14 +198,14 @@ info:
     occupant still succeeds exactly as before.
     Reserved namespace: every name segment beginning .filesv-tmp- or
     .filesv-op- is service-internal. All public operations — write,
-    rename, mkdir, AND remove — reject any path containing such a
-    segment (400 reserved_name), nested or not, whether or not the
-    object exists. Recovery names are not user-addressable: they are
-    hidden from listings, and only the service's own recovery paths may
-    move objects out of them or delete them. Parked foreign objects may
-    therefore remain indefinitely: retained, hidden, and inspectable
-    through the recorded-intent evidence, because no safe discard
-    authority exists for bytes the service cannot attribute.
+    rename, mkdir, remove, AND read, stat, list — reject any path
+    containing such a segment (400 reserved_name), nested or not,
+    whether or not the object exists. Recovery names are not
+    user-addressable: they are hidden from listings, and only the
+    service's own recovery paths may move objects out of them or delete
+    them. Unattributable objects do not stay hidden: the reconciler
+    surfaces them at public recovered-* names (above), so private names
+    never retain content indefinitely.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so

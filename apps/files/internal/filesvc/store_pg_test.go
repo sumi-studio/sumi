@@ -293,8 +293,9 @@ func TestPGWriteSettlesIntent(t *testing.T) {
 	probeAbsent := func() (FileInfo, bool, error) { return FileInfo{}, false, nil }
 	ver, _, err := s.WithWrite(context.Background(), "ws", "a.txt", "write",
 		IfVersion{Mode: "none"}, sha("hello"), probeAbsent,
-		func(intent) (FileInfo, bool, error) {
+		func(it intent) (FileInfo, bool, error) {
 			disk.put("ws", "a.txt", "hello")
+			it.njDone() // a real fs fn drains its journal record
 			return FileInfo{Kind: "file", Fingerprint: "fp-a"}, true, nil
 		})
 	if err != nil {
@@ -877,24 +878,27 @@ func TestPGEmptyLegDoesNotBlockDisjoint(t *testing.T) {
 	// Disjoint write, mkdir and rename all proceed.
 	if _, _, err := s.WithWrite(ctx, "ws", "w2.txt", "write",
 		IfVersion{Mode: "none"}, sha("w2"), probeAbsent,
-		func(intent) (FileInfo, bool, error) {
+		func(it intent) (FileInfo, bool, error) {
 			disk.put("ws", "w2.txt", "w2")
+			it.njDone() // a real fs fn drains its journal record
 			return FileInfo{Kind: "file", Fingerprint: "fp-w2"}, true, nil
 		}); err != nil {
 		t.Fatalf("disjoint write blocked by '' to_path: %v", err)
 	}
 	if _, _, err := s.WithWrite(ctx, "ws", "d1", "mkdir",
 		IfVersion{Mode: "any"}, "dir", probeAbsent,
-		func(intent) (FileInfo, bool, error) {
+		func(it intent) (FileInfo, bool, error) {
 			disk.put("ws", "d1", "dir")
+			it.njDone()
 			return FileInfo{Kind: "dir", Fingerprint: "fp-d1"}, true, nil
 		}); err != nil {
 		t.Fatalf("disjoint mkdir blocked by '' to_path: %v", err)
 	}
 	if _, _, err := s.Rename(ctx, "ws", "w2.txt", "w3.txt",
 		IfVersion{Mode: "any"}, probeAbsent, probeAbsent,
-		func(intent) (FileInfo, bool, error) {
+		func(it intent) (FileInfo, bool, error) {
 			disk.mv("ws", "w2.txt", "w3.txt")
+			it.njDone()
 			return FileInfo{Kind: "file", Fingerprint: "fp-w3"}, true, nil
 		}); err != nil {
 		t.Fatalf("disjoint rename blocked by '' to_path: %v", err)

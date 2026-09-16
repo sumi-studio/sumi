@@ -1333,6 +1333,32 @@ func (v *rootView) ListStaged(scope, dir, prefix string) ([]string, error) {
 	return out, nil
 }
 
+// ListScopes returns the directory entries directly beneath the pinned
+// root — the scope inventory for the orphan sweep, bounded to the owned
+// root's immediate children.
+func (v *rootView) ListScopes() ([]string, error) {
+	// The pinned fd is O_PATH — reopen "." beneath it for readdir so the
+	// listing stays descriptor-relative to the owned root.
+	dfd, err := openBeneath(v.rfd, ".", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dfd.Close()
+	ents, err := dfd.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	out := ents[:0]
+	for _, e := range ents {
+		// Hidden and reserved names are never scope dirs.
+		if strings.HasPrefix(e, ".") || validScope(e) != nil {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 // ListDir returns every entry in dir, unfiltered — the orphan sweep
 // uses it to recurse into subdirectories.
 func (v *rootView) ListDir(scope, dir string) ([]string, error) {
@@ -1548,11 +1574,38 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		}
 		return commit(our3)
 	}
+	if expectFP == "" {
+		// Declared-empty destination: publish non-destructively. An
+		// occupant that arrived after declare is never displaced into
+		// our private name — the write fails honest-conflict instead.
+		it.njAct("pub", rel)
+		err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
+		if p.faultHook != nil {
+			// Kill boundary: the publish may have committed while its
+			// result journal has not.
+			p.faultHook("write.postPub")
+		}
+		switch {
+		case err == nil:
+			it.njRes("ok")
+			return commit(our3)
+		case errors.Is(err, unix.EEXIST):
+			it.njRes("noeff") // provably no effect — nothing moved
+			return fail(ErrExternalChange)
+		case errors.Is(err, unix.ENOENT):
+			it.njRes("noeff") // our staged name is gone — nothing moved
+			return fail(mapPublishErr(err, exclusive))
+		default:
+			// Transport-class failure: the publish outcome is UNKNOWN —
+			// leave the result unrecorded so a successor judges by disk.
+			return fail(mapPublishErr(err, exclusive))
+		}
+	}
 	// Record the exchange BEFORE it can populate the private name with
 	// the displaced object — a crash between syscall and record leaves
 	// the act declared-but-unresulted, which the reconciler reads as
 	// outcome-unknown, never "definitively absent".
-	it.njAct("xch", name)
+	it.njAct("xch", rel)
 	err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_EXCHANGE)
 	if p.faultHook != nil {
 		// Kill boundary: the exchange may have committed while its
@@ -1579,7 +1632,8 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		}
 		return commit(our3)
 	case err != nil:
-		it.njRes("noeff")
+		// Only ENOENT proves no effect; every other error leaves the
+		// exchange's outcome unknown — the result stays unrecorded.
 		return fail(mapPublishErr(err, exclusive))
 	}
 	it.njRes("ok")
@@ -1605,7 +1659,7 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// Declare the undo before its exchanges can repopulate the slot:
 	// res re-opens first so every crash window reads outcome-unknown.
 	it.njRes("")
-	it.njAct("und", name)
+	it.njAct("und", rel)
 	uerr := undoDisplaced(pfd, pfd, tmp, name,
 		func(t3 string) bool { return t3 == our3 })
 	if uerr == nil {
@@ -1799,7 +1853,8 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 			it.njRes("noeff")
 			return FileInfo{}, false, ErrConflict // slot holds leftover residue
 		default:
-			it.njRes("noeff")
+			// Transport-class failure: the capture may have committed —
+			// leave res unrecorded so the outcome reads unknown.
 			return FileInfo{}, false, mapPathErr(err)
 		}
 	}
@@ -1829,13 +1884,15 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 		p.faultHook("rename.postXch")
 	}
 	if err != nil {
-		it.njRes("noeff")
 		switch {
 		case errors.Is(err, unix.ENOENT):
+			it.njRes("noeff")
 			// The destination vanished since declare — nothing to
 			// exchange with; restore the source.
 			return restoreSrc(ErrExternalChange)
 		default:
+			// Any other failure leaves the exchange outcome unknown —
+			// the result stays unrecorded and the intent survives.
 			return restoreSrc(mapPublishErr(err, true))
 		}
 	}

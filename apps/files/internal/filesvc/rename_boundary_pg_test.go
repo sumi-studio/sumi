@@ -70,8 +70,12 @@ func TestBoundaryChild(t *testing.T) {
 			t.Fatalf("child write %s: %v", w[0], err)
 		}
 	}
+	killTag := kill
+	if kill == "write.nestedPostXch" {
+		killTag = "write.postXch"
+	}
 	root.faultHook = func(tag string) {
-		if tag == kill {
+		if tag == killTag {
 			syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
 		}
 	}
@@ -88,6 +92,59 @@ func TestBoundaryChild(t *testing.T) {
 			IfVersion{Mode: "any"}, sha("W2"), authProbe(root, "old.txt"),
 			func(it intent) (FileInfo, bool, error) {
 				return root.atomicWrite("ws", "old.txt", []byte("W2"), false, it)
+			})
+		t.Fatalf("write returned %v — %s hook never ran", werr, kill)
+	case "write.nestedPostXch":
+		// A write under a nested directory killed between the exchange
+		// syscall and the res journal — the journal must carry the
+		// scope-relative path (F238).
+		if err := os.MkdirAll(dir+"/ws/sub", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dir+"/ws/sub/victim.txt", []byte("OLD"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, _, werr := s.WithWrite(ctx, "ws", "sub/victim.txt", "write",
+			IfVersion{Mode: "any"}, sha("NW"), authProbe(root, "sub/victim.txt"),
+			func(it intent) (FileInfo, bool, error) {
+				return root.atomicWrite("ws", "sub/victim.txt", []byte("NW"), false, it)
+			})
+		t.Fatalf("write returned %v — %s hook never ran", werr, kill)
+	case "write.postPub":
+		// A write to a declared-EMPTY destination killed between the
+		// NOREPLACE publish syscall and the res journal — outcome
+		// unknown to the journal, committed (or not) on disk.
+		_, _, werr := s.WithWrite(ctx, "ws", "pub.txt", "write",
+			IfVersion{Mode: "any"}, sha("NP"), authProbe(root, "pub.txt"),
+			func(it intent) (FileInfo, bool, error) {
+				return root.atomicWrite("ws", "pub.txt", []byte("NP"), false, it)
+			})
+		t.Fatalf("write returned %v — %s hook never ran", werr, kill)
+	case "write.preUndo":
+		// A foreign object deposits itself at the OCCUPIED victim path
+		// after declare. The exchange parks the foreign object (not the
+		// declared pre-image); kill before the undo — a real process
+		// death standing in for A's injected pauses (F236 chain).
+		if err := os.WriteFile(dir+"/ws/victim.txt", []byte("X"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dir+"/ws/fdep.txt", []byte("F-ACK"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		root.faultHook = func(tag string) {
+			switch tag {
+			case "write.postCreate":
+				if err := os.Rename(dir+"/ws/fdep.txt", dir+"/ws/victim.txt"); err != nil {
+					panic(err)
+				}
+			case "write.preUndo":
+				syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
+			}
+		}
+		_, _, werr := s.WithWrite(ctx, "ws", "victim.txt", "write",
+			IfVersion{Mode: "any"}, sha("BODY"), authProbe(root, "victim.txt"),
+			func(it intent) (FileInfo, bool, error) {
+				return root.atomicWrite("ws", "victim.txt", []byte("BODY"), false, it)
 			})
 		t.Fatalf("write returned %v — %s hook never ran", werr, kill)
 	default:
@@ -370,6 +427,141 @@ func TestBoundaryKillWritePostXch(t *testing.T) {
 	if e := scanDirForPrivate(dir, "ws"); e != "" {
 		t.Fatalf("private residue left behind: %q", e)
 	}
+	boundaryOrdinaryOps(t, s, root, dir)
+}
+
+// write.postPub: killed between the declared-empty NOREPLACE publish
+// syscall and its result journal — the publish committed on disk (the
+// hook sits after the syscall) but the journal reads res="" (outcome
+// unknown). Recovery must roll the intent forward by observing the
+// product at the path — never assuming the syscall's effect.
+func TestBoundaryKillWritePostPub(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	boundaryKill(t, dsn, dir, "write.postPub")
+
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := boundaryRecover(t, dsn, dir, root)
+	_, _, resolved := boundaryIntent(t, s, "write", "pub.txt")
+	if !resolved {
+		t.Fatal("dead owner's write intent never settled")
+	}
+	if got, ok := authReadOpt(dir, "ws/pub.txt"); !ok || got != "NP" {
+		t.Fatalf("pub.txt=%q ok=%v — published product lost", got, ok)
+	}
+	// The roll-forward committed a truthful row and event.
+	if v, fp, found := authRow(t, s, "pub.txt"); !found {
+		t.Fatal("no row at pub.txt after recovery")
+	} else {
+		live := durFP(t, root, "ws", "pub.txt")
+		if fp3(fp) != fp3(live) {
+			t.Fatalf("pub.txt row fp=%q diverged from live %q", fp, live)
+		}
+		_ = v
+	}
+	var ev int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT 1 FROM file_event WHERE scope='ws' AND path='pub.txt'`).Scan(&ev); err != nil {
+		t.Fatalf("no event for the rolled-forward publish: %v", err)
+	}
+	if e := scanDirForPrivate(dir, "ws"); e != "" {
+		t.Fatalf("private residue left behind: %q", e)
+	}
+	boundaryOrdinaryOps(t, s, root, dir)
+}
+
+// write.preUndo: a real-SIGKILL version of A-F1/F236's producer — a
+// foreign object deposits at the OCCUPIED victim path after declare,
+// the exchange parks it at the private slot, and the caller dies before
+// the undo. Post-kill the slot holds a foreign object under act=xch
+// res=ok. The retained-diverged chain + same-content retry then must
+// never destroy it.
+func TestBoundaryKillWritePreUndo(t *testing.T) {
+	dsn := pgDSN(t)
+	resetTables(t, dsn)
+	dir := t.TempDir()
+	boundaryKill(t, dsn, dir, "write.preUndo")
+	ctx := context.Background()
+
+	// Post-kill shape: the foreign F-ACK parked at the slot, the
+	// body's bytes at victim.txt (the undo never ran).
+	if got, _ := authReadOpt(dir, "ws/victim.txt"); got != "BODY" {
+		t.Fatalf("victim.txt=%q — expected the exchanged body", got)
+	}
+	fAt := scanTreeFor(t, dir, "ws", []byte("F-ACK"))
+	if fAt == "" || !containsPrivateSeg(fAt) {
+		t.Fatalf("post-kill F-ACK at %q — expected parked at a private slot", fAt)
+	}
+
+	// The diverged foreign change lands at the path — as in A's probe.
+	if err := os.WriteFile(dir+"/ws/victim.txt", []byte("FOREIGN-G"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := newRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newPGStore(t, dsn, dir)
+	// Pass 1: a transient settle failure (injected; production may see
+	// any unavailable FUSE window) while the dead intent resolves.
+	once := true
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return &failMoveOnceView{ReconView: v, once: &once}
+	}))
+	authExec(t, s, `UPDATE file_op SET at = now() - interval '10 minutes'`)
+	s.lastTombScan.Store(0)
+	s.Reconcile(ctx)
+
+	// The dead intent resolved with a diverged applyKeep event.
+	id, _, resolved := boundaryIntent(t, s, "write", "victim.txt")
+	if !resolved {
+		t.Fatal("dead intent did not resolve")
+	}
+	var evSHA string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT content_sha FROM file_version WHERE scope='ws' AND path='victim.txt'`).Scan(&evSHA); err != nil {
+		t.Fatalf("no row at victim.txt: %v", err)
+	}
+	if evSHA != sha("FOREIGN-G") {
+		t.Fatalf("diverged observation not journaled: row sha=%q", evSHA)
+	}
+
+	// Same-content retry once the hot tombstone ages out of the overlap
+	// window: the product row then carries the intent's own expectSHA —
+	// the exact authority chain the old code trusted.
+	authExec(t, s, `UPDATE file_op SET resolved_at=now()-interval '2 hours' WHERE id=$1`, id)
+	s.SetReconcileView(authPinned(root, nil))
+	if _, _, err := s.WithWrite(ctx, "ws", "victim.txt", "write",
+		IfVersion{Mode: "any"}, sha("BODY"),
+		authProbe(root, "victim.txt"), authWriteFn(root, "victim.txt", "BODY")); err != nil {
+		t.Fatalf("retry write: %v", err)
+	}
+
+	// Pass 2 (uninjected): the foreign F-ACK must surface, never be
+	// destroyed on act + event + same-content-row facts.
+	s.lastTombScan.Store(0)
+	s.lastTombScanCold.Store(0)
+	s.Reconcile(ctx)
+
+	where := scanTreeFor(t, dir, "ws", []byte("F-ACK"))
+	if where == "" || containsPrivateSeg(where) {
+		t.Fatalf("F-ACK destroyed or left hidden: %q", where)
+	}
+	if got, _ := authReadOpt(dir, "ws/victim.txt"); got != "BODY" {
+		t.Fatalf("victim.txt=%q — committed product disturbed", got)
+	}
+	if _, _, found := authRow(t, s, where); !found {
+		t.Fatalf("surfaced F-ACK at %q has no version row", where)
+	}
+	if e := scanDirForPrivate(dir, "ws"); e != "" {
+		t.Fatalf("private residue left behind: %q", e)
+	}
+	_ = id
 	boundaryOrdinaryOps(t, s, root, dir)
 }
 

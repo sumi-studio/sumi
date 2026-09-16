@@ -158,10 +158,24 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case op == "stat" && r.Method == "GET":
+		// Private staging/operation names are never user-addressable —
+		// read-side ops get the same reserved check mutations do (F239).
+		if err := checkReserved(path); err != nil {
+			s.mapErr(w, err)
+			return
+		}
 		s.handleStat(w, r, scope, path)
 	case op == "list" && r.Method == "GET":
+		if err := checkReserved(path); err != nil {
+			s.mapErr(w, err)
+			return
+		}
 		s.handleList(w, r, scope, path, q)
 	case op == "read" && r.Method == "GET":
+		if err := checkReserved(path); err != nil {
+			s.mapErr(w, err)
+			return
+		}
 		s.handleRead(w, r, scope, path, q)
 	case op == "write" && r.Method == "PUT":
 		s.handleWrite(w, r, scope, path)
