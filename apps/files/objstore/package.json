@@ -1,0 +1,17 @@
+{
+  "name": "@sumi/files-objstore",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "dev": "wrangler dev --config wrangler.jsonc",
+    "deploy": "wrangler deploy --config wrangler.jsonc"
+  },
+  "devDependencies": {
+    "@sumi/typescript-config": "workspace:*",
+    "@types/node": "^24.13.2",
+    "typescript": "~6.0.3",
+    "wrangler": "4.120.1"
+  }
+}
