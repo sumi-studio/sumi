@@ -374,7 +374,7 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 // deterministically — a giant error text can never be persisted
 // verbatim and must be bounded client-side.
 func TestHTTPCommitOverBodyLimit(t *testing.T) {
-	_, mux := newHTTPServer(t)
+	srv, mux := newHTTPServer(t)
 	pa := pid(t)
 	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
 	var created struct {
@@ -395,8 +395,8 @@ func TestHTTPCommitOverBodyLimit(t *testing.T) {
 	var load LoadResult
 	_ = json.Unmarshal(rec.Body.Bytes(), &load)
 
-	// ~1.2 MB of error text — over the 1 MiB body limit.
-	huge := strings.Repeat("x", 1_200_000)
+	// Exceed the configured body limit even when attachment capacity changes.
+	huge := strings.Repeat("x", int(srv.maxBody)+1)
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/turns/"+load.Turn.TurnID+"/commit", tok,
 		`{"generation":`+gen+`,"outcome":"fail","retryable":true,"error":"`+huge+`"}`)
 	if rec.Code != 400 {
