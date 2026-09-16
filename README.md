@@ -37,7 +37,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 ### Not available yet
 
-- **Using the full Web app on the new core as a product.** `make dev-core` runs the Web app on the new core for development — Messaging and Direct Chat included — but connecting it for everyday use is still being verified.
+- **Using the full Web app on the new core as a product.** `make dev-core` runs the Web app on the new core for development. Direct Chat runs on the core; Messaging's core path currently covers attention intake and secretary replies only — shared Messaging history/search and accepting workspace invitations are still served by the existing surfaces, not the core. Connecting it for everyday use is still being verified.
 - **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.

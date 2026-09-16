@@ -1661,6 +1661,143 @@ func connectionLeaseStateMAC(
 
 var errProjectedWriteBlocked = errors.New("a live legacy runtime owns this personality agent's event log")
 
+// ProjectedEvent is one browser-visible event a non-runtime producer asks the
+// gateway to commit. DedupKey is the fact's durable identity: a replayed
+// projection regenerates the same key, so AppendProjectedEvents can refuse to
+// double-commit under the event-file lock — across process restarts and
+// concurrent projectors alike. Events whose wire content already carries their
+// identity (message_id, request/command ids) leave DedupKey zero and default
+// to sha256(Event); anonymous lifecycle markers (agent_start/agent_end carry
+// only {"type"}) must supply a key derived from what they represent.
+type ProjectedEvent struct {
+	Event    json.RawMessage
+	DedupKey [sha256.Size]byte
+}
+
+// dedupIndexPath is the per-persona sidecar of projected-event dedup keys.
+// Record i is the key for event line i+1; entries for lines committed by
+// non-projected writers (the runtime path does not maintain the index) are
+// recovered by hashing the stored line itself.
+func (g *DurableGateway) dedupIndexPath(personalityAgentID string) string {
+	return filepath.Join(g.dir, "events-"+safeFileID(personalityAgentID)+".dedup")
+}
+
+// projectedKeySet loads the durable dedup index under the event-file lock and
+// returns the set of keys covering every committed event line. The index is
+// written before the events it describes (preimage ordering): a crash between
+// the two leaves index records with no event lines, which are truncated here
+// rather than allowed to suppress facts that never committed. Lines committed
+// without index records — runtime-path appends, or an index lost wholesale —
+// are covered by hashing their stored inner event and backfilled.
+func (g *DurableGateway) projectedKeySet(
+	personalityAgentID string,
+	file durableFileHandle,
+	st *personalityAgentLogState,
+) (map[[sha256.Size]byte]struct{}, durableFileHandle, error) {
+	index, err := g.newFile(g.dedupIndexPath(personalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, nil, err
+	}
+	size, err := index.Seek(0, io.SeekEnd)
+	if err != nil {
+		index.Close()
+		return nil, nil, fmt.Errorf("size dedup index: %w", err)
+	}
+	// A torn index tail is dropped; the lines it described are re-covered by
+	// content hashing below.
+	if torn := size % sha256.Size; torn != 0 {
+		if err := index.Truncate(size - torn); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("truncate torn dedup index: %w", err)
+		}
+		if err := index.Sync(); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("sync dedup index truncation: %w", err)
+		}
+		size -= torn
+	}
+	covered := size / sha256.Size
+	if covered > int64(st.eventSeq) {
+		// Phantom preimages of events that never committed.
+		if err := index.Truncate(int64(st.eventSeq) * sha256.Size); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("truncate phantom dedup keys: %w", err)
+		}
+		if err := index.Sync(); err != nil {
+			index.Close()
+			return nil, nil, err
+		}
+		covered = int64(st.eventSeq)
+	}
+	keys := make(map[[sha256.Size]byte]struct{}, st.eventSeq)
+	if covered > 0 {
+		raw := make([]byte, covered*sha256.Size)
+		if _, err := index.Seek(0, io.SeekStart); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("seek dedup index: %w", err)
+		}
+		if _, err := io.ReadFull(index, raw); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("read dedup index: %w", err)
+		}
+		for i := int64(0); i < covered; i++ {
+			var k [sha256.Size]byte
+			copy(k[:], raw[i*sha256.Size:(i+1)*sha256.Size])
+			keys[k] = struct{}{}
+		}
+	}
+	if covered < int64(st.eventSeq) {
+		// Committed lines with no stored key (legacy/runtime writes) are
+		// covered by content hash and the index is brought current.
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			index.Close()
+			return nil, nil, fmt.Errorf("seek event log for dedup rebuild: %w", err)
+		}
+		var backfill bytes.Buffer
+		var seq uint64
+		r := bufio.NewReader(file)
+		for {
+			line, readErr := r.ReadBytes('\n')
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				seq++
+				if int64(seq) > covered {
+					var rec durableEventRecord
+					if err := json.Unmarshal(trimmed, &rec); err != nil {
+						index.Close()
+						return nil, nil, fmt.Errorf("parse committed event for dedup rebuild: %w", err)
+					}
+					k := sha256.Sum256(rec.Event.Event)
+					keys[k] = struct{}{}
+					backfill.Write(k[:])
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				index.Close()
+				return nil, nil, fmt.Errorf("read event log for dedup rebuild: %w", readErr)
+			}
+		}
+		if backfill.Len() > 0 {
+			if _, err := index.Write(backfill.Bytes()); err != nil {
+				index.Close()
+				return nil, nil, fmt.Errorf("backfill dedup index: %w", err)
+			}
+			if err := index.Sync(); err != nil {
+				index.Close()
+				return nil, nil, fmt.Errorf("sync dedup index backfill: %w", err)
+			}
+		}
+	}
+	if _, err := index.Seek(0, io.SeekEnd); err != nil {
+		index.Close()
+		return nil, nil, fmt.Errorf("position dedup index: %w", err)
+	}
+	return keys, index, nil
+}
+
 // AppendProjectedEvents durably appends browser-visible events produced by an
 // in-process API component — currently the core direct-chat projection — rather
 // than by a connected runtime. Unlike Receive it does not require a runtime
@@ -1673,10 +1810,16 @@ var errProjectedWriteBlocked = errors.New("a live legacy runtime owns this perso
 // seq assignment, and folded into the in-memory run/approval guards. The batch
 // is one write+fsync: a crash mid-append leaves a torn tail that EventCatchUp
 // fails closed on, never silently half-applied records.
+//
+// Content uniqueness is atomic: each event's dedup key is checked and recorded
+// against the durable index while the event file is exclusively locked, so a
+// second API process replaying the same projection commits nothing twice —
+// the in-memory seen maps callers keep are an emission-rate optimization, not
+// the guard.
 func (g *DurableGateway) AppendProjectedEvents(
 	ctx context.Context,
 	personalityAgentID string,
-	events []json.RawMessage,
+	events []ProjectedEvent,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1732,15 +1875,33 @@ func (g *DurableGateway) AppendProjectedEvents(
 		return err
 	}
 
+	// Dedup under the same exclusive file lock that owns the append: the
+	// durable index is the guard, not any projector's memory, so overlapping
+	// API processes cannot double-commit.
+	keys, index, err := g.projectedKeySet(personalityAgentID, file, st)
+	if err != nil {
+		return err
+	}
+	defer index.Close()
+
+	var keyBuf bytes.Buffer
 	var buf bytes.Buffer
 	envelopes := make([]Envelope, 0, len(events))
 	for i, raw := range events {
-		seq := st.eventSeq + uint64(i) + 1
+		key := raw.DedupKey
+		if key == ([sha256.Size]byte{}) {
+			key = sha256.Sum256(raw.Event)
+		}
+		if _, seen := keys[key]; seen {
+			continue
+		}
+		keys[key] = struct{}{}
+		seq := st.eventSeq + uint64(len(envelopes)) + 1
 		envelope := Envelope{
 			Audience:           AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: personalityAgentID,
-			Event:              raw,
+			Event:              raw.Event,
 		}
 		if err := validateEnvelope(envelope); err != nil {
 			return fmt.Errorf("projected event %d: %w", i, err)
@@ -1749,9 +1910,23 @@ func (g *DurableGateway) AppendProjectedEvents(
 		if err != nil {
 			return err
 		}
+		keyBuf.Write(key[:])
 		buf.Write(line)
 		buf.WriteByte('\n')
 		envelopes = append(envelopes, envelope)
+	}
+	if len(envelopes) == 0 {
+		return nil
+	}
+
+	// Preimage ordering: the dedup keys reach stable storage before the events
+	// they describe. A crash between leaves phantom index records, which the
+	// next load truncates — no fact is ever suppressed that did not commit.
+	if _, err := index.Write(keyBuf.Bytes()); err != nil {
+		return fmt.Errorf("write dedup index: %w", err)
+	}
+	if err := index.Sync(); err != nil {
+		return fmt.Errorf("sync dedup index: %w", err)
 	}
 
 	preWriteOffset, err := file.Seek(0, io.SeekEnd)

@@ -724,6 +724,13 @@ func newApplicationFromEnv() (*application, error) {
 		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")
 	}
 	var coreDirectChat *agentevents.CoreDirectChat
+	if directChatCoreBackendEnabled() && coreServer == nil {
+		// An explicit core backend with no core state service must not
+		// silently keep the legacy runtime and call it core: the placement
+		// was asked for behavior it cannot deliver, so startup fails.
+		closeOnError()
+		return nil, errors.New("SUMI_DIRECT_CHAT_BACKEND=core requires the core state service (SUMI_CORE_STATE_TOKEN and a database)")
+	}
 	if coreServer != nil && directChatCoreBackendEnabled() {
 		// The accepted TypeScript core serves Direct Chat: admitted commands
 		// become durable core inputs, and committed journal events are

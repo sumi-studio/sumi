@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -57,6 +59,19 @@ type coreDirectChatPersona struct {
 	commandSeq uint64
 	turnInput  map[string]string // turn_id -> input_id, for surface attribution
 	inputKind  map[string]string // input_id -> source_surface
+	// The wire's run model allows one active run per session (agent_end
+	// clears the pending approval prompt), while the core may genuinely
+	// interleave inputs — e.g. a second message processed while the first
+	// waits on an approval. The projection therefore opens one run for a
+	// contiguous busy period and closes it only when no direct-chat input
+	// is live (queued/claimed/waiting): agent_end is then always the truth
+	// "the secretary finished", never emitted mid-approval where it would
+	// hide the actionable prompt. runs counts committed agent_start markers
+	// so start/end dedup keys are deterministic across processes.
+	runs      int
+	runOpen   bool
+	failures  int
+	nextRetry time.Time
 }
 
 var errCoreDirectChatUnavailable = errors.New("core direct chat is unavailable")
@@ -300,10 +315,39 @@ func (c *CoreDirectChat) Run(ctx context.Context) {
 	}
 }
 
+// maxSyncBackoff caps the per-persona retry backoff so a persistently failing
+// projection still recovers promptly once the cause clears — a lost index
+// write, a restarted database — rather than waiting out a long penalty.
+const maxSyncBackoff = 30 * time.Second
+
 func (c *CoreDirectChat) sweep(ctx context.Context) {
 	for _, id := range c.personaIDs(ctx) {
-		if err := c.syncPersona(ctx, id); err != nil && ctx.Err() == nil {
-			log.Printf("core direct-chat projection for %s: %v", id, err)
+		st := c.personaState(id)
+		if time.Now().Before(st.nextRetry) {
+			continue
+		}
+		err := c.syncPersona(ctx, id)
+		switch {
+		case err == nil:
+			if st.failures > 0 {
+				log.Printf("core direct-chat projection for %s recovered after %d consecutive failure(s)", id, st.failures)
+			}
+			st.failures = 0
+			st.nextRetry = time.Time{}
+		case ctx.Err() != nil:
+			// Shutdown raced a sync: not a persona failure.
+		default:
+			st.failures++
+			delay := c.pollInterval() << (st.failures - 1)
+			if delay > maxSyncBackoff {
+				delay = maxSyncBackoff
+			}
+			st.nextRetry = time.Now().Add(delay)
+			// Every failure is logged, but the backoff bounds the rate: a
+			// stuck persona costs at most one line per delay, not one per
+			// poll, and the recovery above is observable the moment it lands.
+			log.Printf("core direct-chat projection for %s failed (%d consecutive; retry in %s): %v",
+				id, st.failures, delay, err)
 		}
 	}
 }
@@ -348,12 +392,9 @@ func (c *CoreDirectChat) personaIDs(ctx context.Context) []string {
 func (c *CoreDirectChat) syncPersona(ctx context.Context, personaID string) error {
 	st := c.personaState(personaID)
 	if !st.loaded {
-		seen, err := c.loadEventHashes(ctx, personaID)
-		if err != nil {
+		if err := c.loadProjectionState(ctx, personaID, st); err != nil {
 			return err
 		}
-		st.seen = seen
-		st.loaded = true
 	}
 	if err := c.projectJournal(ctx, personaID, st); err != nil {
 		return err
@@ -364,22 +405,116 @@ func (c *CoreDirectChat) syncPersona(ctx context.Context, personaID string) erro
 	if err := c.projectFailedTurns(ctx, personaID, st); err != nil {
 		return err
 	}
-	return c.reconcileCommands(ctx, personaID, st)
+	if err := c.reconcileCommands(ctx, personaID, st); err != nil {
+		return err
+	}
+	return c.closeRunIfIdle(ctx, personaID, st)
 }
 
-// loadEventHashes hashes every inner event already in the durable log so
-// regenerated projections of the same journal events are recognized as
-// already committed — the basis of restart idempotence.
-func (c *CoreDirectChat) loadEventHashes(ctx context.Context, personaID string) (map[[sha256.Size]byte]struct{}, error) {
-	out := make(map[[sha256.Size]byte]struct{})
+// loadProjectionState rebuilds this persona's emission cursors from the
+// durable event log: the set of committed dedup keys plus the run markers
+// already on the wire, so a restarted projector re-emits nothing and resumes
+// an open run instead of inventing a second one.
+func (c *CoreDirectChat) loadProjectionState(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
+	seen := make(map[[sha256.Size]byte]struct{})
 	envelopes, err := c.Gateway.EventCatchUp(ctx, personaID, 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, env := range envelopes {
-		out[sha256.Sum256(env.Event)] = struct{}{}
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(env.Event, &head); err != nil {
+			continue
+		}
+		switch head.Type {
+		case "agent_start":
+			st.runs++
+			st.runOpen = true
+		case "agent_end":
+			st.runOpen = false
+		default:
+			seen[sha256.Sum256(env.Event)] = struct{}{}
+		}
 	}
-	return out, nil
+	st.seen = seen
+	st.loaded = true
+	return nil
+}
+
+// emit durably appends run content — messages, tool events, approvals —
+// opening a run marker first when no run is live. Dedup keys make the whole
+// batch idempotent under the event-file lock: a replayed projection, in this
+// process or an overlapping one, commits nothing twice.
+func (c *CoreDirectChat) emit(ctx context.Context, personaID string, st *coreDirectChatPersona, events []json.RawMessage) error {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]ProjectedEvent, 0, len(events)+1)
+	if !st.runOpen {
+		start, err := marshalEvent(map[string]any{"type": "agent_start"})
+		if err != nil {
+			return err
+		}
+		out = append(out, ProjectedEvent{Event: start, DedupKey: runMarkerKey(personaID, "start", st.runs)})
+	}
+	for _, raw := range events {
+		out = append(out, ProjectedEvent{Event: raw})
+	}
+	if err := c.Gateway.AppendProjectedEvents(ctx, personaID, out); err != nil {
+		return err
+	}
+	for _, raw := range events {
+		st.seen[sha256.Sum256(raw)] = struct{}{}
+	}
+	if !st.runOpen {
+		st.runOpen = true
+		st.runs++
+	}
+	return nil
+}
+
+// runMarkerKey is the durable dedup identity of one run's start or end
+// marker. The index of the run within the persona's history makes each key
+// unique while remaining a pure function of the committed log.
+func runMarkerKey(personaID, kind string, index int) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write([]byte("sumi-core-direct-chat\x00run-" + kind + "\x00"))
+	h.Write([]byte(personaID))
+	fmt.Fprintf(h, "\x00%d", index)
+	var key [sha256.Size]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
+// closeRunIfIdle ends the open run when the persona has no live direct-chat
+// input left. The check runs after every other projection pass, so queued
+// inputs reconciled this sweep keep the run open and a pending approval —
+// whose input sits in 'waiting' — never sees its prompt closed early.
+func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
+	if !st.runOpen {
+		return nil
+	}
+	live, err := c.Core.LiveDirectChatInputs(ctx, personaID)
+	if err != nil {
+		return err
+	}
+	if live > 0 {
+		return nil
+	}
+	end, err := marshalEvent(map[string]any{"type": "agent_end"})
+	if err != nil {
+		return err
+	}
+	key := runMarkerKey(personaID, "end", st.runs-1)
+	if err := c.Gateway.AppendProjectedEvents(ctx, personaID,
+		[]ProjectedEvent{{Event: end, DedupKey: key}}); err != nil {
+		return err
+	}
+	st.seen[key] = struct{}{}
+	st.runOpen = false
+	return nil
 }
 
 func (c *CoreDirectChat) projectJournal(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
@@ -404,11 +539,8 @@ func (c *CoreDirectChat) projectJournal(ctx context.Context, personaID string, s
 				out = append(out, raw)
 			}
 		}
-		if err := c.Gateway.AppendProjectedEvents(ctx, personaID, out); err != nil {
+		if err := c.emit(ctx, personaID, st, out); err != nil {
 			return err
-		}
-		for _, raw := range out {
-			st.seen[sha256.Sum256(raw)] = struct{}{}
 		}
 		st.journalSeq = events[len(events)-1].Seq
 		if len(events) < 256 {
@@ -446,13 +578,7 @@ func (c *CoreDirectChat) projectPendingApprovals(ctx context.Context, personaID 
 		}
 		out = append(out, raw)
 	}
-	if err := c.Gateway.AppendProjectedEvents(ctx, personaID, out); err != nil {
-		return err
-	}
-	for _, raw := range out {
-		st.seen[sha256.Sum256(raw)] = struct{}{}
-	}
-	return nil
+	return c.emit(ctx, personaID, st, out)
 }
 
 // inputSurface resolves an input's immutable source surface, cached per
@@ -491,13 +617,7 @@ func (c *CoreDirectChat) projectFailedTurns(ctx context.Context, personaID strin
 		}
 		out = append(out, raw)
 	}
-	if err := c.Gateway.AppendProjectedEvents(ctx, personaID, out); err != nil {
-		return err
-	}
-	for _, raw := range out {
-		st.seen[sha256.Sum256(raw)] = struct{}{}
-	}
-	return nil
+	return c.emit(ctx, personaID, st, out)
 }
 
 // reconcileCommands walks the durable command log: user_message commands
@@ -589,13 +709,17 @@ func (c *CoreDirectChat) appendDisposition(
 	status, reason string,
 ) error {
 	raw := dispositionEvent(env, status, reason)
-	if _, ok := st.seen[sha256.Sum256(raw)]; ok {
+	key := sha256.Sum256(raw)
+	if _, ok := st.seen[key]; ok {
 		return nil
 	}
-	if err := c.Gateway.AppendProjectedEvents(ctx, personaID, []json.RawMessage{raw}); err != nil {
+	// Dispositions are receipts, not run content: they never open a run and
+	// land inside whatever run happens to be open.
+	if err := c.Gateway.AppendProjectedEvents(ctx, personaID,
+		[]ProjectedEvent{{Event: raw, DedupKey: key}}); err != nil {
 		return err
 	}
-	st.seen[sha256.Sum256(raw)] = struct{}{}
+	st.seen[key] = struct{}{}
 	return nil
 }
 
@@ -696,7 +820,15 @@ func (c *CoreDirectChat) translateInputReceived(personaID string, ev agentstate.
 	var out []json.RawMessage
 	text, _ := ev.Payload["text"].(string)
 	inputID, _ := ev.Payload["input_id"].(string)
-	messageID := projectedMessageID(personaID, "user", inputID)
+	// The browser reconciles its optimistic entry by the canonical message
+	// id — UUIDv5 over the command's UUID bytes under the wire namespace —
+	// the same id the legacy runtime minted. Anything else renders the sent
+	// message twice.
+	commandID := strings.TrimPrefix(inputID, "direct-chat:")
+	messageID, err := userMessageIDFromCommandID(commandID)
+	if err != nil {
+		return nil, fmt.Errorf("input %q does not carry a command UUID: %w", inputID, err)
+	}
 	userMessage, err := marshalEvent(map[string]any{
 		"type":       "message_end",
 		"message_id": messageID,
@@ -1079,6 +1211,22 @@ func marshalEvent(m map[string]any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("generated event failed wire validation: %w", err)
 	}
 	return raw, nil
+}
+
+// userMessageNamespace is the wire's canonical user-message namespace — the
+// same constant as apps/web/src/agent/user-message-id.ts and the legacy
+// Rust runtime's USER_MESSAGE_ID_NAMESPACE.
+var userMessageNamespace = uuid.MustParse("78f62d15-b945-4a4f-9d84-d73c7f932b51")
+
+// userMessageIDFromCommandID reproduces the browser's
+// userMessageIdFromCommandId: UUIDv5(namespace, command UUID bytes). The
+// optimistic-entry reconciler keys on this exact value.
+func userMessageIDFromCommandID(commandID string) (string, error) {
+	id, err := uuid.Parse(commandID)
+	if err != nil {
+		return "", err
+	}
+	return uuid.NewSHA1(userMessageNamespace, id[:]).String(), nil
 }
 
 // projectedMessageID derives a stable canonical UUID for a projected message

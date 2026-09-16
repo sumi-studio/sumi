@@ -220,8 +220,12 @@ proven; it requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
 `SUMI_DEV_RUNTIME=core` in `.env.local`) runs each secretary on the accepted
 TypeScript core (`apps/core`): the API mounts the persona-scoped state
 service at `/internal/core`, Messaging attention is admitted as durable core
-inputs, and Direct Chat commands are served through the same core state
-(`SUMI_DIRECT_CHAT_BACKEND=core`). A local dev pool
+inputs with secretary replies delivered back through the messaging effect,
+and Direct Chat commands are served through the same core state
+(`SUMI_DIRECT_CHAT_BACKEND=core`). The Messaging core path stops there for
+now: shared Messaging history/search and workspace-invitation acceptance
+still run on their existing surfaces and are not part of this mode. A local
+dev pool
 (`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`) runs one
 `host/local.ts` Node process per persona, started by the API's wake sweep —
 the same wake contract Cloud uses. The writer lease in Postgres keeps one

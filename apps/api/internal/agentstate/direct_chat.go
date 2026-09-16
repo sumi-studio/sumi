@@ -75,6 +75,20 @@ func (s *Store) TurnFundingRef(ctx context.Context, personaID, turnID string) (*
 	return &f, nil
 }
 
+// LiveDirectChatInputs counts this persona's direct-chat inputs that are not
+// terminally done — queued, claimed, or waiting on an approval. The browser
+// projection uses it as the run-boundary truth: a run stays open while any
+// admitted message is still in flight and closes only when the durable state
+// shows nothing left to do.
+func (s *Store) LiveDirectChatInputs(ctx context.Context, personaID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM core_inputs
+		WHERE persona_id = $1 AND source_surface = 'direct_chat'
+			AND status IN ('queued','claimed','waiting')`, personaID).Scan(&n)
+	return n, err
+}
+
 // FailedDirectChatTurns lists turns in terminal 'failed' status that served
 // inputs admitted from the direct-chat surface, so the projection can
 // surface the failure in the conversation instead of leaving the human's

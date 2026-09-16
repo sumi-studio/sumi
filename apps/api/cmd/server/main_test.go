@@ -172,6 +172,19 @@ func setTokenSecret(t *testing.T) {
 	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", privateRuntimeDir(t))
 }
 
+// An explicit core backend with no core state service must not silently keep
+// the legacy runtime and call it core: startup fails closed instead.
+func TestDirectChatCoreBackendWithoutCoreStateServiceFails(t *testing.T) {
+	setTokenSecret(t)
+	setSessionSecret(t)
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "core")
+	_, err := newApplicationFromEnv()
+	if err == nil || !strings.Contains(err.Error(), "SUMI_DIRECT_CHAT_BACKEND=core requires") {
+		t.Fatalf("explicit core backend without the core state service must fail clearly, got %v", err)
+	}
+}
+
 func setSessionSecret(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUMI_BROWSER_SESSION_SECRET", base64.StdEncoding.EncodeToString(testSessionSecret))
