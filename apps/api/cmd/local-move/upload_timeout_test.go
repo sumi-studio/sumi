@@ -179,12 +179,19 @@ func TestUploadStopsWhenTheConnectionStopsAcceptingBytes(t *testing.T) {
 	out.Reset()
 
 	c.setIntercept(nil)
-	expect(t, m.Resume(c.ctx), exitPending, out, "waiting for the registration")
+	// Recovery runs over a healthy transport: a fresh command with the
+	// production socket buffers and silence bounds, continuing the same
+	// recorded move. The stall conditions above exist to inject the fault,
+	// not to measure a working upload — under a loaded CI machine a
+	// few-KB window can keep a healthy peer's byte gaps above a 300ms
+	// test bound.
+	m2, out2 := c.mover()
+	expect(t, m2.Resume(c.ctx), exitPending, out2, "waiting for the registration")
 	if n := exportRows(t, c.local, c.pid); n != 1 {
 		t.Fatalf("export rows after the resume: %d", n)
 	}
 	c.provision(uid, sid)
-	expect(t, m.Resume(c.ctx), exitDone, out, "Choose a model connection")
+	expect(t, m2.Resume(c.ctx), exitDone, out2, "Choose a model connection")
 }
 
 // A Cloud that swallows the bundle, answers the response headers and then
