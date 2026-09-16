@@ -83,7 +83,9 @@ resolve() {
   printf '%s' "$url"
 }
 
-# envfile_value FILE NAME -> the variable's value per systemd EnvironmentFile
+# Supported EnvironmentFile subset: one NAME=value per line; no export
+# prefix, line continuations or multiline values.
+# envfile_value FILE NAME -> the variable's value for this subset
 # parsing (last NAME= line wins; single quotes literal; double quotes allow
 # \" and \\ escapes; otherwise the raw text). Never sources the file.
 envfile_value() {
@@ -131,7 +133,8 @@ if [[ "${1:-}" == --env ]]; then
     fi
     [[ -n "$value" ]] || continue
     resolved="$(resolve "$value")" || { rm -f "$tmp"; exit 1; }
-    printf '%s=%s\n' "$name" "$(env_quote "$resolved")" >> "$tmp" || { rm -f "$tmp"; exit 1; }
+    quoted="$(env_quote "$resolved")" || { rm -f "$tmp"; exit 1; }
+    printf '%s=%s\n' "$name" "$quoted" >> "$tmp" || { rm -f "$tmp"; exit 1; }
   done
   mv "$tmp" "$out"
 else

@@ -51,10 +51,6 @@ owner="${SUMI_FILES_OWNER:-10002:10002}"
 : "${META_PASSWORD:?META_PASSWORD is required}"
 export META_PASSWORD
 
-case "$meta" in
-  *://*:*@*) echo "refused: put the metadata password in META_PASSWORD, not the URL" >&2; exit 2 ;;
-esac
-
 # A `{docker:CONTAINER}` (or `{docker:CONTAINER@NETWORK}`) token as the URL
 # host resolves the named container's current bridge IP at start: a container
 # address is runtime evidence, not durable configuration. Sibling script
@@ -66,6 +62,12 @@ if [[ "$meta" == *'{docker:'* ]]; then
     exit 3
   }
 fi
+
+# Resolve host tokens before checking userinfo: a network-qualified token
+# itself contains a colon and @, but is not a URL password.
+case "$meta" in
+  *://*:*@*) echo "refused: put the metadata password in META_PASSWORD, not the URL" >&2; exit 2 ;;
+esac
 
 case "$role" in
   service) bg=() ;;
