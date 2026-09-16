@@ -188,7 +188,7 @@ describe("search-result jump windows", () => {
     fetch.mockResolvedValueOnce(range(1, 44));
     await expect(
       useMessaging.getState().loadPlaceAround(key, 20),
-    ).resolves.toBe(true);
+    ).resolves.toBe("found");
     // Centered on the target: 25 older + target + 24 newer.
     expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 45, limit: 50 });
 
@@ -223,7 +223,7 @@ describe("search-result jump windows", () => {
     fetch.mockClear();
     await expect(
       useMessaging.getState().loadPlaceAround(key, 20),
-    ).resolves.toBe(true);
+    ).resolves.toBe("found");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -232,7 +232,7 @@ describe("search-result jump windows", () => {
     fetch.mockResolvedValueOnce(range(1, 44));
     await expect(
       useMessaging.getState().loadPlaceAround(key, 20),
-    ).resolves.toBe(true);
+    ).resolves.toBe("found");
 
     fetch.mockRejectedValueOnce(new Error("temporary network failure"));
     await useMessaging.getState().loadGap(key, 51);
@@ -290,7 +290,7 @@ describe("search-result jump windows", () => {
     fetch.mockResolvedValueOnce(range(1, 44));
     await expect(
       useMessaging.getState().loadPlaceAround(key, 20),
-    ).resolves.toBe(true);
+    ).resolves.toBe("found");
 
     expect(
       timelineRows()
@@ -324,7 +324,7 @@ describe("search-result jump windows", () => {
     );
     await expect(
       useMessaging.getState().loadPlaceAround(key, 20),
-    ).resolves.toBe(true);
+    ).resolves.toBe("found");
     // Context was fetched even though the tombstone was already present.
     expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 45, limit: 50 });
     // The tombstone's neighbors are loaded; a deleted-target marker can be

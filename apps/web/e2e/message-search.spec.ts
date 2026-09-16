@@ -328,6 +328,54 @@ test("Human searches shared messages and reaches the original message", async ({
     await expectRowInViewport(deletedMarker, viewport);
     await artifact("11-deleted-target.png");
 
+    // A permalink to a deleted message must resolve to the same truthful
+    // marker — not a silently dead navigation.
+    await page.goto(
+      `${stack.webURL}/w/${workspace.workspaceID}/messaging/c/${channelID}?m=4`,
+    );
+    await expect(deletedMarker).toBeVisible();
+    await page.waitForTimeout(1_000);
+    await expectRowInViewport(deletedMarker, viewport);
+    await artifact("12-deleted-permalink.png");
+
+    // A transport failure on the context fetch must produce an honest
+    // in-context outcome with a working retry — never a silently dead jump.
+    // Reload so the old needle is unloaded again, then abort only the first
+    // around-fetch.
+    await page.reload();
+    await page.getByRole("button", { name: "search-general" }).click();
+    await expect(
+      page.getByText("filler message 79", { exact: true }),
+    ).toBeVisible();
+    let abortNextAroundFetch = true;
+    await page.route("**/messaging/places/*/messages?**", (route) => {
+      const url = route.request().url();
+      if (abortNextAroundFetch && url.includes("before_seq=")) {
+        abortNextAroundFetch = false;
+        void route.abort();
+        return;
+      }
+      void route.continue();
+    });
+    await search.fill("quartz-needle");
+    const retryHit = page.getByRole("button").filter({ hasText: oldNeedle });
+    await expect(retryHit).toBeVisible();
+    await retryHit.click();
+    await expect(
+      page
+        .getByRole("alert")
+        .filter({ hasText: "そのメッセージへ移動できませんでした" }),
+    ).toBeVisible();
+    await artifact("13-jump-failed.png");
+    await page.unroute("**/messaging/places/*/messages?**");
+    await page.getByRole("button", { name: "再試行" }).click();
+    await page.waitForTimeout(1_500);
+    await expectRowInViewport(
+      viewport.locator(`[data-message-id="${needleMessageID}"]`),
+      viewport,
+    );
+    await artifact("14-jump-retried.png");
+
     // Rapid query switching must not resurrect the previous result list.
     await page.getByRole("button", { name: "search-general" }).click();
     await search.fill(oldNeedle);

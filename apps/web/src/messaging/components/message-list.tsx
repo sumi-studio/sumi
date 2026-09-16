@@ -131,6 +131,10 @@ export function MessageList({
   // 検索結果やpermalinkから辿った対象が削除済みだったとき、そのseq位置に出す
   // 標識。placeを離れたり別の対象へjumpしたら消す。
   const [deletedMarkerSeq, setDeletedMarkerSeq] = useState<number | null>(null);
+  // 同じseqへの再選択を一度きりのscrollにするための世代。scroll完了の記録は
+  // attempt単位で持ち、frameが取り消されたときは未完了のままやり直せる。
+  const [deletedJumpAttempt, setDeletedJumpAttempt] = useState(0);
+  const deletedScrollDoneRef = useRef(-1);
   const highlightTimer = useRef<number | null>(null);
   const visibleIdsRef = useRef<string[]>([]);
   const positionedPlaceRef = useRef<string | null>(null);
@@ -210,11 +214,13 @@ export function MessageList({
 
   // 削除済みのjump対象は行として存在しないので、tombstone位置に「削除されて
   // います」標識を出してそこへ運ぶ。標識行は次のrenderでitemsに入るため、
-  // scrollはeffect側で行う（下のuseEffect参照）。
+  // scrollはeffect側で行う（下のuseEffect参照）。同じseqの再選択でも
+  // attemptが進むので必ず運び直される。
   const markDeletedTarget = useCallback((seq: number) => {
     setHighlightedId(null);
     if (highlightTimer.current) window.clearTimeout(highlightTimer.current);
     setDeletedMarkerSeq(seq);
+    setDeletedJumpAttempt((attempt) => attempt + 1);
   }, []);
 
   useImperativeHandle(
@@ -243,23 +249,25 @@ export function MessageList({
 
   // 削除標識行がitemsに入ったあと、その行へviewportを運ぶ。tombstone自体が
   // jump後のfetchで届くこともあるので、標識行が現れるまでscrollを持ち越す。
-  const deletedScrollDoneRef = useRef<number | null>(null);
   useEffect(() => {
     if (deletedMarkerSeq === null) {
-      deletedScrollDoneRef.current = null;
+      deletedScrollDoneRef.current = -1;
       return;
     }
-    if (deletedScrollDoneRef.current === deletedMarkerSeq) return;
+    if (deletedScrollDoneRef.current === deletedJumpAttempt) return;
     if (!rows.some((row) => row.id === `deleted:${deletedMarkerSeq}`)) return;
-    deletedScrollDoneRef.current = deletedMarkerSeq;
+    const attempt = deletedJumpAttempt;
     const frame = window.requestAnimationFrame(() => {
-      virtualizerRef.current?.scrollToMessage(`deleted:${deletedMarkerSeq}`, {
-        align: "center",
-        behavior: "auto",
-      });
+      // 完了は実際にscrollを発行できたときだけ記録する。このframeがrows更新で
+      // 取り消されても未完了のまま残り、次のrenderでやり直せる。
+      const didScroll = virtualizerRef.current?.scrollToMessage(
+        `deleted:${deletedMarkerSeq}`,
+        { align: "center", behavior: "auto" },
+      );
+      if (didScroll) deletedScrollDoneRef.current = attempt;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [deletedMarkerSeq, rows]);
+  }, [deletedMarkerSeq, deletedJumpAttempt, rows]);
 
   // placeを離れたら削除標識は消す（render中のstate調整。effectだと同一
   // placeのjump後にも遅れて消えかねない）。

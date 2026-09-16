@@ -526,7 +526,16 @@ interface MessagingState {
   /** 同じ形の空のchannelを作り、そのPlaceKeyを返す。 */
   duplicateChannel(channelId: string): Promise<PlaceKey>;
   searchMessages(query: string): Promise<MessageSearchResult[]>;
-  loadPlaceAround(key: PlaceKey, seq: number): Promise<boolean>;
+  /**
+   * "found": 対象(またはそのtombstone)を含む周辺が読めた。
+   * "missing": 取得は完了したがseqが履歴に存在しない。
+   * "cancelled": place保持やtransportの切替で打ち切られた。呼び出し側は
+   * 取消しを「失敗」として表示してはいけない。
+   */
+  loadPlaceAround(
+    key: PlaceKey,
+    seq: number,
+  ): Promise<"found" | "missing" | "cancelled">;
   setDraft(key: PlaceKey, draft: string, transportGeneration?: number): void;
   setDraftSelection(
     key: PlaceKey,
@@ -3445,7 +3454,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
 
     async loadPlaceAround(key, seq) {
       const place = parsePlaceKey(key);
-      if (!place || !Number.isSafeInteger(seq) || seq < 1) return false;
+      if (!place || !Number.isSafeInteger(seq) || seq < 1) return "cancelled";
       // tombstoneは「読み込み済み」ではない。検索とクリックの隙間に削除された
       // 対象が配列に残っていても、周辺文脈を取りに行って削除標識として出す。
       if (
@@ -3453,7 +3462,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
           (message) => message.seq === seq && !message.deleted,
         )
       ) {
-        return true;
+        return "found";
       }
       const request = beginMessagingBackendRequest();
       // permalink由来の追加取得も、いま開いて保持している場所へしか足さない。
@@ -3463,7 +3472,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         holdGeneration === undefined ||
         !holdsPlaceGeneration(key, holdGeneration)
       ) {
-        return false;
+        return "cancelled";
       }
       // 1ページをtarget中心に取る。seq直前だけを取ると「直後の会話」が読めず、
       // newest pageとの間に断絶だけが残る。前後を両方含め、残った未ロード区間は
@@ -3479,7 +3488,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         !request.isCurrent() ||
         !holdsPlaceGeneration(key, holdGeneration)
       ) {
-        return false;
+        return "cancelled";
       }
       rememberKnownMessages(key, messages, get().lastReadByPlace[key] ?? 0);
       set((state) => {
@@ -3510,7 +3519,9 @@ export const useMessaging = create<MessagingState>((set, get) => {
         place,
         messages.reduce((head, message) => Math.max(head, message.seq), 0),
       );
-      return messages.some((message) => message.seq === seq);
+      return messages.some((message) => message.seq === seq)
+        ? "found"
+        : "missing";
     },
 
     setDraft(key, text, transportGeneration) {
