@@ -317,6 +317,25 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE c.persona_id = $1 AND (
 			c.chunk_seq < 1 OR c.layer < 1 OR c.est_tokens < 0
 			OR c.replacement_est_tokens < 0 OR c.attempts < 0 OR c.interruptions < 0)`},
+	// A receipt's input reference must be a JSON string naming a real input
+	// of this persona. Two crafted shapes hide from a plain join: a
+	// non-string input_id, because ->> stringifies scalars and a numeric id
+	// can alias a text input of the same digits; and an id resolving to no
+	// carried input, which produces no join row at all. Both are a receipt
+	// for an arrival that never happened — the write boundary never emits
+	// one — and a destination must not activate it.
+	{"input_received_input_id_not_string", `
+		SELECT count(*) FROM core_events e
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND jsonb_typeof(e.payload->'input_id') IS DISTINCT FROM 'string'`},
+	{"input_received_input_missing", `
+		SELECT count(*) FROM core_events e
+		WHERE e.persona_id = $1 AND e.kind = 'input_received'
+			AND jsonb_typeof(e.payload->'input_id') = 'string'
+			AND NOT EXISTS (
+				SELECT 1 FROM core_inputs i
+				WHERE i.persona_id = e.persona_id
+					AND i.input_id = e.payload->>'input_id')`},
 	// received_seq is the causal-dedup pointer: it must name this input's own
 	// carried input_received event. A marker that dangles, points at another
 	// kind, or names another input's event makes the destination skip
