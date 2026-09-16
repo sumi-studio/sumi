@@ -4333,7 +4333,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
         // request is still current is a real failure the caller may report;
         // anything that settled after the context was replaced is cancelled,
         // not failed.
-        let missing: Message[];
+        let missing: Message[] | undefined;
         try {
           missing = await request.wait((backend) =>
             backend.fetchMessages(place, {
@@ -4348,6 +4348,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
             : "cancelled";
         }
         if (
+          !missing ||
           !request.isCurrent() ||
           !holdsPlaceGeneration(key, holdGeneration)
         ) {

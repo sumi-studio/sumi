@@ -287,14 +287,12 @@ describe("MessageList gap fill outcome", () => {
 
     const gapButton = screen.getByRole("button", {
       name: "この間の会話を読み込む",
-      exact: true,
     });
     fireEvent.click(gapButton);
     // 旧実装は失敗を握りつぶして元の文言へ戻るだけだった——失敗はその行の上に
     // 正直に出て、行は押せるまま残る。
     const retry = await screen.findByRole("button", {
       name: "読み込めませんでした · 再試行",
-      exact: true,
     });
     expect(loadGap).toHaveBeenCalledExactlyOnceWith(KEY, 10);
 
@@ -323,7 +321,6 @@ describe("MessageList gap fill outcome", () => {
     fireEvent.click(
       screen.getByRole("button", {
         name: "この間の会話を読み込む",
-        exact: true,
       }),
     );
     await waitFor(() => expect(loadGap).toHaveBeenCalled());
@@ -331,7 +328,6 @@ describe("MessageList gap fill outcome", () => {
       expect(
         screen.getByRole("button", {
           name: "この間の会話を読み込む",
-          exact: true,
         }),
       ).toBeInTheDocument(),
     );
