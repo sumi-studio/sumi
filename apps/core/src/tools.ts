@@ -74,6 +74,39 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
   {
     internal: true,
+    delegated: true,
+    name: "workspace_invitation.list",
+    description:
+      "List Sumi Workspace invitations addressed to you that are still acceptable. Returns one bounded page; when next_cursor is present, call again with that exact opaque cursor to see the rest. Listing does not accept anything.",
+    parameters: {
+      type: "object",
+      properties: {
+        cursor: {
+          type: "string",
+          description: "opaque next_cursor from a previous page",
+        },
+      },
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "workspace_invitation.accept",
+    description:
+      "Accept one Workspace invitation addressed to you by its invitation_id, joining that Workspace as yourself under your current membership. The response records the tenure at the moment the invitation was resolved — a consumed invitation returns its recorded membership, whose left_at is set if that tenure has already closed. Use workspace_invitation.list to find acceptable invitations first.",
+    parameters: {
+      type: "object",
+      properties: {
+        invitation_id: {
+          type: "string",
+          description: "the invitation_id from workspace_invitation.list",
+        },
+      },
+      required: ["invitation_id"],
+    },
+  },
+  {
+    internal: true,
     name: "journal.note",
     description:
       "Append a durable note to your journal. Use for facts, decisions, or memories worth keeping across restarts.",
