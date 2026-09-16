@@ -13,6 +13,7 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider, useAuth } from "./auth-context";
 import { getAuthErrorMessage } from "./auth-errors";
+import { publishSessionEnded } from "./auth-session-broadcast";
 import type { PendingRedirectAuthFlow } from "./auth-flow-state";
 import {
   loadPendingEmailFlow,
@@ -2276,6 +2277,135 @@ describe("account switch and closed-flow authority", () => {
         "n".repeat(43),
       ),
     );
+  });
+});
+
+/**
+ * Delivers a posted message to every other live channel of the same name,
+ * exactly as BroadcastChannel does across tabs of one browser profile.
+ */
+class FakeBroadcastChannel {
+  static instances: FakeBroadcastChannel[] = [];
+  readonly name: string;
+  private listeners = new Set<(event: { data: unknown }) => void>();
+  closed = false;
+  constructor(name: string) {
+    this.name = name;
+    FakeBroadcastChannel.instances.push(this);
+  }
+  postMessage(data: unknown) {
+    for (const channel of FakeBroadcastChannel.instances) {
+      if (channel !== this && !channel.closed && channel.name === this.name) {
+        for (const listener of channel.listeners) {
+          listener({ data });
+        }
+      }
+    }
+  }
+  addEventListener(
+    _type: string,
+    listener: (event: { data: unknown }) => void,
+  ) {
+    this.listeners.add(listener);
+  }
+  removeEventListener(
+    _type: string,
+    listener: (event: { data: unknown }) => void,
+  ) {
+    this.listeners.delete(listener);
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
+describe("cross-tab session end", () => {
+  beforeEach(() => {
+    FakeBroadcastChannel.instances = [];
+    vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("drops the displayed session when another tab announces the logout", async () => {
+    let live: unknown = {
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    };
+    authMocks.getSumiSession.mockImplementation(() => Promise.resolve(live));
+    const firebaseAuth = { currentUser: { uid: "firebase-user-a" } };
+    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+
+    // The other tab's logout committed: the jar now reads unauthenticated.
+    live = { authenticated: false };
+    publishSessionEnded("other-tab");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      ),
+    );
+    expect(screen.getByTestId("user-id")).toHaveTextContent("none");
+    expect(screen.getByTestId("authority-binding")).toHaveTextContent("none");
+    // The receiver re-read the session and ran the same local teardown —
+    // including the Firebase sign-out — without sending a second logout.
+    expect(authMocks.signOut).toHaveBeenCalledWith(firebaseAuth);
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalled();
+    expect(authMocks.logoutSumiSession).not.toHaveBeenCalled();
+  });
+
+  it("adopts a session another tab established after the logout", async () => {
+    let live: unknown = {
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    };
+    authMocks.getSumiSession.mockImplementation(() => Promise.resolve(live));
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+
+    // The other tab logged out and already signed in again as user-b before
+    // this tab's verification read: the newer session wins.
+    live = {
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-b", displayName: "Bee" },
+    };
+    publishSessionEnded("other-tab");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("user-id")).toHaveTextContent("user-b"),
+    );
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "authenticated",
+    );
+    expect(screen.getByTestId("authority-binding")).toHaveTextContent(
+      authorityBindingB,
+    );
+    expect(authMocks.signOut).not.toHaveBeenCalled();
   });
 });
 

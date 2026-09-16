@@ -130,6 +130,23 @@ export async function postAuthJSON(
 }
 
 /**
+ * Session-cookie GET of a small auth JSON contract. Safe-read endpoints are
+ * same-origin fenced server side; no CSRF token is needed.
+ */
+export async function getAuthJSON(path: `/auth/${string}`): Promise<unknown> {
+  const response = await fetch(path, {
+    credentials: "include",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    signal: authRequestSignal(),
+  });
+  if (!response.ok) {
+    throw await authAPIError(response);
+  }
+  return readAuthJSON(response);
+}
+
+/**
  * Same CSRF-authenticated POST as postAuthJSON for endpoints that answer
  * 204 No Content on success (discard, logout-style mutations).
  */
@@ -193,18 +210,9 @@ export async function verifyCommittedSumiSession(options?: {
 }
 
 export async function getSumiSession(): Promise<SumiSessionStatus> {
-  const response = await fetch("/auth/session", {
-    credentials: "include",
-    cache: "no-store",
-    headers: { Accept: "application/json" },
-    signal: authRequestSignal(),
-  });
-  if (!response.ok) {
-    throw await authAPIError(response);
-  }
-  const body = await readAuthJSON(response);
+  const body = await getAuthJSON("/auth/session");
   if (!isObject(body) || typeof body.authenticated !== "boolean") {
-    throw new AuthAPIError("Invalid authentication response.", response.status);
+    throw new AuthAPIError("Invalid authentication response.", 200);
   }
   if (!body.authenticated) {
     return { authenticated: false };
@@ -223,7 +231,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
           Array.from(body.user.display_name).length >
             maxDisplayNameCodePoints)))
   ) {
-    throw new AuthAPIError("Invalid authentication response.", response.status);
+    throw new AuthAPIError("Invalid authentication response.", 200);
   }
   return {
     authenticated: true,
@@ -240,16 +248,7 @@ export async function getSumiSession(): Promise<SumiSessionStatus> {
 }
 
 export async function getSumiProfile(): Promise<ConfirmedSumiProfile> {
-  const response = await fetch("/auth/profile", {
-    credentials: "include",
-    cache: "no-store",
-    headers: { Accept: "application/json" },
-    signal: authRequestSignal(),
-  });
-  if (!response.ok) {
-    throw await authAPIError(response);
-  }
-  return parseSumiProfileResponse(await readAuthJSON(response), response.status)
+  return parseSumiProfileResponse(await getAuthJSON("/auth/profile"), 200)
     .profile;
 }
 

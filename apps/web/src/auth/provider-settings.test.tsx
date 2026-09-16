@@ -45,6 +45,7 @@ const settingsMocks = vi.hoisted(() => ({
   completeProviderOperation: vi.fn(),
   failProviderOperation: vi.fn(),
   statusProviderOperation: vi.fn(),
+  getProviderMethods: vi.fn(),
 }));
 
 vi.mock("./firebase", () => ({
@@ -60,6 +61,7 @@ vi.mock("./provider-operation-client", () => ({
   completeProviderOperation: settingsMocks.completeProviderOperation,
   failProviderOperation: settingsMocks.failProviderOperation,
   statusProviderOperation: settingsMocks.statusProviderOperation,
+  getProviderMethods: settingsMocks.getProviderMethods,
 }));
 
 vi.mock("firebase/auth", () => ({
@@ -181,6 +183,11 @@ beforeEach(() => {
   settingsMocks.completeProviderOperation.mockResolvedValue(linkedResult);
   settingsMocks.failProviderOperation.mockResolvedValue(undefined);
   settingsMocks.statusProviderOperation.mockResolvedValue(pendingLinkStatus);
+  // Default: the authoritative read is unavailable, so the local Firebase
+  // view renders unchanged. Tests that exercise it set a resolved value.
+  settingsMocks.getProviderMethods.mockRejectedValue(
+    new Error("provider methods unavailable"),
+  );
   settingsMocks.getRedirectResult.mockResolvedValue(null);
   settingsMocks.linkWithRedirect.mockImplementation(leaveForProvider);
   settingsMocks.reauthenticateWithRedirect.mockImplementation(leaveForProvider);
@@ -209,6 +216,76 @@ describe("provider settings", () => {
     render(<ProviderSettings humanId="human-a" />);
 
     expect(screen.getByText("メール")).toBeVisible();
+  });
+
+  it("renders the server's live provider list over the stale local cache", async () => {
+    // This tab's Firebase cache still carries a GitHub entry that another
+    // browser already removed remotely.
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [
+        { providerId: "password" },
+        { providerId: "github.com" },
+      ],
+    };
+    settingsMocks.getProviderMethods.mockResolvedValue({
+      providers: [],
+      email: true,
+    });
+
+    render(<ProviderSettings humanId="human-a" />);
+
+    expect(
+      screen.getByRole("button", { name: "GitHubの解除を開始" }),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "GitHubを追加" }),
+      ).toBeVisible(),
+    );
+    expect(screen.getByText("メール")).toBeVisible();
+    // The cached user is corrected in memory so the method can be added
+    // again; nothing was persisted or reloaded to do it.
+    expect(
+      settingsMocks.currentUser?.providerData.map(
+        ({ providerId }) => providerId,
+      ),
+    ).toEqual(["password"]);
+    expect(settingsMocks.reload).not.toHaveBeenCalled();
+  });
+
+  it("shows a method the server reports even while the local cache lacks it", async () => {
+    settingsMocks.getProviderMethods.mockResolvedValue({
+      providers: ["google.com"],
+      email: true,
+    });
+
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Googleの解除を開始" }),
+      ).toBeVisible(),
+    );
+  });
+
+  it("drops the email row when the server reports the method unusable", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }],
+      email: "person@example.com",
+      emailVerified: true,
+    };
+    settingsMocks.getProviderMethods.mockResolvedValue({
+      providers: [],
+      email: false,
+    });
+
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.queryByText("メール")).not.toBeInTheDocument(),
+    );
   });
 
   it("sends a same-tab redirect for the link and completes it on return", async () => {

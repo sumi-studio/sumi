@@ -46,6 +46,7 @@ import { getFirebaseAuth } from "./firebase";
 import {
   completeProviderOperation,
   failProviderOperation,
+  getProviderMethods,
   type ManagedProvider,
   type ProviderOperation,
   type ProviderOperationResult,
@@ -118,6 +119,13 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
   const [notice, setNotice] = useState<ProviderNotice | null>(null);
   const [pendingOperation, setPendingOperation] =
     useState<PendingProviderOperation | null>(null);
+  // The server's live read of usable methods, keyed to the active scope.
+  // While unset the local Firebase view renders; it is stale at worst, never
+  // wrong about a change this tab itself made.
+  const [serverMethods, setServerMethods] = useState<{
+    providers: ReadonlySet<ManagedProvider>;
+    email: boolean;
+  } | null>(null);
   // A redirect return is consumed once; this fences StrictMode's repeated
   // mount effects and the pageshow restore path.
   const resolvingRedirect = useRef(false);
@@ -157,16 +165,33 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
     // Firebase reload mutates the existing User object, so this revision is
     // the explicit signal to read providerData again.
     void providerRevision;
-    return new Set(
+    const local = new Set(
       firebaseUser?.providerData.map(({ providerId }) => providerId) ?? [],
     );
-  }, [firebaseUser, providerRevision]);
+    if (!serverMethods) return local;
+    // Managed providers follow the server's live read, and the password
+    // entry follows its usable-email verdict — a stale local entry must not
+    // inflate the last-method count. Providers the read does not govern keep
+    // their local membership.
+    const merged = new Set(
+      [...local].filter(
+        (id) =>
+          !isManagedProvider(id) && (id !== "password" || serverMethods.email),
+      ),
+    );
+    for (const provider of serverMethods.providers) merged.add(provider);
+    return merged;
+  }, [firebaseUser, providerRevision, serverMethods]);
   // A verified address signs in with a Sumi email code even without the
-  // Firebase password provider. The server still owns the last-method check.
-  const emailMethod = Boolean(
-    linkedProviders.has("password") ||
-      (firebaseUser?.email && firebaseUser.emailVerified),
-  );
+  // Firebase password provider. When the server read has landed its verdict
+  // is the same rule the unlink guard counts; the server still owns the
+  // last-method check either way.
+  const emailMethod = serverMethods
+    ? serverMethods.email
+    : Boolean(
+        linkedProviders.has("password") ||
+          (firebaseUser?.email && firebaseUser.emailVerified),
+      );
   const usableMethodCount =
     linkedProviders.size +
     (emailMethod && !linkedProviders.has("password") ? 1 : 0);
@@ -187,10 +212,69 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       ? pendingOperation
       : null;
 
+  // The server's read of the live Firebase account is the same truth the
+  // unlink guard counts: it makes a removal another browser applied visible
+  // here without a fresh sign-in, and lets the method be added again despite
+  // this tab's stale providerData. A failed or in-flight read simply leaves
+  // the local view — stale at worst, never wrong about a local change.
+  useEffect(() => {
+    if (!scope) {
+      setServerMethods(null);
+      return;
+    }
+    let cancelled = false;
+    void getProviderMethods()
+      .then((methods) => {
+        const active = activeScopeRef.current;
+        if (
+          cancelled ||
+          !active ||
+          active.firebaseUid !== scope.firebaseUid ||
+          active.humanId !== scope.humanId
+        ) {
+          return;
+        }
+        const remote = new Set<ManagedProvider>(methods.providers);
+        setServerMethods({ providers: remote, email: methods.email });
+        // Correct the cached Firebase user in memory for removals only —
+        // never persist or reload here: a write-back is the late-write vector
+        // that can reinstall a torn-down identity.
+        const live = getFirebaseAuth().currentUser;
+        if (live && live.uid === scope.firebaseUid) {
+          const kept = live.providerData.filter(
+            (entry) =>
+              !isManagedProvider(entry.providerId) ||
+              remote.has(entry.providerId as ManagedProvider),
+          );
+          if (kept.length !== live.providerData.length) {
+            Object.assign(live, { providerData: kept });
+            setProviderRevision((revision) => revision + 1);
+          }
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [scope]);
+
   const refreshUser = useCallback(async (user: User) => {
     await reload(user);
-    setFirebaseUser(getFirebaseAuth().currentUser);
+    const current = getFirebaseAuth().currentUser;
+    setFirebaseUser(current);
     setProviderRevision((revision) => revision + 1);
+    if (current) {
+      // A confirmed local change is already remote truth: keep the server
+      // overlay aligned so the authoritative view does not flicker back.
+      const providers = new Set(
+        current.providerData
+          .map(({ providerId }) => providerId)
+          .filter(isManagedProvider),
+      );
+      setServerMethods((existing) =>
+        existing ? { providers, email: existing.email } : existing,
+      );
+    }
   }, []);
 
   const persistPending = useCallback((next: PendingProviderOperation) => {

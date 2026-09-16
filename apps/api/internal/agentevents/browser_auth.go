@@ -247,6 +247,7 @@ func (s *BrowserAuthServer) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /auth/providers/operations/complete", s.serveCompleteProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/fail", s.serveFailProviderOperation)
 		mux.HandleFunc("POST /auth/providers/operations/status", s.serveProviderOperationStatus)
+		mux.HandleFunc("GET /auth/providers", s.serveProviderMethods)
 		if s.EmailFlows != nil {
 			mux.HandleFunc("POST /auth/email/verify", s.serveVerifyEmailCode)
 			mux.HandleFunc("POST /auth/email/resend", s.serveResendEmailCode)

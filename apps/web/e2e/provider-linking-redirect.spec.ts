@@ -65,9 +65,14 @@ class Stack {
     readonly emulatorHost: string,
   ) {}
 
-  seedAccount(label: string): { humanID: string; email: string } {
+  seedAccount(label: string): {
+    humanID: string;
+    email: string;
+    firebaseUID: string;
+  } {
     const suffix = randomBytes(4).toString("hex");
     const email = `${label}-${suffix}@example.test`;
+    const firebaseUID = `e2e-${label}-${suffix}`;
     const result = spawnSync(join(this.binaries, "e2e-auth-email-seed"), [], {
       env: {
         ...process.env,
@@ -75,13 +80,24 @@ class Stack {
         SUMI_E2E_AUTH_SEED_DATABASE_URL: this.databaseURL,
         SUMI_E2E_AUTH_SEED_WRAPPING_KEY_ID: wrappingKeyID,
         SUMI_E2E_AUTH_SEED_PROJECT_ID: projectID,
-        SUMI_E2E_AUTH_SEED_FIREBASE_UID: `e2e-${label}-${suffix}`,
+        SUMI_E2E_AUTH_SEED_FIREBASE_UID: firebaseUID,
         SUMI_E2E_AUTH_SEED_EMAIL: email,
       },
       encoding: "utf8",
     });
     if (result.status !== 0) throw new Error(`seed: ${result.stderr}`);
-    return { humanID: result.stdout.trim(), email };
+    return { humanID: result.stdout.trim(), email, firebaseUID };
+  }
+
+  /** Runs one SQL statement and returns its unaligned, tuples-only output. */
+  sql(statement: string): string {
+    const result = spawnSync(
+      "psql",
+      [this.databaseURL, "-v", "ON_ERROR_STOP=1", "-At", "-c", statement],
+      { encoding: "utf8" },
+    );
+    if (result.status !== 0) throw new Error(`sql: ${result.stderr}`);
+    return result.stdout.trim();
   }
 
   /** Waits for the next unseen development-mailbox message to this address. */
@@ -116,18 +132,11 @@ class Stack {
     }
   }
 
-  /** Expires a pending provider operation so the server rules it expired. */
-  expireProviderOperation() {
-    const result = spawnSync(
-      "psql",
-      [
-        this.databaseURL,
-        "-c",
-        "UPDATE provider_operations SET expires_at = now() - interval '1 second' WHERE status = 'pending'",
-      ],
-      { encoding: "utf8" },
+  /** Expires this account's pending provider operation. */
+  expireProviderOperation(firebaseUID: string) {
+    this.sql(
+      `UPDATE provider_operations SET expires_at = now() - interval '1 second' WHERE status = 'pending' AND firebase_uid = '${firebaseUID}'`,
     );
-    if (result.status !== 0) throw new Error(`expire: ${result.stderr}`);
   }
 
   stop() {
@@ -366,25 +375,83 @@ async function firebasePersistedUid(page: Page): Promise<string | null> {
     const store = db
       .transaction("firebaseLocalStorage", "readonly")
       .objectStore("firebaseLocalStorage");
-    const keys = await new Promise<IDBValidKey[]>((resolve) => {
-      const request = store.getAllKeys();
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => resolve([]);
-    });
-    for (const key of keys) {
+    // Both requests must be queued while the transaction is still live; an
+    // awaited get() issued after getAllKeys resolves would hit an inactive
+    // transaction and fail closed.
+    const keysRequest = store.getAllKeys();
+    const valuesRequest = store.getAll();
+    const [keys, values] = await Promise.all([
+      new Promise<unknown>((resolve) => {
+        keysRequest.onsuccess = () => resolve(keysRequest.result);
+        keysRequest.onerror = () => resolve(null);
+      }),
+      new Promise<unknown>((resolve) => {
+        valuesRequest.onsuccess = () => resolve(valuesRequest.result);
+        valuesRequest.onerror = () => resolve(null);
+      }),
+    ]);
+    if (!Array.isArray(keys) || !Array.isArray(values)) return null;
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       if (typeof key !== "string" || !key.startsWith("firebase:authUser")) {
         continue;
       }
-      const value = await new Promise<{ uid?: string } | null>((resolve) => {
-        const request = store.get(key);
-        request.onsuccess = () =>
-          resolve(request.result as { uid?: string } | null);
-        request.onerror = () => resolve(null);
-      });
-      return value?.uid ?? null;
+      // The store's keyPath is fbase_key; records are {fbase_key, value}
+      // where value is the serialized user JSON.
+      const record = values[index] as
+        | { value?: unknown; uid?: string }
+        | null;
+      const raw = record && "value" in record ? record.value : record;
+      const user =
+        typeof raw === "string"
+          ? (JSON.parse(raw) as { uid?: string })
+          : (raw as { uid?: string } | null);
+      return user?.uid ?? null;
     }
     return null;
   });
+}
+
+/**
+ * Holds the reads a settling unlink makes once armed — the Firebase lookup
+ * and the authoritative provider-method read — while "解除を確定中" shows. The
+ * real response is fetched up front so the delayed delivery still succeeds
+ * after a sign-out tears the session down.
+ */
+async function holdSettlingReads(page: Page) {
+  let release: () => void = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  let armed = false;
+  let seen = false;
+  const handler = async (route: Parameters<Parameters<Page["route"]>[1]>[0]) => {
+    const settling =
+      armed &&
+      (await page
+        .evaluate(
+          () => document.body.textContent?.includes("解除を確定中") ?? false,
+        )
+        .catch(() => false));
+    if (!settling) {
+      await route.continue();
+      return;
+    }
+    seen = true;
+    const response = await route.fetch().catch(() => null);
+    await held;
+    if (response) await route.fulfill({ response }).catch(() => undefined);
+    else await route.abort().catch(() => undefined);
+  };
+  await page.route("**/accounts:lookup**", handler);
+  await page.route("**/auth/providers", handler);
+  return {
+    arm: () => {
+      armed = true;
+    },
+    seen: () => seen,
+    release: () => release(),
+  };
 }
 
 test.beforeAll(async () => {
@@ -561,7 +628,7 @@ test("an expired server operation after the return is named, not replayed", asyn
   await page.waitForURL(/emulator\/auth\/handler/, { timeout: 20_000 });
 
   // The person lingers at the provider past the server-side TTL.
-  stack.expireProviderOperation();
+  stack.expireProviderOperation(account.firebaseUID);
   await page.locator("#add-account-button").click();
   await page.locator("#email-input").fill(`expired-${account.email}`);
   await page.locator("#sign-in").click();
@@ -598,55 +665,28 @@ test("a logout during the post-unlink lookup is honoured, not overwritten", asyn
     page.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
   ).toBeVisible({ timeout: 45_000 });
 
-  // The post-unlink reconcile ends with a Firebase accounts:lookup via
-  // reload(). Hold only the lookup fired while the unlink is settling, then
-  // log out: the initiated teardown must win over the late completion.
-  let releaseLookup: () => void = () => {};
-  const lookupHeld = new Promise<void>((done) => {
-    releaseLookup = done;
-  });
-  let armLookupHold = false;
-  let lookupSeen = false;
-  await page.route("**/accounts:lookup**", async (route) => {
-    const settling =
-      armLookupHold &&
-      (await page.evaluate(
-        () => document.body.textContent?.includes("解除を確定中") ?? false,
-      ));
-    if (!settling) {
-      await route.continue();
-      return;
-    }
-    lookupSeen = true;
-    // Fetch the real (post-unlink) response up front so the delayed delivery
-    // still succeeds — a continued request can die if the socket resets while
-    // the sign-out tears the session down.
-    const response = await route.fetch();
-    await lookupHeld;
-    await route.fulfill({ response });
-  });
-
+  // Hold the read that settles the unlink, then log out: the transition must
+  // win over the late completion.
+  const settle = await holdSettlingReads(page);
   await page.getByRole("button", { name: "GitHubの解除を開始" }).click();
   await page.getByRole("button", { name: "再認証して解除" }).click();
-  armLookupHold = true;
+  settle.arm();
   await emulatorReuseProviderAccount(page, googlePersona);
 
-  // Wait until the settling unlink is actually inside the held lookup, then
-  // log out before it can write the reconciled user back.
-  await expect.poll(() => lookupSeen, { timeout: 30_000 }).toBe(true);
+  // Wait until the settling unlink is actually inside the held read, then log
+  // out with an ordinary click: nothing in the busy settings popover may
+  // cover the button.
+  await expect.poll(() => settle.seen(), { timeout: 30_000 }).toBe(true);
   const logout = page.getByRole("button", { name: "ログアウト" });
   if (!(await logout.isVisible().catch(() => false))) {
     await page.getByRole("button", { name: "設定" }).click();
   }
-  // Dispatch directly on the button: a covered box inside the scrollable
-  // popover would otherwise route the event to the covering element. The
-  // lookup stays held until the sign-out has fully settled — only then does
-  // releasing it exercise a completion that lands after the transition.
-  await logout.dispatchEvent("click");
+  await shot(page, "07a-logout-while-settling");
+  await logout.click();
   await expect(page.locator("#login-title")).toBeVisible({
     timeout: 30_000,
   });
-  releaseLookup();
+  settle.release();
   await expect.poll(() => sessionUser(page), { timeout: 15_000 }).toBeNull();
 
   // The old Firebase identity must not be reinstalled by the late
@@ -794,5 +834,157 @@ test("a lost start reply shows recovery copy, not a raw network error", async ({
     }),
   ).toBeVisible({ timeout: 45_000 });
   await shot(page, "10-lost-reply");
+  await context.close();
+});
+
+/** Links Google then GitHub from open settings; returns the Google persona. */
+async function linkGoogleAndGitHub(page: Page, email: string): Promise<string> {
+  const googlePersona = `google-${email}`;
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await emulatorLinkProvider(page, googlePersona);
+  await expect(
+    page.getByRole("status").filter({ hasText: "Googleを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await page.getByRole("button", { name: "GitHubを追加" }).click();
+  await emulatorLinkProvider(page, `github-${email}`);
+  await expect(
+    page.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  return googlePersona;
+}
+
+test("a logout in another tab signs this tab out, even while an unlink is settling", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("cross-tab-logout");
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, account.email, account.humanID);
+  await openSettings(page);
+  const googlePersona = await linkGoogleAndGitHub(page, account.email);
+
+  const settle = await holdSettlingReads(page);
+  await page.getByRole("button", { name: "GitHubの解除を開始" }).click();
+  await page.getByRole("button", { name: "再認証して解除" }).click();
+  settle.arm();
+  await emulatorReuseProviderAccount(page, googlePersona);
+  await expect.poll(() => settle.seen(), { timeout: 30_000 }).toBe(true);
+
+  // Tab B on the same browser logs out explicitly. Tab A is left untouched.
+  const tabB = await context.newPage();
+  await tabB.goto(`${stack.webURL}/`);
+  await openSettings(tabB);
+  await tabB.getByRole("button", { name: "ログアウト" }).click();
+  await expect(tabB.locator("#login-title")).toBeVisible({ timeout: 30_000 });
+
+  // Tab A follows the explicit logout on its own, without a reload.
+  await expect(page.locator("#login-title")).toBeVisible({ timeout: 15_000 });
+  settle.release();
+  // Its late completion cannot keep or reinstall the old identity.
+  await expect
+    .poll(() => firebaseLiveUid(page), { timeout: 15_000 })
+    .toBeNull();
+  for (let second = 0; second < 5; second += 1) {
+    expect(await firebasePersistedUid(page)).toBeNull();
+    expect(await firebaseLiveUid(page)).toBeNull();
+    await page.waitForTimeout(1_000);
+  }
+  await expect(page.locator("#login-title")).toBeVisible();
+  await shot(page, "11-cross-tab-logout");
+
+  // A deliberate sign-in afterwards, in either tab, is not undone by the
+  // earlier logout.
+  await signInWithEmailCode(tabB, stack, account.email, account.humanID);
+  for (let second = 0; second < 5; second += 1) {
+    expect(await firebasePersistedUid(tabB)).toBe(account.firebaseUID);
+    await tabB.waitForTimeout(1_000);
+  }
+  await tabB.reload();
+  await expectSignedIn(tabB, account.humanID);
+  // currentUser restores asynchronously from the persisted session.
+  await expect
+    .poll(() => firebaseLiveUid(tabB), { timeout: 15_000 })
+    .toBe(account.firebaseUID);
+  await context.close();
+});
+
+test("another browser's provider removal shows on the next settings open and the method can be added again", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("other-browser");
+  const first = await freshPage(browser);
+  await signInWithEmailCode(first.page, stack, account.email, account.humanID);
+  await openSettings(first.page);
+  const googlePersona = await linkGoogleAndGitHub(first.page, account.email);
+
+  // A second browser signs in while both providers are linked.
+  const second = await freshPage(browser);
+  await signInWithEmailCode(second.page, stack, account.email, account.humanID);
+  await openSettings(second.page);
+  await expect(
+    second.page.getByRole("button", { name: "GitHubの解除を開始" }),
+  ).toBeVisible({ timeout: 15_000 });
+  await second.page.keyboard.press("Escape");
+
+  // The first browser removes GitHub.
+  await first.page.getByRole("button", { name: "GitHubの解除を開始" }).click();
+  await first.page.getByRole("button", { name: "再認証して解除" }).click();
+  await emulatorReuseProviderAccount(first.page, googlePersona);
+  await expect(
+    first.page.getByRole("status").filter({ hasText: "GitHubを解除しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+
+  // Reopening settings in the second browser shows the method as removed,
+  // with no fresh sign-in.
+  await openSettings(second.page);
+  await expect(
+    second.page.getByRole("button", { name: "GitHubを追加" }),
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(
+    second.page.getByRole("button", { name: "GitHubの解除を開始" }),
+  ).toBeHidden();
+  await shot(second.page, "12-other-browser-removal");
+
+  // Its cached Firebase user must not block adding the method again.
+  await second.page.getByRole("button", { name: "GitHubを追加" }).click();
+  await emulatorLinkProvider(second.page, `github-again-${account.email}`);
+  await expect(
+    second.page.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await first.context.close();
+  await second.context.close();
+});
+
+test("an unlink whose browser record was lost no longer blocks provider changes", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("orphan-unlink");
+  // The server still holds a pending unlink, but its nonce lived only in a
+  // browser whose site data was cleared; it expired long ago.
+  const nonceHash = randomBytes(32).toString("hex");
+  const operationID = stack.sql(
+    "SELECT overlay(gen_random_uuid()::text placing '7' from 15 for 1)",
+  );
+  stack.sql(
+    `INSERT INTO provider_operations
+       (operation_id, nonce_hash, human_id, firebase_uid, provider, operation, decision_path, expires_at)
+     VALUES ('${operationID}', decode('${nonceHash}', 'hex'), '${account.humanID}',
+       '${account.firebaseUID}', 'github.com', 'unlink', 'account_settings', now() - interval '1 hour')`,
+  );
+
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, account.email, account.humanID);
+  await openSettings(page);
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await emulatorLinkProvider(page, `google-${account.email}`);
+  await expect(
+    page.getByRole("status").filter({ hasText: "Googleを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await shot(page, "13-orphan-unlink-recovered");
+  // The uncertain unlink was reconciled from the live account, not dropped.
+  expect(
+    stack.sql(
+      `SELECT status || '/' || terminal_outcome FROM provider_operations WHERE operation_id = '${operationID}'`,
+    ),
+  ).toBe("failed/expired");
   await context.close();
 });
