@@ -342,6 +342,51 @@ async function freshPage(
   return { context, page: await context.newPage() };
 }
 
+/** The UID on the live Firebase auth object, or null. */
+async function firebaseLiveUid(page: Page): Promise<string | null> {
+  return page.evaluate(async () => {
+    const mod = (await import("/src/auth/firebase.ts")) as {
+      getFirebaseAuth: () => { currentUser: { uid: string } | null };
+    };
+    return mod.getFirebaseAuth().currentUser?.uid ?? null;
+  });
+}
+
+/** The UID Firebase persists in IndexedDB for this origin, or null. */
+async function firebasePersistedUid(page: Page): Promise<string | null> {
+  return page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase | null>((resolve) => {
+      const request = indexedDB.open("firebaseLocalStorageDb");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+    });
+    if (!db?.objectStoreNames.contains("firebaseLocalStorage")) {
+      return null;
+    }
+    const store = db
+      .transaction("firebaseLocalStorage", "readonly")
+      .objectStore("firebaseLocalStorage");
+    const keys = await new Promise<IDBValidKey[]>((resolve) => {
+      const request = store.getAllKeys();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve([]);
+    });
+    for (const key of keys) {
+      if (typeof key !== "string" || !key.startsWith("firebase:authUser")) {
+        continue;
+      }
+      const value = await new Promise<{ uid?: string } | null>((resolve) => {
+        const request = store.get(key);
+        request.onsuccess = () =>
+          resolve(request.result as { uid?: string } | null);
+        request.onerror = () => resolve(null);
+      });
+      return value?.uid ?? null;
+    }
+    return null;
+  });
+}
+
 test.beforeAll(async () => {
   const testInfo = test.info();
   testInfo.setTimeout(420_000);
@@ -522,10 +567,232 @@ test("an expired server operation after the return is named, not replayed", asyn
   await page.locator("#sign-in").click();
   await page.waitForURL(`${stack.webURL}/**`, { timeout: 30_000 });
 
-  // The link reached Firebase but the operation expired: settings must show
-  // an honest failure and keep the change resumable rather than pretending
-  // success.
-  await expect(page.getByRole("alert")).toBeVisible({ timeout: 45_000 });
+  // The link reached Firebase but the operation expired: settings must name
+  // the expiry rather than pretend success or leave a raw error code.
+  await expect(
+    page.getByRole("alert").filter({
+      hasText: "変更の有効期限が切れました。もう一度お試しください。",
+    }),
+  ).toBeVisible({ timeout: 45_000 });
   await shot(page, "06-expired");
+  await context.close();
+});
+
+test("a logout during the post-unlink lookup is honoured, not overwritten", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("logout-race");
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, account.email, account.humanID);
+  await openSettings(page);
+
+  const googlePersona = `google-${account.email}`;
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await emulatorLinkProvider(page, googlePersona);
+  await expect(
+    page.getByRole("status").filter({ hasText: "Googleを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await page.getByRole("button", { name: "GitHubを追加" }).click();
+  await emulatorLinkProvider(page, `github-${account.email}`);
+  await expect(
+    page.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+
+  // The post-unlink reconcile ends with a Firebase accounts:lookup via
+  // reload(). Hold only the lookup fired while the unlink is settling, then
+  // log out: the initiated teardown must win over the late completion.
+  let releaseLookup: () => void = () => {};
+  const lookupHeld = new Promise<void>((done) => {
+    releaseLookup = done;
+  });
+  let armLookupHold = false;
+  let lookupSeen = false;
+  await page.route("**/accounts:lookup**", async (route) => {
+    const settling =
+      armLookupHold &&
+      (await page.evaluate(
+        () => document.body.textContent?.includes("解除を確定中") ?? false,
+      ));
+    if (!settling) {
+      await route.continue();
+      return;
+    }
+    lookupSeen = true;
+    // Fetch the real (post-unlink) response up front so the delayed delivery
+    // still succeeds — a continued request can die if the socket resets while
+    // the sign-out tears the session down.
+    const response = await route.fetch();
+    await lookupHeld;
+    await route.fulfill({ response });
+  });
+
+  await page.getByRole("button", { name: "GitHubの解除を開始" }).click();
+  await page.getByRole("button", { name: "再認証して解除" }).click();
+  armLookupHold = true;
+  await emulatorReuseProviderAccount(page, googlePersona);
+
+  // Wait until the settling unlink is actually inside the held lookup, then
+  // log out before it can write the reconciled user back.
+  await expect.poll(() => lookupSeen, { timeout: 30_000 }).toBe(true);
+  const logout = page.getByRole("button", { name: "ログアウト" });
+  if (!(await logout.isVisible().catch(() => false))) {
+    await page.getByRole("button", { name: "設定" }).click();
+  }
+  // Dispatch directly on the button: a covered box inside the scrollable
+  // popover would otherwise route the event to the covering element. The
+  // lookup stays held until the sign-out has fully settled — only then does
+  // releasing it exercise a completion that lands after the transition.
+  await logout.dispatchEvent("click");
+  await expect(page.locator("#login-title")).toBeVisible({
+    timeout: 30_000,
+  });
+  releaseLookup();
+  await expect.poll(() => sessionUser(page), { timeout: 15_000 }).toBeNull();
+
+  // The old Firebase identity must not be reinstalled by the late
+  // completion — neither live nor persisted, not now and not after a reload.
+  await expect
+    .poll(() => firebaseLiveUid(page), { timeout: 15_000 })
+    .toBeNull();
+  await expect
+    .poll(() => firebasePersistedUid(page), { timeout: 15_000 })
+    .toBeNull();
+  await page.reload();
+  await expect.poll(() => sessionUser(page), { timeout: 15_000 }).toBeNull();
+  await expect
+    .poll(() => firebaseLiveUid(page), { timeout: 15_000 })
+    .toBeNull();
+  await expect
+    .poll(() => firebasePersistedUid(page), { timeout: 15_000 })
+    .toBeNull();
+  await shot(page, "07-logout-race");
+  await context.close();
+});
+
+test("an unfinished link survives another account taking over the browser", async ({
+  browser,
+}) => {
+  const first = stack.seedAccount("first");
+  const second = stack.seedAccount("second");
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, first.email, first.humanID);
+  await openSettings(page);
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await page.waitForURL(/emulator\/auth\/handler/, { timeout: 20_000 });
+  // The first tab is now at the provider; its unfinished link is durable.
+
+  // A second tab on the same browser signs out and becomes another account.
+  const takeover = await context.newPage();
+  await takeover.goto(`${stack.webURL}/`);
+  await openSettings(takeover);
+  await takeover.getByRole("button", { name: "ログアウト" }).click();
+  await expect(takeover.locator("#login-title")).toBeVisible({
+    timeout: 30_000,
+  });
+  await signInWithEmailCode(takeover, stack, second.email, second.humanID);
+  await openSettings(takeover);
+  // The second account's own change must not see or destroy the first's.
+  await takeover.getByRole("button", { name: "GitHubを追加" }).click();
+  await emulatorLinkProvider(takeover, `github-${second.email}`);
+  await expect(
+    takeover.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+
+  const firstRecord = await takeover.evaluate(() => {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith("sumi.auth.provider-pending.v2/")) continue;
+      const value = JSON.parse(localStorage.getItem(key) ?? "null") as {
+        humanId?: string;
+        provider?: string;
+      } | null;
+      if (value?.provider === "google.com") return value;
+    }
+    return null;
+  });
+  expect(firstRecord?.humanId).toBe(first.humanID);
+
+  // When the first account signs back in, its own pending change resumes
+  // and completes normally — the other account's work never interfered.
+  await takeover.getByRole("button", { name: "ログアウト" }).click();
+  await expect(takeover.locator("#login-title")).toBeVisible({
+    timeout: 30_000,
+  });
+  await signInWithEmailCode(takeover, stack, first.email, first.humanID);
+  await openSettings(takeover);
+  await expect(
+    takeover.getByText("Googleで認証を続けてください"),
+  ).toBeVisible();
+  await takeover.getByRole("button", { name: "Googleで認証を続ける" }).click();
+  await emulatorLinkProvider(takeover, `google-${first.email}`);
+  await expect(
+    takeover.getByRole("status").filter({ hasText: "Googleを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await shot(takeover, "08-cross-account-pending");
+  await context.close();
+});
+
+test("a cancelled unlink reauthentication abandons the unsent intent", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("cancel-reauth");
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, account.email, account.humanID);
+  await openSettings(page);
+
+  const googlePersona = `google-${account.email}`;
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await emulatorLinkProvider(page, googlePersona);
+  await expect(
+    page.getByRole("status").filter({ hasText: "Googleを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+  await page.getByRole("button", { name: "GitHubを追加" }).click();
+  await emulatorLinkProvider(page, `github-${account.email}`);
+  await expect(
+    page.getByRole("status").filter({ hasText: "GitHubを追加しました" }),
+  ).toBeVisible({ timeout: 45_000 });
+
+  await page.getByRole("button", { name: "GitHubの解除を開始" }).click();
+  await page.getByRole("button", { name: "再認証して解除" }).click();
+  await page.waitForURL(/emulator\/auth\/handler/, { timeout: 20_000 });
+  // Backing out before authenticating cancels the reauth: no unlink request
+  // ever reached the server, so the intent is abandoned — not left durable.
+  await page.goBack();
+  await expect(
+    page.getByRole("alert").filter({ hasText: "認証をキャンセルしました。" }),
+  ).toBeVisible({ timeout: 45_000 });
+
+  // A restart must not resurrect the unsent intent or block other changes.
+  await page.reload();
+  await openSettings(page);
+  await expect(page.getByText(/再開できます/)).toBeHidden();
+  await expect(
+    page.getByRole("button", { name: "GitHubの解除を開始" }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Googleの解除を開始" }),
+  ).toBeEnabled();
+  await shot(page, "09-cancelled-reauth");
+  await context.close();
+});
+
+test("a lost start reply shows recovery copy, not a raw network error", async ({
+  browser,
+}) => {
+  const account = stack.seedAccount("lost-reply");
+  const { context, page } = await freshPage(browser);
+  await signInWithEmailCode(page, stack, account.email, account.humanID);
+  await openSettings(page);
+
+  // The operation-start reply never arrives; the request may have committed.
+  await page.route("**/auth/providers/operations", (route) => route.abort());
+  await page.getByRole("button", { name: "Googleを追加" }).click();
+  await expect(
+    page.getByRole("alert").filter({
+      hasText:
+        "結果をまだ確認できません。接続を確認して「再開」を押してください。",
+    }),
+  ).toBeVisible({ timeout: 45_000 });
+  await shot(page, "10-lost-reply");
   await context.close();
 });

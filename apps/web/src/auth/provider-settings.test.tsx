@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import { FirebaseError } from "firebase/app";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { noteAuthTeardown } from "./auth-transition";
 import {
   type PendingProviderRedirect,
   peekPendingProviderRedirect,
@@ -37,6 +38,7 @@ const settingsMocks = vi.hoisted(() => ({
   linkWithRedirect: vi.fn(),
   reauthenticateWithRedirect: vi.fn(),
   reload: vi.fn(),
+  signOut: vi.fn(),
   updateCurrentUser: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
   startProviderOperation: vi.fn(),
@@ -72,6 +74,7 @@ vi.mock("firebase/auth", () => ({
   onAuthStateChanged: settingsMocks.onAuthStateChanged,
   reauthenticateWithRedirect: settingsMocks.reauthenticateWithRedirect,
   reload: settingsMocks.reload,
+  signOut: settingsMocks.signOut,
   updateCurrentUser: settingsMocks.updateCurrentUser,
 }));
 
@@ -95,7 +98,8 @@ const linkedResult = {
   noticeRequired: true,
 };
 
-const PENDING_KEY = "sumi.auth.provider-pending.v1";
+const LEGACY_PENDING_KEY = "sumi.auth.provider-pending.v1";
+const PENDING_KEY = `sumi.auth.provider-pending.v2/${encodeURIComponent("firebase-user-a")}/${encodeURIComponent("human-a")}`;
 const NONCE = "n".repeat(43);
 
 // A sent redirect never resolves inside the tab: the browser navigates away.
@@ -419,20 +423,72 @@ describe("provider settings", () => {
     expect(storedPending()).toBeNull();
   });
 
-  it("discards a redirect receipt that does not match the pending operation", async () => {
+  it("replays the receipt nonce when it no longer matches the stored change", async () => {
+    // Another tab started a different change for the same account while this
+    // tab was away: its record survives untouched, and the returned link is
+    // recovered through the server's nonce-idempotent begin instead of being
+    // silently dropped.
     localStorage.setItem(
       PENDING_KEY,
-      JSON.stringify(storedPendingOperation({ nonce: "m".repeat(43) })),
+      JSON.stringify(
+        storedPendingOperation({
+          provider: "github.com",
+          nonce: "m".repeat(43),
+          operationId: "operation-github",
+        }),
+      ),
     );
     savePendingProviderRedirect(redirectMarker());
+    settingsMocks.currentUser?.providerData.push({
+      providerId: "google.com",
+    });
+    settingsMocks.getRedirectResult.mockResolvedValue(
+      linkCredential(settingsMocks.currentUser as MockUser),
+    );
     render(<ProviderSettings humanId="human-a" />);
 
-    await waitFor(() => expect(peekPendingProviderRedirect()).toBeNull());
+    await waitFor(() =>
+      expect(settingsMocks.startProviderOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: "link",
+          nonce: NONCE,
+        }),
+      ),
+    );
+    expect(await screen.findByText("Googleを追加しました")).toBeInTheDocument();
+    // The recovered write never claimed the slot: GitHub's own record stays.
+    expect(storedPending()).toMatchObject({
+      provider: "github.com",
+      nonce: "m".repeat(43),
+    });
+    expect(peekPendingProviderRedirect()).toBeNull();
+  });
+
+  it("reports a reauth receipt that no longer matches a pending change", async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(
+        storedPendingOperation({
+          operation: "unlink",
+          phase: "unlink_starting",
+          nonce: "m".repeat(43),
+        }),
+      ),
+    );
+    savePendingProviderRedirect(
+      redirectMarker({ kind: "reauth", provider: "github.com" }),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "この認証結果は保留中の変更と一致しませんでした",
+      ),
+    );
     expect(settingsMocks.getRedirectResult).not.toHaveBeenCalled();
+    // The other nonce's unlink intent stays resumable under its own scope.
     expect(storedPending()).toMatchObject({ nonce: "m".repeat(43) });
-    expect(
-      screen.getByRole("button", { name: "Googleで認証を続ける" }),
-    ).toBeVisible();
+    expect(peekPendingProviderRedirect()).toBeNull();
   });
 
   it("reconciles a response-lost link completion after transient status failures", async () => {
@@ -638,7 +694,7 @@ describe("provider settings", () => {
     expect(storedPending()).toBeNull();
   });
 
-  it("keeps a cancelled unlink reauthentication resumable instead of deleting anything", async () => {
+  it("abandons a cancelled unlink reauthentication that was never sent", async () => {
     settingsMocks.currentUser = {
       uid: "firebase-user-a",
       providerData: [
@@ -668,7 +724,47 @@ describe("provider settings", () => {
       ),
     );
     expect(settingsMocks.startProviderOperation).not.toHaveBeenCalled();
-    expect(storedPending()).toMatchObject({ phase: "unlink_starting" });
+    // Nothing reached the server, so the intent is abandoned outright — it
+    // must not survive restart as a pending change that blocks everything.
+    expect(storedPending()).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "GitHubの解除を開始" }),
+    ).toBeEnabled();
+  });
+
+  it("keeps a sent unlink resumable when the return cannot be confirmed", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [
+        { providerId: "google.com" },
+        { providerId: "github.com" },
+      ],
+    };
+    setSignInClaims("google.com", 3_600);
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(
+        storedPendingOperation({
+          operation: "unlink",
+          phase: "unlink_sent",
+          operationId: "operation-2",
+        }),
+      ),
+    );
+    savePendingProviderRedirect(
+      redirectMarker({ kind: "reauth", provider: "github.com" }),
+    );
+    settingsMocks.getRedirectResult.mockResolvedValue(null);
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "認証をキャンセルしました。",
+      ),
+    );
+    // The request may already have reached the server: the uncertain
+    // receipt is never discarded — it stays resumable for reconciliation.
+    expect(storedPending()).toMatchObject({ phase: "unlink_sent" });
     expect(
       screen.getByRole("button", { name: "Googleの解除を再開" }),
     ).toBeVisible();
@@ -813,9 +909,9 @@ describe("provider settings", () => {
     expect(storedPending()).not.toBeNull();
   });
 
-  it("restores a pre-redirect sessionStorage pending record for the same scope", async () => {
+  it("adopts a legacy shared-key pending record for the same scope", async () => {
     sessionStorage.setItem(
-      PENDING_KEY,
+      LEGACY_PENDING_KEY,
       JSON.stringify(storedPendingOperation()),
     );
     render(<ProviderSettings humanId="human-a" />);
@@ -823,6 +919,9 @@ describe("provider settings", () => {
     expect(
       await screen.findByRole("button", { name: "Googleで認証を続ける" }),
     ).toBeVisible();
+    // The record moved to its scoped key; the shared slot is retired.
+    expect(storedPending()).toMatchObject({ nonce: NONCE });
+    expect(sessionStorage.getItem(LEGACY_PENDING_KEY)).toBeNull();
   });
 
   it("cannot repopulate provider state from an old account's in-flight callback", async () => {
@@ -871,6 +970,142 @@ describe("provider settings", () => {
     // The late callback must not persist user B state or adopt user A's op.
     expect(storedPending()?.firebaseUid).not.toBe("firebase-user-b");
     expect(screen.queryByText(/再開できます/)).not.toBeInTheDocument();
+  });
+
+  it("never writes the removed provider back after an account switch", async () => {
+    // The unlink commits server-side while the account changes hands: the
+    // late completion must not patch or persist the old Firebase user.
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    let resolveStart: ((result: unknown) => void) | undefined;
+    settingsMocks.startProviderOperation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const unlinkedResult = {
+      operationId: "operation-2",
+      provider: "google.com",
+      operation: "unlink",
+      status: "completed",
+      outcome: "provider_unlinked",
+      noticeRequired: true,
+    };
+    settingsMocks.statusProviderOperation.mockResolvedValue(unlinkedResult);
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(screen.getByRole("button", { name: "再認証して解除" }));
+    await waitFor(() =>
+      expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(1),
+    );
+
+    // The account switches to B while the server call is in flight.
+    const userB = {
+      uid: "firebase-user-b",
+      providerData: [{ providerId: "password" }],
+    };
+    settingsMocks.currentUser = userB;
+    act(() => settingsMocks.authObserver?.(userB));
+
+    await act(async () => {
+      resolveStart?.(unlinkedResult);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // B's providerData was never touched, A's user was never persisted, and
+    // A's finished unlink stays recoverable under its own scope.
+    expect(userB.providerData).toEqual([{ providerId: "password" }]);
+    expect(settingsMocks.signOut).not.toHaveBeenCalled();
+    expect(storedPending()).toMatchObject({
+      operation: "unlink",
+      phase: "unlink_sent",
+    });
+    expect(screen.queryByText("Googleを解除しました")).not.toBeInTheDocument();
+  });
+
+  it("honours a sign-out initiated while the post-unlink reload is queued", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    const unlinkedResult = {
+      operationId: "operation-2",
+      provider: "google.com",
+      operation: "unlink",
+      status: "completed",
+      outcome: "provider_unlinked",
+      noticeRequired: true,
+    };
+    settingsMocks.startProviderOperation.mockResolvedValue(unlinkedResult);
+    settingsMocks.statusProviderOperation.mockResolvedValue(unlinkedResult);
+    // A teardown is initiated inside the reload window — the queued auth
+    // write ordering can then place this operation's persist last.
+    settingsMocks.reload.mockImplementation(async () => {
+      noteAuthTeardown("firebase-user-a");
+    });
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(screen.getByRole("button", { name: "再認証して解除" }));
+
+    await waitFor(() => expect(settingsMocks.signOut).toHaveBeenCalledTimes(1));
+    expect(settingsMocks.startProviderOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: "unlink", nonce: NONCE }),
+    );
+  });
+
+  it("keeps another account's pending record when a new change is started", async () => {
+    // User A left an unfinished link; user B signs in and starts one. B's
+    // write targets B's own key — A's record can never be clobbered.
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    settingsMocks.currentUser = {
+      uid: "firebase-user-b",
+      providerData: [{ providerId: "password" }],
+    };
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "GitHubを追加" }),
+    );
+
+    await waitFor(() =>
+      expect(settingsMocks.linkWithRedirect).toHaveBeenCalledTimes(1),
+    );
+    expect(storedPending()).toMatchObject({
+      firebaseUid: "firebase-user-a",
+      provider: "google.com",
+      phase: "link_ready",
+    });
+    const bKey = `sumi.auth.provider-pending.v2/${encodeURIComponent("firebase-user-b")}/${encodeURIComponent("human-a")}`;
+    expect(JSON.parse(localStorage.getItem(bKey) ?? "null")).toMatchObject({
+      firebaseUid: "firebase-user-b",
+      provider: "github.com",
+      phase: "link_ready",
+    });
+  });
+
+  it("maps a lost network reply to actionable recovery copy", async () => {
+    settingsMocks.startProviderOperation.mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
+
+    await waitFor(
+      () => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "結果をまだ確認できません。接続を確認して「再開」を押してください。",
+        );
+      },
+      { timeout: 2_500 },
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Failed to fetch");
   });
 
   it("explains and disables removal of the final Firebase login method", () => {

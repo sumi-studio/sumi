@@ -51,6 +51,7 @@ import {
   publishAuthOutcomeNotice,
   takeAuthOutcomeNotice,
 } from "./auth-outcome-notice-state";
+import { noteAuthTeardown } from "./auth-transition";
 import {
   beginSameEmailCredentialRecovery,
   completeSameEmailCredentialRecovery,
@@ -1835,6 +1836,10 @@ function firebaseAccount(user: {
 async function signOutFirebaseBestEffort(): Promise<void> {
   try {
     const auth = getFirebaseAuth();
+    // Mark the identity being torn down before awaiting so an in-flight
+    // provider operation that still holds this account can honour the
+    // transition instead of persisting it again.
+    noteAuthTeardown(auth.currentUser?.uid);
     await signOut(auth).catch(() => undefined);
   } catch {
     // Firebase is cleanup-only after Sumi authority has ended.

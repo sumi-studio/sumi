@@ -20,8 +20,8 @@ import {
   onAuthStateChanged,
   reauthenticateWithRedirect,
   reload,
+  signOut,
   type User,
-  updateCurrentUser,
 } from "firebase/auth";
 import {
   Check,
@@ -41,6 +41,7 @@ import {
 } from "react";
 import { createAuthFlowNonce } from "./auth-flow-client";
 import { hasPendingRedirectFlowRecord } from "./auth-flow-state";
+import { authTeardownCount } from "./auth-transition";
 import { getFirebaseAuth } from "./firebase";
 import {
   completeProviderOperation,
@@ -65,7 +66,10 @@ const PROVIDERS: Array<{ id: ManagedProvider; label: string }> = [
   { id: "github.com", label: "GitHub" },
 ];
 const PROVIDER_NOTICE_KEY = "sumi.auth.provider-notice.v1";
+// Legacy single-record key, adopted on read for records written before the
+// scoped keys existed. New writes only ever target the scope's own key.
 const PROVIDER_PENDING_KEY = "sumi.auth.provider-pending.v1";
+const PROVIDER_PENDING_KEY_PREFIX = "sumi.auth.provider-pending.v2/";
 const RECOVERY_ATTEMPTS = 3;
 
 interface ProviderScope {
@@ -79,11 +83,16 @@ interface ProviderNotice extends ProviderScope {
   operation: "linked" | "unlinked";
 }
 
+// unlink_starting is provably unsent: the record exists only as local intent
+// and nothing reached the server, so cancellation may abandon it. unlink_sent
+// means the unlink request may already have committed server-side; a lost
+// reply must keep the record resumable instead of looking like unsent intent.
 type PendingPhase =
   | "starting"
   | "link_ready"
   | "link_mutated"
-  | "unlink_starting";
+  | "unlink_starting"
+  | "unlink_sent";
 
 interface PendingProviderOperation extends ProviderScope {
   version: 1;
@@ -189,63 +198,92 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       throw new ProviderAccountChangedError();
     }
     // The operation record is durable: a PWA restart during the provider
-    // redirect drops sessionStorage but must not orphan the server-side
-    // pending operation. The pre-redirect sessionStorage key is retired.
-    localStorage.setItem(PROVIDER_PENDING_KEY, JSON.stringify(next));
-    sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+    // redirect must not orphan the server-side pending operation. Each
+    // account scope owns its own storage key, so persisting this change can
+    // never overwrite a different account's unfinished one.
+    localStorage.setItem(pendingKeyFor(next), JSON.stringify(next));
     setPendingOperation(next);
   }, []);
 
-  const clearPending = useCallback((expected: ProviderScope) => {
-    if (
-      !activeScopeRef.current ||
-      !sameScope(expected, activeScopeRef.current)
-    ) {
-      return;
-    }
-    const stored = readPendingJSON();
-    if (hasScope(stored) && !sameScope(stored, expected)) return;
-    localStorage.removeItem(PROVIDER_PENDING_KEY);
-    sessionStorage.removeItem(PROVIDER_PENDING_KEY);
-    setPendingOperation((current) =>
-      current && sameScope(current, expected) ? null : current,
-    );
-  }, []);
-
-  const publishNotice = useCallback(
-    (provider: ManagedProvider, operation: "linked" | "unlinked") => {
-      if (!scope) return;
+  const clearPending = useCallback(
+    (expected: ProviderScope & { nonce?: string }) => {
       if (
         !activeScopeRef.current ||
-        !sameScope(scope, activeScopeRef.current)
+        !sameScope(expected, activeScopeRef.current)
       ) {
         return;
       }
+      const key = pendingKeyFor(expected);
+      const stored = readPendingKey(key);
+      if (stored !== null) {
+        // Only the record this operation owns may be removed: a different
+        // change started with another nonce belongs to whoever wrote it.
+        if (
+          !isPendingProviderOperation(stored) ||
+          !sameScope(stored, expected) ||
+          (expected.nonce !== undefined && stored.nonce !== expected.nonce)
+        ) {
+          return;
+        }
+        localStorage.removeItem(key);
+      }
+      const legacy = readPendingJSON();
+      if (
+        isPendingProviderOperation(legacy) &&
+        sameScope(legacy, expected) &&
+        (expected.nonce === undefined || legacy.nonce === expected.nonce)
+      ) {
+        localStorage.removeItem(PROVIDER_PENDING_KEY);
+        sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+      }
+      setPendingOperation((current) =>
+        current &&
+        sameScope(current, expected) &&
+        (expected.nonce === undefined || current.nonce === expected.nonce)
+          ? null
+          : current,
+      );
+    },
+    [],
+  );
+
+  const publishNotice = useCallback(
+    (owner: PendingProviderOperation, operation: "linked" | "unlinked") => {
+      // The notice belongs to the operation's account, not whoever happens
+      // to be on screen now — a mid-flight account switch must not see it.
+      const active = activeScopeRef.current;
+      if (!active || !sameScope(owner, active)) return;
       const nextNotice: ProviderNotice = {
         version: 1,
-        ...scope,
-        provider,
+        firebaseUid: owner.firebaseUid,
+        humanId: owner.humanId,
+        provider: owner.provider,
         operation,
       };
       sessionStorage.setItem(PROVIDER_NOTICE_KEY, JSON.stringify(nextNotice));
       setNotice(nextNotice);
     },
-    [scope],
+    [],
   );
 
   const operationFor = useCallback(
     (provider: ManagedProvider, operation: ProviderOperation) => {
       if (!scope) throw new Error("ログイン情報を確認できませんでした。");
-      if (scopedPendingOperation) {
-        if (
-          scopedPendingOperation.provider !== provider ||
-          scopedPendingOperation.operation !== operation
-        ) {
+      // Re-read durable storage rather than trusting React state: another
+      // tab may have started a change after this tab last rendered. A live
+      // record for a different change is never overwritten — the only
+      // replaceable record is an unsent reauth intent, which reached no
+      // server and so can be abandoned safely.
+      const stored = loadScopedPendingOperation(scope);
+      if (stored) {
+        if (stored.provider === provider && stored.operation === operation) {
+          return stored;
+        }
+        if (stored.phase !== "unlink_starting") {
           throw new ProviderOperationStillPendingError(
             "別のログイン方法の変更が保留中です。先にその変更を再開してください。",
           );
         }
-        return scopedPendingOperation;
       }
       const next: PendingProviderOperation = {
         version: 1,
@@ -258,7 +296,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       persistPending(next);
       return next;
     },
-    [persistPending, scope, scopedPendingOperation],
+    [persistPending, scope],
   );
 
   /**
@@ -317,34 +355,57 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
    * instead of deleting twice.
    */
   const finishUnlinkOperation = useCallback(
-    async (
-      operation: PendingProviderOperation,
-      user: User,
-      idToken: string,
-    ) => {
-      const result = await startWithSameNonce(
-        operation,
-        idToken,
-        persistPending,
-      );
+    async (operation: PendingProviderOperation, idToken: string) => {
+      // Once the unlink request may have left this tab, the record is no
+      // longer provably unsent: promote it before the network call so a lost
+      // reply keeps the operation resumable instead of looking abandoned.
+      const sent: PendingProviderOperation = {
+        ...operation,
+        phase: "unlink_sent",
+      };
+      persistPending(sent);
+      const teardownAtClaim = authTeardownCount(operation.firebaseUid);
+      const result = await startWithSameNonce(sent, idToken, persistPending);
       if (result.outcome !== "provider_unlinked") {
         throw resultStateError(result);
       }
-      await confirmTerminalStatus(result, operation);
-      await refreshUser(user);
-      // Firebase reload() merges providerData and can never observe a
-      // provider the backend deleted; the server's provider_unlinked outcome
-      // is authoritative. Reconcile and persist the local user so the removed
-      // method does not survive an app restart.
-      Object.assign(user, {
-        providerData: user.providerData.filter(
-          (entry) => entry.providerId !== operation.provider,
-        ),
-      });
-      await updateCurrentUser(getFirebaseAuth(), user);
-      clearPending(operation);
+      await confirmTerminalStatus(result, sent);
+      const auth = getFirebaseAuth();
+      const live = auth.currentUser;
+      // Firebase reload() merges providerData and can never drop an entry
+      // the backend deleted; the server's provider_unlinked outcome is
+      // authoritative. Patch the *live* current user first so reload's own
+      // merge keeps the removal and its current-user-guarded persist stores
+      // it — never write a captured user object, which could reinstall an
+      // identity a logout or account switch already tore down. The teardown
+      // count covers the narrower window where a sign-out was initiated but
+      // its queued write has not applied yet.
+      if (
+        live &&
+        live.uid === operation.firebaseUid &&
+        activeScopeRef.current &&
+        sameScope(operation, activeScopeRef.current) &&
+        authTeardownCount(operation.firebaseUid) === teardownAtClaim
+      ) {
+        Object.assign(live, {
+          providerData: live.providerData.filter(
+            (entry) => entry.providerId !== operation.provider,
+          ),
+        });
+        await refreshUser(live);
+        if (
+          authTeardownCount(operation.firebaseUid) !== teardownAtClaim &&
+          auth.currentUser?.uid === operation.firebaseUid
+        ) {
+          // A sign-out for this account was initiated while reload was in
+          // flight; our persist may have been queued behind it. Honour the
+          // teardown rather than leaving the torn-down identity installed.
+          await signOut(auth).catch(() => undefined);
+        }
+      }
+      clearPending(sent);
       if (result.noticeRequired) {
-        publishNotice(operation.provider, "unlinked");
+        publishNotice(sent, "unlinked");
       }
       setUnlinkTarget(null);
     },
@@ -356,12 +417,16 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
    * it to the backend with a token minted after the operation began.
    */
   const finishLinkFromRedirect = useCallback(
-    async (operation: PendingProviderOperation, user: User) => {
+    async (
+      operation: PendingProviderOperation,
+      user: User,
+      persist: (operation: PendingProviderOperation) => void,
+    ) => {
       const mutated: PendingProviderOperation = {
         ...operation,
         phase: "link_mutated",
       };
-      persistPending(mutated);
+      persist(mutated);
       setBusyLabel(`${providerLabel(operation.provider)}の追加を確定中`);
       const completed = await reconcileLinkCompletion(mutated, user);
       await finishSuccessfulOperation(
@@ -373,7 +438,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         publishNotice,
       );
     },
-    [clearPending, persistPending, publishNotice, refreshUser],
+    [clearPending, publishNotice, refreshUser],
   );
 
   const settleLinkRedirectOutcome = useCallback(
@@ -401,19 +466,9 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
     if (!currentScope || resolvingRedirect.current) return;
     const marker = peekPendingProviderRedirect();
     if (!marker) return;
-    const pending = loadScopedPendingOperation(currentScope);
-    if (
-      !pending ||
-      !sameScope(marker, currentScope) ||
-      marker.nonce !== pending.nonce ||
-      (marker.kind === "link" &&
-        (pending.operation !== "link" ||
-          pending.provider !== marker.provider)) ||
-      (marker.kind === "reauth" && pending.operation !== "unlink")
-    ) {
-      // The return cannot belong to this account's pending change. The
-      // receipt is stale; the operation itself stays resumable under its own
-      // scope.
+    if (!sameScope(marker, currentScope)) {
+      // The receipt belongs to another account's change. Its own scope keeps
+      // the pending record; this session simply ignores the return.
       clearPendingProviderRedirect();
       return;
     }
@@ -421,6 +476,45 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       // A sign-in return owns this navigation's Firebase result. Leave the
       // receipt; once that settles, a later mount reconciles this operation.
       return;
+    }
+    let pending = loadScopedPendingOperation(currentScope);
+    let recovering = false;
+    if (
+      !pending ||
+      marker.nonce !== pending.nonce ||
+      (marker.kind === "link" &&
+        (pending.operation !== "link" ||
+          pending.provider !== marker.provider)) ||
+      (marker.kind === "reauth" && pending.operation !== "unlink")
+    ) {
+      if (marker.kind === "reauth") {
+        // A reauth receipt names only the authenticating provider, never the
+        // unlink target, so the operation cannot be rebuilt from it. Any
+        // stored change stays resumable under its own scope; the return is
+        // reported instead of silently dropped.
+        takePendingProviderRedirect();
+        setError(
+          pending
+            ? "この認証結果は保留中の変更と一致しませんでした。保留中の変更を再開するか、もう一度お試しください。"
+            : "この認証結果に対応する変更が見つかりませんでした。もう一度お試しください。",
+        );
+        return;
+      }
+      // A link receipt whose nonce no longer matches the stored change can
+      // still be legitimate: its record may already have settled in another
+      // tab while the Firebase link itself committed. Rebuild the operation
+      // from the receipt and replay the nonce — the server's idempotent
+      // begin returns the operation it already holds, so recovery reads the
+      // truth instead of guessing it.
+      pending = {
+        version: 1,
+        ...currentScope,
+        provider: marker.provider,
+        operation: "link",
+        nonce: marker.nonce,
+        phase: "link_mutated",
+      };
+      recovering = true;
     }
     takePendingProviderRedirect();
     resolvingRedirect.current = true;
@@ -436,6 +530,46 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         // it under a different Firebase user can never be this operation.
         setError("ログイン状態が変わりました。もう一度お試しください。");
         return;
+      }
+      // While recovering an unbound receipt, writes may claim the scoped
+      // slot only when it is still ours — a different change started
+      // meanwhile keeps its own record.
+      const persist = recovering
+        ? (next: PendingProviderOperation) => {
+            const stored = loadScopedPendingOperation(currentScope);
+            if (stored && stored.nonce !== next.nonce) return;
+            persistPending(next);
+          }
+        : persistPending;
+      if (recovering) {
+        const started = await startWithSameNonce(
+          pending,
+          await getIdToken(user, true),
+          persist,
+        );
+        if (isSuccessfulLink(started)) {
+          await finishSuccessfulOperation(
+            started,
+            pending,
+            user,
+            refreshUser,
+            clearPending,
+            publishNotice,
+          );
+          return;
+        }
+        if (
+          started.outcome !== "client_operation_required" ||
+          !started.completionTokenNotBefore
+        ) {
+          throw resultStateError(started);
+        }
+        pending = {
+          ...pending,
+          operationId: started.operationId,
+          completionTokenNotBefore: started.completionTokenNotBefore,
+        };
+        persist(pending);
       }
       let credential: Awaited<ReturnType<typeof getRedirectResult>>;
       try {
@@ -455,8 +589,10 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
           );
           return;
         }
-        // Reauthentication never mutated anything: the unlink stays
-        // resumable and the person only sees why it did not run.
+        // A failed or cancelled reauth never reached the server: a provably
+        // unsent unlink intent is abandoned so it cannot block other changes
+        // after a restart, while a sent one stays resumable.
+        abandonUnsentUnlink(currentScope, pending, clearPending);
         setError(providerSettingsError(redirectError));
         return;
       }
@@ -473,7 +609,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
             );
             return;
           }
-          await finishLinkFromRedirect(pending, credential.user);
+          await finishLinkFromRedirect(pending, credential.user, persist);
           return;
         }
         // No usable result arrived: the person cancelled or came back early.
@@ -485,7 +621,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
             ({ providerId }) => providerId === marker.provider,
           )
         ) {
-          await finishLinkFromRedirect(pending, user);
+          await finishLinkFromRedirect(pending, user, persist);
           return;
         }
         await settleLinkRedirectOutcome(pending, "cancelled");
@@ -504,16 +640,23 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         credential && credential.user.uid === user.uid ? credential.user : user;
       const idToken = await recentReauthToken(reauthUser, pending.provider);
       if (!idToken) {
+        abandonUnsentUnlink(currentScope, pending, clearPending);
         setError("認証をキャンセルしました。");
         return;
       }
       setBusyLabel(`${providerLabel(pending.provider)}の解除を確定中`);
-      await finishUnlinkOperation(pending, reauthUser, idToken);
+      await finishUnlinkOperation(pending, idToken);
     } catch (nextError) {
-      if (nextError instanceof TerminalProviderOperationError) {
+      if (
+        pending &&
+        (nextError instanceof TerminalProviderOperationError ||
+          (pending.operation === "link" &&
+            isExpiredProviderOperationError(nextError)))
+      ) {
         clearPending(pending);
       }
       if (
+        pending &&
         activeScopeRef.current &&
         sameScope(pending, activeScopeRef.current)
       ) {
@@ -528,6 +671,8 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
     clearPending,
     finishLinkFromRedirect,
     finishUnlinkOperation,
+    persistPending,
+    publishNotice,
     refreshUser,
     settleLinkRedirectOutcome,
   ]);
@@ -603,9 +748,11 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         setBusyLabel(`${providerLabel(provider)}で認証中`);
         await sendProviderRedirect(operation, provider, "link", firebaseUser);
       } catch (nextError) {
-        if (isDefinitiveStartFailure(nextError, operation)) {
-          if (operation) clearPending(operation);
-        } else if (nextError instanceof TerminalProviderOperationError) {
+        if (
+          isDefinitiveStartFailure(nextError, operation) ||
+          nextError instanceof TerminalProviderOperationError ||
+          isExpiredProviderOperationError(nextError)
+        ) {
           if (operation) clearPending(operation);
         }
         if (
@@ -679,7 +826,10 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         setBusyLabel(`${providerLabel(provider)}で認証中`);
         await sendProviderRedirect(operation, provider, "link", firebaseUser);
       } catch (nextError) {
-        if (nextError instanceof TerminalProviderOperationError) {
+        if (
+          nextError instanceof TerminalProviderOperationError ||
+          isExpiredProviderOperationError(nextError)
+        ) {
           clearPending(operation);
         }
         if (
@@ -719,7 +869,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         const recent = await recentReauthToken(firebaseUser, provider);
         if (recent) {
           setBusyLabel(`${providerLabel(provider)}の解除を確定中`);
-          await finishUnlinkOperation(operation, firebaseUser, recent);
+          await finishUnlinkOperation(operation, recent);
           return;
         }
         const alternate = PROVIDERS.find(
@@ -845,8 +995,13 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
             const linked = linkedProviders.has(id);
             const lastMethod = linked && usableMethodCount <= 1;
             const pending = scopedPendingOperation?.provider === id;
+            // An unsent reauth intent reached no server: it must not block
+            // other methods after a cancelled trip. Starting elsewhere
+            // replaces it.
             const blockedByOtherPending = Boolean(
-              scopedPendingOperation && !pending,
+              scopedPendingOperation &&
+                !pending &&
+                scopedPendingOperation.phase !== "unlink_starting",
             );
             const resumeLink =
               pending && scopedPendingOperation.operation === "link";
@@ -1057,6 +1212,9 @@ async function reconcileLinkCompletion(
   let lastError: unknown;
   for (let attempt = 0; attempt < RECOVERY_ATTEMPTS; attempt++) {
     const before = await readOperationStatus(operation).catch((error) => {
+      // An expired operation can never complete — surface it as terminal
+      // instead of hiding it behind a retryable "still pending" message.
+      if (isExpiredProviderOperationError(error)) throw error;
       lastError = error;
       return null;
     });
@@ -1073,9 +1231,11 @@ async function reconcileLinkCompletion(
       const terminal = terminalLinkResult(completed);
       if (terminal) return terminal;
     } catch (error) {
+      if (isExpiredProviderOperationError(error)) throw error;
       lastError = error;
     }
     const after = await readOperationStatus(operation).catch((error) => {
+      if (isExpiredProviderOperationError(error)) throw error;
       lastError = error;
       return null;
     });
@@ -1161,13 +1321,13 @@ async function finishSuccessfulOperation(
   refresh: (user: User) => Promise<void>,
   clear: (expected: ProviderScope) => void,
   publish: (
-    provider: ManagedProvider,
+    owner: PendingProviderOperation,
     operation: "linked" | "unlinked",
   ) => void,
 ): Promise<void> {
   await refresh(user);
   clear(operation);
-  if (result.noticeRequired) publish(operation.provider, "linked");
+  if (result.noticeRequired) publish(operation, "linked");
 }
 
 function assertLinkReady(result: ProviderOperationResult): void {
@@ -1285,6 +1445,10 @@ function providerFailureOutcome(error: unknown) {
   return "firebase_operation_failed" as const;
 }
 
+function isExpiredProviderOperationError(error: unknown): boolean {
+  return error instanceof AuthAPIError && error.message === "flow_expired";
+}
+
 function isRetryableProviderError(error: unknown): boolean {
   if (
     error instanceof TerminalProviderOperationError ||
@@ -1334,6 +1498,8 @@ function providerSettingsError(error: unknown): string {
         return "別のログイン方法の変更が処理中です。保留中の変更を再開してください。";
       case "provider_unavailable":
         return "結果をまだ確認できません。接続を確認して再試行してください。";
+      case "flow_expired":
+        return "変更の有効期限が切れました。もう一度お試しください。";
       case "proof_mismatch":
         return "再認証を確認できませんでした。もう一度お試しください。";
     }
@@ -1357,6 +1523,12 @@ function providerSettingsError(error: unknown): string {
     if (error.code === "auth/redirect-operation-pending") {
       return "別の認証を処理しています。少し待ってから、もう一度お試しください。";
     }
+  }
+  if (error instanceof TypeError) {
+    // A fetch() rejection: the reply may have been lost after the request
+    // committed. The pending record decides what can be retried, so the copy
+    // stays uncertain rather than claiming a definite failure.
+    return "結果をまだ確認できません。接続を確認して「再開」を押してください。";
   }
   return error instanceof Error && error.message
     ? error.message
@@ -1393,19 +1565,74 @@ function loadScopedNotice(scope: ProviderScope): ProviderNotice | null {
   return value;
 }
 
+// Each pending operation lives under its own account scope's key, so
+// persisting one change can never overwrite another account's — no shared
+// record, no lost read-modify-write.
+function pendingKeyFor(scope: ProviderScope): string {
+  return `${PROVIDER_PENDING_KEY_PREFIX}${encodeURIComponent(scope.firebaseUid)}/${encodeURIComponent(scope.humanId)}`;
+}
+
+function readPendingKey(key: string): unknown {
+  try {
+    return JSON.parse(localStorage.getItem(key) ?? "null") as unknown;
+  } catch {
+    localStorage.removeItem(key);
+    return null;
+  }
+}
+
 function loadScopedPendingOperation(
   scope: ProviderScope,
 ): PendingProviderOperation | null {
-  const value = readPendingJSON();
-  if (value === null) return null;
-  if (!isPendingProviderOperation(value)) {
+  const key = pendingKeyFor(scope);
+  const value = readPendingKey(key);
+  if (value !== null) {
+    if (!isPendingProviderOperation(value) || !sameScope(value, scope)) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return value;
+  }
+  // Adopt a record written under the legacy shared key once: it stays
+  // recoverable for its own scope, and a different account's record is
+  // never claimed here.
+  const legacy = readPendingJSON();
+  if (legacy === null) return null;
+  if (!isPendingProviderOperation(legacy)) {
     localStorage.removeItem(PROVIDER_PENDING_KEY);
+    sessionStorage.removeItem(PROVIDER_PENDING_KEY);
     return null;
   }
-  // A different account's unfinished change is left in place: its own scope
-  // can still resume it, and this session simply never adopts it.
-  if (!sameScope(value, scope)) return null;
-  return value;
+  if (!sameScope(legacy, scope)) return null;
+  try {
+    localStorage.setItem(key, JSON.stringify(legacy));
+  } catch {
+    // A quota/private-mode write failure leaves the legacy record in place;
+    // the next read adopts it again.
+    return legacy;
+  }
+  localStorage.removeItem(PROVIDER_PENDING_KEY);
+  sessionStorage.removeItem(PROVIDER_PENDING_KEY);
+  return legacy;
+}
+
+// Clear only a record that is provably unsent: its durable phase is still
+// unlink_starting, so no request can have reached the server and abandoning
+// it is safe. A record another tab already promoted to unlink_sent keeps an
+// uncertain server-side receipt and is never discarded here.
+function abandonUnsentUnlink(
+  scope: ProviderScope,
+  operation: PendingProviderOperation,
+  clear: (expected: ProviderScope & { nonce?: string }) => void,
+): void {
+  const stored = loadScopedPendingOperation(scope);
+  if (
+    stored &&
+    stored.nonce === operation.nonce &&
+    stored.phase === "unlink_starting"
+  ) {
+    clear(operation);
+  }
 }
 
 function clearProviderSessionState(): void {
@@ -1462,7 +1689,8 @@ function isPendingProviderOperation(
     (value.phase === "starting" ||
       value.phase === "link_ready" ||
       value.phase === "link_mutated" ||
-      value.phase === "unlink_starting") &&
+      value.phase === "unlink_starting" ||
+      value.phase === "unlink_sent") &&
     (value.operationId === undefined ||
       (typeof value.operationId === "string" &&
         value.operationId.length <= 128)) &&
