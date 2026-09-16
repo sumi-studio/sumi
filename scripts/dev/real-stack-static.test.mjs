@@ -392,13 +392,14 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   );
 });
 
-test("the default core runtime wires the dev pool to the wake sweep", async () => {
+test("the explicit core runtime wires the dev pool to the wake sweep", async () => {
   const launcher = await source("scripts/dev/real-stack");
 
-  // The documented entrypoint defaults to the new core; the Rust runtime
-  // stays reachable only through the explicit transitional switch.
-  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-core\}"/);
-  assert.match(launcher, /--runtime core\|rust/);
+  // The documented entrypoint keeps the working Rust runtime as the default;
+  // the new core is deliberately opt-in until ordinary Direct Chat adoption
+  // is accepted.
+  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-rust\}"/);
+  assert.match(launcher, /--runtime rust\|core/);
   assert.match(
     launcher,
     /fail "--runtime must be core or rust \(got \$\{RUNTIME_MODE\}\)"/,
@@ -429,9 +430,10 @@ test("the default core runtime wires the dev pool to the wake sweep", async () =
     /core\) validate_core_runtime_configuration ;;\n\s+rust\) validate_rust_runtime_configuration ;;/,
   );
 
-  // The API receives the core state token, the runtime credential and the
-  // wake target only in core mode; local-control env stays on the rust
-  // branch so the legacy attention path cannot engage underneath the core.
+  // The API receives the core state token, the runtime credential, the wake
+  // target, and the core Direct Chat backend switch only in core mode;
+  // local-control env stays on the rust branch so the legacy attention path
+  // cannot engage underneath the core.
   const apiCoreBlock = launcher.slice(
     launcher.indexOf("# Mounts /internal/core"),
     launcher.indexOf('log "starting API"'),
@@ -441,6 +443,7 @@ test("the default core runtime wires the dev pool to the wake sweep", async () =
     '"SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"',
     '"SUMI_CORE_WAKE_URL=http://${DEV_POOL_LISTEN}"',
     '"SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"',
+    '"SUMI_DIRECT_CHAT_BACKEND=core"',
     '"SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}"',
     '"SUMI_LOCAL_CONTROL_ENABLED=1"',
   ]) {
@@ -452,7 +455,7 @@ test("the default core runtime wires the dev pool to the wake sweep", async () =
   );
   assert.match(
     apiCoreBlock,
-    /SUMI_CORE_WAKE_TOKEN=\$\{SUMI_CORE_WAKE_TOKEN\}"\n  \)\nelse\n  api_environment\+=\(/,
+    /SUMI_DIRECT_CHAT_BACKEND=core"\n  \)\nelse\n  api_environment\+=\(/,
   );
 
   // The dev pool is the wake target: it runs apps/core's Node host and is
@@ -517,6 +520,25 @@ test("the default core runtime wires the dev pool to the wake sweep", async () =
     launcher,
     /SUMI_PUBLIC_LISTEN collides with the dev core pool port/,
   );
+
+  // The web port stays 5173 by default; SUMI_DEV_WEB_PORT only overrides it
+  // through the same bounded validation as the other listeners, and the
+  // launcher hands it to Vite so the server binds the validated value.
+  const webPortValidator = launcherFunction(launcher, "validate_web_port");
+  assert.match(
+    webPortValidator,
+    /WEB_PORT="\$\{SUMI_DEV_WEB_PORT:-\$\{WEB_PORT_DEFAULT\}\}"/,
+  );
+  assert.match(webPortValidator, /outside 1\.\.65535/);
+  assert.match(
+    webPortValidator,
+    /SUMI_DEV_WEB_PORT collides with a reserved local-stack port/,
+  );
+  assert.match(
+    webPortValidator,
+    /SUMI_DEV_WEB_PORT collides with the dev core pool port/,
+  );
+  assert.match(launcher, /"SUMI_DEV_PORT=\$\{WEB_PORT\}"/);
 });
 
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
@@ -526,14 +548,15 @@ test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async
   ]);
   assert.match(
     makefile,
-    /dev: ## Start the supported authenticated local Sumi stack \(TypeScript core\)/,
+    /dev: ## Start the supported authenticated local Sumi stack \(Rust runtime for now\)/,
   );
   assert.match(
     makefile,
-    /dev-rust: ## Start the transitional stack on the Rust PersonalityAgent runtime\n\tpnpm dev:rust/,
+    /dev-core: ## Start the stack on the accepted TypeScript secretary core\n\tpnpm dev:core/,
   );
   const scripts = JSON.parse(packageJSON).scripts;
   assert.equal(scripts.dev, "bash scripts/dev/real-stack");
+  assert.equal(scripts["dev:core"], "bash scripts/dev/real-stack --runtime core");
   assert.equal(scripts["dev:rust"], "bash scripts/dev/real-stack --runtime rust");
   assert.equal(scripts["dev:workspaces"], "turbo run dev");
 });

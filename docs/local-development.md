@@ -1,8 +1,9 @@
 # Real local stack
 
 This is the supported developer entrypoint for using the browser chat with a
-real secretary. It runs the Go API, the shared TypeScript secretary core
-(`apps/core`), and Vite as native processes, with PostgreSQL in Docker. The
+real secretary. It runs the Go API, the secretary runtime, and Vite as native
+processes, with PostgreSQL in Docker. `make dev` uses the Rust runtime while
+the new TypeScript core (`apps/core`) is opt-in via `make dev-core`. The
 Playwright stack remains a test fixture and is not the product entrypoint.
 
 ## Prerequisites
@@ -12,10 +13,11 @@ Playwright stack remains a test fixture and is not the product entrypoint.
 - `pnpm install` (`make setup`) completed
 - a Firebase project with Authentication enabled
 - Google and/or GitHub enabled under Firebase Authentication → Sign-in method
-- no model credential is required for the default deterministic `mock`
-  provider; set `SUMI_MODEL_PROVIDER` for a real endpoint
-- for the transitional `--runtime rust` launch only: Rust stable and a real
+- for the default `--runtime rust` launch: Rust stable and a real
   model-provider credential for a preset supported by `apps/agent`
+- for `--runtime core` (`make dev-core`) only: no model credential is
+  required for the deterministic `mock` provider; set `SUMI_MODEL_PROVIDER`
+  for a real endpoint
 
 The Vite development build has a public `sumi-studio` Firebase web
 configuration fallback. It is an identifier, not a server credential, and is
@@ -76,8 +78,8 @@ the exact `SUMI_AUTH_FIREBASE_TENANT_ID`; leave it blank for ordinary Firebase
 Auth. `SUMI_AUTH_TENANT_ID` and `SUMI_AUTH_USER_ID` are server-owned Sumi
 identifiers, not claims accepted from the browser.
 
-On the transitional Rust runtime (`--runtime rust`), the following identity
-must be equal everywhere:
+On the Rust runtime (`--runtime rust`, the `make dev` default), the following
+identity must be equal everywhere:
 
 ```text
 SUMI_PERSONALITY_AGENT_ID
@@ -88,7 +90,7 @@ SUMI_PERSONALITY_AGENT_ID
 
 The launcher derives the local-control and executor/runtime values from
 `SUMI_PERSONALITY_AGENT_ID` and rejects an unequal auth binding. The ID must be
-a canonical lowercase UUIDv7. The default core runtime needs none of this:
+a canonical lowercase UUIDv7. The opt-in core runtime needs none of this:
 each secretary's persona comes from the signed-in human's 戸籍 registration,
 and the dev pool derives the persona id from each wake.
 
@@ -116,8 +118,9 @@ does not prove that two credentials belong to separate provider accounts.
 
 ### Codex OAuth bridge provider
 
-This bridge serves the Rust runtime (`--runtime rust`); the core runtime's
-`openai` provider can point at any OpenAI-compatible endpoint directly.
+This bridge serves the Rust runtime (the `make dev` default); the core
+runtime's `openai` provider can point at any OpenAI-compatible endpoint
+directly.
 
 The existing development-only Codex Responses bridge can provide a real model
 without a public OpenAI API key. It reads an owner-only Codex login file,
@@ -205,26 +208,30 @@ make dev
 
 ### Runtime mode
 
-`make dev` runs each secretary on the shared TypeScript core
-(`apps/core`): the API mounts the persona-scoped state service at
-`/internal/core`, Messaging attention is admitted as durable core inputs, and
-a local dev pool (`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`)
-runs one `host/local.ts` Node process per persona, started by the API's wake
-sweep — the same wake contract Cloud uses. The writer lease in Postgres keeps
-one operative execution owner per secretary, so restarting the pool or a host
+`make dev` keeps the working launch on the Rust tool executor +
+`PersonalityAgent` while Direct Chat adoption of the new core is being
+proven; it requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
+`SUMI_MODEL_PRESET` and the provider/reviewer credentials in `.env.local`.
+
+`make dev-core` (`scripts/dev/real-stack --runtime core`, or
+`SUMI_DEV_RUNTIME=core` in `.env.local`) runs each secretary on the accepted
+TypeScript core (`apps/core`): the API mounts the persona-scoped state
+service at `/internal/core`, Messaging attention is admitted as durable core
+inputs, and Direct Chat commands are served through the same core state
+(`SUMI_DIRECT_CHAT_BACKEND=core`). A local dev pool
+(`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`) runs one
+`host/local.ts` Node process per persona, started by the API's wake sweep —
+the same wake contract Cloud uses. The writer lease in Postgres keeps one
+operative execution owner per secretary, so restarting the pool or a host
 preserves saved work and does not duplicate committed effects.
 
-The default `mock` model provider is deterministic and network-free — enough
-to develop against the real application without a paid account.
-`SUMI_MODEL_PROVIDER` selects `fixture` (scripted rules),
+Under `--runtime core` the `mock` model provider is deterministic and
+network-free — enough to develop against the real application without a paid
+account. `SUMI_MODEL_PROVIDER` selects `fixture` (scripted rules),
 `openai` (an OpenAI-compatible endpoint), or `none` instead; a model
 connection selected in the app overrides the environment.
 
-`make dev-rust` (`scripts/dev/real-stack --runtime rust`, or
-`SUMI_DEV_RUNTIME=rust` in `.env.local`) keeps the transitional launch on the
-Rust tool executor + `PersonalityAgent` while that runtime still has
-remaining consumers; it requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
-`SUMI_MODEL_PRESET` and the provider/reviewer credentials in `.env.local`.
+`make dev-rust` is the same launch as `make dev`, spelled out.
 
 Open exactly <http://127.0.0.1:5173>. The fixed Vite server proxies HTTP
 `/auth` and WebSocket `/direct-chat` to <http://127.0.0.1:8080>, so the browser

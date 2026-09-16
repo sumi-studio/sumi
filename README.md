@@ -37,7 +37,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 ### Not available yet
 
-- **Using the full Web app on the new core as a product.** Connecting the existing Web app to the new core for everyday use is still being verified. No documented local setup runs the full Web app on it yet.
+- **Using the full Web app on the new core as a product.** `make dev-core` runs the Web app on the new core for development — Messaging and Direct Chat included — but connecting it for everyday use is still being verified.
 - **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
@@ -65,9 +65,9 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 ## Run the Web app from source
 
-`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the TypeScript secretary core (`apps/core`) on a local dev pool, and Vite — the same core the Local host and Sumi Cloud use. `make dev-rust` keeps the transitional launch on the Rust agent runtime and tool executor (`apps/agent`) while it still has remaining consumers.
+`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor (`apps/agent`), and Vite. `make dev-core` runs the same app on the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — while its Direct Chat adoption is being proven.
 
-Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. No model credential is needed for the default deterministic provider. The Rust path additionally needs Rust stable and model-provider credentials for the conversation model and two separate review models.
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; Rust stable and model-provider credentials for the conversation model and two separate review models. `make dev-core` needs no model credential for the default deterministic provider.
 
 ```sh
 make setup

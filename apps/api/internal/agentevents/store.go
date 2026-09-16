@@ -927,6 +927,26 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *personalityAgent
 	return nil
 }
 
+// PersonaIDs lists the personality agents that have a durable command log.
+// The core-backed direct-chat adapter uses it to rediscover personas whose
+// admitted commands still need reconciliation after a restart.
+func (s *CommandStore) PersonaIDs() ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(s.dir, "commands-*.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(matches))
+	for _, path := range matches {
+		id, err := personalityAgentIDFromPath(path)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
 func commandLogPath(dir, personalityAgentID string) string {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(personalityAgentID))
 	return filepath.Join(dir, "commands-"+encoded+".jsonl")

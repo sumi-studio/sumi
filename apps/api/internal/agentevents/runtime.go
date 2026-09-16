@@ -31,10 +31,10 @@ import (
 
 type DurableGateway struct {
 	historyMu sync.Mutex
-	history map[string]*browserHistoryIndex
-	dir      string
-	commands *CommandStore
-	mu       sync.Mutex
+	history   map[string]*browserHistoryIndex
+	dir       string
+	commands  *CommandStore
+	mu        sync.Mutex
 
 	// runtimeDir is a pinned descriptor for the private, shared runtime
 	// directory. Authoritative PAID locks are opened relative to it and their
@@ -1657,6 +1657,136 @@ func connectionLeaseStateMAC(
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write(raw)
 	return mac.Sum(nil), nil
+}
+
+var errProjectedWriteBlocked = errors.New("a live legacy runtime owns this personality agent's event log")
+
+// AppendProjectedEvents durably appends browser-visible events produced by an
+// in-process API component — currently the core direct-chat projection — rather
+// than by a connected runtime. Unlike Receive it does not require a runtime
+// generation or connection lease: the writer is the API itself. It refuses
+// while a legacy runtime could still write (hydrated generation or active
+// connection lease), so the log keeps a single writer per persona at all times.
+//
+// Events are validated through the same validateEnvelope contract a runtime's
+// Receive applies, appended under the same file lock with the same contiguous
+// seq assignment, and folded into the in-memory run/approval guards. The batch
+// is one write+fsync: a crash mid-append leaves a torn tail that EventCatchUp
+// fails closed on, never silently half-applied records.
+func (g *DurableGateway) AppendProjectedEvents(
+	ctx context.Context,
+	personalityAgentID string,
+	events []json.RawMessage,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return err
+	}
+	defer g.mu.Unlock()
+	lock, err := g.openRuntimeLock(personalityAgentID)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
+		return fmt.Errorf("lock runtime generation for projected side effect: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	state, err := g.state(ctx, personalityAgentID)
+	if err != nil {
+		return err
+	}
+	if state.needsResign {
+		return errors.New("runtime state requires exclusive integrity re-sign")
+	}
+	if state.present && state.HydrationReceiptIdentity != nil {
+		return errProjectedWriteBlocked
+	}
+	record, err := g.connectionLeaseState(personalityAgentID)
+	if err != nil {
+		return err
+	}
+	if record.Active {
+		return errProjectedWriteBlocked
+	}
+
+	st := g.stateFor(personalityAgentID)
+	file, err := g.newFile(g.eventPath(personalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock durable event log for projected append: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+	if err := g.refreshEventTailLocked(file, st); err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	envelopes := make([]Envelope, 0, len(events))
+	for i, raw := range events {
+		seq := st.eventSeq + uint64(i) + 1
+		envelope := Envelope{
+			Audience:           AudienceDirectChat,
+			Seq:                &seq,
+			PersonalityAgentID: personalityAgentID,
+			Event:              raw,
+		}
+		if err := validateEnvelope(envelope); err != nil {
+			return fmt.Errorf("projected event %d: %w", i, err)
+		}
+		line, err := json.Marshal(durableEventRecord{Seq: seq, Event: envelope})
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+		envelopes = append(envelopes, envelope)
+	}
+
+	preWriteOffset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	data := buf.Bytes()
+	written, writeErr := file.Write(data)
+	if writeErr != nil || written != len(data) {
+		var opErr error
+		if writeErr != nil {
+			opErr = fmt.Errorf("write durable event log: %w", writeErr)
+		} else {
+			opErr = fmt.Errorf("short write to durable event log: wrote %d of %d bytes", written, len(data))
+		}
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
+	}
+	if syncErr := file.Sync(); syncErr != nil {
+		opErr := fmt.Errorf("sync durable event log: %w", syncErr)
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
+	}
+
+	st.eventSeq += uint64(len(envelopes))
+	st.eventSize = preWriteOffset + int64(len(data))
+	st.eventCRC = updateCRC(st.eventCRC, data)
+	for _, envelope := range envelopes {
+		g.updateAgentSessionStateLocked(personalityAgentID, envelope.Event)
+	}
+	return nil
 }
 
 func (g *DurableGateway) appendDurableEventLocked(

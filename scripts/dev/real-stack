@@ -7,18 +7,19 @@ readonly DEFAULT_ENV_FILE="${REPOSITORY_ROOT}/deploy/local/.env.local"
 readonly LOCAL_CONTROL_ORIGIN="http://127.0.0.1:8081"
 readonly LOOPBACK_GATEWAY_LISTEN="127.0.0.1:8082"
 readonly DEV_POOL_LISTEN_DEFAULT="127.0.0.1:8083"
-readonly WEB_PORT=5173
+readonly WEB_PORT_DEFAULT=5173
 readonly POSTGRES_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.yaml"
-readonly POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
+readonly COMPOSE_POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
-RUNTIME_MODE="${SUMI_DEV_RUNTIME:-core}"
+RUNTIME_MODE="${SUMI_DEV_RUNTIME:-rust}"
 CHECK_ONLY=0
 RUNTIME_ROOT=
 PUBLIC_HOST=
 API_PORT=
 API_ORIGIN=
 WEB_ORIGIN=
+WEB_PORT=
 declare -a CHILD_PIDS=()
 
 log() {
@@ -32,15 +33,15 @@ fail() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev/real-stack [--check] [--env-file PATH] [--runtime core|rust]
+Usage: scripts/dev/real-stack [--check] [--env-file PATH] [--runtime rust|core]
 
-Starts the real local Sumi API, the shared TypeScript secretary core, and the
-Vite frontend. The default `core` runtime runs each secretary on the new
-TypeScript core (apps/core) driven by the API's wake sweep; `--runtime rust`
-(SUMI_DEV_RUNTIME=rust) keeps the transitional tool-executor +
-PersonalityAgent launch while that runtime is still needed. --check validates
-credentials and identity configuration without building or starting
-processes.
+Starts the real local Sumi API, the secretary runtime, and the Vite frontend.
+The default `rust` runtime keeps the working tool-executor + PersonalityAgent
+launch. `--runtime core` (SUMI_DEV_RUNTIME=core, `make dev-core`) runs each
+secretary on the accepted TypeScript core (apps/core) driven by the API's
+wake sweep, with Messaging and Direct Chat served through the durable core
+state service. --check validates credentials and identity configuration
+without building or starting processes.
 EOF
 }
 
@@ -210,6 +211,22 @@ validate_firebase_web_config() {
     do
       require_value "${name}"
     done
+  fi
+}
+
+validate_web_port() {
+  WEB_PORT="${SUMI_DEV_WEB_PORT:-${WEB_PORT_DEFAULT}}"
+  export WEB_PORT
+  [[ "${WEB_PORT}" =~ ^[0-9]{1,5}$ ]] ||
+    fail "SUMI_DEV_WEB_PORT must be a decimal port (got ${WEB_PORT})"
+  ((10#${WEB_PORT} >= 1 && 10#${WEB_PORT} <= 65535)) ||
+    fail "SUMI_DEV_WEB_PORT is outside 1..65535"
+  [[ "${WEB_PORT}" != "8081" && "${WEB_PORT}" != "8082" ]] ||
+    fail "SUMI_DEV_WEB_PORT collides with a reserved local-stack port"
+  if [[ "${RUNTIME_MODE}" == "core" ]]; then
+    local pool_port="${DEV_POOL_LISTEN##*:}"
+    [[ "${WEB_PORT}" != "${pool_port}" ]] ||
+      fail "SUMI_DEV_WEB_PORT collides with the dev core pool port"
   fi
 }
 
@@ -416,6 +433,7 @@ validate_configuration() {
   if [[ "${RUNTIME_MODE}" == "core" ]]; then
     validate_dev_pool_listen
   fi
+  validate_web_port
   validate_public_listen
 
   for name in \
@@ -514,6 +532,22 @@ wait_for_socket() {
 }
 
 start_postgres() {
+  if [[ -n "${POSTGRES_DB_URL_OVERRIDE}" ]]; then
+    # An already configured owned database (for example a developer-managed
+    # instance) replaces the compose-managed one. The API still enforces its
+    # own connectivity and migrations; here we only prove the endpoint
+    # answers before builds start.
+    log "using configured development database instead of compose Postgres"
+    node -e '
+      const net = require("node:net");
+      const url = new URL(process.argv[1]);
+      const socket = net.connect({ host: url.hostname, port: Number(url.port || 5432) });
+      const timer = setTimeout(() => { socket.destroy(); process.exit(1); }, 5000);
+      socket.on("connect", () => { clearTimeout(timer); socket.end(); });
+      socket.on("error", () => { clearTimeout(timer); process.exit(1); });
+    ' "${POSTGRES_DB_URL}" || fail "configured database ${POSTGRES_DB_URL} is not reachable"
+    return
+  fi
   log "starting control-plane Postgres via compose"
   docker compose -f "${POSTGRES_COMPOSE_FILE}" up -d postgres >/dev/null
   local attempt
@@ -700,9 +734,17 @@ if ((CHECK_ONLY)); then
   exit 0
 fi
 
-for command in awk curl docker flock go openssl pnpm setsid ss; do
+# An owned, already running database may replace the compose-managed one for
+# development; the API still validates connectivity itself on startup.
+readonly POSTGRES_DB_URL_OVERRIDE="${SUMI_DEV_DATABASE_URL:-}"
+readonly POSTGRES_DB_URL="${POSTGRES_DB_URL_OVERRIDE:-${COMPOSE_POSTGRES_DB_URL}}"
+
+for command in awk curl flock go openssl pnpm setsid ss; do
   require_command "${command}"
 done
+if [[ -z "${POSTGRES_DB_URL_OVERRIDE}" ]]; then
+  require_command docker
+fi
 if [[ "${RUNTIME_MODE}" == "rust" ]]; then
   require_command cargo
 else
@@ -777,7 +819,9 @@ fi
 start_postgres
 
 SUMI_AGENT_TOKEN_SECRET="$(random_base64)"
-SUMI_BROWSER_SESSION_SECRET="$(random_base64)"
+# An externally supplied session secret lets owned e2e fixtures (for example
+# cmd/e2e-session-cookie) mint browser sessions against the launched stack.
+SUMI_BROWSER_SESSION_SECRET="${SUMI_BROWSER_SESSION_SECRET:-$(random_base64)}"
 readonly SUMI_AGENT_TOKEN_SECRET SUMI_BROWSER_SESSION_SECRET
 
 if [[ "${RUNTIME_MODE}" == "core" ]]; then
@@ -883,13 +927,15 @@ declare -a api_environment=(
   "SUMI_AGENT_WRAPPING_KEY_ID=local-ephemeral/v1"
 )
 if [[ "${RUNTIME_MODE}" == "core" ]]; then
-  # Mounts /internal/core and the wake sweep, and switches Messaging
-  # attention to the durable core-input path (see cmd/server/main.go).
+  # Mounts /internal/core and the wake sweep, switches Messaging attention to
+  # the durable core-input path, and serves Direct Chat commands and replies
+  # through the core (see cmd/server/main.go).
   api_environment+=(
     "SUMI_CORE_STATE_TOKEN=${SUMI_CORE_STATE_TOKEN}"
     "SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"
     "SUMI_CORE_WAKE_URL=http://${DEV_POOL_LISTEN}"
     "SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"
+    "SUMI_DIRECT_CHAT_BACKEND=core"
   )
 else
   api_environment+=(
@@ -1021,6 +1067,7 @@ declare -a vite_environment=(
   "HOME=${HOME}"
   "SUMI_DEV_HOST=${PUBLIC_HOST}"
   "SUMI_DEV_API_ORIGIN=${API_ORIGIN}"
+  "SUMI_DEV_PORT=${WEB_PORT}"
 )
 for name in \
   VITE_FIREBASE_API_KEY \
