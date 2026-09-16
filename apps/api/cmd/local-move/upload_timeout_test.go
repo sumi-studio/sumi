@@ -5,8 +5,11 @@ package main
 // exercised against an owned endpoint with a short test configuration.
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,13 +92,30 @@ func TestUploadStopsOnASilentCloudAndStaysResumable(t *testing.T) {
 }
 
 // A Cloud that stops reading part way through a bundle ends the attempt on
-// the silence bound rather than blocking on the socket for good. The bundle
-// here is large enough that the connection really does fill up and stop.
+// the silence bound rather than blocking on the socket for good. Whether the
+// client's writes stop being accepted must not depend on the host's socket
+// autotuning — a kernel that can hold the whole bundle makes the attempt a
+// legitimate answer wait instead of a stall — so this case runs the traffic
+// through sockets whose buffers are deliberately tiny at both ends.
 func TestUploadStopsWhenTheConnectionStopsAcceptingBytes(t *testing.T) {
 	c := setupMove(t)
 	uid := "fixture-stall-" + c.pid[24:]
 	sid, moveURL := c.newSession(uid)
 	fillSecretary(t, c, 400, 4096)
+
+	// The same dispatch as c.srv, on a listener whose accepted sockets can
+	// hold only a few KB: a handler that stops reading is then a real stall,
+	// not the receive window quietly absorbing the bundle.
+	tight := httptest.NewUnstartedServer(c.srv.Config.Handler)
+	tight.Config.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetReadBuffer(4096)
+		}
+		return ctx
+	}
+	tight.Start()
+	t.Cleanup(tight.Close)
+	moveURL = strings.Replace(moveURL, c.srv.URL, tight.URL, 1)
 
 	quiet := make(chan struct{})
 	t.Cleanup(func() { close(quiet) })
@@ -104,14 +124,37 @@ func TestUploadStopsWhenTheConnectionStopsAcceptingBytes(t *testing.T) {
 			return false
 		}
 		// Take a little and then stop reading, the way a connection that
-		// silently goes away does.
+		// silently goes away does. A cancelled attempt releases the handler
+		// with its request instead of parking until the test ends.
 		_, _ = io.CopyN(io.Discard, r.Body, 1024)
-		<-quiet
+		select {
+		case <-quiet:
+		case <-r.Context().Done():
+		}
 		return true
 	})
 
 	m, out := c.mover()
 	m.stall = 300 * time.Millisecond
+	// Keep the client's own send queue small too, or it can hold the whole
+	// bundle locally while the peer's window is shut. The short answer bound
+	// is the loud fallback: a platform whose buffers still swallow the bundle
+	// ends each attempt on the answer bound and fails the stall assertion
+	// below fast, rather than retrying the production answer wait for ten
+	// minutes.
+	answerBound(m, 300*time.Millisecond)
+	tr := m.client.Transport.(*http.Transport)
+	dial := tr.DialContext
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetWriteBuffer(4096)
+		}
+		return conn, nil
+	}
 	started := time.Now()
 	code := m.Start(c.ctx, moveURL)
 	took := time.Since(started)

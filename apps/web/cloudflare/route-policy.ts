@@ -33,6 +33,9 @@ export const originRoutes = Object.freeze({
     "/messaging/",
     "/feedback/threads/",
     "/feedback/attachments/",
+    // Keep transfer API requests out of the SPA fallback. The API origin
+    // returns 404 until the registrar is mounted with production auth.
+    "/api/secretary-transfer/",
     "/workspaces/",
     "/workspace-invites/",
     "/apps/",
@@ -97,6 +100,7 @@ export const deniedRoutes = Object.freeze({
     "/wrangler.jsonc",
     "/workspace-invites",
     "/apps",
+    "/api/secretary-transfer",
     "/agent/ws",
     "/internal",
     "/local-control/v1",
