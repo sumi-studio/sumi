@@ -1096,6 +1096,18 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+// Helper graph selectors also have prepare/launch cases. Phase contracts must
+// inspect the action dispatch, not the first similarly named helper branch.
+func supervisorActionDispatch(t *testing.T, supervisor string) string {
+	t.Helper()
+	const marker = "\ncase \"${action}\" in\n"
+	start := strings.Index(supervisor, marker)
+	if start < 0 {
+		t.Fatal("supervisor has no explicit action dispatch")
+	}
+	return supervisor[start+len(marker):]
+}
+
 func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	prepare := readDeploymentFile(t, "compose.prepare.yaml")
 	for _, service := range []string{"runtime", "executor", "broker"} {
@@ -1107,7 +1119,7 @@ func TestDeploymentPrepareGraphCannotStartLongLivedRoles(t *testing.T) {
 	if !regexp.MustCompile(`(?m)^  allocator:$`).MatchString(prepare) || !regexp.MustCompile(`(?m)^  prepare:$`).MatchString(prepare) {
 		t.Fatal("prepare graph omits allocator or filesystem prepare role")
 	}
-	supervisor := readDeploymentFile(t, "supervisor")
+	supervisor := supervisorActionDispatch(t, readDeploymentFile(t, "supervisor"))
 	prepareStart := strings.Index(supervisor, "  prepare)")
 	activateStart := strings.Index(supervisor, "  activate)")
 	if prepareStart < 0 || activateStart <= prepareStart {
@@ -1487,12 +1499,13 @@ func waitForSupervisorProcessGone(t *testing.T, pid int, limit time.Duration) {
 
 func TestDeploymentActivateCannotRerunAllocatorOrExposeDockerSocket(t *testing.T) {
 	supervisor := readDeploymentFile(t, "supervisor")
-	activateStart := strings.Index(supervisor, "  activate)")
-	abortStart := strings.Index(supervisor, "  abort)")
+	actions := supervisorActionDispatch(t, supervisor)
+	activateStart := strings.Index(actions, "  activate)")
+	abortStart := strings.Index(actions, "  abort)")
 	if activateStart < 0 || abortStart <= activateStart {
 		t.Fatal("supervisor has no explicit activate phase")
 	}
-	activate := supervisor[activateStart:abortStart]
+	activate := actions[activateStart:abortStart]
 	if !strings.Contains(activate, "--no-deps") || !strings.Contains(activate, "executor broker runtime") {
 		t.Fatalf("activate phase can reach a one-shot allocator dependency:\n%s", activate)
 	}
@@ -1503,7 +1516,7 @@ func TestDeploymentActivateCannotRerunAllocatorOrExposeDockerSocket(t *testing.T
 		t.Fatal("activation environment validation does not establish the local-control trust snapshot")
 	}
 	validate := strings.Index(activate, "require_launch_environment")
-	launch := strings.Index(activate, `run_tracked_compose "${COMPOSE_FILE}"`)
+	launch := strings.Index(activate, "run_tracked_compose launch up")
 	firstRevalidation := strings.Index(activate, "revalidate_local_control_socket")
 	lastRevalidation := strings.LastIndex(activate, "revalidate_local_control_socket")
 	if validate < 0 || firstRevalidation <= validate || launch <= firstRevalidation || lastRevalidation <= launch {
@@ -1514,9 +1527,9 @@ func TestDeploymentActivateCannotRerunAllocatorOrExposeDockerSocket(t *testing.T
 			t.Fatalf("%s exposes the Docker socket to a container", file)
 		}
 	}
-	stopStart := strings.Index(supervisor, "  stop|down)")
-	statusStart := strings.Index(supervisor, "  status|ps)")
-	if stopStart < 0 || statusStart <= stopStart || strings.Contains(supervisor[stopStart:statusStart], "--volumes") {
+	stopStart := strings.Index(actions, "  stop|down)")
+	statusStart := strings.Index(actions, "  status|ps)")
+	if stopStart < 0 || statusStart <= stopStart || strings.Contains(actions[stopStart:statusStart], "--volumes") {
 		t.Fatal("ordinary stop can remove PAID-private volumes")
 	}
 }

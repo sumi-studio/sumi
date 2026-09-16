@@ -296,7 +296,7 @@ paths:
           description: kind, size, mtime_ns, version, fingerprint, external_change
         '403': { description: No grant for scope, or path escapes scope }
         '404': { description: Path not found }
-        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/list:
     get:
       operationId: fileList
@@ -309,6 +309,7 @@ paths:
         '200': { description: entries[] (name, kind, size, mtime_ns), next_cursor }
         '400': { description: Path is not a directory }
         '404': { description: Path not found }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/read:
     get:
       operationId: fileRead
@@ -322,10 +323,12 @@ paths:
           description: >-
             File bytes. X-File-Version carries the last service-minted
             version; X-External-Change: true marks content changed outside
-            the API since that version.
+            the API since that version. The first bytes are read before
+            the status is sent; if storage fails later the body is
+            truncated short of Content-Length.
         '400': { description: wrong_kind (directory or special file) }
         '404': { description: Path not found }
-        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable | content_unavailable (file bytes unreadable, e.g. object storage unreachable; safe to retry) }
   /v1/files/{scope}/write:
     put:
       operationId: fileWrite
@@ -336,7 +339,7 @@ paths:
         '200': { description: '{ "version": n }' }
         '409': { description: version_conflict }
         '413': { description: Body exceeds the 256 MiB service ceiling }
-        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/rename:
     post:
       operationId: fileRename
@@ -357,13 +360,14 @@ paths:
         '400': { description: wrong_kind on file/dir kind mismatch }
         '404': { description: Source not found }
         '409': { description: version_conflict | dir_not_empty | external_change }
-        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/mkdir:
     post:
       operationId: fileMkdir
       description: 'JSON body { "path": "..." }; creates parents.'
       responses:
         '200': { description: '{ "version": n }' }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/remove:
     delete:
       operationId: fileRemove
@@ -375,7 +379,7 @@ paths:
         '400': { description: reserved_name (any .filesv-tmp-/.filesv-op- path segment) }
         '404': { description: Path not found }
         '409': { description: version_conflict | external_change }
-        '503': { description: mount_unavailable | store_unavailable | pending_settlement | unavailable }
+        '503': { description: mount_unavailable | mount_policy | store_unavailable | pending_settlement | unavailable }
   /v1/files/{scope}/changes:
     get:
       operationId: fileChanges

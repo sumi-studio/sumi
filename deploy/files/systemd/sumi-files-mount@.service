@@ -1,0 +1,29 @@
+# One JuiceFS client of the canonical files volume.
+#   user unit on the WSL alpha origin: instance "service",
+#     env ~/.config/sumi-files/service.env, binaries ~/.local/lib/sumi-files
+#   system unit on executor hosts (root, adds allow_other): instance "executor",
+#     env /etc/sumi-files/executor.env, binaries /root/.local/lib/sumi-files
+# ($$ passes a literal $ to bash; systemd itself substitutes nothing here.)
+[Unit]
+Description=Sumi canonical files volume client (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SUMI_FILES_ENV=%E/sumi-files/%i.env
+Environment=SUMI_FILES_BIN=%h/.local/lib/sumi-files
+ExecStart=/bin/bash -c 'exec "$${SUMI_FILES_BIN}/sumi-files-mount" "$${SUMI_FILES_ENV}"'
+# Ready only when the mount serves the pinned volume with zero metadata cache.
+ExecStartPost=/bin/bash -c 'set -a; . "$${SUMI_FILES_ENV}"; exec "$${SUMI_FILES_BIN}/sumi-files-check" --wait 60 "$${SUMI_FILES_MOUNTPOINT}" "$${SUMI_FILES_VOLUME_UUID}"'
+# Unmount; lazily if a holder keeps it busy. A client that still serves a held
+# executor bind after SIGTERM is killed at TimeoutStopSec (holders then see ENOTCONN).
+ExecStop=/bin/bash -c 'set -a; . "$${SUMI_FILES_ENV}"; m="$${SUMI_FILES_MOUNTPOINT}"; umount "$$m" 2>/dev/null || fusermount3 -u "$$m" 2>/dev/null || umount -l "$$m" 2>/dev/null || fusermount3 -uz "$$m"'
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
