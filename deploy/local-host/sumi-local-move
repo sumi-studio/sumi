@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# sumi-local-move — bring this Local secretary into a Sumi Cloud registration.
+#
+#   sumi-local-move start     paste the move URL shown by Sumi Cloud (stdin)
+#   sumi-local-move resume    continue an interrupted move
+#   sumi-local-move cancel    cancel before the Cloud account is created
+#   sumi-local-move status    show where the move stands
+#
+# Reads the same state home and config.env as sumi-local (SUMI_LOCAL_HOME,
+# default $XDG_STATE_HOME/sumi/local) and hands the Local database URL and
+# persona id to the Go command through its environment — never argv. The
+# move URL is read from stdin. Progress lives in <state-home>/move (0700).
+# Docs: docs/local-cloud-move.md
+set -Eeuo pipefail
+
+readonly PROG=sumi-local-move
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+die() { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+home="$(realpath -m "${SUMI_LOCAL_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/sumi/local}")"
+config="$home/config.env"
+[[ -r $config ]] || die "no readable $config — install Sumi Local first (sumi-local install)"
+
+# Same data-only contract as sumi-local: KEY=value lines, quoted or bare,
+# last wins; nothing is executed.
+config_val() {
+  node -e '
+    const fs=require("fs");
+    let hit=null;
+    for (const l of fs.readFileSync(process.argv[1],"utf8").split("\n")) {
+      const m=l.replace(/\r$/,"").match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m || m[1]!==process.argv[2]) continue;
+      let v=m[2];
+      if (v.length>=2 && v.startsWith("\x27") && v.endsWith("\x27"))
+        v=v.slice(1,-1).replace(/\x27\\\x27\x27/g,"\x27");
+      else if (v.length>=2 && v.startsWith("\x22") && v.endsWith("\x22"))
+        v=v.slice(1,-1);
+      hit=v;
+    }
+    if (hit!==null) process.stdout.write(hit);
+  ' "$config" "$1"
+}
+
+persona="$(config_val SUMI_PERSONA_ID)"
+[[ -n $persona ]] || die "$config has no SUMI_PERSONA_ID"
+mode="$(config_val SUMI_LOCAL_DB_MODE)"
+case $mode in
+  external)
+    db_url="$(config_val SUMI_DB_URL)"
+    [[ -n $db_url ]] || die "$config has no SUMI_DB_URL"
+    ;;
+  managed)
+    container="$(config_val SUMI_LOCAL_PG_CONTAINER)"
+    password="$(config_val SUMI_LOCAL_PG_PASSWORD)"
+    [[ -n $container && -n $password ]] || die "$config is missing the managed database settings"
+    addr="$(docker port "$container" 5432/tcp 2>/dev/null | grep -m1 '^127\.0\.0\.1:' || true)"
+    [[ -n $addr ]] || die "the managed database is not running — run: sumi-local start"
+    db_url="postgres://sumi:${password}@${addr}/sumi?sslmode=disable"
+    ;;
+  *) die "$config has an unknown SUMI_LOCAL_DB_MODE '$mode'" ;;
+esac
+
+# The command: an explicit binary, one installed next to this script, or a
+# build from the source checkout this script lives in.
+bin="${SUMI_LOCAL_MOVE_BIN:-}"
+if [[ -z $bin && -x $SCRIPT_DIR/sumi-local-move-bin ]]; then
+  bin="$SCRIPT_DIR/sumi-local-move-bin"
+elif [[ -z $bin && -f $SCRIPT_DIR/../../apps/api/cmd/local-move/main.go ]]; then
+  command -v go >/dev/null || die "go is required to build sumi-local-move from a source checkout"
+  mkdir -p "$home/run"
+  bin="$home/run/sumi-local-move"
+  (cd "$SCRIPT_DIR/../../apps/api" && go build -buildvcs=false -o "$bin" ./cmd/local-move) \
+    || die "building sumi-local-move failed"
+fi
+[[ -n $bin ]] || die "sumi-local-move binary not found; set SUMI_LOCAL_MOVE_BIN"
+
+SUMI_LOCAL_HOME="$home" SUMI_DB_URL="$db_url" SUMI_PERSONA_ID="$persona" exec "$bin" "$@"
