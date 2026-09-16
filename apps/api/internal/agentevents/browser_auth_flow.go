@@ -123,6 +123,14 @@ var (
 	ErrBrowserAuthLastMethod          = errors.New("last login method")
 	ErrBrowserAuthProviderPending     = errors.New("provider operation pending")
 	ErrBrowserAuthProviderUnavailable = errors.New("provider operation unavailable")
+	// ErrBrowserTransferPending is a registration that chose to bring its
+	// Local secretary while that secretary has not arrived yet: run the move
+	// command or cancel the session, then finish.
+	ErrBrowserTransferPending = errors.New("secretary move is still waiting for its bundle")
+	// ErrBrowserTransferUnavailable is a registration whose chosen transfer
+	// can no longer be claimed (cancelled, expired or raced); the person
+	// starts the move choice again.
+	ErrBrowserTransferUnavailable = errors.New("secretary move can no longer be claimed")
 )
 
 // BrowserAuthFlowController owns persisted intent/proof transitions. It never
@@ -451,6 +459,10 @@ func writeFlowError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "provider_operation_pending"
 	case errors.Is(err, ErrBrowserAuthProviderUnavailable):
 		status, code = http.StatusServiceUnavailable, "provider_unavailable"
+	case errors.Is(err, ErrBrowserTransferPending):
+		status, code = http.StatusConflict, "transfer_pending"
+	case errors.Is(err, ErrBrowserTransferUnavailable):
+		status, code = http.StatusConflict, "transfer_unavailable"
 	}
 	body["error"] = code
 	writeBrowserAuthJSON(w, status, body)

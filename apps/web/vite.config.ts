@@ -92,6 +92,7 @@ export function createDevServerConfig(
     proxy: {
       "/auth": apiProxy(target.origin),
       "/api/model-connections": apiProxy(target.origin),
+      "/api/secretary-transfer": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
       "^/feedback/(bootstrap|threads|attachments|diagnostics)(?:/|\\?|$)":
@@ -126,5 +127,14 @@ export default defineConfig({
     process.env.SUMI_DEV_HOST?.trim() || SUMI_DEV_HOST,
     parseDevAllowedHosts(process.env.SUMI_DEV_ALLOWED_HOSTS),
     parseDevPort(process.env.SUMI_DEV_PORT),
+  ),
+  // `vite preview` serves the production build locally; it shares the dev
+  // server's same-origin API proxy so a built bundle can be exercised
+  // against a real API without an edge in front.
+  preview: createDevServerConfig(
+    process.env.SUMI_DEV_API_ORIGIN?.trim() || SUMI_DEV_API_ORIGIN,
+    SUMI_DEV_HOST,
+    [],
+    4173,
   ),
 });

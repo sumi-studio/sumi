@@ -169,7 +169,8 @@ func browserAuthServerFromEnv(
 	sessions *agentevents.HMACUserSessionVerifier,
 	allowedOrigins []string,
 ) (*agentevents.BrowserAuthServer, bool, error) {
-	return browserAuthServerFromEnvWithDB(ctx, sessions, allowedOrigins, nil)
+	server, _, enabled, err := browserAuthServerFromEnvWithDB(ctx, sessions, allowedOrigins, nil)
+	return server, enabled, err
 }
 
 // browserAuthServerFromEnvWithDB enables the explicit 戸籍 auth-flow boundary
@@ -183,7 +184,7 @@ func browserAuthServerFromEnvWithDB(
 	allowedOrigins []string,
 	pool *pgxpool.Pool,
 	directChatLifecycle ...*directchat.LifecycleFence,
-) (*agentevents.BrowserAuthServer, bool, error) {
+) (*agentevents.BrowserAuthServer, *secretaryTransferMount, bool, error) {
 	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
 	kosekiMode := pool != nil
 	if !kosekiMode && firebaseUID == "" {
@@ -192,13 +193,13 @@ func browserAuthServerFromEnvWithDB(
 				continue
 			}
 			if strings.TrimSpace(os.Getenv(name)) != "" {
-				return nil, false, errors.New("SUMI_AUTH_FIREBASE_UID is required when any SUMI_AUTH_* setting is configured")
+				return nil, nil, false, errors.New("SUMI_AUTH_FIREBASE_UID is required when any SUMI_AUTH_* setting is configured")
 			}
 		}
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if sessions == nil {
-		return nil, false, errors.New("SUMI_BROWSER_SESSION_SECRET is required when Firebase auth is enabled")
+		return nil, nil, false, errors.New("SUMI_BROWSER_SESSION_SECRET is required when Firebase auth is enabled")
 	}
 
 	projectID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_PROJECT_ID"))
@@ -206,7 +207,7 @@ func browserAuthServerFromEnvWithDB(
 		projectID = strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_PROJECT"))
 	}
 	if projectID == "" {
-		return nil, false, errors.New("SUMI_AUTH_FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT is required when Firebase auth is enabled")
+		return nil, nil, false, errors.New("SUMI_AUTH_FIREBASE_PROJECT_ID or GOOGLE_CLOUD_PROJECT is required when Firebase auth is enabled")
 	}
 
 	firebaseTenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_TENANT_ID"))
@@ -215,11 +216,11 @@ func browserAuthServerFromEnvWithDB(
 	if kosekiMode {
 		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
 		if tenantID == "" {
-			return nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
+			return nil, nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
 		}
 		wrappingKeyID := strings.TrimSpace(os.Getenv("SUMI_AGENT_WRAPPING_KEY_ID"))
 		if err := runtimeprovision.ValidateAgentWrappingKeyID(wrappingKeyID); err != nil {
-			return nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
+			return nil, nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
 		}
 		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID, directChatLifecycle...)
 		registrationStore.EnrollmentWorkspaceAuthority = workspacecontrol.New(pool)
@@ -229,7 +230,7 @@ func browserAuthServerFromEnvWithDB(
 		userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
 		personalityAgentID := strings.TrimSpace(os.Getenv("SUMI_AUTH_PERSONALITY_AGENT_ID"))
 		if tenantID == "" || userID == "" || personalityAgentID == "" {
-			return nil, false, errors.New("SUMI_AUTH_TENANT_ID, SUMI_AUTH_USER_ID, and SUMI_AUTH_PERSONALITY_AGENT_ID are required when Firebase auth is enabled")
+			return nil, nil, false, errors.New("SUMI_AUTH_TENANT_ID, SUMI_AUTH_USER_ID, and SUMI_AUTH_PERSONALITY_AGENT_ID are required when Firebase auth is enabled")
 		}
 		resolver, err := agentevents.NewStaticIdentityBindingResolverForTenant(
 			firebaseUID,
@@ -241,7 +242,7 @@ func browserAuthServerFromEnvWithDB(
 			},
 		)
 		if err != nil {
-			return nil, false, fmt.Errorf("Firebase identity binding: %w", err)
+			return nil, nil, false, fmt.Errorf("Firebase identity binding: %w", err)
 		}
 		bindings = resolver
 	}
@@ -254,11 +255,11 @@ func browserAuthServerFromEnvWithDB(
 		ServiceAccountID: strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID")),
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("initialize Firebase Admin SDK: %w", err)
+		return nil, nil, false, fmt.Errorf("initialize Firebase Admin SDK: %w", err)
 	}
 	client, err := app.Auth(ctx)
 	if err != nil {
-		return nil, false, fmt.Errorf("initialize Firebase Auth client: %w", err)
+		return nil, nil, false, fmt.Errorf("initialize Firebase Auth client: %w", err)
 	}
 	var verifierClient firebaseIDTokenClient = client
 	var providerClient firebaseProviderUserClient = client
@@ -266,7 +267,7 @@ func browserAuthServerFromEnvWithDB(
 	if firebaseTenantID != "" {
 		tenantClient, err := client.TenantManager.AuthForTenant(firebaseTenantID)
 		if err != nil {
-			return nil, false, fmt.Errorf("initialize Firebase tenant Auth client: %w", err)
+			return nil, nil, false, fmt.Errorf("initialize Firebase tenant Auth client: %w", err)
 		}
 		verifierClient = tenantClient
 		providerClient = tenantClient
@@ -277,7 +278,7 @@ func browserAuthServerFromEnvWithDB(
 	if raw := strings.TrimSpace(os.Getenv("SUMI_AUTH_ALLOW_INSECURE_COOKIES")); raw != "" {
 		allow, err := strconv.ParseBool(raw)
 		if err != nil {
-			return nil, false, errors.New("SUMI_AUTH_ALLOW_INSECURE_COOKIES must be a boolean")
+			return nil, nil, false, errors.New("SUMI_AUTH_ALLOW_INSECURE_COOKIES must be a boolean")
 		}
 		secureCookies = !allow
 	}
@@ -290,11 +291,11 @@ func browserAuthServerFromEnvWithDB(
 		secureCookies,
 	)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	ttl, err := authSessionTTLFromEnv()
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	server.SessionTTL = ttl
 	if kosekiMode {
@@ -307,14 +308,14 @@ func browserAuthServerFromEnvWithDB(
 				continue
 			}
 			if _, err := uuid.Parse(id); err != nil {
-				return nil, false, errors.New("SUMI_ENROLLMENT_ADMIN_HUMAN_IDS must contain Human UUIDs")
+				return nil, nil, false, errors.New("SUMI_ENROLLMENT_ADMIN_HUMAN_IDS must contain Human UUIDs")
 			}
 			var exists bool
 			if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM humans WHERE human_id=$1)", id).Scan(&exists); err != nil {
-				return nil, false, err
+				return nil, nil, false, err
 			}
 			if !exists {
-				return nil, false, errors.New("enrollment admin Human does not exist")
+				return nil, nil, false, errors.New("enrollment admin Human does not exist")
 			}
 			server.EnrollmentAdmins[id] = true
 		}
@@ -325,7 +326,7 @@ func browserAuthServerFromEnvWithDB(
 		)
 		emailConfig, err := emailAuthConfigFromEnv(allowedOrigins, secureCookies)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 		if emailConfig != nil {
 			registrationStore.EmailChallengeKey = emailConfig.key
@@ -338,7 +339,11 @@ func browserAuthServerFromEnvWithDB(
 		}
 		server.Flows = controller
 	}
-	return server, true, nil
+	transfer, err := secretaryTransferFromEnv(pool, registrationStore, allowedOrigins)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return server, transfer, true, nil
 }
 
 func authSessionTTLFromEnv() (time.Duration, error) {
