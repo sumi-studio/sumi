@@ -213,7 +213,7 @@ func TestTargetedInvitationListAppliesExactTargetAndCurrentAdmissionTruth(t *tes
 		t.Fatal(err)
 	}
 
-	page, err := w.store.targetedInvitationPageFor(ctx, w.agentA, nil)
+	page, err := w.store.targetedInvitationPageFor(ctx, w.pool, w.agentA, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestTargetedInvitationListAppliesExactTargetAndCurrentAdmissionTruth(t *tes
 			t.Fatalf("ineligible invitation %s was exposed", hidden)
 		}
 	}
-	otherPage, err := w.store.targetedInvitationPageFor(ctx, w.agentB, nil)
+	otherPage, err := w.store.targetedInvitationPageFor(ctx, w.pool, w.agentB, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -234,9 +234,12 @@ TypeScript core (`apps/core`): the API mounts the persona-scoped state
 service at `/internal/core`, Messaging attention is admitted as durable core
 inputs with secretary replies delivered back through the messaging effect,
 and Direct Chat commands are served through the same core state
-(`SUMI_DIRECT_CHAT_BACKEND=core`). The Messaging core path stops there for
-now: shared Messaging history/search and workspace-invitation acceptance
-still run on their existing surfaces and are not part of this mode. A local
+(`SUMI_DIRECT_CHAT_BACKEND=core`). Workspace-invitation list/accept run as
+delegated core tools (`workspace_invitation.list` /
+`workspace_invitation.accept`): acceptance commits atomically with the
+operation record under the secretary's own identity, the same guarantee the
+runtime's local-control calls gave. Shared Messaging history/search still
+run on their existing surfaces and are not part of this mode. A local
 dev pool
 (`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`) runs one
 `host/local.ts` Node process per persona, started by the API's wake sweep —

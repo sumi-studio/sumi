@@ -259,6 +259,7 @@ func (s *Store) workspacePageFor(
 // as target or Workspace authority.
 func (s *Store) targetedInvitationPageFor(
 	ctx context.Context,
+	db workspaceQuerier,
 	target participant.Ref,
 	after *workspaceInvitationListCursorPosition,
 ) (workspaceInvitationListPage, error) {
@@ -312,7 +313,7 @@ func (s *Store) targetedInvitationPageFor(
 	if after != nil {
 		afterID = after.InvitationID
 	}
-	rows, err := s.pool.Query(
+	rows, err := db.Query(
 		ctx,
 		selectPage,
 		target.ID,
@@ -1089,10 +1090,34 @@ func (s *Store) AcceptTargetedInvitation(
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
+	membership, err := s.AcceptTargetedInvitationInTx(ctx, tx, invitationID, target)
+	if err != nil {
+		return Membership{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Membership{}, fmt.Errorf("commit targeted Workspace invitation acceptance: %w", err)
+	}
+	return membership, nil
+}
+
+// AcceptTargetedInvitationInTx is AcceptTargetedInvitation inside the
+// caller's transaction: the caller owns Begin/Commit so the acceptance can
+// commit atomically with an enclosing record (the core claim transaction).
+func (s *Store) AcceptTargetedInvitationInTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	invitationID string,
+	target participant.Ref,
+) (Membership, error) {
+	if !isCanonicalUUIDv7(invitationID) ||
+		target.Kind != participant.KindPersonalityAgent || target.Validate() != nil {
+		return Membership{}, ErrInviteUnavailable
+	}
+
 	// This is resolution only, not authority.  Do not lock the invitation before
 	// its Workspace lock root, and do not reveal whether another target owns it.
 	var workspaceID string
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT workspace_id
 		FROM workspace_invites
 		WHERE invite_id = $1
@@ -1174,9 +1199,6 @@ func (s *Store) AcceptTargetedInvitation(
 		if err != nil {
 			return Membership{}, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Membership{}, fmt.Errorf("commit targeted invitation acceptance replay: %w", err)
-		}
 		return membership, nil
 	}
 
@@ -1253,9 +1275,6 @@ func (s *Store) AcceptTargetedInvitation(
 	}
 	if tag.RowsAffected() != 1 {
 		return Membership{}, ErrInviteUnavailable
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Membership{}, fmt.Errorf("commit targeted Workspace invitation acceptance: %w", err)
 	}
 	return membership, nil
 }
