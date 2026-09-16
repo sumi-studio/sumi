@@ -706,6 +706,10 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 			firstClaims.authorityBindingID,
 		)
 	}
+	// A replay presenting the retired predecessor cookie is a lost-response
+	// recovery: the retired credential is non-authoritative, the fresh
+	// id_token proves the same Human, and the epoch tip is rotated into the
+	// newly issued session rather than wedging the jar.
 	replayedExchange := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"id_token":"concurrent-replay"}`))
 	replayedExchange.Header.Set("Origin", browserAuthTestOrigin)
 	replayedExchange.Header.Set("Content-Type", "application/json")
@@ -715,11 +719,22 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	replayedExchange.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: first})
 	replayedRecorder := httptest.NewRecorder()
 	server.serveSessionExchange(replayedRecorder, replayedExchange)
-	if replayedRecorder.Code != http.StatusServiceUnavailable || len(replayedRecorder.Result().Cookies()) != 0 {
-		t.Fatalf("retired replacement credential minted another session: %d %+v", replayedRecorder.Code, replayedRecorder.Result().Cookies())
+	if replayedRecorder.Code != http.StatusNoContent {
+		t.Fatalf("lost-response replay was refused: %d %s", replayedRecorder.Code, replayedRecorder.Body.String())
 	}
-	if _, err := sessions.VerifySession(context.Background(), second); err != nil {
-		t.Fatalf("replayed old credential invalidated replacement: %v", err)
+	replayedCookies := replayedRecorder.Result().Cookies()
+	if len(replayedCookies) != 1 {
+		t.Fatalf("replay cookies = %d, want 1", len(replayedCookies))
+	}
+	if _, err := sessions.VerifySession(context.Background(), second); err == nil {
+		t.Fatal("replayed issuance left the displaced tip authoritative")
+	}
+	replayedClaims, err := sessions.VerifySession(context.Background(), replayedCookies[0].Value)
+	if err != nil {
+		t.Fatalf("replayed session is invalid: %v", err)
+	}
+	if replayedClaims.authorityBindingID != firstClaims.authorityBindingID {
+		t.Fatal("replayed issuance changed the authority binding")
 	}
 
 	logout := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
@@ -727,16 +742,16 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 	logout.Header.Set("X-CSRF-Token", csrf)
 	logout.AddCookie(csrfCookie)
 	logout.AddCookie(epochCookie)
-	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: second})
+	logout.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: replayedCookies[0].Value})
 	logoutRecorder := httptest.NewRecorder()
 	server.serveLogout(logoutRecorder, logout)
 	if logoutRecorder.Code != http.StatusNoContent {
 		t.Fatalf("replacement logout: %d %s", logoutRecorder.Code, logoutRecorder.Body.String())
 	}
-	if _, err := sessions.VerifySession(context.Background(), second); err == nil {
+	if _, err := sessions.VerifySession(context.Background(), replayedCookies[0].Value); err == nil {
 		t.Fatal("logout left replacement session authoritative")
 	}
-	if len(closer.sessionIDs) != 2 || closer.sessionIDs[1] != secondClaims.sessionID {
+	if len(closer.sessionIDs) != 3 || closer.sessionIDs[2] != replayedClaims.sessionID {
 		t.Fatalf("replacement lifecycle closed sessions %v", closer.sessionIDs)
 	}
 }
@@ -835,9 +850,11 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	}
 	wait.Wait()
 
+	// Both requests carry a fresh valid id_token for the same Human, so each
+	// mints a session on its own epoch. The shared predecessor cookie is
+	// retired exactly once — whichever admission commits first revokes it —
+	// and the loser's request simply treats the retired cookie as absent.
 	successes := 0
-	failures := 0
-	var replacement string
 	for _, recorder := range recorders {
 		switch recorder.Code {
 		case http.StatusNoContent:
@@ -846,24 +863,18 @@ func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 			if len(cookies) != 1 {
 				t.Fatalf("successful replacement cookies = %+v", cookies)
 			}
-			replacement = cookies[0].Value
-		case http.StatusServiceUnavailable:
-			failures++
-			if len(recorder.Result().Cookies()) != 0 {
-				t.Fatal("replayed replacement published a cookie")
+			if _, err := secondSessions.VerifySession(
+				context.Background(),
+				cookies[0].Value,
+			); err != nil {
+				t.Fatalf("minted replacement is invalid: %v", err)
 			}
 		default:
 			t.Fatalf("replacement status = %d", recorder.Code)
 		}
 	}
-	if successes != 1 || failures != 1 {
-		t.Fatalf("replacement outcomes: successes=%d failures=%d", successes, failures)
-	}
-	if _, err := secondSessions.VerifySession(
-		context.Background(),
-		replacement,
-	); err != nil {
-		t.Fatalf("winning replacement is invalid: %v", err)
+	if successes != 2 {
+		t.Fatalf("replacement outcomes: successes=%d, want both", successes)
 	}
 	if _, err := firstSessions.VerifySession(
 		context.Background(),

@@ -1292,6 +1292,70 @@ describe("logout authority transition", () => {
     );
   });
 
+  it("recovers a provider confirmation whose commit response was lost", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    const firebaseUser = {
+      uid: "firebase-existing",
+      displayName: "Existing Human",
+      email: "existing@example.com",
+    };
+    const firebaseAuth = {
+      currentUser: firebaseUser,
+      authStateReady: vi.fn().mockResolvedValue(undefined),
+    };
+    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue({
+      ...pendingRedirectReceipt(),
+      intent: "sign_up",
+    });
+    authMocks.resolveRedirectSignInUser.mockResolvedValue(firebaseUser);
+    authMocks.getIdToken.mockResolvedValue("id-token-existing");
+    authMocks.resolveAuthFlow
+      .mockResolvedValueOnce({
+        flowId: "flow-id",
+        outcome: "confirmation_required",
+        nextAction: "sign_in",
+        continuation: "/",
+        expiresAt: "2026-08-01T01:00:00Z",
+      })
+      .mockResolvedValue({
+        flowId: "flow-id",
+        outcome: "signed_in",
+        continuation: "/",
+        expiresAt: "2026-08-01T01:00:00Z",
+        humanId: "user-existing",
+      });
+    authMocks.verifyCommittedSumiSession.mockResolvedValue({
+      authenticated: true,
+      authorityBindingId: authorityBindingB,
+      user: { id: "user-existing" },
+    });
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("confirmation")).toHaveTextContent("sign_in");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "confirm transition" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      );
+    });
+    // The re-resolve replayed the committed completion for a provider flow,
+    // so no second confirm is issued.
+    expect(authMocks.confirmAuthFlow).not.toHaveBeenCalled();
+    expect(screen.getByTestId("outcome")).toHaveTextContent(
+      "signed_in:sign_up:confirmed",
+    );
+  });
+
   it("invalidates pending confirmation when Firebase auth state changes", async () => {
     let authObserver: ((user: { uid: string } | null) => void) | undefined;
     authMocks.onAuthStateChanged.mockImplementation((_auth, observer) => {

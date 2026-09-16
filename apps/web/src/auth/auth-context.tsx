@@ -1274,13 +1274,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         });
         let confirmed: Awaited<ReturnType<typeof confirmAuthFlow>>;
         if (
-          pending.provider === "email_code" &&
           auth.currentUser?.uid === pending.firebaseUID &&
           (refreshed.outcome === "signed_in" ||
             refreshed.outcome === "account_created")
         ) {
-          // The email confirmation committed earlier but its session was
-          // lost; this resolve replayed the same completion.
+          // The confirmation committed earlier but its issuance was refused
+          // or its response was lost; this resolve replayed the same
+          // completion for any channel.
           confirmed = refreshed;
         } else {
           if (

@@ -366,8 +366,12 @@ func TestEmailProofRetriesKeepAuthorityAndSecondUseIsDistinct(t *testing.T) {
 			t.Fatalf("replay with %s accepted: %v", name, err)
 		}
 	}
-	if _, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionSignIn); !errors.Is(err, ErrAuthFlowConsumed) {
-		t.Fatalf("confirmation replay: %v", err)
+	if _, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount); !errors.Is(err, ErrAuthFlowConsumed) {
+		t.Fatalf("confirmation replay with the wrong action: %v", err)
+	}
+	confirmed, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionSignIn)
+	if err != nil || confirmed.TerminalOutcome != OutcomeSignedIn || confirmed.HumanID != registered.HumanID {
+		t.Fatalf("same-action confirmation replay must recover the outcome: %+v %v", confirmed, err)
 	}
 	if _, err := store.VerifyEmailCode(ctx, flow.FlowID, testNonce(t), code); !errors.Is(err, ErrInvalidAuthFlow) {
 		t.Fatalf("other authority replayed completion: %v", err)
@@ -811,8 +815,12 @@ func TestEmailCompletionReplayGrantsNoSecondAccountOrInvitation(t *testing.T) {
 	if err != nil || confirmed.TerminalOutcome != OutcomeAccountCreated {
 		t.Fatalf("confirm: %+v %v", confirmed, err)
 	}
-	if _, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount); !errors.Is(err, ErrAuthFlowConsumed) {
-		t.Fatalf("second confirmation: %v", err)
+	if _, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionSignIn); !errors.Is(err, ErrAuthFlowConsumed) {
+		t.Fatalf("confirmation replay with the wrong action: %v", err)
+	}
+	secondConfirm, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount)
+	if err != nil || secondConfirm.TerminalOutcome != OutcomeAccountCreated || secondConfirm.HumanID != confirmed.HumanID {
+		t.Fatalf("same-action confirmation replay must recover the outcome: %+v %v", secondConfirm, err)
 	}
 	replayed, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, customTokenProof("replay-invited"))
 	if err != nil || replayed.TerminalOutcome != OutcomeAccountCreated || replayed.HumanID != confirmed.HumanID {

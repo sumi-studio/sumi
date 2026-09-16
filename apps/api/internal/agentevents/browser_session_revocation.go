@@ -338,18 +338,28 @@ func admitBrowserSessionState(
 
 	presentedLive := false
 	if admission.Presented != nil {
-		if err := checkBrowserSessionState(
+		err := checkBrowserSessionState(
 			*state,
 			admission.Presented.ID,
 			admission.Presented.ExpiresAt.Unix(),
 			nowUnix,
-		); err != nil {
+		)
+		switch {
+		case errors.Is(err, errBrowserSessionRevoked):
 			// A locally valid but durably retired cookie is consumed
-			// authority, not a fresh start: replaying it must not mint or
-			// displace a session. Locally invalid cookies never reach here.
+			// authority — a lost logout or rotation response leaves exactly
+			// this in the jar. It is non-authoritative, like an absent
+			// cookie: it cannot mint, displace, or stand in for the jar's
+			// current Human, and the epoch's live tip is still evaluated
+			// independently below. Locally invalid cookies never reach here.
+		case err != nil:
+			// A stored record contradicting the presented credential is an
+			// integrity violation and keeps failing closed.
 			return outcome, fmt.Errorf("presented session: %w", err)
-		} else if lineage, exists := state.Lineages[admission.Presented.ID]; !exists || lineage.Successor == "" {
-			presentedLive = true
+		default:
+			if lineage, exists := state.Lineages[admission.Presented.ID]; !exists || lineage.Successor == "" {
+				presentedLive = true
+			}
 		}
 	}
 
@@ -407,14 +417,23 @@ func admitBrowserSessionState(
 		retired[sessionID] = struct{}{}
 		return nil
 	}
+	// The successor's lineage parent is the live presented cookie, or — when
+	// the request's cookie was absent or already consumed — the epoch tip
+	// this admission displaces, so a later logout can still walk the jar's
+	// real session chain.
+	parentID := ""
 	if presentedLive {
 		if err := retire(admission.Presented.ID, admission.Presented.ExpiresAt.Unix()); err != nil {
 			return outcome, err
 		}
+		parentID = admission.Presented.ID
 	}
 	if tipID != "" && tipID != admission.PresentedID() {
 		if err := retire(tipID, state.Lineages[tipID].ExpiresAt); err != nil {
 			return outcome, err
+		}
+		if parentID == "" {
+			parentID = tipID
 		}
 	}
 
@@ -434,14 +453,16 @@ func admitBrowserSessionState(
 		Epoch:       admission.Epoch,
 		Human:       admission.SuccessorBy,
 	}
-	if presentedLive {
+	if parentID != "" {
 		successor := state.Lineages[admission.Successor.ID]
-		successor.Parent = admission.Presented.ID
+		successor.Parent = parentID
 		state.Lineages[admission.Successor.ID] = successor
-		current, exists := state.Lineages[admission.Presented.ID]
+		current, exists := state.Lineages[parentID]
 		if !exists {
 			// A session issued before lineage tracking still rotates into a
 			// fresh record so logout through its cookie revokes the successor.
+			// Only the presented cookie can reach this branch — a live epoch
+			// tip always has a lineage record.
 			current = browserSessionLineageRecord{
 				ExpiresAt:   admission.Presented.ExpiresAt.Unix(),
 				RetainUntil: admission.Presented.ExpiresAt.Unix(),
@@ -451,7 +472,7 @@ func admitBrowserSessionState(
 		if admission.Successor.ExpiresAt.Unix() > current.RetainUntil {
 			current.RetainUntil = admission.Successor.ExpiresAt.Unix()
 		}
-		state.Lineages[admission.Presented.ID] = current
+		state.Lineages[parentID] = current
 		for ancestorID := current.Parent; ancestorID != ""; {
 			ancestor, exists := state.Lineages[ancestorID]
 			if !exists {
@@ -636,11 +657,16 @@ func closeBrowserSessionsForLogoutState(
 		retired[sessionID] = struct{}{}
 		return nil
 	}
+	presentedLive := false
 	for _, session := range presented {
 		expiresAt := session.ExpiresAt.Unix()
 		if lineage, exists := state.Lineages[session.ID]; exists &&
 			lineage.ExpiresAt != expiresAt {
 			return nil, nil, nil, errors.New("browser session lineage expiry changed")
+		}
+		if _, retiredAlready := state.Entries[session.ID]; !retiredAlready &&
+			now.Unix() < expiresAt {
+			presentedLive = true
 		}
 		if err := retire(session.ID, expiresAt); err != nil {
 			return nil, nil, nil, err
@@ -650,6 +676,13 @@ func closeBrowserSessionsForLogoutState(
 	closing := make(map[string]struct{})
 	for _, epoch := range epochs {
 		closing[epoch] = struct{}{}
+		// Retiring the epoch's live tip requires at least one live presented
+		// session: a request carrying only durably retired cookies may still
+		// revoke its own lineage above, but a live session it cannot connect
+		// to that lineage belongs to a later deliberate choice.
+		if !presentedLive {
+			continue
+		}
 		if tip := liveEpochSessionTip(state, epoch, now.Unix()); tip != "" {
 			if err := retire(tip, state.Lineages[tip].ExpiresAt); err != nil {
 				return nil, nil, nil, err
@@ -879,6 +912,10 @@ func revokeBrowserSessionState(
 		lineage.ExpiresAt != expiresAt {
 		return errors.New("browser session lineage expiry changed")
 	}
+	rootHuman := ""
+	if lineage, exists := state.Lineages[sessionID]; exists {
+		rootHuman = lineage.Human
+	}
 	currentID := sessionID
 	currentExpiry := expiresAt
 	visited := make(map[string]struct{})
@@ -899,6 +936,12 @@ func revokeBrowserSessionState(
 		successor, exists := state.Lineages[lineage.Successor]
 		if !exists {
 			return errors.New("browser session lineage successor is missing")
+		}
+		// A recorded Human change marks a deliberate account switch: the
+		// descendant belongs to a later explicit choice that stale cleanup
+		// through an ancestor cookie must not consume.
+		if successor.Human != rootHuman {
+			break
 		}
 		currentID = lineage.Successor
 		currentExpiry = successor.ExpiresAt
