@@ -493,9 +493,7 @@ async function expectRowInViewport(row: Locator, viewport: Locator) {
         const box = await row.boundingBox();
         const frame = await viewport.boundingBox();
         if (!box || !frame) return false;
-        return (
-          box.y + box.height > frame.y && box.y < frame.y + frame.height
-        );
+        return box.y + box.height > frame.y && box.y < frame.y + frame.height;
       },
       { timeout: 5_000, message: "row must intersect the viewport" },
     )
