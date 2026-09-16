@@ -368,3 +368,162 @@ func TestSignUpClaimsTheCarriedSecretary(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// With the transfer surface disabled — no SUMI_TRANSFER_PUBLIC_BASE_URL, so
+// Store.Transfers is nil — account creation must provision directly and never
+// consult transfer_sessions. A leftover awaiting_bundle row must not wedge
+// sign-up on a 409 with no mounted cancel route, and a leftover staged row
+// must not silently adopt a secretary the person never chose. The rows stay
+// as they were: disabled mode cleans nothing up.
+func TestDisabledSurfaceNeverConsultsSessions(t *testing.T) {
+	subject := func(uid string) transfersession.Subject {
+		return transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: uid}
+	}
+	sessionStatus := func(t *testing.T, ctx context.Context, store *Store, sessionID string) string {
+		t.Helper()
+		var status string
+		if err := store.pool.QueryRow(ctx,
+			`SELECT status FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&status); err != nil {
+			t.Fatalf("session status: %v", err)
+		}
+		return status
+	}
+
+	t.Run("a leftover awaiting row does not wedge sign_up", func(t *testing.T) {
+		store, ctx := authFlowStore(t) // Transfers stays nil: the feature is off.
+		sessions := transfersession.New(store.pool, transfersession.Config{})
+		uid := "disabled-awaiting-firebase"
+		created, _, err := sessions.Create(ctx, subject(uid))
+		if err != nil {
+			t.Fatalf("seed stale session: %v", err)
+		}
+		nonce := testNonce(t)
+		flow := startEmailFlow(t, ctx, store, IntentSignUp, "wedge@example.com", nonce)
+		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof(uid, "wedge@example.com"))
+		if err != nil {
+			t.Fatalf("disabled sign-up wedged on a leftover row: %v", err)
+		}
+		if result.TerminalOutcome != OutcomeAccountCreated {
+			t.Fatalf("outcome: %q", result.TerminalOutcome)
+		}
+		if got := sessionStatus(t, ctx, store, created.View.SessionID); got != transfersession.StatusAwaitingBundle {
+			t.Fatalf("leftover session mutated: %s", got)
+		}
+		assertRegistryCounts(t, ctx, store, 1, 1)
+	})
+
+	t.Run("a leftover staged row is not silently adopted by sign_up", func(t *testing.T) {
+		store, ctx := authFlowStore(t)
+		sessions := transfersession.New(store.pool, transfersession.Config{})
+		local := newLocalPlacement(t)
+		uid := "disabled-staged-firebase"
+		sessionID := stageTransfer(t, ctx, store.pool, sessions, local, uid)
+		nonce := testNonce(t)
+		flow := startEmailFlow(t, ctx, store, IntentSignUp, "staged@example.com", nonce)
+		result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof(uid, "staged@example.com"))
+		if err != nil {
+			t.Fatalf("disabled sign-up failed on a leftover row: %v", err)
+		}
+		if result.TerminalOutcome != OutcomeAccountCreated {
+			t.Fatalf("outcome: %q", result.TerminalOutcome)
+		}
+		if result.AgentID == local.pid {
+			t.Fatalf("disabled sign-up adopted the carried persona %s", local.pid)
+		}
+		if got := sessionStatus(t, ctx, store, sessionID); got != transfersession.StatusStaged {
+			t.Fatalf("staged session mutated: %s", got)
+		}
+		var bound string
+		if err := store.pool.QueryRow(ctx,
+			`SELECT coalesce(human_id::text, '') FROM core_personas WHERE persona_id = $1`,
+			local.pid).Scan(&bound); err != nil {
+			t.Fatalf("carried persona lookup: %v", err)
+		}
+		if bound != "" {
+			t.Fatalf("carried persona bound to %s without a claim", bound)
+		}
+		assertRegistryCounts(t, ctx, store, 1, 1)
+	})
+
+	t.Run("a leftover awaiting row does not wedge auto-registration", func(t *testing.T) {
+		store, ctx := authFlowStore(t)
+		sessions := transfersession.New(store.pool, transfersession.Config{})
+		uid := "disabled-awaiting-legacy"
+		created, _, err := sessions.Create(ctx, subject(uid))
+		if err != nil {
+			t.Fatalf("seed stale session: %v", err)
+		}
+		if _, err := store.AutoRegisterWithDisplayName(ctx, "firebase", uid, ""); err != nil {
+			t.Fatalf("disabled auto-registration wedged on a leftover row: %v", err)
+		}
+		if got := sessionStatus(t, ctx, store, created.View.SessionID); got != transfersession.StatusAwaitingBundle {
+			t.Fatalf("leftover session mutated: %s", got)
+		}
+		assertRegistryCounts(t, ctx, store, 1, 1)
+	})
+
+	t.Run("a leftover staged row is not silently adopted by auto-registration", func(t *testing.T) {
+		store, ctx := authFlowStore(t)
+		sessions := transfersession.New(store.pool, transfersession.Config{})
+		local := newLocalPlacement(t)
+		uid := "disabled-staged-legacy"
+		sessionID := stageTransfer(t, ctx, store.pool, sessions, local, uid)
+		reg, err := store.AutoRegisterWithDisplayName(ctx, "firebase", uid, "")
+		if err != nil {
+			t.Fatalf("disabled auto-registration failed on a leftover row: %v", err)
+		}
+		if reg.AgentID == local.pid {
+			t.Fatalf("disabled auto-registration adopted the carried persona %s", local.pid)
+		}
+		if got := sessionStatus(t, ctx, store, sessionID); got != transfersession.StatusStaged {
+			t.Fatalf("staged session mutated: %s", got)
+		}
+		assertRegistryCounts(t, ctx, store, 1, 1)
+	})
+}
+
+// On an enabled surface the consult is also the deadline check: a
+// past-admit_until awaiting row expires instead of answering pending until a
+// sweep notices it, and the expired session frees registration to mint a
+// fresh secretary.
+func TestPastDeadlineSessionExpiresDuringRegistration(t *testing.T) {
+	store, sessions, ctx := transferStore(t)
+	uid := "deadline-firebase"
+	created, _, err := sessions.Create(ctx, transfersession.Subject{
+		Provider: transfersession.ProviderFirebase, Subject: uid,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx,
+		`UPDATE transfer_sessions SET admit_until = now() - interval '1 second' WHERE session_id = $1`,
+		created.View.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	nonce := testNonce(t)
+	flow := startEmailFlow(t, ctx, store, IntentSignUp, "late@example.com", nonce)
+	result, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof(uid, "late@example.com"))
+	if err != nil {
+		t.Fatalf("past-deadline registration: %v", err)
+	}
+	if result.Status != "confirmation_required" || result.ConfirmationAction != ActionCreateAccount {
+		t.Fatalf("outcome: %q/%q, want the transfer choice", result.Status, result.ConfirmationAction)
+	}
+	confirmed, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount)
+	if err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if confirmed.TerminalOutcome != OutcomeAccountCreated {
+		t.Fatalf("confirmed outcome: %q", confirmed.TerminalOutcome)
+	}
+	var status string
+	if err := store.pool.QueryRow(ctx,
+		`SELECT status FROM transfer_sessions WHERE session_id = $1`,
+		created.View.SessionID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != transfersession.StatusExpired {
+		t.Fatalf("session after registration: %s", status)
+	}
+	assertRegistryCounts(t, ctx, store, 1, 1)
+}

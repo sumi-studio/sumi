@@ -67,8 +67,9 @@ type secretaryTransferMount struct {
 }
 
 // secretaryTransferFromEnv wires the secretary-move surface. With the env
-// unset the feature is simply off: no routes, no sweep, and the account
-// transaction's claim consult finds no sessions. With it set, 戸籍-backed
+// unset the feature is simply off: no routes, no sweep, and no account path
+// ever consults transfer_sessions — leftover rows neither wedge nor join a
+// sign-up. With it set, 戸籍-backed
 // authentication is required — the only thing that can produce a live
 // verified registration flow — and the same service instance serves the
 // routes, the sweep, and the account-transaction claim so deadlines agree.

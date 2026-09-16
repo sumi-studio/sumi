@@ -467,11 +467,13 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 	if err := tx.Commit(ctx); err != nil {
 		return AuthFlow{}, fmt.Errorf("commit auth flow: %w", err)
 	}
-	if flow.TerminalOutcome == OutcomeAccountCreated {
+	if s.Transfers != nil && flow.TerminalOutcome == OutcomeAccountCreated {
 		// A claimed transfer session is provisioned by the commit above and
 		// owes activation. Close that obligation now, detached from the
 		// request's cancellation — a lost response must not leave the Local
 		// source sealed and waiting. Sweep covers a crash before this runs.
+		// With the surface off there is no claim to close — and a leftover
+		// provisioned row must not be activated over a fresh registration.
 		s.reconcileProvisionedTransfer(firebaseUID)
 	}
 	return flow, nil
@@ -491,7 +493,7 @@ func (s *Store) reconcileProvisionedTransfer(firebaseUID string) {
 	if err != nil {
 		return
 	}
-	_ = s.transferSessions().Reconcile(ctx, sessionID)
+	_ = s.Transfers.Reconcile(ctx, sessionID)
 }
 
 func emailCodeIdentityMatches(flow AuthFlow, identity VerifiedIdentity) bool {
@@ -635,10 +637,19 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	// persona id instead of a minted one — or fails, never silently falls
 	// back to a second secretary. ErrPending (bundle not arrived) and claim
 	// conflicts abort the registration for an explicit answer.
-	claim, claimed, err := s.transferSessions().ClaimForSubjectInTx(ctx, tx,
-		transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: identity.FirebaseUID})
-	if err != nil {
-		return AuthFlow{}, err
+	//
+	// The consult exists only while the feature is mounted: with Transfers
+	// unset the surface is off — no routes, no sweep — and leftover rows are
+	// inert data that must neither wedge sign-up nor silently adopt a
+	// carried secretary.
+	var claim transfersession.Claim
+	claimed := false
+	if s.Transfers != nil {
+		claim, claimed, err = s.Transfers.ClaimForSubjectInTx(ctx, tx,
+			transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: identity.FirebaseUID})
+		if err != nil {
+			return AuthFlow{}, err
+		}
 	}
 	humanID, agentID := newUUIDv7(), newUUIDv7()
 	if claimed {

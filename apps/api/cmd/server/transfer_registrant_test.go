@@ -184,3 +184,32 @@ func TestRegistrantProofAdapterBoundaries(t *testing.T) {
 		t.Fatalf("foreign jar replayed the flow: %d", code)
 	}
 }
+
+// The deployment switch: env unset leaves the whole surface off — no mount,
+// no sweep, and the registration store's feature flag stays nil so no
+// account-creation path ever consults transfer_sessions. Env set wires one
+// service instance into the routes and the store so the claim consult and
+// the mounted surface agree.
+func TestSecretaryTransferEnvContract(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+
+	t.Setenv(transferPublicBaseURLEnv, "")
+	disabled := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	mount, err := secretaryTransferFromEnv(pool, disabled, []string{registrantTestOrigin})
+	if err != nil || mount != nil {
+		t.Fatalf("disabled mount: %+v %v", mount, err)
+	}
+	if disabled.Transfers != nil {
+		t.Fatal("a disabled surface still wired a claim service into the store")
+	}
+
+	t.Setenv(transferPublicBaseURLEnv, "https://move.example.test")
+	enabled := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	mount, err = secretaryTransferFromEnv(pool, enabled, []string{registrantTestOrigin})
+	if err != nil || mount == nil || mount.service == nil || mount.server == nil {
+		t.Fatalf("enabled mount: %+v %v", mount, err)
+	}
+	if enabled.Transfers != mount.service {
+		t.Fatal("the claim consult and the mounted routes disagree on the service")
+	}
+}

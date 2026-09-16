@@ -123,6 +123,86 @@ func TestClaimForSubjectAnswers(t *testing.T) {
 		}
 	})
 
+	t.Run("a past-deadline session expires on consult, without a sweep", func(t *testing.T) {
+		uid := uidFor(t, "deadline")
+		sid, _ := h.create(uid)
+		if _, err := h.cloud.pool.Exec(h.ctx,
+			`UPDATE transfer_sessions SET admit_until = now() - interval '1 second' WHERE session_id = $1`,
+			sid); err != nil {
+			t.Fatal(err)
+		}
+		// The consult itself reaches the deadline result: the row expires
+		// under the claim's row lock instead of answering pending until a
+		// later sweep notices it. Commit the account transaction so the
+		// expiry lands the way provisionFromFlow's commit does.
+		tx, err := h.cloud.pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := h.sessions.ClaimForSubjectInTx(context.Background(), tx,
+			transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: uid}); err != nil || ok {
+			t.Fatalf("past-deadline claim: ok=%v err=%v", ok, err)
+		}
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.dbStatus(sid); got != transfersession.StatusExpired {
+			t.Fatalf("after consult: %s", got)
+		}
+	})
+
+	t.Run("the deadline expiry rolls back with a failed account transaction", func(t *testing.T) {
+		uid := uidFor(t, "deadline-rollback")
+		sid, _ := h.create(uid)
+		if _, err := h.cloud.pool.Exec(h.ctx,
+			`UPDATE transfer_sessions SET admit_until = now() - interval '1 second' WHERE session_id = $1`,
+			sid); err != nil {
+			t.Fatal(err)
+		}
+		// The expiry is part of the account transaction: when the account
+		// creation aborts, the session must not be left expired by a tx
+		// that never committed.
+		tx, err := h.cloud.pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := h.sessions.ClaimForSubjectInTx(context.Background(), tx,
+			transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: uid}); err != nil || ok {
+			t.Fatalf("past-deadline claim: ok=%v err=%v", ok, err)
+		}
+		if err := tx.Rollback(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.dbStatus(sid); got != transfersession.StatusAwaitingBundle {
+			t.Fatalf("after rollback: %s", got)
+		}
+	})
+
+	t.Run("a past-deadline interrupted import still promotes and claims", func(t *testing.T) {
+		uid := uidFor(t, "interrupted-late")
+		pid := freshPersona(t, h)
+		sid, grant := h.create(uid)
+		bundle := sealAs(h, sid, grant, pid)
+		// The import committed and the promotion was lost, then admit_until
+		// passed. The committed staged import must still be recovered — the
+		// deadline must never expire what upload already committed.
+		if _, _, err := portable.NewService(h.cloud.pool).Import(h.ctx, bytes.NewReader(bundle), nil, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.cloud.pool.Exec(h.ctx,
+			`UPDATE transfer_sessions SET admit_until = now() - interval '1 second' WHERE session_id = $1`,
+			sid); err != nil {
+			t.Fatal(err)
+		}
+		claim, ok, err := claimForSubject(t, h, uid)
+		if err != nil || !ok {
+			t.Fatalf("late promoting claim: ok=%v err=%v", ok, err)
+		}
+		if claim.SessionID != sid || claim.PersonaID != pid {
+			t.Fatalf("claim %+v, want session %s persona %s", claim, sid, pid)
+		}
+	})
+
 	t.Run("an interrupted import is promoted and claimed", func(t *testing.T) {
 		uid := uidFor(t, "interrupted")
 		pid := freshPersona(t, h)

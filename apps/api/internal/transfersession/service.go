@@ -928,7 +928,23 @@ func (s *Service) ClaimForSubjectInTx(ctx context.Context, tx pgx.Tx, subj Subje
 				return Claim{}, false, err
 			}
 			if !arrived {
-				return Claim{}, false, ErrPending
+				// No committed import and the admission deadline passed: this
+				// is what the sweep writes, decided under the claim's own row
+				// lock so the deadline answer never waits on a sweep tick —
+				// or on a deployment that runs no sweep. An import committed
+				// before promotion still promotes and claims above: admission
+				// is enforced at upload, so a staged import always arrived in
+				// time.
+				expired, err := tx.Exec(ctx, `UPDATE transfer_sessions
+					SET status = 'expired', updated_at = now()
+					WHERE session_id = $1 AND status = 'awaiting_bundle' AND admit_until <= now()`, sessionID)
+				if err != nil {
+					return Claim{}, false, err
+				}
+				if expired.RowsAffected() == 0 {
+					return Claim{}, false, ErrPending
+				}
+				return Claim{}, false, nil
 			}
 			// The import committed but the promotion did not: promote now,
 			// inside the claim's own lock, with the service's claim

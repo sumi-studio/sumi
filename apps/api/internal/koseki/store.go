@@ -55,8 +55,8 @@ type Store struct {
 	EmailChallengeKey *EmailChallengeKey
 	// Transfers is the secretary-move session service the account
 	// transaction claims through, and the "move is offered" signal: when it
-	// is nil a new credential's sign-up provisions directly at resolve, and
-	// the claim consult uses a default service over the same pool.
+	// is nil the feature is off — sign-up provisions directly at resolve,
+	// and no account path ever consults transfer_sessions rows.
 	Transfers           *transfersession.Service
 	pool                *pgxpool.Pool
 	wrappingKeyID       string
@@ -89,15 +89,6 @@ func NewWithWrappingKeyID(
 		directChatLifecycle: lifecycle,
 		directChatApps:      applicationapps.New(pool, nil, lifecycle),
 	}
-}
-
-// transfers lazily provides the default session service when the wiring did
-// not install a configured one.
-func (s *Store) transferSessions() *transfersession.Service {
-	if s.Transfers != nil {
-		return s.Transfers
-	}
-	return transfersession.New(s.pool, transfersession.Config{})
 }
 
 func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
@@ -449,11 +440,17 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 	defer func() { _ = tx.Rollback(ctx) }()
 	// An open secretary-move session for this credential claims the carried
 	// persona here too: a registration path that minted a second Secretary
-	// over a staged import would strand the Local source's authority.
-	claim, claimed, err := s.transferSessions().ClaimForSubjectInTx(ctx, tx,
-		transfersession.Subject{Provider: provider, Subject: externalSubject})
-	if err != nil {
-		return Registration{}, err
+	// over a staged import would strand the Local source's authority. The
+	// consult runs only while the transfer surface is mounted; with it off,
+	// leftover rows are inert and this path always mints fresh.
+	var claim transfersession.Claim
+	claimed := false
+	if s.Transfers != nil {
+		claim, claimed, err = s.Transfers.ClaimForSubjectInTx(ctx, tx,
+			transfersession.Subject{Provider: provider, Subject: externalSubject})
+		if err != nil {
+			return Registration{}, err
+		}
 	}
 	if claimed {
 		agentID = claim.PersonaID
