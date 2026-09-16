@@ -69,11 +69,19 @@ Email sign-in (a 6-digit code first, with the emailed link as an alternative)
 is off unless all of `SUMI_AUTH_EMAIL_CHALLENGE_KEY` (base64, at least 32
 bytes), `SUMI_AUTH_EMAIL_CHALLENGE_KEY_ID`, `SUMI_AUTH_EMAIL_SENDER` and
 `SUMI_AUTH_EMAIL_LINK_ORIGIN` (one of the allowed browser origins) are set.
-The only sender today is `dev-mailbox`, which writes each message as an
-owner-only JSON file under the absolute `SUMI_AUTH_EMAIL_DEV_MAILBOX_DIR`
-instead of sending mail. It is accepted only with insecure local cookies or the
-Firebase Auth emulator. Changing the key or its ID ends codes and links that are
-still outstanding. With a real Firebase project, the server signs custom tokens
+Two senders exist. `dev-mailbox` writes each message as an owner-only JSON
+file under the absolute `SUMI_AUTH_EMAIL_DEV_MAILBOX_DIR` instead of sending
+mail; it is accepted only with insecure local cookies or the Firebase Auth
+emulator. `smtp` sends through an authenticated TLS SMTP submission endpoint
+configured by `SUMI_AUTH_EMAIL_SMTP_HOST`, `SUMI_AUTH_EMAIL_SMTP_TLS`
+(`starttls` default, or `implicit` for SMTPS), `SUMI_AUTH_EMAIL_SMTP_PORT`,
+`SUMI_AUTH_EMAIL_SMTP_USERNAME`, `SUMI_AUTH_EMAIL_SMTP_FROM`, and exactly one
+of `SUMI_AUTH_EMAIL_SMTP_PASSWORD` / `SUMI_AUTH_EMAIL_SMTP_PASSWORD_FILE`.
+Credentials are never sent on a cleartext connection: a server that does not
+offer the negotiated TLS mode or AUTH fails the delivery permanently, and
+certificate verification against the system roots is always enforced.
+Changing the key or its ID ends codes and links that are still outstanding.
+With a real Firebase project, the server signs custom tokens
 with the Admin credential, or through IAM `signBlob` for
 `SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID`.
 

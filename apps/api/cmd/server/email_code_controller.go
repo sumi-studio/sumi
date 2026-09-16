@@ -442,6 +442,12 @@ func emailAuthConfigFromEnv(allowedOrigins []string, secureCookies bool) (*email
 		}
 		log.Printf("auth email uses the local development mailbox")
 		sender = &authemail.DevMailbox{Dir: dir}
+	case "smtp":
+		smtpSender, err := smtpSenderFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		sender = smtpSender
 	default:
 		return nil, fmt.Errorf("unsupported SUMI_AUTH_EMAIL_SENDER %q", senderName)
 	}
