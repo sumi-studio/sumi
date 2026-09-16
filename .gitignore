@@ -688,3 +688,8 @@ apps/web/test-results/
 /AGENTS.md
 /CLAUDE.md
 /.claude/
+
+# Wrangler local dev vars (may contain secrets) and local state
+.dev.vars
+**/.dev.vars
+.wrangler/

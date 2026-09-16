@@ -906,6 +906,64 @@ test("BYOK list reaches the bound API origin without a static fallback", async (
   assert.notEqual(classifyPath("/api/model-connections-unrelated"), "origin");
 });
 
+test("secretary transfer calls reach the bound API origin, never the SPA", async () => {
+  // The transfer registrar is not mounted by the production server yet, but
+  // the edge still owns the routing decision: every registered path forwards
+  // to the API origin (which answers 404 while unmounted), and neither the
+  // SPA fallback nor a synthetic denial answers an API call in its place.
+  for (const path of [
+    "/api/secretary-transfer/sessions",
+    "/api/secretary-transfer/registrant/session",
+    "/api/secretary-transfer/sessions/sess-1",
+    "/api/secretary-transfer/sessions/sess-1/source",
+    "/api/secretary-transfer/sessions/sess-1/bundle",
+    "/api/secretary-transfer/sessions/sess-1/cancel",
+  ]) {
+    assert.equal(classifyPath(path), "origin", path);
+  }
+  // The bare namespace is not an application page, and a lookalike path
+  // outside the prefix is not API traffic either.
+  assert.equal(classifyPath("/api/secretary-transfer"), "deny");
+  assert.notEqual(
+    classifyPath("/api/secretary-transfer-lookalike/x"),
+    "origin",
+  );
+
+  const unmounted = Response.json({ error: "not found" }, { status: 404 });
+  let forwarded: Request | undefined;
+  const actual = await handleRequest(
+    new Request("https://sumi.example/api/secretary-transfer/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer grant-fixture",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    }),
+    {
+      ASSETS: {
+        fetch: () => assert.fail("transfer API reached static assets"),
+      },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          forwarded = request;
+          return unmounted;
+        },
+      },
+    },
+    async () => assert.fail("transfer API bypassed the bound API origin"),
+  );
+  assert.equal(
+    forwarded?.url,
+    "http://sumi.example/api/secretary-transfer/sessions",
+  );
+  assert.equal(forwarded?.method, "POST");
+  assert.equal(forwarded?.headers.get("Authorization"), "Bearer grant-fixture");
+  // The origin's own answer — a 404 while the registrar is unmounted — is
+  // returned by identity rather than replaced by the SPA document.
+  assert.equal(actual, unmounted);
+});
+
 test("model connection status and login route to the authenticated API", () => {
   for (const path of [
     "/api/model-connections/chatgpt",

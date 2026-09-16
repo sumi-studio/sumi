@@ -482,22 +482,39 @@ func (s *Store) EnsurePersona(ctx context.Context, personaID string, humanID *st
 // never silently rebound, and a sealed or transferred one cannot bind at
 // all — this placement no longer owns it.
 func (s *Store) BindHuman(ctx context.Context, personaID, humanID string) (Persona, error) {
+	return bindHuman(ctx, s.pool, personaID, humanID)
+}
+
+// BindHumanInTx is BindHuman inside the caller's transaction, so an account
+// transaction can create the human and bind a staged persona atomically.
+func BindHumanInTx(ctx context.Context, tx pgx.Tx, personaID, humanID string) (Persona, error) {
+	return bindHuman(ctx, tx, personaID, humanID)
+}
+
+func bindHuman(ctx context.Context, db queryRower, personaID, humanID string) (Persona, error) {
 	var exists int
-	if err := s.pool.QueryRow(ctx,
+	if err := db.QueryRow(ctx,
 		`SELECT 1 FROM humans WHERE human_id = $1`, humanID).Scan(&exists); errors.Is(err, pgx.ErrNoRows) {
 		return Persona{}, fmt.Errorf("%w: human %s does not exist", ErrBadRequest, humanID)
 	} else if err != nil {
 		return Persona{}, err
 	}
 	var p Persona
-	err := s.pool.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		UPDATE core_personas SET human_id = $2
 		WHERE persona_id = $1 AND human_id IS NULL AND authority IN ('staged','active')
 		RETURNING persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent`,
 		personaID, humanID).
 		Scan(&p.PersonaID, &p.HumanID, &p.DisplayName, &p.CreatedAt, &p.Authority, &p.TransferID, &p.ModelIntent)
 	if errors.Is(err, pgx.ErrNoRows) {
-		existing, perr := s.persona(ctx, personaID)
+		var existing Persona
+		perr := db.QueryRow(ctx,
+			`SELECT persona_id, human_id, display_name, created_at, authority, transfer_id, model_intent FROM core_personas WHERE persona_id = $1`,
+			personaID).Scan(&existing.PersonaID, &existing.HumanID, &existing.DisplayName, &existing.CreatedAt,
+			&existing.Authority, &existing.TransferID, &existing.ModelIntent)
+		if errors.Is(perr, pgx.ErrNoRows) {
+			perr = ErrPersonaNotFound
+		}
 		if perr != nil {
 			return Persona{}, perr
 		}
