@@ -214,7 +214,9 @@ describe("search-result jump windows", () => {
     // The gap is reachable: filling it joins the windows into one contiguous
     // history and removes the gap row.
     fetch.mockResolvedValueOnce(range(45, 50));
-    await useMessaging.getState().loadGap(key, 51);
+    await expect(useMessaging.getState().loadGap(key, 51)).resolves.toBe(
+      "filled",
+    );
     expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 51, limit: 50 });
     expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
     expect(timelineRows().filter((row) => row.kind === "gap")).toHaveLength(0);
@@ -235,7 +237,11 @@ describe("search-result jump windows", () => {
     ).resolves.toBe("found");
 
     fetch.mockRejectedValueOnce(new Error("temporary network failure"));
-    await useMessaging.getState().loadGap(key, 51);
+    // A rejected fetch while the request is still current is a real failure —
+    // the caller may surface a retryable outcome for that exact row.
+    await expect(useMessaging.getState().loadGap(key, 51)).resolves.toBe(
+      "failed",
+    );
     // Nothing merged, both windows intact, marker cleared, gap still shown.
     expect(useMessaging.getState().messagesByPlace[key]).toEqual([
       ...range(1, 44),
@@ -247,8 +253,34 @@ describe("search-result jump windows", () => {
     ).toBe(true);
 
     fetch.mockResolvedValueOnce(range(45, 50));
-    await useMessaging.getState().loadGap(key, 51);
+    await expect(useMessaging.getState().loadGap(key, 51)).resolves.toBe(
+      "filled",
+    );
     expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
+  });
+
+  it.each([
+    "resolve",
+    "reject",
+  ] as const)("reports a gap fill that settles after session replacement as cancelled, not failed", async (outcome) => {
+    const old = await openHistory();
+    old.fetch.mockResolvedValueOnce(range(1, 44));
+    await useMessaging.getState().loadPlaceAround(key, 20);
+
+    const stale = deferred<Message[]>();
+    old.fetch.mockReturnValueOnce(stale.promise);
+    const oldFill = useMessaging.getState().loadGap(key, 51);
+
+    // Replacing the session must not let the old request's outcome be
+    // reported as a failure on the new context.
+    await openHistory();
+    if (outcome === "resolve") stale.resolve(range(45, 50));
+    else stale.reject(new Error("old request failed"));
+    await expect(oldFill).resolves.toBe("cancelled");
+    // The old fill also must not merge into the replaced session's history.
+    expect(useMessaging.getState().messagesByPlace[key]).toEqual(
+      range(51, 100),
+    );
   });
 
   it("keeps the omitted range reachable when a tombstone lands inside it live", async () => {
@@ -300,7 +332,9 @@ describe("search-result jump windows", () => {
 
     // And the range is actually reachable through the boundary tombstone.
     fetch.mockResolvedValueOnce(range(45, 50));
-    await useMessaging.getState().loadGap(key, 51);
+    await expect(useMessaging.getState().loadGap(key, 51)).resolves.toBe(
+      "filled",
+    );
     expect(
       useMessaging.getState().messagesByPlace[key].map((m) => m.seq),
     ).toEqual(range(1, 100).map((m) => m.seq));

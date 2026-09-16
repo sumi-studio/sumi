@@ -236,14 +236,37 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(gapButton).toBeVisible();
     await artifact("04-gap-row.png");
 
+    // A transport failure on the gap fill must produce an honest in-context
+    // outcome on that row — never a silent return to the original copy — and
+    // the same row must retry successfully once transport recovers.
+    let abortNextGapFetch = true;
+    await page.route("**/messaging/places/*/messages?**", (route) => {
+      const url = route.request().url();
+      if (abortNextGapFetch && url.includes("before_seq=")) {
+        abortNextGapFetch = false;
+        void route.abort();
+        return;
+      }
+      void route.continue();
+    });
+    await gapButton.click();
+    const gapRetry = page.getByRole("button", {
+      name: "読み込めませんでした · 再試行",
+      exact: true,
+    });
+    await expect(gapRetry).toBeVisible();
+    await artifact("05-gap-fill-failed.png");
+    await page.unroute("**/messaging/places/*/messages?**");
+    await gapRetry.click();
+
     // Clicking fills the missing range: the windows join into one contiguous
     // history anchored where the person was reading.
-    await gapButton.click();
     await expect(gapButton).toHaveCount(0);
+    await expect(gapRetry).toHaveCount(0);
     await expect(
       page.getByText("filler message 24", { exact: true }),
     ).toBeVisible();
-    await artifact("05-gap-filled.png");
+    await artifact("06-gap-filled.png");
 
     // Follow-latest control: returning to the end must still follow live
     // arrivals — the fix may not just disable following. Wait for the smooth
@@ -258,7 +281,7 @@ test("Human searches shared messages and reaches the original message", async ({
     });
     await expect(liveRow).toBeVisible();
     await expectRowInViewport(liveRow, viewport);
-    await artifact("06-follow-latest.png");
+    await artifact("07-follow-latest.png");
 
     await search.fill("日本語メッセージ");
     await expect(
@@ -272,13 +295,13 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(
       viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
     ).toBeVisible();
-    await artifact("07-japanese-result.png");
+    await artifact("08-japanese-result.png");
 
     await search.fill("zzz-no-match-token");
     await expect(
       page.getByText("一致するメッセージはありません", { exact: true }),
     ).toBeVisible();
-    await artifact("08-no-results.png");
+    await artifact("09-no-results.png");
 
     // Deleted content must not come back through search.
     await search.fill(deletedNeedle);
@@ -294,7 +317,7 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(threadHit).toBeVisible();
     await threadHit.click();
     await expect(viewport.getByText(`${threadNeedle} in-thread`)).toBeVisible();
-    await artifact("09-thread-result.png");
+    await artifact("10-thread-result.png");
 
     // A Human participant can still find and reach DM history.
     await search.fill(dmSecret);
@@ -302,7 +325,7 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(dmHit).toBeVisible();
     await dmHit.click();
     await expect(viewport.getByText(`${dmSecret} body`)).toBeVisible();
-    await artifact("10-dm-result.png");
+    await artifact("11-dm-result.png");
 
     // A result deleted between search and click must still land truthfully:
     // the jump resolves to a deletion marker at the target's position with
@@ -326,7 +349,7 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(deletedMarker).toBeVisible();
     await page.waitForTimeout(1_500);
     await expectRowInViewport(deletedMarker, viewport);
-    await artifact("11-deleted-target.png");
+    await artifact("12-deleted-target.png");
 
     // A permalink to a deleted message must resolve to the same truthful
     // marker — not a silently dead navigation.
@@ -336,7 +359,7 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(deletedMarker).toBeVisible();
     await page.waitForTimeout(1_000);
     await expectRowInViewport(deletedMarker, viewport);
-    await artifact("12-deleted-permalink.png");
+    await artifact("13-deleted-permalink.png");
 
     // A transport failure on the context fetch must produce an honest
     // in-context outcome with a working retry — never a silently dead jump.
@@ -366,7 +389,7 @@ test("Human searches shared messages and reaches the original message", async ({
         .getByRole("alert")
         .filter({ hasText: "そのメッセージへ移動できませんでした" }),
     ).toBeVisible();
-    await artifact("13-jump-failed.png");
+    await artifact("14-jump-failed.png");
     await page.unroute("**/messaging/places/*/messages?**");
     await page.getByRole("button", { name: "再試行" }).click();
     await page.waitForTimeout(1_500);
@@ -374,7 +397,69 @@ test("Human searches shared messages and reaches the original message", async ({
       viewport.locator(`[data-message-id="${needleMessageID}"]`),
       viewport,
     );
-    await artifact("14-jump-retried.png");
+    await artifact("15-jump-retried.png");
+
+    // A reply whose original was deleted must quote it truthfully — not a
+    // bogus "添付ファイル" fallback — and clicking the quote must reach the
+    // existing deletion marker instead of dead-ending. A dedicated small
+    // channel keeps the seq arithmetic above untouched; the tombstone stays
+    // inside the only loaded page.
+    const quoteChannelID = await createChannel(page, "search-quotes");
+    const aliveQuoteTargetID = await sendMessage(
+      post,
+      quoteChannelID,
+      "alive-quote-target-e2e",
+    );
+    const doomedQuoteTargetID = await sendMessage(
+      post,
+      quoteChannelID,
+      "doomed-quote-target-e2e",
+    );
+    const aliveReplyID = await sendMessage(
+      post,
+      quoteChannelID,
+      "reply-to-alive-e2e",
+      aliveQuoteTargetID,
+    );
+    const doomedReplyID = await sendMessage(
+      post,
+      quoteChannelID,
+      "reply-to-doomed-e2e",
+      doomedQuoteTargetID,
+    );
+    const doomedQuoteDelete = await api.delete(
+      `${stack.apiURL}/messaging/places/${quoteChannelID}/messages/${doomedQuoteTargetID}?${scopeQuery}`,
+      { headers: { Origin: stack.webURL } },
+    );
+    expect(doomedQuoteDelete.status()).toBe(200);
+
+    await page.getByRole("button", { name: "search-quotes" }).click();
+    const doomedReplyRow = viewport.locator(
+      `[data-message-id="${doomedReplyID}"]`,
+    );
+    const doomedQuote = doomedReplyRow.getByTitle(/の返信元へ移動$/);
+    await expect(doomedQuote).toBeVisible();
+    await expect(doomedQuote).toContainText("削除されたメッセージ");
+    await expect(doomedQuote).not.toContainText("添付ファイル");
+    await doomedQuote.click();
+    const quoteMarker = viewport.getByText("このメッセージは削除されています", {
+      exact: true,
+    });
+    await expect(quoteMarker).toBeVisible();
+    await expectRowInViewport(quoteMarker, viewport);
+    await artifact("16-deleted-quote.png");
+
+    // An ordinary quote still shows the original text and jumps to it.
+    const aliveReplyRow = viewport.locator(
+      `[data-message-id="${aliveReplyID}"]`,
+    );
+    const aliveQuote = aliveReplyRow.getByTitle(/の返信元へ移動$/);
+    await expect(aliveQuote).toContainText("alive-quote-target-e2e");
+    await aliveQuote.click();
+    await expectRowInViewport(
+      viewport.locator(`[data-message-id="${aliveQuoteTargetID}"]`),
+      viewport,
+    );
 
     // Rapid query switching must not resurrect the previous result list.
     await page.getByRole("button", { name: "search-general" }).click();
@@ -397,21 +482,24 @@ test("Human searches shared messages and reaches the original message", async ({
 
 // `toBeVisible` only means "mounted" for a virtualized list — overscan mounts
 // rows outside the viewport. A landed jump must be measured by real
-// intersection with the scroll viewport.
+// intersection with the scroll viewport. Poll the geometry so a follow-scroll
+// that is still landing (e.g. a live append just before the assertion) is
+// measured at its settled position rather than racing a single snapshot.
 async function expectRowInViewport(row: Locator, viewport: Locator) {
   await expect(row).toBeVisible();
-  const box = await row.boundingBox();
-  const frame = await viewport.boundingBox();
-  expect(box, "row must have a layout box").not.toBeNull();
-  expect(frame, "viewport must have a layout box").not.toBeNull();
-  if (!box || !frame) return;
-  expect(
-    box.y + box.height,
-    "row must intersect the viewport vertically",
-  ).toBeGreaterThan(frame.y);
-  expect(box.y, "row must intersect the viewport vertically").toBeLessThan(
-    frame.y + frame.height,
-  );
+  await expect
+    .poll(
+      async () => {
+        const box = await row.boundingBox();
+        const frame = await viewport.boundingBox();
+        if (!box || !frame) return false;
+        return (
+          box.y + box.height > frame.y && box.y < frame.y + frame.height
+        );
+      },
+      { timeout: 5_000, message: "row must intersect the viewport" },
+    )
+    .toBe(true);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -491,6 +579,7 @@ async function sendMessage(
   }>,
   placeID: string,
   content: string,
+  replyTo?: string,
 ): Promise<string> {
   // Bulk seeding can exceed the mutation admission burst (64 tokens, 4/s
   // refill); honor Retry-After instead of failing the fixture.
@@ -499,6 +588,7 @@ async function sendMessage(
     const response = await post(`/messaging/places/${placeID}/messages`, {
       content,
       client_nonce: nonce,
+      ...(replyTo ? { reply_to: replyTo } : {}),
     });
     if (response.status() !== 429) {
       expect(response.status()).toBe(201);

@@ -584,7 +584,17 @@ interface MessagingState {
   toggleReaction(message: Message, emoji: string): void;
   votePoll(message: Message, optionIds: string[]): Promise<void>;
   loadOlder(key: PlaceKey): Promise<void>;
-  loadGap(key: PlaceKey, beforeSeq: number): Promise<void>;
+  /**
+   * gap行からの途中履歴の補填。結果を呼び出し側へ返す:
+   * - "filled": 未取得区間がmergeされた
+   * - "failed": 現在の要求のままfetchが失敗した——呼び出し側は再試行を提示してよい
+   * - "cancelled": place/sessionの差し替えや無効な引数で要求が無効化された。
+   *   失敗として見せてはいけない。
+   */
+  loadGap(
+    key: PlaceKey,
+    beforeSeq: number,
+  ): Promise<"filled" | "failed" | "cancelled">;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
 }
@@ -4299,15 +4309,16 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const state = get();
       const place = parsePlaceKey(key);
       const current = state.messagesByPlace[key];
-      if (!place || !current || current.length === 0) return;
-      if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 2) return;
-      if ((state.loadingGapsByPlace[key] ?? []).includes(beforeSeq)) return;
+      if (!place || !current || current.length === 0) return "cancelled";
+      if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 2) return "cancelled";
+      if ((state.loadingGapsByPlace[key] ?? []).includes(beforeSeq))
+        return "cancelled";
       const holdGeneration = placeHoldGenerations.get(key);
       if (
         holdGeneration === undefined ||
         !holdsPlaceGeneration(key, holdGeneration)
       ) {
-        return;
+        return "cancelled";
       }
       set((entry) => ({
         loadingGapsByPlace: {
@@ -4318,21 +4329,29 @@ export const useMessaging = create<MessagingState>((set, get) => {
       const request = beginMessagingBackendRequest();
       try {
         // Keep the loaded windows and the gap row if the request fails; the
-        // row stays clickable so the person can retry.
-        const missing = await request
-          .wait((backend) =>
+        // row stays clickable so the person can retry. A rejection while the
+        // request is still current is a real failure the caller may report;
+        // anything that settled after the context was replaced is cancelled,
+        // not failed.
+        let missing: Message[];
+        try {
+          missing = await request.wait((backend) =>
             backend.fetchMessages(place, {
               beforeSeq,
               limit: PAGE_SIZE,
             }),
-          )
-          .catch(() => undefined);
+          );
+        } catch {
+          return request.isCurrent() &&
+            holdsPlaceGeneration(key, holdGeneration)
+            ? "failed"
+            : "cancelled";
+        }
         if (
-          !missing ||
           !request.isCurrent() ||
           !holdsPlaceGeneration(key, holdGeneration)
         ) {
-          return;
+          return "cancelled";
         }
         rememberKnownMessages(key, missing, get().lastReadByPlace[key] ?? 0);
         set((entry) => {
@@ -4358,6 +4377,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
               : {}),
           };
         });
+        return "filled";
       } finally {
         if (request.isCurrent() && holdsPlaceGeneration(key, holdGeneration)) {
           set((entry) => ({

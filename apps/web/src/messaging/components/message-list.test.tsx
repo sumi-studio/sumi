@@ -257,3 +257,113 @@ describe("MessageList deleted-target jumps", () => {
     expect(scrollTops.length).toBeGreaterThan(0);
   });
 });
+
+describe("MessageList gap fill outcome", () => {
+  const messages = [
+    message(1),
+    message(2),
+    message(10),
+    message(11),
+    message(12),
+  ];
+
+  it("reports a failed fill on the gap row and lets the retry fill it", async () => {
+    bindMessagingSessionIdentity("self");
+    mountList(messages);
+    const loadGap = vi
+      .fn()
+      .mockResolvedValueOnce("failed" as const)
+      .mockImplementationOnce(async () => {
+        // 成功時はstoreが区間をmergeする——ここでは同じ結果を再現する。
+        const merged = [
+          ...messages,
+          ...[3, 4, 5, 6, 7, 8, 9].map((seq) => message(seq)),
+        ].sort((a, b) => a.seq - b.seq);
+        useMessaging.setState({ messagesByPlace: { [KEY]: merged } });
+        return "filled" as const;
+      });
+    act(() => useMessaging.setState({ loadGap }));
+    await settleInitialPositioning();
+
+    const gapButton = screen.getByRole("button", {
+      name: "この間の会話を読み込む",
+      exact: true,
+    });
+    fireEvent.click(gapButton);
+    // 旧実装は失敗を握りつぶして元の文言へ戻るだけだった——失敗はその行の上に
+    // 正直に出て、行は押せるまま残る。
+    const retry = await screen.findByRole("button", {
+      name: "読み込めませんでした · 再試行",
+      exact: true,
+    });
+    expect(loadGap).toHaveBeenCalledExactlyOnceWith(KEY, 10);
+
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(screen.queryByText("Message 5", { exact: true })).not.toBeNull(),
+    );
+    expect(loadGap).toHaveBeenCalledTimes(2);
+    // 埋まったgap行は消える——失敗表示も一緒に消える。
+    expect(
+      screen.queryByRole("button", { name: /読み込めませんでした/ }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "この間の会話を読み込む" }),
+    ).toBeNull();
+  });
+
+  it("does not report a cancelled fill as a failure", async () => {
+    bindMessagingSessionIdentity("self");
+    mountList(messages);
+    // place/session差し替えで無効化された要求は"cancelled"——失敗とは出さない。
+    const loadGap = vi.fn().mockResolvedValue("cancelled" as const);
+    act(() => useMessaging.setState({ loadGap }));
+    await settleInitialPositioning();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "この間の会話を読み込む",
+        exact: true,
+      }),
+    );
+    await waitFor(() => expect(loadGap).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", {
+          name: "この間の会話を読み込む",
+          exact: true,
+        }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("button", { name: /読み込めませんでした/ }),
+    ).toBeNull();
+  });
+});
+
+describe("MessageList reply quote to a deleted original", () => {
+  it("scrolls to the deletion marker instead of dead-ending", async () => {
+    bindMessagingSessionIdentity("self");
+    const messages = [
+      message(1),
+      message(2),
+      message(3, true),
+      { ...message(4), replyTo: "jump-3" },
+      message(5),
+    ];
+    mountList(messages);
+    await settleInitialPositioning();
+    const viewport = screen.getByRole("region") as HTMLElement;
+    const scrollTops = recordScrollTo(viewport);
+
+    // 旧実装はflashMessageへ直結していて、tombstoneは行として存在しないので
+    // scrollToMessageがfalseで終わり、標識もscrollも起きなかった。
+    fireEvent.click(screen.getByTitle("Self の返信元へ移動"));
+    await waitFor(() =>
+      expect(
+        screen.getByText("このメッセージは削除されています", { exact: true }),
+      ).toBeInTheDocument(),
+    );
+    await waitFor(() => expect(scrollTops.length).toBeGreaterThan(0));
+  });
+});
