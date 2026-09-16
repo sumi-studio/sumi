@@ -340,7 +340,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.upload_attachment",
     description:
-      "Upload a small file into a place as a draft attachment, then bind it to a message with messaging.send's attachments field. content_base64 is the file's bytes in base64 (at most ~2 MiB — meant for small generated artifacts; larger files go through the human upload lane); filename is display metadata, not a path. The upload runs under your workspace quota.",
+      "Upload a small file into a place as a draft attachment, then bind it to a message with messaging.send's attachments field. content_base64 is the file's bytes in base64 (at most ~2 MiB — meant for small generated artifacts; larger files go through the human upload lane); filename is display metadata, not a path. The upload runs under your workspace quota. Plan at most one upload per step: each step is one request and must fit the service's ~4 MiB request limit, so two large uploads in one step cannot be recorded — split them across steps instead.",
     parameters: {
       type: "object",
       properties: {

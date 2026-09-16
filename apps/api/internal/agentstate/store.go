@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"sort"
 	"strconv"
@@ -341,7 +342,32 @@ type Store struct {
 	// the record, so it runs post-commit and its outcome cannot affect the
 	// committed state. Set at wiring time; not synchronized.
 	ApprovalsChanged func(ctx context.Context, personaID string)
+	// TerminalFailureNotice, when set, runs inside the commit transaction
+	// when a non-retryable failure resolves an input — the domain's chance
+	// to leave the requester a durable, place-visible record of what
+	// happened, atomic with the failure itself and deduplicated under
+	// commit replay by its own durable identity. It returns a best-effort
+	// post-commit step (live fanout) or nil. Its error never vetoes the
+	// commit: the failure record must land even when the notice cannot.
+	// Set at wiring time; not synchronized.
+	TerminalFailureNotice TerminalFailureNoticeFunc
 }
+
+// TerminalFailure carries the resolved input/turn identity and the recorded
+// reason to a registered terminal-failure notice hook.
+type TerminalFailure struct {
+	PersonaID string
+	InputID   string
+	TurnID    string
+	Error     string
+	ErrorKind string
+}
+
+// TerminalFailureNoticeFunc appends whatever place-visible record a domain
+// keeps for a request that can no longer produce a reply. It runs inside
+// the commit transaction so the notice is atomic with the failure record;
+// the returned closure runs after commit for best-effort live fanout.
+type TerminalFailureNoticeFunc func(ctx context.Context, tx pgx.Tx, f TerminalFailure) (func(context.Context), error)
 
 // ToolEffect delegates one tool's atomic, state-internal effect to a
 // registered applier — the seam that lets an in-process domain (Messaging)
@@ -1206,6 +1232,27 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
+	// fireNotice lets the registered domain hook leave its place-visible
+	// record of a terminal failure inside this transaction. It runs on the
+	// identical-replay path too: a retried commit is the recovery point for
+	// a notice the first attempt could not write, and the domain's own
+	// dedup keeps the replay from posting twice. A notice error is logged
+	// and swallowed — it must never veto the failure record itself.
+	var noticePublish func(context.Context)
+	fireNotice := func() {
+		if s.TerminalFailureNotice == nil || req.Outcome != "fail" || req.Retryable {
+			return
+		}
+		publish, err := s.TerminalFailureNotice(ctx, tx, TerminalFailure{
+			PersonaID: personaID, InputID: t.InputID, TurnID: turnID,
+			Error: req.Error, ErrorKind: req.ErrorKind,
+		})
+		if err != nil {
+			log.Printf("terminal failure notice for input %s: %v", t.InputID, err)
+			return
+		}
+		noticePublish = publish
+	}
 	if t.Status != "running" {
 		if t.Generation != generation {
 			return nil, ErrTurnConflict
@@ -1230,8 +1277,12 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		if !same {
 			return nil, fmt.Errorf("%w: turn replay carries a different commit", ErrTurnConflict)
 		}
+		fireNotice()
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
+		}
+		if noticePublish != nil {
+			noticePublish(ctx)
 		}
 		return t, nil
 	}
@@ -1528,6 +1579,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				}); err != nil {
 				return nil, fmt.Errorf("append outbox: %w", err)
 			}
+			fireNotice()
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1535,6 +1587,9 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	}
 	if parked {
 		s.notifyApprovalsChanged(ctx, personaID)
+	}
+	if noticePublish != nil {
+		noticePublish(ctx)
 	}
 	return t, nil
 }

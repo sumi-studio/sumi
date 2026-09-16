@@ -983,3 +983,333 @@ func TestCoreToolsMembershipAndEpochFences(t *testing.T) {
 		t.Fatalf("overview after uninstall: got %v, want ErrBadRequest", err)
 	}
 }
+
+// TestCoreToolsTerminalFailureNotice is the F302 contract: a directed
+// Messaging input whose turn fails terminally leaves the requester a
+// durable, reply-associated message from the secretary in the same place —
+// atomic with the failure record, deduplicated on commit replay, gated off
+// for ambient observations, and suppressed when live scope no longer
+// authorizes the secretary to speak there.
+func TestCoreToolsTerminalFailureNotice(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newCoreToolsWorld(t, ctx)
+	ws, ch := w.workspaceWithChannel(t, ctx)
+
+	coreStore := agentstate.NewStore(w.store.core.pool)
+	delivery := &CoreAttentionDelivery{Core: coreStore, Messaging: w.store.core}
+	coreStore.TerminalFailureNotice = delivery.TerminalFailureNotice
+	for tool, effect := range delivery.CoreToolEffects() {
+		if err := coreStore.RegisterEffect(tool, effect); err != nil {
+			t.Fatalf("register %s: %v", tool, err)
+		}
+	}
+	release, err := delivery.Prepare(ctx, w.agent.ID)
+	if err != nil {
+		t.Fatalf("prepare persona: %v", err)
+	}
+	release()
+
+	occurred := time.Now()
+	submit := func(inputID, attention, messageID, text string) {
+		t.Helper()
+		_, _, err := coreStore.SubmitInput(ctx, &agentstate.Input{
+			PersonaID: w.agent.ID, InputID: inputID, Kind: "message",
+			Payload: map[string]any{
+				"event_id":     strings.TrimPrefix(inputID, "messaging:"),
+				"event_kind":   "mention",
+				"workspace_id": ws.WorkspaceID,
+				"actor": map[string]any{
+					"kind": "human", "id": w.humanA.ID, "display_name": "Yohaku"},
+				"place": map[string]any{
+					"id": ch.PlaceID, "kind": ch.Kind, "name": ch.Name},
+				"message_id":       messageID,
+				"message_seq":      1,
+				"message_revision": 1,
+				"text":             text,
+			},
+			ActorKind: "human", ActorID: w.humanA.ID,
+			SourceSurface: "messaging", ThreadID: ch.PlaceID,
+			OccurredAt: &occurred, Attention: attention,
+		})
+		if err != nil {
+			t.Fatalf("submit %s: %v", inputID, err)
+		}
+	}
+	lease, err := coreStore.AcquireWriter(ctx, w.agent.ID, "runtime", 30*time.Second)
+	if err != nil {
+		t.Fatalf("acquire writer: %v", err)
+	}
+	gen := lease.Generation
+	turnSeq := 0
+	nextTurn := func() string {
+		t.Helper()
+		turnSeq++
+		turnID := fmt.Sprintf("turn-notice-%d", turnSeq)
+		res, err := coreStore.LoadTurn(ctx, w.agent.ID, gen, turnID, 20)
+		if err != nil || res.Turn == nil {
+			t.Fatalf("load turn %s: %v %+v", turnID, err, res)
+		}
+		return res.Turn.TurnID
+	}
+	history := func() []Message {
+		t.Helper()
+		msgs, err := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA).
+			History(ctx, ch.PlaceID, HistoryOptions{Limit: 50})
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		return msgs
+	}
+
+	// A directed request whose turn fails terminally posts the notice.
+	ask := w.send(t, ctx, ch.PlaceID, w.humanA, "please file these notes")
+	submit("messaging:notice-directed", "reply", ask.MessageID, ask.Content)
+	turnID := nextTurn()
+	failReq := agentstate.CommitRequest{
+		Outcome: "fail", Retryable: false,
+		Error: "decision could not be recorded: plan body 5800000 bytes " +
+			"exceeds the 4190208-byte request budget",
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("commit fail: %v", err)
+	}
+	msgs := history()
+	notice := msgs[len(msgs)-1]
+	if notice.Author != w.agent {
+		t.Fatalf("notice author = %v, want the secretary", notice.Author)
+	}
+	if notice.ReplyTo != ask.MessageID {
+		t.Fatalf("notice reply_to = %q, want the requesting message %q",
+			notice.ReplyTo, ask.MessageID)
+	}
+	if !strings.Contains(notice.Content, "could not complete") ||
+		!strings.Contains(notice.Content, "ask me again") {
+		t.Fatalf("notice content = %q", notice.Content)
+	}
+	if strings.Contains(notice.Content, "already have been done") {
+		t.Fatalf("no effects committed, notice must not hedge: %q", notice.Content)
+	}
+	// The notice is durable history: it survives a scope re-resolution —
+	// the reconnect path — exactly like any other message.
+	before := len(msgs)
+
+	// An identical commit replay (the lost-response retry) refires the hook;
+	// the notice's own nonce returns the existing row instead of a duplicate.
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("replay commit: %v", err)
+	}
+	if msgs := history(); len(msgs) != before {
+		t.Fatalf("identical replay posted a second notice: %d → %d", before, len(msgs))
+	}
+
+	// Ambient observation that fails is silent — it never asked for a reply.
+	ambient := w.send(t, ctx, ch.PlaceID, w.humanB, "unrelated chatter")
+	submit("messaging:notice-ambient", "observe", ambient.MessageID, ambient.Content)
+	turnID = nextTurn()
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("ambient commit fail: %v", err)
+	}
+	if msgs := history(); len(msgs) != before+1 {
+		t.Fatalf("ambient failure changed history: %d → %d", before+1, len(msgs))
+	}
+
+	// When the turn committed effects before failing, the notice must not
+	// promise a clean retry — the operation ledger is the record.
+	ask2 := w.send(t, ctx, ch.PlaceID, w.humanA, "rename and summarize")
+	submit("messaging:notice-partial", "reply", ask2.MessageID, ask2.Content)
+	turnID = nextTurn()
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, turnID, gen, 0,
+		agentstate.Decision{Text: "acting", Calls: []agentstate.PlanCall{{
+			CallID: "c0", Tool: MessagingCoreTool, Route: "normal",
+			Request: map[string]any{"place_id": ch.PlaceID, "content": "committed effect"},
+		}}}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+	if op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, turnID,
+		gen, turnID+":op:0", MessagingCoreTool, 0,
+		map[string]any{"place_id": ch.PlaceID, "content": "committed effect"}); err != nil ||
+		!fresh || op.Status != "done" {
+		t.Fatalf("effect claim: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("partial commit fail: %v", err)
+	}
+	msgs = history()
+	notice = msgs[len(msgs)-1]
+	if notice.Author != w.agent || notice.ReplyTo != ask2.MessageID {
+		t.Fatalf("partial notice = %+v", notice)
+	}
+	if !strings.Contains(notice.Content, "already have been done") ||
+		strings.Contains(notice.Content, "ask me again") {
+		t.Fatalf("committed effects must not offer a clean retry: %q", notice.Content)
+	}
+
+	// Once the secretary's membership is closed, the notice has no permitted
+	// place to land — nothing posts, and the failure still records.
+	if err := w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.agent); err != nil {
+		t.Fatalf("remove member: %v", err)
+	}
+	ask3 := w.send(t, ctx, ch.PlaceID, w.humanA, "one more thing")
+	submit("messaging:notice-removed", "reply", ask3.MessageID, ask3.Content)
+	turnID = nextTurn()
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("removed-scope commit fail: %v", err)
+	}
+	msgs = history()
+	if last := msgs[len(msgs)-1]; last.MessageID != ask3.MessageID {
+		t.Fatalf("removed scope still posted a notice: %+v", last)
+	}
+}
+
+// TestCoreToolsTerminalFailureNoticeEndToEnd drives the whole F301+F302 path
+// through the real stack: the TypeScript core streams an oversized reply
+// from the deterministic provider, the bounded re-plan either recovers or
+// resolves to a recorded terminal failure, and the failure hook posts a
+// reply-associated notice into the same place the Human asked in — all over
+// real agentstate HTTP into real PostgreSQL.
+func TestCoreToolsTerminalFailureNoticeEndToEnd(t *testing.T) {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not on PATH; skipping Node core e2e")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	w := newCoreToolsWorld(t, ctx)
+	ws, ch := w.workspaceWithChannel(t, ctx)
+	_ = ch
+	dm, _, err := w.store.EnsureDM(ctx, w.humanA, w.agent)
+	if err != nil {
+		t.Fatalf("ensure dm: %v", err)
+	}
+
+	delivery, coreStore := newSharedIntakeDelivery(t, w)
+	for tool, effect := range delivery.CoreToolEffects() {
+		if err := coreStore.RegisterEffect(tool, effect); err != nil {
+			t.Fatalf("register %s: %v", tool, err)
+		}
+	}
+	srv := agentstate.NewServer(w.store.core.pool, "core-notice-e2e-token-0123456789")
+	for tool, effect := range delivery.CoreToolEffects() {
+		if err := srv.RegisterToolEffect(tool, effect); err != nil {
+			t.Fatalf("serve %s: %v", tool, err)
+		}
+	}
+	srv.Store().TerminalFailureNotice = delivery.TerminalFailureNotice
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	httpSrv := &http.Server{Handler: mux}
+	go func() { _ = httpSrv.Serve(ln) }()
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	})
+	baseURL := "http://" + ln.Addr().String()
+
+	// Two DM directives drive the two F301 outcomes: "!pad" crosses the
+	// plan budget once and recovers on the bounded re-plan (the mock's next
+	// consult sees the size notice, not the directive); "!alwayspad" re-emits
+	// the oversized reply on every re-plan and resolves to the recorded
+	// terminal failure that must still reach the requester.
+	recovering := w.send(t, ctx, dm.PlaceID, w.humanA, "!pad 4400000 hello")
+	failing := w.send(t, ctx, dm.PlaceID, w.humanA, "!alwayspad 4400000")
+	stats, err := w.store.core.DeliverAgentAttention(ctx, delivery, 25)
+	if err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	if stats.Admitted != 2 {
+		t.Fatalf("admitted %d events, want 2", stats.Admitted)
+	}
+
+	env := append(os.Environ(),
+		"SUMI_STATE_URL="+baseURL,
+		"SUMI_PERSONA_ID="+w.agent.ID,
+		"SUMI_PERSONA_TOKEN="+srv.PersonaToken(w.agent.ID),
+		"SUMI_MODEL_PROVIDER=mock",
+		"SUMI_LEASE_TTL_MS=8000",
+		"SUMI_ONCE_IDLE_MS=1500",
+	)
+	cmd := exec.CommandContext(ctx, nodePath,
+		filepath.Join(coreRootDir(t), "src", "host", "local.ts"), "--once")
+	cmd.Dir = coreRootDir(t)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("core --once failed: %v\n%s", err, out)
+	}
+
+	// The recovered decision completes; the persistently oversized one ends
+	// in the recorded terminal failure — both inputs resolve, nothing wedges.
+	var turns []struct {
+		inputID, status string
+		err             *string
+	}
+	tRows, err := w.store.core.pool.Query(ctx, `
+		SELECT i.input_id, t.status, t.error::text
+		FROM core_turns t JOIN core_inputs i
+		  ON i.persona_id = t.persona_id AND i.input_id = t.input_id
+		WHERE t.persona_id = $1 ORDER BY t.turn_id`, w.agent.ID)
+	if err != nil {
+		t.Fatalf("turns: %v", err)
+	}
+	defer tRows.Close()
+	for tRows.Next() {
+		var row struct {
+			inputID, status string
+			err             *string
+		}
+		if err := tRows.Scan(&row.inputID, &row.status, &row.err); err != nil {
+			t.Fatalf("scan turn: %v", err)
+		}
+		turns = append(turns, row)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("turns = %+v", turns)
+	}
+	var sawCompleted, sawFailed bool
+	for _, tr := range turns {
+		switch tr.status {
+		case "done":
+			sawCompleted = true
+		case "failed":
+			sawFailed = true
+			if tr.err == nil || !strings.Contains(*tr.err, "request budget") {
+				t.Fatalf("failed turn error = %v", tr.err)
+			}
+		default:
+			t.Fatalf("turn status = %+v", tr)
+		}
+	}
+	if !sawCompleted || !sawFailed {
+		t.Fatalf("turns = %+v, want one completed + one failed", turns)
+	}
+
+	// The failure is visible where the request was made: one secretary
+	// message in the DM, replying to the failing directive, explaining what
+	// happened and what the Human can do — and nothing for the recovered one.
+	msgs, err := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA).
+		History(ctx, dm.PlaceID, HistoryOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("dm history: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("dm history = %d messages, want 3", len(msgs))
+	}
+	notice := msgs[2]
+	if notice.Author != w.agent || notice.ReplyTo != failing.MessageID {
+		t.Fatalf("notice = %+v", notice)
+	}
+	if !strings.Contains(notice.Content, "could not complete") ||
+		!strings.Contains(notice.Content, "too large to record") ||
+		!strings.Contains(notice.Content, "ask me again") {
+		t.Fatalf("notice content = %q", notice.Content)
+	}
+	if notice.ReplyTo == recovering.MessageID {
+		t.Fatal("notice answered the recovered request instead of the failed one")
+	}
+}

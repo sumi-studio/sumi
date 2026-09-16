@@ -1086,6 +1086,18 @@ export class Secretary {
     let text = "";
     let calls: ToolCall[] = [];
     let usage: Record<string, unknown> = {};
+    // A decision whose recorded plan would exceed the request budget gets a
+    // bounded re-plan: nothing was journaled or claimed for it, so asking the
+    // model again with an explicit size notice is safe. Past the cap the turn
+    // fails honestly rather than discarding an ordinary request unexplained.
+    let oversizeRecoveries = 0;
+    let planBody: {
+      turnId: string;
+      round: number;
+      text: string;
+      calls: PlanCall[];
+      usage: Record<string, unknown>;
+    } | null = null;
     for (;;) {
       text = "";
       calls = [];
@@ -1106,7 +1118,6 @@ export class Secretary {
           else if (ev.type === "tool_call") calls.push(ev.call);
           else usage = ev.usage;
         }
-        break;
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
         if (e instanceof BudgetWaitError) {
@@ -1256,9 +1267,7 @@ export class Secretary {
         });
         return { failed: true, retryable };
       }
-    }
-    try {
-      const saved = await state.savePlan(personaId, gen, {
+      const candidate = {
         turnId: turn.turn_id,
         round,
         // Display text and usage metadata are normalized: a stray NUL in a
@@ -1273,7 +1282,46 @@ export class Secretary {
           request: c.arguments,
         })),
         usage: stripNulDeep(usage) as Record<string, unknown>,
+      };
+      // Measure the plan as savePlan will serialize it — the request body is
+      // the wire contract the agentstate body limit applies to. Individually
+      // valid arguments (e.g. two near-cap uploads) can exceed it in
+      // aggregate, so the bound lives on the whole decision, not per call.
+      const planBytes = Buffer.byteLength(
+        JSON.stringify({
+          generation: gen,
+          turn_id: candidate.turnId,
+          round: candidate.round,
+          text: candidate.text,
+          calls: candidate.calls,
+          usage: candidate.usage,
+        }),
+        "utf8",
+      );
+      if (planBytes <= PLAN_REQUEST_MAX_BYTES) {
+        planBody = candidate;
+        break;
+      }
+      oversizeRecoveries += 1;
+      if (oversizeRecoveries > MAX_OVERSIZE_DECISION_RECOVERIES) {
+        await this.failPermanent(
+          turn,
+          events,
+          `decision could not be recorded: plan body ${planBytes} bytes exceeds the ${PLAN_REQUEST_MAX_BYTES}-byte request budget after ${MAX_OVERSIZE_DECISION_RECOVERIES} re-plan attempt(s)`,
+          "oversize_plan",
+        );
+        return { failed: true, retryable: false };
+      }
+      this.log("decision over the plan budget; asking for a smaller plan", {
+        turn_id: turn.turn_id,
+        round,
+        plan_bytes: planBytes,
+        recovery: oversizeRecoveries,
       });
+      sendMessages = [...sendMessages, decisionSizeNotice(planBytes)];
+    }
+    try {
+      const saved = await state.savePlan(personaId, gen, planBody!);
       // Always execute the stored plan — a lost-response resend returns
       // the identical rounds; a conflict never silently substitutes.
       return { rounds: saved.plan.plan };
@@ -1321,11 +1369,13 @@ export class Secretary {
     turn: Turn,
     events: { kind: string; payload: Record<string, unknown> }[],
     error: string,
+    errorKind?: "no_model_connection" | "oversize_plan",
   ): Promise<void> {
     await this.commitTurnFinal(turn, {
       outcome: "fail",
       retryable: false,
       error: stripNul(error),
+      error_kind: errorKind,
       events,
     });
     this.log("turn failed permanently", {
@@ -1424,6 +1474,27 @@ export class Secretary {
 // minimal fallback commit is always storable.
 const RECORDED_ERROR_BYTES = 8 * 1024;
 const TRUNC_MARK = "…[truncated]";
+
+// The durable-plan request budget: the agentstate service caps one request
+// body at 4 MiB, and a saved plan is a single request — so the bound is on
+// the whole decision, not on any one tool argument. Slack covers the small
+// envelope around the serialized plan. A decision over the budget is not a
+// defect: the core asks the model for a smaller plan (each round is its own
+// request, so splitting work across steps is the intended contract).
+export const PLAN_REQUEST_MAX_BYTES = (4 << 20) - 4096;
+const MAX_OVERSIZE_DECISION_RECOVERIES = 2;
+
+// The model-facing notice for an unrecordable decision — the same
+// working-context-note convention as capacity notices, never journaled.
+function decisionSizeNotice(planBytes: number): ChatMessage {
+  return {
+    role: "user",
+    content:
+      "[Decision-size notice; not a new user message]\n" +
+      `Your previous reply could not be recorded: serialized it is ${planBytes} bytes, over the ${PLAN_REQUEST_MAX_BYTES}-byte per-request limit, so nothing in it ran. ` +
+      "Answer again with a smaller reply — plan at most one attachment upload per step (each step is its own request), and keep reply text and arguments modest.",
+  };
+}
 
 // A tool result is carried verbatim in the turn summary only while it is
 // small enough to appear twice in one commit body — the journaled

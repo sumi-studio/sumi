@@ -787,6 +787,10 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		coreApprovals.RegisterRoutes(mux)
 		coreServer.Store().ApprovalsChanged = coreApprovals.NotifyChanged
+		// A directed Messaging request that fails terminally leaves its
+		// requester a visible reply in the same place — committed atomically
+		// with the failure record and deduplicated on commit replay.
+		coreServer.Store().TerminalFailureNotice = delivery.TerminalFailureNotice
 		log.Print("messaging attention delivers to core state inputs (messaging.* effects registered)")
 		if calls := messagingServer.Calls; calls != nil {
 			// The secretary's call surface: delegated effects commit session
