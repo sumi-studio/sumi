@@ -61,14 +61,49 @@ type AgentAttentionEvent struct {
 	// (dm/mention/keyword/all). It rides along so the delivery adapter can
 	// carry the same attention hint into the core input — it is a hint about
 	// how strongly the message asks for a response, not a mandate to answer.
-	Reason          string                      `json:"reason,omitempty"`
-	MessageRevision int64                       `json:"message_revision"`
-	MessageSeq      int64                       `json:"message_seq"`
-	OccurredAt      time.Time                   `json:"occurred_at"`
-	Content         string                      `json:"content"`
-	MarkerID        string                      `json:"marker_id,omitempty"`
-	DueAt           *time.Time                  `json:"due_at,omitempty"`
-	PollVote        *AgentAttentionPollVoteData `json:"poll_vote,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	MessageRevision int64     `json:"message_revision"`
+	MessageSeq      int64     `json:"message_seq"`
+	OccurredAt      time.Time `json:"occurred_at"`
+	Content         string    `json:"content"`
+	// Attachments is the scoped metadata of the files bound to this message —
+	// identity, name, type, and size, never bytes. An attachment-only message
+	// must still reach the secretary as a meaningful input, and the ids let it
+	// read the bytes afterwards through the authorized open_attachment effect.
+	// Tombstones, poll-vote reports, and reminders carry none.
+	Attachments []AgentAttentionAttachment  `json:"attachments,omitempty"`
+	MarkerID    string                      `json:"marker_id,omitempty"`
+	DueAt       *time.Time                  `json:"due_at,omitempty"`
+	PollVote    *AgentAttentionPollVoteData `json:"poll_vote,omitempty"`
+}
+
+// AgentAttentionAttachment is the delivery-time projection of one bound
+// attachment. It names the attachment, never grants access: byte reads
+// re-authorize against current tenure and visibility.
+type AgentAttentionAttachment struct {
+	AttachmentID string `json:"attachment_id"`
+	Filename     string `json:"filename"`
+	MIME         string `json:"mime"`
+	SizeBytes    int64  `json:"size_bytes"`
+	SHA256       string `json:"sha256"`
+	Position     int    `json:"position"`
+	Spoiler      bool   `json:"spoiler"`
+	Alt          string `json:"alt,omitempty"`
+}
+
+func attentionAttachments(attachments []Attachment) []AgentAttentionAttachment {
+	if len(attachments) == 0 {
+		return nil
+	}
+	out := make([]AgentAttentionAttachment, len(attachments))
+	for i, a := range attachments {
+		out[i] = AgentAttentionAttachment{
+			AttachmentID: a.AttachmentID, Filename: a.Filename, MIME: a.MIME,
+			SizeBytes: a.SizeBytes, SHA256: a.SHA256Hex(), Position: a.Position,
+			Spoiler: a.Spoiler, Alt: a.Alt,
+		}
+	}
+	return out
 }
 
 // The frozen complete selection at one poll revision, in poll display order.
@@ -130,6 +165,7 @@ func (s *ScopedStore) attentionEvent(place Place, message Message, actor Partici
 		Place:     AgentAttentionPlace{ID: place.PlaceID, Kind: place.Kind, Name: place.Name},
 		MessageID: message.MessageID, MessageRevision: message.Revision,
 		MessageSeq: message.Seq, OccurredAt: message.CreatedAt, Content: message.Content,
+		Attachments: attentionAttachments(message.Attachments),
 	}
 }
 
@@ -320,7 +356,10 @@ func (s *ScopedStore) issueAgentMessageChange(ctx context.Context, tx pgx.Tx, pl
 			event.ReplyToMessageID = message.ReplyTo
 		}
 		if change == AttentionChangeDeleted {
-			event.Content = ""
+			// A tombstone reports that the current view no longer contains the
+			// message: the delivered content and its attachment references are
+			// cleared the same way.
+			event.Content, event.Attachments = "", nil
 		} else {
 			for _, ref := range message.Mentions {
 				if ref == decision.Participant && decision.Reason != NotifyReasonDM {
@@ -474,7 +513,7 @@ func (s *ScopedStore) issueAgentPollVote(ctx context.Context, tx pgx.Tx, place P
 	}
 	event := s.attentionEvent(place, message, s.Scope.Actor, voterName)
 	event.Kind, event.PersonalityAgentID = AgentAttentionPollVote, message.Author.ID
-	event.Content, event.OccurredAt = "", votedAt
+	event.Content, event.Attachments, event.OccurredAt = "", nil, votedAt
 	event.PollVote = &AgentAttentionPollVoteData{PollRevision: poll.Revision, Question: poll.Question, SelectedOptions: selected}
 	return s.insertAgentAttention(ctx, tx, event, message.MessageID, poll.Revision,
 		access.WorkspaceMemberID, access.PlaceMemberID, votedAt)
@@ -498,6 +537,7 @@ func (s *ScopedStore) issueAgentReminder(ctx context.Context, tx pgx.Tx, place P
 	event := s.attentionEvent(place, message, marker.Participant, name)
 	event.Kind, event.PersonalityAgentID = AgentAttentionReminder, marker.Participant.ID
 	event.MarkerID, event.Content, event.DueAt = marker.MarkerID, marker.Note, &marker.RemindAt
+	event.Attachments = nil
 	// The PA created this reminder; its source message time is not creation time.
 	if err := tx.QueryRow(ctx, "SELECT created_at FROM reply_later_markers WHERE marker_id=$1", marker.MarkerID).Scan(&event.OccurredAt); err != nil {
 		return err

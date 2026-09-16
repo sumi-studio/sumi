@@ -740,10 +740,12 @@ func newApplicationFromEnv() (*application, error) {
 			Messaging: messagingServer.Store,
 			Hub:       messagingServer.Hub,
 		}
-		if err := coreServer.RegisterToolEffect(messaging.MessagingCoreTool, delivery.SendEffect()); err != nil {
-			stopBackground()
-			closeOnError()
-			return nil, fmt.Errorf("register core messaging effect: %w", err)
+		for tool, effect := range delivery.CoreToolEffects() {
+			if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+				stopBackground()
+				closeOnError()
+				return nil, fmt.Errorf("register core messaging effect %s: %w", tool, err)
+			}
 		}
 		deliverAttention = func(ctx context.Context) (messaging.AgentAttentionDeliveryStats, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
@@ -760,7 +762,7 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		coreApprovals.RegisterRoutes(mux)
 		coreServer.Store().ApprovalsChanged = coreApprovals.NotifyChanged
-		log.Print("messaging attention delivers to core state inputs (messaging.send effect registered)")
+		log.Print("messaging attention delivers to core state inputs (messaging.* effects registered)")
 		if calls := messagingServer.Calls; calls != nil {
 			// The secretary's call surface: delegated effects commit session
 			// and utterance intent atomically with the operation record, and

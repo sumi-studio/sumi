@@ -4,6 +4,7 @@ import {
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
   estTextTokens,
   evictToBudget,
+  inputBodyText,
   inputMarker,
   renderedViewTokens,
   renderJournalContext,
@@ -1452,7 +1453,9 @@ const SYSTEM =
   "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
   "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
-  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
+  "Shared-conversation inputs arrive with actor and place provenance; the messaging.* tools are your ordinary Messaging surface — overview, open, and search read the places you can see, create_channel, start_dm, and create_thread open new ones, and notification_settings reads and sets your own alert preferences. " +
+  "Reply into that place with messaging.send when a response is genuinely warranted — it can carry urgency or attachments you uploaded — and stay silent on ambient traffic. " +
+  "You may edit or retract only your own messages through messaging.edit_message and messaging.delete_message. A message's attachments arrive as metadata — filename, type, size, and attachment_id; open the bytes only through messaging.open_attachment with the shown place_id and message_id, and upload files you want to send with messaging.upload_attachment. " +
   "When a call starts in a place you belong to, a 'call_started' input arrives; call.join enters it as a real participant. In a call, others' speech arrives as 'call_utterance' inputs with speaker and timing provenance — you may listen and stay silent, speak with call.say, or leave with call.leave. call.say records your intent and what is known about its playback, never that anyone heard it; call.state shows who is in a call. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
@@ -1484,6 +1487,7 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       reason: typeof p.reason === "string" ? p.reason : null,
       message_change:
         typeof p.message_change === "string" ? p.message_change : null,
+      attachments: Array.isArray(p.attachments) ? p.attachments : null,
       attempt: turn.attempt,
     },
   };
@@ -1506,10 +1510,8 @@ export function assemble(
     ...renderJournalContext(context, memory, omitted, memoryOmitted),
   ];
   const p = input.payload as Record<string, unknown>;
-  const text =
-    typeof p.text === "string" && p.text !== ""
-      ? p.text
-      : JSON.stringify(input.payload);
+  const body = inputBodyText(p);
+  const text = body !== "" ? body : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"

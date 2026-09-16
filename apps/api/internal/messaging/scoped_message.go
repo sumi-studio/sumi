@@ -403,6 +403,21 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 }
 
 func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, content string, expectedRevision int64) (Message, error) {
+	return s.editMessage(ctx, placeID, messageID, content, &expectedRevision)
+}
+
+// EditMessageAtCurrent edits the author's own message at whatever revision
+// the lock finds. Callers that never held a message snapshot — the core
+// tool lane answering "make my message say this" — have no revision to
+// assert; the FOR UPDATE lock makes "current" precise inside the
+// transaction. When the requested content is already the committed state of
+// an edited message, the call converges without a second write: the effect
+// that produced that state committed before its own record did.
+func (s *ScopedStore) EditMessageAtCurrent(ctx context.Context, placeID, messageID, content string) (Message, error) {
+	return s.editMessage(ctx, placeID, messageID, content, nil)
+}
+
+func (s *ScopedStore) editMessage(ctx context.Context, placeID, messageID, content string, expectedRevision *int64) (Message, error) {
 	if content == "" {
 		return Message{}, errors.New("content must not be empty")
 	}
@@ -442,8 +457,18 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		// operation rejected while preserving the revision that made it terminal.
 		return message, ErrMessageDeleted
 	}
-	if expectedRevision <= 0 || message.Revision != expectedRevision {
+	if expectedRevision != nil && (*expectedRevision <= 0 || message.Revision != *expectedRevision) {
 		return Message{}, currentRevisionConflict(ctx, tx, message)
+	}
+	if expectedRevision == nil && message.Content == content && message.EditedAt != nil {
+		parts := []Message{message}
+		if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
+			return Message{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Message{}, fmt.Errorf("commit scoped edit replay: %w", err)
+		}
+		return parts[0], nil
 	}
 	members, err := s.activeMembersScoped(ctx, tx, place)
 	if err != nil {
@@ -455,7 +480,7 @@ func (s *ScopedStore) EditMessage(ctx context.Context, placeID, messageID, conte
 		UPDATE messages SET content = $1, edited_at = now(), revision = revision + 1
 		WHERE workspace_id = $2 AND message_id = $3 AND revision = $4
 		RETURNING edited_at, revision`,
-		content, s.Scope.WorkspaceID, messageID, expectedRevision).Scan(&editedAt, &message.Revision); err != nil {
+		content, s.Scope.WorkspaceID, messageID, message.Revision).Scan(&editedAt, &message.Revision); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Message{}, currentRevisionConflict(ctx, tx, message)
 		}

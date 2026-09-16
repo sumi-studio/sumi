@@ -53,7 +53,10 @@ type Server struct {
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
-	return &Server{store: NewStore(pool), secret: []byte(adminSecret), maxBody: 1 << 20}
+	// 4 MiB: delegated Messaging tools carry attachment bytes as base64
+	// inside plan/claim requests and inside committed tool results — a
+	// MaxCoreAttachmentBytes file needs ~2.8 MiB plus the envelope.
+	return &Server{store: NewStore(pool), secret: []byte(adminSecret), maxBody: 4 << 20}
 }
 
 // SetModelConnections wires the user model-connection store so
