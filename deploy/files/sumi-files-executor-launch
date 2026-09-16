@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# sumi-files-executor-launch SCOPE — launch one secretary through the same
+# supervisor lifecycle the provisioner drives (prepare -> activate), with the
+# workspace bound to canonical files scope SCOPE.
+#
+# SCOPE is the secretary's compact personality-agent id
+# (SUMI_PERSONALITY_AGENT_ID without hyphens); the unit name
+# sumi-files-executor@<scope>.service is therefore also the Compose project
+# suffix. A scope that does not match the agent env's PAID is refused.
+#
+# Environment (via the unit's EnvironmentFile directives):
+#   /etc/sumi-files/executor.env   SUMI_FILES_MOUNTPOINT, SUMI_FILES_VOLUME_UUID,
+#                                  optional SUMI_FILES_CHECK, SUMI_FILES_CHECK_WAIT_SECONDS
+#   /etc/sumi-files/agent-<s>.env  SUMI_PERSONALITY_AGENT_ID,
+#                                  SUMI_AGENT_COMPOSE_DIR (checkout containing
+#                                  deploy/agent) and the launch environment and
+#                                  secrets consumed by deploy/agent/supervisor
+set -euo pipefail
+
+scope="${1:-}"
+refuse() {
+  echo "refused: $*" >&2
+  exit 2
+}
+[[ -n "$scope" ]] || refuse "usage: sumi-files-executor-launch SCOPE"
+
+: "${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required in agent env}"
+paid_compact="${SUMI_PERSONALITY_AGENT_ID//-/}"
+[[ "$scope" == "$paid_compact" ]] ||
+  refuse "scope $scope must be the secretary's compact personality-agent id $paid_compact"
+: "${SUMI_AGENT_COMPOSE_DIR:?SUMI_AGENT_COMPOSE_DIR is required in agent env}"
+: "${SUMI_FILES_MOUNTPOINT:?SUMI_FILES_MOUNTPOINT is required in executor env}"
+: "${SUMI_FILES_VOLUME_UUID:?SUMI_FILES_VOLUME_UUID is required in executor env}"
+supervisor="${SUMI_AGENT_COMPOSE_DIR}/deploy/agent/supervisor"
+[[ -x "$supervisor" ]] || refuse "supervisor is not executable at $supervisor"
+check="${SUMI_FILES_CHECK:-$(cd "$(dirname "$0")" && pwd)/sumi-files-check}"
+[[ -x "$check" ]] || refuse "sumi-files-check is not executable at $check"
+export SUMI_FILES_MOUNTPOINT SUMI_FILES_VOLUME_UUID
+export SUMI_FILES_CHECK="$check"
+
+# The canonical scope must verify before any epoch is allocated; the
+# supervisor re-verifies it inside the fenced prepare/activate actions.
+"$check" --wait "${SUMI_FILES_CHECK_WAIT_SECONDS:-60}" \
+  "$SUMI_FILES_MOUNTPOINT" "$SUMI_FILES_VOLUME_UUID" "$scope" >/dev/null
+
+epoch_json="$("$supervisor" prepare)"
+generation="$(sed -n 's/.*"generation":\([0-9][0-9]*\).*/\1/p' <<<"$epoch_json" | head -1)"
+nonce="$(sed -n 's/.*"rpc_boot_nonce":"\([^"]*\)".*/\1/p' <<<"$epoch_json" | head -1)"
+[[ -n "$generation" && -n "$nonce" ]] || {
+  echo "refused: supervisor prepare returned no coherent epoch" >&2
+  exit 1
+}
+exec env SUMI_EXPECTED_RPC_GENERATION="$generation" \
+  SUMI_EXPECTED_RPC_NONCE="$nonce" "$supervisor" activate

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
 type AuthIntent string
@@ -392,9 +394,14 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 				}
 			}
 			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn, identity.ProviderSubject)
-		case flow.Intent == IntentSignUp && !exists:
+		case flow.Intent == IntentSignUp && !exists && s.Transfers == nil:
 			flow, err = s.provisionFromFlow(ctx, tx, flow, identity)
-		case flow.Intent == IntentSignIn && !exists:
+		case !exists && (flow.Intent == IntentSignIn || flow.Intent == IntentSignUp):
+			// A new credential never provisions at resolve while the secretary
+			// move is offered: registration must present "bring my Local
+			// secretary" before any account or persona is created. With the
+			// transfer surface off there is no choice to make, so sign-up keeps
+			// its direct provision above.
 			if err := s.checkEnrollmentInviteProof(ctx, tx, flow, identity); err != nil {
 				return AuthFlow{}, err
 			}
@@ -460,7 +467,33 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 	if err := tx.Commit(ctx); err != nil {
 		return AuthFlow{}, fmt.Errorf("commit auth flow: %w", err)
 	}
+	if s.Transfers != nil && flow.TerminalOutcome == OutcomeAccountCreated {
+		// A claimed transfer session is provisioned by the commit above and
+		// owes activation. Close that obligation now, detached from the
+		// request's cancellation — a lost response must not leave the Local
+		// source sealed and waiting. Sweep covers a crash before this runs.
+		// With the surface off there is no claim to close — and a leftover
+		// provisioned row must not be activated over a fresh registration.
+		s.reconcileProvisionedTransfer(firebaseUID)
+	}
 	return flow, nil
+}
+
+// reconcileProvisionedTransfer activates the just-committed transfer claim
+// for this credential. It is deliberately best-effort and detached from the
+// caller's context: the account outcome is already committed, and the
+// session sweep retakes anything this misses.
+func (s *Store) reconcileProvisionedTransfer(firebaseUID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var sessionID string
+	err := s.pool.QueryRow(ctx, `SELECT session_id FROM transfer_sessions
+		WHERE claim_provider = $1 AND claim_subject = $2 AND status = 'provisioned'`,
+		transfersession.ProviderFirebase, firebaseUID).Scan(&sessionID)
+	if err != nil {
+		return
+	}
+	_ = s.Transfers.Reconcile(ctx, sessionID)
 }
 
 func emailCodeIdentityMatches(flow AuthFlow, identity VerifiedIdentity) bool {
@@ -598,7 +631,30 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	if err != nil {
 		return AuthFlow{}, fmt.Errorf("configured wrapping key ID: %w", err)
 	}
+	// A verified credential that chose to bring its Local secretary has an
+	// open transfer session under its own subject. Claim it here, in the
+	// account transaction, so the account is created with the carried
+	// persona id instead of a minted one — or fails, never silently falls
+	// back to a second secretary. ErrPending (bundle not arrived) and claim
+	// conflicts abort the registration for an explicit answer.
+	//
+	// The consult exists only while the feature is mounted: with Transfers
+	// unset the surface is off — no routes, no sweep — and leftover rows are
+	// inert data that must neither wedge sign-up nor silently adopt a
+	// carried secretary.
+	var claim transfersession.Claim
+	claimed := false
+	if s.Transfers != nil {
+		claim, claimed, err = s.Transfers.ClaimForSubjectInTx(ctx, tx,
+			transfersession.Subject{Provider: transfersession.ProviderFirebase, Subject: identity.FirebaseUID})
+		if err != nil {
+			return AuthFlow{}, err
+		}
+	}
 	humanID, agentID := newUUIDv7(), newUUIDv7()
+	if claimed {
+		agentID = claim.PersonaID
+	}
 	wrappingKey, err := generateWrappingKey()
 	if err != nil {
 		return AuthFlow{}, err
@@ -645,6 +701,14 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	if _, err := s.directChatApps.InstallDirectChatForNewHumanInTx(ctx, tx, humanID); err != nil {
 		return AuthFlow{}, fmt.Errorf("install initial direct chat: %w", err)
 	}
+	if claimed {
+		// The credential row above must commit before this binds the staged
+		// persona; the session's activation obligation is recorded here and
+		// Reconcile closes it after commit.
+		if err := transfersession.ProvisionInTx(ctx, tx, claim, humanID); err != nil {
+			return AuthFlow{}, fmt.Errorf("provision carried secretary: %w", err)
+		}
+	}
 	return completeExistingFlow(ctx, tx, flow, identity.FirebaseUID, humanID, agentID, OutcomeAccountCreated, identity.ProviderSubject)
 }
 
@@ -677,6 +741,66 @@ func syncVerifiedProviderTx(ctx context.Context, tx pgx.Tx, humanID, provider, s
 			VALUES ($1,$2,'provider_linked',$3,'linked')`, humanID, provider, decisionPath)
 	}
 	return err
+}
+
+// RegistrantProofSubject authenticates the credential a live new-account
+// registration flow proved, for the secretary-move endpoints that act on the
+// registrant's behalf. It returns the verified Firebase UID and the browser
+// epoch hash the flow was bound to at start; the caller compares that epoch
+// to the request's own jar before trusting the subject.
+//
+// The flow must still carry account-creation authority: a confirmation
+// holding "create_account" for a verified UID, or the completed
+// account-creation inside its replay window — the same authority a lost
+// confirmation answer recovers from. A consumed, closed, expired or
+// unrelated flow proves nothing, and a request-body subject is never read.
+func (s *Store) RegistrantProofSubject(ctx context.Context, flowID, nonce string) (firebaseUID, epochHash string, err error) {
+	nonceHash, err := validateNonce(nonce)
+	if err != nil {
+		return "", "", err
+	}
+	var (
+		storedNonce        []byte
+		status             string
+		confirmationAction string
+		terminalOutcome    string
+		expiresAt          time.Time
+		completedAt        *time.Time
+		closedAt           *time.Time
+	)
+	err = s.pool.QueryRow(ctx, `SELECT nonce_hash, status,
+		COALESCE(confirmation_action,''), COALESCE(terminal_outcome,''), COALESCE(firebase_uid,''),
+		COALESCE(browser_epoch_hash,''), expires_at, completed_at, closed_at
+		FROM auth_flows WHERE flow_id=$1`, flowID).Scan(
+		&storedNonce, &status, &confirmationAction, &terminalOutcome, &firebaseUID,
+		&epochHash, &expiresAt, &completedAt, &closedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrInvalidAuthFlow
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if subtle.ConstantTimeCompare(storedNonce, nonceHash) != 1 {
+		return "", "", ErrAuthProofMismatch
+	}
+	if closedAt != nil {
+		return "", "", ErrAuthFlowConsumed
+	}
+	now := time.Now().UTC()
+	if status == "completed" {
+		flow := AuthFlow{Status: status, TerminalOutcome: terminalOutcome, CompletedAt: completedAt}
+		if terminalOutcome == OutcomeAccountCreated && firebaseUID != "" && flowCompletionReplayable(flow, now) {
+			return firebaseUID, epochHash, nil
+		}
+		return "", "", ErrAuthFlowConsumed
+	}
+	if status != "confirmation_required" || confirmationAction != ActionCreateAccount || firebaseUID == "" {
+		return "", "", ErrInvalidAuthFlow
+	}
+	if !now.Before(expiresAt) {
+		return "", "", ErrAuthFlowExpired
+	}
+	return firebaseUID, epochHash, nil
 }
 
 // BrowserFlowRef is the revocation-facing view of one flow: enough to fence

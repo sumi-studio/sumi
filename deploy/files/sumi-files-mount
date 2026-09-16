@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# sumi-files-mount — run one JuiceFS client of the canonical Sumi files volume
+# in the foreground (systemd `sumi-files-mount@.service`, or a supervisor).
+#
+#   sumi-files-mount ENV_FILE
+#
+# ENV_FILE (mode 0600 or 0400, owned by the client user; never in the repository):
+#   SUMI_FILES_ROLE          service | executor
+#   SUMI_FILES_JUICEFS       JuiceFS binary (default /usr/local/bin/juicefs)
+#   SUMI_FILES_META_URL      postgres://USER@HOST:PORT/DB?sslmode=... (no password)
+#   META_PASSWORD            metadata database password
+#   SUMI_FILES_VOLUME_UUID   the volume this host must mount (refuses others)
+#   SUMI_FILES_MOUNTPOINT    e.g. /var/lib/sumi-files/mnt
+#   SUMI_FILES_CACHE_DIR     local block cache, e.g. /var/cache/sumi-files
+#   SUMI_FILES_CACHE_SIZE_MIB (default 10240)
+#   SUMI_FILES_OWNER         uid:gid every client squashes to (default 10002:10002)
+#
+# Object-storage credentials live in the volume settings written by
+# `juicefs format`; anyone holding the metadata credential can read them, so
+# the credential file belongs to the host, never to an executor container.
+set -euo pipefail
+
+env_file="${1:-}"
+[[ -n "$env_file" && -r "$env_file" ]] || {
+  echo "usage: sumi-files-mount ENV_FILE" >&2
+  exit 2
+}
+if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]]; then
+  echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
+  exit 2
+fi
+if [[ "$(stat -c %u "$env_file")" != "$(id -u)" ]]; then
+  echo "refused: credential file $env_file must be owned by the client uid $(id -u)" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
+jfs="${SUMI_FILES_JUICEFS:-/usr/local/bin/juicefs}"
+role="${SUMI_FILES_ROLE:?SUMI_FILES_ROLE is required}"
+meta="${SUMI_FILES_META_URL:?SUMI_FILES_META_URL is required}"
+want_uuid="${SUMI_FILES_VOLUME_UUID:?SUMI_FILES_VOLUME_UUID is required}"
+mnt="${SUMI_FILES_MOUNTPOINT:?SUMI_FILES_MOUNTPOINT is required}"
+cache_dir="${SUMI_FILES_CACHE_DIR:?SUMI_FILES_CACHE_DIR is required}"
+cache_mib="${SUMI_FILES_CACHE_SIZE_MIB:-10240}"
+owner="${SUMI_FILES_OWNER:-10002:10002}"
+: "${META_PASSWORD:?META_PASSWORD is required}"
+export META_PASSWORD
+
+case "$meta" in
+  *://*:*@*) echo "refused: put the metadata password in META_PASSWORD, not the URL" >&2; exit 2 ;;
+esac
+
+case "$role" in
+  service) bg=() ;;
+  # Background jobs (trash, compaction, session cleanup) run on the always-on
+  # service client only; executors come and go.
+  executor) bg=(--no-bgjob) ;;
+  *) echo "refused: SUMI_FILES_ROLE must be service or executor" >&2; exit 2 ;;
+esac
+
+[[ "$mnt" == /* && "$mnt" != */ && "$mnt" != *[[:space:]]* ]] || {
+  echo "refused: SUMI_FILES_MOUNTPOINT must be absolute, without trailing slash or whitespace" >&2
+  exit 2
+}
+
+# The kernel mounts at the resolved path, so the configured mountpoint must
+# already be canonical: a symlinked leaf or intermediate component (or a
+# "." / ".." element) would mount the volume outside the private parent
+# validated below, and a literal-path mountinfo compare would then disagree
+# with the kernel about whether anything is mounted. `realpath -m` resolves
+# existing symlinks without requiring the leaf to exist; the call is bounded
+# so a dead or stalled FUSE component fails closed instead of hanging the
+# unit.
+mnt_resolved="$(LC_ALL=C timeout 5 realpath -m -- "$mnt")" || {
+  echo "refused: cannot resolve mountpoint path $mnt" >&2
+  exit 2
+}
+[[ "$mnt_resolved" == "$mnt" ]] || {
+  echo "refused: mountpoint $mnt resolves to $mnt_resolved; configure the canonical path" >&2
+  exit 2
+}
+
+# Host traversal guard: --all-squash collapses every scope to one owner, so
+# once a host user can reach the mountpoint at all they can read, write and
+# rename every scope on the volume. The only host-level boundary is the path
+# leading to the mountpoint: its parent must be private to the client uid.
+# A dedicated parent (containing nothing but the mountpoint) is tightened in
+# place; a shared parent that is group/other-accessible is refused, never
+# silently chmodded, because other entries may rely on its permissions.
+mnt_parent="$(dirname "$mnt")"
+if [[ ! -d "$mnt_parent" ]]; then
+  install -d -m 0700 "$mnt_parent" || {
+    echo "refused: cannot create private mountpoint parent $mnt_parent" >&2
+    exit 2
+  }
+fi
+[[ "$(stat -c %u "$mnt_parent")" == "$(id -u)" ]] || {
+  echo "refused: mountpoint parent $mnt_parent must be owned by the client uid $(id -u)" >&2
+  exit 2
+}
+if (( (8#$(stat -c %a "$mnt_parent") & 077) != 0 )); then
+  shopt -s nullglob dotglob
+  parent_entries=("$mnt_parent"/*)
+  shopt -u nullglob dotglob
+  if (( ${#parent_entries[@]} == 0 )) ||
+    { (( ${#parent_entries[@]} == 1 )) && [[ "${parent_entries[0]}" == "$mnt" ]]; }; then
+    chmod 0700 "$mnt_parent" || {
+      echo "refused: cannot make mountpoint parent $mnt_parent private" >&2
+      exit 2
+    }
+  else
+    echo "refused: mountpoint parent $mnt_parent is shared and group/other-accessible; move the mountpoint under a dedicated private directory" >&2
+    exit 2
+  fi
+fi
+
+# fstype of the last mountinfo entry at the mountpoint (empty when none).
+mount_fstype() {
+  awk -v mp="$mnt" '
+    { sep = 0; for (i = 7; i <= NF; i++) if ($i == "-") { sep = i; break } }
+    sep && $5 == mp { fstype = $(sep + 1) }
+    END { if (fstype != "") print fstype }' /proc/self/mountinfo
+}
+
+# Bounded probe of the existing mount at the mountpoint. Prints one verdict:
+#   live         — stat succeeded; a live filesystem answered
+#   dead         — stat failed with ENOTCONN: the FUSE client is gone and the
+#                  mount is a disconnected corpse
+#   unresponsive — stat timed out or failed any other way; the mount cannot be
+#                  classified and must not be touched
+# The probe runs under LC_ALL=C so the ENOTCONN diagnostic is not localized.
+probe_mount() {
+  local out rc
+  out="$(LC_ALL=C timeout 5 stat -- "$mnt" 2>&1)" && { echo live; return; }
+  rc=$?
+  if (( rc != 124 )) && [[ "$out" == *"Transport endpoint is not connected"* ]]; then
+    echo dead
+  else
+    echo unresponsive
+  fi
+}
+
+fstype="$(mount_fstype)"
+if [[ -n "$fstype" ]]; then
+  verdict="$(probe_mount)"
+  if [[ "$verdict" == live ]]; then
+    echo "refused: $mnt is already a mountpoint; unmount it first" >&2
+    exit 2
+  fi
+  if [[ "$fstype" != "fuse.juicefs" ]]; then
+    echo "refused: $mnt holds an unresponsive $fstype mount; unmount it first" >&2
+    exit 2
+  fi
+  # A killed JuiceFS client leaves the FUSE mount registered but dead: every
+  # lookup answers ENOTCONN and systemd never ran ExecStop. Only that proven
+  # disconnection is safe to remove: a slow or stalled client answers with a
+  # timeout or another error, and unmounting a merely unresponsive mount would
+  # detach a live filesystem that may recover on its own.
+  if [[ "$verdict" != dead ]]; then
+    echo "refused: $mnt did not answer but is not proven disconnected; unmount it manually only if the client is known dead" >&2
+    exit 2
+  fi
+  if [[ "$(mount_fstype)" != "fuse.juicefs" || "$(probe_mount)" != dead ]]; then
+    echo "refused: $mnt changed state during recovery; unmount it first" >&2
+    exit 2
+  fi
+  umount "$mnt" 2>/dev/null || fusermount3 -u "$mnt" 2>/dev/null ||
+    umount -l "$mnt" 2>/dev/null || fusermount3 -uz "$mnt" 2>/dev/null || true
+  if [[ -n "$(mount_fstype)" ]]; then
+    echo "refused: dead FUSE mount at $mnt did not unmount" >&2
+    exit 2
+  fi
+fi
+install -d -m 0700 "$mnt"
+# The cache dir gets the same canonical-path rule as the mountpoint:
+# mkdir/chmod follow symlinks, so a symlinked cache dir would chmod its
+# referent.
+cache_resolved="$(LC_ALL=C timeout 5 realpath -m -- "$cache_dir")" || {
+  echo "refused: cannot resolve cache dir path $cache_dir" >&2
+  exit 2
+}
+[[ "$cache_resolved" == "$cache_dir" ]] || {
+  echo "refused: cache dir $cache_dir resolves to $cache_resolved; configure the canonical path" >&2
+  exit 2
+}
+mkdir -p "$cache_dir"
+chmod 0700 "$cache_dir"
+
+# Refuse to mount a different volume than the pinned one (a re-formatted or
+# mistyped metadata database would otherwise mount an empty namespace).
+# The status output includes object-storage settings: keep it in memory only.
+if ! status="$("$jfs" status "$meta" 2>/dev/null)"; then
+  echo "refused: metadata engine unreachable or not a formatted volume" >&2
+  exit 3
+fi
+got_uuid="$(grep -o '"UUID": *"[^"]*"' <<<"$status" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+unset status
+if [[ "$got_uuid" != "$want_uuid" ]]; then
+  echo "refused: metadata engine holds volume ${got_uuid:-unknown}, expected $want_uuid" >&2
+  exit 2
+fi
+
+# Zero metadata caching is a service correctness requirement
+# (contracts/files-api.yaml) and gives executors the same view without a
+# freshness window. --all-squash gives the file service and every executor
+# one owner, so either side can edit what the other created.
+exec "$jfs" mount \
+  --no-usage-report \
+  --attr-cache=0 --entry-cache=0 --dir-entry-cache=0 --negative-entry-cache=0 \
+  --all-squash "$owner" \
+  --backup-meta 0 \
+  --cache-dir "$cache_dir" --cache-size "$cache_mib" \
+  "${bg[@]}" \
+  "$meta" "$mnt"

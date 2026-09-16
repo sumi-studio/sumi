@@ -795,7 +795,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       // A Firebase account is display state, not Sumi authorization. Do not
       // retain it when the server-owned identity binding/exchange failed.
-      if (firebaseSignInCompleted && !confirmationRequired) {
+      // A deterministic refusal committed nothing and is retried with the
+      // same flow authority; dropping the credential would only break other
+      // tabs' in-progress work.
+      if (
+        firebaseSignInCompleted &&
+        !confirmationRequired &&
+        !isAuthRefusalError(error)
+      ) {
         await signOutFirebaseBestEffort();
       }
       if (isCurrentGeneration(generation)) setRedirectSignInError(error);
@@ -1108,7 +1115,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             }
             await reconcileSessionState();
           }
-          await signOutFirebaseBestEffort();
+          if (!isAuthRefusalError(error)) {
+            await signOutFirebaseBestEffort();
+          }
           throw error;
         }
       } finally {
@@ -1931,4 +1940,17 @@ async function signOutFirebaseBestEffort(): Promise<void> {
   } catch {
     // Firebase is cleanup-only after Sumi authority has ended.
   }
+}
+
+/**
+ * A 4xx answer is a deterministic refusal: the server rejected the flow
+ * before committing anything, so there is nothing to compensate. Signing
+ * Firebase out on a refusal would revoke the credential for every tab on
+ * this origin — demolishing a sibling tab's in-progress confirmation —
+ * without making this attempt any more refused.
+ */
+function isAuthRefusalError(error: unknown): boolean {
+  return (
+    error instanceof AuthAPIError && error.status >= 400 && error.status < 500
+  );
 }

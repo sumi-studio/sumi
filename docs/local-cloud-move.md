@@ -158,8 +158,14 @@ yet.
   fresh secretary. Creating someone new is a separate option the person
   chooses explicitly.
 - **Mount** — `transfersession.NewServer(svc, proof, publicBaseURL)`; mount
-  its routes only with a real adapter, and run the sweep. The grant is not
-  the core state administrator token and must never be accepted as one.
+  its routes only with a real adapter, and run the sweep. `cmd/server`
+  mounts them only when `SUMI_TRANSFER_PUBLIC_BASE_URL` is set to the API's
+  trusted public origin (https outside loopback; `http://127.0.0.1:<port>`
+  for local development). Unset means the move choice is not offered: the
+  registration UI hides it when the routes answer a bare 404, and a new
+  credential's sign-up provisions directly without the confirmation step.
+  The grant is not the core state administrator token and must never be
+  accepted as one.
 - **Model connection and Direct Chat** — the carried inputs are processed by
   a core host pointed at Cloud state; showing them and the replies in Direct
   Chat, and asking for a model connection after arrival, belong to those

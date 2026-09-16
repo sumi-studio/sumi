@@ -2008,9 +2008,10 @@ describe("redirect return resilience", () => {
       nonce: "n".repeat(43),
       idToken: "id-token-b",
     });
-    // The server rejected the exchange, so the orphaned Firebase identity is
-    // display state only and is signed out.
-    expect(authMocks.signOut).toHaveBeenCalled();
+    // The server's refusal committed nothing, so the Firebase credential is
+    // retained: it is shared across tabs and a sibling's in-progress flow may
+    // still depend on it. A deliberate cancel or logout still signs out.
+    expect(authMocks.signOut).not.toHaveBeenCalled();
   });
 });
 
