@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	BrowserCSRFCookie        = "sumi_csrf"
+	BrowserCSRFCookie = "sumi_csrf"
 	// BrowserEpochCookie is an HttpOnly browser-jar authority marker. Its
 	// server-held hash names "this cookie jar" so session admission can
 	// compare a flow's issuing browser against the jar's current Human even
@@ -721,6 +721,22 @@ func validBrowserEpochHash(hash string) bool {
 	decoded, err := base64.RawURLEncoding.DecodeString(hash)
 	return err == nil && len(decoded) == sha256.Size &&
 		base64.RawURLEncoding.EncodeToString(decoded) == hash
+}
+
+// RequestBrowserEpochHash reads the browser epoch cookie without minting:
+// the hash of the jar this request came from, or "" when the jar holds none.
+// Adjacent browser-bound surfaces (secretary transfer) compare it to the
+// epoch hash recorded on an auth flow instead of trusting request-body
+// identity.
+func RequestBrowserEpochHash(r *http.Request) (string, error) {
+	cookies := r.CookiesNamed(BrowserEpochCookie)
+	if len(cookies) == 1 && validBrowserEpochValue(cookies[0].Value) {
+		return hashBrowserEpochValue(cookies[0].Value), nil
+	}
+	if len(cookies) > 1 {
+		return "", errors.New("duplicate browser epoch cookies")
+	}
+	return "", nil
 }
 
 // browserEpochHash returns the hash of this jar's epoch cookie. With mint it

@@ -7,6 +7,7 @@ import (
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
 const (
@@ -501,6 +502,11 @@ func mapFlowError(err error) error {
 		return agentevents.ErrBrowserAuthLastMethod
 	case errors.Is(err, koseki.ErrProviderOperationPending):
 		return agentevents.ErrBrowserAuthProviderPending
+	case errors.Is(err, transfersession.ErrPending):
+		return agentevents.ErrBrowserTransferPending
+	case errors.Is(err, transfersession.ErrClosed), errors.Is(err, transfersession.ErrExpired),
+		errors.Is(err, transfersession.ErrConflict), errors.Is(err, transfersession.ErrNotFound):
+		return agentevents.ErrBrowserTransferUnavailable
 	default:
 		return agentevents.ErrBrowserAuthFlowInvalid
 	}

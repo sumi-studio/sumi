@@ -20,6 +20,7 @@ import (
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
 // Employer types for the employment ledger.
@@ -51,7 +52,11 @@ type Store struct {
 	EnrollmentWorkspaceAuthority EnrollmentWorkspaceAuthority
 	// EmailChallengeKey derives emailed codes and link tokens. Email sign-in
 	// fails closed while it is unset.
-	EmailChallengeKey   *EmailChallengeKey
+	EmailChallengeKey *EmailChallengeKey
+	// Transfers is the secretary-move session service the account
+	// transaction claims through. When nil the store uses a default service
+	// over the same pool.
+	Transfers           *transfersession.Service
 	pool                *pgxpool.Pool
 	wrappingKeyID       string
 	directChatLifecycle *directchat.LifecycleFence
@@ -83,6 +88,15 @@ func NewWithWrappingKeyID(
 		directChatLifecycle: lifecycle,
 		directChatApps:      applicationapps.New(pool, nil, lifecycle),
 	}
+}
+
+// transfers lazily provides the default session service when the wiring did
+// not install a configured one.
+func (s *Store) transferSessions() *transfersession.Service {
+	if s.Transfers != nil {
+		return s.Transfers
+	}
+	return transfersession.New(s.pool, transfersession.Config{})
 }
 
 func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
@@ -432,6 +446,17 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 		return Registration{}, fmt.Errorf("begin auto-register: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// An open secretary-move session for this credential claims the carried
+	// persona here too: a registration path that minted a second Secretary
+	// over a staged import would strand the Local source's authority.
+	claim, claimed, err := s.transferSessions().ClaimForSubjectInTx(ctx, tx,
+		transfersession.Subject{Provider: provider, Subject: externalSubject})
+	if err != nil {
+		return Registration{}, err
+	}
+	if claimed {
+		agentID = claim.PersonaID
+	}
 	displayName := initialHumanDisplayName(rawDisplayName)
 	if _, err := tx.Exec(ctx, `INSERT INTO humans (human_id, display_name)
 		VALUES ($1, COALESCE(NULLIF($2, ''), 'Sumi'))`, humanID, displayName); err != nil {
@@ -463,8 +488,16 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 	if _, err := s.directChatApps.InstallDirectChatForNewHumanInTx(ctx, tx, humanID); err != nil {
 		return Registration{}, fmt.Errorf("install initial direct chat: %w", err)
 	}
+	if claimed {
+		if err := transfersession.ProvisionInTx(ctx, tx, claim, humanID); err != nil {
+			return Registration{}, fmt.Errorf("provision carried secretary: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Registration{}, fmt.Errorf("commit auto-register: %w", err)
+	}
+	if claimed {
+		s.reconcileProvisionedTransfer(externalSubject)
 	}
 	return Registration{
 		HumanID: humanID, AgentID: agentID,
