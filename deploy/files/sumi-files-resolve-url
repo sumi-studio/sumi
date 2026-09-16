@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# sumi-files-resolve-url — resolve a `{docker:CONTAINER}` (or
+# `{docker:CONTAINER@NETWORK}`) token embedded as the host part of a URL to
+# the container's current bridge IP.
+#
+#   sumi-files-resolve-url 'postgres://user@{docker:sumi-dev-postgres-1}:5432/db?sslmode=disable'
+#       prints the resolved URL on stdout
+#
+#   sumi-files-resolve-url --env OUTFILE NAME [NAME...]
+#       writes "NAME=<resolved value>" lines to OUTFILE (mode 0600) for every
+#       listed variable already set in the process environment; variables that
+#       are unset or contain no token are written unchanged when set. Used by a
+#       unit's ExecStartPre to render a fragment EnvironmentFile.
+#
+# Why: host-side clients reach a containerized PostgreSQL at its bridge IP,
+# which changes when the container is recreated — the address is runtime
+# evidence, not durable configuration. Resolving the named container at every
+# start keeps env files free of a stale address. Resolution fails closed:
+# docker unavailable, an absent/unstarted container, or an empty address all
+# exit nonzero and print nothing.
+set -euo pipefail
+
+resolve() {
+  local url=$1 token name net ip guard=0
+  while [[ "$url" == *'{docker:'*'}'* ]]; do
+    (( ++guard > 5 )) && return 1
+    token=${url#*\{docker:}
+    token=${token%%\}*}
+    name=${token%%@*}
+    net=
+    [[ "$token" == *@* ]] && net=${token#*@}
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
+    if [[ -n "$net" ]]; then
+      ip="$(docker inspect -f '{{index .NetworkSettings.Networks "'"$net"'"}}.IPAddress' -- "$name" 2>/dev/null)" || return 1
+    else
+      ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' -- "$name" 2>/dev/null)" || return 1
+    fi
+    [[ -n "$ip" && "$ip" != '<no value>' ]] || return 1
+    url=${url/"{docker:${token}}"/"$ip"}
+  done
+  printf '%s' "$url"
+}
+
+if [[ "${1:-}" == --env ]]; then
+  out=${2:?usage: sumi-files-resolve-url --env OUTFILE NAME...}
+  shift 2
+  umask 077
+  tmp="${out}.tmp.$$"
+  : > "$tmp"
+  for name in "$@"; do
+    [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { rm -f "$tmp"; exit 2; }
+    value=${!name-}
+    [[ -n "$value" ]] || continue
+    resolved="$(resolve "$value")" || { rm -f "$tmp"; exit 1; }
+    printf '%s=%s\n' "$name" "$resolved" >> "$tmp"
+  done
+  mv "$tmp" "$out"
+else
+  for url in "$@"; do
+    resolve "$url" || exit 1
+    printf '\n'
+  done
+fi

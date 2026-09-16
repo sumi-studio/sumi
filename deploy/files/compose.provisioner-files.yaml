@@ -1,0 +1,42 @@
+# Files-scope mode for the runtime provisioner (co-located executor client).
+#
+# The provisioner is the sole Docker authority: it execs
+# deploy/agent/supervisor per prepare/activate/stop inside this container, so
+# the canonical-files scope gate (require_files_scope) must see the host's
+# executor JuiceFS mount from inside the container, and the scope bind the
+# supervisor writes into the agent Compose graph must resolve to the same
+# host path the daemon sees. Binding /var/lib/sumi-files at the identical
+# path satisfies both.
+#
+# Requirements on the host:
+#   - a root JuiceFS client mounts the canonical volume at
+#     /var/lib/sumi-files/mnt (sumi-files-mount@executor, adds allow_other);
+#   - /var/lib/sumi-files is a *shared* mount on the host
+#     (`mount --bind /var/lib/sumi-files /var/lib/sumi-files` once, then
+#     `mount --make-rshared /var/lib/sumi-files`), so a remount after a client
+#     crash propagates into this rslave bind instead of leaving the
+#     provisioner checking a stale corpse;
+#   - SUMI_FILES_VOLUME_UUID is the UUID printed by sumi-files-format.
+#
+# The four SUMI_FILES_* names are allowlisted into the supervisor environment
+# by apps/api/cmd/runtime-provisioner (hostEnvironment). All-or-none: a
+# partial set makes the supervisor fail closed. SUMI_FILES_CHECK_WAIT_SECONDS
+# bounds each scope verification probe; it is not a global launch deadline.
+#
+# Merge after the base provisioning stack:
+#   docker compose -f deploy/local/compose.yaml -f deploy/local/compose.dev.yaml \
+#     -f deploy/files/compose.provisioner-files.yaml ...
+services:
+  runtime-provisioner:
+    environment:
+      SUMI_FILES_MOUNTPOINT: /var/lib/sumi-files/mnt
+      SUMI_FILES_VOLUME_UUID: ${SUMI_FILES_VOLUME_UUID:?set to the volume UUID printed by sumi-files-format}
+      SUMI_FILES_CHECK: /opt/sumi/deploy/files/sumi-files-check
+      SUMI_FILES_CHECK_WAIT_SECONDS: ${SUMI_FILES_CHECK_WAIT_SECONDS:-30}
+    volumes:
+      - type: bind
+        source: /var/lib/sumi-files
+        target: /var/lib/sumi-files
+        bind:
+          propagation: rslave
+          create_host_path: false
