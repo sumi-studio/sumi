@@ -29,6 +29,10 @@ if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]
   echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
   exit 2
 fi
+if [[ "$(stat -c %u "$env_file")" != "$(id -u)" ]]; then
+  echo "refused: credential file $env_file must be owned by the client uid $(id -u)" >&2
+  exit 2
+fi
 set -a
 # shellcheck disable=SC1090
 . "$env_file"
@@ -62,6 +66,23 @@ esac
   exit 2
 }
 
+# The kernel mounts at the resolved path, so the configured mountpoint must
+# already be canonical: a symlinked leaf or intermediate component (or a
+# "." / ".." element) would mount the volume outside the private parent
+# validated below, and a literal-path mountinfo compare would then disagree
+# with the kernel about whether anything is mounted. `realpath -m` resolves
+# existing symlinks without requiring the leaf to exist; the call is bounded
+# so a dead or stalled FUSE component fails closed instead of hanging the
+# unit.
+mnt_resolved="$(LC_ALL=C timeout 5 realpath -m -- "$mnt")" || {
+  echo "refused: cannot resolve mountpoint path $mnt" >&2
+  exit 2
+}
+[[ "$mnt_resolved" == "$mnt" ]] || {
+  echo "refused: mountpoint $mnt resolves to $mnt_resolved; configure the canonical path" >&2
+  exit 2
+}
+
 # Host traversal guard: --all-squash collapses every scope to one owner, so
 # once a host user can reach the mountpoint at all they can read, write and
 # rename every scope on the volume. The only host-level boundary is the path
@@ -70,10 +91,6 @@ esac
 # place; a shared parent that is group/other-accessible is refused, never
 # silently chmodded, because other entries may rely on its permissions.
 mnt_parent="$(dirname "$mnt")"
-if [[ -L "$mnt_parent" ]]; then
-  echo "refused: mountpoint parent $mnt_parent must be a real directory, not a symlink" >&2
-  exit 2
-fi
 if [[ ! -d "$mnt_parent" ]]; then
   install -d -m 0700 "$mnt_parent" || {
     echo "refused: cannot create private mountpoint parent $mnt_parent" >&2
@@ -158,6 +175,17 @@ if [[ -n "$fstype" ]]; then
   fi
 fi
 install -d -m 0700 "$mnt"
+# The cache dir gets the same canonical-path rule as the mountpoint:
+# mkdir/chmod follow symlinks, so a symlinked cache dir would chmod its
+# referent.
+cache_resolved="$(LC_ALL=C timeout 5 realpath -m -- "$cache_dir")" || {
+  echo "refused: cannot resolve cache dir path $cache_dir" >&2
+  exit 2
+}
+[[ "$cache_resolved" == "$cache_dir" ]] || {
+  echo "refused: cache dir $cache_dir resolves to $cache_resolved; configure the canonical path" >&2
+  exit 2
+}
 mkdir -p "$cache_dir"
 chmod 0700 "$cache_dir"
 

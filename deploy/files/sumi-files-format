@@ -19,6 +19,10 @@ if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]
   echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
   exit 2
 fi
+if [[ "$(stat -c %u "$env_file")" != "$(id -u)" ]]; then
+  echo "refused: credential file $env_file must be owned by the client uid $(id -u)" >&2
+  exit 2
+fi
 set -a
 # shellcheck disable=SC1090
 . "$env_file"

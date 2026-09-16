@@ -343,6 +343,9 @@ Primary sources, read 2026-09-16:
     (`flush … timeout after waited 5m0s`). Retrying the write after storage
     returns can answer 503 `pending_settlement` until the reconciler settles
     the interrupted write (25–95 s after restore in two runs), then succeeds.
+    A 503 on write does not prove the write did not commit: an interrupted
+    upload can still materialize once storage returns, so callers should
+    `stat`/`read` the target before assuming a retry is needed.
     The interrupted write's staged bytes surfaced as a public
     `recovered-o<id>-<random>` file next to the target, as the contract
     specifies for unattributable staged objects; callers or people may need
@@ -380,6 +383,14 @@ Primary sources, read 2026-09-16:
   and restarting `filesvc`. Issuing per-secretary scope tokens from account
   authorization, and routing Cloud callers to `filesvc`, are separate
   integrations.
+- **Local-control availability drives generation churn.** Each executor unit
+  (re)start runs supervisor prepare/activate, which allocates a new epoch —
+  by design, a restarted secretary never reuses a dead generation. In a
+  fixture a ~2-minute local-control listener outage produced restart
+  generations 2→9 before the runtime published `ready` again: truthful
+  fencing and self-healing, but the runtime-secret tree and any
+  generation-keyed state churn with it. A reliable local-control listener is
+  a rollout prerequisite; no bound on generation count is claimed here.
 
 ## What has and has not been verified
 
@@ -399,10 +410,21 @@ restart; full remount persistence; object-store outage and recovery; SigV4
 positive/negative cases; `files-cloud-probe.mjs --mount-dir` from the
 executor host.
 
+Verified additionally in the repair fixture and an independent review
+fixture (2026-09-17): real `systemd` unit operation (mount, `filesvc`, and
+`sumi-files-executor@` units on user and system managers), the supervisor
+prepare/activate path launching the published agent image under nested
+Docker with the canonical scope bound at `/workspace`, runtime Ready
+publication and gateway exchange through local stub endpoints, killed-client
+corpse recovery with dependent restart, dead-mount classification
+(ENOTCONN-only removal), mountpoint canonicalization refusals, host-user
+scope isolation, and two-way API↔executor file I/O.
+
 Not verified: the deployed Worker and Durable Object (TLS, real edge header
 handling, CPU limits, whether a remote client signs `UNSIGNED-PAYLOAD`), R2,
-a separate executor host over the network, Docker executor containers from
-the agent image using the Compose override (the merged Compose file was
-rendered, not run; the agent `prepare` step's `install -d -o 10002` on the
-bound scope is untested), and `systemd` unit operation (the unit files pass
-`systemd-analyze verify` only).
+real account grants and public provisioning, a separate executor host over
+the network (fixtures co-locate service and executor stand-ins on one Docker
+network), AppArmor-enforced launch (fixtures use the documented
+`SUMI_DEV_ALLOW_APPARMOR_UNCONFINED` fallback; seccomp, caps, read-only
+mounts and namespace fencing were still enforced), and real model-provider
+calls.

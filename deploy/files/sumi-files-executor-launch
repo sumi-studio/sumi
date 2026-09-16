@@ -10,7 +10,7 @@
 #
 # Environment (via the unit's EnvironmentFile directives):
 #   /etc/sumi-files/executor.env   SUMI_FILES_MOUNTPOINT, SUMI_FILES_VOLUME_UUID,
-#                                  optional SUMI_FILES_CHECK, SUMI_FILES_CHECK_WAIT
+#                                  optional SUMI_FILES_CHECK, SUMI_FILES_CHECK_WAIT_SECONDS
 #   /etc/sumi-files/agent-<s>.env  SUMI_PERSONALITY_AGENT_ID,
 #                                  SUMI_AGENT_COMPOSE_DIR (checkout containing
 #                                  deploy/agent) and the launch environment and
@@ -40,7 +40,7 @@ export SUMI_FILES_CHECK="$check"
 
 # The canonical scope must verify before any epoch is allocated; the
 # supervisor re-verifies it inside the fenced prepare/activate actions.
-"$check" --wait "${SUMI_FILES_CHECK_WAIT:-60}" \
+"$check" --wait "${SUMI_FILES_CHECK_WAIT_SECONDS:-60}" \
   "$SUMI_FILES_MOUNTPOINT" "$SUMI_FILES_VOLUME_UUID" "$scope" >/dev/null
 
 epoch_json="$("$supervisor" prepare)"

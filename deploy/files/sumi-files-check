@@ -36,6 +36,14 @@ refuse() {
 [[ "$wait_s" =~ ^[0-9]+$ ]] || refuse usage "--wait takes whole seconds"
 [[ "$mnt" == /* && "$mnt" != */ && "$mnt" != *[[:space:]]* ]] ||
   refuse usage "MOUNTPOINT must be absolute, without trailing slash or whitespace"
+# The kernel records the resolved path in mountinfo, not the configured
+# spelling: a symlinked mountpoint mounts at its target. Canonicalize so the
+# mount lookup and the printed scope path describe the path the kernel would
+# actually mount. Bounded so a dead or stalled filesystem component fails
+# closed instead of hanging.
+mnt_resolved="$(LC_ALL=C timeout 5 realpath -m -- "$mnt")" ||
+  refuse usage "cannot resolve MOUNTPOINT path"
+mnt="$mnt_resolved"
 if [[ -n "$scope" ]]; then
   [[ "$scope" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$scope" != *..* && "$scope" != .filesv-* ]] ||
     refuse usage "invalid scope name"
@@ -66,8 +74,10 @@ check_once() {
     echo "subdir_mount:$mnt mounts volume subdirectory $root, not the volume root"
     return 1
   fi
-  if ! stat -- "$mnt" >/dev/null 2>&1; then
-    echo "not_mounted:$mnt does not answer (dead FUSE daemon)"
+  # Bounded: a stalled-but-alive client blocks lookups without answering
+  # ENOTCONN, and an unbounded stat would hang the --wait loop forever.
+  if ! LC_ALL=C timeout 5 stat -- "$mnt" >/dev/null 2>&1; then
+    echo "not_mounted:$mnt does not answer (unresponsive or dead FUSE daemon)"
     return 1
   fi
   if ! cfg="$(timeout 5 cat -- "$mnt/.config" 2>/dev/null)"; then
@@ -102,7 +112,9 @@ done
 
 if [[ -n "$scope" ]]; then
   dir="$mnt/$scope"
-  if [[ -L "$dir" || ! -d "$dir" ]]; then
+  # Bounded stat covers "missing", "not a directory" and "symlink" in one
+  # lstat without an unbounded filesystem call on a possibly-stalled mount.
+  if [[ "$(LC_ALL=C timeout 5 stat -c %F -- "$dir" 2>/dev/null)" != directory ]]; then
     refuse scope_missing "$scope is not a directory on volume $want_uuid"
   fi
   printf '%s\n' "$dir"
