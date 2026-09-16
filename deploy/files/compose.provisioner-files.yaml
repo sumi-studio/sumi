@@ -8,15 +8,18 @@
 # host path the daemon sees. Binding /var/lib/sumi-files at the identical
 # path satisfies both.
 #
-# Requirements on the host:
-#   - a root JuiceFS client mounts the canonical volume at
-#     /var/lib/sumi-files/mnt (sumi-files-mount@executor, adds allow_other);
-#   - /var/lib/sumi-files is a *shared* mount on the host
-#     (`mount --bind /var/lib/sumi-files /var/lib/sumi-files` once, then
-#     `mount --make-rshared /var/lib/sumi-files`), so a remount after a client
-#     crash propagates into this rslave bind instead of leaving the
-#     provisioner checking a stale corpse;
-#   - SUMI_FILES_VOLUME_UUID is the UUID printed by sumi-files-format.
+# Requirements on the host, in order:
+#   1. /var/lib/sumi-files is made a *shared* mount
+#      (`mount --bind /var/lib/sumi-files /var/lib/sumi-files` once, then
+#      `mount --make-rshared /var/lib/sumi-files`) — BEFORE the client
+#      mounts. Doing it over an active FUSE mount shadows that mount (the
+#      client keeps serving an orphaned mountpoint while the visible path
+#      shows the bare directory). With the shared parent in place, a remount
+#      after a client crash propagates into this rslave bind instead of
+#      leaving the provisioner checking a stale corpse;
+#   2. a root JuiceFS client mounts the canonical volume at
+#      /var/lib/sumi-files/mnt (sumi-files-mount@executor, adds allow_other);
+#   3. SUMI_FILES_VOLUME_UUID is the UUID printed by sumi-files-format.
 #
 # The four SUMI_FILES_* names are allowlisted into the supervisor environment
 # by apps/api/cmd/runtime-provisioner (hostEnvironment). All-or-none: a

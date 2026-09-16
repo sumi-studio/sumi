@@ -8,7 +8,10 @@
 #     FILESV_LISTEN FILESV_ROOT FILESV_DB_URL FILESV_TOKENS FILESV_REQUIRE_MOUNT=1
 # FILESV_DB_URL may use a {docker:CONTAINER} host token; ExecStartPre resolves
 # it to the container's current bridge IP into a fragment environment file
-# (the address is runtime evidence, not durable configuration).
+# (the address is runtime evidence, not durable configuration). --from reads
+# the template env file afresh: a previous run's fragment (loaded into this
+# process's environment by systemd before ExecStartPre runs) would otherwise
+# shadow the token and freeze the resolved address.
 [Unit]
 Description=Sumi files API (filesvc)
 Requires=sumi-files-mount@service.service
@@ -20,7 +23,7 @@ Type=simple
 RuntimeDirectory=sumi-files
 EnvironmentFile=%E/sumi-files/filesvc.env
 ExecStartPre=/bin/bash -c 'test "$${FILESV_REQUIRE_MOUNT}" = 1 || { echo "refused: FILESV_REQUIRE_MOUNT must be 1 in Cloud placement" >&2; exit 2; }'
-ExecStartPre=%h/.local/lib/sumi-files/sumi-files-resolve-url --env %t/sumi-files/filesvc-url.env FILESV_DB_URL
+ExecStartPre=%h/.local/lib/sumi-files/sumi-files-resolve-url --env %t/sumi-files/filesvc-url.env --from %E/sumi-files/filesvc.env FILESV_DB_URL
 EnvironmentFile=-%t/sumi-files/filesvc-url.env
 ExecStart=%h/.local/lib/sumi-files/filesvc
 Restart=on-failure
