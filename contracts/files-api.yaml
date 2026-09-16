@@ -124,6 +124,22 @@ info:
     declared-EMPTY destination uses renameat2 RENAME_NOREPLACE, so a
     foreign object that claims the name first is never overwritten —
     the operation reports 409 external_change instead.
+    The verified discard runs while the operation holds the name and is
+    guaranteed against every supported actor: API operations cannot
+    address reserved names at all, the reconciler never writes into an
+    existing private name, and the operation's own syscalls on the name
+    complete before the discard begins — including an exchange whose
+    reply was lost: an unknown-outcome exchange parks the state for the
+    reconciler rather than stat-unlinking a name an outstanding syscall
+    can still populate. The boundary is a raw same-mount writer
+    deliberately renaming INTO a visible reserved .filesv-op-* name
+    between the verify and the unlink — an object so placed can be
+    lost. That is the same convention as writing inside .git/: the
+    reserved namespace is service-internal, and the random suffix
+    prevents collisions and pre-positioning, not observation by a
+    local writer that lists the directory. Direct edits to ordinary
+    public names — including during an in-flight operation — remain
+    protected (external_change, undo, or surfaced preservation).
     Every act that can populate a private name is journaled BEFORE the
     syscall (act + scope-relative source path), and its result is
     journaled after (ok / noeff / empty = outcome unknown). The journal
@@ -151,10 +167,11 @@ info:
     A committed file_event, a matching content hash, fingerprint or
     inode similarity, and the intent row's absence are all individually
     and jointly NOT disposal authority — events and rows record what the
-    operation produced, not which bytes may be destroyed. The only
-    deletion the reconciler performs is a proven same-object duplicate:
-    a private name and a public name verified to reference the SAME
-    object (kind + durable identity) collapse to the public link.
+    operation produced, not which bytes may be destroyed. The reconciler
+    performs NO deletion at all: a private name verified to reference
+    the same object as a public name still surfaces its link visibly,
+    because no check-and-unlink can be made atomic against an
+    interloper swapped in between the check and the unlink.
     Settlement destination discipline: before a captured or surfaced
     object is moved, its destination is journaled (the record's home
     field). If the move succeeds but the row or event commit fails —
@@ -206,9 +223,15 @@ info:
     never deletes — a stat-then-unlink cannot prove the object still
     beneath a private name is the verified one against an interloper
     swap, so uncertain or duplicate objects surface at public
-    recovered-* names instead. Unattributable objects do not stay
-    hidden: the reconciler surfaces them at public recovered-* names
-    (above), so private names never retain content indefinitely.
+    recovered-* names instead. The two prefixes differ: under
+    .filesv-op- (the recovery journal's private names) unattributable
+    objects do not stay hidden — the reconciler surfaces them at public
+    recovered-* names (above), so those names never retain content
+    indefinitely. .filesv-tmp- is reserved-but-unused: no current code
+    path mints it and none deletes it, so a foreign deposit under it is
+    preserved exactly as found — still hidden from listings and
+    API-rejected — for as long as it exists; the service claims no
+    disposal authority over it.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so

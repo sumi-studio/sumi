@@ -36,6 +36,20 @@ type posixRoot struct {
 	// exchange's post-verify and the displaced-object discard — the
 	// window a paused actor resumes into after ownership loss.
 	faultHook func(tag string)
+
+	// xchFn, when non-nil (tests only), replaces the RENAME_EXCHANGE
+	// syscall — used to inject a lost reply: the effect applied (or
+	// not) while the call reports a transport-class error.
+	xchFn func(oldfd int, old string, newfd int, newName string) error
+}
+
+// exchange swaps two names atomically (RENAME_EXCHANGE). Isolated
+// behind a helper so tests can inject the lost-reply outcome.
+func (p *posixRoot) exchange(oldfd int, old string, newfd int, newName string) error {
+	if p.xchFn != nil {
+		return p.xchFn(oldfd, old, newfd, newName)
+	}
+	return unix.Renameat2(oldfd, old, newfd, newName, unix.RENAME_EXCHANGE)
 }
 
 // inflightMountCheck broadcasts one checkMountInner result to every caller
@@ -767,23 +781,34 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// isSealedName reports whether base is a quarantine name: an
-// opStage-prefixed name carrying "-q-". Sealed names are a structural
+// isSealedName reports whether base is a legacy quarantine name: an
+// opStage-prefixed name carrying "-q-", minted by earlier versions and
+// still possible as an on-disk deposit. Sealed names are a structural
 // invariant — once created, NOTHING may write into them (no exchange,
 // no rename target, no link target); they may only be moved out of or
-// unlinked. That is what makes verify-then-unlink on a sealed name
-// race-free: enumerating the name (every reconcile pass does) grants
-// no write authority over it.
+// unlinked. Currently minted private names (o<id>-a0-<rand>,
+// c<id>-<rand>, adhoc-<rand>) carry no "-q-" and need no runtime guard:
+// no code path computes them as a destination, so they are excluded by
+// construction rather than by this check.
 func isSealedName(base string) bool {
 	return strings.HasPrefix(base, opStagePrefix) && strings.Contains(base, "-q-")
 }
 
 // discardOwned unlinks the object at name beneath pfd after re-proving
-// its fp3. The name is an owned single-epoch private name: the identity
-// recheck plus in-place unlink is definitive because nothing else may
-// write the name. ENOTEMPTY/EEXIST (a dir that gained members) maps to
-// ErrNotEmpty so callers can treat it as divergence; a foreign capture
-// (fp3 mismatch) reports ErrConflict and leaves the object parked.
+// its fp3. The name is an owned single-epoch private name. No supported
+// actor can populate it: API paths reject the reserved prefix, the
+// reconciler never targets an existing private name (captures mint
+// fresh c- names; settlements go to home or recovered-*), and the op's
+// own syscalls on the name are program-ordered before this point — so
+// the verify→unlink pair is closed for every in-protocol writer. The
+// residual exposure is a raw same-mount writer deliberately renaming
+// into a visible reserved name between the check and the unlink — the
+// same envelope as writing into .git internals; documented in the
+// contract, not defended by the random suffix (which prevents
+// pre-positioning and collisions, not observation).
+// ENOTEMPTY/EEXIST (a dir that gained members) maps to ErrNotEmpty so
+// callers can treat it as divergence; a foreign capture (fp3 mismatch)
+// reports ErrConflict and leaves the object parked.
 func discardOwned(pfd *os.File, name, want3 string) error {
 	st3, _, _, err := fp3at(pfd, name)
 	if errors.Is(err, ErrNotFound) {
@@ -1439,11 +1464,15 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		p.faultHook("write.postCreate")
 	}
 	// fail returns a pre-commit error after best-effort cleanup of the
-	// staged file. The name is ours, but a delayed effect may have
-	// swapped its occupant between create and now — verify the name
-	// still holds OUR object (same inode; an in-place scribble on our
-	// own object is still ours to delete) before unlinking; a foreign
-	// occupant stays parked and the intent must be tombstoned.
+	// staged file. Only reachable from branches whose outstanding
+	// syscalls can never REFILL tmp with foreign content: NOREPLACE
+	// publish moves tmp's object out (a late landing empties it or
+	// fails), linkat never populates tmp, and the unknown-outcome
+	// exchange — the one syscall that refills tmp — parks instead of
+	// calling fail (F270). Still verify the name holds OUR object
+	// (same inode) before unlinking: a foreign occupant — e.g. one an
+	// earlier late effect swapped in — stays parked and the intent
+	// must be tombstoned.
 	fail := func(perr error) (FileInfo, bool, error) {
 		cur3, _, _, cerr := fp3at(pfd, tmp)
 		curIno, _, _, _ := fpParts(cur3 + ":0")
@@ -1569,7 +1598,7 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// the act declared-but-unresulted, which the reconciler reads as
 	// outcome-unknown, never "definitively absent".
 	it.njAct("xch", rel)
-	err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_EXCHANGE)
+	err = p.exchange(int(pfd.Fd()), tmp, int(pfd.Fd()), name)
 	if p.faultHook != nil {
 		// Kill boundary: the exchange may have committed while its
 		// result journal has not — a successor must read res="" +
@@ -1596,8 +1625,14 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		return commit(our3)
 	case err != nil:
 		// Only ENOENT proves no effect; every other error leaves the
-		// exchange's outcome unknown — the result stays unrecorded.
-		return fail(mapPublishErr(err, exclusive))
+		// exchange's outcome unknown — and a lost reply can still land
+		// later, refilling tmp with the displaced object (possibly a
+		// concurrent public edit). A stat→unlink on a name an
+		// outstanding syscall may still populate is not a conditional
+		// delete: park the whole state for the reconciler instead
+		// (F270). The result stays unrecorded — outcome unknown.
+		return FileInfo{}, false, fmt.Errorf("%w: %w",
+			mapPublishErr(err, exclusive), errUndoParked)
 	}
 	it.njRes("ok")
 	// Exchanged: the private name now holds the object the path used to
@@ -1620,8 +1655,8 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		p.faultHook("write.preUndo")
 	}
 	// Declare the undo before its exchanges can repopulate the slot:
-	// res re-opens first so every crash window reads outcome-unknown.
-	it.njRes("")
+	// journal.act re-opens res in the same write, so every crash window
+	// reads outcome-unknown for the act in flight.
 	it.njAct("und", rel)
 	uerr := undoDisplaced(pfd, pfd, tmp, name,
 		func(t3 string) bool { return t3 == our3 })
@@ -1839,8 +1874,8 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// before the syscall can populate the name with the displaced
 	// object.
 	it.njAct("xch", relTo)
-	err = unix.Renameat2(int(srcPfd.Fd()), stage,
-		int(dstPfd.Fd()), dstName, unix.RENAME_EXCHANGE)
+	err = p.exchange(int(srcPfd.Fd()), stage,
+		int(dstPfd.Fd()), dstName)
 	if p.faultHook != nil {
 		// Kill boundary: the exchange may have committed while its
 		// result journal has not.
@@ -1855,8 +1890,14 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 			return restoreSrc(ErrExternalChange)
 		default:
 			// Any other failure leaves the exchange outcome unknown —
-			// the result stays unrecorded and the intent survives.
-			return restoreSrc(mapPublishErr(err, true))
+			// and a lost reply can still land later. Do not restoreSrc:
+			// if the exchange landed, the stage name holds the
+			// displaced destination object, and moving it onto the
+			// public source name misplaces content we no longer own
+			// there. Park everything for the reconciler, which judges
+			// the slot's real occupant (F270/Fable).
+			return FileInfo{}, false, fmt.Errorf("%w: %w",
+				mapPublishErr(err, true), errUndoParked)
 		}
 	}
 	it.njRes("ok")
@@ -1909,9 +1950,8 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// Undo: exchange the private name back with the destination (the
 	// foreign object returns to its name, ours to the private name),
 	// then restore the source to `from`. Never unlinks foreign bytes.
-	// Declared before it can repopulate the slot: res re-opens first so
-	// every crash window reads outcome-unknown.
-	it.njRes("")
+	// Declared before it can repopulate the slot: journal.act re-opens
+	// res in the same write, so every crash window reads outcome-unknown.
 	it.njAct("und", relTo)
 	uerr := undoDisplaced(srcPfd, dstPfd, stage, dstName,
 		func(t3 string) bool { return t3 == src3 })

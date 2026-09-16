@@ -79,9 +79,10 @@ type Store struct {
 	fsCheck          func() error                             // when set, verdict that the fs root is trustworthy (canonical mount live)
 	viewFn           func(context.Context) (ReconView, error) // pass-pinned fs view; supersedes statFn/hashFn/fsCheck when set
 	reconcile        chan struct{}
-	lastTombScan     atomic.Int64 // unix nanos of the last hot tombstone re-judgment
-	lastTombScanCold atomic.Int64 // unix nanos of the last cold tombstone re-judgment
-	lastStageSweep   atomic.Int64 // unix nanos of the last orphan staged sweep
+	claimRowsFn      func(ctx context.Context, scope, keep, sha string) (claimRows, error) // test seam — nil in production
+	lastTombScan     atomic.Int64                                                          // unix nanos of the last hot tombstone re-judgment
+	lastTombScanCold atomic.Int64                                                          // unix nanos of the last cold tombstone re-judgment
+	lastStageSweep   atomic.Int64                                                          // unix nanos of the last orphan staged sweep
 }
 
 // StatFn stats a scope-relative path — injected by the service so the
@@ -627,6 +628,11 @@ func (nj *nameJournal) patchBool(i int, cond string, val bool) {
 // act records that a named act was initiated on names[i] BEFORE the
 // syscall that can populate it — this ordering is what makes an
 // unresulted record mean "outcome unknown" rather than "never ran".
+// The act transition re-opens the result in the same write: res belongs
+// to the CURRENT act, so a previous act's "ok" must never survive to be
+// read as the new act's outcome (F267 — a crash after act=xch used to
+// leave the cap act's res=ok durable, which the reconciler then read as
+// "exchange applied").
 func (nj *nameJournal) act(i int, act, src string) {
 	if nj == nil {
 		return
@@ -634,12 +640,14 @@ func (nj *nameJournal) act(i int, act, src string) {
 	ctx, cancel := context.WithTimeout(context.Background(), nj.s.dbTimeout)
 	defer cancel()
 	_, err := nj.s.pool.Exec(ctx,
-		`UPDATE file_op SET names = jsonb_set(jsonb_set(names,
+		`UPDATE file_op SET names = jsonb_set(jsonb_set(jsonb_set(names,
 		    $2::text[], to_jsonb($3::text)),
-		    $4::text[], to_jsonb($5::text))
+		    $4::text[], to_jsonb($5::text)),
+		    $6::text[], to_jsonb(''::text))
 		 WHERE id = $1`, nj.id,
 		[]string{strconv.Itoa(i), "act"}, act,
-		[]string{strconv.Itoa(i), "src"}, src)
+		[]string{strconv.Itoa(i), "src"}, src,
+		[]string{strconv.Itoa(i), "res"})
 	if err != nil {
 		log.Printf("filesvc: name journal act op=%d [%d]: %v", nj.id, i, err)
 	}
@@ -1894,34 +1902,63 @@ func ambiguousMeaning(it intent, rec nameRec, st FileInfo, sha string) objMeanin
 	if it.op == "rename" && it.toPath != "" {
 		displacedHome = it.toPath
 	}
-	if st.Oid != "" {
-		switch {
-		case it.dstOid != "" && st.Oid == it.dstOid:
-			return objMeaning{ocDisplaced, displacedHome, true, true}
-		case it.op == "rename" && it.preOid != "" && st.Oid == it.preOid:
-			return objMeaning{ocFromPath, it.path, true, true}
-		case it.op == "write" && obsOidMatch(rec, st.Oid):
-			return objMeaning{ocAuthored, it.path, true, true}
-		}
-		return objMeaning{} // bound proof it is none of the declared objects
+	// Each role is judged by its strongest declared evidence: a bound
+	// live oid proves or disproves a role only when that role declared
+	// an oid to compare; a role declared by fp+sha alone is still
+	// decided by fp+sha — a live handle cannot contradict identity the
+	// intent never recorded. (b117 CI: ext4/tmpfs vend handles to every
+	// stat, while fixtures and unbound-filesystem declares store no
+	// oid — treating "bound oid, no declared oid" as proof-of-foreign
+	// silently surfaced every such object instead of restoring it.)
+	mDst, bDst := roleMatch(st, it.dstOid, it.dstFP != "" &&
+		fp3(st.Fingerprint) == fp3(it.dstFP) &&
+		(it.dstSHA == "" || st.Kind != "file" || sha == it.dstSHA))
+	mPre, bPre := false, false
+	if it.op == "rename" {
+		mPre, bPre = roleMatch(st, it.preOid, it.preFP != "" &&
+			fp3(st.Fingerprint) == fp3(it.preFP) &&
+			(it.srcKind != "file" || it.expectSHA == "" || sha == it.expectSHA))
 	}
-	// Unbound object: declared fp3 + content evidence only.
-	mDst := it.dstFP != "" && fp3(st.Fingerprint) == fp3(it.dstFP) &&
-		(it.dstSHA == "" || st.Kind != "file" || sha == it.dstSHA)
-	mPre := it.op == "rename" && it.preFP != "" &&
-		fp3(st.Fingerprint) == fp3(it.preFP) &&
-		(it.srcKind != "file" || it.expectSHA == "" || sha == it.expectSHA)
-	mObs := it.op == "write" && obsFPMatch(rec, st.Fingerprint) &&
-		(it.expectSHA == "" || sha == it.expectSHA)
+	mObs, bObs := false, false
+	if it.op == "write" {
+		if st.Oid != "" && hasObsOid(rec) {
+			mObs, bObs = obsOidMatch(rec, st.Oid), true
+		} else {
+			mObs = obsFPMatch(rec, st.Fingerprint) &&
+				(it.expectSHA == "" || sha == it.expectSHA)
+		}
+	}
 	switch {
 	case mDst && !mPre && !mObs:
-		return objMeaning{ocDisplaced, displacedHome, true, false}
+		return objMeaning{ocDisplaced, displacedHome, true, bDst}
 	case mPre && !mDst && !mObs:
-		return objMeaning{ocFromPath, it.path, true, false}
+		return objMeaning{ocFromPath, it.path, true, bPre}
 	case mObs && !mDst && !mPre:
-		return objMeaning{ocAuthored, it.path, true, false}
+		return objMeaning{ocAuthored, it.path, true, bObs}
 	}
 	return objMeaning{} // ambiguous or foreign — unknown
+}
+
+// roleMatch scores one declared-identity role against the live object.
+// A declared oid plus a bound live oid is decided bound; anything else
+// falls to the declared weak evidence (already fully evaluated).
+func roleMatch(st FileInfo, doid string, weak bool) (match, bound bool) {
+	if st.Oid != "" && doid != "" {
+		return st.Oid == doid, true
+	}
+	return weak, false
+}
+
+// hasObsOid reports whether any journaled observation carries a bound
+// oid — the condition under which a bound live oid decides the
+// authored-body role instead of the weaker fp+sha evidence.
+func hasObsOid(rec nameRec) bool {
+	for _, o := range rec.Obs {
+		if _, ooid := obsParts(o); ooid != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // occupantOrUnknown applies a settled act's provenance while checking
@@ -2478,30 +2515,62 @@ func (s *Store) surfaceBookkeeping(ctx context.Context, it intent, view ReconVie
 // the row's own fp so a row rewritten since our read is left alone.
 // Only ever applied to rows describing the object we hold — never used
 // to elect a home.
+// claimRows is the minimal row-stream surface dropStaleClaims needs —
+// pgx.Rows satisfies it; claimRowsFn lets tests inject a narrow
+// mid-iteration failure boundary.
+type claimRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+	Close()
+}
+
 func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, keep string, live FileInfo, sha string) bool {
 	if s.pool == nil {
 		return true
 	}
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
-	rows, err := s.pool.Query(dctx,
-		`SELECT path, fp, coalesce(oid,'') FROM file_version
-		  WHERE scope=$1 AND path<>$2 AND content_sha=$3`,
-		it.scope, keep, sha)
+	var rows claimRows
+	var err error
+	if s.claimRowsFn != nil {
+		rows, err = s.claimRowsFn(dctx, it.scope, keep, sha)
+	} else {
+		rows, err = s.pool.Query(dctx,
+			`SELECT path, fp, coalesce(oid,'') FROM file_version
+			  WHERE scope=$1 AND path<>$2 AND content_sha=$3`,
+			it.scope, keep, sha)
+	}
 	if err != nil {
 		return false
 	}
+	// Materialize the whole candidate set before touching the pool
+	// again: the result stream owns its connection until Close, and
+	// deleting through the same pool while it is open can self-wait
+	// under a small or saturated pool.
 	type claim struct{ path, fp, oid string }
-	var cands []claim
+	var claims []claim
+	ok := true
 	for rows.Next() {
 		var c claim
-		if rows.Scan(&c.path, &c.fp, &c.oid) == nil {
-			cands = append(cands, c)
+		if err := rows.Scan(&c.path, &c.fp, &c.oid); err != nil {
+			ok = false // a row we cannot read cannot be certified
+			continue
 		}
+		claims = append(claims, c)
 	}
+	streamErr := rows.Err()
 	rows.Close()
-	ok := true
-	for _, c := range cands {
+	if streamErr != nil {
+		// The stream ended early (cancelled/failed mid-iteration) —
+		// unprocessed candidates may remain, so the bookkeeping is
+		// incomplete and must retry, never report done (F257/B-N2).
+		ok = false
+	}
+	for _, c := range claims {
+		if dctx.Err() != nil {
+			return false // deadline/cancellation — remaining work is doomed
+		}
 		match := false
 		if live.Oid != "" && c.oid != "" {
 			match = c.oid == live.Oid
@@ -2524,6 +2593,9 @@ func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, 
 			it.scope, c.path, c.fp); err != nil {
 			log.Printf("reconcile: drop stale claim %s: %v", c.path, err)
 			ok = false
+			if dctx.Err() != nil {
+				break
+			}
 		}
 	}
 	return ok
@@ -2650,12 +2722,18 @@ func (s *Store) surfaceRowTx(ctx context.Context, tx pgx.Tx, it intent, target s
 
 // mintMemberRows gives every member of a surfaced directory a fresh
 // version row so its contents stay ordinary readable/deletable API
-// objects — minted only where no row exists, bounded in depth and
-// deduplicated by object identity. A member never moves: the container
-// carries it, and its recorded path (if any) keeps its own stale row.
+// objects — minted only where no row exists and deduplicated by object
+// identity. A member never moves: the container carries it, and its
+// recorded path (if any) keeps its own stale row.
+//
+// The walk is an explicit-stack DFS with no depth cap: the API places
+// no depth bound on supported trees, so a capped walk could only
+// re-walk the same prefix forever while reporting the mint incomplete
+// (F257/B-N2 progress). markSeen dedups directories by object identity
+// so a cyclic structure cannot spin the stack. Every unobservable
+// member or subtree still reports false — incomplete bookkeeping
+// retries rather than claims minted rows that were never written.
 func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, root string) bool {
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
 	type member struct {
 		rel, sha string
 		st       FileInfo
@@ -2663,15 +2741,14 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 	var members []member
 	seen := map[string]struct{}{}
 	ok := true
-	var walk func(rel string, depth int)
-	walk = func(rel string, depth int) {
-		if depth > 256 {
-			return
-		}
+	stack := []string{root}
+	for len(stack) > 0 {
+		rel := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		ents, err := view.ListDir(it.scope, rel)
 		if err != nil {
 			ok = false // subtree unobservable — the mint is incomplete
-			return
+			continue
 		}
 		for _, m := range ents {
 			mrel := rel + "/" + m
@@ -2693,19 +2770,24 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 				if !markSeen(seen, st, mrel) {
 					continue
 				}
-				walk(mrel, depth+1)
+				stack = append(stack, mrel)
 			}
 			members = append(members, member{mrel, msha, st})
 		}
 	}
-	walk(root, 0)
 	for _, m := range members {
+		// One dbCtx per member tx: the walk above is bounded by tree
+		// size, not a deadline — a deep tree on a slow filesystem must
+		// not strand every mint behind one exhausted 15s window.
+		dctx, cancel := s.dbCtx(ctx)
 		tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
 		if err != nil {
+			cancel()
 			return false
 		}
 		fail := func() bool {
 			tx.Rollback(dctx)
+			cancel()
 			return false
 		}
 		if err := s.checkOwnerTx(dctx, tx); err != nil {
@@ -2738,6 +2820,7 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 			log.Printf("reconcile: member row %s: %v", m.rel, err)
 			ok = false
 		}
+		cancel()
 	}
 	return ok
 }
@@ -2772,7 +2855,11 @@ func (s *Store) sweepOrphanNames(ctx context.Context, view ReconView) []int64 {
 }
 
 // knownScopes lists every scope with recorded state — version rows or
-// intents under this root.
+// intents under this root. A mid-iteration stream or Scan failure is
+// logged, not silent: the partial set is still useful (the caller
+// unions it with the filesystem's own scope listing, and every sweep
+// pass retries), but an unreadable row is never treated as proven
+// absent (A R3).
 func (s *Store) knownScopes(ctx context.Context) []string {
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
@@ -2780,15 +2867,21 @@ func (s *Store) knownScopes(ctx context.Context) []string {
 		`SELECT scope FROM file_version
 		 UNION SELECT scope FROM file_op WHERE root=$1`, s.rootID)
 	if err != nil {
+		log.Printf("reconcile: scope enumeration query: %v", err)
 		return nil
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
 		var sc string
-		if rows.Scan(&sc) == nil {
-			out = append(out, sc)
+		if serr := rows.Scan(&sc); serr != nil {
+			log.Printf("reconcile: scope enumeration scan: %v", serr)
+			continue
 		}
+		out = append(out, sc)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("reconcile: scope enumeration stream: %v", err)
 	}
 	return out
 }
