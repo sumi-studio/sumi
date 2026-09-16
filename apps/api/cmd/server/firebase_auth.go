@@ -63,12 +63,21 @@ type firebaseAdminProviderLifecycle struct {
 	client firebaseProviderUserClient
 }
 
+// errFirebaseUserGone marks a Firebase account that no longer exists. The
+// reconcile paths treat it as an empty account — every provider the unlink or
+// the credential table ever knew is gone with the user — instead of an
+// unverifiable remote that would hold the fence forever.
+var errFirebaseUserGone = errors.New("firebase user no longer exists")
+
 func (a *firebaseAdminProviderLifecycle) ProviderAccount(ctx context.Context, firebaseUID string) (firebaseProviderAccount, error) {
 	if a == nil || a.client == nil {
 		return firebaseProviderAccount{}, errors.New("firebase provider lifecycle is unavailable")
 	}
 	user, err := a.client.GetUser(ctx, firebaseUID)
 	if err != nil {
+		if firebaseauth.IsUserNotFound(err) {
+			return firebaseProviderAccount{}, errFirebaseUserGone
+		}
 		return firebaseProviderAccount{}, err
 	}
 	return firebaseProviderAccountFromUser(user, firebaseUID)

@@ -19,6 +19,10 @@ type fakeAuthFlowController struct {
 	providerStatusCalls   int
 	providerStatusClaims  UserSessionClaims
 	providerStatusRequest ProviderOperationStatusRequest
+	providerMethodsResult ProviderMethodsResult
+	providerMethodsErr    error
+	providerMethodsCalls  int
+	providerMethodsClaims UserSessionClaims
 	flowEpoch             string
 	flowEpochErr          error
 	flowForNonce          BrowserFlowRef
@@ -49,6 +53,11 @@ func (f *fakeAuthFlowController) CompleteProviderOperation(context.Context, User
 }
 func (f *fakeAuthFlowController) FailProviderOperation(context.Context, UserSessionClaims, FailProviderOperationRequest) (ProviderOperationResult, error) {
 	return ProviderOperationResult{}, nil
+}
+func (f *fakeAuthFlowController) ProviderMethods(_ context.Context, claims UserSessionClaims) (ProviderMethodsResult, error) {
+	f.providerMethodsCalls++
+	f.providerMethodsClaims = claims
+	return f.providerMethodsResult, f.providerMethodsErr
 }
 func (f *fakeAuthFlowController) StatusProviderOperation(_ context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error) {
 	f.providerStatusCalls++
@@ -312,6 +321,71 @@ func TestProviderOperationStatusRequiresOriginCSRFAndSession(t *testing.T) {
 	}
 	if controller.providerStatusCalls != 0 {
 		t.Fatalf("rejected request reached controller %d times", controller.providerStatusCalls)
+	}
+}
+
+func TestProviderMethodsReadRequiresLiveSessionAndSameOrigin(t *testing.T) {
+	server, sessions := newTestBrowserAuthServer(t, &fakeFirebaseVerifier{}, &fakeBindingResolver{})
+	controller := &fakeAuthFlowController{providerMethodsResult: ProviderMethodsResult{
+		Providers: []string{"github.com"}, Email: true,
+	}}
+	server.Flows = controller
+	claims := UserSessionClaims{
+		TenantID: "local", UserID: "0198f0f4-9b72-7000-8000-000000000010",
+		PersonalityAgentID: "0198f0f4-9b72-7000-8000-000000000011",
+	}
+	session, err := sessions.IssueSession(context.Background(), claims, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(origin string, withSession bool) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/auth/providers", nil)
+		if origin != "" {
+			request.Header.Set("Origin", origin)
+		}
+		if withSession {
+			request.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: session})
+		}
+		recorder := httptest.NewRecorder()
+		server.serveProviderMethods(recorder, request)
+		return recorder
+	}
+	if got := read("https://evil.example", true); got.Code != http.StatusForbidden {
+		t.Fatalf("foreign origin: %d %s", got.Code, got.Body.String())
+	}
+	if got := read(browserAuthTestOrigin, false); got.Code != http.StatusUnauthorized {
+		t.Fatalf("missing session: %d %s", got.Code, got.Body.String())
+	}
+	if controller.providerMethodsCalls != 0 {
+		t.Fatalf("rejected read reached controller %d times", controller.providerMethodsCalls)
+	}
+	got := read(browserAuthTestOrigin, true)
+	if got.Code != http.StatusOK || got.Body.String() != "{\"providers\":[\"github.com\"],\"email\":true}\n" ||
+		got.Header().Get("Cache-Control") != "no-store" || len(got.Result().Cookies()) != 0 {
+		t.Fatalf("methods read: %d %q %v", got.Code, got.Body.String(), got.Header())
+	}
+	if controller.providerMethodsCalls != 1 || controller.providerMethodsClaims.UserID != claims.UserID {
+		t.Fatalf("controller invocation: %d %+v", controller.providerMethodsCalls, controller.providerMethodsClaims)
+	}
+
+	// A logged-out session no longer reads the methods.
+	if _, err := sessions.RevokeSession(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(browserAuthTestOrigin, true); got.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session: %d %s", got.Code, got.Body.String())
+	}
+
+	controller.providerMethodsErr = ErrBrowserAuthProviderUnavailable
+	fresh, err := sessions.IssueSession(context.Background(), claims, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session = fresh
+	if got := read(browserAuthTestOrigin, true); got.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(got.Body.String(), "provider_unavailable") {
+		t.Fatalf("unavailable authority: %d %s", got.Code, got.Body.String())
 	}
 }
 

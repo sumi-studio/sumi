@@ -113,6 +113,13 @@ type ProviderOperationStatusResult struct {
 	NoticeRequired           bool       `json:"notice_required"`
 }
 
+// ProviderMethodsResult is the session Human's usable sign-in methods, read from
+// live server authority rather than one browser's cached Firebase user.
+type ProviderMethodsResult struct {
+	Providers []string `json:"providers"`
+	Email     bool     `json:"email"`
+}
+
 var (
 	ErrBrowserEnrollmentInvite        = errors.New("enrollment invitation required")
 	ErrBrowserAuthFlowInvalid         = errors.New("invalid authentication flow")
@@ -146,6 +153,7 @@ type BrowserAuthFlowController interface {
 	CompleteProviderOperation(ctx context.Context, claims UserSessionClaims, request CompleteProviderOperationRequest, identity FirebaseIdentity) (ProviderOperationResult, error)
 	FailProviderOperation(ctx context.Context, claims UserSessionClaims, request FailProviderOperationRequest) (ProviderOperationResult, error)
 	StatusProviderOperation(ctx context.Context, claims UserSessionClaims, request ProviderOperationStatusRequest) (ProviderOperationStatusResult, error)
+	ProviderMethods(ctx context.Context, claims UserSessionClaims) (ProviderMethodsResult, error)
 	// AuthFlowEpoch returns the browser epoch hash bound at flow start.
 	AuthFlowEpoch(ctx context.Context, flowID string) (string, error)
 	// AuthFlowForNonce returns a flow only to its nonce authority, for the
@@ -376,6 +384,23 @@ func (s *BrowserAuthServer) serveProviderOperationStatus(w http.ResponseWriter, 
 		writeFlowError(w, err)
 		return
 	}
+	writeBrowserAuthJSON(w, http.StatusOK, result)
+}
+
+func (s *BrowserAuthServer) serveProviderMethods(w http.ResponseWriter, r *http.Request) {
+	if !s.allowSafeReadOrigin(w, r) {
+		return
+	}
+	claims, ok := s.authenticatedClaims(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.Flows.ProviderMethods(r.Context(), claims)
+	if err != nil {
+		writeFlowError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeBrowserAuthJSON(w, http.StatusOK, result)
 }
 

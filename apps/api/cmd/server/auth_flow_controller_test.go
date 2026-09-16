@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
@@ -216,6 +217,352 @@ func TestProviderUnlinkKeepsFenceUntilIndeterminatePostcheckReconciles(t *testin
 	recovered, err := controller.StartProviderOperation(ctx, claims, request, identity)
 	if err != nil || recovered.OperationID != operationID || recovered.Outcome != "provider_unlinked" || providers.deleteCalls != 1 {
 		t.Fatalf("postcheck recovery: %+v %v deletes=%d", recovered, err, providers.deleteCalls)
+	}
+}
+
+func TestOrphanedProviderUnlinkIsSettledFromLiveStateInsteadOfFencingForever(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	const uid = "orphan-controller-uid"
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, subject := range map[string]string{"google.com": "google-subject", "github.com": "github-subject"} {
+		if err := store.BindCredential(ctx, provider, subject, registered.HumanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	providers := &fakeFirebaseProviderLifecycle{accounts: map[string]firebaseProviderAccount{uid: {
+		UID: uid, ProviderSubjects: map[string]string{"google.com": "google-subject", "github.com": "github-subject"},
+	}}}
+	controller := newKosekiAuthFlowController(store, "local", providers)
+	now := time.Now().UTC()
+	controller.clock = func() time.Time { return now }
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	identity := agentevents.FirebaseIdentity{UID: uid, AuthTime: now, SignInProvider: "google.com", ProviderSubjects: map[string][]string{"google.com": {"google-subject"}}}
+	expire := func(interval string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-$2::interval WHERE firebase_uid=$1 AND status='pending'", uid, interval); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// An unlink whose remote delete may or may not have happened, and whose
+	// browser record (the nonce) is gone.
+	lost, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", controllerNonce(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkRequest := agentevents.StartProviderOperationRequest{Provider: "github.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	if _, err := controller.StartProviderOperation(ctx, claims, linkRequest, identity); !errors.Is(err, agentevents.ErrBrowserAuthProviderPending) {
+		t.Fatalf("live unlink did not fence: %v", err)
+	}
+	expire("1 second")
+	if _, err := controller.StartProviderOperation(ctx, claims, linkRequest, identity); !errors.Is(err, agentevents.ErrBrowserAuthProviderPending) {
+		t.Fatalf("present provider inside settle grace released its fence: %v", err)
+	}
+
+	// The late remote delete becomes visible and is reconciled at once.
+	providers.mu.Lock()
+	delete(providers.accounts[uid].ProviderSubjects, "github.com")
+	providers.mu.Unlock()
+	started, err := controller.StartProviderOperation(ctx, claims, linkRequest, identity)
+	if err != nil || started.Outcome != "client_operation_required" {
+		t.Fatalf("new change after settled orphan: %+v %v", started, err)
+	}
+	var lostStatus, lostOutcome string
+	if err := pool.QueryRow(ctx, "SELECT status, terminal_outcome FROM provider_operations WHERE operation_id=$1", lost.OperationID).Scan(&lostStatus, &lostOutcome); err != nil ||
+		lostStatus != "completed" || lostOutcome != "unlinked" {
+		t.Fatalf("orphan settlement: %s %s %v", lostStatus, lostOutcome, err)
+	}
+	if providers.deleteCalls != 0 {
+		t.Fatalf("settlement issued %d Admin deletes", providers.deleteCalls)
+	}
+
+	// A nonce holder replaying an expired unlink inside the settle grace sees
+	// the honest "still settling" answer — the server has not yet decided the
+	// remote outcome and never re-runs the original delete through the replay.
+	if _, err := controller.FailProviderOperation(ctx, claims, agentevents.FailProviderOperationRequest{OperationID: started.OperationID, Nonce: linkRequest.Nonce, Outcome: "cancelled"}); err != nil {
+		t.Fatal(err)
+	}
+	unlinkRequest := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "unlink", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	held, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "google.com", "unlink", "account_settings", unlinkRequest.Nonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.SignInProvider = "password"
+	identity.Email, identity.EmailVerified = "human@example.com", true
+	identity.ProviderSubjects = map[string][]string{"email": {"human@example.com"}}
+	expire("1 second")
+	if _, err := controller.StartProviderOperation(ctx, claims, unlinkRequest, identity); !errors.Is(err, agentevents.ErrBrowserAuthProviderPending) {
+		t.Fatalf("expired unlink inside grace: %v", err)
+	}
+	if providers.deleteCalls != 0 {
+		t.Fatalf("inside-grace settle issued %d Admin deletes", providers.deleteCalls)
+	}
+
+	// The user relinked GitHub from another browser while the Google orphan
+	// was fencing: the account now carries a different GitHub subject. Past
+	// the grace the unlink's recorded subject is still linked remotely and
+	// other methods remain, so the server drives one bounded reconcile delete
+	// of its own: the original intent is fulfilled without touching the
+	// relinked identity, the operation completes, the fence releases.
+	providers.mu.Lock()
+	providers.accounts[uid].ProviderSubjects["github.com"] = "github-relinked-subject"
+	providers.mu.Unlock()
+	expire("3 minutes")
+	replayed, err := controller.StartProviderOperation(ctx, claims, unlinkRequest, identity)
+	if err != nil || replayed.OperationID != held.OperationID || replayed.Outcome != "provider_unlinked" {
+		t.Fatalf("expired unlink reconcile: %+v %v", replayed, err)
+	}
+	status, err := controller.StatusProviderOperation(ctx, claims, agentevents.ProviderOperationStatusRequest{OperationID: held.OperationID, Nonce: unlinkRequest.Nonce})
+	if err != nil || status.Status != "completed" || status.Outcome != "provider_unlinked" {
+		t.Fatalf("reconciled unlink status: %+v %v", status, err)
+	}
+	if providers.deleteCalls != 1 {
+		t.Fatalf("reconcile issued %d Admin deletes", providers.deleteCalls)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "google.com"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("reconciled credential still active: %q %v", subject, err)
+	}
+}
+
+func TestOrphanedProviderUnlinkReconcileDeleteFailureAndSubjectDrift(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	const uid = "orphan-reconcile-uid"
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCredential(ctx, "github.com", "github-subject", registered.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCredential(ctx, "google.com", "google-subject", registered.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	providers := &fakeFirebaseProviderLifecycle{
+		accounts: map[string]firebaseProviderAccount{uid: {
+			UID: uid, ProviderSubjects: map[string]string{
+				"github.com": "github-subject", "google.com": "google-subject",
+			},
+		}},
+		// The remote delete cannot confirm removal: the provider stays.
+		leaveProvider: true,
+	}
+	controller := newKosekiAuthFlowController(store, "local", providers)
+	controller.clock = func() time.Time { return time.Now().UTC() }
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	expire := func(interval string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-$2::interval WHERE firebase_uid=$1 AND status='pending'", uid, interval); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	orphan, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", controllerNonce(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expire("3 minutes")
+	linkRequest := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	// The reconcile delete is issued, but the postcheck still shows the
+	// provider: the operation ends as expired, the fence releases, and the
+	// credential survives — nothing was removed remotely.
+	started, err := controller.StartProviderOperation(ctx, claims, linkRequest, agentevents.FirebaseIdentity{UID: uid})
+	if err != nil {
+		t.Fatalf("new change after expired orphan: %v", err)
+	}
+	var status, outcome string
+	if err := pool.QueryRow(ctx, "SELECT status, terminal_outcome FROM provider_operations WHERE operation_id=$1", orphan.OperationID).Scan(&status, &outcome); err != nil ||
+		status != "failed" || outcome != "expired" {
+		t.Fatalf("unconfirmable reconcile: %s %s %v", status, outcome, err)
+	}
+	if providers.deleteCalls != 1 {
+		t.Fatalf("reconcile issued %d Admin deletes", providers.deleteCalls)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); err != nil || subject != "github-subject" {
+		t.Fatalf("credential disabled although provider survived: %q %v", subject, err)
+	}
+
+	// The recorded subject is gone but a different identity now occupies the
+	// provider remotely: the unlink's target is still removed, so it
+	// completes — and disables the stale credential — without another delete.
+	if _, err := store.FailProviderOperation(ctx, started.OperationID, linkRequest.Nonce, "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", controllerNonce(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expire("3 minutes")
+	providers.mu.Lock()
+	providers.accounts[uid].ProviderSubjects["github.com"] = "github-other-subject"
+	providers.mu.Unlock()
+	next := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	if _, err := controller.StartProviderOperation(ctx, claims, next, agentevents.FirebaseIdentity{UID: uid}); err != nil {
+		t.Fatalf("new change after drifted orphan: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT status, terminal_outcome FROM provider_operations WHERE operation_id=$1", second.OperationID).Scan(&status, &outcome); err != nil ||
+		status != "completed" || outcome != "unlinked" {
+		t.Fatalf("subject-drift reconcile: %s %s %v", status, outcome, err)
+	}
+	if providers.deleteCalls != 1 {
+		t.Fatalf("subject drift issued %d extra Admin deletes", providers.deleteCalls-1)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("stale credential survived subject drift: %q %v", subject, err)
+	}
+}
+
+func TestOrphanedProviderUnlinkOnLastMethodFailsWithoutServerDelete(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	const uid = "orphan-last-method-uid"
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindCredential(ctx, "github.com", "github-subject", registered.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	providers := &fakeFirebaseProviderLifecycle{accounts: map[string]firebaseProviderAccount{uid: {
+		UID: uid, ProviderSubjects: map[string]string{"github.com": "github-subject"},
+	}}}
+	controller := newKosekiAuthFlowController(store, "local", providers)
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+
+	// An orphaned unlink whose target is the account's only usable sign-in
+	// method: consent captured at start does not outlive the methods that
+	// made it safe, so the server never issues a delete that would strand
+	// the account. The orphan ends as last_login_method, the fence releases,
+	// and the credential survives.
+	orphan, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", controllerNonce(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-interval '3 minutes' WHERE operation_id=$1", orphan.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	linkRequest := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	started, err := controller.StartProviderOperation(ctx, claims, linkRequest, agentevents.FirebaseIdentity{UID: uid})
+	if err != nil || started.Outcome != "client_operation_required" {
+		t.Fatalf("new change after last-method orphan: %+v %v", started, err)
+	}
+	var status, outcome string
+	if err := pool.QueryRow(ctx, "SELECT status, terminal_outcome FROM provider_operations WHERE operation_id=$1", orphan.OperationID).Scan(&status, &outcome); err != nil ||
+		status != "failed" || outcome != "last_login_method" {
+		t.Fatalf("last-method settle: %s %s %v", status, outcome, err)
+	}
+	if providers.deleteCalls != 0 {
+		t.Fatalf("last-method settle issued %d Admin deletes", providers.deleteCalls)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); err != nil || subject != "github-subject" {
+		t.Fatalf("last-method credential was disabled: %q %v", subject, err)
+	}
+	// The lost nonce is not the link nonce: status stays nonce-bound.
+	if _, err := controller.StatusProviderOperation(ctx, claims, agentevents.ProviderOperationStatusRequest{OperationID: orphan.OperationID, Nonce: linkRequest.Nonce}); !errors.Is(err, agentevents.ErrBrowserAuthFlowInvalid) {
+		t.Fatalf("orphan status leaked to another nonce: %v", err)
+	}
+}
+
+func TestProviderMethodsReadLiveAccountAndCountOnlyProvedEmail(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	const uid = "methods-controller-uid"
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A provider is listed only while the remote account carries the exact
+	// subject an active credential binds.
+	if err := store.BindCredential(ctx, "github.com", "github-subject", registered.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	providers := &fakeFirebaseProviderLifecycle{accounts: map[string]firebaseProviderAccount{uid: {
+		UID: uid, EmailVerified: true,
+		ProviderSubjects: map[string]string{"github.com": "github-subject", "facebook.com": "unsupported"},
+	}}}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+
+	if _, err := newKosekiAuthFlowController(store, "local", nil).ProviderMethods(ctx, claims); !errors.Is(err, agentevents.ErrBrowserAuthProviderUnavailable) {
+		t.Fatalf("methods without Admin authority: %v", err)
+	}
+	controller := newKosekiAuthFlowController(store, "local", providers)
+	controller.email = &emailCodeController{}
+	methods, err := controller.ProviderMethods(ctx, claims)
+	if err != nil || !reflect.DeepEqual(methods.Providers, []string{"github.com"}) || methods.Email {
+		t.Fatalf("unproved email counted: %+v %v", methods, err)
+	}
+	normalized, err := koseki.NormalizeEmail("methods@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofNonce := controllerNonce(t)
+	proof, err := store.StartAuthFlow(ctx, koseki.StartAuthFlowRequest{
+		Intent: koseki.IntentSignIn, Channel: koseki.ChannelEmailLink,
+		ExpectedProvider: "password", NormalizedEmail: normalized,
+		Continuation: "/direct-chat", Nonce: proofNonce, TTL: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveAuthProof(ctx, proof.FlowID, proofNonce, koseki.VerifiedIdentity{
+		FirebaseUID: uid, NormalizedEmail: normalized, EmailVerified: true, SignInProvider: "password",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	methods, err = controller.ProviderMethods(ctx, claims)
+	if err != nil || !reflect.DeepEqual(methods.Providers, []string{"github.com"}) || !methods.Email {
+		t.Fatalf("proved email not counted: %+v %v", methods, err)
+	}
+	// Another browser's removal is visible immediately, and the credential it
+	// stranded is retired by the same read.
+	providers.mu.Lock()
+	delete(providers.accounts[uid].ProviderSubjects, "github.com")
+	providers.mu.Unlock()
+	methods, err = controller.ProviderMethods(ctx, claims)
+	if err != nil || len(methods.Providers) != 0 || !methods.Email {
+		t.Fatalf("removed provider still listed: %+v %v", methods, err)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("stranded credential not healed: %q %v", subject, err)
+	}
+
+	// A remote identity no credential binds is not a usable method and is not
+	// listed; a pending unlink suppresses the heal while the saga owns the
+	// credential's transition.
+	providers.mu.Lock()
+	providers.accounts[uid].ProviderSubjects["github.com"] = "github-subject-2"
+	providers.mu.Unlock()
+	if err := store.BindCredential(ctx, "github.com", "github-subject-2", registered.HumanID); err != nil {
+		t.Fatal(err)
+	}
+	methods, err = controller.ProviderMethods(ctx, claims)
+	if err != nil || !reflect.DeepEqual(methods.Providers, []string{"github.com"}) {
+		t.Fatalf("rebound provider not listed: %+v %v", methods, err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, "github.com", "unlink", "account_settings", controllerNonce(t)); err != nil {
+		t.Fatal(err)
+	}
+	providers.mu.Lock()
+	delete(providers.accounts[uid].ProviderSubjects, "github.com")
+	providers.mu.Unlock()
+	methods, err = controller.ProviderMethods(ctx, claims)
+	if err != nil || len(methods.Providers) != 0 {
+		t.Fatalf("mid-flight unlink listed: %+v %v", methods, err)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); err != nil || subject != "github-subject-2" {
+		t.Fatalf("heal raced a pending unlink: %q %v", subject, err)
 	}
 }
 

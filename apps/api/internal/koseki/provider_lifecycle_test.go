@@ -134,6 +134,94 @@ func TestCompletedEmailLinkProofRequiresSameHumanAndFirebaseUID(t *testing.T) {
 	assertProof(other.HumanID, "email-proof-owner", false)
 }
 
+func TestOrphanedProviderUnlinkSettlesWithoutNonceOnlyAfterGrace(t *testing.T) {
+	store, ctx := authFlowStore(t)
+	const uid = "orphan-unlink-owner"
+	owner, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, subject := range map[string]string{"github.com": "github-subject", "google.com": "google-subject"} {
+		if err := store.BindCredential(ctx, provider, subject, owner.HumanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setExpiry := func(operationID, interval string) {
+		t.Helper()
+		if _, err := store.pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-$2::interval WHERE operation_id=$1", operationID, interval); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The browser that owned this nonce is gone: only the server can settle it.
+	lostNonce := testNonce(t)
+	orphan, err := store.BeginProviderOperation(ctx, owner.HumanID, uid, "github.com", "unlink", "account_settings", lostNonce)
+	if err != nil || orphan.Expired {
+		t.Fatalf("begin: %+v %v", orphan, err)
+	}
+	if _, found, err := store.SettlingProviderUnlink(ctx, owner.HumanID, uid); err != nil || found {
+		t.Fatalf("live unlink offered for settlement: found=%v %v", found, err)
+	}
+	if _, err := store.SettleProviderUnlink(ctx, orphan.OperationID, uid, "github-subject", true, "expired"); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("settled a live unlink: %v", err)
+	}
+	// Just expired: a run begun before expiry may still be mutating Firebase,
+	// so a provider that is still present cannot yet be declared untouched.
+	setExpiry(orphan.OperationID, "1 second")
+	if _, found, err := store.SettlingProviderUnlink(ctx, "00000000-0000-7000-8000-000000000000", uid); !errors.Is(err, ErrAuthProofMismatch) || found {
+		t.Fatalf("another Human read the fence: found=%v %v", found, err)
+	}
+	settling, found, err := store.SettlingProviderUnlink(ctx, owner.HumanID, uid)
+	if err != nil || !found || settling.OperationID != orphan.OperationID {
+		t.Fatalf("settling read: %+v found=%v %v", settling, found, err)
+	}
+	if _, err := store.SettleProviderUnlink(ctx, orphan.OperationID, uid, "github-subject", false, "expired"); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("present provider expired inside grace: %v", err)
+	}
+	replay, err := store.BeginProviderOperation(ctx, owner.HumanID, uid, "github.com", "unlink", "account_settings", lostNonce)
+	if err != nil || !replay.Expired || replay.OperationID != orphan.OperationID {
+		t.Fatalf("expired same-nonce replay: %+v %v", replay, err)
+	}
+	// The remote delete landed before the reply was lost: a removal can only
+	// be confirmed by a late run, so it completes without waiting.
+	event, err := store.SettleProviderUnlink(ctx, orphan.OperationID, uid, "github-subject", true, "expired")
+	if err != nil || event.EventType != "provider_unlinked" || event.TerminalOutcome != "unlinked" {
+		t.Fatalf("settle removed provider: %+v %v", event, err)
+	}
+	if _, err := store.ActiveProviderSubject(ctx, owner.HumanID, "github.com"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("credential still active after settled unlink: %v", err)
+	}
+	if _, err := store.SettleProviderUnlink(ctx, orphan.OperationID, uid, "github-subject", true, "expired"); !errors.Is(err, ErrAuthFlowConsumed) {
+		t.Fatalf("settled twice: %v", err)
+	}
+	// The original nonce, if it ever returns, reads the same terminal truth.
+	status, err := store.ProviderOperationStatus(ctx, owner.HumanID, orphan.OperationID, lostNonce)
+	if err != nil || status.Status != "completed" || status.TerminalOutcome != "unlinked" {
+		t.Fatalf("status after settle: %+v %v", status, err)
+	}
+
+	// A remote delete that never happened ends as expired and releases the fence.
+	second, err := store.BeginProviderOperation(ctx, owner.HumanID, uid, "google.com", "unlink", "account_settings", testNonce(t))
+	if err != nil {
+		t.Fatalf("fence not released by settled unlink: %v", err)
+	}
+	setExpiry(second.OperationID, "1 second")
+	if _, err := store.SettleProviderUnlink(ctx, second.OperationID, uid, "google-subject", false, "expired"); !errors.Is(err, ErrProviderOperationPending) {
+		t.Fatalf("present provider expired inside grace: %v", err)
+	}
+	setExpiry(second.OperationID, "3 minutes")
+	event, err = store.SettleProviderUnlink(ctx, second.OperationID, uid, "google-subject", false, "expired")
+	if err != nil || event.EventType != "provider_unlink_failed" || event.TerminalOutcome != "expired" {
+		t.Fatalf("settle present provider: %+v %v", event, err)
+	}
+	if subject, err := store.ActiveProviderSubject(ctx, owner.HumanID, "google.com"); err != nil || subject != "google-subject" {
+		t.Fatalf("unremoved credential was disabled: %q %v", subject, err)
+	}
+	if _, err := store.BeginProviderOperation(ctx, owner.HumanID, uid, "github.com", "link", "account_settings", testNonce(t)); err != nil {
+		t.Fatalf("fence not released by expired unlink: %v", err)
+	}
+}
+
 func TestExpiredProviderUnlinkCanStillTerminalizeItsDurableFence(t *testing.T) {
 	store, ctx := authFlowStore(t)
 	owner, err := store.AutoRegister(ctx, "firebase", "expired-unlink-owner")
