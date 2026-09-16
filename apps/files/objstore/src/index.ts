@@ -10,10 +10,12 @@
  *   DeleteObjects are implemented — the surface JuiceFS's S3 backend uses.
  *   Multipart upload is NOT implemented (JuiceFS writes 4 MiB blocks as single
  *   PUTs; add it only if a real client requires it).
- * - Auth: requests must carry an AWS4-HMAC-SHA256 Authorization header whose
- *   Credential access-key id equals the S3_ACCESS_KEY secret. The signature
- *   itself is not verified — the access key id functions as a bearer secret.
- *   This is a validation-plane simplification, not a production auth design.
+ * - Auth: every request except /healthz must carry a valid AWS Signature V4
+ *   Authorization header (header form only; presigned URLs are refused) for
+ *   the S3_ACCESS_KEY / S3_SECRET_KEY secret pair, dated within 15 minutes.
+ *   A hex x-amz-content-sha256 is checked against the body; UNSIGNED-PAYLOAD
+ *   relies on TLS for body integrity. The access key id alone grants nothing
+ *   (JuiceFS prints it in `juicefs status`), and the secret never travels.
  * - Each bucket maps to one DO via idFromName(bucket); all objects for that
  *   bucket are serialized through it. Fine for validation; a real store shards.
  */
@@ -45,6 +47,7 @@ interface NamespaceBinding {
 interface EnvLike {
   BUCKET: NamespaceBinding;
   S3_ACCESS_KEY?: string;
+  S3_SECRET_KEY?: string;
   [key: string]: unknown;
 }
 
@@ -68,20 +71,171 @@ function s3Error(code: string, message: string, status: number): Response {
   });
 }
 
-function authorized(req: Request, env: EnvLike): boolean {
-  const want = env.S3_ACCESS_KEY;
-  if (!want) return false; // fail closed when the secret is not configured
+const encoder = new TextEncoder();
+const MAX_CLOCK_SKEW_MS = 15 * 60 * 1000;
+
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function sha256Hex(data: ArrayBuffer | Uint8Array): Promise<string> {
+  return toHex(await crypto.subtle.digest("SHA-256", data));
+}
+
+async function hmac(
+  key: ArrayBuffer | Uint8Array,
+  data: string,
+): Promise<ArrayBuffer> {
+  const k = await crypto.subtle.importKey(
+    "raw",
+    key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return crypto.subtle.sign("HMAC", k, encoder.encode(data));
+}
+
+// RFC 3986 encoding as the AWS SigV4 signer applies it: everything except
+// unreserved characters is percent-encoded (slashes kept in paths).
+function awsEncode(s: string, keepSlash: boolean): string {
+  let out = "";
+  for (const byte of encoder.encode(s)) {
+    const c = String.fromCharCode(byte);
+    if (/[A-Za-z0-9\-._~]/.test(c) || (keepSlash && c === "/")) out += c;
+    else out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return out;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+type AuthResult =
+  | { ok: true; body: ArrayBuffer | null }
+  | { ok: false; reason: string };
+
+// Verifies an AWS Signature V4 header-signed request. Returns the buffered
+// body (when the method carries one) so the caller can forward it.
+async function verifySigV4(req: Request, env: EnvLike): Promise<AuthResult> {
+  const accessKey = env.S3_ACCESS_KEY;
+  const secretKey = env.S3_SECRET_KEY;
+  if (!accessKey || !secretKey) return { ok: false, reason: "not configured" }; // fail closed
   const auth = req.headers.get("authorization") ?? "";
-  const m = /Credential=([^,/]+)/.exec(auth);
-  return m?.[1] === want;
+  const m =
+    /^AWS4-HMAC-SHA256\s+Credential=([^/,\s]+)\/(\d{8})\/([^/,\s]+)\/s3\/aws4_request,\s*SignedHeaders=([a-z0-9;-]+),\s*Signature=([0-9a-f]{64})$/.exec(
+      auth.trim(),
+    );
+  if (!m) return { ok: false, reason: "malformed authorization" };
+  const [, keyId, scopeDate, region, signedHeaderList, signature] =
+    m as unknown as string[];
+  if (!timingSafeEqual(keyId ?? "", accessKey))
+    return { ok: false, reason: "unknown access key" };
+
+  const amzDate = req.headers.get("x-amz-date") ?? "";
+  const dm = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(amzDate);
+  if (!dm || amzDate.slice(0, 8) !== scopeDate)
+    return { ok: false, reason: "bad x-amz-date" };
+  const [, year = 0, month = 1, day = 0, hour = 0, minute = 0, second = 0] =
+    dm.map(Number);
+  const when = Date.UTC(year, month - 1, day, hour, minute, second);
+  if (Math.abs(Date.now() - when) > MAX_CLOCK_SKEW_MS)
+    return { ok: false, reason: "request time too skewed" };
+
+  const signedHeaders = (signedHeaderList ?? "").split(";");
+  if (!signedHeaders.includes("host") || !signedHeaders.includes("x-amz-date"))
+    return { ok: false, reason: "host and x-amz-date must be signed" };
+
+  const payloadHash = req.headers.get("x-amz-content-sha256") ?? "";
+  let body: ArrayBuffer | null = null;
+  if (req.method === "PUT" || req.method === "POST")
+    body = await req.arrayBuffer();
+  if (/^[0-9a-f]{64}$/.test(payloadHash)) {
+    if ((await sha256Hex(body ?? new Uint8Array(0))) !== payloadHash)
+      return { ok: false, reason: "payload hash mismatch" };
+  } else if (payloadHash !== "UNSIGNED-PAYLOAD") {
+    return { ok: false, reason: "unsupported x-amz-content-sha256" };
+  }
+
+  const url = new URL(req.url);
+  let canonicalPath: string;
+  try {
+    canonicalPath = awsEncode(
+      url.pathname
+        .split("/")
+        .map((seg) => decodeURIComponent(seg))
+        .join("/"),
+      true,
+    );
+  } catch {
+    return { ok: false, reason: "malformed path" };
+  }
+  const query = [...url.searchParams.entries()]
+    .map(([k, v]) => [awsEncode(k, false), awsEncode(v, false)] as const)
+    .sort((a, b) =>
+      a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : a[0] < b[0] ? -1 : 1,
+    )
+    .map(([k, v]) => `${k}=${v}`)
+    .join("&");
+  let key = await hmac(encoder.encode(`AWS4${secretKey}`), scopeDate ?? "");
+  key = await hmac(key, region ?? "");
+  key = await hmac(key, "s3");
+  key = await hmac(key, "aws4_request");
+  const credentialScope = `${scopeDate}/${region}/s3/aws4_request`;
+
+  const signatureFor = async (
+    overrides: Record<string, string>,
+  ): Promise<string> => {
+    const headerLines = signedHeaders.map((h) => {
+      const v = overrides[h] ?? req.headers.get(h) ?? "";
+      return `${h}:${v.trim().replace(/\s+/g, " ")}\n`;
+    });
+    const canonicalRequest = [
+      req.method,
+      canonicalPath,
+      query,
+      headerLines.join(""),
+      signedHeaderList,
+      payloadHash,
+    ].join("\n");
+    const stringToSign = [
+      "AWS4-HMAC-SHA256",
+      amzDate,
+      credentialScope,
+      await sha256Hex(encoder.encode(canonicalRequest)),
+    ].join("\n");
+    return toHex(await hmac(key, stringToSign));
+  };
+
+  if (timingSafeEqual(await signatureFor({}), signature ?? ""))
+    return { ok: true, body };
+  // The Workers runtime rewrites Accept-Encoding before the handler sees it
+  // (observed: a client's signed "identity" arrives as "br, gzip"). AWS SDKs
+  // send "identity" for S3; accept a signature over that value. The header
+  // carries no authority, and the signature still proves the secret.
+  if (
+    signedHeaders.includes("accept-encoding") &&
+    timingSafeEqual(
+      await signatureFor({ "accept-encoding": "identity" }),
+      signature ?? "",
+    )
+  )
+    return { ok: true, body };
+  return { ok: false, reason: "signature mismatch" };
 }
 
 export default {
   async fetch(req: Request, env: EnvLike): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/healthz") return new Response("ok");
-    if (!authorized(req, env))
-      return s3Error("AccessDenied", "unknown access key", 403);
+    const auth = await verifySigV4(req, env);
+    if (!auth.ok) return s3Error("AccessDenied", auth.reason, 403);
 
     // Strip a leading slash, then bucket[/key...]. Keys may contain any bytes;
     // keep the raw tail and let URL decoding handle escapes once.
@@ -93,7 +247,11 @@ export default {
       try {
         key = decodeURIComponent(path.slice(slash + 1));
       } catch {
-        return s3Error("InvalidArgument", "malformed percent-encoding in key", 400);
+        return s3Error(
+          "InvalidArgument",
+          "malformed percent-encoding in key",
+          400,
+        );
       }
     }
     if (!bucket) {
@@ -111,7 +269,14 @@ export default {
     const inner = new URL(req.url);
     inner.searchParams.set("__bucket", bucket);
     inner.searchParams.set("__key", key);
-    return stub.fetch(new Request(inner.toString(), req));
+    // The verified body was buffered; forward exactly those bytes.
+    return stub.fetch(
+      new Request(inner.toString(), {
+        method: req.method,
+        headers: req.headers,
+        body: auth.body,
+      }),
+    );
   },
 };
 
@@ -186,7 +351,11 @@ export class BucketObject {
     }
   }
 
-  private bucketOp(method: string, url: URL, req: Request): Promise<Response> | Response {
+  private bucketOp(
+    method: string,
+    url: URL,
+    req: Request,
+  ): Promise<Response> | Response {
     if (method === "PUT") return new Response(null, { status: 200 }); // create
     if (method === "HEAD") return new Response(null, { status: 200 });
     if (method === "GET") {
@@ -267,7 +436,10 @@ export class BucketObject {
       buf.set(p, at);
       at += p.length;
     }
-    const slice = buf.subarray(start - firstSeq * CHUNK, end - firstSeq * CHUNK + 1);
+    const slice = buf.subarray(
+      start - firstSeq * CHUNK,
+      end - firstSeq * CHUNK + 1,
+    );
     const headers: Record<string, string> = {
       etag: String(meta.etag),
       // HTTP-date (IMF-fixdate) — AWS SDKs reject ISO 8601 in this header.
@@ -380,7 +552,10 @@ export class BucketObject {
     if (!truncated && rows.length >= fetchLimit) truncated = true;
     const name = xmlEscape(url.searchParams.get("__bucket") ?? "");
     const cp = common
-      .map((p) => `<CommonPrefixes><Prefix>${xmlEscape(p)}</Prefix></CommonPrefixes>`)
+      .map(
+        (p) =>
+          `<CommonPrefixes><Prefix>${xmlEscape(p)}</Prefix></CommonPrefixes>`,
+      )
       .join("");
     const body = v2
       ? `<?xml version="1.0" encoding="UTF-8"?>` +
@@ -408,7 +583,11 @@ export class BucketObject {
     try {
       src = decodeURIComponent(copySource).replace(/^\/+/, "");
     } catch {
-      return s3Error("InvalidArgument", "malformed percent-encoding in copy source", 400);
+      return s3Error(
+        "InvalidArgument",
+        "malformed percent-encoding in copy source",
+        400,
+      );
     }
     const slash = src.indexOf("/");
     if (slash !== -1) src = src.slice(slash + 1); // same-bucket copy assumed
@@ -447,7 +626,10 @@ export class BucketObject {
   private async deleteObjects(req: Request): Promise<Response> {
     const text = await req.text();
     const keys = [...text.matchAll(/<Key>([^<]*)<\/Key>/g)].map((m) =>
-      (m[1] ?? "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"),
+      (m[1] ?? "")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&amp;/g, "&"),
     );
     this.state.storage.transactionSync(() => {
       for (const key of keys) {
@@ -455,7 +637,9 @@ export class BucketObject {
         this.state.storage.sql.exec("DELETE FROM chunks WHERE key = ?", key);
       }
     });
-    const deleted = keys.map((k) => `<Deleted><Key>${xmlEscape(k)}</Key></Deleted>`);
+    const deleted = keys.map(
+      (k) => `<Deleted><Key>${xmlEscape(k)}</Key></Deleted>`,
+    );
     return new Response(
       `<?xml version="1.0" encoding="UTF-8"?><DeleteResult>${deleted.join("")}</DeleteResult>`,
       { headers: { "content-type": "application/xml" } },

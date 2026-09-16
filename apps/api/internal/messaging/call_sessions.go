@@ -354,7 +354,7 @@ func (c *CallService) applyCallSay(ctx context.Context, tx pgx.Tx, personaID, _ 
 // CallStateEffect is a read: the place's call state plus this persona's own
 // live sessions, so the secretary can answer "am I in this call" truthfully.
 func (c *CallService) CallStateEffect() agentstate.ToolEffect {
-	return agentstate.ToolEffect{Apply: c.applyCallState}
+	return agentstate.ToolEffect{Apply: c.applyCallState, ReadOnly: agentstate.AlwaysReadOnly}
 }
 
 func (c *CallService) applyCallState(ctx context.Context, tx pgx.Tx, personaID, _ string, request map[string]any) (map[string]any, error) {

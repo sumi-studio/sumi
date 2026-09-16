@@ -138,6 +138,11 @@ services:
       SUMI_AUTH_TENANT_ID: ${SUMI_AUTH_TENANT_ID:-sumi-dev}
       SUMI_AUTH_ALLOW_INSECURE_COOKIES: ${SUMI_AUTH_ALLOW_INSECURE_COOKIES:-true}
       SUMI_AUTH_SESSION_TTL: ${SUMI_AUTH_SESSION_TTL:-1h}
+      # Bring-your-Local-secretary registration mounts /api/secretary-transfer
+      # only when this names the API's trusted public origin a sumi-local-move
+      # command can reach (never the request Host). The published loopback
+      # below is right for a move command on the same host.
+      SUMI_TRANSFER_PUBLIC_BASE_URL: ${SUMI_TRANSFER_PUBLIC_BASE_URL:-}
       # API-side traffic stays inside the Compose network. Browsers use the
       # exact published host address configured on the web service below.
       FIREBASE_AUTH_EMULATOR_HOST: firebase-auth:9099

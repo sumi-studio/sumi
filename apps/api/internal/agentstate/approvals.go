@@ -183,6 +183,16 @@ func validateToolRequest(tool string, request map[string]any) error {
 		if content, _ := request["content"].(string); content == "" {
 			return fmt.Errorf("%w: messaging.send requires content", ErrBadRequest)
 		}
+	case "workspace_invitation.list":
+		if cursor, present := request["cursor"]; present && cursor != nil {
+			if _, ok := cursor.(string); !ok {
+				return fmt.Errorf("%w: workspace_invitation.list cursor must be a string", ErrBadRequest)
+			}
+		}
+	case "workspace_invitation.accept":
+		if invitationID, _ := request["invitation_id"].(string); invitationID == "" {
+			return fmt.Errorf("%w: workspace_invitation.accept requires invitation_id", ErrBadRequest)
+		}
 	}
 	return nil
 }

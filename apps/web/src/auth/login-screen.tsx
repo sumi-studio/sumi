@@ -12,6 +12,7 @@ import {
   inspectEnrollmentInvitation,
   isEnrollmentInvitationUnavailable,
 } from "./enrollment-invitations";
+import { RegistrationSecretaryPanel } from "./registration-secretary-panel";
 import { AuthAPIError } from "./session-client";
 
 const providers: Array<{ id: SignInProvider; label: string }> = [
@@ -391,49 +392,73 @@ export function LoginScreen() {
                 onDismiss={handleDismissLink}
               />
             ) : confirmation ? (
-              <div className="space-y-4">
-                <p className="rounded-lg bg-muted px-3 py-2.5 text-sm">
-                  対象アカウント: {confirmationAccountLabel(confirmation)}
-                </p>
-                <p className="text-muted-foreground text-sm leading-6">
-                  {confirmation.action === "create_account"
-                    ? "ログインを選択しましたが、この認証情報に対応するSumiアカウントはまだありません。新規登録して続けますか？"
-                    : "新規登録を選択しましたが、この認証情報は既存のSumiアカウントに登録されています。ログインして続けますか？"}
-                </p>
-                <Button
-                  type="button"
-                  onClick={() => {
+              confirmation.action === "create_account" ? (
+                <RegistrationSecretaryPanel
+                  confirmation={confirmation}
+                  accountLabel={confirmationAccountLabel(confirmation)}
+                  busy={busy === "confirm"}
+                  onConfirm={async () => {
                     setBusy("confirm");
                     setError(null);
-                    void confirmIntentTransition()
-                      .catch((nextError: unknown) => {
-                        setError(getAuthErrorMessage(nextError));
-                      })
-                      .finally(() => setBusy(null));
+                    try {
+                      await confirmIntentTransition();
+                    } finally {
+                      setBusy(null);
+                    }
                   }}
-                  disabled={busy !== null}
-                  className="h-11 w-full rounded-lg"
-                >
-                  {busy === "confirm" && (
-                    <LoaderCircle className="size-5 animate-spin" />
-                  )}
-                  {confirmation.action === "create_account"
-                    ? "新規登録して続ける"
-                    : "ログインして続ける"}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
+                  onCancel={async () => {
                     setBusy("cancel");
-                    void cancelIntentTransition().finally(() => setBusy(null));
+                    try {
+                      await cancelIntentTransition();
+                    } finally {
+                      setBusy(null);
+                    }
                   }}
-                  disabled={busy !== null}
-                  className="h-11 w-full rounded-lg"
-                >
-                  キャンセル
-                </Button>
-              </div>
+                  onError={setError}
+                />
+              ) : (
+                <div className="space-y-4">
+                  <p className="rounded-lg bg-muted px-3 py-2.5 text-sm">
+                    対象アカウント: {confirmationAccountLabel(confirmation)}
+                  </p>
+                  <p className="text-muted-foreground text-sm leading-6">
+                    新規登録を選択しましたが、この認証情報は既存のSumiアカウントに登録されています。ログインして続けますか？
+                  </p>
+                  <Button
+                    type="button"
+                    onClick={() => {
+                      setBusy("confirm");
+                      setError(null);
+                      void confirmIntentTransition()
+                        .catch((nextError: unknown) => {
+                          setError(getAuthErrorMessage(nextError));
+                        })
+                        .finally(() => setBusy(null));
+                    }}
+                    disabled={busy !== null}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    {busy === "confirm" && (
+                      <LoaderCircle className="size-5 animate-spin" />
+                    )}
+                    ログインして続ける
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setBusy("cancel");
+                      void cancelIntentTransition().finally(() =>
+                        setBusy(null),
+                      );
+                    }}
+                    disabled={busy !== null}
+                    className="h-11 w-full rounded-lg"
+                  >
+                    キャンセル
+                  </Button>
+                </div>
+              )
             ) : emailCode ? (
               <div className="space-y-4">
                 {emailCode.recovery && (

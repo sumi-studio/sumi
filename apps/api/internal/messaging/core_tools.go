@@ -81,10 +81,9 @@ func (d *CoreAttentionDelivery) CoreToolEffects() map[string]agentstate.ToolEffe
 	}
 }
 
-// alwaysReadOnly declares a delegated effect that can never change anything
-// outside its own operation record — history, overview, search, and
-// attachment reads.
-func alwaysReadOnly(map[string]any) bool { return true }
+// alwaysReadOnly is the shared AlwaysReadOnly predicate — a delegated effect
+// that can never change anything outside its own operation record.
+var alwaysReadOnly = agentstate.AlwaysReadOnly
 
 // notificationSettingsMutation reports whether a settings call writes — the
 // same request keys applyNotificationSettings treats as a replacement — so

@@ -46,6 +46,7 @@ person ─ browser ─ sumi-alpha Worker ─ VPC Service sumi-alpha-api ─ tunn
 | `SUMI_CORE_RUNTIME_TOKEN` | API env and Worker secret (same value) | Accesses any persona's scoped state routes. It cannot create personas, bind humans, decide approvals or transfer. |
 | `SUMI_CORE_WAKE_URL` | API env | `https://sumi-core-alpha.<workers.dev subdomain>.workers.dev` |
 | `SUMI_CORE_WAKE_TOKEN` | API env and Worker secret (same value) | Bearer for `/personas/:id/wake`, `/personas/:id/check` and `/health/state` |
+| `SUMI_TRANSFER_PUBLIC_BASE_URL` | API env | Optional. The API's own trusted public origin (`https://api.<domain>`). Mounts `/api/secretary-transfer` and offers "bring my Local secretary" to new registrants. Never derived from the request Host. Unset means the choice is not offered and registration provisions a new secretary directly. |
 
 Tokens must be at least 32 characters. The runtime token must differ from the
 state token. Keep them in files with `0600` permissions outside the repository.

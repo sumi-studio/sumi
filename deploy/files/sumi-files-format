@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# sumi-files-format — create the canonical Sumi files volume ONCE.
+#
+#   sumi-files-format ENV_FILE
+#
+# ENV_FILE (0600): the mount variables (SUMI_FILES_JUICEFS, SUMI_FILES_META_URL,
+# META_PASSWORD) plus
+#   SUMI_FILES_VOLUME_NAME   e.g. sumi-files-alpha
+#   SUMI_FILES_BUCKET_URL    https://sumi-fabric-obj.<subdomain>.workers.dev/<bucket>
+#   ACCESS_KEY, SECRET_KEY   the object-store Worker's S3_ACCESS_KEY / S3_SECRET_KEY
+#
+# Refuses when the metadata database already holds a volume: re-formatting
+# would start an empty namespace under every existing mount. Prints only the
+# new volume UUID — pin it as SUMI_FILES_VOLUME_UUID in every client env file.
+set -euo pipefail
+env_file="${1:-}"
+[[ -n "$env_file" && -r "$env_file" ]] || { echo "usage: sumi-files-format ENV_FILE" >&2; exit 2; }
+if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]]; then
+  echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
+  exit 2
+fi
+if [[ "$(stat -c %u "$env_file")" != "$(id -u)" ]]; then
+  echo "refused: credential file $env_file must be owned by the client uid $(id -u)" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+jfs="${SUMI_FILES_JUICEFS:-/usr/local/bin/juicefs}"
+meta="${SUMI_FILES_META_URL:?}"
+: "${META_PASSWORD:?}" "${ACCESS_KEY:?}" "${SECRET_KEY:?}"
+name="${SUMI_FILES_VOLUME_NAME:?}"
+bucket="${SUMI_FILES_BUCKET_URL:?}"
+export META_PASSWORD ACCESS_KEY SECRET_KEY
+
+if "$jfs" status "$meta" >/dev/null 2>&1; then
+  echo "refused: $meta already holds a volume; nothing changed" >&2
+  exit 2
+fi
+# minio = path-style S3 at an arbitrary endpoint (the Worker serves /<bucket>/<key>).
+# --trash-days 1 keeps deleted blocks recoverable for a day (JuiceFS default).
+if ! "$jfs" format --no-update --storage minio --bucket "$bucket" --trash-days 1 \
+  "$meta" "$name" >/dev/null 2>"${TMPDIR:-/tmp}/sumi-files-format.$$.err"; then
+  grep -v -i -E 'key|password|secret' "${TMPDIR:-/tmp}/sumi-files-format.$$.err" | tail -5 >&2
+  rm -f "${TMPDIR:-/tmp}/sumi-files-format.$$.err"
+  exit 1
+fi
+rm -f "${TMPDIR:-/tmp}/sumi-files-format.$$.err"
+"$jfs" status "$meta" 2>/dev/null | grep -o '"UUID": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/'

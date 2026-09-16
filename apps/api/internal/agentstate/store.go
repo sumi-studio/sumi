@@ -390,6 +390,11 @@ type ToolEffect struct {
 	ReadOnly func(request map[string]any) bool
 }
 
+// AlwaysReadOnly declares a delegated effect that can never change anything
+// outside its own operation record — shared by the packages that register
+// pure reads (Messaging history/search, call.state, invitation listing).
+func AlwaysReadOnly(map[string]any) bool { return true }
+
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }

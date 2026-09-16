@@ -447,9 +447,24 @@ func (p *posixRoot) rootFD() (*os.File, error) {
 	return os.NewFile(uintptr(fd), p.root), nil
 }
 
+// validScope accepts exactly the scope names deploy/files/sumi-files-check
+// accepts: [A-Za-z0-9][A-Za-z0-9._-]* without "..". Keeping one charset across
+// the API boundary, the mount check, and the executor launch path means a
+// scope the API serves can always be verified and bound the same way; the
+// executor's canonical scope is the compact personality-agent id, which is a
+// strict subset of this set.
 func validScope(scope string) error {
-	if scope == "" || strings.Contains(scope, "/") || strings.Contains(scope, "..") || strings.HasPrefix(scope, ".") {
+	if scope == "" || len(scope) > 255 || strings.Contains(scope, "..") {
 		return ErrEscape
+	}
+	for i := 0; i < len(scope); i++ {
+		c := scope[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case i > 0 && (c == '.' || c == '_' || c == '-'):
+		default:
+			return ErrEscape
+		}
 	}
 	return nil
 }
