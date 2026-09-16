@@ -75,6 +75,7 @@ import {
 } from "./email-code-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
+import { clearPendingProviderRedirect } from "./provider-redirect";
 import {
   beginRedirectSignIn,
   hasPendingRedirectSignIn,
@@ -1400,10 +1401,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               pending.account.email ??
               "このアカウント",
             (switchFromUserId) =>
-              runIntentConfirmation(
-                pending,
-                switchFromUserId || undefined,
-              ),
+              runIntentConfirmation(pending, switchFromUserId || undefined),
             async () => {
               try {
                 await discardAuthFlow(pending.flowId, pending.nonce);
@@ -1653,6 +1651,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         clearPendingEmailLink();
         setEmailLinkPending(false);
         clearPendingRedirectFlow();
+        clearPendingProviderRedirect();
         emailCompletionRecoveries.current.clear();
         setAccountSwitch(null);
         setCredentialRecoveryEmailSent(false);

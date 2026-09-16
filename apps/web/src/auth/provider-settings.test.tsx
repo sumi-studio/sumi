@@ -9,12 +9,20 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { FirebaseError } from "firebase/app";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  type PendingProviderRedirect,
+  peekPendingProviderRedirect,
+  savePendingProviderRedirect,
+} from "./provider-redirect";
 import { ProviderSettings } from "./provider-settings";
 import { AuthAPIError } from "./session-client";
 
 interface MockUser {
   uid: string;
+  email?: string;
+  emailVerified?: boolean;
   providerData: Array<{ providerId: string }>;
 }
 
@@ -25,9 +33,11 @@ const settingsMocks = vi.hoisted(() => ({
   onAuthStateChanged: vi.fn(),
   getIdToken: vi.fn(),
   getIdTokenResult: vi.fn(),
-  linkWithPopup: vi.fn(),
-  reauthenticateWithPopup: vi.fn(),
+  getRedirectResult: vi.fn(),
+  linkWithRedirect: vi.fn(),
+  reauthenticateWithRedirect: vi.fn(),
   reload: vi.fn(),
+  updateCurrentUser: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
   startProviderOperation: vi.fn(),
   completeProviderOperation: vi.fn(),
@@ -57,10 +67,12 @@ vi.mock("firebase/auth", () => ({
   },
   getIdToken: settingsMocks.getIdToken,
   getIdTokenResult: settingsMocks.getIdTokenResult,
-  linkWithPopup: settingsMocks.linkWithPopup,
+  getRedirectResult: settingsMocks.getRedirectResult,
+  linkWithRedirect: settingsMocks.linkWithRedirect,
   onAuthStateChanged: settingsMocks.onAuthStateChanged,
-  reauthenticateWithPopup: settingsMocks.reauthenticateWithPopup,
+  reauthenticateWithRedirect: settingsMocks.reauthenticateWithRedirect,
   reload: settingsMocks.reload,
+  updateCurrentUser: settingsMocks.updateCurrentUser,
 }));
 
 const pendingLinkStatus = {
@@ -83,8 +95,63 @@ const linkedResult = {
   noticeRequired: true,
 };
 
+const PENDING_KEY = "sumi.auth.provider-pending.v1";
+const NONCE = "n".repeat(43);
+
+// A sent redirect never resolves inside the tab: the browser navigates away.
+const leaveForProvider = () => new Promise<never>(() => {});
+
+function storedPending() {
+  return JSON.parse(localStorage.getItem(PENDING_KEY) ?? "null");
+}
+
+function storedPendingOperation(overrides: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    firebaseUid: "firebase-user-a",
+    humanId: "human-a",
+    provider: "google.com",
+    operation: "link",
+    nonce: NONCE,
+    phase: "link_ready",
+    operationId: "operation-1",
+    completionTokenNotBefore: "2020-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function redirectMarker(
+  overrides: Partial<PendingProviderRedirect> = {},
+): PendingProviderRedirect {
+  return {
+    version: 1,
+    kind: "link",
+    provider: "google.com",
+    nonce: NONCE,
+    firebaseUid: "firebase-user-a",
+    humanId: "human-a",
+    sentAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function linkCredential(user: MockUser) {
+  return { user, operationType: "link" };
+}
+
+function setSignInClaims(signInProvider: string, authTimeAgeSeconds = 0) {
+  settingsMocks.getIdTokenResult.mockResolvedValue({
+    token: `fresh-${signInProvider}-token`,
+    claims: {
+      auth_time: Math.floor(Date.now() / 1000) - authTimeAgeSeconds,
+      firebase: { sign_in_provider: signInProvider },
+    },
+  });
+}
+
 beforeEach(() => {
   sessionStorage.clear();
+  localStorage.clear();
   settingsMocks.currentUser = {
     uid: "firebase-user-a",
     providerData: [{ providerId: "password" }],
@@ -99,13 +166,7 @@ beforeEach(() => {
     return vi.fn();
   });
   settingsMocks.getIdToken.mockResolvedValue("id-token");
-  settingsMocks.getIdTokenResult.mockResolvedValue({
-    token: "fresh-email-token",
-    claims: {
-      auth_time: Math.floor(Date.now() / 1000),
-      firebase: { sign_in_provider: "password" },
-    },
-  });
+  setSignInClaims("password");
   settingsMocks.startProviderOperation.mockResolvedValue({
     operationId: "operation-1",
     outcome: "client_operation_required",
@@ -116,12 +177,14 @@ beforeEach(() => {
   settingsMocks.completeProviderOperation.mockResolvedValue(linkedResult);
   settingsMocks.failProviderOperation.mockResolvedValue(undefined);
   settingsMocks.statusProviderOperation.mockResolvedValue(pendingLinkStatus);
-  settingsMocks.linkWithPopup.mockImplementation(async () => {
-    settingsMocks.currentUser?.providerData.push({ providerId: "google.com" });
-    return { user: settingsMocks.currentUser };
-  });
-  settingsMocks.reauthenticateWithPopup.mockResolvedValue({});
+  settingsMocks.getRedirectResult.mockResolvedValue(null);
+  settingsMocks.linkWithRedirect.mockImplementation(leaveForProvider);
+  settingsMocks.reauthenticateWithRedirect.mockImplementation(leaveForProvider);
   settingsMocks.reload.mockResolvedValue(undefined);
+  settingsMocks.updateCurrentUser.mockImplementation(async (_auth, user) => {
+    settingsMocks.currentUser = user;
+    settingsMocks.authObserver?.(settingsMocks.currentUser);
+  });
 });
 
 afterEach(() => {
@@ -137,25 +200,46 @@ describe("provider settings", () => {
       providerData: [{ providerId: "github.com" }],
       email: "person@example.com",
       emailVerified: true,
-    } as typeof settingsMocks.currentUser;
+    };
 
     render(<ProviderSettings humanId="human-a" />);
 
     expect(screen.getByText("メール")).toBeVisible();
   });
 
-  it("persists an identity-scoped link notice and exposes dense 44px actions", async () => {
+  it("sends a same-tab redirect for the link and completes it on return", async () => {
     render(<ProviderSettings humanId="human-a" />);
 
     expect(screen.getByText("メール")).toBeVisible();
     const add = screen.getByRole("button", { name: "Googleを追加" });
     expect(add).toHaveClass("h-11");
     fireEvent.click(add);
-    const continueWithGoogle = await screen.findByRole("button", {
-      name: "Googleで認証を続ける",
+
+    await waitFor(() =>
+      expect(settingsMocks.linkWithRedirect).toHaveBeenCalledTimes(1),
+    );
+    expect(storedPending()).toMatchObject({
+      nonce: NONCE,
+      operationId: "operation-1",
+      phase: "link_ready",
     });
-    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
-    fireEvent.click(continueWithGoogle);
+    expect(peekPendingProviderRedirect()).toMatchObject({
+      kind: "link",
+      provider: "google.com",
+      nonce: NONCE,
+      firebaseUid: "firebase-user-a",
+      humanId: "human-a",
+    });
+    // The tab is leaving now; the completion happens after the return.
+
+    cleanup();
+    settingsMocks.currentUser?.providerData.push({
+      providerId: "google.com",
+    });
+    settingsMocks.getRedirectResult.mockResolvedValue(
+      linkCredential(settingsMocks.currentUser as MockUser),
+    );
+    render(<ProviderSettings humanId="human-a" />);
 
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -164,7 +248,7 @@ describe("provider settings", () => {
     });
     expect(settingsMocks.completeProviderOperation).toHaveBeenCalledWith({
       operationId: "operation-1",
-      nonce: "n".repeat(43),
+      nonce: NONCE,
       idToken: "id-token",
     });
     expect(
@@ -176,10 +260,11 @@ describe("provider settings", () => {
       humanId: "human-a",
       operation: "linked",
     });
-    expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
+    expect(storedPending()).toBeNull();
+    expect(peekPendingProviderRedirect()).toBeNull();
   });
 
-  it("never mutates Firebase until the backend operation is durably acknowledged", async () => {
+  it("never leaves for the provider until the backend operation is durably acknowledged", async () => {
     let rejectStart: ((error: unknown) => void) | undefined;
     settingsMocks.startProviderOperation.mockImplementation(
       () =>
@@ -193,7 +278,7 @@ describe("provider settings", () => {
     await waitFor(() =>
       expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(1),
     );
-    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
+    expect(settingsMocks.linkWithRedirect).not.toHaveBeenCalled();
 
     rejectStart?.(new AuthAPIError("proof_mismatch", 403));
     await waitFor(() =>
@@ -201,11 +286,11 @@ describe("provider settings", () => {
         "再認証を確認できませんでした",
       ),
     );
-    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
-    expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
+    expect(settingsMocks.linkWithRedirect).not.toHaveBeenCalled();
+    expect(storedPending()).toBeNull();
   });
 
-  it("retries start with the same nonce, then opens OAuth synchronously on the second click", async () => {
+  it("retries start with the same nonce before sending the redirect", async () => {
     settingsMocks.startProviderOperation
       .mockRejectedValueOnce(new TypeError("request not sent"))
       .mockResolvedValueOnce({
@@ -220,25 +305,148 @@ describe("provider settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
 
     await waitFor(() =>
-      expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(2),
+      expect(settingsMocks.linkWithRedirect).toHaveBeenCalledTimes(1),
     );
+    expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(2);
     expect(settingsMocks.startProviderOperation.mock.calls[0]?.[0].nonce).toBe(
-      "n".repeat(43),
+      NONCE,
     );
     expect(settingsMocks.startProviderOperation.mock.calls[1]?.[0].nonce).toBe(
-      "n".repeat(43),
+      NONCE,
     );
-    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
-    const continueWithGoogle = await screen.findByRole("button", {
-      name: "Googleで認証を続ける",
+  });
+
+  it("keeps a resumable pending operation when the redirect cannot be sent", async () => {
+    settingsMocks.linkWithRedirect.mockRejectedValue(
+      new FirebaseError("auth/web-storage-unsupported", "storage unavailable"),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(peekPendingProviderRedirect()).toBeNull();
+    expect(storedPending()).toMatchObject({ phase: "link_ready" });
+    expect(
+      screen.getByRole("button", { name: "Googleで認証を続ける" }),
+    ).toBeVisible();
+  });
+
+  it("settles a cancelled provider return without touching the link", async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    savePendingProviderRedirect(redirectMarker());
+    settingsMocks.getRedirectResult.mockResolvedValue(null);
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "認証をキャンセルしました。",
+      ),
+    );
+    expect(settingsMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "operation-1",
+      nonce: NONCE,
+      outcome: "cancelled",
     });
-    fireEvent.click(continueWithGoogle);
-    // This assertion intentionally runs in the same test task as the second
-    // click. A deferred effect or post-await call would still be zero here.
-    expect(settingsMocks.linkWithPopup).toHaveBeenCalledTimes(1);
+    expect(settingsMocks.completeProviderOperation).not.toHaveBeenCalled();
+    expect(storedPending()).toBeNull();
+    expect(peekPendingProviderRedirect()).toBeNull();
+  });
+
+  it("reports a credential already bound elsewhere from the redirect return", async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    savePendingProviderRedirect(redirectMarker());
+    settingsMocks.getRedirectResult.mockRejectedValue(
+      new FirebaseError("auth/credential-already-in-use", "in use"),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "このログイン方法は別のアカウントで使用されています。",
+      ),
+    );
+    expect(settingsMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "operation-1",
+      nonce: NONCE,
+      outcome: "credential_in_use",
+    });
+    expect(storedPending()).toBeNull();
+  });
+
+  it("does not adopt a redirect result belonging to a different Firebase user", async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    savePendingProviderRedirect(redirectMarker());
+    const otherUser: MockUser = {
+      uid: "firebase-user-b",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    settingsMocks.getRedirectResult.mockResolvedValue(
+      linkCredential(otherUser),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "ログイン方法を変更できませんでした",
+      ),
+    );
+    expect(settingsMocks.failProviderOperation).toHaveBeenCalledWith({
+      operationId: "operation-1",
+      nonce: NONCE,
+      outcome: "firebase_operation_failed",
+    });
+    expect(settingsMocks.completeProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a link that was applied by a result this tab never read", async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    savePendingProviderRedirect(redirectMarker());
+    // The result was consumed elsewhere (for example a shared sign-in
+    // return), but the provider made it onto the account.
+    settingsMocks.currentUser?.providerData.push({
+      providerId: "google.com",
+    });
+    settingsMocks.getRedirectResult.mockResolvedValue(null);
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Googleを追加しました",
+      ),
+    );
+    expect(settingsMocks.completeProviderOperation).toHaveBeenCalled();
+    expect(storedPending()).toBeNull();
+  });
+
+  it("discards a redirect receipt that does not match the pending operation", async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(storedPendingOperation({ nonce: "m".repeat(43) })),
+    );
+    savePendingProviderRedirect(redirectMarker());
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() => expect(peekPendingProviderRedirect()).toBeNull());
+    expect(settingsMocks.getRedirectResult).not.toHaveBeenCalled();
+    expect(storedPending()).toMatchObject({ nonce: "m".repeat(43) });
+    expect(
+      screen.getByRole("button", { name: "Googleで認証を続ける" }),
+    ).toBeVisible();
   });
 
   it("reconciles a response-lost link completion after transient status failures", async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(storedPendingOperation({ phase: "link_mutated" })),
+    );
+    savePendingProviderRedirect(redirectMarker());
+    settingsMocks.currentUser?.providerData.push({
+      providerId: "google.com",
+    });
+    settingsMocks.getRedirectResult.mockResolvedValue(
+      linkCredential(settingsMocks.currentUser as MockUser),
+    );
     settingsMocks.completeProviderOperation.mockRejectedValueOnce(
       new TypeError("response lost after commit"),
     );
@@ -248,13 +456,6 @@ describe("provider settings", () => {
       .mockResolvedValueOnce(linkedResult);
     render(<ProviderSettings humanId="human-a" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Googleで認証を続ける",
-      }),
-    );
-
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
         "Googleを追加しました",
@@ -262,10 +463,21 @@ describe("provider settings", () => {
     });
     expect(settingsMocks.completeProviderOperation).toHaveBeenCalledTimes(1);
     expect(settingsMocks.statusProviderOperation).toHaveBeenCalledTimes(3);
-    expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
+    expect(storedPending()).toBeNull();
   });
 
   it("keeps an unresolved completion and exposes an explicit same-operation resume", async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(storedPendingOperation({ phase: "link_mutated" })),
+    );
+    savePendingProviderRedirect(redirectMarker());
+    settingsMocks.currentUser?.providerData.push({
+      providerId: "google.com",
+    });
+    settingsMocks.getRedirectResult.mockResolvedValue(
+      linkCredential(settingsMocks.currentUser as MockUser),
+    );
     settingsMocks.completeProviderOperation.mockRejectedValue(
       new TypeError("request unavailable"),
     );
@@ -273,13 +485,6 @@ describe("provider settings", () => {
       new TypeError("status unavailable"),
     );
     render(<ProviderSettings humanId="human-a" />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Googleを追加" }));
-    fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Googleで認証を続ける",
-      }),
-    );
 
     await waitFor(
       () => {
@@ -292,12 +497,8 @@ describe("provider settings", () => {
     expect(
       screen.getByRole("button", { name: "Googleの追加結果を確認" }),
     ).toBeVisible();
-    expect(
-      JSON.parse(
-        sessionStorage.getItem("sumi.auth.provider-pending.v1") ?? "null",
-      ),
-    ).toMatchObject({
-      nonce: "n".repeat(43),
+    expect(storedPending()).toMatchObject({
+      nonce: NONCE,
       operationId: "operation-1",
       phase: "link_mutated",
     });
@@ -316,17 +517,167 @@ describe("provider settings", () => {
         "Googleを追加しました",
       ),
     );
-    expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(1);
-    expect(settingsMocks.linkWithPopup).toHaveBeenCalledTimes(1);
+    expect(settingsMocks.startProviderOperation).not.toHaveBeenCalled();
+    expect(settingsMocks.linkWithRedirect).not.toHaveBeenCalled();
   });
 
-  it("replays a backend-owned unlink with the same nonce and tolerates transient status loss", async () => {
+  it("resends the provider redirect when a link_ready operation is resumed", async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(storedPendingOperation()));
+    render(<ProviderSettings humanId="human-a" />);
+
+    const resume = await screen.findByRole("button", {
+      name: "Googleで認証を続ける",
+    });
+    fireEvent.click(resume);
+
+    await waitFor(() =>
+      expect(settingsMocks.linkWithRedirect).toHaveBeenCalledTimes(1),
+    );
+    expect(peekPendingProviderRedirect()).toMatchObject({
+      kind: "link",
+      nonce: NONCE,
+    });
+    expect(settingsMocks.startProviderOperation).not.toHaveBeenCalled();
+  });
+
+  it("unlinks with a recent sign-in proof without a provider trip", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    const unlinkedResult = {
+      operationId: "operation-2",
+      provider: "google.com",
+      operation: "unlink",
+      status: "completed",
+      outcome: "provider_unlinked",
+      noticeRequired: true,
+    };
+    settingsMocks.startProviderOperation.mockResolvedValue(unlinkedResult);
+    settingsMocks.statusProviderOperation.mockResolvedValue(unlinkedResult);
+    // A real reload() merges providerData and cannot drop the provider the
+    // backend deleted; the confirmed outcome reconciles the local user.
+    settingsMocks.reload.mockImplementation(async () => {});
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(screen.getByRole("button", { name: "再認証して解除" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Googleを解除しました",
+      );
+    });
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
+    expect(settingsMocks.startProviderOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: "unlink",
+        nonce: NONCE,
+        idToken: "fresh-password-token",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Googleを追加" })).toBeVisible();
+  });
+
+  it("reauthenticates by redirect for an unlink and resumes it on return", async () => {
     settingsMocks.currentUser = {
       uid: "firebase-user-a",
       providerData: [
         { providerId: "google.com" },
         { providerId: "github.com" },
       ],
+    };
+    // The Google session is old, so the unlink needs a fresh proof through
+    // the other linked method.
+    setSignInClaims("google.com", 3_600);
+    const unlinkedResult = {
+      operationId: "operation-2",
+      provider: "google.com",
+      operation: "unlink",
+      status: "completed",
+      outcome: "provider_unlinked",
+      noticeRequired: true,
+    };
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(screen.getByRole("button", { name: "再認証して解除" }));
+
+    await waitFor(() =>
+      expect(settingsMocks.reauthenticateWithRedirect).toHaveBeenCalledTimes(1),
+    );
+    expect(storedPending()).toMatchObject({
+      operation: "unlink",
+      provider: "google.com",
+      phase: "unlink_starting",
+    });
+    expect(peekPendingProviderRedirect()).toMatchObject({
+      kind: "reauth",
+      provider: "github.com",
+      nonce: NONCE,
+    });
+
+    cleanup();
+    settingsMocks.getRedirectResult.mockResolvedValue({
+      user: settingsMocks.currentUser,
+      operationType: "reauthenticate",
+    });
+    setSignInClaims("github.com");
+    settingsMocks.startProviderOperation.mockResolvedValue(unlinkedResult);
+    settingsMocks.statusProviderOperation.mockResolvedValue(unlinkedResult);
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Googleを解除しました",
+      );
+    });
+    expect(settingsMocks.startProviderOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ operation: "unlink", nonce: NONCE }),
+    );
+    expect(storedPending()).toBeNull();
+  });
+
+  it("keeps a cancelled unlink reauthentication resumable instead of deleting anything", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [
+        { providerId: "google.com" },
+        { providerId: "github.com" },
+      ],
+    };
+    setSignInClaims("google.com", 3_600);
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(
+        storedPendingOperation({
+          operation: "unlink",
+          phase: "unlink_starting",
+        }),
+      ),
+    );
+    savePendingProviderRedirect(
+      redirectMarker({ kind: "reauth", provider: "github.com" }),
+    );
+    settingsMocks.getRedirectResult.mockResolvedValue(null);
+    render(<ProviderSettings humanId="human-a" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "認証をキャンセルしました。",
+      ),
+    );
+    expect(settingsMocks.startProviderOperation).not.toHaveBeenCalled();
+    expect(storedPending()).toMatchObject({ phase: "unlink_starting" });
+    expect(
+      screen.getByRole("button", { name: "Googleの解除を再開" }),
+    ).toBeVisible();
+  });
+
+  it("replays a backend-owned unlink with the same nonce and tolerates transient status loss", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
     };
     const unlinkedResult = {
       operationId: "operation-2",
@@ -342,28 +693,23 @@ describe("provider settings", () => {
     settingsMocks.statusProviderOperation
       .mockRejectedValueOnce(new TypeError("transient status loss"))
       .mockResolvedValueOnce(unlinkedResult);
-    settingsMocks.reload.mockImplementation(async () => {
-      if (settingsMocks.currentUser) {
-        settingsMocks.currentUser.providerData = [{ providerId: "github.com" }];
-      }
-    });
+    // reload() merges providerData and cannot drop a backend-deleted
+    // provider; the confirmed outcome reconciles the local user.
+    settingsMocks.reload.mockImplementation(async () => {});
     render(<ProviderSettings humanId="human-a" />);
 
     fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
-    expect(
-      screen.getByText(/別のリンク済み方法で再認証してから解除します/),
-    ).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "再認証して解除" }));
 
     await waitFor(() =>
       expect(settingsMocks.startProviderOperation).toHaveBeenCalledTimes(2),
     );
-    expect(settingsMocks.reauthenticateWithPopup).toHaveBeenCalledTimes(1);
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
     expect(settingsMocks.startProviderOperation.mock.calls[0]?.[0].nonce).toBe(
-      "n".repeat(43),
+      NONCE,
     );
     expect(settingsMocks.startProviderOperation.mock.calls[1]?.[0].nonce).toBe(
-      "n".repeat(43),
+      NONCE,
     );
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -371,9 +717,10 @@ describe("provider settings", () => {
       );
     });
     expect(settingsMocks.statusProviderOperation).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Googleを追加" })).toBeVisible();
   });
 
-  it("clears notices and pending state on an account switch and logout", async () => {
+  it("hides another account's pending operation without destroying it", async () => {
     sessionStorage.setItem(
       "sumi.auth.provider-notice.v1",
       JSON.stringify({
@@ -384,17 +731,9 @@ describe("provider settings", () => {
         operation: "linked",
       }),
     );
-    sessionStorage.setItem(
-      "sumi.auth.provider-pending.v1",
-      JSON.stringify({
-        version: 1,
-        firebaseUid: "firebase-user-a",
-        humanId: "human-a",
-        provider: "github.com",
-        operation: "link",
-        nonce: "n".repeat(43),
-        phase: "starting",
-      }),
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(storedPendingOperation({ phase: "starting" })),
     );
     render(<ProviderSettings humanId="human-a" />);
     expect(screen.getByText("Googleを追加しました")).toBeVisible();
@@ -409,9 +748,11 @@ describe("provider settings", () => {
       expect(
         screen.queryByText("Googleを追加しました"),
       ).not.toBeInTheDocument();
+      expect(screen.queryByText(/再開できます/)).not.toBeInTheDocument();
     });
     expect(sessionStorage.getItem("sumi.auth.provider-notice.v1")).toBeNull();
-    expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
+    // User A's unfinished change stays stored under its own scope.
+    expect(storedPending()).toMatchObject({ firebaseUid: "firebase-user-a" });
 
     sessionStorage.setItem(
       "sumi.auth.provider-notice.v1",
@@ -443,28 +784,18 @@ describe("provider settings", () => {
         operation: "linked",
       }),
     );
-    sessionStorage.setItem(
-      "sumi.auth.provider-pending.v1",
-      JSON.stringify({
-        version: 1,
-        firebaseUid: "firebase-user-a",
-        humanId: "human-a",
-        provider: "github.com",
-        operation: "link",
-        nonce: "n".repeat(43),
-        phase: "link_ready",
-        operationId: "operation-restored",
-        completionTokenNotBefore: "2020-01-01T00:00:00Z",
-      }),
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(
+        storedPendingOperation({ operationId: "operation-restored" }),
+      ),
     );
 
     render(<ProviderSettings humanId="human-a" />);
     expect(
       sessionStorage.getItem("sumi.auth.provider-notice.v1"),
     ).not.toBeNull();
-    expect(
-      sessionStorage.getItem("sumi.auth.provider-pending.v1"),
-    ).not.toBeNull();
+    expect(storedPending()).not.toBeNull();
 
     settingsMocks.currentUser = {
       uid: "firebase-user-a",
@@ -474,14 +805,24 @@ describe("provider settings", () => {
 
     expect(await screen.findByText("Googleを追加しました")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: "GitHubで認証を続ける" }),
+      screen.getByRole("button", { name: "Googleで認証を続ける" }),
     ).toBeVisible();
     expect(
       sessionStorage.getItem("sumi.auth.provider-notice.v1"),
     ).not.toBeNull();
+    expect(storedPending()).not.toBeNull();
+  });
+
+  it("restores a pre-redirect sessionStorage pending record for the same scope", async () => {
+    sessionStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify(storedPendingOperation()),
+    );
+    render(<ProviderSettings humanId="human-a" />);
+
     expect(
-      sessionStorage.getItem("sumi.auth.provider-pending.v1"),
-    ).not.toBeNull();
+      await screen.findByRole("button", { name: "Googleで認証を続ける" }),
+    ).toBeVisible();
   });
 
   it("cannot repopulate provider state from an old account's in-flight callback", async () => {
@@ -512,9 +853,7 @@ describe("provider settings", () => {
     };
     act(() => settingsMocks.authObserver?.(settingsMocks.currentUser));
     await waitFor(() =>
-      expect(
-        sessionStorage.getItem("sumi.auth.provider-pending.v1"),
-      ).toBeNull(),
+      expect(screen.queryByText(/再開できます/)).not.toBeInTheDocument(),
     );
 
     await act(async () => {
@@ -528,8 +867,9 @@ describe("provider settings", () => {
       await Promise.resolve();
     });
 
-    expect(settingsMocks.linkWithPopup).not.toHaveBeenCalled();
-    expect(sessionStorage.getItem("sumi.auth.provider-pending.v1")).toBeNull();
+    expect(settingsMocks.linkWithRedirect).not.toHaveBeenCalled();
+    // The late callback must not persist user B state or adopt user A's op.
+    expect(storedPending()?.firebaseUid).not.toBe("firebase-user-b");
     expect(screen.queryByText(/再開できます/)).not.toBeInTheDocument();
   });
 
@@ -548,6 +888,6 @@ describe("provider settings", () => {
         "最後のログイン方法は解除できません。先に別の方法を追加してください。",
       ),
     ).toBeVisible();
-    expect(settingsMocks.reauthenticateWithPopup).not.toHaveBeenCalled();
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
   });
 });
