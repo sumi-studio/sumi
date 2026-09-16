@@ -42,10 +42,27 @@ export function parseDevAllowedHosts(raw: string | undefined): string[] {
     .filter((value) => value !== "");
 }
 
+/**
+ * Optional dev-server port override (SUMI_DEV_PORT, decimal 1..65535). The
+ * launcher uses this to keep every listener inside an owned port range.
+ */
+export function parseDevPort(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return SUMI_DEV_PORT;
+  if (!/^[0-9]{1,5}$/.test(raw.trim())) {
+    throw new Error(`Sumi dev port is not a decimal port: ${raw}`);
+  }
+  const port = Number(raw.trim());
+  if (port < 1 || port > 65535) {
+    throw new Error(`Sumi dev port is outside 1..65535: ${raw}`);
+  }
+  return port;
+}
+
 export function createDevServerConfig(
   apiOrigin = SUMI_DEV_API_ORIGIN,
   host = SUMI_DEV_HOST,
   allowedHosts: readonly string[] = [],
+  port = SUMI_DEV_PORT,
 ): ServerOptions {
   const target = new URL(apiOrigin);
   if (
@@ -69,7 +86,7 @@ export function createDevServerConfig(
   }
   return {
     host,
-    port: SUMI_DEV_PORT,
+    port,
     strictPort: true,
     ...(allowedHosts.length > 0 ? { allowedHosts: [...allowedHosts] } : {}),
     proxy: {
@@ -109,5 +126,15 @@ export default defineConfig({
     process.env.SUMI_DEV_API_ORIGIN?.trim() || SUMI_DEV_API_ORIGIN,
     process.env.SUMI_DEV_HOST?.trim() || SUMI_DEV_HOST,
     parseDevAllowedHosts(process.env.SUMI_DEV_ALLOWED_HOSTS),
+    parseDevPort(process.env.SUMI_DEV_PORT),
+  ),
+  // `vite preview` serves the production build locally; it shares the dev
+  // server's same-origin API proxy so a built bundle can be exercised
+  // against a real API without an edge in front.
+  preview: createDevServerConfig(
+    process.env.SUMI_DEV_API_ORIGIN?.trim() || SUMI_DEV_API_ORIGIN,
+    SUMI_DEV_HOST,
+    [],
+    4173,
   ),
 });

@@ -136,6 +136,13 @@ export type ConversationEntry =
       runId: string | null;
       message: string;
       retryable: false;
+      /**
+       * Bounded failure classification carried on the wire's provider_code.
+       * "no_model_connection" = no usable model connection is selected; the
+       * row renders localized guidance plus the connection-settings sheet.
+       * Unknown/absent codes keep the generic presentation.
+       */
+      cause?: "no_model_connection";
     };
 
 /**

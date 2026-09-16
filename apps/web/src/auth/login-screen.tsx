@@ -677,19 +677,6 @@ export function LoginScreen() {
                     </Button>
                   ))}
                 </div>
-                {intent === "sign_up" && invitationStatus === "valid" && (
-                  <p className="pt-1 text-center text-muted-foreground text-xs leading-5">
-                    Sumi Localの秘書を引き継ぐ場合は
-                    <button
-                      type="button"
-                      className="underline underline-offset-4"
-                      onClick={() => setIntent("sign_in")}
-                      disabled={busy !== null}
-                    >
-                      ログインして移動を選ぶ
-                    </button>
-                  </p>
-                )}
               </>
             )}
 

@@ -38,22 +38,51 @@ interface FlowAuthority {
   nonce: string;
 }
 
+/**
+ * The secretary-move routes are not mounted on this API — the feature is off
+ * (SUMI_TRANSFER_PUBLIC_BASE_URL unset). Distinct from an ordinary 404: every
+ * mounted route's "nothing here" answer is the JSON "transfer session not
+ * found", so a 404 without it means the surface itself is absent.
+ */
+export class TransferFeatureDisabledError extends AuthAPIError {
+  constructor() {
+    super("transfer_feature_disabled", 404);
+    this.name = "TransferFeatureDisabledError";
+  }
+}
+
+export function isTransferFeatureDisabled(error: unknown): boolean {
+  return error instanceof TransferFeatureDisabledError;
+}
+
+/**
+ * A sibling tab can rotate the shared CSRF cookie between this tab's token
+ * fetch and the POST that uses it, so one ordinary poll can land a 401 that
+ * says nothing about the flow. One immediate retry carries the token the jar
+ * now holds; a 401 that persists is a real refusal — an expired, closed or
+ * foreign flow still ends the attempt, never an endless loop.
+ */
 async function postTransfer(
   path: string,
   body: Record<string, string>,
 ): Promise<Record<string, unknown>> {
-  const csrfToken = await fetchCSRFToken();
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "include",
-    cache: "no-store",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      "X-CSRF-Token": csrfToken,
-    },
-    body: JSON.stringify(body),
-  });
+  let response: Response | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const csrfToken = await fetchCSRFToken();
+    response = await fetch(path, {
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken,
+      },
+      body: JSON.stringify(body),
+    });
+    if (response.status !== 401) break;
+  }
+  if (response === null) throw new AuthAPIError("transfer request failed", 0);
   const parsed: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const detail =
@@ -63,6 +92,9 @@ async function postTransfer(
       typeof parsed.error === "string"
         ? parsed.error
         : "transfer request failed";
+    if (response.status === 404 && detail !== "transfer session not found") {
+      throw new TransferFeatureDisabledError();
+    }
     const error = new AuthAPIError(detail, response.status);
     if (
       response.status === 409 &&
@@ -126,7 +158,11 @@ export async function readSecretaryTransfer(
     );
     return isTransferSession(body) ? body : null;
   } catch (error) {
-    if (error instanceof AuthAPIError && error.status === 404) {
+    if (
+      !(error instanceof TransferFeatureDisabledError) &&
+      error instanceof AuthAPIError &&
+      error.status === 404
+    ) {
       return null;
     }
     throw error;

@@ -1240,6 +1240,7 @@ export class Secretary {
           // the first commit upload should never carry that onto a
           // memory-limited host. The truncation marker stays in the record.
           error: `model: ${truncateText(detail, RECORDED_ERROR_BYTES)}`,
+          error_kind: mErr?.cause,
           retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
           events: retryable ? [] : events,
         });
@@ -1389,6 +1390,9 @@ export class Secretary {
         payload: scrubJson(e.payload) as Record<string, unknown>,
       })),
       error: msg,
+      // A certain bounded cause survives the scrub — it carries no
+      // provider bytes, so it can never be what made the commit un-storable.
+      error_kind: req.error_kind,
     };
     try {
       await commit(scrubbed);

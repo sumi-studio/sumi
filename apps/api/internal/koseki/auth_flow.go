@@ -394,9 +394,14 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 				}
 			}
 			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn, identity.ProviderSubject)
-		case flow.Intent == IntentSignUp && !exists:
+		case flow.Intent == IntentSignUp && !exists && s.Transfers == nil:
 			flow, err = s.provisionFromFlow(ctx, tx, flow, identity)
-		case flow.Intent == IntentSignIn && !exists:
+		case !exists && (flow.Intent == IntentSignIn || flow.Intent == IntentSignUp):
+			// A new credential never provisions at resolve while the secretary
+			// move is offered: registration must present "bring my Local
+			// secretary" before any account or persona is created. With the
+			// transfer surface off there is no choice to make, so sign-up keeps
+			// its direct provision above.
 			if err := s.checkEnrollmentInviteProof(ctx, tx, flow, identity); err != nil {
 				return AuthFlow{}, err
 			}

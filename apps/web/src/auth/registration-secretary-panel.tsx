@@ -7,6 +7,7 @@ import {
   cancelSecretaryTransfer,
   clearMoveURL,
   createSecretaryTransfer,
+  isTransferFeatureDisabled,
   isTransferPendingError,
   isTransferUnavailableError,
   loadMoveURL,
@@ -90,6 +91,10 @@ export function RegistrationSecretaryPanel({
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [authLost, setAuthLost] = useState(false);
+  // Pessimistic until the mount read answers: the Local CTA renders only
+  // after a mounted-route answer, so an API without transfer routes never
+  // flashes a button that would 404.
+  const [transferAvailable, setTransferAvailable] = useState(false);
   const mounted = useRef(false);
   useEffect(() => {
     // Setting it inside the effect, not at ref creation, keeps the guard
@@ -133,6 +138,8 @@ export function RegistrationSecretaryPanel({
     void readSecretaryTransfer({ flowId, nonce: flowNonce })
       .then((next) => {
         if (cancelled) return;
+        // A real answer — even "no session" — proves the routes are mounted.
+        setTransferAvailable(true);
         applySession(next);
         if (
           saved &&
@@ -145,7 +152,9 @@ export function RegistrationSecretaryPanel({
       })
       .catch((error: unknown) => {
         if (cancelled) return;
-        if (error instanceof AuthAPIError && error.status === 401) {
+        if (isTransferFeatureDisabled(error)) {
+          setTransferAvailable(false);
+        } else if (error instanceof AuthAPIError && error.status === 401) {
           setAuthLost(true);
         } else {
           onError(getAuthErrorMessage(error));
@@ -236,6 +245,10 @@ export function RegistrationSecretaryPanel({
       }
       if (error instanceof AuthAPIError && error.status === 401) {
         setAuthLost(true);
+        return;
+      }
+      if (isTransferFeatureDisabled(error)) {
+        setTransferAvailable(false);
         return;
       }
       onError(getAuthErrorMessage(error));
@@ -357,8 +370,9 @@ export function RegistrationSecretaryPanel({
       {phase === "choice" && (
         <>
           <p className="text-muted-foreground text-sm leading-6">
-            この認証情報に対応するSumiアカウントはまだありません。新しい秘書で登録するか、Sumi
-            Localで使っている秘書を引き継ぐかを選べます。
+            {transferAvailable
+              ? "この認証情報に対応するSumiアカウントはまだありません。新しい秘書で登録するか、Sumi Localで使っている秘書を引き継ぐかを選べます。"
+              : "この認証情報に対応するSumiアカウントはまだありません。新規登録して続けますか？"}
           </p>
           <Button
             type="button"
@@ -369,16 +383,18 @@ export function RegistrationSecretaryPanel({
             {busy && <LoaderCircle className="size-5 animate-spin" />}
             新しい秘書で登録する
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => void startMove()}
-            disabled={disabled}
-            className="h-11 w-full rounded-lg"
-          >
-            {working && <LoaderCircle className="size-5 animate-spin" />}
-            Localの秘書を引き継ぐ
-          </Button>
+          {transferAvailable && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void startMove()}
+              disabled={disabled}
+              className="h-11 w-full rounded-lg"
+            >
+              {working && <LoaderCircle className="size-5 animate-spin" />}
+              Localの秘書を引き継ぐ
+            </Button>
+          )}
           <Button
             type="button"
             variant="ghost"

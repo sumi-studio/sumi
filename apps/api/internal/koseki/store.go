@@ -54,8 +54,9 @@ type Store struct {
 	// fails closed while it is unset.
 	EmailChallengeKey *EmailChallengeKey
 	// Transfers is the secretary-move session service the account
-	// transaction claims through. When nil the store uses a default service
-	// over the same pool.
+	// transaction claims through, and the "move is offered" signal: when it
+	// is nil a new credential's sign-up provisions directly at resolve, and
+	// the claim consult uses a default service over the same pool.
 	Transfers           *transfersession.Service
 	pool                *pgxpool.Pool
 	wrappingKeyID       string

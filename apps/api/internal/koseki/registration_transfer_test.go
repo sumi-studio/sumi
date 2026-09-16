@@ -101,8 +101,13 @@ func transferStore(t *testing.T) (*Store, *transfersession.Service, context.Cont
 
 func startRegistration(t *testing.T, ctx context.Context, store *Store, uid, email string) (AuthFlow, string) {
 	t.Helper()
+	return startRegistrationIntent(t, ctx, store, IntentSignIn, uid, email)
+}
+
+func startRegistrationIntent(t *testing.T, ctx context.Context, store *Store, intent AuthIntent, uid, email string) (AuthFlow, string) {
+	t.Helper()
 	nonce := testNonce(t)
-	flow := startEmailFlow(t, ctx, store, IntentSignIn, email, nonce)
+	flow := startEmailFlow(t, ctx, store, intent, email, nonce)
 	pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof(uid, email))
 	if err != nil {
 		t.Fatalf("resolve proof: %v", err)
@@ -290,4 +295,76 @@ func TestRegistrantProofSubject(t *testing.T) {
 			t.Fatalf("unknown flow: %v", err)
 		}
 	})
+}
+
+// The default invited sign-up path must offer the secretary choice before
+// any account or persona exists: resolve parks the flow at a create-account
+// confirmation, and only the person's confirm commits anything.
+func TestSignUpOffersTheChoiceBeforeCreating(t *testing.T) {
+	store, _, ctx := transferStore(t)
+	uid := "choice-" + uuid.Must(uuid.NewV7()).String()[:12]
+
+	nonce := testNonce(t)
+	flow := startEmailFlow(t, ctx, store, IntentSignUp, "choice@example.com", nonce)
+	pending, err := store.ResolveAuthProof(ctx, flow.FlowID, nonce, emailProof(uid, "choice@example.com"))
+	if err != nil {
+		t.Fatalf("sign-up resolve: %v", err)
+	}
+	if pending.Status != "confirmation_required" || pending.ConfirmationAction != ActionCreateAccount {
+		t.Fatalf("sign-up never offered the choice: %+v", pending)
+	}
+	// Resolve created nothing: no Human, no persona, no session.
+	assertRegistryCounts(t, ctx, store, 0, 0)
+	var sessionCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM transfer_sessions`).Scan(&sessionCount); err != nil {
+		t.Fatal(err)
+	}
+	if sessionCount != 0 {
+		t.Fatalf("resolve created a transfer session: %d", sessionCount)
+	}
+
+	result, err := store.ConfirmAuthFlow(ctx, pending.FlowID, nonce, ActionCreateAccount)
+	if err != nil {
+		t.Fatalf("confirm create-account: %v", err)
+	}
+	if result.TerminalOutcome != OutcomeAccountCreated || result.AgentID == "" {
+		t.Fatalf("fresh registration failed: %+v", result)
+	}
+	assertRegistryCounts(t, ctx, store, 1, 1)
+}
+
+// The same default sign-up path claims a staged move: the choice is still
+// presented first, and confirming it binds the carried persona — never a
+// second default secretary.
+func TestSignUpClaimsTheCarriedSecretary(t *testing.T) {
+	store, sessions, ctx := transferStore(t)
+	local := newLocalPlacement(t)
+	uid := "signup-moved-" + uuid.Must(uuid.NewV7()).String()[:12]
+	sessionID := stageTransfer(t, ctx, store.pool, sessions, local, uid)
+
+	flow, nonce := startRegistrationIntent(t, ctx, store, IntentSignUp, uid, "signup-moved@example.com")
+	result, err := store.ConfirmAuthFlow(ctx, flow.FlowID, nonce, ActionCreateAccount)
+	if err != nil {
+		t.Fatalf("sign-up confirm with staged transfer: %v", err)
+	}
+	if result.TerminalOutcome != OutcomeAccountCreated || result.AgentID != local.pid {
+		t.Fatalf("sign-up did not take the carried persona: %+v (carried %s)", result, local.pid)
+	}
+	assertRegistryCounts(t, ctx, store, 1, 1)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var status string
+		if err := store.pool.QueryRow(ctx,
+			`SELECT status FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&status); err != nil {
+			t.Fatalf("session status: %v", err)
+		}
+		if status == transfersession.StatusActivated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("activation never committed: %s", status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
