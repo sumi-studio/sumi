@@ -78,7 +78,7 @@ func requestMatchesReplay(in AppendInput, storedDigest []byte) bool {
 }
 
 func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInput) (Message, bool, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, false, fmt.Errorf("begin idempotent scoped re-read: %w", err)
 	}
@@ -111,7 +111,7 @@ func (s *ScopedStore) authorizedMessageByNonce(ctx context.Context, in AppendInp
 }
 
 func (s *ScopedStore) appendScopedOnce(ctx context.Context, in AppendInput) (Message, bool, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, false, fmt.Errorf("begin scoped append: %w", err)
 	}
@@ -284,7 +284,7 @@ func (s *ScopedStore) messageByNonce(ctx context.Context, q querier, in AppendIn
 }
 
 func (s *ScopedStore) History(ctx context.Context, placeID string, opt HistoryOptions) ([]Message, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped history: %w", err)
 	}
@@ -360,7 +360,7 @@ func (s *ScopedStore) MessagesSince(ctx context.Context, placeID string, sinceSe
 	if limit <= 0 || limit > MaxHistoryLimit {
 		limit = MaxHistoryLimit
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped catch-up: %w", err)
 	}
@@ -424,7 +424,7 @@ func (s *ScopedStore) editMessage(ctx context.Context, placeID, messageID, conte
 	if !messageContentFitsStorage(content) {
 		return Message{}, fmt.Errorf("content is not storable or exceeds %d bytes", MaxContentBytes)
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, fmt.Errorf("begin scoped edit: %w", err)
 	}
@@ -532,7 +532,7 @@ func (s *ScopedStore) DeleteMessage(ctx context.Context, placeID, messageID stri
 	if err := s.Scope.Validate(); err != nil {
 		return Message{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, fmt.Errorf("begin scoped delete: %w", err)
 	}
@@ -663,7 +663,7 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 	if seq < 0 {
 		return errors.New("seq must be non-negative")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin scoped read-through: %w", err)
 	}
@@ -700,7 +700,7 @@ func (s *ScopedStore) ReadThrough(ctx context.Context, placeID string, seq int64
 }
 
 func (s *ScopedStore) ReadMarker(ctx context.Context, placeID string) (int64, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin scoped read-marker read: %w", err)
 	}
@@ -748,7 +748,7 @@ func (s *ScopedStore) readMarkerAfterAuthorization(
 }
 
 func (s *ScopedStore) UnreadSummaries(ctx context.Context) ([]UnreadSummary, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped unread read: %w", err)
 	}

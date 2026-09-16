@@ -55,7 +55,7 @@ func (s *ScopedStore) SearchMessages(
 		limit = MaxSearchLimit
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped message search: %w", err)
 	}

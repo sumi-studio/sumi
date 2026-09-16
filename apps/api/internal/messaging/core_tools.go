@@ -26,6 +26,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
+	"unicode/utf8"
 )
 
 const (
@@ -44,11 +45,20 @@ const (
 	MessagingCoreOpenAttachmentTool   = "messaging.open_attachment"
 )
 
-// MaxCoreAttachmentBytes bounds attachment bytes crossing the tool boundary:
-// base64 inside the operation request or response. It matches the local
-// lane's fetch bound — larger files stay available through the human REST
-// lane, and the metadata (with the oversized flag) still reaches the model.
+// MaxCoreAttachmentBytes bounds attachment bytes the model uploads inline —
+// base64 inside the operation claim request. It matches the local lane's
+// fetch bound: larger files still upload through the human REST lane.
+// Downloads are not bounded by it — open_attachment pages any size file in
+// bounded slices.
 const MaxCoreAttachmentBytes int64 = MaxLocalAttachmentFetchBytes
+
+// open_attachment page bounds: default page 64 KiB, hard cap 128 KiB. A
+// binary page is ~1.4x as base64 — the largest possible result stays far
+// inside the agentstate commit body budget alongside the rest of a turn.
+const (
+	coreAttachmentReadSliceDefault int64 = 64 << 10
+	coreAttachmentReadSliceMax     int64 = 128 << 10
+)
 
 // CoreToolEffects is the delegated tool/effect surface the host registers on
 // the agentstate store when Messaging and the core share one service.
@@ -160,6 +170,7 @@ func (d *CoreAttentionDelivery) applyOverview(ctx context.Context, tx pgx.Tx, pe
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	overview, err := buildOverviewWire(ctx, scoped)
 	if err != nil {
 		return nil, coreEffectFailure(err)
@@ -175,6 +186,7 @@ func (d *CoreAttentionDelivery) applyOpen(ctx context.Context, tx pgx.Tx, person
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	var opt HistoryOptions
 	if v, ok := coreRequestInt(request, "before_seq"); ok {
 		opt.BeforeSeq = v
@@ -186,15 +198,20 @@ func (d *CoreAttentionDelivery) applyOpen(ctx context.Context, tx pgx.Tx, person
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
-	messages := make([]messageWire, len(snapshot.Messages))
-	for i, m := range snapshot.Messages {
-		messages[i] = messageToWire(snapshot.Place, m)
-	}
+	messages, nextBefore := boundedWirePage(snapshot.Messages, func(m Message) any {
+		return messageToWire(snapshot.Place, m)
+	})
 	response := map[string]any{
 		"place":         corePlaceMap(snapshot.Place),
 		"members":       wireJSON(membersToWire(snapshot.Members)),
-		"messages":      wireJSON(messages),
+		"messages":      messages,
 		"last_read_seq": snapshot.LastReadSeq,
+	}
+	if nextBefore > 0 {
+		// The page hit the response budget before the requested limit: the
+		// caller resumes with before_seq = next_before_seq.
+		response["truncated"] = true
+		response["next_before_seq"] = nextBefore
 	}
 	if snapshot.Thread != nil {
 		response["thread"] = wireMap(threadToWire(*snapshot.Thread))
@@ -224,6 +241,7 @@ func (d *CoreAttentionDelivery) applySearch(ctx context.Context, tx pgx.Tx, pers
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	var opt SearchOptions
 	opt.PlaceID = placeID
 	if v, ok := coreRequestInt(request, "limit"); ok {
@@ -233,15 +251,64 @@ func (d *CoreAttentionDelivery) applySearch(ctx context.Context, tx pgx.Tx, pers
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
-	items := make([]searchResultWire, len(results))
-	for i, r := range results {
-		items[i] = searchResultWire{
+	items, truncated := boundedWirePageTruncated(results, func(r SearchResult) any {
+		return searchResultWire{
 			MessageID: r.Message.MessageID, Place: placeToWire(r.Place),
 			Seq: r.Message.Seq, Author: participantToWire(r.Message.Author),
 			Snippet: r.Snippet, CreatedAt: r.Message.CreatedAt,
 		}
+	})
+	response := map[string]any{"results": items}
+	if truncated {
+		// No cursor: the caller narrows the query or a place_id.
+		response["truncated"] = true
 	}
-	return map[string]any{"results": wireJSON(items)}, nil
+	return response, nil
+}
+
+// coreToolReadPageBytes bounds one serialized read page — history, search —
+// so a page of maximum-size messages can still live in the operation record,
+// the journal event, the commit body, and the model context at once.
+const coreToolReadPageBytes = 256 << 10
+
+// boundedWirePage projects an ascending-seq history page bounded by
+// coreToolReadPageBytes, keeping the newest rows — the messages an open is
+// for. On truncation it returns the seq of the first kept row as the resume
+// cursor (exclusive, matching before_seq) so the caller can page older.
+func boundedWirePage(rows []Message, project func(Message) any) ([]any, int64) {
+	items := make([]any, 0, len(rows))
+	used := 0
+	var nextBefore int64
+	for i := len(rows) - 1; i >= 0; i-- {
+		entry := wireJSON(project(rows[i]))
+		raw, err := json.Marshal(entry)
+		if err == nil && used > 0 && used+len(raw) > coreToolReadPageBytes {
+			nextBefore = rows[i+1].Seq
+			break
+		}
+		items = append(items, entry)
+		used += len(raw)
+	}
+	for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
+		items[left], items[right] = items[right], items[left]
+	}
+	return items, nextBefore
+}
+
+// boundedWirePageTruncated is boundedWirePage for rows without a seq cursor.
+func boundedWirePageTruncated[T any](rows []T, project func(T) any) ([]any, bool) {
+	items := make([]any, 0, len(rows))
+	used := 0
+	for _, r := range rows {
+		entry := wireJSON(project(r))
+		raw, err := json.Marshal(entry)
+		if err == nil && used > 0 && used+len(raw) > coreToolReadPageBytes {
+			return items, true
+		}
+		items = append(items, entry)
+		used += len(raw)
+	}
+	return items, false
 }
 
 // --- place creation and channel metadata ---
@@ -254,6 +321,7 @@ func (d *CoreAttentionDelivery) applyStartDM(ctx context.Context, tx pgx.Tx, per
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	rawParticipants, ok := request["participants"].([]any)
 	if !ok || len(rawParticipants) == 0 {
 		return nil, coreBadRequest("participants must list at least one other member")
@@ -302,6 +370,7 @@ func (d *CoreAttentionDelivery) applyCreateChannel(ctx context.Context, tx pgx.T
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	voice, _ := request["voice"].(bool)
 	place, created, err := scoped.CreateChannelOnce(ctx,
 		coreRequestString(request, "name"), coreRequestString(request, "topic"),
@@ -323,6 +392,7 @@ func (d *CoreAttentionDelivery) applyUpdateChannel(ctx context.Context, tx pgx.T
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	var name, topic *string
 	if raw, ok := request["name"]; ok {
 		s, isString := raw.(string)
@@ -351,6 +421,7 @@ func (d *CoreAttentionDelivery) applyDuplicateChannel(ctx context.Context, tx pg
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	place, created, err := scoped.DuplicateChannelOnce(ctx, placeID,
 		coreRequestString(request, "name"), coreToolNonce(MessagingCoreDuplicateChannelTool, idemKey))
 	if err != nil {
@@ -372,6 +443,7 @@ func (d *CoreAttentionDelivery) applyCreateThread(ctx context.Context, tx pgx.Tx
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	thread, created, err := scoped.CreateThread(ctx, placeID,
 		coreRequestString(request, "name"), coreRequestString(request, "message_id"),
 		coreToolNonce(MessagingCoreCreateThreadTool, idemKey))
@@ -407,6 +479,7 @@ func (d *CoreAttentionDelivery) applyEditMessage(ctx context.Context, tx pgx.Tx,
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	var message Message
 	if expected, ok := coreRequestInt(request, "expected_revision"); ok {
 		message, err = scoped.EditMessage(ctx, placeID, messageID, content, expected)
@@ -452,6 +525,7 @@ func (d *CoreAttentionDelivery) applyDeleteMessage(ctx context.Context, tx pgx.T
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	message, err := scoped.DeleteMessage(ctx, placeID, messageID)
 	if err != nil {
 		return nil, coreEffectFailure(err)
@@ -478,6 +552,7 @@ func (d *CoreAttentionDelivery) applyNotificationSettings(ctx context.Context, t
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	current, err := scoped.NotificationSettingFor(ctx)
 	if err != nil {
 		return nil, coreEffectFailure(err)
@@ -580,6 +655,7 @@ func (d *CoreAttentionDelivery) applyUploadAttachment(ctx context.Context, tx pg
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	req := attachmentUploadRequest{
 		placeID:      placeID,
 		clientNonce:  coreToolNonce(MessagingCoreUploadTool, idemKey),
@@ -614,11 +690,19 @@ func (d *CoreAttentionDelivery) applyUploadAttachment(ctx context.Context, tx pg
 	}, nil
 }
 
-// applyOpenAttachment reads attachment bytes the secretary can currently see.
-// Like the local lane, the request binds the exact place and message the
-// view showed the attachment on — a mismatched identity is not-found, and
-// visibility is re-authorized under the live scope, so a frozen input can
-// never read what removal or a tombstone took away.
+// applyOpenAttachment reads a bounded slice of attachment bytes the
+// secretary can currently see. Like the local lane, the request binds the
+// exact place and message the view showed the attachment on — a mismatched
+// identity is not-found, and visibility is re-authorized under the live
+// scope, so a frozen input can never read what removal or a tombstone took
+// away.
+//
+// Reads are paged (offset/max_bytes) so any size file fits inside the
+// operation, journal, commit-body, and model budgets. Textual payloads come
+// back decoded as content_text — the representation a text model actually
+// reads — with each page cut on a rune boundary so byte-offset paging stays
+// exact. Binary payloads return content_base64 for inspection; the tool
+// does not pretend a text model comprehends binary content.
 func (d *CoreAttentionDelivery) applyOpenAttachment(ctx context.Context, tx pgx.Tx, personaID, _ string, request map[string]any) (map[string]any, error) {
 	placeID := coreRequestString(request, "place_id")
 	messageID := coreRequestString(request, "message_id")
@@ -630,6 +714,7 @@ func (d *CoreAttentionDelivery) applyOpenAttachment(ctx context.Context, tx pgx.
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
+	scoped = scoped.bindTx(tx)
 	if !scoped.Store.AttachmentsEnabled() {
 		return nil, coreEffectFailure(ErrAttachmentsUnavailable)
 	}
@@ -640,27 +725,109 @@ func (d *CoreAttentionDelivery) applyOpenAttachment(ctx context.Context, tx pgx.
 	if att.PlaceID != placeID || att.MessageID == "" || att.MessageID != messageID {
 		return nil, coreEffectFailure(ErrAttachmentNotFound)
 	}
-	if att.SizeBytes > MaxCoreAttachmentBytes {
-		return map[string]any{
-			"attachment":         wireMap(attachmentToWire(att)),
-			"exceeds_tool_limit": true,
-			"max_bytes":          MaxCoreAttachmentBytes,
-		}, nil
+	offset, ok := coreRequestInt(request, "offset")
+	if !ok {
+		offset = 0
 	}
+	if offset < 0 || offset > att.SizeBytes {
+		return nil, coreBadRequest("offset must be within the attachment's %d bytes", att.SizeBytes)
+	}
+	maxBytes, ok := coreRequestInt(request, "max_bytes")
+	if !ok || maxBytes <= 0 {
+		maxBytes = coreAttachmentReadSliceDefault
+	}
+	if maxBytes > coreAttachmentReadSliceMax {
+		maxBytes = coreAttachmentReadSliceMax
+	}
+
+	response := map[string]any{
+		"attachment": wireMap(attachmentToWire(att)),
+		"size_bytes": att.SizeBytes,
+		"offset":     offset,
+	}
+	if offset == att.SizeBytes {
+		response["returned_bytes"] = 0
+		response["has_more"] = false
+		if attachmentTextual(att.MIME, nil) {
+			response["encoding"] = "text"
+			response["content_text"] = ""
+		} else {
+			response["encoding"] = "base64"
+			response["content_base64"] = ""
+		}
+		return response, nil
+	}
+
 	blob, err := scoped.Store.AttachmentBlobStore().Open(att.AttachmentID)
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
 	defer func() { _ = blob.Close() }()
-	data, err := io.ReadAll(io.LimitReader(blob, att.SizeBytes+1))
+	if _, err := blob.Seek(offset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek attachment blob: %w", err)
+	}
+	data, err := io.ReadAll(io.LimitReader(blob, maxBytes+4))
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
-		"attachment":     wireMap(attachmentToWire(att)),
-		"content_base64": base64.StdEncoding.EncodeToString(data),
-		"encoding":       "base64",
-	}, nil
+	if int64(len(data)) > maxBytes {
+		data = data[:maxBytes]
+	}
+	hasMore := offset+int64(len(data)) < att.SizeBytes
+	response["has_more"] = hasMore
+	if attachmentTextual(att.MIME, data) {
+		// Never split a code point across the page edge: returned_bytes
+		// then names the exact resume offset.
+		data = data[:len(data)-partialRuneTail(data)]
+		response["returned_bytes"] = len(data)
+		response["encoding"] = "text"
+		response["content_text"] = string(data)
+		return response, nil
+	}
+	response["returned_bytes"] = len(data)
+	response["encoding"] = "base64"
+	response["content_base64"] = base64.StdEncoding.EncodeToString(data)
+	return response, nil
+}
+
+// attachmentTextual decides whether a payload is decodable text for the
+// model: an explicit textual MIME, or unlabeled bytes that are actually
+// valid UTF-8 without NULs.
+func attachmentTextual(mime string, sample []byte) bool {
+	mime = strings.ToLower(strings.TrimSpace(strings.SplitN(mime, ";", 2)[0]))
+	if strings.HasPrefix(mime, "text/") {
+		return true
+	}
+	switch mime {
+	case "application/json", "application/ld+json", "application/xml",
+		"application/javascript", "application/x-javascript",
+		"application/yaml", "application/x-yaml", "application/toml",
+		"application/sql", "application/csv", "application/x-ndjson",
+		"application/x-sh", "image/svg+xml":
+		return true
+	}
+	if mime == "" || mime == "application/octet-stream" {
+		// Tolerate a page ending mid-codepoint — the boundary is the
+		// reader's, not the file's.
+		trimmed := sample[:len(sample)-partialRuneTail(sample)]
+		return len(trimmed) > 0 && utf8.Valid(trimmed) && !bytes.ContainsRune(trimmed, 0)
+	}
+	return false
+}
+
+// partialRuneTail returns how many trailing bytes of buf form an incomplete
+// UTF-8 encoding — the bytes to leave for the next page. An unfinished
+// sequence is at most UTFMax-1 continuation bytes.
+func partialRuneTail(buf []byte) int {
+	if utf8.Valid(buf) {
+		return 0
+	}
+	for tail := 1; tail <= utf8.UTFMax && tail <= len(buf); tail++ {
+		if utf8.Valid(buf[:len(buf)-tail]) {
+			return tail
+		}
+	}
+	return 0
 }
 
 // --- live fanout after commit ---
@@ -696,6 +863,12 @@ func (d *CoreAttentionDelivery) rescopeAfterCommit(ctx context.Context, personaI
 // live rather than on the next reload.
 func (d *CoreAttentionDelivery) afterPlaceCreatedCommit(ctx context.Context, personaID string, _, response map[string]any) {
 	if d.Hub == nil {
+		return
+	}
+	// A fresh claim whose derived nonce found the place already existing
+	// converged without creating it — don't re-announce a place clients
+	// already have.
+	if created, _ := response["created"].(bool); !created {
 		return
 	}
 	placeID, _ := response["place_id"].(string)

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { eventMessage, inputBodyText } from "../src/memory.ts";
-import { assemble } from "../src/secretary.ts";
+import { assemble, summarizeToolResults } from "../src/secretary.ts";
 import { toolSpecs } from "../src/tools.ts";
 import type { Event } from "../src/types.ts";
 
@@ -46,6 +46,31 @@ test("messaging.send advertises urgency and attachment binding", () => {
   assert.ok(props.urgency, "urgency parameter missing");
   assert.ok(props.attachments, "attachments parameter missing");
   assert.ok(props.place_id && props.content);
+});
+
+test("messaging.search requires the workspace; open_attachment pages", () => {
+  const specs = toolSpecs(new Set(MESSAGING_TOOLS));
+  const search = specs.find((s) => s.name === "messaging.search");
+  assert.ok(search);
+  assert.deepEqual(
+    (search.parameters as Record<string, any>).required,
+    ["query", "workspace_id"],
+  );
+  const open = specs.find((s) => s.name === "messaging.open_attachment");
+  assert.ok(open);
+  const props = (open.parameters as Record<string, any>).properties;
+  assert.ok(props.offset && props.max_bytes, "paging parameters missing");
+});
+
+test("oversized tool results leave the turn summary bounded", () => {
+  const big = "x".repeat(256 * 1024);
+  const [small, large] = summarizeToolResults([
+    { call_id: "c1", tool: "messaging.send", result: { ok: true }, replayed: false },
+    { call_id: "c2", tool: "messaging.open_attachment", result: { content_base64: big }, replayed: false },
+  ]);
+  assert.deepEqual(small!.result, { ok: true });
+  assert.equal(large!.result, undefined);
+  assert.equal(typeof large!.result_bytes, "number");
 });
 
 const ATTACHMENT = {

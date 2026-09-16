@@ -8,6 +8,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,7 +26,7 @@ import (
 
 func newCoreToolsWorld(t *testing.T, ctx context.Context) world {
 	t.Helper()
-	return newWorldOnPool(t, ctx, createOwnedTestDB(t, "sumi-core-messaging-parity-20260916-"))
+	return newWorldOnPool(t, ctx, createOwnedTestDB(t, "sumi_coretools_"))
 }
 
 // coreToolsFixture is one claimed writer turn on a prepared persona, with
@@ -479,12 +481,14 @@ func TestCoreToolsAttachmentsAndAttachmentOnlyWake(t *testing.T) {
 	}
 
 	// The secretary reads the bytes back under the exact place+message
-	// binding; a mismatched message identity is refused.
+	// binding — a text file comes back decoded, one page covering it; a
+	// mismatched message identity is refused.
 	op = f.claim(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
 		"place_id": ch.PlaceID, "message_id": messageID, "attachment_id": attID})
-	got, err := base64.StdEncoding.DecodeString(op.Response["content_base64"].(string))
-	if err != nil || string(got) != string(payload) {
-		t.Fatalf("open attachment = %v %v", got, err)
+	if op.Response["encoding"] != "text" ||
+		op.Response["content_text"] != string(payload) ||
+		op.Response["has_more"] != false {
+		t.Fatalf("open attachment = %+v", op.Response)
 	}
 	if err := f.claimError(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
 		"place_id": ch.PlaceID, "message_id": "msg-not-real", "attachment_id": attID}); !errors.Is(err, agentstate.ErrBadRequest) {
@@ -543,13 +547,263 @@ func TestCoreToolsAttachmentsAndAttachmentOnlyWake(t *testing.T) {
 	if !foundInput {
 		t.Fatalf("attachment-only message produced no core input")
 	}
-	// And the secretary can read those bytes by the shown identity.
+	// And the secretary can read those bytes by the shown identity — a
+	// binary file pages as base64 slices.
 	op = f.claim(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
 		"place_id": ch.PlaceID, "message_id": humanMsg.MessageID,
 		"attachment_id": uploaded.AttachmentID})
-	got, err = base64.StdEncoding.DecodeString(op.Response["content_base64"].(string))
+	got, err := base64.StdEncoding.DecodeString(op.Response["content_base64"].(string))
 	if err != nil || !bytes.Equal(got, pngHeader) {
 		t.Fatalf("secretary read of human's attachment = %v %v", got, err)
+	}
+}
+
+// TestCoreToolsOpenAttachmentPaging pages one attachment through the slice
+// reader: byte offsets resume exactly, text pages never split a code point,
+// and a file larger than the old whole-blob limit reads in bounded pages
+// instead of failing the turn.
+func TestCoreToolsOpenAttachmentPaging(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newCoreToolsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	root := filepath.Join(t.TempDir(), "attachments")
+	blobs, err := NewDiskAttachments(root)
+	if err != nil {
+		t.Fatalf("disk attachments: %v", err)
+	}
+	if err := w.store.core.ConfigureAttachments(blobs, AttachmentPolicy{
+		WorkspaceQuotaBytes:   64 << 20,
+		WorkspaceQuotaObjects: 10_000,
+		TotalQuotaBytes:       256 << 20,
+		TotalQuotaObjects:     50_000,
+	}); err != nil {
+		t.Fatalf("configure attachments: %v", err)
+	}
+	f := newCoreToolsFixture(t, ctx, w)
+	humanScope := w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA)
+	fx := attachmentFixture{world: w, root: root, blobs: blobs}
+
+	// A UTF-8 text file whose size crosses several slice pages, including
+	// multibyte runes that would split at a naive byte boundary.
+	var textBuf strings.Builder
+	for textBuf.Len() < 200*1024 {
+		textBuf.WriteString("秘書が読む長い行だよ — 0123456789\n")
+	}
+	uploaded := fx.mustUpload(t, ctx, humanScope, ch.PlaceID, "big-text-1",
+		"長文.txt", "text/plain", []byte(textBuf.String()))
+	msg, _, err := humanScope.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Content: "long file", ClientNonce: "big-text-msg",
+		AttachmentIDs: []string{uploaded.AttachmentID},
+	})
+	if err != nil {
+		t.Fatalf("attach big text: %v", err)
+	}
+
+	// Page through with a small max_bytes; concatenated pages must equal the
+	// file, and every page must be valid UTF-8 ending on a rune boundary.
+	var got []byte
+	offset := int64(0)
+	for i := 0; ; i++ {
+		if i > 100 {
+			t.Fatalf("paging did not terminate")
+		}
+		op := f.claim(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
+			"place_id": ch.PlaceID, "message_id": msg.MessageID,
+			"attachment_id": uploaded.AttachmentID,
+			"offset":        offset, "max_bytes": 40 * 1024})
+		if op.Response["encoding"] != "text" {
+			t.Fatalf("page %d encoding = %v", i, op.Response["encoding"])
+		}
+		page, _ := op.Response["content_text"].(string)
+		returned, _ := op.Response["returned_bytes"].(float64)
+		if int64(returned) != int64(len(page)) {
+			t.Fatalf("page %d returned_bytes %v != len(content_text) %d", i, returned, len(page))
+		}
+		got = append(got, page...)
+		hasMore, _ := op.Response["has_more"].(bool)
+		if !hasMore {
+			break
+		}
+		offset += int64(returned)
+	}
+	if string(got) != textBuf.String() {
+		t.Fatalf("paged read reconstructed %d bytes, want %d", len(got), textBuf.Len())
+	}
+
+	// Oversize requests clamp to the slice cap rather than failing.
+	op := f.claim(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
+		"place_id": ch.PlaceID, "message_id": msg.MessageID,
+		"attachment_id": uploaded.AttachmentID, "max_bytes": 1 << 20})
+	returned, _ := op.Response["returned_bytes"].(float64)
+	if int64(returned) != coreAttachmentReadSliceMax {
+		t.Fatalf("clamped page = %v bytes, want %d", returned, coreAttachmentReadSliceMax)
+	}
+	if err := f.claimError(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
+		"place_id": ch.PlaceID, "message_id": msg.MessageID,
+		"attachment_id": uploaded.AttachmentID,
+		"offset":        int64(textBuf.Len()) + 1}); !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("offset beyond size: got %v, want ErrBadRequest", err)
+	}
+
+	// The previous whole-blob read failed any attachment past 2 MiB: a
+	// human's larger binary now pages through as bounded base64 slices.
+	big := make([]byte, (2<<20)+37_000)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatalf("random payload: %v", err)
+	}
+	bigAtt := fx.mustUpload(t, ctx, humanScope, ch.PlaceID, "big-bin-1",
+		"大.bin", "application/octet-stream", big)
+	bigMsg, _, err := humanScope.AppendMessage(ctx, AppendInput{
+		PlaceID: ch.PlaceID, Content: "big binary", ClientNonce: "big-bin-msg",
+		AttachmentIDs: []string{bigAtt.AttachmentID},
+	})
+	if err != nil {
+		t.Fatalf("attach big binary: %v", err)
+	}
+	var rebuilt []byte
+	offset = 0
+	for i := 0; ; i++ {
+		if i > 40 {
+			t.Fatalf("binary paging did not terminate")
+		}
+		op := f.claim(t, ctx, MessagingCoreOpenAttachmentTool, map[string]any{
+			"place_id": ch.PlaceID, "message_id": bigMsg.MessageID,
+			"attachment_id": bigAtt.AttachmentID, "offset": offset})
+		if op.Response["encoding"] != "base64" {
+			t.Fatalf("binary page %d encoding = %v", i, op.Response["encoding"])
+		}
+		page, err := base64.StdEncoding.DecodeString(op.Response["content_base64"].(string))
+		if err != nil {
+			t.Fatalf("page %d base64: %v", i, err)
+		}
+		returned, _ := op.Response["returned_bytes"].(float64)
+		if int64(returned) != int64(len(page)) {
+			t.Fatalf("page %d returned_bytes %v != decoded %d", i, returned, len(page))
+		}
+		rebuilt = append(rebuilt, page...)
+		if hasMore, _ := op.Response["has_more"].(bool); !hasMore {
+			break
+		}
+		offset += int64(returned)
+	}
+	if !bytes.Equal(rebuilt, big) {
+		t.Fatalf("binary pages reconstructed %d bytes, want %d", len(rebuilt), len(big))
+	}
+}
+
+// TestCoreToolsClaimAtomicity proves the delegated effects honor the
+// ToolEffect contract: an applied effect's domain mutations live inside the
+// claim transaction, so a claim that never commits leaves nothing behind —
+// and no recovered or replayed claim can later overwrite a newer human
+// change. One pool connection carries the whole plan→claim→effect path,
+// proving the effect never acquires a second connection while the claim
+// holds its own.
+func TestCoreToolsClaimAtomicity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorldOnPool(t, ctx, createOwnedTestDBConns(t, "sumi_coretools_", 1))
+	ws, ch := w.workspaceWithChannel(t, ctx)
+	grantManageChannels(t, ctx, w, ws.WorkspaceID, w.agent)
+	f := newCoreToolsFixture(t, ctx, w)
+
+	// Under one connection a mutating claim completes — before the effects
+	// ran inside the claim transaction, this needed a second connection.
+	op := f.claim(t, ctx, MessagingCoreUpdateChannelTool, map[string]any{
+		"place_id": ch.PlaceID, "name": "委員会"})
+	if op.Status != "done" {
+		t.Fatalf("update claim = %+v", op)
+	}
+	if place, err := w.store.PlaceFor(ctx, ch.PlaceID, w.humanA); err != nil ||
+		place.Name != "委員会" {
+		t.Fatalf("committed rename = %+v %v", place, err)
+	}
+
+	// An effect applied inside a transaction that then rolls back leaves no
+	// mutation: the domain write and the operation record share one fate.
+	eff := f.delivery.CoreToolEffects()[MessagingCoreUpdateChannelTool]
+	tx, err := w.store.core.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	resp, err := eff.Apply(ctx, tx, w.agent.ID, "rollback-key", map[string]any{
+		"place_id": ch.PlaceID, "name": "消えるはずの名前"})
+	if err != nil {
+		t.Fatalf("apply in claim tx: %v", err)
+	}
+	if ch2, _ := resp["channel"].(map[string]any); ch2["name"] != "消えるはずの名前" {
+		t.Fatalf("apply response = %+v", resp)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	place, err := w.store.PlaceFor(ctx, ch.PlaceID, w.humanA)
+	if err != nil || place.Name != "委員会" {
+		t.Fatalf("rolled-back rename leaked: %+v %v", place, err)
+	}
+}
+
+// TestCoreToolsLiveMessageCarriesAttachments is the F2 contract: the live
+// message_created frame a human's open client receives carries the
+// attachment metadata — the same parts the history read returns — not a
+// bare row that only renders on reload.
+func TestCoreToolsLiveMessageCarriesAttachments(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newCoreToolsWorld(t, ctx)
+	_, ch := w.workspaceWithChannel(t, ctx)
+	root := filepath.Join(t.TempDir(), "attachments")
+	blobs, err := NewDiskAttachments(root)
+	if err != nil {
+		t.Fatalf("disk attachments: %v", err)
+	}
+	if err := w.store.core.ConfigureAttachments(blobs, AttachmentPolicy{
+		WorkspaceQuotaBytes:   64 << 20,
+		WorkspaceQuotaObjects: 10_000,
+		TotalQuotaBytes:       256 << 20,
+		TotalQuotaObjects:     50_000,
+	}); err != nil {
+		t.Fatalf("configure attachments: %v", err)
+	}
+	f := newCoreToolsFixture(t, ctx, w)
+	f.delivery.Hub = NewHub(w.store.core)
+	viewer := f.delivery.Hub.subscribe(w.store.mustScopeForPlace(t, ctx, ch.PlaceID, w.humanA))
+	defer f.delivery.Hub.unsubscribe(viewer)
+
+	op := f.claim(t, ctx, MessagingCoreUploadTool, map[string]any{
+		"place_id": ch.PlaceID, "filename": "写真.png",
+		"content_base64": base64.StdEncoding.EncodeToString(pngHeader),
+		"mime":           "image/png"})
+	att, _ := op.Response["attachment"].(map[string]any)
+	attID, _ := att["attachment_id"].(string)
+	if attID == "" {
+		t.Fatalf("upload = %+v", op.Response)
+	}
+	op = f.claim(t, ctx, MessagingCoreTool, map[string]any{
+		"place_id": ch.PlaceID, "content": "写真です",
+		"attachments": []any{attID}})
+	messageID, _ := op.Response["message_id"].(string)
+	if messageID == "" {
+		t.Fatalf("send = %+v", op.Response)
+	}
+
+	// The human subscriber's live frame names the attachment.
+	sawLive := false
+	for len(viewer.send) > 0 {
+		frame := <-viewer.send
+		payload := string(frame.payload)
+		if !strings.Contains(payload, messageID) ||
+			!strings.Contains(payload, "message_created") {
+			continue
+		}
+		sawLive = true
+		if !strings.Contains(payload, attID) ||
+			!strings.Contains(payload, "写真.png") {
+			t.Fatalf("live message_created lacks attachment parts: %s", payload)
+		}
+	}
+	if !sawLive {
+		t.Fatal("no live message_created frame reached the human subscriber")
 	}
 }
 
@@ -588,15 +842,11 @@ func TestCoreToolsEndToEndCoreSurface(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
-	var ln net.Listener
-	for port := 13421; port <= 13439; port++ {
-		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err == nil {
-			break
-		}
-	}
-	if ln == nil {
-		t.Fatalf("no free port in 13421-13439: %v", err)
+	// Ephemeral port: the test must run anywhere, not only inside the
+	// author's port allocation.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
 	httpSrv := &http.Server{Handler: mux}
 	go func() { _ = httpSrv.Serve(ln) }()

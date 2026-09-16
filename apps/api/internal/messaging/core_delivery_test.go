@@ -31,6 +31,14 @@ import (
 // reused by — another worker's fixtures.
 func createOwnedTestDB(t *testing.T, prefix string) *pgxpool.Pool {
 	t.Helper()
+	return createOwnedTestDBConns(t, prefix, 10)
+}
+
+// createOwnedTestDBConns is createOwnedTestDB with a sized pool — a
+// one-connection pool proves the delegated-effect path never acquires a
+// second connection while the operation claim holds its own.
+func createOwnedTestDBConns(t *testing.T, prefix string, maxConns int32) *pgxpool.Pool {
+	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("SUMI_TEST_DB_URL"))
 	if databaseURL == "" {
 		t.Skip("SUMI_TEST_DB_URL not set; skipping Postgres integration test")
@@ -57,7 +65,7 @@ func createOwnedTestDB(t *testing.T, prefix string) *pgxpool.Pool {
 		dropSharedIntakeDB(maintenance, testDBName)
 		t.Fatalf("parse test database config: %v", err)
 	}
-	config.MaxConns = 10
+	config.MaxConns = maxConns
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		dropSharedIntakeDB(maintenance, testDBName)

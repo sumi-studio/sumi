@@ -439,10 +439,17 @@ func (d *CoreAttentionDelivery) afterSendCommit(ctx context.Context, personaID s
 	if err != nil {
 		return
 	}
+	// Mentions, attachments, and polls ride the live event — the same parts
+	// every other send lane publishes — so recipients render the full
+	// message without a reload.
+	parts := []Message{message}
+	if err := attachMessagePartsWith(ctx, tx, parts); err != nil {
+		return
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return
 	}
-	publishMessageCreated(ctx, scoped, d.Hub, place, message)
+	publishMessageCreated(ctx, scoped, d.Hub, place, parts[0])
 }
 
 // coreToolNonce derives a delegated Messaging effect's client nonce from the

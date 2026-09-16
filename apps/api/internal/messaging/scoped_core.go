@@ -23,7 +23,7 @@ type PlaceAccess struct {
 }
 
 func (s *ScopedStore) Workspace(ctx context.Context) (Workspace, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Workspace{}, fmt.Errorf("begin scoped Workspace read: %w", err)
 	}
@@ -44,7 +44,7 @@ func (s *ScopedStore) Workspace(ctx context.Context) (Workspace, error) {
 }
 
 func (s *ScopedStore) WorkspaceMembers(ctx context.Context) ([]MemberProfile, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin scoped Workspace-members read: %w", err)
 	}
@@ -204,7 +204,7 @@ func (s *ScopedStore) createChannel(ctx context.Context, name, topic string, voi
 		Topic string `json:"topic"`
 		Voice bool   `json:"voice"`
 	}{name, topic, voice})
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin create channel: %w", err)
 	}
@@ -274,7 +274,7 @@ func (s *ScopedStore) UpdateChannel(ctx context.Context, placeID string, name, t
 	if name != nil && !validChannelName(*name) {
 		return Place{}, ErrInvalidChannelName
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, fmt.Errorf("begin update channel: %w", err)
 	}
@@ -344,7 +344,7 @@ func (s *ScopedStore) duplicateChannel(ctx context.Context, placeID, name, nonce
 		PlaceID string `json:"place_id"`
 		Name    string `json:"name"`
 	}{placeID, name})
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin duplicate channel: %w", err)
 	}
@@ -441,7 +441,7 @@ func (s *ScopedStore) EnsureDM(ctx context.Context, other ParticipantRef) (Place
 		return Place{}, false, errors.New("a dm needs two distinct participants")
 	}
 	other = others[0]
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin ensure dm: %w", err)
 	}
@@ -510,7 +510,7 @@ func (s *ScopedStore) createGroupDM(ctx context.Context, others []ParticipantRef
 	digest := placeCreationDigest(placeCreationGroupDM, struct {
 		Participants []ParticipantRef `json:"participants"`
 	}{others})
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin create group dm: %w", err)
 	}
@@ -650,7 +650,7 @@ func (s *ScopedStore) PlaceFor(ctx context.Context, placeID string) (Place, erro
 // viewer's own ledger (rather than merely being readable) needs the second
 // answer, not the first.
 func (s *ScopedStore) PlaceParticipationFor(ctx context.Context, placeID string) (Place, bool, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Place{}, false, fmt.Errorf("begin scoped place read: %w", err)
 	}
@@ -759,7 +759,7 @@ func (s *ScopedStore) placeAccessAfterAuthorization(ctx context.Context, q queri
 }
 
 func (s *ScopedStore) ActiveMembers(ctx context.Context, placeID string) ([]MemberProfile, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin active-members read: %w", err)
 	}

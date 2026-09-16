@@ -272,7 +272,7 @@ func (s *ScopedStore) ReserveAttachmentUpload(ctx context.Context, placeID, clie
 	if declaredBytes > MaxAttachmentBytes {
 		return AttachmentUploadReceipt{}, ErrAttachmentTooLarge
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return AttachmentUploadReceipt{}, fmt.Errorf("begin attachment reservation: %w", err)
 	}
@@ -453,7 +453,7 @@ func (s *ScopedStore) AbandonAttachmentStaging(ctx context.Context, reservation 
 	if s == nil || s.Store == nil || reservation.StageToken == "" {
 		return nil
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin attachment staging abandonment: %w", err)
 	}
@@ -613,7 +613,7 @@ func (s *ScopedStore) AttachmentUploadReceiptByNonce(ctx context.Context, placeI
 	if err := s.requireAttachments(); err != nil {
 		return Attachment{}, false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Attachment{}, false, fmt.Errorf("begin attachment receipt read: %w", err)
 	}
@@ -691,7 +691,7 @@ func (s *ScopedStore) FinalizeAttachmentUpload(ctx context.Context, placeID stri
 	if len(staged.SHA256) != sha256.Size {
 		return discard(finalizeNotCommitted(errors.New("attachment digest must be sha256")))
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return discard(finalizeNotCommitted(fmt.Errorf("begin attachment finalize: %w", err)))
 	}
@@ -839,7 +839,7 @@ func (s *ScopedStore) AttachmentForViewer(ctx context.Context, attachmentID stri
 	if !validAttachmentID(attachmentID) {
 		return Attachment{}, ErrAttachmentNotFound
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Attachment{}, fmt.Errorf("begin attachment read: %w", err)
 	}
@@ -931,7 +931,7 @@ func (s *ScopedStore) UpdateDraftAttachment(ctx context.Context, attachmentID st
 	if patch.Alt != nil && utf8.RuneCountInString(*patch.Alt) > MaxAttachmentAltRunes {
 		return Attachment{}, fmt.Errorf("alt must be at most %d characters", MaxAttachmentAltRunes)
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Attachment{}, fmt.Errorf("begin attachment edit: %w", err)
 	}

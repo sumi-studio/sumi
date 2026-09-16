@@ -104,7 +104,7 @@ func (s *ScopedStore) SavePushSubscription(
 	if err := s.Store.pushEgressPolicy().allowEndpoint(ctx, endpoint); err != nil {
 		return PushSubscription{}, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return PushSubscription{}, fmt.Errorf("begin push subscription save: %w", err)
 	}
@@ -253,7 +253,7 @@ func (s *ScopedStore) DeletePushSubscription(
 	if owner.Kind != KindHuman || deviceID == "" || endpoint == "" || len(endpoint) > maxPushEndpointBytes {
 		return ErrInvalidPushSubscription
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin push subscription delete: %w", err)
 	}

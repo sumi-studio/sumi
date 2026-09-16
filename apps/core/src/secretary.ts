@@ -831,7 +831,7 @@ export class Secretary {
           await this.commitTurnFinal(turn, {
             outcome: "complete",
             events,
-            output: { text: decision.text, tool_results: results },
+            output: { text: decision.text, tool_results: summarizeToolResults(results) },
             usage: { rounds: usages },
           });
           this.log("turn committed", {
@@ -1416,10 +1416,49 @@ export class Secretary {
 }
 
 // Recorded-error budget: a persisted failure only needs the reason, not
-// megabytes. Kept far below the state service's 1 MiB body limit so the
+// megabytes. Kept far below the state service's 4 MiB body limit so the
 // minimal fallback commit is always storable.
 const RECORDED_ERROR_BYTES = 8 * 1024;
 const TRUNC_MARK = "…[truncated]";
+
+// A tool result is carried verbatim in the turn summary only while it is
+// small enough to appear twice in one commit body — the journaled
+// tool_result event already holds the full result. Larger results are
+// summarized by size: the durable record stays the journal event and the
+// operation row, and the commit cannot exceed the state service's body
+// limit on a single result.
+export const OUTPUT_RESULT_SUMMARY_BYTES = 64 * 1024;
+
+export function summarizeToolResults(
+  results: {
+    call_id: string;
+    tool: string;
+    result: unknown;
+    replayed: boolean;
+  }[],
+): Record<string, unknown>[] {
+  return results.map((r) => {
+    const entry: Record<string, unknown> = {
+      call_id: r.call_id,
+      tool: r.tool,
+      replayed: r.replayed,
+    };
+    let size = 0;
+    try {
+      size = Buffer.byteLength(JSON.stringify(r.result ?? null), "utf8");
+    } catch {
+      size = OUTPUT_RESULT_SUMMARY_BYTES + 1;
+    }
+    if (size <= OUTPUT_RESULT_SUMMARY_BYTES) {
+      entry.result = r.result;
+    } else {
+      // The full result remains in this commit's tool_result event under
+      // the same call_id, and durably in the operation row.
+      entry.result_bytes = size;
+    }
+    return entry;
+  });
+}
 
 /** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
 function scrubJson(v: unknown): unknown {
@@ -1455,7 +1494,7 @@ const SYSTEM =
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
   "Shared-conversation inputs arrive with actor and place provenance; the messaging.* tools are your ordinary Messaging surface — overview, open, and search read the places you can see, create_channel, start_dm, and create_thread open new ones, and notification_settings reads and sets your own alert preferences. " +
   "Reply into that place with messaging.send when a response is genuinely warranted — it can carry urgency or attachments you uploaded — and stay silent on ambient traffic. " +
-  "You may edit or retract only your own messages through messaging.edit_message and messaging.delete_message. A message's attachments arrive as metadata — filename, type, size, and attachment_id; open the bytes only through messaging.open_attachment with the shown place_id and message_id, and upload files you want to send with messaging.upload_attachment. " +
+  "You may edit or retract only your own messages through messaging.edit_message and messaging.delete_message. A message's attachments arrive as metadata — filename, type, size, and attachment_id; read the bytes only through messaging.open_attachment with the shown place_id and message_id, paging with offset when has_more says more remains, and upload files you want to send with messaging.upload_attachment. " +
   "When a call starts in a place you belong to, a 'call_started' input arrives; call.join enters it as a real participant. In a call, others' speech arrives as 'call_utterance' inputs with speaker and timing provenance — you may listen and stay silent, speak with call.say, or leave with call.leave. call.say records your intent and what is known about its playback, never that anyone heard it; call.state shows who is in a call. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +

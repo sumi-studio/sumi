@@ -27,7 +27,7 @@ func (s *ScopedStore) OpenSnapshot(
 	placeID string,
 	opt HistoryOptions,
 ) (OpenSnapshot, error) {
-	tx, err := s.Store.beginOpenSnapshot(ctx)
+	tx, err := s.beginSnapshotTx(ctx)
 	if err != nil {
 		return OpenSnapshot{}, err
 	}

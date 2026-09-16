@@ -110,7 +110,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.open",
     description:
-      "Open one Messaging place as yourself: its details, members, your read position, and a page of message history (before_seq pages further back). Deleted messages appear as tombstones. Works for channels, threads, and DMs you belong to.",
+      "Open one Messaging place as yourself: its details, members, your read position, and a page of message history (before_seq pages further back). When the page is marked truncated, next_before_seq continues it. Deleted messages appear as tombstones. Works for channels, threads, and DMs you belong to.",
     parameters: {
       type: "object",
       properties: {
@@ -133,7 +133,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.search",
     description:
-      "Search messages across the places you can see in a workspace — the same visibility rules as reading them. Returns snippets with message_id, place, and seq; use messaging.open to read the surrounding history.",
+      "Search messages across the places you can see in a workspace — the same visibility rules as reading them. Returns snippets with message_id, place, and seq; use messaging.open to read the surrounding history. When the result is marked truncated, narrow with place_id or a more specific query.",
     parameters: {
       type: "object",
       properties: {
@@ -148,7 +148,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         },
         limit: { type: "integer", description: "optional result cap" },
       },
-      required: ["query"],
+      required: ["query", "workspace_id"],
     },
   },
   {
@@ -340,7 +340,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.upload_attachment",
     description:
-      "Upload a file into a place as a draft attachment, then bind it to a message with messaging.send's attachments field. content_base64 is the file's bytes in base64 (at most ~2 MiB); filename is display metadata, not a path. The upload runs under your workspace quota.",
+      "Upload a small file into a place as a draft attachment, then bind it to a message with messaging.send's attachments field. content_base64 is the file's bytes in base64 (at most ~2 MiB — meant for small generated artifacts; larger files go through the human upload lane); filename is display metadata, not a path. The upload runs under your workspace quota.",
     parameters: {
       type: "object",
       properties: {
@@ -368,13 +368,22 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.open_attachment",
     description:
-      "Read the bytes of one attachment on a message you can see. Pass the exact place_id, message_id, and attachment_id the input showed — a mismatched identity is refused. Returns the file's metadata and its bytes as content_base64 when the file fits the tool limit (larger files return metadata with exceeds_tool_limit).",
+      "Read a slice of one attachment's bytes on a message you can see. Pass the exact place_id, message_id, and attachment_id the input showed — a mismatched identity is refused. Returns the file's metadata plus one page of content: text files come back decoded as content_text, binary as content_base64. Page large files with offset (the next offset is offset + returned_bytes; has_more says whether more remains).",
     parameters: {
       type: "object",
       properties: {
         place_id: { type: "string" },
         message_id: { type: "string" },
         attachment_id: { type: "string" },
+        offset: {
+          type: "integer",
+          description: "optional byte offset to read from (default 0)",
+        },
+        max_bytes: {
+          type: "integer",
+          description:
+            "optional page size in bytes (default 65536, at most 131072)",
+        },
       },
       required: ["place_id", "message_id", "attachment_id"],
     },

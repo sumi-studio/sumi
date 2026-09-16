@@ -1519,11 +1519,11 @@ test("an oversized complete commit downgrades through the minimal tier (F-B1)", 
   const state = new FakeState();
   state.addPersona(PERSONA);
   state.addInput(PERSONA, "in-52", "hi");
-  // A ~1.5 MB reply makes both the original commit AND the scrubbed
+  // A ~5 MB reply makes both the original commit AND the scrubbed
   // commit (events still carry the giant assistant_message) un-storable;
   // only the minimal failure commit can land.
   const s = new Secretary(cfg(state, "h", {
-    provider: new ScriptedProvider({ text: "x".repeat(1_500_000) }),
+    provider: new ScriptedProvider({ text: "x".repeat(5_000_000) }),
   }));
   await s.start();
   assert.equal(await s.step(), "turn");

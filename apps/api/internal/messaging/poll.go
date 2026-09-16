@@ -186,7 +186,7 @@ func (s *ScopedStore) votePollWithClock(
 		seen[optionID] = struct{}{}
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, fmt.Errorf("begin scoped poll vote: %w", err)
 	}
