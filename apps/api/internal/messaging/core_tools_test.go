@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 )
 
@@ -1083,11 +1084,18 @@ func TestCoreToolsTerminalFailureNotice(t *testing.T) {
 		t.Fatalf("notice reply_to = %q, want the requesting message %q",
 			notice.ReplyTo, ask.MessageID)
 	}
-	if !strings.Contains(notice.Content, "could not complete") ||
-		!strings.Contains(notice.Content, "ask me again") {
+	if !strings.Contains(notice.Content, "完了できませんでした") ||
+		!strings.Contains(notice.Content, "予期しない問題") ||
+		!strings.Contains(notice.Content, "お尋ねください") {
 		t.Fatalf("notice content = %q", notice.Content)
 	}
-	if strings.Contains(notice.Content, "already have been done") {
+	// The recorded error is private diagnostic text — provider/tool/SQL
+	// detail stays in the turn record, never the conversation.
+	if strings.Contains(notice.Content, "decision could not be recorded") ||
+		strings.Contains(notice.Content, "5800000") {
+		t.Fatalf("notice leaked the recorded diagnostic: %q", notice.Content)
+	}
+	if strings.Contains(notice.Content, "実行された可能性") {
 		t.Fatalf("no effects committed, notice must not hedge: %q", notice.Content)
 	}
 	// The notice is durable history: it survives a scope re-resolution —
@@ -1140,8 +1148,8 @@ func TestCoreToolsTerminalFailureNotice(t *testing.T) {
 	if notice.Author != w.agent || notice.ReplyTo != ask2.MessageID {
 		t.Fatalf("partial notice = %+v", notice)
 	}
-	if !strings.Contains(notice.Content, "already have been done") ||
-		strings.Contains(notice.Content, "ask me again") {
+	if !strings.Contains(notice.Content, "実行された可能性") ||
+		strings.Contains(notice.Content, "お尋ねください") {
 		t.Fatalf("committed effects must not offer a clean retry: %q", notice.Content)
 	}
 
@@ -1159,6 +1167,217 @@ func TestCoreToolsTerminalFailureNotice(t *testing.T) {
 	msgs = history()
 	if last := msgs[len(msgs)-1]; last.MessageID != ask3.MessageID {
 		t.Fatalf("removed scope still posted a notice: %+v", last)
+	}
+}
+
+// TestCoreToolsTerminalFailureNoticeIsolation is the F310 contract: a notice
+// hook whose SQL fails mid-commit must not take the failure record down with
+// it. The hook runs inside a savepoint of the commit transaction, so its
+// aborted work — including a message row it already wrote — is discarded,
+// the terminal failure still commits, and the missing notice is recovered by
+// the post-commit retry or by an identical-commit replay, never duplicated.
+func TestCoreToolsTerminalFailureNoticeIsolation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	w := newCoreToolsWorld(t, ctx)
+	ws, ch := w.workspaceWithChannel(t, ctx)
+
+	coreStore := agentstate.NewStore(w.store.core.pool)
+	delivery := &CoreAttentionDelivery{Core: coreStore, Messaging: w.store.core}
+	for tool, effect := range delivery.CoreToolEffects() {
+		if err := coreStore.RegisterEffect(tool, effect); err != nil {
+			t.Fatalf("register %s: %v", tool, err)
+		}
+	}
+	release, err := delivery.Prepare(ctx, w.agent.ID)
+	if err != nil {
+		t.Fatalf("prepare persona: %v", err)
+	}
+	release()
+
+	occurred := time.Now()
+	submit := func(inputID, messageID, text string) {
+		t.Helper()
+		_, _, err := coreStore.SubmitInput(ctx, &agentstate.Input{
+			PersonaID: w.agent.ID, InputID: inputID, Kind: "message",
+			Payload: map[string]any{
+				"event_id":     strings.TrimPrefix(inputID, "messaging:"),
+				"event_kind":   "mention",
+				"workspace_id": ws.WorkspaceID,
+				"actor": map[string]any{
+					"kind": "human", "id": w.humanA.ID, "display_name": "Yohaku"},
+				"place": map[string]any{
+					"id": ch.PlaceID, "kind": ch.Kind, "name": ch.Name},
+				"message_id":       messageID,
+				"message_seq":      1,
+				"message_revision": 1,
+				"text":             text,
+			},
+			ActorKind: "human", ActorID: w.humanA.ID,
+			SourceSurface: "messaging", ThreadID: ch.PlaceID,
+			OccurredAt: &occurred, Attention: "reply",
+		})
+		if err != nil {
+			t.Fatalf("submit %s: %v", inputID, err)
+		}
+	}
+	lease, err := coreStore.AcquireWriter(ctx, w.agent.ID, "runtime", 30*time.Second)
+	if err != nil {
+		t.Fatalf("acquire writer: %v", err)
+	}
+	gen := lease.Generation
+	turnSeq := 0
+	nextTurn := func() string {
+		t.Helper()
+		turnSeq++
+		turnID := fmt.Sprintf("turn-iso-%d", turnSeq)
+		res, err := coreStore.LoadTurn(ctx, w.agent.ID, gen, turnID, 20)
+		if err != nil || res.Turn == nil {
+			t.Fatalf("load turn %s: %v %+v", turnID, err, res)
+		}
+		return res.Turn.TurnID
+	}
+	history := func() []Message {
+		t.Helper()
+		msgs, err := w.store.mustScope(t, ctx, ws.WorkspaceID, w.humanA).
+			History(ctx, ch.PlaceID, HistoryOptions{Limit: 50})
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		return msgs
+	}
+	committed := func(turnID, inputID string) (turnStatus, inputStatus string, failedOutbox int) {
+		t.Helper()
+		if err := w.store.core.pool.QueryRow(ctx, `
+			SELECT t.status, i.status FROM core_turns t
+			JOIN core_inputs i ON i.persona_id = t.persona_id AND i.input_id = t.input_id
+			WHERE t.persona_id = $1 AND t.turn_id = $2`,
+			w.agent.ID, turnID).Scan(&turnStatus, &inputStatus); err != nil {
+			t.Fatalf("turn state %s: %v", turnID, err)
+		}
+		if err := w.store.core.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM core_outbox
+			WHERE persona_id = $1 AND kind = 'turn_failed'
+			  AND payload->>'input_id' = $2`,
+			w.agent.ID, inputID).Scan(&failedOutbox); err != nil {
+			t.Fatalf("outbox %s: %v", turnID, err)
+		}
+		return turnStatus, inputStatus, failedOutbox
+	}
+	failReq := agentstate.CommitRequest{
+		Outcome: "fail", Retryable: false,
+		Error: "provider refused the request", ErrorKind: "",
+	}
+
+	// A hook that appends the real notice and then fails at the SQL level:
+	// the row exists inside the savepoint but must never be committed.
+	appendThenFail := func(ctx context.Context, tx pgx.Tx, f agentstate.TerminalFailure) (func(context.Context), error) {
+		if _, err := delivery.TerminalFailureNotice(ctx, tx, f); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, "SELECT 1/0"); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("notice SQL did not fail")
+	}
+
+	// 1. A notice whose SQL aborts does not veto the commit: the turn
+	// fails, the input resolves, the outbox records it, and the partial
+	// notice the hook wrote inside the savepoint leaves no row behind —
+	// even after the post-commit recovery attempt fails the same way.
+	coreStore.TerminalFailureNotice = appendThenFail
+	ask := w.send(t, ctx, ch.PlaceID, w.humanA, "please tally these")
+	submit("messaging:iso-directed", ask.MessageID, ask.Content)
+	turnID := nextTurn()
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("notice SQL failure vetoed the commit: %v", err)
+	}
+	if ts, is, n := committed(turnID, "messaging:iso-directed"); ts != "failed" || is != "done" || n != 1 {
+		t.Fatalf("failure state = turn %q input %q outbox %d", ts, is, n)
+	}
+	if msgs := history(); len(msgs) != 1 {
+		t.Fatalf("partial notice survived the savepoint rollback: %d messages", len(msgs))
+	}
+
+	// 2. The identical-commit replay refires the hook: with a working hook
+	// the missing notice lands — exactly once — reply-associated to the
+	// request that failed.
+	coreStore.TerminalFailureNotice = delivery.TerminalFailureNotice
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("replay commit: %v", err)
+	}
+	msgs := history()
+	if len(msgs) != 2 {
+		t.Fatalf("replay recovered %d messages, want request + one notice", len(msgs))
+	}
+	if msgs[1].Author != w.agent || msgs[1].ReplyTo != ask.MessageID {
+		t.Fatalf("recovered notice = %+v", msgs[1])
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
+		t.Fatalf("second replay: %v", err)
+	}
+	if msgs := history(); len(msgs) != 2 {
+		t.Fatalf("replay posted a duplicate notice: %d messages", len(msgs))
+	}
+
+	// 3. A transiently failing hook is recovered by the post-commit retry
+	// on a fresh transaction — no replay needed — and replay still cannot
+	// duplicate the notice.
+	calls := 0
+	coreStore.TerminalFailureNotice = func(ctx context.Context, tx pgx.Tx, f agentstate.TerminalFailure) (func(context.Context), error) {
+		calls++
+		if calls == 1 {
+			if _, err := tx.Exec(ctx, "SELECT 1/0"); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("notice SQL did not fail")
+		}
+		return delivery.TerminalFailureNotice(ctx, tx, f)
+	}
+	ask2 := w.send(t, ctx, ch.PlaceID, w.humanA, "and file them too")
+	submit("messaging:iso-recover", ask2.MessageID, ask2.Content)
+	turnID2 := nextTurn()
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID2, gen, failReq); err != nil {
+		t.Fatalf("recovery commit: %v", err)
+	}
+	if ts, is, n := committed(turnID2, "messaging:iso-recover"); ts != "failed" || is != "done" || n != 1 {
+		t.Fatalf("failure state = turn %q input %q outbox %d", ts, is, n)
+	}
+	if calls < 2 {
+		t.Fatalf("post-commit recovery never retried the hook: %d calls", calls)
+	}
+	msgs = history()
+	if len(msgs) != 4 || msgs[3].ReplyTo != ask2.MessageID {
+		t.Fatalf("post-commit recovery did not land the notice: %+v", msgs)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID2, gen, failReq); err != nil {
+		t.Fatalf("recovery replay: %v", err)
+	}
+	if msgs := history(); len(msgs) != 4 {
+		t.Fatalf("replay after recovery duplicated the notice: %d messages", len(msgs))
+	}
+}
+
+// TestFailureNoticeCauseStaysPublic is the F311 contract: the recorded
+// error is private diagnostic text. Whatever it contains — provider, tool,
+// or SQL detail — only the bounded error_kind classification may reach the
+// conversation; unknown causes get truthful generic wording.
+func TestFailureNoticeCauseStaysPublic(t *testing.T) {
+	const canary = "CANARY-PRIVATE-TOKEN-123456"
+	for _, kind := range []string{"", "no_model_connection", "oversize_plan", "unlisted_kind"} {
+		f := agentstate.TerminalFailure{
+			Error:     "provider rejected request containing " + canary,
+			ErrorKind: kind,
+		}
+		if got := failureNoticeCause(f); strings.Contains(got, canary) {
+			t.Fatalf("kind %q: private diagnostic reached the notice: %q", kind, got)
+		}
+		if got := failureNoticeNext(f); strings.Contains(got, canary) {
+			t.Fatalf("kind %q: private diagnostic reached the next action: %q", kind, got)
+		}
+	}
+	if got := failureNoticeCause(agentstate.TerminalFailure{}); !strings.Contains(got, "予期しない問題") {
+		t.Fatalf("unclassified cause = %q, want honest generic wording", got)
 	}
 }
 
@@ -1304,10 +1523,13 @@ func TestCoreToolsTerminalFailureNoticeEndToEnd(t *testing.T) {
 	if notice.Author != w.agent || notice.ReplyTo != failing.MessageID {
 		t.Fatalf("notice = %+v", notice)
 	}
-	if !strings.Contains(notice.Content, "could not complete") ||
-		!strings.Contains(notice.Content, "too large to record") ||
-		!strings.Contains(notice.Content, "ask me again") {
+	if !strings.Contains(notice.Content, "完了できませんでした") ||
+		!strings.Contains(notice.Content, "大きすぎて記録できませんでした") ||
+		!strings.Contains(notice.Content, "お尋ねください") {
 		t.Fatalf("notice content = %q", notice.Content)
+	}
+	if strings.Contains(notice.Content, "request budget") {
+		t.Fatalf("notice leaked the recorded diagnostic: %q", notice.Content)
 	}
 	if notice.ReplyTo == recovering.MessageID {
 		t.Fatal("notice answered the recovered request instead of the failed one")

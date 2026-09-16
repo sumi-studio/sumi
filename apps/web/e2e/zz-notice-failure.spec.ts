@@ -148,7 +148,7 @@ test("a terminally failed directed request leaves an inline notice in the existi
 
     // The server's attention drain (1s) admits the input; a bounded loop of
     // real core passes covers the admission lag.
-    const noticeText = page.getByText(/could not complete that request/);
+    const noticeText = page.getByText(/完了できませんでした/);
     for (let i = 0; i < 6; i++) {
       stack.runCoreOnce(`fail-notice-${i}`);
       if (await noticeText.isVisible().catch(() => false)) break;
@@ -162,12 +162,12 @@ test("a terminally failed directed request leaves an inline notice in the existi
     const noticeFrame = frames
       .filter((f) => f.type === "message_created")
       .map((f) => asRecord(f.event.message))
-      .find((m) => String(m.content ?? "").includes("could not complete"));
+      .find((m) => String(m.content ?? "").includes("完了できませんでした"));
     expect(noticeFrame, "no message_created frame for the notice").toBeTruthy();
     expect(asRecord(noticeFrame!.author).kind).toBe("personality_agent");
     expect(noticeFrame!.reply_to).toBe(requestMessageID);
-    expect(String(noticeFrame!.content)).toContain("too large to record");
-    expect(String(noticeFrame!.content)).toContain("ask me again");
+    expect(String(noticeFrame!.content)).toContain("大きすぎて記録できませんでした");
+    expect(String(noticeFrame!.content)).toContain("お尋ねください");
     await page.screenshot({ path: join(evidenceDir, "notice-01-inline.png") });
     note("notice rendered live, reply-associated with the request");
 
@@ -175,10 +175,10 @@ test("a terminally failed directed request leaves an inline notice in the existi
     // and the notice's own nonce both dedupe.
     stack.runCoreOnce("restart-replay");
     await page.waitForTimeout(1500);
-    await expect(page.getByText(/could not complete that request/)).toHaveCount(1);
+    await expect(page.getByText(/完了できませんでした/)).toHaveCount(1);
 
     // And the ambient message produced no failure noise anywhere.
-    await expect(page.getByText(/could not complete that request/)).toHaveCount(1);
+    await expect(page.getByText(/完了できませんでした/)).toHaveCount(1);
     note("restart produced no duplicate; ambient observation stayed silent");
 
     // Reconnect durability: a reload reads the same durable history.
@@ -187,7 +187,7 @@ test("a terminally failed directed request leaves an inline notice in the existi
     await expect(
       page.getByRole("paragraph").filter({ hasText: "!alwayspad 4300000" }),
     ).toBeVisible();
-    await expect(page.getByText(/could not complete that request/)).toBeVisible();
+    await expect(page.getByText(/完了できませんでした/)).toBeVisible();
     await page.screenshot({ path: join(evidenceDir, "notice-02-after-reload.png") });
     note("notice still present after reload — durable in place history");
   } finally {

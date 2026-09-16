@@ -347,9 +347,11 @@ type Store struct {
 	// to leave the requester a durable, place-visible record of what
 	// happened, atomic with the failure itself and deduplicated under
 	// commit replay by its own durable identity. It returns a best-effort
-	// post-commit step (live fanout) or nil. Its error never vetoes the
-	// commit: the failure record must land even when the notice cannot.
-	// Set at wiring time; not synchronized.
+	// post-commit step (live fanout) or nil. It runs on a savepoint inside
+	// the commit transaction: its error — including a statement that
+	// aborts its work at the SQL level — never vetoes the commit, and a
+	// notice that could not land in-transaction is retried once after the
+	// commit on a fresh transaction. Set at wiring time; not synchronized.
 	TerminalFailureNotice TerminalFailureNoticeFunc
 }
 
@@ -1236,22 +1238,62 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	// record of a terminal failure inside this transaction. It runs on the
 	// identical-replay path too: a retried commit is the recovery point for
 	// a notice the first attempt could not write, and the domain's own
-	// dedup keeps the replay from posting twice. A notice error is logged
-	// and swallowed — it must never veto the failure record itself.
+	// dedup keeps the replay from posting twice.
+	//
+	// The hook's statements run inside a savepoint of the commit
+	// transaction. A failed statement aborts the surrounding transaction
+	// at the wire level — swallowing the Go error cannot undo that — so a
+	// hook error rolls back to the savepoint, discarding any partial
+	// notice work and leaving the failure record's commit path live. The
+	// missed notice is then retried once post-commit on a fresh
+	// transaction (recoverNotice), and an identical-commit replay refires
+	// the whole path if the recovery could not write it either.
 	var noticePublish func(context.Context)
+	var noticeRetry *TerminalFailure
 	fireNotice := func() {
 		if s.TerminalFailureNotice == nil || req.Outcome != "fail" || req.Retryable {
 			return
 		}
-		publish, err := s.TerminalFailureNotice(ctx, tx, TerminalFailure{
+		failure := TerminalFailure{
 			PersonaID: personaID, InputID: t.InputID, TurnID: turnID,
 			Error: req.Error, ErrorKind: req.ErrorKind,
-		})
-		if err != nil {
-			log.Printf("terminal failure notice for input %s: %v", t.InputID, err)
+		}
+		if _, err := tx.Exec(ctx, "SAVEPOINT terminal_failure_notice"); err != nil {
+			log.Printf("terminal failure notice for input %s: savepoint: %v", t.InputID, err)
+			noticeRetry = &failure
 			return
 		}
-		noticePublish = publish
+		publish, nerr := s.TerminalFailureNotice(ctx, tx, failure)
+		if nerr == nil {
+			if _, relErr := tx.Exec(ctx, "RELEASE SAVEPOINT terminal_failure_notice"); relErr == nil {
+				noticePublish = publish
+				return
+			} else {
+				nerr = relErr
+			}
+		}
+		if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT terminal_failure_notice"); rbErr != nil {
+			// The savepoint rollback failing means the commit transaction
+			// itself is already broken; the commit reports it honestly
+			// rather than the notice path hiding it.
+			log.Printf("terminal failure notice for input %s: %v (savepoint rollback: %v)",
+				t.InputID, nerr, rbErr)
+			return
+		}
+		log.Printf("terminal failure notice for input %s: %v", t.InputID, nerr)
+		noticeRetry = &failure
+	}
+	// publishNotice runs the post-commit tail once the commit has landed:
+	// the hook's own live fanout when its work committed in-transaction,
+	// or a one-shot recovery on a fresh transaction when it could not.
+	publishNotice := func() {
+		if noticePublish != nil {
+			noticePublish(ctx)
+			return
+		}
+		if noticeRetry != nil {
+			s.recoverTerminalFailureNotice(ctx, *noticeRetry)
+		}
 	}
 	if t.Status != "running" {
 		if t.Generation != generation {
@@ -1281,9 +1323,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
-		if noticePublish != nil {
-			noticePublish(ctx)
-		}
+		publishNotice()
 		return t, nil
 	}
 	if t.Generation != generation {
@@ -1588,10 +1628,40 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if parked {
 		s.notifyApprovalsChanged(ctx, personaID)
 	}
-	if noticePublish != nil {
-		noticePublish(ctx)
-	}
+	publishNotice()
 	return t, nil
+}
+
+// recoverTerminalFailureNotice retries the domain's terminal-failure notice
+// once on a fresh transaction after its in-commit attempt failed. The
+// failure record already committed — the savepoint rollback discarded the
+// notice work — so this runs the same hook against committed state and
+// relies on the domain's durable dedup (derived from the input identity)
+// to converge with any attempt that already landed. Best-effort: every
+// error is logged and swallowed; an identical-commit replay refires the
+// in-transaction path for whatever this could not write.
+func (s *Store) recoverTerminalFailureNotice(ctx context.Context, f TerminalFailure) {
+	if s.TerminalFailureNotice == nil {
+		return
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	publish, err := s.TerminalFailureNotice(ctx, tx, f)
+	if err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	if publish != nil {
+		publish(ctx)
+	}
 }
 
 // notifyApprovalsChanged runs the optional post-commit approval fanout.

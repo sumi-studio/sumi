@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
-	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -88,13 +86,16 @@ func (d *CoreAttentionDelivery) TerminalFailureNotice(ctx context.Context, tx pg
 	}
 	var next string
 	if effectsCommitted {
-		next = "Some of what it asked may already have been done — please check what changed and send me a new message about what is still missing, rather than asking me to repeat the whole request."
+		// The request may have failed after some of its effects committed.
+		// Repeating the whole request can double-apply that work, so the
+		// notice points at what remains instead of inviting a blind retry.
+		next = "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
 	} else {
-		next = "Nothing from it was sent or changed — you can simply ask me again."
+		next = "このリクエストによる送信や変更は行われていません。" + failureNoticeNext(f)
 	}
 	appendIn := AppendInput{
 		PlaceID:     placeID,
-		Content:     "I could not complete that request — " + failureNoticeCause(f) + " " + next,
+		Content:     "このリクエストは完了できませんでした。" + failureNoticeCause(f) + next,
 		ReplyTo:     provenance.MessageID,
 		ClientNonce: coreToolNonce("core.failure_notice", f.InputID),
 	}
@@ -128,38 +129,32 @@ func (d *CoreAttentionDelivery) TerminalFailureNotice(ctx context.Context, tx pg
 	}, nil
 }
 
-// failureNoticeCause renders the recorded reason as one short line the
-// requester can act on. It never carries a stack trace, credentials, or
-// unrelated context: known classifications get fixed wording, anything else
-// is the first line of the recorded error, capped well under any message
-// bound.
+// failureNoticeCause renders the public cause of a terminal failure in the
+// product's own Japanese register. Only the bounded error_kind
+// classification is safe to show: the recorded error is private diagnostic
+// text — provider, tool, and SQL detail — and stays in the turn record and
+// service logs. An unclassified failure gets truthful generic wording, never
+// a copy of the raw reason.
 func failureNoticeCause(f agentstate.TerminalFailure) string {
 	switch f.ErrorKind {
 	case "no_model_connection":
-		return "I had no usable model connection."
+		return "モデル接続が選択されていないため、応答できませんでした。"
 	case "oversize_plan":
-		return "my answer was too large to record — it exceeded the service's per-request size limit."
+		return "回答が大きすぎて記録できませんでした（1リクエストのサイズ上限を超えました）。"
 	}
-	cause := f.Error
-	if i := strings.IndexAny(cause, "\r\n"); i >= 0 {
-		cause = cause[:i]
+	return "予期しない問題が発生しました。"
+}
+
+// failureNoticeNext renders what the requester can do next when the
+// operation ledger shows the turn committed nothing — a plain retry is
+// honest there. Where the classification names a concrete fix, the notice
+// says so instead of a bare "try again".
+func failureNoticeNext(f agentstate.TerminalFailure) string {
+	switch f.ErrorKind {
+	case "no_model_connection":
+		return "「AIの接続」で使う接続を選んでから、もう一度お尋ねください。"
+	case "oversize_plan":
+		return "内容を分けて、もう一度お尋ねください。"
 	}
-	cause = strings.Map(func(r rune) rune {
-		if r < 0x20 {
-			return -1
-		}
-		return r
-	}, cause)
-	if !utf8.ValidString(cause) {
-		cause = strings.ToValidUTF8(cause, "")
-	}
-	const maxCauseRunes = 200
-	if utf8.RuneCountInString(cause) > maxCauseRunes {
-		runes := []rune(cause)
-		cause = string(runes[:maxCauseRunes-1]) + "…"
-	}
-	if cause == "" {
-		return "it stopped without a recorded reason."
-	}
-	return "it stopped with the recorded reason: " + cause + "."
+	return "もう一度お尋ねください。"
 }
