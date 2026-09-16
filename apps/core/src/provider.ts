@@ -114,12 +114,19 @@ export interface ModelProvider {
  * is distinguishable from a genuine evaluated-model failure so callers
  * that spend budget on model work (memory preparation attempts) can
  * pause instead of burning an attempt on a configuration gap.
+ *
+ * `cause` is a bounded machine-readable classification for the surfaces
+ * that render the failure — "no_model_connection" means the user has no
+ * usable model connection selected and the fix lives in connection
+ * settings. It is set only where the cause is certain; everything else
+ * stays unclassified rather than guessing at a provider taxonomy.
  */
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
   readonly refusal?: "context_length";
   readonly unavailable?: boolean;
+  readonly cause?: "no_model_connection";
   constructor(
     message: string,
     opts: {
@@ -127,6 +134,7 @@ export class ModelError extends Error {
       retryAfterMs?: number;
       refusal?: "context_length";
       unavailable?: boolean;
+      cause?: "no_model_connection";
     },
   ) {
     super(message);
@@ -135,5 +143,6 @@ export class ModelError extends Error {
     this.retryAfterMs = opts.retryAfterMs;
     this.refusal = opts.refusal;
     this.unavailable = opts.unavailable;
+    this.cause = opts.cause;
   }
 }

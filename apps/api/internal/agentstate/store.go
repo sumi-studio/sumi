@@ -304,6 +304,11 @@ type CommitRequest struct {
 	Usage     map[string]any `json:"usage"`
 	Error     string         `json:"error"`
 	Retryable bool           `json:"retryable"`
+	// ErrorKind is a bounded machine-readable failure classification set by
+	// the committing host ("no_model_connection": the user has no usable
+	// model connection selected). Anything without a certain cause stays
+	// empty — the field never guesses at a provider-error taxonomy.
+	ErrorKind string `json:"error_kind,omitempty"`
 	// RetryAfterMs is provider-supplied pacing (HTTP Retry-After) for a
 	// retryable failure: the requeue's not_before is at least
 	// now()+RetryAfterMs on top of the per-attempt backoff. Clamped to

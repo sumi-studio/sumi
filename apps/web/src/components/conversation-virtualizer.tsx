@@ -281,6 +281,20 @@ export function ConversationVirtualizer<
           followRef.current = true;
         }
         flightRef.current = { active: false, startedAt: 0 };
+        // isAtEnd is a tolerance, not proof of visibility: an appended row
+        // whose measured height grew after the follow scroll was computed
+        // can rest with its bottom below the fold, still inside
+        // scrollEndThreshold. While following, verify the real distance to
+        // the end and pin again when the last row is actually clipped.
+        const viewport = viewportRef.current;
+        if (viewport && followRef.current) {
+          const distanceToEnd =
+            viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+          if (distanceToEnd > paddingEnd + 4) {
+            flightRef.current = { active: true, startedAt: performance.now() };
+            virtualizer.scrollToEnd({ behavior: "auto" });
+          }
+        }
       }
       return;
     }

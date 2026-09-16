@@ -13,3 +13,18 @@ func (a *application) startCoreWaker() {
 		a.coreWaker.Run(a.backgroundCtx)
 	}()
 }
+
+// startCoreDirectChat runs the Direct Chat projection: admitted commands
+// already flow through the adapter's Append path; this sweep keeps core
+// journal events, terminal turn failures, and command dispositions moving
+// into the durable browser event log even without a connected client.
+func (a *application) startCoreDirectChat() {
+	if a.coreDirectChat == nil {
+		return
+	}
+	a.attentionWorkers.Add(1)
+	go func() {
+		defer a.attentionWorkers.Done()
+		a.coreDirectChat.Run(a.backgroundCtx)
+	}()
+}
