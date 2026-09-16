@@ -18,6 +18,7 @@
     "test:e2e:portable": "node scripts/e2e-portable.mjs",
     "test:e2e:portable:memory": "node scripts/e2e-portable-memory.mjs",
     "dev:local": "node src/host/local.ts",
+    "dev:pool": "node src/host/dev-pool.ts",
     "dev:job-runner": "node src/host/job-runner.ts",
     "dev:worker": "wrangler dev --config wrangler.jsonc",
     "dev:call-runner": "node src/host/call-runner.ts"

@@ -360,9 +360,43 @@ func NewBrowserServer(sessions UserSessionAuthorizer, appender CommandAppender, 
 	return s
 }
 
-func (s *BrowserServer) checkCommandState(personalityAgentID string, head browserCommandHead) (RejectReason, bool) {
+// directChatReadiness reports executor readiness to the browser. When the
+// command appender owns a non-runtime executor — the core-backed Direct Chat
+// adapter — its readiness is authoritative; otherwise the durable gateway's
+// runtime-hydration readiness applies as before.
+func (s *BrowserServer) directChatReadiness(ctx context.Context, personalityAgentID string) (directChatReadiness, error) {
+	if p, ok := s.Appender.(interface {
+		DirectChatReadiness(context.Context, string) (directChatReadiness, error)
+	}); ok {
+		return p.DirectChatReadiness(ctx, personalityAgentID)
+	}
+	return s.Events.directChatReadiness(ctx, personalityAgentID)
+}
+
+// SetAppender repoints command admission — POST ingress and WebSocket commands
+// alike — at a different CommandAppender, keeping this server as the single
+// owner of the durable event log the browser consumes.
+func (s *BrowserServer) SetAppender(appender CommandAppender) {
+	s.Appender = appender
+	if s.commandIngress != nil {
+		s.commandIngress.Appender = appender
+	}
+}
+
+func (s *BrowserServer) checkCommandState(ctx context.Context, personalityAgentID string, head browserCommandHead) (RejectReason, bool) {
 	if s.Events == nil {
 		return "", false
+	}
+	switch head.Type {
+	case "abort", "approval_decision":
+		// These guards consult committed event state, and a sibling API
+		// process may have opened the run or raised the approval since this
+		// process last looked. Refresh the durable tail under the event
+		// lock first so the decision reflects what is actually committed;
+		// when the log cannot be verified, fail closed as unavailable.
+		if err := s.Events.RefreshDurableEventTail(ctx, personalityAgentID); err != nil {
+			return RejectUnavailable, true
+		}
 	}
 	switch head.Type {
 	case "abort":
@@ -841,7 +875,7 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	}
 	// Replay may block on the durable log, so sample readiness only after it
 	// completes instead of publishing a status captured before the barrier.
-	readiness, err := s.Events.directChatReadiness(ctx, claims.PersonalityAgentID)
+	readiness, err := s.directChatReadiness(ctx, claims.PersonalityAgentID)
 	if err != nil {
 		return fmt.Errorf("read direct-chat readiness: %w", err)
 	}
@@ -956,7 +990,7 @@ func (s *BrowserServer) browserEventPump(
 				return fmt.Errorf("revalidate browser direct chat: %w", err)
 			}
 		case <-ticker.C:
-			current, err := s.Events.directChatReadiness(ctx, personalityAgentID)
+			current, err := s.directChatReadiness(ctx, personalityAgentID)
 			if err != nil {
 				return fmt.Errorf("poll direct-chat readiness: %w", err)
 			}
@@ -1045,7 +1079,7 @@ func (s *BrowserServer) browserReadPump(
 			}
 			continue
 		}
-		if reason, reject := s.checkCommandState(claims.PersonalityAgentID, head); reject {
+		if reason, reject := s.checkCommandState(ctx, claims.PersonalityAgentID, head); reject {
 			if err := write(browserCommandRejectedFrame{Type: "command_rejected", IdempotencyKey: frame.IdempotencyKey, RejectReason: reason}); err != nil {
 				return err
 			}

@@ -406,6 +406,14 @@ export interface CommitRequest {
   error?: string;
   retryable?: boolean;
   /**
+   * Bounded machine-readable failure classification for the surfaces that
+   * render this failure — currently only "no_model_connection" (the user
+   * has no usable model connection selected; the fix lives in connection
+   * settings). Anything without a certain cause stays absent rather than
+   * guessing at a provider-error taxonomy.
+   */
+  error_kind?: "no_model_connection";
+  /**
    * Provider-supplied retry pacing (Retry-After) for a retryable
    * failure: the requeue's not_before is at least now+retry_after_ms
    * (server clamps). Absent/0 = the default per-attempt backoff.

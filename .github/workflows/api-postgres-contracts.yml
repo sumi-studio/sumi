@@ -80,4 +80,7 @@ jobs:
             --command "CREATE ROLE sumi_test_creator WITH LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOREPLICATION PASSWORD 'sumi_test_password'"
 
       - name: Run API contract tests
-        run: go test -count=1 ./...
+        # Large PostgreSQL suites create and migrate a database per fixture.
+        # Allow for runner contention beyond Go's default 10m package timeout;
+        # individual operation deadlines and the 30m job limit still apply.
+        run: go test -count=1 -timeout 20m ./...

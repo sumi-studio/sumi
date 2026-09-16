@@ -104,6 +104,7 @@ func run(ctx context.Context) (runErr error) {
 	log.Printf("sumi api listening on %s", publicListener.Addr())
 	app.startAgentAttention()
 	app.startCoreWaker()
+	app.startCoreDirectChat()
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startChatGPTActivation()
@@ -260,6 +261,7 @@ type application struct {
 	cleanupFeedbackAttachments func(context.Context) error
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
+	coreDirectChat             *agentevents.CoreDirectChat
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
@@ -723,6 +725,29 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		log.Print("core state routes ready (/internal/core, scoped tokens; transfers admin-only)")
 	}
+	var coreDirectChat *agentevents.CoreDirectChat
+	if directChatCoreBackendEnabled() && coreServer == nil {
+		// An explicit core backend with no core state service must not
+		// silently keep the legacy runtime and call it core: the placement
+		// was asked for behavior it cannot deliver, so startup fails.
+		closeOnError()
+		return nil, errors.New("SUMI_DIRECT_CHAT_BACKEND=core requires the core state service (SUMI_CORE_STATE_TOKEN and a database)")
+	}
+	if coreServer != nil && directChatCoreBackendEnabled() {
+		// The accepted TypeScript core serves Direct Chat: admitted commands
+		// become durable core inputs, and committed journal events are
+		// projected into the same browser-visible event log the existing
+		// WebSocket/history surfaces already consume. The durable gateway
+		// remains the event-log owner; the adapter only repoints admission
+		// and readiness.
+		coreDirectChat = &agentevents.CoreDirectChat{
+			Core:    coreServer.Store(),
+			Gateway: runtime,
+			Pool:    database.Pool,
+		}
+		browser.SetAppender(coreDirectChat)
+		log.Print("direct chat commands and replies run through the core state service (SUMI_DIRECT_CHAT_BACKEND=core)")
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
@@ -812,6 +837,7 @@ func newApplicationFromEnv() (*application, error) {
 		emailDelivery:              emailDeliveryWorkerFor(authServer),
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
+		coreDirectChat:             coreDirectChat,
 		publicMux:                  mux,
 		localMux:                   localMux,
 		localListener:              localListener,
@@ -2208,6 +2234,13 @@ func browserSessionConfigFromEnv(
 		return nil, nil, err
 	}
 	return sessions, origins, nil
+}
+
+// directChatCoreBackendEnabled selects the core-backed Direct Chat executor
+// for this placement. It is an explicit opt-in — deployments that still run
+// the legacy runtime keep it until the core path is deliberately switched on.
+func directChatCoreBackendEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("SUMI_DIRECT_CHAT_BACKEND")), "core")
 }
 
 func originsFromEnv(name string) []string {
