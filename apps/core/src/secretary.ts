@@ -4,6 +4,7 @@ import {
   DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
   estTextTokens,
   evictToBudget,
+  inputBodyText,
   inputMarker,
   renderedViewTokens,
   renderJournalContext,
@@ -830,7 +831,7 @@ export class Secretary {
           await this.commitTurnFinal(turn, {
             outcome: "complete",
             events,
-            output: { text: decision.text, tool_results: results },
+            output: { text: decision.text, tool_results: summarizeToolResults(results) },
             usage: { rounds: usages },
           });
           this.log("turn committed", {
@@ -1085,6 +1086,18 @@ export class Secretary {
     let text = "";
     let calls: ToolCall[] = [];
     let usage: Record<string, unknown> = {};
+    // A decision whose recorded plan would exceed the request budget gets a
+    // bounded re-plan: nothing was journaled or claimed for it, so asking the
+    // model again with an explicit size notice is safe. Past the cap the turn
+    // fails honestly rather than discarding an ordinary request unexplained.
+    let oversizeRecoveries = 0;
+    let planBody: {
+      turnId: string;
+      round: number;
+      text: string;
+      calls: PlanCall[];
+      usage: Record<string, unknown>;
+    } | null = null;
     for (;;) {
       text = "";
       calls = [];
@@ -1105,7 +1118,6 @@ export class Secretary {
           else if (ev.type === "tool_call") calls.push(ev.call);
           else usage = ev.usage;
         }
-        break;
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
         if (e instanceof BudgetWaitError) {
@@ -1255,9 +1267,7 @@ export class Secretary {
         });
         return { failed: true, retryable };
       }
-    }
-    try {
-      const saved = await state.savePlan(personaId, gen, {
+      const candidate = {
         turnId: turn.turn_id,
         round,
         // Display text and usage metadata are normalized: a stray NUL in a
@@ -1272,7 +1282,45 @@ export class Secretary {
           request: c.arguments,
         })),
         usage: stripNulDeep(usage) as Record<string, unknown>,
+      };
+      // Measure the plan as savePlan will serialize it — the request body is
+      // the wire contract the agentstate body limit applies to. Individually
+      // valid arguments (e.g. two near-cap uploads) can exceed it in
+      // aggregate, so the bound lives on the whole decision, not per call.
+      const planBytes = utf8Bytes(
+        JSON.stringify({
+          generation: gen,
+          turn_id: candidate.turnId,
+          round: candidate.round,
+          text: candidate.text,
+          calls: candidate.calls,
+          usage: candidate.usage,
+        }),
+      );
+      if (planBytes <= PLAN_REQUEST_MAX_BYTES) {
+        planBody = candidate;
+        break;
+      }
+      oversizeRecoveries += 1;
+      if (oversizeRecoveries > MAX_OVERSIZE_DECISION_RECOVERIES) {
+        await this.failPermanent(
+          turn,
+          events,
+          `decision could not be recorded: plan body ${planBytes} bytes exceeds the ${PLAN_REQUEST_MAX_BYTES}-byte request budget after ${MAX_OVERSIZE_DECISION_RECOVERIES} re-plan attempt(s)`,
+          "oversize_plan",
+        );
+        return { failed: true, retryable: false };
+      }
+      this.log("decision over the plan budget; asking for a smaller plan", {
+        turn_id: turn.turn_id,
+        round,
+        plan_bytes: planBytes,
+        recovery: oversizeRecoveries,
       });
+      sendMessages = [...sendMessages, decisionSizeNotice(planBytes)];
+    }
+    try {
+      const saved = await state.savePlan(personaId, gen, planBody!);
       // Always execute the stored plan — a lost-response resend returns
       // the identical rounds; a conflict never silently substitutes.
       return { rounds: saved.plan.plan };
@@ -1320,11 +1368,13 @@ export class Secretary {
     turn: Turn,
     events: { kind: string; payload: Record<string, unknown> }[],
     error: string,
+    errorKind?: "no_model_connection" | "oversize_plan",
   ): Promise<void> {
     await this.commitTurnFinal(turn, {
       outcome: "fail",
       retryable: false,
       error: stripNul(error),
+      error_kind: errorKind,
       events,
     });
     this.log("turn failed permanently", {
@@ -1419,10 +1469,70 @@ export class Secretary {
 }
 
 // Recorded-error budget: a persisted failure only needs the reason, not
-// megabytes. Kept far below the state service's 1 MiB body limit so the
+// megabytes. Kept far below the state service's 4 MiB body limit so the
 // minimal fallback commit is always storable.
 const RECORDED_ERROR_BYTES = 8 * 1024;
 const TRUNC_MARK = "…[truncated]";
+
+// The durable-plan request budget: the agentstate service caps one request
+// body at 4 MiB, and a saved plan is a single request — so the bound is on
+// the whole decision, not on any one tool argument. Slack covers the small
+// envelope around the serialized plan. A decision over the budget is not a
+// defect: the core asks the model for a smaller plan (each round is its own
+// request, so splitting work across steps is the intended contract).
+export const PLAN_REQUEST_MAX_BYTES = (4 << 20) - 4096;
+const MAX_OVERSIZE_DECISION_RECOVERIES = 2;
+
+// The model-facing notice for an unrecordable decision — the same
+// working-context-note convention as capacity notices, never journaled.
+function decisionSizeNotice(planBytes: number): ChatMessage {
+  return {
+    role: "user",
+    content:
+      "[Decision-size notice; not a new user message]\n" +
+      `Your previous reply could not be recorded: serialized it is ${planBytes} bytes, over the ${PLAN_REQUEST_MAX_BYTES}-byte per-request limit, so nothing in it ran. ` +
+      "Answer again with a smaller reply — plan at most one attachment upload per step (each step is its own request), and keep reply text and arguments modest.",
+  };
+}
+
+// A tool result is carried verbatim in the turn summary only while it is
+// small enough to appear twice in one commit body — the journaled
+// tool_result event already holds the full result. Larger results are
+// summarized by size: the durable record stays the journal event and the
+// operation row, and the commit cannot exceed the state service's body
+// limit on a single result.
+export const OUTPUT_RESULT_SUMMARY_BYTES = 64 * 1024;
+
+export function summarizeToolResults(
+  results: {
+    call_id: string;
+    tool: string;
+    result: unknown;
+    replayed: boolean;
+  }[],
+): Record<string, unknown>[] {
+  return results.map((r) => {
+    const entry: Record<string, unknown> = {
+      call_id: r.call_id,
+      tool: r.tool,
+      replayed: r.replayed,
+    };
+    let size = 0;
+    try {
+      size = utf8Bytes(JSON.stringify(r.result ?? null));
+    } catch {
+      size = OUTPUT_RESULT_SUMMARY_BYTES + 1;
+    }
+    if (size <= OUTPUT_RESULT_SUMMARY_BYTES) {
+      entry.result = r.result;
+    } else {
+      // The full result remains in this commit's tool_result event under
+      // the same call_id, and durably in the operation row.
+      entry.result_bytes = size;
+    }
+    return entry;
+  });
+}
 
 /** Replace NUL with U+FFFD recursively — jsonb can never hold 0x00. */
 function scrubJson(v: unknown): unknown {
@@ -1434,6 +1544,14 @@ function scrubJson(v: unknown): unknown {
     );
   }
   return v;
+}
+
+// UTF-8 byte length of a serialized value. TextEncoder is the portable
+// primitive — Node's Buffer does not exist on the workerd host, and the
+// plan/result budgets must measure identically on every runtime.
+const utf8Encoder = new TextEncoder();
+function utf8Bytes(s: string): number {
+  return utf8Encoder.encode(s).length;
 }
 
 /**
@@ -1456,7 +1574,9 @@ const SYSTEM =
   "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
   "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
   "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
-  "Shared-conversation inputs arrive with actor and place provenance; reply into that place with messaging.send when a response is genuinely warranted, and stay silent on ambient traffic. " +
+  "Shared-conversation inputs arrive with actor and place provenance; the messaging.* tools are your ordinary Messaging surface — overview, open, and search read the places you can see, create_channel, start_dm, and create_thread open new ones, and notification_settings reads and sets your own alert preferences. " +
+  "Reply into that place with messaging.send when a response is genuinely warranted — it can carry urgency or attachments you uploaded — and stay silent on ambient traffic. " +
+  "You may edit or retract only your own messages through messaging.edit_message and messaging.delete_message. A message's attachments arrive as metadata — filename, type, size, and attachment_id; read the bytes only through messaging.open_attachment with the shown place_id and message_id, paging with offset when has_more says more remains, and upload files you want to send with messaging.upload_attachment. " +
   "When a call starts in a place you belong to, a 'call_started' input arrives; call.join enters it as a real participant. In a call, others' speech arrives as 'call_utterance' inputs with speaker and timing provenance — you may listen and stay silent, speak with call.say, or leave with call.leave. call.say records your intent and what is known about its playback, never that anyone heard it; call.state shows who is in a call. " +
   "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
@@ -1488,6 +1608,7 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       reason: typeof p.reason === "string" ? p.reason : null,
       message_change:
         typeof p.message_change === "string" ? p.message_change : null,
+      attachments: Array.isArray(p.attachments) ? p.attachments : null,
       attempt: turn.attempt,
     },
   };
@@ -1510,10 +1631,8 @@ export function assemble(
     ...renderJournalContext(context, memory, omitted, memoryOmitted),
   ];
   const p = input.payload as Record<string, unknown>;
-  const text =
-    typeof p.text === "string" && p.text !== ""
-      ? p.text
-      : JSON.stringify(input.payload);
+  const body = inputBodyText(p);
+  const text = body !== "" ? body : JSON.stringify(input.payload);
   const who =
     input.actor_kind === "schedule"
       ? "[scheduled wake]"

@@ -491,7 +491,7 @@ func (s *ScopedStore) withCallAdmission(
 	placeID string,
 	effect func(Place, string) error,
 ) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin call admission: %w", err)
 	}

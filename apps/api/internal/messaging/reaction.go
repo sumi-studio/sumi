@@ -44,7 +44,7 @@ func (s *ScopedStore) ToggleReactionIdempotent(ctx context.Context, placeID, mes
 	if err := validateReactionEmoji(emoji); err != nil {
 		return Message{}, false, err
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Message{}, false, fmt.Errorf("begin scoped reaction: %w", err)
 	}

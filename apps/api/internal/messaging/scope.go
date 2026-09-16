@@ -75,7 +75,7 @@ func (s *ScopedStore) withLiveAuthorityLease(
 	if s == nil || s.Store == nil || effect == nil {
 		return ErrInvalidScope
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin live authority lease: %w", err)
 	}
@@ -118,9 +118,19 @@ type AppAuthority interface {
 
 // ScopedStore is one immutable view of one installed Messaging app. Keeping
 // Actor on the receiver prevents a payload from selecting a different author.
+//
+// Every method runs its work in one transaction. Unbound, that is a fresh
+// pool transaction; bound (bindTx, the delegated-effect lane) it is a nested
+// transaction — a savepoint — of the caller's, so the method's Commit is a
+// savepoint release and its mutations share the enclosing transaction's
+// commit or rollback. The agentstate claim binds its operation transaction
+// this way: an effect's domain writes land atomically with the operation
+// record, and no second pool connection is acquired while the claim holds
+// its own.
 type ScopedStore struct {
 	*Store
-	Scope Scope
+	Scope   Scope
+	boundTx pgx.Tx
 }
 
 func (s *Store) Scoped(scope Scope) (*ScopedStore, error) {
@@ -128,6 +138,34 @@ func (s *Store) Scoped(scope Scope) (*ScopedStore, error) {
 		return nil, err
 	}
 	return &ScopedStore{Store: s, Scope: scope}, nil
+}
+
+// bindTx returns the same scope bound into tx — see ScopedStore.boundTx. The
+// bound store must not outlive its transaction: post-commit live fanout
+// resolves a fresh unbound store.
+func (s *ScopedStore) bindTx(tx pgx.Tx) *ScopedStore {
+	bound := *s
+	bound.boundTx = tx
+	return &bound
+}
+
+// beginTx opens the transaction one scoped method's work runs in.
+func (s *ScopedStore) beginTx(ctx context.Context) (pgx.Tx, error) {
+	if s.boundTx != nil {
+		return s.boundTx.Begin(ctx)
+	}
+	return s.pool.Begin(ctx)
+}
+
+// beginSnapshotTx is beginTx for the repeatable-read snapshot readers. Under
+// a bound store the snapshot degrades to the enclosing transaction's read
+// committed view: a concurrent cursor advance can still surface as the
+// last_read-exceeds-latest guard, a transient error the claim lane retries.
+func (s *ScopedStore) beginSnapshotTx(ctx context.Context) (pgx.Tx, error) {
+	if s.boundTx != nil {
+		return s.boundTx.Begin(ctx)
+	}
+	return s.Store.beginOpenSnapshot(ctx)
 }
 
 func (s *ScopedStore) authorize(ctx context.Context) error {

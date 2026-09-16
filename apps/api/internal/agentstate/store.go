@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"sort"
 	"strconv"
@@ -341,7 +342,34 @@ type Store struct {
 	// the record, so it runs post-commit and its outcome cannot affect the
 	// committed state. Set at wiring time; not synchronized.
 	ApprovalsChanged func(ctx context.Context, personaID string)
+	// TerminalFailureNotice, when set, runs inside the commit transaction
+	// when a non-retryable failure resolves an input — the domain's chance
+	// to leave the requester a durable, place-visible record of what
+	// happened, atomic with the failure itself and deduplicated under
+	// commit replay by its own durable identity. It returns a best-effort
+	// post-commit step (live fanout) or nil. It runs on a savepoint inside
+	// the commit transaction: its error — including a statement that
+	// aborts its work at the SQL level — never vetoes the commit, and a
+	// notice that could not land in-transaction is retried once after the
+	// commit on a fresh transaction. Set at wiring time; not synchronized.
+	TerminalFailureNotice TerminalFailureNoticeFunc
 }
+
+// TerminalFailure carries the resolved input/turn identity and the recorded
+// reason to a registered terminal-failure notice hook.
+type TerminalFailure struct {
+	PersonaID string
+	InputID   string
+	TurnID    string
+	Error     string
+	ErrorKind string
+}
+
+// TerminalFailureNoticeFunc appends whatever place-visible record a domain
+// keeps for a request that can no longer produce a reply. It runs inside
+// the commit transaction so the notice is atomic with the failure record;
+// the returned closure runs after commit for best-effort live fanout.
+type TerminalFailureNoticeFunc func(ctx context.Context, tx pgx.Tx, f TerminalFailure) (func(context.Context), error)
 
 // ToolEffect delegates one tool's atomic, state-internal effect to a
 // registered applier — the seam that lets an in-process domain (Messaging)
@@ -354,7 +382,18 @@ type Store struct {
 type ToolEffect struct {
 	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
 	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
+	// ReadOnly reports whether a completed call could not have changed
+	// anything outside its own operation record — a predicate because some
+	// tools both read and write and the request decides which. A nil
+	// predicate means the effect may mutate; never mark a mutating effect
+	// read-only.
+	ReadOnly func(request map[string]any) bool
 }
+
+// AlwaysReadOnly declares a delegated effect that can never change anything
+// outside its own operation record — shared by the packages that register
+// pure reads (Messaging history/search, call.state, invitation listing).
+func AlwaysReadOnly(map[string]any) bool { return true }
 
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
@@ -1206,6 +1245,67 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
+	// fireNotice lets the registered domain hook leave its place-visible
+	// record of a terminal failure inside this transaction. It runs on the
+	// identical-replay path too: a retried commit is the recovery point for
+	// a notice the first attempt could not write, and the domain's own
+	// dedup keeps the replay from posting twice.
+	//
+	// The hook's statements run inside a savepoint of the commit
+	// transaction. A failed statement aborts the surrounding transaction
+	// at the wire level — swallowing the Go error cannot undo that — so a
+	// hook error rolls back to the savepoint, discarding any partial
+	// notice work and leaving the failure record's commit path live. The
+	// missed notice is then retried once post-commit on a fresh
+	// transaction (recoverNotice), and an identical-commit replay refires
+	// the whole path if the recovery could not write it either.
+	var noticePublish func(context.Context)
+	var noticeRetry *TerminalFailure
+	fireNotice := func() {
+		if s.TerminalFailureNotice == nil || req.Outcome != "fail" || req.Retryable {
+			return
+		}
+		failure := TerminalFailure{
+			PersonaID: personaID, InputID: t.InputID, TurnID: turnID,
+			Error: req.Error, ErrorKind: req.ErrorKind,
+		}
+		if _, err := tx.Exec(ctx, "SAVEPOINT terminal_failure_notice"); err != nil {
+			log.Printf("terminal failure notice for input %s: savepoint: %v", t.InputID, err)
+			noticeRetry = &failure
+			return
+		}
+		publish, nerr := s.TerminalFailureNotice(ctx, tx, failure)
+		if nerr == nil {
+			if _, relErr := tx.Exec(ctx, "RELEASE SAVEPOINT terminal_failure_notice"); relErr == nil {
+				noticePublish = publish
+				return
+			} else {
+				nerr = relErr
+			}
+		}
+		if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT terminal_failure_notice"); rbErr != nil {
+			// The savepoint rollback failing means the commit transaction
+			// itself is already broken; the commit reports it honestly
+			// rather than the notice path hiding it.
+			log.Printf("terminal failure notice for input %s: %v (savepoint rollback: %v)",
+				t.InputID, nerr, rbErr)
+			return
+		}
+		log.Printf("terminal failure notice for input %s: %v", t.InputID, nerr)
+		noticeRetry = &failure
+	}
+	// publishNotice runs the post-commit tail once the commit has landed:
+	// the hook's own live fanout when its work committed in-transaction,
+	// or a one-shot recovery on a fresh transaction when it could not.
+	publishNotice := func() {
+		if noticePublish != nil {
+			noticePublish(ctx)
+			return
+		}
+		if noticeRetry != nil {
+			s.recoverTerminalFailureNotice(ctx, *noticeRetry)
+		}
+	}
 	if t.Status != "running" {
 		if t.Generation != generation {
 			return nil, ErrTurnConflict
@@ -1230,9 +1330,11 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 		if !same {
 			return nil, fmt.Errorf("%w: turn replay carries a different commit", ErrTurnConflict)
 		}
+		fireNotice()
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
+		publishNotice()
 		return t, nil
 	}
 	if t.Generation != generation {
@@ -1528,6 +1630,7 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 				}); err != nil {
 				return nil, fmt.Errorf("append outbox: %w", err)
 			}
+			fireNotice()
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1536,7 +1639,40 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if parked {
 		s.notifyApprovalsChanged(ctx, personaID)
 	}
+	publishNotice()
 	return t, nil
+}
+
+// recoverTerminalFailureNotice retries the domain's terminal-failure notice
+// once on a fresh transaction after its in-commit attempt failed. The
+// failure record already committed — the savepoint rollback discarded the
+// notice work — so this runs the same hook against committed state and
+// relies on the domain's durable dedup (derived from the input identity)
+// to converge with any attempt that already landed. Best-effort: every
+// error is logged and swallowed; an identical-commit replay refires the
+// in-transaction path for whatever this could not write.
+func (s *Store) recoverTerminalFailureNotice(ctx context.Context, f TerminalFailure) {
+	if s.TerminalFailureNotice == nil {
+		return
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	publish, err := s.TerminalFailureNotice(ctx, tx, f)
+	if err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("terminal failure notice recovery for input %s: %v", f.InputID, err)
+		return
+	}
+	if publish != nil {
+		publish(ctx)
+	}
 }
 
 // notifyApprovalsChanged runs the optional post-commit approval fanout.
@@ -2422,6 +2558,49 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		}
 		return op, a, false, nil
 	}
+}
+
+// InputMayHaveCommittedEffects reports whether the operation ledger records
+// work for this input that may already have run — across every attempt of
+// the input, not only the failing turn, because a replayed claim keeps the
+// first claiming turn's id. A failed operation ran no effect and a
+// read-only operation changed nothing outside its own record; a tool known
+// to neither registry is conservatively treated as able to mutate.
+func (s *Store) InputMayHaveCommittedEffects(ctx context.Context, tx pgx.Tx, personaID, inputID string) (bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT o.tool, o.request FROM core_operations o
+		JOIN core_turns t ON t.persona_id = o.persona_id AND t.turn_id = o.turn_id
+		WHERE o.persona_id = $1 AND t.input_id = $2 AND o.status <> 'failed'`,
+		personaID, inputID)
+	if err != nil {
+		return false, dataErr(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tool string
+		var request map[string]any
+		if err := rows.Scan(&tool, &request); err != nil {
+			return false, err
+		}
+		if !s.operationReadOnly(tool, request) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// operationReadOnly reports whether a recorded call could not have changed
+// anything outside its own operation row: internal reads are marked in
+// toolAuthority, delegated effects declare a ReadOnly predicate, and a tool
+// known to neither is treated as able to mutate.
+func (s *Store) operationReadOnly(tool string, request map[string]any) bool {
+	if info, ok := toolAuthority[tool]; ok && info.internal {
+		return info.readOnly
+	}
+	if effect, ok := s.effects[tool]; ok && effect.ReadOnly != nil {
+		return effect.ReadOnly(request)
+	}
+	return false
 }
 
 func (s *Store) operationByKey(ctx context.Context, db queryRower, personaID, tool, idemKey string) (Operation, error) {

@@ -12,6 +12,13 @@ import type { ModelEvent, ModelProvider, ModelRequest } from "../provider.ts";
  *   "!elevated <tool> <json-args>" → the same call on the elevated route
  *     (the model asking the human for a one-shot approval, ADR 0013 §1)
  *   "!slow <ms> <text>"    → delay before answering (used to kill mid-turn)
+ *   "!pad <bytes> <text>"  → pad the reply to <bytes> bytes (used to cross
+ *     the durable plan-request size boundary in tests). A re-plan consult
+ *     after a decision-size notice sees the notice, not the directive, so
+ *     !pad exercises the recovery path.
+ *   "!alwayspad <bytes>"   → like !pad but scans every visible user message,
+ *     so a re-plan still emits the oversized reply — the deterministic
+ *     terminal-failure path.
  *   anything else          → echo reply text
  *
  * Round-aware like a real model: directives are parsed on round 0 only.
@@ -40,7 +47,29 @@ export class MockProvider implements ModelProvider {
 
     const slow =
       request.round === 0 ? /^!slow\s+(\d+)\s*(.*)$/s.exec(text) : null;
-    if (slow) {
+    const pad =
+      request.round === 0 ? /^!pad\s+(\d+)\s*(.*)$/s.exec(text) : null;
+    // !alwayspad looks past the latest user message: a re-plan consult after
+    // a decision-size notice still finds the directive and re-emits the
+    // oversized reply, so the turn reaches its terminal-failure bound.
+    let alwayspad: RegExpExecArray | null = null;
+    if (request.round === 0) {
+      for (const m of request.messages) {
+        if (m.role !== "user") continue;
+        const t = m.content.replace(/^\[[^\]]*\]\s*/, "");
+        alwayspad = /^!alwayspad\s+(\d+)\s*(.*)$/s.exec(t);
+        if (alwayspad) break;
+      }
+    }
+    if (alwayspad) {
+      const size = Number(alwayspad[1]);
+      reply = `echo: ${alwayspad[2] ?? ""}`;
+      if (reply.length < size) reply = reply.padEnd(size, "x");
+    } else if (pad) {
+      const size = Number(pad[1]);
+      reply = `echo: ${pad[2] ?? ""}`;
+      if (reply.length < size) reply = reply.padEnd(size, "x");
+    } else if (slow) {
       const delay = Number(slow[1]);
       await waitWithSignal(delay, request.signal);
       reply = `echo: ${slow[2] ?? ""}`;

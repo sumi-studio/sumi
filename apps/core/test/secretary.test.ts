@@ -1515,15 +1515,18 @@ test("a >body-limit provider error still records a bounded honest failure (F-B1)
   assert.equal(ob50!.kind, "turn_completed");
 });
 
-test("an oversized complete commit downgrades through the minimal tier (F-B1)", async () => {
+test("an oversized decision fails at the plan boundary, honestly (F-B1)", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   state.addInput(PERSONA, "in-52", "hi");
-  // A ~1.5 MB reply makes both the original commit AND the scrubbed
-  // commit (events still carry the giant assistant_message) un-storable;
-  // only the minimal failure commit can land.
+  // A ~5 MB reply can never be journaled as a plan — it exceeds the
+  // agentstate request budget no matter how the body is scrubbed. The
+  // client-side bound catches it before savePlan, gives the model a
+  // bounded re-plan, and — the script re-emitting the same oversized
+  // reply — resolves the input as a recorded failure rather than letting
+  // the body limit kill an opaque commit.
   const s = new Secretary(cfg(state, "h", {
-    provider: new ScriptedProvider({ text: "x".repeat(1_500_000) }),
+    provider: new ScriptedProvider({ text: "x".repeat(5_000_000) }),
   }));
   await s.start();
   assert.equal(await s.step(), "turn");
@@ -1533,8 +1536,8 @@ test("an oversized complete commit downgrades through the minimal tier (F-B1)", 
   assert.ok(failed, "oversized complete resolves as a recorded failure");
   const recorded = failed!.error ?? "";
   assert.ok(recorded.length < 10_000, "recorded error bounded");
-  assert.match(recorded, /read body/);
-  assert.match(recorded, /could not be stored/);
+  assert.match(recorded, /request budget/);
+  assert.match(recorded, /could not be recorded/);
   const in52 = state.inputs.find((i) => i.input_id === "in-52")!;
   assert.equal(in52.status, "done", "input finalizes — no poison loop");
   // No fabricated success: this branch records a visible turn_failed —
@@ -1914,4 +1917,140 @@ test("a near-limit input with a transient provider error stays retryable (opus F
     (out!.payload as { output: { text: string } }).output.text,
     "recovered",
   );
+});
+
+// A decision whose recorded plan would exceed the agentstate request body
+// limit cannot be saved at all — two individually valid near-cap arguments
+// aggregate past it. The turn must not die silently: the model gets an
+// explicit size notice and a bounded chance to re-plan, and only repeated
+// oversize replies resolve the input as an honest recorded failure.
+test("an oversized decision re-plans with a size notice, then completes", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  // !pad emits a reply padded past the 4 MiB request envelope; on the
+  // re-plan consult the mock sees the size notice (not the directive) and
+  // answers normally — the real recovery path, no special-casing.
+  state.addInput(PERSONA, "in-pad", "!pad 4400000 hello");
+
+  const provider = new MockProvider();
+  const requests: ModelRequest[] = [];
+  const recording = new (class extends MockProvider {
+    override async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      requests.push(req);
+      yield* provider.stream(req);
+    }
+  })();
+  const s = new Secretary(cfg(state, "test-1", { provider: recording }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle");
+
+  // Two consults at round 0: the oversized reply, then the re-plan.
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1]!.round, 0);
+  const notice = requests[1]!.messages.at(-1)!;
+  assert.match(notice.content, /Decision-size notice/);
+  assert.match(notice.content, /per-request limit/);
+
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(outbox.length, 1);
+  assert.equal(outbox[0]!.kind, "turn_completed");
+  const input = state.inputs.find((i) => i.input_id === "in-pad")!;
+  assert.equal(input.status, "done");
+});
+
+test("a persistently oversized decision fails honestly — nothing unrecorded ran", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-fat", "!alwayspad 4400000");
+
+  const provider = new MockProvider();
+  const requests: ModelRequest[] = [];
+  const recording = new (class extends MockProvider {
+    override async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      requests.push(req);
+      yield* provider.stream(req);
+    }
+  })();
+  const s = new Secretary(cfg(state, "test-1", { provider: recording }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+
+  // Initial reply + the two bounded re-plan attempts, then the recorded
+  // terminal failure — no unbounded consult loop.
+  assert.equal(requests.length, 3);
+  const input = state.inputs.find((i) => i.input_id === "in-fat")!;
+  assert.equal(input.status, "done");
+  const outbox = await state.outbox(PERSONA, 0);
+  const failed = outbox.find((o) => o.kind === "turn_failed");
+  assert.ok(failed, "expected a turn_failed outbox record");
+  assert.match(
+    (failed!.payload as { error: string }).error,
+    /exceeds the \d+-byte request budget/,
+  );
+  // savePlan was never reached: no plan row, no journaled assistant reply,
+  // and no operation could have been claimed for the unrecordable decision.
+  assert.equal(state.plans.size, 0);
+  const evs = await state.events(PERSONA, 0);
+  assert.ok(!evs.some((e) => e.kind === "assistant_message"));
+  assert.ok(!evs.some((e) => e.kind === "tool_result"));
+});
+
+// The plan budget is a UTF-8 byte contract — the wire size the state
+// service limits. Multibyte text crosses it long before its character count
+// reaches the bound; a code-unit (.length) measure would record the
+// unrecordable plan and fail opaquely at the server instead.
+test("a multibyte decision is measured in UTF-8 bytes at the plan boundary", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-jp", "レポートをまとめて");
+
+  // ~4.5 MB of UTF-8 in 1.5M characters — under the budget as a code-unit
+  // count, over it on the wire. The scripted provider re-emits it on every
+  // consult, so the bounded re-plan exhausts into the recorded failure.
+  const provider = new ScriptedProvider({ text: "あ".repeat(1_500_000) });
+  const s = new Secretary(cfg(state, "test-1", { provider }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+
+  assert.equal(provider.consultations.length, 3); // initial + 2 re-plans
+  const input = state.inputs.find((i) => i.input_id === "in-jp")!;
+  assert.equal(input.status, "done");
+  const outbox = await state.outbox(PERSONA, 0);
+  const failed = outbox.find((o) => o.kind === "turn_failed");
+  assert.ok(failed, "multibyte oversize must resolve as a recorded failure");
+  assert.match(
+    (failed!.payload as { error: string }).error,
+    /request budget/,
+  );
+  assert.equal(state.plans.size, 0);
+});
+
+test("an oversized plan's tool calls never reach the operation ledger", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-calls", "please do the work");
+
+  // The scripted reply carries a valid journal.note call but text padded
+  // past the request budget — the whole decision is unrecordable, so the
+  // call must not run; and since the provider re-emits it on every re-plan
+  // consult, the turn resolves to the honest terminal failure.
+  const provider = new ScriptedProvider({
+    text: "x".repeat(4_400_000),
+    calls: [{ tool: "journal.note", request: { text: "should not land" } }],
+  });
+  const s = new Secretary(cfg(state, "test-1", { provider }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+
+  const input = state.inputs.find((i) => i.input_id === "in-calls")!;
+  assert.equal(input.status, "done");
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.ok(outbox.some((o) => o.kind === "turn_failed"));
+  const evs = await state.events(PERSONA, 0);
+  assert.ok(
+    !evs.some((e) => e.kind === "note"),
+    "the unrecordable plan's effect must not have run",
+  );
+  assert.equal(state.plans.size, 0);
 });

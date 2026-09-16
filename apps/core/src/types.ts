@@ -407,12 +407,13 @@ export interface CommitRequest {
   retryable?: boolean;
   /**
    * Bounded machine-readable failure classification for the surfaces that
-   * render this failure — currently only "no_model_connection" (the user
-   * has no usable model connection selected; the fix lives in connection
-   * settings). Anything without a certain cause stays absent rather than
-   * guessing at a provider-error taxonomy.
+   * render this failure — "no_model_connection" (the user has no usable
+   * model connection selected; the fix lives in connection settings) and
+   * "oversize_plan" (the decision itself exceeded the service's per-request
+   * size limit and could not be recorded). Anything without a certain cause
+   * stays absent rather than guessing at a provider-error taxonomy.
    */
-  error_kind?: "no_model_connection";
+  error_kind?: "no_model_connection" | "oversize_plan";
   /**
    * Provider-supplied retry pacing (Retry-After) for a retryable
    * failure: the requeue's not_before is at least now+retry_after_ms

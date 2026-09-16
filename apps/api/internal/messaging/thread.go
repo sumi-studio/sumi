@@ -67,7 +67,7 @@ func (s *ScopedStore) CreateThread(ctx context.Context, parentPlaceID, name, ori
 		Name            string `json:"name"`
 		OriginMessageID string `json:"origin_message_id"`
 	}{parentPlaceID, name, originMessageID})
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return Thread{}, false, fmt.Errorf("begin create thread: %w", err)
 	}
@@ -180,7 +180,7 @@ func joinThread(ctx context.Context, tx pgx.Tx, placeID string, membership works
 // participant list are three statements, and at READ COMMITTED a commit
 // between them would produce a summary that existed at no single moment.
 func (s *ScopedStore) ThreadsIn(ctx context.Context, parentPlaceID string) ([]Thread, error) {
-	tx, err := s.Store.beginOpenSnapshot(ctx)
+	tx, err := s.beginSnapshotTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +211,7 @@ func (s *ScopedStore) ThreadsIn(ctx context.Context, parentPlaceID string) ([]Th
 
 // ThreadsFor lists the threads this viewer participates in, from one snapshot.
 func (s *ScopedStore) ThreadsFor(ctx context.Context) ([]Thread, error) {
-	tx, err := s.Store.beginOpenSnapshot(ctx)
+	tx, err := s.beginSnapshotTx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +234,7 @@ func (s *ScopedStore) ThreadsFor(ctx context.Context) ([]Thread, error) {
 
 // ThreadFor projects one thread from one snapshot.
 func (s *ScopedStore) ThreadFor(ctx context.Context, threadID string) (Thread, error) {
-	tx, err := s.Store.beginOpenSnapshot(ctx)
+	tx, err := s.beginSnapshotTx(ctx)
 	if err != nil {
 		return Thread{}, err
 	}
