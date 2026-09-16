@@ -217,6 +217,129 @@ func TestFirebaseEmulatorUnlinkReconcilesRemoteAppliedDatabaseLost(t *testing.T)
 	}
 }
 
+func TestFirebaseEmulatorOrphanedUnlinkSettlesFromLiveAccountWithoutNonce(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	client := firebaseProviderEmulatorClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	uid := firebaseEmulatorID(t, "unlink-orphan")
+	createFirebaseEmulatorUser(t, client, uid, map[string]string{
+		"google.com": "google-subject", "github.com": "github-subject",
+	})
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, subject := range map[string]string{"google.com": "google-subject", "github.com": "github-subject"} {
+		if err := store.BindCredential(ctx, provider, subject, registered.HumanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lifecycle := &firebaseAdminProviderLifecycle{client: client}
+	controller := newKosekiAuthFlowController(store, "local", lifecycle)
+	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
+	identity := agentevents.FirebaseIdentity{
+		UID: uid, AuthTime: time.Now().UTC(), SignInProvider: "google.com",
+		ProviderSubjects: map[string][]string{"google.com": {"google-subject"}},
+	}
+	orphanUnlink := func(provider string) string {
+		t.Helper()
+		operation, err := store.BeginProviderOperation(ctx, registered.HumanID, uid, provider, "unlink", "account_settings", controllerNonce(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return operation.OperationID
+	}
+	expire := func(operationID, interval string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "UPDATE provider_operations SET expires_at=now()-$2::interval WHERE operation_id=$1", operationID, interval); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outcome := func(operationID string) string {
+		t.Helper()
+		var status, terminal string
+		if err := pool.QueryRow(ctx, "SELECT status, COALESCE(terminal_outcome, '') FROM provider_operations WHERE operation_id=$1", operationID).Scan(&status, &terminal); err != nil {
+			t.Fatal(err)
+		}
+		return status + "/" + terminal
+	}
+
+	// The remote delete never happened and the browser record is gone.
+	untouched := orphanUnlink("github.com")
+	expire(untouched, "1 second")
+	link := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	if _, err := controller.StartProviderOperation(ctx, claims, link, identity); !errors.Is(err, agentevents.ErrBrowserAuthProviderPending) {
+		t.Fatalf("present provider inside grace released its fence: %v", err)
+	}
+	// Past the grace the server cannot know whether the original delete is
+	// still in flight, so it does not declare the remote final: it drives one
+	// bounded reconcile delete of the recorded subject itself. The emulator
+	// applies it — the orphan completes as unlinked and the fence releases.
+	expire(untouched, "3 minutes")
+	started, err := controller.StartProviderOperation(ctx, claims, link, identity)
+	if err != nil || started.Outcome != "client_operation_required" || outcome(untouched) != "completed/unlinked" {
+		t.Fatalf("untouched orphan reconcile: %+v %v %s", started, err, outcome(untouched))
+	}
+	account, err := lifecycle.ProviderAccount(ctx, uid)
+	if err != nil {
+		t.Fatalf("read remote account: %v", err)
+	}
+	if _, stillLinked := account.ProviderSubjects["github.com"]; stillLinked {
+		t.Fatalf("reconcile delete did not remove the provider: %+v", account)
+	}
+	if _, err := store.ActiveProviderSubject(ctx, registered.HumanID, "github.com"); err == nil {
+		t.Fatal("credential stayed active after reconciled remote removal")
+	}
+	if _, err := controller.FailProviderOperation(ctx, claims, agentevents.FailProviderOperationRequest{OperationID: started.OperationID, Nonce: link.Nonce, Outcome: "cancelled"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The remote delete landed but its reply and browser record were lost —
+	// a second principal, since the emulator cannot re-link the removed
+	// provider to the same user through Admin. Credentials are globally
+	// unique on (provider, subject), so this principal gets its own.
+	uid2 := firebaseEmulatorID(t, "unlink-orphan-applied")
+	createFirebaseEmulatorUser(t, client, uid2, map[string]string{
+		"google.com": "google-subject-2", "github.com": "github-subject-2",
+	})
+	registered2, err := store.AutoRegister(ctx, "firebase", uid2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for provider, subject := range map[string]string{"google.com": "google-subject-2", "github.com": "github-subject-2"} {
+		if err := store.BindCredential(ctx, provider, subject, registered2.HumanID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims2 := agentevents.UserSessionClaims{TenantID: "local", UserID: registered2.HumanID, PersonalityAgentID: registered2.AgentID}
+	identity2 := agentevents.FirebaseIdentity{
+		UID: uid2, AuthTime: time.Now().UTC(), SignInProvider: "google.com",
+		ProviderSubjects: map[string][]string{"google.com": {"google-subject-2"}},
+	}
+	applied, err := store.BeginProviderOperation(ctx, registered2.HumanID, uid2, "github.com", "unlink", "account_settings", controllerNonce(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.DeleteProvider(ctx, uid2, "github.com"); err != nil {
+		t.Fatal(err)
+	}
+	expire(applied.OperationID, "1 second")
+	link2 := agentevents.StartProviderOperationRequest{Provider: "google.com", Operation: "link", DecisionPath: "account_settings", Nonce: controllerNonce(t)}
+	started, err = controller.StartProviderOperation(ctx, claims2, link2, identity2)
+	if err != nil || started.Outcome != "client_operation_required" || outcome(applied.OperationID) != "completed/unlinked" {
+		t.Fatalf("applied orphan settlement: %+v %v %s", started, err, outcome(applied.OperationID))
+	}
+	if _, err := store.ActiveProviderSubject(ctx, registered2.HumanID, "github.com"); err == nil {
+		t.Fatal("credential stayed active after settled remote removal")
+	}
+	methods, err := controller.ProviderMethods(ctx, claims2)
+	if err != nil || len(methods.Providers) != 1 || methods.Providers[0] != "google.com" {
+		t.Fatalf("live methods after settlement: %+v %v", methods, err)
+	}
+}
+
 func TestFirebaseEmulatorLinkNonceReplayCannotEscapePendingUnlinkFence(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	client := firebaseProviderEmulatorClient(t)

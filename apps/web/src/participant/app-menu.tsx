@@ -53,9 +53,6 @@ export function ParticipantAppsMenu() {
   return (
     <Popover>
       <PopoverTrigger
-        openOnHover
-        delay={0}
-        closeDelay={120}
         render={
           <Button
             variant="ghost"

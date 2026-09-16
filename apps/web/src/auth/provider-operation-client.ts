@@ -1,8 +1,37 @@
-import { postAuthJSON } from "./session-client";
+import { getAuthJSON, postAuthJSON } from "./session-client";
 
 export type ManagedProvider = "google.com" | "github.com";
 export type ProviderOperation = "link" | "unlink";
 export type ProviderDecisionPath = "account_settings" | "same_email_recovery";
+
+export interface ProviderMethods {
+  providers: ManagedProvider[];
+  email: boolean;
+}
+
+/**
+ * The server's live view of the session Human's usable sign-in methods — the
+ * same truth the unlink guard counts. `providers` covers only the managed
+ * OAuth providers; `email` is the server-side usable-email verdict. This read
+ * also makes a removal another browser applied visible here, so it must not
+ * be replaced by the local Firebase SDK's cached providerData.
+ */
+export async function getProviderMethods(): Promise<ProviderMethods> {
+  const body = await getAuthJSON("/auth/providers");
+  if (
+    !isObject(body) ||
+    !Array.isArray(body.providers) ||
+    !body.providers.every(isManagedProvider) ||
+    typeof body.email !== "boolean"
+  ) {
+    throw new Error("Invalid provider methods response.");
+  }
+  return { providers: body.providers, email: body.email };
+}
+
+function isManagedProvider(value: unknown): value is ManagedProvider {
+  return value === "google.com" || value === "github.com";
+}
 
 export interface ProviderOperationResult {
   operationId: string;
