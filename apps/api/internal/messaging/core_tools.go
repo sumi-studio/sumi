@@ -65,9 +65,9 @@ const (
 func (d *CoreAttentionDelivery) CoreToolEffects() map[string]agentstate.ToolEffect {
 	return map[string]agentstate.ToolEffect{
 		MessagingCoreTool:                 {Apply: d.applySend, AfterCommit: d.afterSendCommit},
-		MessagingCoreOverviewTool:         {Apply: d.applyOverview},
-		MessagingCoreOpenTool:             {Apply: d.applyOpen},
-		MessagingCoreSearchTool:           {Apply: d.applySearch},
+		MessagingCoreOverviewTool:         {Apply: d.applyOverview, ReadOnly: alwaysReadOnly},
+		MessagingCoreOpenTool:             {Apply: d.applyOpen, ReadOnly: alwaysReadOnly},
+		MessagingCoreSearchTool:           {Apply: d.applySearch, ReadOnly: alwaysReadOnly},
 		MessagingCoreStartDMTool:          {Apply: d.applyStartDM, AfterCommit: d.afterPlaceCreatedCommit},
 		MessagingCoreCreateChannelTool:    {Apply: d.applyCreateChannel, AfterCommit: d.afterPlaceCreatedCommit},
 		MessagingCoreDuplicateChannelTool: {Apply: d.applyDuplicateChannel, AfterCommit: d.afterPlaceCreatedCommit},
@@ -75,10 +75,30 @@ func (d *CoreAttentionDelivery) CoreToolEffects() map[string]agentstate.ToolEffe
 		MessagingCoreCreateThreadTool:     {Apply: d.applyCreateThread, AfterCommit: d.afterThreadCreatedCommit},
 		MessagingCoreEditMessageTool:      {Apply: d.applyEditMessage, AfterCommit: d.afterMessageEditedCommit},
 		MessagingCoreDeleteMessageTool:    {Apply: d.applyDeleteMessage, AfterCommit: d.afterMessageDeletedCommit},
-		MessagingCoreNotificationTool:     {Apply: d.applyNotificationSettings},
+		MessagingCoreNotificationTool:     {Apply: d.applyNotificationSettings, ReadOnly: notificationSettingsReadOnly},
 		MessagingCoreUploadTool:           {Apply: d.applyUploadAttachment},
-		MessagingCoreOpenAttachmentTool:   {Apply: d.applyOpenAttachment},
+		MessagingCoreOpenAttachmentTool:   {Apply: d.applyOpenAttachment, ReadOnly: alwaysReadOnly},
 	}
+}
+
+// alwaysReadOnly declares a delegated effect that can never change anything
+// outside its own operation record — history, overview, search, and
+// attachment reads.
+func alwaysReadOnly(map[string]any) bool { return true }
+
+// notificationSettingsMutation reports whether a settings call writes — the
+// same request keys applyNotificationSettings treats as a replacement — so
+// the notice's effect check and the effect itself can never disagree about
+// what a read is.
+func notificationSettingsMutation(request map[string]any) bool {
+	_, hasDefaults := request["defaults_level"]
+	_, hasPerPlace := request["per_place"]
+	_, hasKeywords := request["keywords"]
+	return hasDefaults || hasPerPlace || hasKeywords
+}
+
+func notificationSettingsReadOnly(request map[string]any) bool {
+	return !notificationSettingsMutation(request)
 }
 
 // --- request decoding helpers ---
@@ -557,21 +577,18 @@ func (d *CoreAttentionDelivery) applyNotificationSettings(ctx context.Context, t
 	if err != nil {
 		return nil, coreEffectFailure(err)
 	}
-	_, hasDefaults := request["defaults_level"]
-	_, hasPerPlace := request["per_place"]
-	_, hasKeywords := request["keywords"]
-	if !hasDefaults && !hasPerPlace && !hasKeywords {
+	if !notificationSettingsMutation(request) {
 		return map[string]any{"setting": wireMap(notificationSettingToWire(current))}, nil
 	}
 	defaultLevel := current.DefaultLevel
-	if hasDefaults {
+	if _, hasDefaults := request["defaults_level"]; hasDefaults {
 		defaultLevel = coreRequestString(request, "defaults_level")
 		if err := ValidateNotifyLevel(defaultLevel); err != nil {
 			return nil, coreEffectFailure(err)
 		}
 	}
 	perPlace := current.PerPlace
-	if hasPerPlace {
+	if _, hasPerPlace := request["per_place"]; hasPerPlace {
 		var entries []struct {
 			Place placeWire `json:"place"`
 			Level string    `json:"level"`
@@ -596,7 +613,7 @@ func (d *CoreAttentionDelivery) applyNotificationSettings(ctx context.Context, t
 		}
 	}
 	keywords := current.Keywords
-	if hasKeywords {
+	if _, hasKeywords := request["keywords"]; hasKeywords {
 		var list []string
 		raw, err := json.Marshal(request["keywords"])
 		if err != nil || json.Unmarshal(raw, &list) != nil {

@@ -382,6 +382,12 @@ type TerminalFailureNoticeFunc func(ctx context.Context, tx pgx.Tx, f TerminalFa
 type ToolEffect struct {
 	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
 	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
+	// ReadOnly reports whether a completed call could not have changed
+	// anything outside its own operation record — a predicate because some
+	// tools both read and write and the request decides which. A nil
+	// predicate means the effect may mutate; never mark a mutating effect
+	// read-only.
+	ReadOnly func(request map[string]any) bool
 }
 
 func NewStore(pool *pgxpool.Pool) *Store {
@@ -2547,6 +2553,49 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		}
 		return op, a, false, nil
 	}
+}
+
+// InputMayHaveCommittedEffects reports whether the operation ledger records
+// work for this input that may already have run — across every attempt of
+// the input, not only the failing turn, because a replayed claim keeps the
+// first claiming turn's id. A failed operation ran no effect and a
+// read-only operation changed nothing outside its own record; a tool known
+// to neither registry is conservatively treated as able to mutate.
+func (s *Store) InputMayHaveCommittedEffects(ctx context.Context, tx pgx.Tx, personaID, inputID string) (bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT o.tool, o.request FROM core_operations o
+		JOIN core_turns t ON t.persona_id = o.persona_id AND t.turn_id = o.turn_id
+		WHERE o.persona_id = $1 AND t.input_id = $2 AND o.status <> 'failed'`,
+		personaID, inputID)
+	if err != nil {
+		return false, dataErr(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tool string
+		var request map[string]any
+		if err := rows.Scan(&tool, &request); err != nil {
+			return false, err
+		}
+		if !s.operationReadOnly(tool, request) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// operationReadOnly reports whether a recorded call could not have changed
+// anything outside its own operation row: internal reads are marked in
+// toolAuthority, delegated effects declare a ReadOnly predicate, and a tool
+// known to neither is treated as able to mutate.
+func (s *Store) operationReadOnly(tool string, request map[string]any) bool {
+	if info, ok := toolAuthority[tool]; ok && info.internal {
+		return info.readOnly
+	}
+	if effect, ok := s.effects[tool]; ok && effect.ReadOnly != nil {
+		return effect.ReadOnly(request)
+	}
+	return false
 }
 
 func (s *Store) operationByKey(ctx context.Context, db queryRower, personaID, tool, idemKey string) (Operation, error) {

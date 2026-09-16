@@ -24,7 +24,7 @@ import (
 // instead of posting a second one. A notice error never vetoes the commit:
 // the failure record must land even when nothing can be posted.
 func (d *CoreAttentionDelivery) TerminalFailureNotice(ctx context.Context, tx pgx.Tx, f agentstate.TerminalFailure) (func(context.Context), error) {
-	if d == nil || d.Messaging == nil {
+	if d == nil || d.Messaging == nil || d.Core == nil {
 		return nil, nil
 	}
 	var surface, attention string
@@ -73,26 +73,17 @@ func (d *CoreAttentionDelivery) TerminalFailureNotice(ctx context.Context, tx pg
 	default:
 		return nil, err
 	}
-	// The request may have failed after some of its effects committed. The
-	// durable operation ledger is the record of what actually ran — it, not
-	// the error text, decides whether "ask again" is honest.
-	var effectsCommitted bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM core_operations
-			WHERE persona_id = $1 AND turn_id = $2)`,
-		f.PersonaID, f.TurnID).Scan(&effectsCommitted); err != nil {
+	// The request may have failed after some of its work ran. The durable
+	// operation ledger is the record of what actually happened — it, not
+	// the error text, decides whether "ask again" is honest. The ledger is
+	// input-scoped: an input's effects may be spread over several attempts,
+	// and a replayed claim keeps its first turn's id, so the check must
+	// cover the whole input, not just this turn.
+	effectsCommitted, err := d.Core.InputMayHaveCommittedEffects(ctx, tx, f.PersonaID, f.InputID)
+	if err != nil {
 		return nil, err
 	}
-	var next string
-	if effectsCommitted {
-		// The request may have failed after some of its effects committed.
-		// Repeating the whole request can double-apply that work, so the
-		// notice points at what remains instead of inviting a blind retry.
-		next = "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
-	} else {
-		next = "このリクエストによる送信や変更は行われていません。" + failureNoticeNext(f)
-	}
+	next := failureNoticeNext(f, effectsCommitted)
 	appendIn := AppendInput{
 		PlaceID:     placeID,
 		Content:     "このリクエストは完了できませんでした。" + failureNoticeCause(f) + next,
@@ -145,16 +136,28 @@ func failureNoticeCause(f agentstate.TerminalFailure) string {
 	return "予期しない問題が発生しました。"
 }
 
-// failureNoticeNext renders what the requester can do next when the
-// operation ledger shows the turn committed nothing — a plain retry is
-// honest there. Where the classification names a concrete fix, the notice
-// says so instead of a bare "try again".
-func failureNoticeNext(f agentstate.TerminalFailure) string {
+// failureNoticeNext renders what the requester can do next. When the
+// operation ledger shows none of the request's work could have changed
+// anything, a plain retry is honest; where the classification names a
+// concrete fix, the notice says so first. When work may already have run,
+// repeating the whole request can double-apply it — the notice warns and
+// asks for what is still needed instead of inviting a blind retry, while
+// keeping a concrete fix where one exists.
+func failureNoticeNext(f agentstate.TerminalFailure, effectsCommitted bool) string {
+	if effectsCommitted {
+		switch f.ErrorKind {
+		case "no_model_connection":
+			return "一部の処理はすでに実行された可能性があります。「AIの接続」で使う接続を選んでから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
+		case "oversize_plan":
+			return "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを分けて、新しいメッセージでお知らせください。"
+		}
+		return "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
+	}
 	switch f.ErrorKind {
 	case "no_model_connection":
-		return "「AIの接続」で使う接続を選んでから、もう一度お尋ねください。"
+		return "このリクエストによる送信や変更は行われていません。「AIの接続」で使う接続を選んでから、もう一度お尋ねください。"
 	case "oversize_plan":
-		return "内容を分けて、もう一度お尋ねください。"
+		return "このリクエストによる送信や変更は行われていません。内容を分けて、もう一度お尋ねください。"
 	}
-	return "もう一度お尋ねください。"
+	return "このリクエストによる送信や変更は行われていません。もう一度お尋ねください。"
 }

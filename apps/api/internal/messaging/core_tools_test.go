@@ -1153,19 +1153,191 @@ func TestCoreToolsTerminalFailureNotice(t *testing.T) {
 		t.Fatalf("committed effects must not offer a clean retry: %q", notice.Content)
 	}
 
+	// The operation ledger is input-scoped, not turn-scoped: a send that
+	// committed in an earlier attempt still counts when a later attempt of
+	// the same input fails — the terminal turn itself claims no operations
+	// (the attempt-cap shape), so a turn_id check would wrongly promise
+	// "nothing was sent" while the message sits in history.
+	ask3 := w.send(t, ctx, ch.PlaceID, w.humanA, "post the note, then keep going")
+	submit("messaging:notice-attempts", "reply", ask3.MessageID, ask3.Content)
+	sendRequest := map[string]any{"place_id": ch.PlaceID, "content": "earlier attempt effect"}
+	turnA := nextTurn()
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, turnA, gen, 0,
+		agentstate.Decision{Text: "acting", Calls: []agentstate.PlanCall{{
+			CallID: "c0", Tool: MessagingCoreTool, Route: "normal", Request: sendRequest,
+		}}}); err != nil {
+		t.Fatalf("save plan attempt 1: %v", err)
+	}
+	op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, turnA,
+		gen, turnA+":op:0", MessagingCoreTool, 0, sendRequest)
+	if err != nil || !fresh || op.Status != "done" {
+		t.Fatalf("attempt 1 claim: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	retryable := agentstate.CommitRequest{Outcome: "fail", Retryable: true, Error: "provider hiccup"}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnA, gen, retryable); err != nil {
+		t.Fatalf("attempt 1 retryable fail: %v", err)
+	}
+	clearBackoff := func(inputID string) {
+		t.Helper()
+		if _, err := w.store.core.pool.Exec(ctx, `
+			UPDATE core_inputs SET not_before = NULL
+			WHERE persona_id = $1 AND input_id = $2`,
+			w.agent.ID, inputID); err != nil {
+			t.Fatalf("clear backoff %s: %v", inputID, err)
+		}
+	}
+	// Attempt 2 replays the recorded plan: the claim returns the stored
+	// receipt — fresh=false — and the operation keeps attempt 1's turn id.
+	clearBackoff("messaging:notice-attempts")
+	turnB := nextTurn()
+	op, _, fresh, err = coreStore.ClaimOperation(ctx, w.agent.ID, turnB,
+		gen, turnB+":op:0", MessagingCoreTool, 0, sendRequest)
+	if err != nil || fresh || op.Status != "done" {
+		t.Fatalf("attempt 2 receipt replay: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	var opTurn string
+	if err := w.store.core.pool.QueryRow(ctx, `
+		SELECT turn_id FROM core_operations
+		WHERE persona_id = $1 AND operation_id = $2`,
+		w.agent.ID, turnA+":op:0").Scan(&opTurn); err != nil || opTurn != turnA {
+		t.Fatalf("operation turn_id = %q err=%v, want claiming turn %q", opTurn, err, turnA)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnB, gen, retryable); err != nil {
+		t.Fatalf("attempt 2 retryable fail: %v", err)
+	}
+	// Attempt 3 gives up — like an attempt cap, this turn claims nothing.
+	clearBackoff("messaging:notice-attempts")
+	turnC := nextTurn()
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnC, gen, failReq); err != nil {
+		t.Fatalf("attempt 3 terminal fail: %v", err)
+	}
+	msgs = history()
+	notice = msgs[len(msgs)-1]
+	if notice.Author != w.agent || notice.ReplyTo != ask3.MessageID {
+		t.Fatalf("earlier-attempt notice = %+v", notice)
+	}
+	if !strings.Contains(notice.Content, "実行された可能性") ||
+		strings.Contains(notice.Content, "送信や変更は行われていません") {
+		t.Fatalf("earlier-attempt effect must hedge, got: %q", notice.Content)
+	}
+	sentEarlier := false
+	for _, m := range msgs {
+		if m.Author == w.agent && m.Content == "earlier attempt effect" {
+			sentEarlier = true
+		}
+	}
+	if !sentEarlier {
+		t.Fatalf("the committed send is missing from history: %+v", msgs)
+	}
+
+	// Read-only work is not a change: an input that only ran reads fails
+	// with the truthful no-change wording, and a classified cause keeps its
+	// concrete next step.
+	ask4 := w.send(t, ctx, ch.PlaceID, w.humanA, "check the board for me")
+	submit("messaging:notice-readonly", "reply", ask4.MessageID, ask4.Content)
+	turnD := nextTurn()
+	overviewRequest := map[string]any{"workspace_id": ws.WorkspaceID}
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, turnD, gen, 0,
+		agentstate.Decision{Text: "reading", Calls: []agentstate.PlanCall{{
+			CallID: "c0", Tool: MessagingCoreOverviewTool, Route: "normal", Request: overviewRequest,
+		}}}); err != nil {
+		t.Fatalf("save plan readonly: %v", err)
+	}
+	if op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, turnD,
+		gen, turnD+":op:0", MessagingCoreOverviewTool, 0, overviewRequest); err != nil ||
+		!fresh || op.Status != "done" {
+		t.Fatalf("overview claim: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	noConnection := agentstate.CommitRequest{
+		Outcome: "fail", Retryable: false,
+		Error:     "no model connection configured for this persona",
+		ErrorKind: "no_model_connection",
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnD, gen, noConnection); err != nil {
+		t.Fatalf("readonly commit fail: %v", err)
+	}
+	msgs = history()
+	notice = msgs[len(msgs)-1]
+	if notice.Author != w.agent || notice.ReplyTo != ask4.MessageID {
+		t.Fatalf("readonly notice = %+v", notice)
+	}
+	if strings.Contains(notice.Content, "実行された可能性") ||
+		!strings.Contains(notice.Content, "送信や変更は行われていません") ||
+		!strings.Contains(notice.Content, "「AIの接続」") {
+		t.Fatalf("read-only notice must not hedge and must keep the fix: %q", notice.Content)
+	}
+	if strings.Contains(notice.Content, "no model connection configured") {
+		t.Fatalf("notice leaked the recorded diagnostic: %q", notice.Content)
+	}
+
+	// notification_settings is request-conditional: a read-shaped call is
+	// not a change, a write-shaped one is.
+	ask5 := w.send(t, ctx, ch.PlaceID, w.humanA, "are my mentions muted?")
+	submit("messaging:notice-settings-read", "reply", ask5.MessageID, ask5.Content)
+	turnE := nextTurn()
+	settingsRead := map[string]any{"workspace_id": ws.WorkspaceID}
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, turnE, gen, 0,
+		agentstate.Decision{Text: "reading", Calls: []agentstate.PlanCall{{
+			CallID: "c0", Tool: MessagingCoreNotificationTool, Route: "normal", Request: settingsRead,
+		}}}); err != nil {
+		t.Fatalf("save plan settings read: %v", err)
+	}
+	if op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, turnE,
+		gen, turnE+":op:0", MessagingCoreNotificationTool, 0, settingsRead); err != nil ||
+		!fresh || op.Status != "done" {
+		t.Fatalf("settings read claim: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnE, gen, failReq); err != nil {
+		t.Fatalf("settings read commit fail: %v", err)
+	}
+	msgs = history()
+	notice = msgs[len(msgs)-1]
+	if strings.Contains(notice.Content, "実行された可能性") ||
+		!strings.Contains(notice.Content, "送信や変更は行われていません") {
+		t.Fatalf("settings read must not hedge: %q", notice.Content)
+	}
+
+	// A committed write before a classified failure still warns — and the
+	// classified fix stays useful instead of a blanket retry.
+	ask6 := w.send(t, ctx, ch.PlaceID, w.humanA, "mute everything and report")
+	submit("messaging:notice-partial-known", "reply", ask6.MessageID, ask6.Content)
+	turnF := nextTurn()
+	settingsWrite := map[string]any{"workspace_id": ws.WorkspaceID, "defaults_level": "mute"}
+	if _, _, err := coreStore.SavePlan(ctx, w.agent.ID, turnF, gen, 0,
+		agentstate.Decision{Text: "writing", Calls: []agentstate.PlanCall{{
+			CallID: "c0", Tool: MessagingCoreNotificationTool, Route: "normal", Request: settingsWrite,
+		}}}); err != nil {
+		t.Fatalf("save plan settings write: %v", err)
+	}
+	if op, _, fresh, err := coreStore.ClaimOperation(ctx, w.agent.ID, turnF,
+		gen, turnF+":op:0", MessagingCoreNotificationTool, 0, settingsWrite); err != nil ||
+		!fresh || op.Status != "done" {
+		t.Fatalf("settings write claim: %+v fresh=%t err=%v", op, fresh, err)
+	}
+	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnF, gen, noConnection); err != nil {
+		t.Fatalf("partial known commit fail: %v", err)
+	}
+	msgs = history()
+	notice = msgs[len(msgs)-1]
+	if !strings.Contains(notice.Content, "実行された可能性") ||
+		!strings.Contains(notice.Content, "「AIの接続」") ||
+		strings.Contains(notice.Content, "お尋ねください") {
+		t.Fatalf("partial known-cause notice = %q", notice.Content)
+	}
+
 	// Once the secretary's membership is closed, the notice has no permitted
 	// place to land — nothing posts, and the failure still records.
 	if err := w.store.RemoveWorkspaceMember(ctx, ws.WorkspaceID, w.agent); err != nil {
 		t.Fatalf("remove member: %v", err)
 	}
-	ask3 := w.send(t, ctx, ch.PlaceID, w.humanA, "one more thing")
-	submit("messaging:notice-removed", "reply", ask3.MessageID, ask3.Content)
+	ask7 := w.send(t, ctx, ch.PlaceID, w.humanA, "one more thing")
+	submit("messaging:notice-removed", "reply", ask7.MessageID, ask7.Content)
 	turnID = nextTurn()
 	if _, err := coreStore.CommitTurn(ctx, w.agent.ID, turnID, gen, failReq); err != nil {
 		t.Fatalf("removed-scope commit fail: %v", err)
 	}
 	msgs = history()
-	if last := msgs[len(msgs)-1]; last.MessageID != ask3.MessageID {
+	if last := msgs[len(msgs)-1]; last.MessageID != ask7.MessageID {
 		t.Fatalf("removed scope still posted a notice: %+v", last)
 	}
 }
@@ -1372,8 +1544,16 @@ func TestFailureNoticeCauseStaysPublic(t *testing.T) {
 		if got := failureNoticeCause(f); strings.Contains(got, canary) {
 			t.Fatalf("kind %q: private diagnostic reached the notice: %q", kind, got)
 		}
-		if got := failureNoticeNext(f); strings.Contains(got, canary) {
-			t.Fatalf("kind %q: private diagnostic reached the next action: %q", kind, got)
+		for _, effectsCommitted := range []bool{false, true} {
+			if got := failureNoticeNext(f, effectsCommitted); strings.Contains(got, canary) {
+				t.Fatalf("kind %q committed=%t: private diagnostic reached the next action: %q",
+					kind, effectsCommitted, got)
+			}
+		}
+		// The hedge branch never offers a blanket re-ask — a repeat could
+		// double-apply work that already ran.
+		if got := failureNoticeNext(f, true); strings.Contains(got, "もう一度お尋ねください") {
+			t.Fatalf("kind %q: committed-effects wording invites a blind retry: %q", kind, got)
 		}
 	}
 	if got := failureNoticeCause(agentstate.TerminalFailure{}); !strings.Contains(got, "予期しない問題") {

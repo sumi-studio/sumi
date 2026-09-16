@@ -89,14 +89,19 @@ var toolAuthority = map[string]struct {
 	internal         bool
 	requiresApproval bool
 	elevatedOnly     bool
+	// readOnly marks an internal tool that can never change anything
+	// outside its own operation record. The public failure notice uses it
+	// to keep "nothing was sent or changed" honest; a tool without the
+	// mark is conservatively treated as able to mutate.
+	readOnly bool
 }{
 	"schedule.set":         {internal: true},
 	"journal.note":         {internal: true},
-	"conversation_history": {internal: true},
+	"conversation_history": {internal: true, readOnly: true},
 	// Jobs (merged slice): ordinary internal effects under the secretary's
 	// own authority — no human decision on either route.
 	"job.start":  {internal: true},
-	"job.status": {internal: true},
+	"job.status": {internal: true, readOnly: true},
 	"job.cancel": {internal: true},
 	// Speaking into the shared channel on the human's behalf is an
 	// outward-facing act requiring consent. Per ADR 0013 §2 the Normal
