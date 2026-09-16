@@ -24,7 +24,12 @@ const confirmation = {
   next_action: "create_account",
   continuation: "/",
 };
-const terminal = { ...proof, outcome: "account_created", continuation: "/" };
+const terminal = {
+  ...proof,
+  outcome: "account_created",
+  continuation: "/",
+  human_id: "human-1",
+};
 function capture() {
   history.replaceState(null, "", `/#invite=${token}`);
   captureEnrollmentInvitation();
@@ -48,7 +53,7 @@ afterEach(() => {
 it.each([
   "google.com",
   "github.com",
-  "email_link",
+  "email_code",
 ] as const)("binds invitation at %s startup and keeps it through confirmation", async (provider) => {
   capture();
   const mock = responses(proof, confirmation, terminal);

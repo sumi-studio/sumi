@@ -49,10 +49,13 @@ const employmentAuthorityLockDomain = "sumi:employment-authority:v1:"
 // credential binding flows through it; no other component writes the registry.
 type Store struct {
 	EnrollmentWorkspaceAuthority EnrollmentWorkspaceAuthority
-	pool                         *pgxpool.Pool
-	wrappingKeyID                string
-	directChatLifecycle          *directchat.LifecycleFence
-	directChatApps               *applicationapps.Store
+	// EmailChallengeKey derives emailed codes and link tokens. Email sign-in
+	// fails closed while it is unset.
+	EmailChallengeKey   *EmailChallengeKey
+	pool                *pgxpool.Pool
+	wrappingKeyID       string
+	directChatLifecycle *directchat.LifecycleFence
+	directChatApps      *applicationapps.Store
 }
 
 // New returns a Store backed by the given pool. The pool must be connected to a

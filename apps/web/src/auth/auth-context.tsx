@@ -29,10 +29,18 @@ import {
 import {
   type AuthIntent,
   confirmAuthFlow,
+  discardAuthFlow,
+  type EmailChallengeStatus,
   resolveAuthFlow,
 } from "./auth-flow-client";
 import {
+  clearActiveEmailFlowState,
+  clearPendingEmailFlow,
+  clearPendingRedirectFlow,
   isExpiredFlow,
+  listPendingEmailFlows,
+  loadPendingEmailFlow,
+  loadPendingRedirectFlow,
   type PendingRedirectAuthFlow,
   type RecoverableProvider,
 } from "./auth-flow-state";
@@ -49,11 +57,22 @@ import {
   isSameEmailCredentialCollision,
 } from "./credential-recovery";
 import {
-  beginEmailLinkAuth,
-  completeEmailLinkAuth,
-  hasEmailLinkCallback,
-  rejectEmailLinkAuth,
-} from "./email-link-auth";
+  type ActiveEmailCodeFlow,
+  abandonEmailCodeFlow,
+  beginEmailCodeAuth,
+  clearPendingEmailLink,
+  completeEmailLink as completeEmailLinkProof,
+  type EmailLinkInspection,
+  type EmailProof,
+  ensureEmailCompletionSession,
+  finishEmailProof,
+  inspectEmailLink as inspectPendingEmailLink,
+  loadActiveEmailCodeFlow,
+  pendingEmailLink,
+  readEmailCodeStatus,
+  resendEmailCode as requestEmailCodeResend,
+  verifyEmailCode,
+} from "./email-code-auth";
 import { getFirebaseAuth } from "./firebase";
 import { isFirebaseConfigured } from "./firebase-config";
 import {
@@ -139,6 +158,31 @@ export interface AuthUser {
   photoURL: string | null;
 }
 
+export interface EmailCodeView {
+  email: string;
+  intent: AuthIntent;
+  /** A provider collision waits for this email proof before linking. */
+  recovery: boolean;
+  challenge: EmailChallengeStatus | null;
+}
+
+/**
+ * A sign-in resolved to a Human while this jar already belongs to another.
+ * The person chooses: switch (the server retires the active session and
+ * issues the new one) or cancel (the interrupted flow is discarded).
+ */
+export interface AccountSwitchPrompt {
+  currentUserId: string;
+  currentDisplayName: string | null;
+  /** What the interrupted sign-in was for, e.g. its email address. */
+  target: string;
+}
+
+interface PendingAccountSwitch extends AccountSwitchPrompt {
+  resume: (switchFromUserId: string) => Promise<void>;
+  abandon: () => Promise<void>;
+}
+
 export interface AuthContextValue {
   configured: boolean;
   loading: boolean;
@@ -150,15 +194,28 @@ export interface AuthContextValue {
   user: AuthUser | null;
   confirmation: PendingAuthConfirmation | null;
   outcomeNotice: AuthOutcomeNotice | null;
-  emailLinkCallbackPending: boolean;
+  emailCode: EmailCodeView | null;
+  emailLinkPending: boolean;
+  accountSwitch: AccountSwitchPrompt | null;
+  confirmAccountSwitch: () => Promise<void>;
+  cancelAccountSwitch: () => void;
   credentialRecoveryEmailSent: boolean;
   redirectSignInPending: boolean;
   redirectSignInError: unknown;
   dismissRedirectSignInError: () => void;
   signIn: (provider: SignInProvider, intent: AuthIntent) => Promise<void>;
-  sendEmailLink: (email: string, intent: AuthIntent) => Promise<void>;
-  completeEmailLink: () => Promise<void>;
-  rejectEmailLink: () => void;
+  startEmailCode: (email: string, intent: AuthIntent) => Promise<void>;
+  submitEmailCode: (code: string) => Promise<void>;
+  resendEmailCode: () => Promise<void>;
+  refreshEmailCode: () => Promise<void>;
+  cancelEmailCode: () => void;
+  inspectEmailLink: () => Promise<EmailLinkInspection>;
+  continueEmailLink: (
+    inspection: EmailLinkInspection,
+    adopt: boolean,
+    options?: { switchFromUserId?: string },
+  ) => Promise<void>;
+  dismissEmailLink: () => void;
   confirmIntentTransition: () => Promise<void>;
   cancelIntentTransition: () => Promise<void>;
   dismissOutcomeNotice: () => void;
@@ -193,9 +250,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [outcomeNotice, setOutcomeNotice] = useState<AuthOutcomeNotice | null>(
     null,
   );
-  const [emailLinkCallbackPending, setEmailLinkCallbackPending] = useState(() =>
-    hasEmailLinkCallback(),
+  const [emailCodeFlow, setEmailCodeFlow] =
+    useState<ActiveEmailCodeFlow | null>(() => loadActiveEmailCodeFlow());
+  const [emailChallenge, setEmailChallenge] =
+    useState<EmailChallengeStatus | null>(null);
+  const [emailLinkPending, setEmailLinkPending] = useState(
+    () => pendingEmailLink() !== null,
   );
+  const [accountSwitch, setAccountSwitch] =
+    useState<PendingAccountSwitch | null>(null);
   const [credentialRecoveryEmailSent, setCredentialRecoveryEmailSent] =
     useState(false);
   // Every state-changing auth operation claims a generation. Late session
@@ -440,6 +503,81 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [claimSavedOutcomeNotice, confirmation, nextGeneration]);
 
   /**
+   * A failed completion may still have committed a session — for this flow's
+   * Human or for a later choice made in another tab. Publishing the jar's
+   * actual state keeps the UI honest; a blind logout would erase another
+   * account's legitimate sign-in.
+   */
+  const reconcileSessionState = useCallback(async () => {
+    let status: SumiSessionStatus;
+    try {
+      status = await getSumiSession();
+    } catch {
+      return;
+    }
+    flushSync(() => {
+      if (status.authenticated) {
+        bindDirectChatAuthority(status.authorityBindingId);
+      } else {
+        clearDirectChatAuthority();
+      }
+      serverSession.current = status;
+      setSession(status);
+      setSessionState(
+        status.authenticated ? "authenticated" : "unauthenticated",
+      );
+    });
+  }, []);
+
+  /**
+   * A 409 session_active means this jar's session belongs to a different
+   * Human than the interrupted sign-in. The interrupted work keeps its flow
+   * authority while the person decides: confirming retries the completion
+   * with switch_from_user_id, which the server turns into a session
+   * replacement; cancelling discards the interrupted flow.
+   */
+  const offerAccountSwitch = useCallback(
+    async (
+      target: string,
+      resume: (switchFromUserId: string) => Promise<void>,
+      abandon: () => Promise<void>,
+    ): Promise<void> => {
+      let live: SumiSessionStatus;
+      try {
+        live = await getSumiSession();
+      } catch {
+        live = { authenticated: false };
+      }
+      if (!live.authenticated) {
+        // The conflicting session is already gone — no choice is needed.
+        await resume("");
+        return;
+      }
+      setAccountSwitch({
+        currentUserId: live.user.id,
+        currentDisplayName: live.user.displayName,
+        target,
+        resume,
+        abandon,
+      });
+    },
+    [],
+  );
+
+  const confirmAccountSwitch = useCallback(async () => {
+    const pending = accountSwitch;
+    if (!pending) return;
+    setAccountSwitch(null);
+    await pending.resume(pending.currentUserId);
+  }, [accountSwitch]);
+
+  const cancelAccountSwitch = useCallback(() => {
+    const pending = accountSwitch;
+    setAccountSwitch(null);
+    if (pending) void pending.abandon().catch(() => undefined);
+  }, [accountSwitch]);
+
+  /**
    * Turns a proven Firebase credential into the server-owned Sumi session.
    * Shared by the redirect return and any later provider proof: a Firebase UID
    * alone never authorizes a session.
@@ -449,10 +587,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       generation,
       flow,
       user,
+      switchFromUserId,
     }: {
       generation: number;
       flow: PendingRedirectAuthFlow;
       user: User;
+      switchFromUserId?: string;
     }): Promise<boolean> => {
       let confirmationRequired = false;
       await serializeSessionMutation(async () => {
@@ -463,6 +603,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           flowId: flow.flowId,
           nonce: flow.nonce,
           idToken,
+          switchFromUserId,
         });
         if (resolved.outcome === "confirmation_required") {
           const pending: PendingAuthConfirmation = {
@@ -480,12 +621,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (isCurrentGeneration(generation)) setConfirmation(pending);
           return;
         }
-        const nextSession = await verifyCommittedSumiSession();
+        const nextSession = await verifyCommittedSumiSession({
+          compensate: () => discardAuthFlow(flow.flowId, flow.nonce),
+        });
         if (
           resolved.outcome !== "signed_in" &&
           resolved.outcome !== "account_created"
         ) {
           throw new AuthAPIError("Invalid authentication flow response.", 0);
+        }
+        if (nextSession.user.id !== resolved.humanId) {
+          // The jar's session belongs to a different Human than the resolved
+          // one — a later choice in another tab stands unless the person
+          // explicitly switches.
+          throw new AuthAPIError("session_active", 409);
         }
         publishOutcomeNotice({
           firebaseUID: user.uid,
@@ -509,6 +658,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [isCurrentGeneration, publishOutcomeNotice, serializeSessionMutation],
   );
 
+  // A switch confirmation retries the exchange later, through whatever the
+  // current callback identity is.
+  const exchangeFirebaseProofRef = useRef(exchangeFirebaseProof);
+  exchangeFirebaseProofRef.current = exchangeFirebaseProof;
+
   /**
    * Completes a provider redirect once, on startup. The persisted receipt —
    * not the Firebase account — names the flow whose proof may be exchanged.
@@ -521,15 +675,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     redirectCompletionActive.current = true;
     let firebaseSignInCompleted = false;
     let confirmationRequired = false;
+    let user: User | null = null;
+    let flow: PendingRedirectAuthFlow | null = null;
     try {
-      const flow = takePendingRedirectSignIn();
+      flow = takePendingRedirectSignIn();
       if (!flow) {
         // A raw record existed but failed validation (or a reload claimed it
         // first). The return must report an outcome, not land silently on
         // the login screen.
         throw new RedirectSignInAbandonedError();
       }
-      let user: User;
       try {
         user = await resolveRedirectSignInUser();
       } catch (error) {
@@ -537,12 +692,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           isSameEmailCredentialCollision(error) &&
           isCurrentGeneration(generation)
         ) {
-          await beginSameEmailCredentialRecovery(
+          const started = await beginSameEmailCredentialRecovery(
             error,
             flow.provider,
             flow.intent,
           );
           if (isCurrentGeneration(generation)) {
+            setEmailCodeFlow(started.active);
+            setEmailChallenge(started.challenge);
             setCredentialRecoveryEmailSent(true);
           }
           return;
@@ -572,6 +729,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await signOutFirebaseBestEffort();
       }
     } catch (error) {
+      if (
+        isSessionActiveError(error) &&
+        isCurrentGeneration(generation) &&
+        user &&
+        flow
+      ) {
+        // The resolved Human differs from the jar's active session. Keep the
+        // Firebase credential and the flow alive while the person decides —
+        // switching retries the exchange with switch_from_user_id, cancelling
+        // discards the flow.
+        const resolvedUser = user;
+        const resolvedFlow = flow;
+        const target =
+          resolvedUser.displayName ??
+          resolvedUser.email ??
+          resolvedFlow.provider;
+        const resume = async (switchFromUserId: string) => {
+          await exchangeFirebaseProofRef.current({
+            generation: nextGeneration(),
+            flow: resolvedFlow,
+            user: resolvedUser,
+            switchFromUserId: switchFromUserId || undefined,
+          });
+        };
+        const abandon = async () => {
+          try {
+            await discardAuthFlow(resolvedFlow.flowId, resolvedFlow.nonce);
+          } catch {
+            // Epoch closure and expiry still fence its issuance.
+          }
+          await signOutFirebaseBestEffort();
+        };
+        await offerAccountSwitch(target, resume, abandon);
+        return;
+      }
       if (
         (error instanceof SumiSessionCompensatedError ||
           error instanceof SumiSessionCompensationFailedError) &&
@@ -616,6 +808,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     exchangeFirebaseProof,
     isCurrentGeneration,
     nextGeneration,
+    offerAccountSwitch,
     refreshSession,
   ]);
 
@@ -666,6 +859,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       nextGeneration();
       setCredentialRecoveryEmailSent(false);
       setRedirectSignInError(null);
+      setAccountSwitch(null);
       // Each attempt writes a fresh receipt, so each return — including a
       // back/forward-cache restore of this same document — is a new return
       // that must be allowed to complete once. Resetting here, before the
@@ -700,16 +894,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setRedirectSignInError(null);
   }, []);
 
-  const sendEmailLink = useCallback(
+  const startEmailCode = useCallback(
     async (email: string, intent: AuthIntent) => {
       if (preissuedSessionMode || !authOriginAllowed) {
         throw new AuthAPIError("Authentication is unavailable.", 0);
       }
       nextGeneration();
       setCredentialRecoveryEmailSent(false);
+      setAccountSwitch(null);
       signInPending.current = true;
       try {
-        await beginEmailLinkAuth(email, intent);
+        const started = await beginEmailCodeAuth(email, intent);
+        setEmailCodeFlow(started.active);
+        setEmailChallenge(started.challenge);
       } finally {
         signInPending.current = false;
       }
@@ -717,231 +914,530 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [nextGeneration],
   );
 
-  const completeEmailLink = useCallback(async () => {
-    if (preissuedSessionMode || !authOriginAllowed) {
-      throw new AuthAPIError("Authentication is unavailable.", 0);
-    }
-    const generation = nextGeneration();
-    signInPending.current = true;
-    try {
-      const completed = await completeEmailLinkAuth();
-      await serializeSessionMutation(async () => {
-        if (!isCurrentGeneration(generation)) return;
-        let recoveryOutcome:
-          | "provider_linked"
-          | "provider_already_linked"
-          | null = null;
-        if (completed.flow.credentialRecovery) {
-          if (completed.result.outcome !== "signed_in") {
-            throw new AuthAPIError(
-              "Provider recovery requires an existing Sumi account.",
-              0,
-            );
-          }
-          recoveryOutcome = await completeSameEmailCredentialRecovery({
-            recovery: completed.flow.credentialRecovery,
-            user: completed.firebaseUser,
-          });
-        }
-        if (completed.result.outcome === "confirmation_required") {
-          const pending: PendingAuthConfirmation = {
-            flowId: completed.result.flowId,
-            nonce: completed.flow.nonce,
-            intent: completed.flow.intent,
-            provider: "email_link",
-            expiresAt: completed.result.expiresAt,
-            action: completed.result.nextAction,
-            firebaseUID: completed.firebaseUser.uid,
-            account: {
-              displayName: completed.firebaseUser.displayName,
-              email: completed.firebaseUser.email,
-            },
-          };
-          savePendingConfirmation(pending);
-          setConfirmation(pending);
-          setEmailLinkCallbackPending(false);
-          return;
-        }
-        const nextSession = await verifyCommittedSumiSession();
-        if (
-          completed.result.outcome !== "signed_in" &&
-          completed.result.outcome !== "account_created"
-        ) {
-          throw new AuthAPIError("Invalid authentication flow response.", 0);
-        }
-        const recoveryIntent =
-          completed.flow.credentialRecovery?.requestedIntent ??
-          completed.flow.intent;
-        publishOutcomeNotice({
-          firebaseUID: completed.firebaseUser.uid,
-          humanId: nextSession.user.id,
-          outcome:
-            recoveryOutcome === "provider_linked"
-              ? "provider_linked"
-              : completed.result.outcome,
-          intent: recoveryIntent,
-          intentTransition:
-            completed.flow.credentialRecovery && recoveryIntent === "sign_up"
-              ? "recovery_proved"
-              : "none",
-          receiptId: completed.result.flowId,
-        });
-        flushSync(() => {
-          bindDirectChatAuthority(nextSession.authorityBindingId);
-          serverSession.current = nextSession;
-          if (!isCurrentGeneration(generation)) return;
-          setSession(nextSession);
-          setSessionState("authenticated");
-          setEmailLinkCallbackPending(false);
-          setCredentialRecoveryEmailSent(false);
-        });
-      });
-    } catch (error) {
-      if (isCurrentGeneration(generation)) {
-        let logoutCompleted = true;
-        try {
-          await logoutSumiSession();
-        } catch {
-          logoutCompleted = false;
-        }
-        let authorityCleared = true;
-        flushSync(() => {
-          authorityCleared = clearDirectChatAuthority();
-          serverSession.current = { authenticated: false };
-          setSession({ authenticated: false });
-          setSessionState(
-            logoutCompleted && authorityCleared
-              ? "unauthenticated"
-              : "unavailable",
-          );
-        });
-      }
-      await signOutFirebaseBestEffort();
-      throw error;
-    } finally {
-      signInPending.current = false;
-    }
-  }, [
-    isCurrentGeneration,
-    nextGeneration,
-    publishOutcomeNotice,
-    serializeSessionMutation,
-  ]);
-
-  const rejectEmailLink = useCallback(() => {
-    rejectEmailLinkAuth();
-    setEmailLinkCallbackPending(false);
+  const forgetEmailCodeFlow = useCallback((active: ActiveEmailCodeFlow) => {
+    abandonEmailCodeFlow(active);
+    setEmailCodeFlow((current) =>
+      current?.state === active.state ? null : current,
+    );
+    setEmailChallenge(null);
     setCredentialRecoveryEmailSent(false);
   }, []);
 
-  const confirmIntentTransition = useCallback(async () => {
-    const pending = confirmation;
-    if (!pending || preissuedSessionMode || !authOriginAllowed) {
-      throw new AuthAPIError("Authentication confirmation is unavailable.", 0);
-    }
-    const generation = nextGeneration();
-    await serializeSessionMutation(async () => {
-      const auth = getFirebaseAuth();
-      await auth.authStateReady();
-      const firebaseUser = auth.currentUser;
-      if (!firebaseUser || firebaseUser.uid !== pending.firebaseUID) {
-        clearPendingConfirmation();
-        setConfirmation(null);
-        throw new AuthAPIError(
-          "Firebase account changed before confirmation.",
-          0,
-        );
-      }
-      const idToken = await getIdToken(firebaseUser, true);
-      const refreshed = await resolveAuthFlow({
-        flowId: pending.flowId,
-        nonce: pending.nonce,
-        idToken,
-      });
+  /**
+   * A flow that finished, closed, or moved elsewhere cannot be retried here.
+   * Another tab of this browser may already hold its session.
+   */
+  const settleEndedEmailFlow = useCallback(
+    (active: ActiveEmailCodeFlow, error: unknown) => {
+      if (!(error instanceof AuthAPIError)) return;
       if (
-        refreshed.outcome !== "confirmation_required" ||
-        refreshed.nextAction !== pending.action ||
-        auth.currentUser?.uid !== pending.firebaseUID
+        error.message === "continued_in_other_browser" ||
+        error.message === "flow_consumed" ||
+        error.message === "flow_closed" ||
+        error.message === "flow_expired" ||
+        error.message === "invalid_flow"
       ) {
-        clearPendingConfirmation();
-        setConfirmation(null);
-        throw new AuthAPIError(
-          "Authentication confirmation is no longer valid.",
-          0,
-        );
+        forgetEmailCodeFlow(active);
       }
-      const confirmed = await confirmAuthFlow({
-        flowId: pending.flowId,
-        nonce: pending.nonce,
-        action: pending.action,
-      });
       if (
-        !isCurrentGeneration(generation) ||
-        auth.currentUser?.uid !== pending.firebaseUID
+        error.message === "flow_consumed" ||
+        error.message === "flow_closed"
       ) {
-        const identityError = new AuthAPIError(
-          "Firebase account changed during confirmation.",
-          0,
-        );
+        void refreshSession({ background: true });
+      }
+    },
+    [forgetEmailCodeFlow, refreshSession],
+  );
+
+  // A switch confirmation retries the interrupted completion later, through
+  // whatever the current callback identity is.
+  const completeEmailProofRef = useRef<
+    (
+      obtainProof: () => Promise<EmailProof>,
+      options?: { switchFromUserId?: string },
+    ) => Promise<void>
+  >(() => Promise.resolve());
+
+  /**
+   * Mailbox proof errors leave the session untouched. After a proof, the
+   * Firebase exchange and flow resolution share the provider compensation:
+   * a failure there is retried with the same flow authority. A
+   * session_active answer is not an error to bury — it asks the person
+   * whether to replace the account this jar currently belongs to.
+   */
+  const completeEmailProof = useCallback(
+    async (
+      obtainProof: () => Promise<EmailProof>,
+      options?: { switchFromUserId?: string },
+    ) => {
+      if (preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError("Authentication is unavailable.", 0);
+      }
+      const generation = nextGeneration();
+      signInPending.current = true;
+      try {
+        const proof = await obtainProof();
         try {
-          await logoutSumiSession();
-        } catch (logoutError) {
+          const completed = await finishEmailProof(proof, options);
+          await serializeSessionMutation(async () => {
+            if (!isCurrentGeneration(generation)) return;
+            let recoveryOutcome:
+              | "provider_linked"
+              | "provider_already_linked"
+              | null = null;
+            if (completed.flow.credentialRecovery) {
+              if (completed.result.outcome !== "signed_in") {
+                throw new AuthAPIError(
+                  "Provider recovery requires an existing Sumi account.",
+                  0,
+                );
+              }
+              recoveryOutcome = await completeSameEmailCredentialRecovery({
+                recovery: completed.flow.credentialRecovery,
+                user: completed.firebaseUser,
+              });
+            }
+            if (completed.result.outcome === "confirmation_required") {
+              const pending: PendingAuthConfirmation = {
+                flowId: completed.result.flowId,
+                nonce: completed.flow.nonce,
+                intent: completed.flow.intent,
+                provider: "email_code",
+                expiresAt: completed.result.expiresAt,
+                action: completed.result.nextAction,
+                firebaseUID: completed.firebaseUser.uid,
+                account: {
+                  displayName: completed.firebaseUser.displayName,
+                  email: completed.firebaseUser.email,
+                },
+              };
+              savePendingConfirmation(pending);
+              setConfirmation(pending);
+              setEmailCodeFlow(null);
+              setEmailChallenge(null);
+              setEmailLinkPending(false);
+              return;
+            }
+            const nextSession = await verifyCommittedSumiSession({
+              // If this flow committed a session the status read cannot
+              // confirm, discard closes exactly this flow's authority and
+              // revokes what it minted — never another account's session.
+              compensate: () =>
+                discardAuthFlow(completed.result.flowId, completed.flow.nonce),
+            });
+            if (
+              completed.result.outcome !== "signed_in" &&
+              completed.result.outcome !== "account_created"
+            ) {
+              throw new AuthAPIError(
+                "Invalid authentication flow response.",
+                0,
+              );
+            }
+            if (nextSession.user.id !== completed.result.humanId) {
+              // The session in this jar belongs to a different Human than
+              // the one this flow resolved to — the person's later choice
+              // stands unless they explicitly switch back.
+              throw new AuthAPIError("session_active", 409);
+            }
+            const recoveryIntent =
+              completed.flow.credentialRecovery?.requestedIntent ??
+              completed.flow.intent;
+            publishOutcomeNotice({
+              firebaseUID: completed.firebaseUser.uid,
+              humanId: nextSession.user.id,
+              outcome:
+                recoveryOutcome === "provider_linked"
+                  ? "provider_linked"
+                  : completed.result.outcome,
+              intent: recoveryIntent,
+              intentTransition:
+                completed.flow.credentialRecovery &&
+                recoveryIntent === "sign_up"
+                  ? "recovery_proved"
+                  : "none",
+              receiptId: completed.result.flowId,
+            });
+            flushSync(() => {
+              bindDirectChatAuthority(nextSession.authorityBindingId);
+              serverSession.current = nextSession;
+              if (!isCurrentGeneration(generation)) return;
+              setSession(nextSession);
+              setSessionState("authenticated");
+              setEmailCodeFlow(null);
+              setEmailChallenge(null);
+              setEmailLinkPending(false);
+              setCredentialRecoveryEmailSent(false);
+            });
+          });
+        } catch (error) {
+          if (isCurrentGeneration(generation)) {
+            if (isSessionActiveError(error)) {
+              const resume = completeEmailProofRef.current;
+              await offerAccountSwitch(
+                proof.active.flow.email,
+                (switchFromUserId) =>
+                  resume(() => Promise.resolve(proof), {
+                    switchFromUserId: switchFromUserId || undefined,
+                  }),
+                async () => {
+                  try {
+                    await discardAuthFlow(
+                      proof.active.flow.flowId,
+                      proof.active.flow.nonce,
+                    );
+                  } catch {
+                    // Epoch closure and expiry still fence its issuance.
+                  }
+                  forgetEmailCodeFlow(proof.active);
+                },
+              );
+              return;
+            }
+            await reconcileSessionState();
+          }
+          await signOutFirebaseBestEffort();
+          throw error;
+        }
+      } finally {
+        signInPending.current = false;
+      }
+    },
+    [
+      forgetEmailCodeFlow,
+      isCurrentGeneration,
+      nextGeneration,
+      offerAccountSwitch,
+      publishOutcomeNotice,
+      reconcileSessionState,
+      serializeSessionMutation,
+    ],
+  );
+  completeEmailProofRef.current = completeEmailProof;
+
+  const submitEmailCode = useCallback(
+    async (code: string) => {
+      const active = emailCodeFlow;
+      if (!active) {
+        throw new AuthAPIError("invalid_flow", 400);
+      }
+      try {
+        await completeEmailProof(() => verifyEmailCode(active, code));
+      } catch (error) {
+        settleEndedEmailFlow(active, error);
+        throw error;
+      }
+    },
+    [completeEmailProof, emailCodeFlow, settleEndedEmailFlow],
+  );
+
+  const resendEmailCode = useCallback(async () => {
+    const active = emailCodeFlow;
+    if (!active) throw new AuthAPIError("invalid_flow", 400);
+    try {
+      setEmailChallenge(await requestEmailCodeResend(active.flow));
+    } catch (error) {
+      settleEndedEmailFlow(active, error);
+      throw error;
+    }
+  }, [emailCodeFlow, settleEndedEmailFlow]);
+
+  const emailCompletionRecoveries = useRef(new Set<string>());
+
+  const refreshEmailCode = useCallback(async () => {
+    const active = emailCodeFlow;
+    if (!active) return;
+    try {
+      const status = await readEmailCodeStatus(active.flow);
+      setEmailChallenge(status);
+      if (status.flowStatus !== "completed" || signInPending.current) return;
+      // A flow settled by another tab of this browser left its session here.
+      if (loadPendingEmailFlow(active.state) === null) {
+        forgetEmailCodeFlow(active);
+        void refreshSession({ background: true });
+        return;
+      }
+      // Still stored and completed: this browser may have lost the completion
+      // response. Recover it once through the server's replay; later polls
+      // leave the session alone, and a manual retry after the window reports
+      // flow_consumed, which ends the flow.
+      if (emailCompletionRecoveries.current.has(active.state)) return;
+      emailCompletionRecoveries.current.add(active.state);
+      let live: SumiSessionStatus;
+      try {
+        live = await getSumiSession();
+      } catch {
+        live = { authenticated: false };
+      }
+      if (live.authenticated) {
+        if (status.humanId && live.user.id !== status.humanId) {
+          // The completed sign-in resolved to a different Human than the one
+          // this jar now belongs to. Only an explicit switch replaces the
+          // person's later choice; the flow keeps its authority meanwhile.
+          const resume = completeEmailProofRef.current;
+          await offerAccountSwitch(
+            active.flow.email,
+            (switchFromUserId) =>
+              resume(() => verifyEmailCode(active, ""), {
+                switchFromUserId: switchFromUserId || undefined,
+              }),
+            async () => {
+              try {
+                await discardAuthFlow(active.flow.flowId, active.flow.nonce);
+              } catch {
+                // Epoch closure and expiry still fence its issuance.
+              }
+              forgetEmailCodeFlow(active);
+            },
+          );
+          return;
+        }
+        forgetEmailCodeFlow(active);
+        void refreshSession({ background: true });
+        return;
+      }
+      await completeEmailProofRef.current(() => verifyEmailCode(active, ""));
+    } catch (error) {
+      settleEndedEmailFlow(active, error);
+      throw error;
+    }
+  }, [
+    emailCodeFlow,
+    forgetEmailCodeFlow,
+    offerAccountSwitch,
+    refreshSession,
+    settleEndedEmailFlow,
+  ]);
+
+  const cancelEmailCode = useCallback(() => {
+    nextGeneration();
+    if (emailCodeFlow) {
+      const { flow } = emailCodeFlow;
+      forgetEmailCodeFlow(emailCodeFlow);
+      // Cancelling abandons the flow: close its server-side issuance so a
+      // lost completion cannot deliver a session to this jar later.
+      void discardAuthFlow(flow.flowId, flow.nonce).catch(() => undefined);
+    }
+  }, [emailCodeFlow, forgetEmailCodeFlow, nextGeneration]);
+
+  const inspectEmailLink = useCallback(async () => {
+    const link = pendingEmailLink();
+    if (!link) throw new AuthAPIError("link_invalid", 404);
+    return inspectPendingEmailLink(link);
+  }, []);
+
+  const continueEmailLink = useCallback(
+    async (
+      inspection: EmailLinkInspection,
+      adopt: boolean,
+      options?: { switchFromUserId?: string },
+    ) => {
+      const link = pendingEmailLink();
+      if (!link) throw new AuthAPIError("link_invalid", 404);
+      await completeEmailProof(
+        () => completeEmailLinkProof(link, inspection, adopt),
+        options,
+      );
+    },
+    [completeEmailProof],
+  );
+
+  const dismissEmailLink = useCallback(() => {
+    clearPendingEmailLink();
+    setEmailLinkPending(false);
+    // A proof finished in this tab may have been saved as the active flow.
+    setEmailCodeFlow(loadActiveEmailCodeFlow());
+  }, []);
+
+  /**
+   * Runs the confirmation exchange for a saved pending confirmation. Split
+   * from the context method so an account-switch confirmation can retry the
+   * same step with switch_from_user_id.
+   */
+  const runIntentConfirmation = useCallback(
+    async (pending: PendingAuthConfirmation, switchFromUserId?: string) => {
+      const generation = nextGeneration();
+      await serializeSessionMutation(async () => {
+        const auth = getFirebaseAuth();
+        await auth.authStateReady();
+        const firebaseUser = auth.currentUser;
+        if (!firebaseUser || firebaseUser.uid !== pending.firebaseUID) {
+          clearPendingConfirmation();
+          setConfirmation(null);
+          throw new AuthAPIError(
+            "Firebase account changed before confirmation.",
+            0,
+          );
+        }
+        const request = {
+          flowId: pending.flowId,
+          nonce: pending.nonce,
+          idToken: await getIdToken(firebaseUser, true),
+        };
+        const refreshed = await resolveAuthFlow({
+          ...request,
+          switchFromUserId,
+        });
+        let confirmed: Awaited<ReturnType<typeof confirmAuthFlow>>;
+        if (
+          auth.currentUser?.uid === pending.firebaseUID &&
+          (refreshed.outcome === "signed_in" ||
+            refreshed.outcome === "account_created")
+        ) {
+          // The confirmation committed earlier but its issuance was refused
+          // or its response was lost; this resolve replayed the same
+          // completion for any channel.
+          confirmed = refreshed;
+        } else {
+          if (
+            refreshed.outcome !== "confirmation_required" ||
+            refreshed.nextAction !== pending.action ||
+            auth.currentUser?.uid !== pending.firebaseUID
+          ) {
+            clearPendingConfirmation();
+            setConfirmation(null);
+            throw new AuthAPIError(
+              "Authentication confirmation is no longer valid.",
+              0,
+            );
+          }
+          confirmed = await confirmAuthFlow({
+            flowId: pending.flowId,
+            nonce: pending.nonce,
+            action: pending.action,
+            switchFromUserId,
+          });
+        }
+        if (
+          !isCurrentGeneration(generation) ||
+          auth.currentUser?.uid !== pending.firebaseUID
+        ) {
+          const identityError = new AuthAPIError(
+            "Firebase account changed during confirmation.",
+            0,
+          );
+          try {
+            await logoutSumiSession();
+          } catch (logoutError) {
+            flushSync(() => {
+              clearDirectChatAuthority();
+              serverSession.current = { authenticated: false };
+              clearPendingConfirmation();
+              setConfirmation(null);
+              setSession({ authenticated: false });
+              setSessionState("unavailable");
+            });
+            throw new SumiSessionCompensationFailedError(
+              identityError,
+              logoutError,
+            );
+          }
           flushSync(() => {
-            clearDirectChatAuthority();
+            const authorityCleared = clearDirectChatAuthority();
             serverSession.current = { authenticated: false };
             clearPendingConfirmation();
             setConfirmation(null);
             setSession({ authenticated: false });
-            setSessionState("unavailable");
+            setSessionState(
+              authorityCleared ? "unauthenticated" : "unavailable",
+            );
           });
-          throw new SumiSessionCompensationFailedError(
-            identityError,
-            logoutError,
-          );
+          throw new SumiSessionCompensatedError(identityError);
         }
+        if (pending.provider === "email_code") {
+          await ensureEmailCompletionSession(request, confirmed, {
+            switchFromUserId,
+          });
+        }
+        const nextSession = await verifyCommittedSumiSession({
+          compensate: () => discardAuthFlow(pending.flowId, pending.nonce),
+        });
+        if (nextSession.user.id !== confirmed.humanId) {
+          throw new AuthAPIError("session_active", 409);
+        }
+        publishOutcomeNotice({
+          firebaseUID: firebaseUser.uid,
+          humanId: nextSession.user.id,
+          outcome: confirmed.outcome,
+          intent: pending.intent,
+          intentTransition: "confirmed",
+          receiptId: confirmed.flowId,
+        });
         flushSync(() => {
-          const authorityCleared = clearDirectChatAuthority();
-          serverSession.current = { authenticated: false };
+          bindDirectChatAuthority(nextSession.authorityBindingId);
+          serverSession.current = nextSession;
           clearPendingConfirmation();
           setConfirmation(null);
-          setSession({ authenticated: false });
-          setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
+          if (!isCurrentGeneration(generation)) return;
+          setSession(nextSession);
+          setSessionState("authenticated");
         });
-        throw new SumiSessionCompensatedError(identityError);
+      });
+    },
+    [
+      isCurrentGeneration,
+      nextGeneration,
+      publishOutcomeNotice,
+      serializeSessionMutation,
+    ],
+  );
+
+  const confirmIntentTransition = useCallback(
+    async (options?: { switchFromUserId?: string }) => {
+      const pending = confirmation;
+      if (!pending || preissuedSessionMode || !authOriginAllowed) {
+        throw new AuthAPIError(
+          "Authentication confirmation is unavailable.",
+          0,
+        );
       }
-      const nextSession = await verifyCommittedSumiSession();
-      publishOutcomeNotice({
-        firebaseUID: firebaseUser.uid,
-        humanId: nextSession.user.id,
-        outcome: confirmed.outcome,
-        intent: pending.intent,
-        intentTransition: "confirmed",
-        receiptId: confirmed.flowId,
-      });
-      flushSync(() => {
-        bindDirectChatAuthority(nextSession.authorityBindingId);
-        serverSession.current = nextSession;
-        clearPendingConfirmation();
-        setConfirmation(null);
-        if (!isCurrentGeneration(generation)) return;
-        setSession(nextSession);
-        setSessionState("authenticated");
-      });
-    });
-  }, [
-    confirmation,
-    isCurrentGeneration,
-    nextGeneration,
-    publishOutcomeNotice,
-    serializeSessionMutation,
-  ]);
+      try {
+        await runIntentConfirmation(pending, options?.switchFromUserId);
+      } catch (error) {
+        if (isSessionActiveError(error)) {
+          await offerAccountSwitch(
+            pending.account.displayName ??
+              pending.account.email ??
+              "このアカウント",
+            (switchFromUserId) =>
+              runIntentConfirmation(
+                pending,
+                switchFromUserId || undefined,
+              ),
+            async () => {
+              try {
+                await discardAuthFlow(pending.flowId, pending.nonce);
+              } catch {
+                // The flow's own expiry still fences its issuance.
+              }
+              clearPendingConfirmation();
+              setConfirmation(null);
+              await signOutFirebaseBestEffort();
+            },
+          );
+          return;
+        }
+        throw error;
+      }
+    },
+    [confirmation, offerAccountSwitch, runIntentConfirmation],
+  );
 
   const cancelIntentTransition = useCallback(async () => {
     nextGeneration();
+    const pending = confirmation;
     clearPendingConfirmation();
     setConfirmation(null);
+    if (pending) {
+      // Cancelling abandons the flow: close its server-side issuance.
+      try {
+        await discardAuthFlow(pending.flowId, pending.nonce);
+      } catch {
+        // The flow's own expiry still fences its issuance.
+      }
+    }
     await signOutFirebaseBestEffort();
-  }, [nextGeneration]);
+  }, [confirmation, nextGeneration]);
 
   const dismissOutcomeNotice = useCallback(() => {
     clearAuthOutcomeNotice();
@@ -1104,7 +1600,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
     try {
       await serializeSessionMutation(async () => {
-        await logoutSumiSession();
+        // Logout ends this jar's work: the epoch covers most of it, but
+        // flows bound to an epoch this jar no longer presents are named
+        // explicitly so the server can still close them by nonce.
+        const flows: Array<{ flowId: string; nonce: string }> =
+          listPendingEmailFlows().map(({ flowId, nonce }) => ({
+            flowId,
+            nonce,
+          }));
+        const pending = confirmation;
+        if (pending) {
+          flows.push({ flowId: pending.flowId, nonce: pending.nonce });
+        }
+        const redirect = loadPendingRedirectFlow();
+        if (redirect) {
+          flows.push({ flowId: redirect.flowId, nonce: redirect.nonce });
+        }
+        await logoutSumiSession(flows);
       });
     } catch (error) {
       logoutPending.current = false;
@@ -1118,7 +1630,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (isCurrentGeneration(generation)) {
       // Server logout is the authority transition. Commit it before touching
       // optional Firebase/emulator display-state cleanup, which may throw
-      // synchronously during setup.
+      // synchronously during setup. Every pending flow the server just
+      // closed is dropped locally so nothing can replay it into a session.
+      const pendingFlows = listPendingEmailFlows();
       flushSync(() => {
         authorityCleared = clearDirectChatAuthority();
         sessionRevalidationRequired.current = false;
@@ -1126,6 +1640,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         serverSession.current = { authenticated: false };
         setSession({ authenticated: false });
         setSessionState(authorityCleared ? "unauthenticated" : "unavailable");
+        clearPendingConfirmation();
+        setConfirmation(null);
+        for (const flow of pendingFlows) {
+          clearPendingEmailFlow(flow.state);
+        }
+        if (emailCodeFlow) {
+          clearActiveEmailFlowState(emailCodeFlow.state);
+        }
+        setEmailCodeFlow(null);
+        setEmailChallenge(null);
+        clearPendingEmailLink();
+        setEmailLinkPending(false);
+        clearPendingRedirectFlow();
+        emailCompletionRecoveries.current.clear();
+        setAccountSwitch(null);
+        setCredentialRecoveryEmailSent(false);
       });
     }
     await signOutFirebaseBestEffort();
@@ -1133,6 +1663,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw new Error("Direct-chat private state could not be cleared");
     }
   }, [
+    confirmation,
+    emailCodeFlow,
     isCurrentGeneration,
     nextGeneration,
     refreshSession,
@@ -1159,6 +1691,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [session, sessionState]);
 
+  const emailCode = useMemo<EmailCodeView | null>(
+    () =>
+      emailCodeFlow
+        ? {
+            email: emailCodeFlow.flow.email,
+            intent: emailCodeFlow.flow.intent,
+            recovery: emailCodeFlow.flow.credentialRecovery !== undefined,
+            challenge: emailChallenge,
+          }
+        : null,
+    [emailChallenge, emailCodeFlow],
+  );
+
   const authorityBindingId =
     sessionState === "authenticated" && session.authenticated
       ? session.authorityBindingId
@@ -1177,15 +1722,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       confirmation,
       outcomeNotice,
-      emailLinkCallbackPending,
+      emailCode,
+      emailLinkPending,
+      accountSwitch,
+      confirmAccountSwitch,
+      cancelAccountSwitch,
       credentialRecoveryEmailSent,
       redirectSignInPending,
       redirectSignInError,
       dismissRedirectSignInError,
       signIn,
-      sendEmailLink,
-      completeEmailLink,
-      rejectEmailLink,
+      startEmailCode,
+      submitEmailCode,
+      resendEmailCode,
+      refreshEmailCode,
+      cancelEmailCode,
+      inspectEmailLink,
+      continueEmailLink,
+      dismissEmailLink,
       confirmIntentTransition,
       cancelIntentTransition,
       dismissOutcomeNotice,
@@ -1195,24 +1749,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refreshSession,
     }),
     [
+      accountSwitch,
       authorityBindingId,
+      cancelAccountSwitch,
       cancelIntentTransition,
       confirmation,
-      completeEmailLink,
+      cancelEmailCode,
+      confirmAccountSwitch,
       confirmIntentTransition,
+      continueEmailLink,
+      dismissEmailLink,
+      emailCode,
+      emailLinkPending,
+      inspectEmailLink,
       logout,
-      emailLinkCallbackPending,
+      refreshEmailCode,
+      resendEmailCode,
+      startEmailCode,
+      submitEmailCode,
       credentialRecoveryEmailSent,
       dismissOutcomeNotice,
       dismissRedirectSignInError,
       redirectSignInError,
       redirectSignInPending,
-      rejectEmailLink,
       refreshSession,
       session.authenticated,
       sessionState,
       sessionSuspended,
-      sendEmailLink,
       signIn,
       outcomeNotice,
       user,
@@ -1239,6 +1802,14 @@ export function classifySessionFailure(error: unknown): AuthSessionState {
     }
   }
   return "unavailable";
+}
+
+function isSessionActiveError(error: unknown): boolean {
+  return (
+    error instanceof AuthAPIError &&
+    error.status === 409 &&
+    error.message === "session_active"
+  );
 }
 
 function isDefinitiveProfileUpdateRejection(error: unknown): boolean {

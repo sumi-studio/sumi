@@ -158,7 +158,7 @@ func (s *Store) HasCompletedEmailLinkProof(ctx context.Context, humanID, firebas
 	var proved bool
 	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
 		SELECT 1 FROM auth_flows
-		WHERE human_id=$1 AND firebase_uid=$2 AND channel='email_link'
+		WHERE human_id=$1 AND firebase_uid=$2 AND channel IN ('email_link', 'email_code')
 			AND status='completed'
 	)`, humanID, firebaseUID).Scan(&proved)
 	if err != nil {

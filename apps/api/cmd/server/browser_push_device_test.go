@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
@@ -23,7 +25,15 @@ import (
 type pushLoginIdentity struct{}
 
 func (pushLoginIdentity) VerifyIDToken(_ context.Context, token string) (agentevents.FirebaseIdentity, error) {
-	return agentevents.FirebaseIdentity{UID: token}, nil
+	identity := agentevents.FirebaseIdentity{UID: token}
+	// "google:<subject>" carries the provider sign-in shape a real Google token
+	// verifies into; the bare form stays a direct exchange token.
+	if subject, ok := strings.CutPrefix(token, "google:"); ok {
+		identity.UID = "firebase-" + subject
+		identity.SignInProvider = "google.com"
+		identity.ProviderSubjects = map[string][]string{"google.com": {subject}}
+	}
+	return identity, nil
 }
 func (pushLoginIdentity) ResolveIdentity(_ context.Context, identity agentevents.FirebaseIdentity) (agentevents.UserSessionClaims, error) {
 	return agentevents.UserSessionClaims{TenantID: "push-test", UserID: identity.UID, PersonalityAgentID: testLocalControlPAID}, nil
@@ -44,6 +54,26 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Both Humans sign in through the real provider auth flow, so each needs
+	// the registry state a provisioned account would have: a Secretary plus
+	// the Firebase and Google credentials the flow resolves by. POST
+	// /auth/session is the no-flows fallback and is absent once flow routes
+	// are registered, exactly as in production.
+	seed := func(humanID, providerSubject string) {
+		t.Helper()
+		if _, err := registry.MintSecretary(ctx, humanID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO credentials (provider, external_subject, human_id)
+			VALUES ('firebase', $1, $2), ('google.com', $3, $2)`,
+			"firebase-"+providerSubject, humanID, providerSubject); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const providerSubjectA = "google-subject-a"
+	const providerSubjectB = "google-subject-b"
+	seed(humanA, providerSubjectA)
+	seed(humanB, providerSubjectB)
 	commands, err := agentevents.OpenCommandStore(privateRuntimeDir(t))
 	if err != nil {
 		t.Fatal(err)
@@ -61,6 +91,7 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	auth.Flows = newKosekiAuthFlowController(registry, "push-test", nil)
 	auth.PushDevices = messaging.New(pool, nil, nil)
 	mux := http.NewServeMux()
 	auth.RegisterRoutes(mux)
@@ -86,17 +117,61 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 		jar.SetCookies(u, w.Result().Cookies())
 		return w
 	}
-	login := func(human string) *httptest.ResponseRecorder {
+	startFlow := func() (string, string) {
+		t.Helper()
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			t.Fatal(err)
+		}
+		nonce := base64.RawURLEncoding.EncodeToString(raw)
+		started := request(ctx, "/auth/flows", `{"intent":"sign_in","provider":"google.com","continuation":"/","nonce":"`+nonce+`"}`)
+		if started.Code != http.StatusCreated {
+			t.Fatal(started.Code, started.Body.String())
+		}
+		var flow struct {
+			FlowID string `json:"flow_id"`
+		}
+		if err := json.Unmarshal(started.Body.Bytes(), &flow); err != nil || flow.FlowID == "" {
+			t.Fatalf("flow start: %v %s", err, started.Body.String())
+		}
+		return flow.FlowID, nonce
+	}
+	resolveFlow := func(flowID, nonce, idToken, switchFrom string) *httptest.ResponseRecorder {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]string{
+			"flow_id": flowID, "nonce": nonce, "id_token": idToken,
+			"switch_from_user_id": switchFrom,
+		})
+		return request(ctx, "/auth/flows/resolve", string(payload))
+	}
+	login := func(idToken string) *httptest.ResponseRecorder {
 		t.Helper()
 		if w := request(ctx, "/auth/csrf", ""); w.Code != http.StatusOK {
 			t.Fatal(w.Code, w.Body.String())
 		}
-		payload, _ := json.Marshal(map[string]string{"id_token": human})
-		w := request(ctx, "/auth/session", string(payload))
-		if w.Code != http.StatusNoContent {
+		flowID, nonce := startFlow()
+		w := resolveFlow(flowID, nonce, idToken, "")
+		if w.Code != http.StatusOK {
 			t.Fatal(w.Code, w.Body.String())
 		}
 		return w
+	}
+	// switchLogin signs a different Human in through the supported account-
+	// switch path: the provider flow's resolve is first refused by session
+	// admission while another Human is active, then recovered by replaying
+	// the same committed flow once the person names the Human being replaced.
+	switchLogin := func(idToken, currentHuman string) {
+		t.Helper()
+		if w := request(ctx, "/auth/csrf", ""); w.Code != http.StatusOK {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		flowID, nonce := startFlow()
+		if w := resolveFlow(flowID, nonce, idToken, ""); w.Code != http.StatusConflict {
+			t.Fatalf("provider switch must be refused without consent: %d %s", w.Code, w.Body.String())
+		}
+		if w := resolveFlow(flowID, nonce, idToken, currentHuman); w.Code != http.StatusOK {
+			t.Fatalf("consented provider switch failed: %d %s", w.Code, w.Body.String())
+		}
 	}
 	deviceID := func() string {
 		t.Helper()
@@ -129,7 +204,7 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 			t.Fatal("retired device can still receive notifications")
 		}
 	}
-	first := login(humanA)
+	first := login("google:" + providerSubjectA)
 	var sessionAge, pushAge int
 	for _, cookie := range first.Result().Cookies() {
 		switch cookie.Name {
@@ -149,11 +224,11 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 	if deviceOwner(firstID) != humanA {
 		t.Fatal("device assigned to a different Human")
 	}
-	login(humanA)
+	login("google:" + providerSubjectA)
 	if deviceID() != firstID {
 		t.Fatal("ordinary login refresh retired device")
 	}
-	login(humanB)
+	switchLogin("google:"+providerSubjectB, humanA)
 	secondID := deviceID()
 	if secondID == firstID || deviceOwner(secondID) != humanB {
 		t.Fatal("account switch reused the old recipient")
@@ -176,7 +251,7 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 
 	// If persistence cannot finish revocation, retain the only device handle
 	// and return an error. A retry must actually revoke it, not claim success.
-	login(humanA)
+	login("google:" + providerSubjectA)
 	thirdID := deviceID()
 	lock, err := pool.Begin(ctx)
 	if err != nil {

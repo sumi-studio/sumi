@@ -139,7 +139,15 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       firebaseUser?.providerData.map(({ providerId }) => providerId) ?? [],
     );
   }, [firebaseUser, providerRevision]);
-  const usableMethodCount = linkedProviders.size;
+  // A verified address signs in with a Sumi email code even without the
+  // Firebase password provider. The server still owns the last-method check.
+  const emailMethod = Boolean(
+    linkedProviders.has("password") ||
+      (firebaseUser?.email && firebaseUser.emailVerified),
+  );
+  const usableMethodCount =
+    linkedProviders.size +
+    (emailMethod && !linkedProviders.has("password") ? 1 : 0);
 
   const scope = useMemo<ProviderScope | null>(
     () =>
@@ -545,9 +553,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         </p>
       ) : (
         <div className="border-border border-t">
-          {linkedProviders.has("password") && (
-            <ProviderRow label="メールリンク" linked />
-          )}
+          {emailMethod && <ProviderRow label="メール" linked />}
           {PROVIDERS.map(({ id, label }) => {
             const linked = linkedProviders.has(id);
             const lastMethod = linked && usableMethodCount <= 1;
@@ -946,17 +952,18 @@ async function reauthenticateForUnlink(
       : "";
   const authTime = token.claims.auth_time;
   const age = typeof authTime === "number" ? Date.now() / 1000 - authTime : NaN;
+  const recent = Number.isFinite(age) && age >= -60 && age <= 240;
   if (
-    signInProvider === "password" &&
-    Number.isFinite(age) &&
-    age >= -60 &&
-    age <= 240 &&
-    user.providerData.some(({ providerId }) => providerId === "password")
+    recent &&
+    ((signInProvider === "password" &&
+      user.providerData.some(({ providerId }) => providerId === "password")) ||
+      // Sumi mints custom tokens only after an email code or link proof.
+      (signInProvider === "custom" && user.email && user.emailVerified))
   ) {
     return token.token;
   }
   throw new Error(
-    "別のログイン方法で再認証できません。ログアウトし、メールリンクで再ログインしてから5分以内にもう一度お試しください。",
+    "別のログイン方法で再認証できません。ログアウトし、メールの確認コードで再ログインしてから5分以内にもう一度お試しください。",
   );
 }
 
