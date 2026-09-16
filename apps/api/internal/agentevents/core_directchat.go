@@ -62,14 +62,15 @@ type coreDirectChatPersona struct {
 	// The wire's run model allows one active run per session (agent_end
 	// clears the pending approval prompt), while the core may genuinely
 	// interleave inputs — e.g. a second message processed while the first
-	// waits on an approval. The projection therefore opens one run for a
-	// contiguous busy period and closes it only when no direct-chat input
-	// is live (queued/claimed/waiting): agent_end is then always the truth
-	// "the secretary finished", never emitted mid-approval where it would
-	// hide the actionable prompt. runs counts committed agent_start markers
-	// so start/end dedup keys are deterministic across processes.
-	runs      int
-	runOpen   bool
+	// waits on an approval. The projection therefore asks the gateway to
+	// open one run for a contiguous busy period and to close it only when
+	// no direct-chat input is live (queued/claimed/waiting): agent_end is
+	// then always the truth "the secretary finished", never emitted
+	// mid-approval where it would hide the actionable prompt. Marker
+	// need/identity is decided under the event-file lock from committed
+	// log state — this projector keeps no run counters of its own, so a
+	// stale or overlapping projector cannot mint a marker for an index
+	// that already closed or orphan content after agent_end.
 	failures  int
 	nextRetry time.Time
 }
@@ -338,7 +339,13 @@ func (c *CoreDirectChat) sweep(ctx context.Context) {
 			// Shutdown raced a sync: not a persona failure.
 		default:
 			st.failures++
-			delay := c.pollInterval() << (st.failures - 1)
+			// Double the delay up to the cap. Iterating instead of shifting
+			// keeps large failure counts from overflowing time.Duration
+			// before the cap can apply — failures is unbounded.
+			delay := c.pollInterval()
+			for i := 1; i < st.failures && delay < maxSyncBackoff; i++ {
+				delay *= 2
+			}
 			if delay > maxSyncBackoff {
 				delay = maxSyncBackoff
 			}
@@ -408,13 +415,14 @@ func (c *CoreDirectChat) syncPersona(ctx context.Context, personaID string) erro
 	if err := c.reconcileCommands(ctx, personaID, st); err != nil {
 		return err
 	}
-	return c.closeRunIfIdle(ctx, personaID, st)
+	return c.closeRunIfIdle(ctx, personaID)
 }
 
-// loadProjectionState rebuilds this persona's emission cursors from the
-// durable event log: the set of committed dedup keys plus the run markers
-// already on the wire, so a restarted projector re-emits nothing and resumes
-// an open run instead of inventing a second one.
+// loadProjectionState rebuilds this persona's content cursors from the
+// durable event log so a restarted projector re-emits nothing already
+// committed. Run state is deliberately not loaded here: marker decisions are
+// made under the event-file lock against committed log state, so neither a
+// restart nor an overlapping projector can act on a stale cached view.
 func (c *CoreDirectChat) loadProjectionState(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
 	seen := make(map[[sha256.Size]byte]struct{})
 	envelopes, err := c.Gateway.EventCatchUp(ctx, personaID, 0)
@@ -422,21 +430,7 @@ func (c *CoreDirectChat) loadProjectionState(ctx context.Context, personaID stri
 		return err
 	}
 	for _, env := range envelopes {
-		var head struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(env.Event, &head); err != nil {
-			continue
-		}
-		switch head.Type {
-		case "agent_start":
-			st.runs++
-			st.runOpen = true
-		case "agent_end":
-			st.runOpen = false
-		default:
-			seen[sha256.Sum256(env.Event)] = struct{}{}
-		}
+		seen[sha256.Sum256(env.Event)] = struct{}{}
 	}
 	st.seen = seen
 	st.loaded = true
@@ -444,21 +438,17 @@ func (c *CoreDirectChat) loadProjectionState(ctx context.Context, personaID stri
 }
 
 // emit durably appends run content — messages, tool events, approvals —
-// opening a run marker first when no run is live. Dedup keys make the whole
-// batch idempotent under the event-file lock: a replayed projection, in this
-// process or an overlapping one, commits nothing twice.
+// asking the gateway to open a run marker when the committed log has none.
+// Dedup keys make the content idempotent and the marker is conditional on
+// committed state under the event-file lock, so a replayed projection — in
+// this process or an overlapping one — neither double-commits content nor
+// strands it behind a stale run boundary.
 func (c *CoreDirectChat) emit(ctx context.Context, personaID string, st *coreDirectChatPersona, events []json.RawMessage) error {
 	if len(events) == 0 {
 		return nil
 	}
 	out := make([]ProjectedEvent, 0, len(events)+1)
-	if !st.runOpen {
-		start, err := marshalEvent(map[string]any{"type": "agent_start"})
-		if err != nil {
-			return err
-		}
-		out = append(out, ProjectedEvent{Event: start, DedupKey: runMarkerKey(personaID, "start", st.runs)})
-	}
+	out = append(out, ProjectedEvent{RunMarker: RunMarkerStart})
 	for _, raw := range events {
 		out = append(out, ProjectedEvent{Event: raw})
 	}
@@ -468,34 +458,18 @@ func (c *CoreDirectChat) emit(ctx context.Context, personaID string, st *coreDir
 	for _, raw := range events {
 		st.seen[sha256.Sum256(raw)] = struct{}{}
 	}
-	if !st.runOpen {
-		st.runOpen = true
-		st.runs++
-	}
 	return nil
 }
 
-// runMarkerKey is the durable dedup identity of one run's start or end
-// marker. The index of the run within the persona's history makes each key
-// unique while remaining a pure function of the committed log.
-func runMarkerKey(personaID, kind string, index int) [sha256.Size]byte {
-	h := sha256.New()
-	h.Write([]byte("sumi-core-direct-chat\x00run-" + kind + "\x00"))
-	h.Write([]byte(personaID))
-	fmt.Fprintf(h, "\x00%d", index)
-	var key [sha256.Size]byte
-	copy(key[:], h.Sum(nil))
-	return key
-}
-
-// closeRunIfIdle ends the open run when the persona has no live direct-chat
-// input left. The check runs after every other projection pass, so queued
-// inputs reconciled this sweep keep the run open and a pending approval —
-// whose input sits in 'waiting' — never sees its prompt closed early.
-func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
-	if !st.runOpen {
-		return nil
-	}
+// closeRunIfIdle asks the gateway to end the open run when the persona has
+// no live direct-chat input left. The liveness check runs after every other
+// projection pass, so queued inputs reconciled this sweep keep the run open
+// and a pending approval — whose input sits in 'waiting' — never sees its
+// prompt closed early. Whether a run is actually open is decided from
+// committed log state under the event-file lock: a stale projector that
+// thinks a run is open commits nothing, and a stale projector that thinks
+// none is open still closes one another writer left behind.
+func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string) error {
 	live, err := c.Core.LiveDirectChatInputs(ctx, personaID)
 	if err != nil {
 		return err
@@ -503,18 +477,8 @@ func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string, s
 	if live > 0 {
 		return nil
 	}
-	end, err := marshalEvent(map[string]any{"type": "agent_end"})
-	if err != nil {
-		return err
-	}
-	key := runMarkerKey(personaID, "end", st.runs-1)
-	if err := c.Gateway.AppendProjectedEvents(ctx, personaID,
-		[]ProjectedEvent{{Event: end, DedupKey: key}}); err != nil {
-		return err
-	}
-	st.seen[key] = struct{}{}
-	st.runOpen = false
-	return nil
+	return c.Gateway.AppendProjectedEvents(ctx, personaID,
+		[]ProjectedEvent{{RunMarker: RunMarkerEnd}})
 }
 
 func (c *CoreDirectChat) projectJournal(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
@@ -655,6 +619,14 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 						}
 					} else {
 						return err
+					}
+				} else {
+					// The resubmitted input is now durable core work: the
+					// command's receipt is applied, same as a command whose
+					// input was already present. The deduped append keeps a
+					// replayed sweep from minting a second receipt.
+					if aerr := c.appendDisposition(ctx, personaID, st, env, "applied", ""); aerr != nil {
+						return aerr
 					}
 				}
 			default:
@@ -1034,6 +1006,14 @@ func (c *CoreDirectChat) errorMessageEnd(personaID string, f agentstate.FailedDi
 		when = f.FinishedAt.UTC()
 	}
 	info := coreChatModelInfo{InstanceID: "env", Protocol: "open_ai_responses", Model: "unknown", Provider: "unknown"}
+	// The host's bounded failure classification rides the existing nullable
+	// provider_code field — no contract change, and the browser maps
+	// "no_model_connection" to its localized guidance instead of the raw
+	// provider detail.
+	var providerCode any
+	if f.ErrorKind != "" {
+		providerCode = f.ErrorKind
+	}
 	return marshalEvent(map[string]any{
 		"type":       "message_end",
 		"message_id": projectedMessageID(personaID, "error", f.TurnID),
@@ -1046,7 +1026,7 @@ func (c *CoreDirectChat) errorMessageEnd(personaID string, f agentstate.FailedDi
 			"usage":         zeroUsage(),
 			"stop_reason":   "error",
 			"error_message": f.Error,
-			"provider_code": nil,
+			"provider_code": providerCode,
 			"interrupted":   false,
 			"timestamp":     when.Format(time.RFC3339),
 		},

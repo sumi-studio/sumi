@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -815,5 +817,474 @@ func TestCoreDirectChatSweepBackoffBoundsFailures(t *testing.T) {
 	adapter.sweep(f.ctx)
 	if st.failures != 1 {
 		t.Fatalf("backoff did not skip the retry: failures=%d", st.failures)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review-B regressions: stale/overlapping projectors, sidecar loss, backoff
+// saturation, and reconciler receipts. Each reproduces a deterministic
+// finding with real Postgres + real file-backed logs.
+// ---------------------------------------------------------------------------
+
+// newProjector is a second "API process": its own gateway over the same
+// durable dir, so its only shared truth is the committed log itself.
+func (f *coreDirectChatFixture) newProjector(t *testing.T) (*CoreDirectChat, *DurableGateway) {
+	t.Helper()
+	gw, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	return &CoreDirectChat{Core: f.core, Gateway: gw, PollInterval: time.Millisecond}, gw
+}
+
+func (f *coreDirectChatFixture) sendOn(t *testing.T, a *CoreDirectChat, key, text string) CommandEnvelope {
+	t.Helper()
+	env, err := a.Append(f.ctx, f.provenance(), key,
+		json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":%q,"attachments":[]}`, text)))
+	if err != nil {
+		t.Fatalf("append %q: %v", text, err)
+	}
+	return env
+}
+
+func syncOn(t *testing.T, a *CoreDirectChat, pa string) {
+	t.Helper()
+	if err := a.syncPersona(context.Background(), pa); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+}
+
+// hostComplete finishes the input's claimed turn with the ordinary event set
+// (input_received, one tool round-trip, assistant reply), like the TS host.
+func (f *coreDirectChatFixture) hostComplete(t *testing.T, inputID, reply string) {
+	t.Helper()
+	in, _, err := f.core.GetInput(f.ctx, f.pa, inputID)
+	if err != nil {
+		t.Fatalf("get input %s: %v", inputID, err)
+	}
+	f.runHostTurn(t, []agentstate.EventInput{
+		f.inputReceived(in, 1),
+		{Kind: "tool_call", Payload: map[string]any{"tool": "journal.note", "call_id": "call-" + in.InputID, "request": map[string]any{"text": reply}, "route": "normal"}},
+		{Kind: "tool_result", Payload: map[string]any{"tool": "journal.note", "call_id": "call-" + in.InputID, "response": map[string]any{"noted": reply}}},
+		{Kind: "assistant_message", Payload: map[string]any{"text": reply, "round": 1}},
+	}, agentstate.CommitRequest{Outcome: "complete"})
+}
+
+// hostPark commits the input's turn as awaiting an elevated approval: the
+// input stays 'waiting' until the approval resolves.
+func (f *coreDirectChatFixture) hostPark(t *testing.T, inputID string) (turnID, approvalID string) {
+	t.Helper()
+	lease, err := f.core.AcquireWriter(f.ctx, f.pa, "test-host", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	loaded, err := f.core.LoadTurn(f.ctx, f.pa, lease.Generation, "", 100)
+	if err != nil || loaded.Turn == nil {
+		t.Fatalf("load: %v turn=%v", err, loaded.Turn)
+	}
+	if _, _, err := f.core.SavePlan(f.ctx, f.pa, loaded.Turn.TurnID, lease.Generation, 0,
+		agentstate.Decision{Calls: []agentstate.PlanCall{{
+			Tool: "journal.note", Route: "elevated", Request: map[string]any{"text": "x"},
+		}}}); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	_, approval, _, err := f.core.ClaimOperation(f.ctx, f.pa, loaded.Turn.TurnID,
+		lease.Generation, "op-"+inputID, "journal.note", 0, map[string]any{"text": "x"})
+	if err != nil || approval == nil {
+		t.Fatalf("claim: %v approval=%v", err, approval)
+	}
+	if _, err := f.core.CommitTurn(f.ctx, f.pa, loaded.Turn.TurnID, lease.Generation,
+		agentstate.CommitRequest{
+			Outcome: "await",
+			Events: []agentstate.EventInput{
+				{Kind: "tool_call", Payload: map[string]any{"tool": "journal.note", "call_id": "call-park", "request": map[string]any{"text": "x"}, "route": "elevated"}},
+				{Kind: "approval_requested", Payload: map[string]any{"tool": "journal.note", "call_id": "call-park", "route": "elevated", "approval_id": approval.ApprovalID, "request": map[string]any{"text": "x"}}},
+			},
+		}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+	if err := f.core.ReleaseWriter(f.ctx, f.pa, "test-host", lease.Generation); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	return loaded.Turn.TurnID, approval.ApprovalID
+}
+
+// assertEnvelopeIntegrity walks the committed log once and requires every
+// non-marker event to sit inside an open run — content after the last
+// agent_end with no agent_start after it is the orphan tail F1 produced.
+func assertEnvelopeIntegrity(t *testing.T, events []Envelope) {
+	t.Helper()
+	open := false
+	starts, ends := 0, 0
+	var orphans []string
+	for _, e := range events {
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(e.Event, &head); err != nil {
+			continue
+		}
+		seq := uint64(0)
+		if e.Seq != nil {
+			seq = *e.Seq
+		}
+		switch head.Type {
+		case "agent_start":
+			starts++
+			open = true
+		case "agent_end":
+			ends++
+			open = false
+		case "command_disposition":
+			// Receipts are not run content: they land inside whatever run
+			// is open and are also valid outside one.
+		default:
+			if !open {
+				orphans = append(orphans, fmt.Sprintf("%s@%d", head.Type, seq))
+			}
+		}
+	}
+	if open {
+		t.Fatalf("log ends with an unclosed run")
+	}
+	if starts != ends {
+		t.Fatalf("unbalanced run markers: %d starts %d ends", starts, ends)
+	}
+	if len(orphans) > 0 {
+		t.Fatalf("content committed outside a run envelope: %v", orphans)
+	}
+}
+
+// F1: a projector whose cached view predates a whole busy period used to mint
+// a start marker under a stale index, have it dedup-suppressed, then commit
+// content after the committed agent_end — orphaning tool/approval events the
+// browser reducer drops. Marker need/identity now comes from committed log
+// state under the event-file lock.
+func TestCoreDirectChatStaleProjectorKeepsContentInsideRun(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	// Busy period 0: completed by A.
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+	if n := countEvent(eventTypes(durableEvents(t, gwA, f.pa)), "agent_start"); n != 1 {
+		t.Fatalf("starts after run0: %d", n)
+	}
+
+	// B freezes its view now — before busy period 1 exists.
+	b, gwB := f.newProjector(t)
+	if err := b.loadProjectionState(f.ctx, f.pa, b.personaState(f.pa)); err != nil {
+		t.Fatalf("B load: %v", err)
+	}
+
+	// Busy period 1: A projects a parked turn (run open), then resolves and
+	// completes it (run closed).
+	env2 := f.sendOn(t, a, "k2", "second")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env2.CommandID)
+	syncOn(t, a, f.pa)
+	if _, err := f.core.ResolveApproval(f.ctx, f.pa, approvalID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d1", DecidedByKind: "human", DecidedByID: f.user,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+	syncOn(t, a, f.pa)
+
+	// Busy period 2 is projected only by the stale B.
+	env3 := f.sendOn(t, b, "k3", "third")
+	f.hostComplete(t, "direct-chat:"+env3.CommandID, "reply-3")
+	syncOn(t, b, f.pa)
+
+	events := durableEvents(t, gwB, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	if texts := messageTexts(events, "assistant"); len(texts) != 3 {
+		t.Fatalf("assistant messages: %v", texts)
+	}
+	if n := countEvent(eventTypes(events), "agent_start"); n != 3 {
+		t.Fatalf("starts: %d", n)
+	}
+}
+
+// F2: losing the .dedup sidecar must not forget explicit marker keys — the
+// rebuild recovers them positionally from the committed log, so replayed
+// emissions still dedup. A stale projector closing after index loss used to
+// commit a duplicate agent_end.
+func TestCoreDirectChatDedupIndexLossPreservesMarkerKeys(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+
+	env2 := f.sendOn(t, a, "k2", "second")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env2.CommandID)
+	syncOn(t, a, f.pa)
+
+	b, _ := f.newProjector(t)
+	if err := b.loadProjectionState(f.ctx, f.pa, b.personaState(f.pa)); err != nil {
+		t.Fatalf("B load: %v", err)
+	}
+
+	if _, err := f.core.ResolveApproval(f.ctx, f.pa, approvalID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d1", DecidedByKind: "human", DecidedByID: f.user,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+	syncOn(t, a, f.pa)
+
+	before := durableEvents(t, gwA, f.pa)
+	if n := countEvent(eventTypes(before), "agent_end"); n != 2 {
+		t.Fatalf("ends before index loss: %d", n)
+	}
+
+	if err := os.Remove(filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".dedup")); err != nil {
+		t.Fatalf("remove dedup index: %v", err)
+	}
+
+	// The stale projector sweeps again: its view says a run is open, but the
+	// committed log says closed — and the rebuilt index must still know the
+	// committed marker keys either way.
+	syncOn(t, b, f.pa)
+	syncOn(t, a, f.pa)
+
+	after := durableEvents(t, gwA, f.pa)
+	assertEnvelopeIntegrity(t, after)
+	if len(after) != len(before) {
+		t.Fatalf("index loss caused new commits: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// F3: the sweep backoff must saturate, not overflow, at arbitrarily large
+// failure counts — and a success must clear the penalty entirely.
+func TestCoreDirectChatBackoffSaturatesHugeFailureCounts(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	pool := testdb.Create(t)
+	adapter := &CoreDirectChat{Core: agentstate.NewStore(pool), Gateway: f.gateway, PollInterval: 500 * time.Millisecond}
+	pool.Close()
+	adapter.notePersona(f.pa)
+	st := adapter.personaState(f.pa)
+
+	for _, failures := range []int{1, 5, 35, 36, 40, 100, 1 << 20} {
+		st.failures = failures - 1 // the sweep increments before computing
+		st.nextRetry = time.Time{}
+		adapter.sweep(f.ctx)
+		if st.failures != failures {
+			t.Fatalf("failures=%d want %d", st.failures, failures)
+		}
+		delay := time.Until(st.nextRetry)
+		if delay <= 0 || delay > maxSyncBackoff+time.Second {
+			t.Fatalf("failures=%d produced delay %v", failures, delay)
+		}
+	}
+}
+
+// F4: a durable user_message whose dispatch never ran (crash between command
+// commit and SubmitInput) is resubmitted by the reconciler — and now also
+// receives its applied receipt, exactly once, within the process lifetime.
+func TestCoreDirectChatResubmittedCommandGetsApplied(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+
+	env, _, err := f.gateway.commands.appendWithIdempotencyStatus(f.ctx, f.provenance(), "k-orphan",
+		json.RawMessage(`{"type":"user_message","text":"orphaned","attachments":[]}`))
+	if err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	f.sweep(t)
+
+	if _, _, err := f.core.GetInput(f.ctx, f.pa, "direct-chat:"+env.CommandID); err != nil {
+		t.Fatalf("reconciler did not submit the input: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env.CommandID, "recovered")
+	f.sweep(t)
+	f.sweep(t) // a replayed sweep must not mint a second receipt
+
+	var statuses []string
+	for _, e := range durableEvents(t, f.gateway, f.pa) {
+		var ev struct {
+			Type      string `json:"type"`
+			CommandID string `json:"command_id"`
+			Status    string `json:"status"`
+		}
+		if json.Unmarshal(e.Event, &ev) == nil && ev.Type == "command_disposition" && ev.CommandID == env.CommandID {
+			statuses = append(statuses, ev.Status)
+		}
+	}
+	if len(statuses) != 1 || statuses[0] != "applied" {
+		t.Fatalf("resubmitted command receipts: %v", statuses)
+	}
+}
+
+// A fresh projector over an in-flight approval must see the open run in the
+// committed log — folded from event lines, not from any cached counter — and
+// must neither duplicate the start nor close the run while the input waits.
+func TestCoreDirectChatRestartMidApprovalKeepsCommittedRun(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "hold this")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env1.CommandID)
+	syncOn(t, a, f.pa)
+	if n := countEvent(eventTypes(durableEvents(t, gwA, f.pa)), "agent_start"); n != 1 {
+		t.Fatalf("starts: %d", n)
+	}
+
+	// API restart: brand-new gateway + adapter over the same dir.
+	b, gwB := f.newProjector(t)
+	if err := gwB.EnsureAgentSessionStateRebuilt(f.ctx, f.pa); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !gwB.IsApprovalPending(f.pa, approvalID) {
+		t.Fatal("pending approval not rebuilt across restart")
+	}
+	syncOn(t, b, f.pa)
+	types := eventTypes(durableEvents(t, gwB, f.pa))
+	if n := countEvent(types, "agent_start"); n != 1 {
+		t.Fatalf("restart emitted a second agent_start: %d", n)
+	}
+	if n := countEvent(types, "agent_end"); n != 0 {
+		t.Fatalf("restart closed the open run while the approval waits: %d", n)
+	}
+
+	// The decision taken on the restarted process resolves the parked turn;
+	// the run closes exactly once, after the completion lands.
+	decision := fmt.Sprintf(`{"type":"approval_decision","request_id":%q,"decision":{"type":"approve_once"}}`, approvalID)
+	if _, err := b.Append(f.ctx, f.provenance(), "k2", json.RawMessage(decision)); err != nil {
+		t.Fatalf("decision: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "resumed reply")
+	syncOn(t, b, f.pa)
+
+	events := durableEvents(t, gwB, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	types = eventTypes(events)
+	if n := countEvent(types, "agent_start"); n != 1 || countEvent(types, "agent_end") != 1 {
+		t.Fatalf("run markers across restart: %v", types)
+	}
+	if n := countEvent(types, "approval_resolved"); n != 1 {
+		t.Fatalf("approval_resolved missing: %v", types)
+	}
+}
+
+// A crash between the index fsync and the event write leaves a key for a
+// line that never committed. The phantom must be truncated on load —
+// honoring it would suppress the next run's agent_start and orphan every
+// event inside it.
+func TestCoreDirectChatPhantomIndexRecordDoesNotSuppress(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+	if n := countEvent(eventTypes(durableEvents(t, gwA, f.pa)), "agent_start"); n != 1 {
+		t.Fatalf("starts: %d", n)
+	}
+
+	// Forge a phantom: the exact key the NEXT busy period's agent_start
+	// will use, without its event line ever committing.
+	indexPath := filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".dedup")
+	ix, err := os.OpenFile(indexPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open index: %v", err)
+	}
+	k := runMarkerKey(f.pa, "start", 1)
+	if _, err := ix.Write(k[:]); err != nil {
+		t.Fatalf("phantom write: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("phantom close: %v", err)
+	}
+
+	env2 := f.sendOn(t, a, "k2", "second")
+	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+	syncOn(t, a, f.pa)
+
+	events := durableEvents(t, gwA, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	if n := countEvent(eventTypes(events), "agent_start"); n != 2 {
+		t.Fatalf("phantom suppressed the next run's agent_start: starts=%d", n)
+	}
+}
+
+// A torn event tail (crash mid-line) must fail reads closed, then heal on
+// the next write: refreshEventTailLocked truncates the partial record and
+// the projector appends cleanly.
+func TestCoreDirectChatTornEventTailHealsOnAppend(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+
+	eventsPath := filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".jsonl")
+	ef, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open events: %v", err)
+	}
+	if _, err := ef.WriteString(`{"seq":9,"event":{"type":"message_end"`); err != nil {
+		t.Fatalf("torn write: %v", err)
+	}
+	if err := ef.Close(); err != nil {
+		t.Fatalf("torn close: %v", err)
+	}
+
+	if _, err := gwA.EventCatchUp(f.ctx, f.pa, 0); err == nil {
+		t.Fatal("torn event tail was silently served")
+	}
+
+	env2 := f.sendOn(t, a, "k2", "second")
+	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+	syncOn(t, a, f.pa)
+	events := durableEvents(t, gwA, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	if texts := messageTexts(events, "assistant"); len(texts) != 2 {
+		t.Fatalf("assistant messages after torn-tail heal: %v", texts)
+	}
+}
+
+// A projector whose in-memory receipt map predates the committed applied
+// disposition re-applies the decision; the identical replay resolves
+// cleanly in the core store, so no contradictory superseded receipt lands.
+func TestCoreDirectChatStaleProjectorNoContradictoryReceipt(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "park me")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env1.CommandID)
+	syncOn(t, a, f.pa)
+
+	b, _ := f.newProjector(t)
+	if err := b.loadProjectionState(f.ctx, f.pa, b.personaState(f.pa)); err != nil {
+		t.Fatalf("B load: %v", err)
+	}
+
+	decision := fmt.Sprintf(`{"type":"approval_decision","request_id":%q,"decision":{"type":"approve_once"}}`, approvalID)
+	denv, err := a.Append(f.ctx, f.provenance(), "k2", json.RawMessage(decision))
+	if err != nil {
+		t.Fatalf("decision: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "done")
+	syncOn(t, a, f.pa)
+
+	// Stale B reconciles the same command log.
+	syncOn(t, b, f.pa)
+
+	var statuses []string
+	for _, e := range durableEvents(t, gwA, f.pa) {
+		var ev struct {
+			Type      string `json:"type"`
+			CommandID string `json:"command_id"`
+			Status    string `json:"status"`
+		}
+		if json.Unmarshal(e.Event, &ev) == nil && ev.Type == "command_disposition" && ev.CommandID == denv.CommandID {
+			statuses = append(statuses, ev.Status)
+		}
+	}
+	if len(statuses) != 1 || statuses[0] != "applied" {
+		t.Fatalf("decision command has contradictory receipts: %v", statuses)
 	}
 }

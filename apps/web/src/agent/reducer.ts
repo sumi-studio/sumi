@@ -384,12 +384,20 @@ function applyMessage(
   if (complete && message.stop_reason === "error") {
     const detail = message.error_message?.trim() || "Provider request failed";
     const providerCode = message.provider_code?.trim();
+    const cause =
+      providerCode === "no_model_connection"
+        ? "no_model_connection"
+        : undefined;
     conversation = upsertEntry(conversation, {
       kind: "error",
       id: `message-error:${messageId}`,
       runId,
-      message: providerCode ? `${detail} (${providerCode})` : detail,
+      message:
+        providerCode && cause === undefined
+          ? `${detail} (${providerCode})`
+          : detail,
       retryable: false,
+      ...(cause === undefined ? {} : { cause }),
     });
   }
 

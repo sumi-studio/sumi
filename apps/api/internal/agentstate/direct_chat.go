@@ -44,9 +44,13 @@ func (s *Store) Turn(ctx context.Context, personaID, turnID string) (*Turn, erro
 // direct-chat input. The projection turns each into a terminal error
 // message exactly once.
 type FailedDirectChatTurn struct {
-	TurnID     string
-	InputID    string
-	Error      string
+	TurnID  string
+	InputID string
+	Error   string
+	// ErrorKind is the bounded failure classification the committing host
+	// recorded on the commit request (e.g. "no_model_connection"); empty
+	// when the failure carries no certain cause.
+	ErrorKind  string
 	FinishedAt *time.Time
 }
 
@@ -95,7 +99,8 @@ func (s *Store) LiveDirectChatInputs(ctx context.Context, personaID string) (int
 // visible message unanswered forever.
 func (s *Store) FailedDirectChatTurns(ctx context.Context, personaID string) ([]FailedDirectChatTurn, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.turn_id, t.input_id, COALESCE(t.error, ''), t.finished_at
+		SELECT t.turn_id, t.input_id, COALESCE(t.error, ''),
+			COALESCE(t.commit_request->>'error_kind', ''), t.finished_at
 		FROM core_turns t
 		JOIN core_inputs i ON i.persona_id = t.persona_id AND i.turn_id = t.turn_id
 		WHERE t.persona_id = $1 AND t.status = 'failed' AND i.source_surface = 'direct_chat'
@@ -107,7 +112,7 @@ func (s *Store) FailedDirectChatTurns(ctx context.Context, personaID string) ([]
 	var out []FailedDirectChatTurn
 	for rows.Next() {
 		var f FailedDirectChatTurn
-		if err := rows.Scan(&f.TurnID, &f.InputID, &f.Error, &f.FinishedAt); err != nil {
+		if err := rows.Scan(&f.TurnID, &f.InputID, &f.Error, &f.ErrorKind, &f.FinishedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, f)

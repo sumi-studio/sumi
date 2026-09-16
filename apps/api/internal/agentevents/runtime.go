@@ -94,6 +94,13 @@ type personalityAgentLogState struct {
 	eventSeq  uint64
 	eventSize int64
 	eventCRC  uint32
+	// runStarts/runOpen are the committed run-marker state, folded from
+	// every event line as it is observed under the event-file lock (own
+	// appends and other writers' tails alike). Projected lifecycle markers
+	// derive their identity from these counters at commit time, never from
+	// a caller's cached view.
+	runStarts uint64
+	runOpen   bool
 	acks      map[uint64]CommandAck
 	ackOrder  []ackCacheEntry
 	ackSize   int64
@@ -1667,17 +1674,76 @@ var errProjectedWriteBlocked = errors.New("a live legacy runtime owns this perso
 // double-commit under the event-file lock — across process restarts and
 // concurrent projectors alike. Events whose wire content already carries their
 // identity (message_id, request/command ids) leave DedupKey zero and default
-// to sha256(Event); anonymous lifecycle markers (agent_start/agent_end carry
-// only {"type"}) must supply a key derived from what they represent.
+// to sha256(Event).
+//
+// RunMarker instead asks for a lifecycle marker whose need is decided under
+// the append lock from committed run state — never from the caller's cache:
+// RunMarkerStart emits {"type":"agent_start"} iff the committed log has no
+// open run and some later element of the same batch commits (a replayed or
+// fully deduplicated batch leaves no bare start behind); RunMarkerEnd emits
+// {"type":"agent_end"} iff a run is open at that point in the batch. A marker
+// that is not needed commits nothing and consumes no seq. Event and DedupKey
+// are ignored for marker elements: the gateway mints the marker bytes and the
+// dedup key from the committed run index it holds under the lock.
 type ProjectedEvent struct {
-	Event    json.RawMessage
-	DedupKey [sha256.Size]byte
+	Event     json.RawMessage
+	DedupKey  [sha256.Size]byte
+	RunMarker string
+}
+
+// Run-marker kinds understood by AppendProjectedEvents.
+const (
+	RunMarkerStart = "start"
+	RunMarkerEnd   = "end"
+)
+
+var (
+	projectedRunStartBytes = json.RawMessage(`{"type":"agent_start"}`)
+	projectedRunEndBytes   = json.RawMessage(`{"type":"agent_end"}`)
+)
+
+// runMarkerKey is the durable dedup identity of one run's start or end
+// marker. The index of the run within the persona's committed history makes
+// each key unique while remaining a pure function of the log — a recovered
+// index can therefore rebuild it positionally.
+func runMarkerKey(personaID, kind string, index uint64) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write([]byte("sumi-core-direct-chat\x00run-" + kind + "\x00"))
+	h.Write([]byte(personaID))
+	fmt.Fprintf(h, "\x00%d", index)
+	var key [sha256.Size]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
+// foldRunMarkerLocked folds the committed run-marker state forward for one
+// event line. It runs on every path that observes a committed line — tail
+// refresh and both append paths — so the counters in
+// personalityAgentLogState always describe the durable log, not one
+// projector's view of it.
+func foldRunMarkerLocked(st *personalityAgentLogState, event json.RawMessage) {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(event, &head); err != nil {
+		return
+	}
+	switch head.Type {
+	case "agent_start":
+		st.runStarts++
+		st.runOpen = true
+	case "agent_end":
+		st.runOpen = false
+	}
 }
 
 // dedupIndexPath is the per-persona sidecar of projected-event dedup keys.
-// Record i is the key for event line i+1; entries for lines committed by
-// non-projected writers (the runtime path does not maintain the index) are
-// recovered by hashing the stored line itself.
+// The index is an ordered preimage stream, not a positional map: non-projected
+// writers (the runtime path does not maintain the index) interleave event
+// lines without index records. Missing coverage is recovered by scanning the
+// committed log — anonymous run markers get their deterministic positional
+// key (the k-th committed agent_start's identity is runMarkerKey("start",k)),
+// every other line is covered by hashing its stored inner event.
 func (g *DurableGateway) dedupIndexPath(personalityAgentID string) string {
 	return filepath.Join(g.dir, "events-"+safeFileID(personalityAgentID)+".dedup")
 }
@@ -1747,27 +1813,45 @@ func (g *DurableGateway) projectedKeySet(
 		}
 	}
 	if covered < int64(st.eventSeq) {
-		// Committed lines with no stored key (legacy/runtime writes) are
-		// covered by content hash and the index is brought current.
+		// Committed lines with no stored key (runtime-path writes, torn-index
+		// drops, or an index lost wholesale) are re-covered and the index is
+		// brought current. Anonymous lifecycle markers recover their exact
+		// explicit key positionally — the k-th committed marker of a kind is
+		// runMarkerKey(kind,k) — because their bare {"type":...} content
+		// cannot reproduce it by hashing.
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			index.Close()
 			return nil, nil, fmt.Errorf("seek event log for dedup rebuild: %w", err)
 		}
 		var backfill bytes.Buffer
-		var seq uint64
+		var seq, startOrd, endOrd uint64
 		r := bufio.NewReader(file)
 		for {
 			line, readErr := r.ReadBytes('\n')
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {
+				var rec durableEventRecord
+				if err := json.Unmarshal(trimmed, &rec); err != nil {
+					index.Close()
+					return nil, nil, fmt.Errorf("parse committed event for dedup rebuild: %w", err)
+				}
 				seq++
+				var k [sha256.Size]byte
+				var head struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(rec.Event.Event, &head)
+				switch head.Type {
+				case "agent_start":
+					k = runMarkerKey(personalityAgentID, "start", startOrd)
+					startOrd++
+				case "agent_end":
+					k = runMarkerKey(personalityAgentID, "end", endOrd)
+					endOrd++
+				default:
+					k = sha256.Sum256(rec.Event.Event)
+				}
 				if int64(seq) > covered {
-					var rec durableEventRecord
-					if err := json.Unmarshal(trimmed, &rec); err != nil {
-						index.Close()
-						return nil, nil, fmt.Errorf("parse committed event for dedup rebuild: %w", err)
-					}
-					k := sha256.Sum256(rec.Event.Event)
 					keys[k] = struct{}{}
 					backfill.Write(k[:])
 				}
@@ -1875,33 +1959,92 @@ func (g *DurableGateway) AppendProjectedEvents(
 		return err
 	}
 
-	// Dedup under the same exclusive file lock that owns the append: the
-	// durable index is the guard, not any projector's memory, so overlapping
-	// API processes cannot double-commit.
-	keys, index, err := g.projectedKeySet(personalityAgentID, file, st)
-	if err != nil {
-		return err
+	// Every emission decision is taken here, under the lock, against the
+	// committed log — a stale or overlapping projector's cached view of run
+	// state cannot mint a marker for a run index that is already closed or
+	// skip one the log says is needed. Content dedup still runs against the
+	// durable index; the index load is skipped for pure-marker batches.
+	hasContent := false
+	for _, pe := range events {
+		if pe.RunMarker == "" {
+			hasContent = true
+			break
+		}
 	}
-	defer index.Close()
+	var keys map[[sha256.Size]byte]struct{}
+	var index durableFileHandle
+	if hasContent {
+		keys, index, err = g.projectedKeySet(personalityAgentID, file, st)
+		if err != nil {
+			return err
+		}
+		defer index.Close()
+	} else {
+		keys = make(map[[sha256.Size]byte]struct{})
+	}
+
+	// Pass 1: which content elements are new? Markers are decided in pass 2.
+	commit := make([]bool, len(events))
+	elemKey := make([][sha256.Size]byte, len(events))
+	for i, pe := range events {
+		if pe.RunMarker != "" {
+			continue
+		}
+		key := pe.DedupKey
+		if key == ([sha256.Size]byte{}) {
+			key = sha256.Sum256(pe.Event)
+		}
+		elemKey[i] = key
+		if _, seen := keys[key]; !seen {
+			keys[key] = struct{}{}
+			commit[i] = true
+		}
+	}
+	// later[i] reports whether any content element after i will commit — a
+	// run-start marker is only emitted when the batch actually lands content.
+	later := make([]bool, len(events)+1)
+	for i := len(events) - 1; i >= 0; i-- {
+		later[i] = later[i+1] || commit[i]
+	}
 
 	var keyBuf bytes.Buffer
 	var buf bytes.Buffer
 	envelopes := make([]Envelope, 0, len(events))
-	for i, raw := range events {
-		key := raw.DedupKey
-		if key == ([sha256.Size]byte{}) {
-			key = sha256.Sum256(raw.Event)
+	simOpen := st.runOpen
+	simStarts := st.runStarts
+	for i, pe := range events {
+		var eventBytes json.RawMessage
+		var key [sha256.Size]byte
+		switch pe.RunMarker {
+		case "":
+			if !commit[i] {
+				continue
+			}
+			eventBytes, key = pe.Event, elemKey[i]
+		case RunMarkerStart:
+			if simOpen || !later[i+1] {
+				continue
+			}
+			eventBytes = projectedRunStartBytes
+			key = runMarkerKey(personalityAgentID, "start", simStarts)
+			simOpen = true
+			simStarts++
+		case RunMarkerEnd:
+			if !simOpen {
+				continue
+			}
+			eventBytes = projectedRunEndBytes
+			key = runMarkerKey(personalityAgentID, "end", simStarts-1)
+			simOpen = false
+		default:
+			return fmt.Errorf("projected event %d: unknown run marker %q", i, pe.RunMarker)
 		}
-		if _, seen := keys[key]; seen {
-			continue
-		}
-		keys[key] = struct{}{}
 		seq := st.eventSeq + uint64(len(envelopes)) + 1
 		envelope := Envelope{
 			Audience:           AudienceDirectChat,
 			Seq:                &seq,
 			PersonalityAgentID: personalityAgentID,
-			Event:              raw.Event,
+			Event:              eventBytes,
 		}
 		if err := validateEnvelope(envelope); err != nil {
 			return fmt.Errorf("projected event %d: %w", i, err)
@@ -1917,6 +2060,15 @@ func (g *DurableGateway) AppendProjectedEvents(
 	}
 	if len(envelopes) == 0 {
 		return nil
+	}
+	if index == nil {
+		// A pure-marker batch that actually emitted still needs the index —
+		// a committed marker is part of the preimage stream. (The common
+		// no-op marker batch above never touches it.)
+		if _, index, err = g.projectedKeySet(personalityAgentID, file, st); err != nil {
+			return err
+		}
+		defer index.Close()
 	}
 
 	// Preimage ordering: the dedup keys reach stable storage before the events
@@ -1958,6 +2110,10 @@ func (g *DurableGateway) AppendProjectedEvents(
 	st.eventSeq += uint64(len(envelopes))
 	st.eventSize = preWriteOffset + int64(len(data))
 	st.eventCRC = updateCRC(st.eventCRC, data)
+	// The simulated run state becomes committed state only now that the
+	// write+fsync landed.
+	st.runStarts = simStarts
+	st.runOpen = simOpen
 	for _, envelope := range envelopes {
 		g.updateAgentSessionStateLocked(personalityAgentID, envelope.Event)
 	}
@@ -2024,6 +2180,7 @@ func (g *DurableGateway) appendDurableEventLocked(
 	st.eventSeq = record.Seq
 	st.eventSize = preWriteOffset + int64(len(data))
 	st.eventCRC = updateCRC(st.eventCRC, data)
+	foldRunMarkerLocked(st, record.Event.Event)
 	return nil
 }
 
@@ -2285,10 +2442,14 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 		st.eventSeq = 0
 		st.eventSize = 0
 		st.eventCRC = 0
+		st.runStarts = 0
+		st.runOpen = false
 	} else if size < st.eventSize {
 		st.eventSeq = 0
 		st.eventSize = 0
 		st.eventCRC = 0
+		st.runStarts = 0
+		st.runOpen = false
 	}
 	if st.eventSize > 0 && size > st.eventSize {
 		// Before scanning an appended tail, confirm the existing prefix has
@@ -2301,6 +2462,8 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 			st.eventSeq = 0
 			st.eventSize = 0
 			st.eventCRC = 0
+			st.runStarts = 0
+			st.runOpen = false
 		}
 	}
 
@@ -2357,6 +2520,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 			return fmt.Errorf("durable event log is non-contiguous: got %d after %d", existing.Seq, last)
 		}
 		last = existing.Seq
+		foldRunMarkerLocked(st, existing.Event.Event)
 
 		if readErr == io.EOF {
 			if len(line) > 0 && line[len(line)-1] != '\n' {
