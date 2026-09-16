@@ -339,14 +339,16 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 		// discard, or an account switch); no proof or replay may proceed.
 		return AuthFlow{}, ErrAuthFlowConsumed
 	}
-	if flow.Channel == ChannelEmailCode && flow.Status == "completed" {
-		return replayEmailCompletionTx(ctx, tx, flow, firebaseUID, identity, action)
+	if flow.Status == "completed" {
+		// A committed outcome is recoverable by the same authority inside the
+		// replay window: session admission — not flow completion — owns the
+		// current-Human consent check, so a refused or lost issuance response
+		// must be able to return the recorded outcome again without repeating
+		// provisioning, invite consumption, or credential binding.
+		return replayFlowCompletionTx(ctx, tx, flow, firebaseUID, identity, action)
 	}
 	if !time.Now().UTC().Before(flow.ExpiresAt) {
 		return AuthFlow{}, ErrAuthFlowExpired
-	}
-	if flow.Status == "completed" {
-		return AuthFlow{}, ErrAuthFlowConsumed
 	}
 
 	if action == "" {
@@ -389,7 +391,7 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 					return AuthFlow{}, err
 				}
 			}
-			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn)
+			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn, identity.ProviderSubject)
 		case flow.Intent == IntentSignUp && !exists:
 			flow, err = s.provisionFromFlow(ctx, tx, flow, identity)
 		case flow.Intent == IntentSignIn && !exists:
@@ -449,7 +451,7 @@ func (s *Store) advanceAuthFlow(ctx context.Context, flowID, nonce string, ident
 					return AuthFlow{}, err
 				}
 			}
-			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn)
+			flow, err = completeExistingFlow(ctx, tx, flow, firebaseUID, humanID, agentID, OutcomeSignedIn, flow.VerifiedProviderSubject)
 		}
 		if err != nil {
 			return AuthFlow{}, err
@@ -468,22 +470,60 @@ func emailCodeIdentityMatches(flow AuthFlow, identity VerifiedIdentity) bool {
 		!identity.IssuedAt.Before(flow.EmailProofUIDBoundAt.Add(-emailProofTokenSkew))
 }
 
-// replayEmailCompletionTx repeats a completed email sign-in whose response was
-// lost. Only a resolve by the flow authority with a custom-token sign-in of
-// the principal the proof bound is accepted, inside the replay window, while
-// that principal still resolves to the Human the flow completed for. Nothing
-// is written, so no Human, invitation, credential, or flow changes; a
-// confirmation or a later use stays consumed.
-func replayEmailCompletionTx(ctx context.Context, tx pgx.Tx, flow AuthFlow, firebaseUID string, identity VerifiedIdentity, action string) (AuthFlow, error) {
+// completionActionFor maps a recorded terminal outcome back to the
+// confirmation action that committed it, so a repeated confirm can be checked
+// for action consistency after confirmation_action was cleared.
+func completionActionFor(outcome string) string {
+	switch outcome {
+	case OutcomeAccountCreated:
+		return ActionCreateAccount
+	case OutcomeSignedIn:
+		return ActionSignIn
+	}
+	return ""
+}
+
+// completionIdentityMatches demands that a resolve replay carry a verified
+// token for the exact identity the flow completed with: per channel, the
+// recorded provider subject or the bound mailbox principal.
+func completionIdentityMatches(flow AuthFlow, identity VerifiedIdentity) bool {
+	switch flow.Channel {
+	case ChannelEmailCode:
+		return emailCodeIdentityMatches(flow, identity)
+	case ChannelEmailLink:
+		return identity.EmailVerified && identity.SignInProvider == "password" &&
+			identity.NormalizedEmail == flow.NormalizedEmail
+	default:
+		return identity.SignInProvider == flow.ExpectedProvider &&
+			flow.VerifiedProviderSubject != "" &&
+			identity.ProviderSubject == flow.VerifiedProviderSubject
+	}
+}
+
+// replayFlowCompletionTx repeats a committed terminal outcome whose issuance
+// was refused by session admission or whose response was lost. A resolve
+// replay must carry the same proof identity the flow completed with; a
+// confirm replay must repeat the action implied by the recorded outcome.
+// Both are bounded by the replay window and by the recorded principal still
+// resolving to the recorded Human. Nothing is written, so no Human,
+// invitation, credential, or flow changes, and a mismatched request or a use
+// outside the window stays consumed.
+func replayFlowCompletionTx(ctx context.Context, tx pgx.Tx, flow AuthFlow, firebaseUID string, identity VerifiedIdentity, action string) (AuthFlow, error) {
 	now, err := dbNow(ctx, tx)
 	if err != nil {
 		return AuthFlow{}, err
 	}
-	if action != "" || !emailCompletionReplayable(flow, now) {
+	if !flowCompletionReplayable(flow, now) {
 		return AuthFlow{}, ErrAuthFlowConsumed
 	}
-	if !emailCodeIdentityMatches(flow, identity) || firebaseUID != flow.EmailProofUID {
-		return AuthFlow{}, ErrAuthProofMismatch
+	if action == "" {
+		if !completionIdentityMatches(flow, identity) || firebaseUID != identity.FirebaseUID {
+			return AuthFlow{}, ErrAuthProofMismatch
+		}
+	} else {
+		if action != completionActionFor(flow.TerminalOutcome) {
+			return AuthFlow{}, ErrAuthFlowConsumed
+		}
 	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "8:firebase"+firebaseUID); err != nil {
 		return AuthFlow{}, fmt.Errorf("lock Firebase credential: %w", err)
@@ -534,16 +574,22 @@ func resolveHumanTx(ctx context.Context, tx pgx.Tx, firebaseUID string) (string,
 	return humanID, agentID, true, nil
 }
 
-func completeExistingFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, uid, humanID, agentID, outcome string) (AuthFlow, error) {
+func completeExistingFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, uid, humanID, agentID, outcome, providerSubject string) (AuthFlow, error) {
+	// provider_subject is retained on completion so a terminal-outcome replay
+	// can still demand the exact recorded provider identity.
 	_, err := tx.Exec(ctx, `UPDATE auth_flows SET status='completed', confirmation_action=NULL,
 		firebase_uid=$2, human_id=$3, personality_agent_id=$4, terminal_outcome=$5,
+		provider_subject=COALESCE(NULLIF($6,''), provider_subject),
 		proved_at=COALESCE(proved_at, now()), completed_at=now() WHERE flow_id=$1`,
-		flow.FlowID, uid, humanID, agentID, outcome)
+		flow.FlowID, uid, humanID, agentID, outcome, providerSubject)
 	if err != nil {
 		return AuthFlow{}, fmt.Errorf("complete auth flow: %w", err)
 	}
 	flow.Status, flow.ConfirmationAction, flow.TerminalOutcome = "completed", "", outcome
 	flow.HumanID, flow.AgentID = humanID, agentID
+	if providerSubject != "" {
+		flow.VerifiedProviderSubject = providerSubject
+	}
 	return flow, nil
 }
 
@@ -599,7 +645,7 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	if _, err := s.directChatApps.InstallDirectChatForNewHumanInTx(ctx, tx, humanID); err != nil {
 		return AuthFlow{}, fmt.Errorf("install initial direct chat: %w", err)
 	}
-	return completeExistingFlow(ctx, tx, flow, identity.FirebaseUID, humanID, agentID, OutcomeAccountCreated)
+	return completeExistingFlow(ctx, tx, flow, identity.FirebaseUID, humanID, agentID, OutcomeAccountCreated, identity.ProviderSubject)
 }
 
 func syncVerifiedProviderTx(ctx context.Context, tx pgx.Tx, humanID, provider, subject, decisionPath string) error {

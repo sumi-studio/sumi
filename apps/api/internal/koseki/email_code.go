@@ -183,7 +183,7 @@ func scanEmailFlowForUpdate(ctx context.Context, tx pgx.Tx, where string, args .
 // completion it holds only inside the completion replay window.
 func emailProofRetryError(flow AuthFlow, now time.Time) error {
 	if flow.Status == "completed" {
-		if emailCompletionReplayable(flow, now) {
+		if flowCompletionReplayable(flow, now) {
 			return nil
 		}
 		return ErrAuthFlowConsumed
@@ -194,8 +194,11 @@ func emailProofRetryError(flow AuthFlow, now time.Time) error {
 	return nil
 }
 
-func emailCompletionReplayable(flow AuthFlow, now time.Time) bool {
-	return flow.Channel == ChannelEmailCode && flow.Status == "completed" && flow.CompletedAt != nil &&
+// flowCompletionReplayable bounds terminal-outcome replay to the recorded
+// sign-in/account-creation outcomes of any channel, inside the completion
+// replay window.
+func flowCompletionReplayable(flow AuthFlow, now time.Time) bool {
+	return flow.Status == "completed" && flow.CompletedAt != nil &&
 		(flow.TerminalOutcome == OutcomeSignedIn || flow.TerminalOutcome == OutcomeAccountCreated) &&
 		now.Before(flow.CompletedAt.Add(EmailCompletionReplayWindow))
 }

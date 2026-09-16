@@ -241,8 +241,9 @@ func TestAdmitBrowserSessionLaterChoiceStandsOverStaleWork(t *testing.T) {
 		t.Fatalf("explicit switch to B: %v", err)
 	}
 
-	// Replaying A's retired cookie is refused rather than treated as a fresh
-	// jar that may mint a session beside B's.
+	// Replaying A's retired cookie is consumed authority: it cannot mint a
+	// session beside B's, because the epoch tip still names B and the
+	// cross-Human consent check refuses it.
 	claimsA, err := v.VerifySessionLocal(context.Background(), signedA)
 	if err != nil {
 		t.Fatalf("local verify of retired cookie: %v", err)
@@ -257,8 +258,8 @@ func TestAdmitBrowserSessionLaterChoiceStandsOverStaleWork(t *testing.T) {
 		},
 		testClaimsFor(testHumanA),
 		time.Minute,
-	); err == nil {
-		t.Fatal("retired cookie replay minted a session")
+	); !errors.Is(err, ErrBrowserSessionActive) {
+		t.Fatalf("retired cookie replay = %v, want session_active", err)
 	}
 	if _, err := v.VerifySession(context.Background(), signedB); err != nil {
 		t.Fatalf("stale replay disturbed the later session: %v", err)
@@ -384,5 +385,260 @@ func TestDiscardBrowserFlowRevokesOnlyItsOwnSessions(t *testing.T) {
 		time.Now().Add(browserFlowClosureHorizon),
 	); err != nil {
 		t.Fatalf("idempotent discard: %v", err)
+	}
+}
+
+// A lost logout response leaves a locally valid but durably retired cookie
+// in the jar. That cookie is consumed authority, so a fresh sign-in that
+// presents it must still issue — the request is evaluated like a cookieless
+// one, on the request's own (freshly minted) epoch.
+func TestAdmitBrowserSessionRetiredCookieRecoversAfterLostLogout(t *testing.T) {
+	v := newAdmissionTestVerifier(t)
+	_, signed, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{FlowID: testFlowIDA, Epoch: testEpochA},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	if _, _, _, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signed},
+		[]string{testEpochA},
+		nil,
+	); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	claims, err := v.VerifySessionLocal(context.Background(), signed)
+	if err != nil {
+		t.Fatalf("local verify of retired cookie: %v", err)
+	}
+	retired := claims.BrowserSessionIdentity()
+
+	// The closed epoch was replaced at mint; the retired cookie is present
+	// but non-authoritative, so the fresh sign-in issues on the new epoch.
+	_, signedAgain, outcome, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{
+			Presented:   &retired,
+			PresentedBy: testHumanA,
+			Epoch:       testEpochB,
+		},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("sign-in presenting retired cookie: %v", err)
+	}
+	if len(outcome.RetiredSessionIDs) != 0 {
+		t.Fatalf("retired cookie re-retired sessions: %v", outcome.RetiredSessionIDs)
+	}
+	if _, err := v.VerifySession(context.Background(), signedAgain); err != nil {
+		t.Fatalf("recovered session invalid: %v", err)
+	}
+}
+
+// A lost rotation response leaves the predecessor cookie in the jar while
+// the committed successor is live. Replaying the flow presents the retired
+// cookie; admission must re-issue on the same epoch and link the new
+// session into the jar's real chain so a later logout still reaches it.
+func TestAdmitBrowserSessionRetiredCookieRecoversLostRotation(t *testing.T) {
+	v := newAdmissionTestVerifier(t)
+	_, signedA, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{FlowID: testFlowIDA, Epoch: testEpochA},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	claimsA, err := v.VerifySessionLocal(context.Background(), signedA)
+	if err != nil {
+		t.Fatalf("local verify: %v", err)
+	}
+	identityA := claimsA.BrowserSessionIdentity()
+
+	// Same-Human rotation commits S2; its response is lost, so the jar keeps
+	// the retired S1 cookie.
+	_, signedB, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{
+			Presented:   &identityA,
+			PresentedBy: testHumanA,
+			Epoch:       testEpochA,
+		},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("rotation: %v", err)
+	}
+
+	// The designed replay presents the retired cookie; the epoch tip still
+	// names Human A, so the same-Human re-issue is ordinary.
+	_, signedC, outcome, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{
+			FlowID:      testFlowIDA,
+			FlowEpoch:   testEpochA,
+			Presented:   &identityA,
+			PresentedBy: testHumanA,
+			Epoch:       testEpochA,
+		},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("replay presenting retired cookie: %v", err)
+	}
+	if _, err := v.VerifySession(context.Background(), signedC); err != nil {
+		t.Fatalf("replayed session invalid: %v", err)
+	}
+	if _, err := v.VerifySession(context.Background(), signedB); err == nil {
+		t.Fatal("displaced epoch tip still verifies")
+	}
+	retired := map[string]bool{}
+	for _, sid := range outcome.RetiredSessionIDs {
+		retired[sid] = true
+	}
+	if len(retired) != 1 {
+		t.Fatalf("replay retired %v sessions, want just the displaced tip", len(retired))
+	}
+
+	// The new session stayed in the jar's chain: a later logout presenting
+	// the retired ancestor still retires it (same-Human lineage walk).
+	if _, _, retiredSessions, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signedA},
+		nil,
+		nil,
+	); err != nil {
+		t.Fatalf("ancestor logout: %v", err)
+	} else if len(retiredSessions) != 1 {
+		t.Fatalf("ancestor logout retired %v, want the ancestor", retiredSessions)
+	}
+	if _, err := v.VerifySession(context.Background(), signedC); err == nil {
+		t.Fatal("session issued over a retired cookie escaped its lineage cleanup")
+	}
+}
+
+// A stale cleanup request carrying only durably retired cookies must not
+// log out a later deliberately chosen different-Human session — not through
+// the retired cookie's lineage, and not through a presented epoch's tip.
+func TestRevokeSessionsForLogoutStaleCookieKeepsLaterHuman(t *testing.T) {
+	v := newAdmissionTestVerifier(t)
+	_, signedA, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{FlowID: testFlowIDA, Epoch: testEpochA},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("human A admission: %v", err)
+	}
+	// The jar deliberately switches to Human B on the same epoch; A's cookie
+	// is retired and A's issuing flow is closed.
+	_, signedB, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{
+			FlowID:     testFlowIDB,
+			Epoch:      testEpochA,
+			SwitchFrom: testHumanA,
+		},
+		testClaimsFor(testHumanB),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("explicit switch: %v", err)
+	}
+
+	// A stale request presents the retired A cookie plus an epoch the
+	// lineage never used — B must survive.
+	if _, _, _, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signedA},
+		[]string{testEpochB},
+		nil,
+	); err != nil {
+		t.Fatalf("stale logout: %v", err)
+	}
+	if _, err := v.VerifySession(context.Background(), signedB); err != nil {
+		t.Fatalf("stale cleanup logged the later Human out: %v", err)
+	}
+
+	// Even presenting the epoch B's session still lives on must not kill it:
+	// the request carries no live session authority.
+	if _, _, _, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signedA},
+		[]string{testEpochA},
+		nil,
+	); err != nil {
+		t.Fatalf("stale logout on B's epoch: %v", err)
+	}
+	if _, err := v.VerifySession(context.Background(), signedB); err != nil {
+		t.Fatalf("stale cookie plus live epoch logged B out: %v", err)
+	}
+
+	// B's own live session cookie still performs an ordinary logout.
+	if _, _, retiredSessions, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signedB},
+		[]string{testEpochA},
+		nil,
+	); err != nil {
+		t.Fatalf("live logout: %v", err)
+	} else if len(retiredSessions) == 0 {
+		t.Fatal("live logout retired nothing")
+	}
+	if _, err := v.VerifySession(context.Background(), signedB); err == nil {
+		t.Fatal("live logout left the session valid")
+	}
+}
+
+// A presented credential that contradicts the durable record is an
+// integrity violation, not a recoverable retired cookie: admission keeps
+// failing closed rather than treating it as absent.
+func TestAdmitBrowserSessionContradictingCookieFailsClosed(t *testing.T) {
+	v := newAdmissionTestVerifier(t)
+	_, signed, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{Epoch: testEpochA},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	if _, _, _, err := v.RevokeSessionsForLogout(
+		context.Background(),
+		[]string{signed},
+		[]string{testEpochA},
+		nil,
+	); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	claims, err := v.VerifySessionLocal(context.Background(), signed)
+	if err != nil {
+		t.Fatalf("local verify: %v", err)
+	}
+	// Same session identity but a contradicting expiry — the durable record
+	// and the credential disagree, so this is not an ordinary retired cookie.
+	forged := claims.BrowserSessionIdentity()
+	forged.ExpiresAt = forged.ExpiresAt.Add(-time.Second)
+	if _, _, _, err := v.AdmitSession(
+		context.Background(),
+		BrowserSessionAdmission{
+			Presented:   &forged,
+			PresentedBy: testHumanA,
+			Epoch:       testEpochB,
+		},
+		testClaimsFor(testHumanA),
+		time.Minute,
+	); err == nil {
+		t.Fatal("contradicting retired credential minted a session")
 	}
 }
