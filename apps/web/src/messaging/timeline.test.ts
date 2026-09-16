@@ -358,6 +358,132 @@ describe("buildRows", () => {
     ).toEqual([false, false]);
   });
 
+  it("読み込み済みwindowの断絶をgap行にし、tombstoneはgapにしない", () => {
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 2, deleted: true }),
+        message({ seq: 3 }),
+        message({ seq: 10 }),
+      ],
+      null,
+    );
+    const kinds = result.map((row) => row.kind);
+    // seq2のtombstoneはロード済みなので1→3にgapは無い。3→10の断絶だけ。
+    expect(kinds).toEqual(["date", "message", "message", "gap", "message"]);
+    const gap = result.find((row) => row.kind === "gap");
+    expect(gap).toMatchObject({
+      afterSeq: 3,
+      beforeSeq: 10,
+      missingCount: 6,
+    });
+  });
+
+  // tombstoneはseqを占有するが描画されない——window境界に立つと、gap判定から
+  // 外す実装だと未ロード区間ごとgap行を隠してしまう（独立レビュー F-1）。
+  it("新しいwindowの先頭がtombstoneでもgap行を残す", () => {
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 100, deleted: true }),
+        message({ seq: 101 }),
+      ],
+      null,
+    );
+    expect(result.filter((row) => row.kind === "gap")).toEqual([
+      expect.objectContaining({ afterSeq: 1, beforeSeq: 100 }),
+    ]);
+  });
+
+  it("連続するtombstoneがwindowの先頭にあってもgap行を残す", () => {
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 100, deleted: true }),
+        message({ seq: 101, deleted: true }),
+        message({ seq: 102 }),
+      ],
+      null,
+    );
+    expect(
+      result
+        .filter((row) => row.kind === "gap")
+        .map((row) => row.kind === "gap" && [row.afterSeq, row.beforeSeq]),
+    ).toEqual([[1, 100]]);
+  });
+
+  it("未ロード区間内へ届いたlive tombstoneは区間を二分するgapにする", () => {
+    // jump windowと最新頁の間に、tombstoneが配列へ挿入された状態。
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 2 }),
+        message({ seq: 3 }),
+        message({ seq: 50, deleted: true }),
+        message({ seq: 100 }),
+        message({ seq: 101 }),
+      ],
+      null,
+    );
+    expect(
+      result
+        .filter((row) => row.kind === "gap")
+        .map((row) => row.kind === "gap" && [row.afterSeq, row.beforeSeq]),
+    ).toEqual([
+      [3, 50],
+      [50, 100],
+    ]);
+  });
+
+  it("古いwindowの末尾がtombstoneでもgap行の範囲は正しい", () => {
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 2, deleted: true }),
+        message({ seq: 100 }),
+      ],
+      null,
+    );
+    expect(result.filter((row) => row.kind === "gap")).toEqual([
+      expect.objectContaining({
+        afterSeq: 2,
+        beforeSeq: 100,
+        missingCount: 97,
+      }),
+    ]);
+  });
+
+  it("jump対象のtombstoneには削除標識行を出す", () => {
+    const messages = [
+      message({ seq: 1 }),
+      message({ seq: 2, deleted: true }),
+      message({ seq: 3 }),
+    ];
+    const result = buildRows({
+      messages,
+      pending: [],
+      selfKey,
+      unreadLineSeq: null,
+      self: SELF,
+      now: BASE_AT,
+      deletedTargetSeq: 2,
+    });
+    expect(result.map((row) => row.kind)).toEqual([
+      "date",
+      "message",
+      "deleted",
+      "message",
+    ]);
+    const marker = result.find((row) => row.kind === "deleted");
+    expect(marker).toMatchObject({ id: "deleted:2", seq: 2 });
+    // 指定しないときは通常どおり描画しない。
+    expect(rows(messages, null).map((row) => row.kind)).toEqual([
+      "date",
+      "message",
+      "message",
+    ]);
+  });
+
   it("pendingは末尾に自分のメッセージとして並ぶ", () => {
     const result = buildRows({
       messages: [message({ seq: 1 })],

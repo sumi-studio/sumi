@@ -61,6 +61,37 @@ func TestScopedSearchMatchesJapaneseAndBoundsSnippet(t *testing.T) {
 	}
 }
 
+func TestScopedSearchReflectsEdit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	workspace, channel := w.workspaceWithChannel(t, ctx)
+	message := w.send(t, ctx, channel.PlaceID, w.humanA, "旧称の検索対象")
+
+	search := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA)
+	if _, err := search.EditMessage(ctx, channel.PlaceID, message.MessageID,
+		"改称後の検索対象", message.Revision); err != nil {
+		t.Fatalf("edit search fixture: %v", err)
+	}
+	results, err := search.SearchMessages(ctx, "旧称", SearchOptions{})
+	if err != nil {
+		t.Fatalf("search superseded content: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("edited-out content still matched: %+v", results)
+	}
+	results, err = search.SearchMessages(ctx, "改称後", SearchOptions{})
+	if err != nil {
+		t.Fatalf("search edited content: %v", err)
+	}
+	if len(results) != 1 || results[0].Message.MessageID != message.MessageID {
+		t.Fatalf("edited results = %+v, want %s", results, message.MessageID)
+	}
+	if !strings.Contains(results[0].Snippet, "改称後") {
+		t.Fatalf("snippet %q does not reflect the edit", results[0].Snippet)
+	}
+}
+
 func TestScopedSearchEnforcesPlaceTenureAndScope(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -38,7 +38,6 @@ export function LoginScreen() {
     emailCode,
     emailLinkPending,
     inspectEmailLink,
-    logout,
     redirectSignInError,
     refreshEmailCode,
     resendEmailCode,
@@ -46,6 +45,7 @@ export function LoginScreen() {
     signIn,
     startEmailCode,
     submitEmailCode,
+    user,
   } = useAuth();
   const [invitation, setInvitation] = useState(captureEnrollmentInvitation);
   useEffect(() => {
@@ -265,8 +265,13 @@ export function LoginScreen() {
     setBusy("link");
     setError(null);
     try {
-      if (switchAccount) await logout();
-      await continueEmailLink(linkInspection, !linkInspection.sameBrowser);
+      // The switch click is the explicit consent: resolve carries
+      // switch_from_user_id and the server replaces the session atomically.
+      // Logging out first would clear the pending link and leave a window
+      // with no account at all.
+      await continueEmailLink(linkInspection, !linkInspection.sameBrowser, {
+        switchFromUserId: switchAccount ? user?.id : undefined,
+      });
     } catch (nextError) {
       setError(getAuthErrorMessage(nextError));
     } finally {

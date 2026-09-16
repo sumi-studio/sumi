@@ -213,6 +213,7 @@ export interface AuthContextValue {
   continueEmailLink: (
     inspection: EmailLinkInspection,
     adopt: boolean,
+    options?: { switchFromUserId?: string },
   ) => Promise<void>;
   dismissEmailLink: () => void;
   confirmIntentTransition: () => Promise<void>;
@@ -1226,11 +1227,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const continueEmailLink = useCallback(
-    async (inspection: EmailLinkInspection, adopt: boolean) => {
+    async (
+      inspection: EmailLinkInspection,
+      adopt: boolean,
+      options?: { switchFromUserId?: string },
+    ) => {
       const link = pendingEmailLink();
       if (!link) throw new AuthAPIError("link_invalid", 404);
-      await completeEmailProof(() =>
-        completeEmailLinkProof(link, inspection, adopt),
+      await completeEmailProof(
+        () => completeEmailLinkProof(link, inspection, adopt),
+        options,
       );
     },
     [completeEmailProof],
