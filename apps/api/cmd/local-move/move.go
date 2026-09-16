@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +31,7 @@ var (
 	errGrantRejected = errors.New("Cloud rejected the move grant for this session")
 	errUnreachable   = errors.New("Cloud is unreachable")
 	errHeaderDone    = errors.New("header captured")
+	errStalled       = errors.New("the connection stopped moving data")
 
 	// beforeComplete and afterComplete are failpoints around the source
 	// Complete transaction. They do nothing unless the binary is built with
@@ -37,6 +40,12 @@ var (
 	beforeComplete = func() {}
 	afterComplete  = func() {}
 )
+
+// answerTimeout bounds the wait for a response after a request has been
+// written — headers and body together, the phase a silent Cloud hangs in
+// once it has taken the whole bundle. It is not a limit on sending the
+// bundle itself.
+const answerTimeout = 2 * time.Minute
 
 const (
 	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried."
@@ -93,14 +102,19 @@ func parseMoveURL(raw string) (sessionURL, sessionID, grant string, err error) {
 // records intent and what Cloud said it is; authority is always re-read from
 // the Local ledger and the Cloud session, never trusted from this file.
 type moveState struct {
-	Version     int       `json:"version"`
-	SessionURL  string    `json:"session_url"`
-	SessionID   string    `json:"session_id"`
-	Grant       string    `json:"grant"`
-	PersonaID   string    `json:"persona_id"`
-	Destination string    `json:"destination_placement_id,omitempty"`
-	Outcome     string    `json:"outcome,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Version     int    `json:"version"`
+	SessionURL  string `json:"session_url"`
+	SessionID   string `json:"session_id"`
+	Grant       string `json:"grant"`
+	PersonaID   string `json:"persona_id"`
+	Destination string `json:"destination_placement_id,omitempty"`
+	// Bound records that Cloud accepted this placement as the session's one
+	// source, which happens before anything is sealed. Until then nothing of
+	// this secretary has left Local and nothing was taken from anyone else,
+	// so cancelling is a local matter.
+	Bound     bool      `json:"bound,omitempty"`
+	Outcome   string    `json:"outcome,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type mover struct {
@@ -116,6 +130,14 @@ type mover struct {
 	unreachable time.Duration
 	sealRetries int
 	sealDelay   time.Duration
+	// stall bounds a silent upload: how long the connection may carry no
+	// bytes at all before this attempt is given up and retried. It is not a
+	// limit on the upload's total time — a large secretary on a slow link
+	// keeps going as long as it keeps moving.
+	stall time.Duration
+	// answer bounds the wait for a response once the request is written.
+	// Tests shorten it; production uses answerTimeout.
+	answer time.Duration
 }
 
 func newMover(home, personaID string, src *portable.Service, state *agentstate.Store, out io.Writer) *mover {
@@ -124,9 +146,23 @@ func newMover(home, personaID string, src *portable.Service, state *agentstate.S
 		client: &http.Client{
 			// Never follow a redirect: the grant is for this session URL only.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			// Every phase a silent peer can hang in gets its own bound.
+			// ResponseHeaderTimeout starts after the request body is
+			// written, so it bounds a Cloud that accepted a whole bundle
+			// and then said nothing, without capping a long upload.
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          4,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ExpectContinueTimeout: time.Second,
+				ResponseHeaderTimeout: answerTimeout,
+			},
 		},
 		wait: 30 * time.Minute, poll: 2 * time.Second, unreachable: 5 * time.Minute,
-		sealRetries: 5, sealDelay: 10 * time.Second,
+		sealRetries: 5, sealDelay: 10 * time.Second, stall: 2 * time.Minute, answer: answerTimeout,
 	}
 }
 
@@ -308,8 +344,32 @@ func (m *mover) drive(ctx context.Context, st *moveState) int {
 			return m.fail(err)
 		}
 		if !sealed {
+			// Cloud may already be carrying another Local install's
+			// secretary for this URL. Nothing was sealed here, so say so
+			// plainly instead of reporting an impossible state.
+			if v.Source != nil && v.Source.PersonaID != m.personaID {
+				return m.refusedURL(st, v.Source)
+			}
 			switch v.Status {
 			case transfersession.StatusAwaitingBundle:
+				// Take the move URL for this placement first. Nothing of
+				// this secretary has left Local yet, so a URL already taken
+				// by another Local install is answered while this one is
+				// still active and answering. The seal decision uses the
+				// session as the take left it — a close or an arrival that
+				// raced the fetch is in the bind's own answer.
+				v, code, done := m.bindSource(ctx, st)
+				if done {
+					return code
+				}
+				switch v.Status {
+				case transfersession.StatusAwaitingBundle:
+				case transfersession.StatusCancelled, transfersession.StatusExpired:
+					return m.finish(st, "cancelled_unsealed",
+						"The Cloud session is %s and this secretary was never sealed here; it stays active on Local.", v.Status)
+				default:
+					return m.fail(fmt.Errorf("Cloud reports the session %s, but this Local placement never sealed transfer %s; nothing was changed", v.Status, st.SessionID))
+				}
 				if code, done := m.seal(ctx, st, v); done {
 					return code
 				}
@@ -343,7 +403,7 @@ func (m *mover) drive(ctx context.Context, st *moveState) int {
 				return m.fail(err)
 			}
 		case transfersession.StatusStaged, transfersession.StatusProvisioned:
-			if v.Status == transfersession.StatusStaged && time.Since(waitStart) >= m.wait {
+			if time.Since(waitStart) >= m.wait {
 				until := ""
 				if v.ClaimUntil != nil {
 					until = " before " + v.ClaimUntil.Local().Format(time.RFC1123)
@@ -430,6 +490,72 @@ func (m *mover) checkDestination(st *moveState, v transfersession.View) error {
 	return nil
 }
 
+// bindSource records this placement as the session's one source, before
+// anything is sealed. It is idempotent for the placement that already holds
+// the session, so a lost answer, a retry, a restart or a repeated start of
+// the same move URL all continue the same move. It returns the session as
+// the take left it: the caller decides from that view, not from the one it
+// fetched before.
+func (m *mover) bindSource(ctx context.Context, st *moveState) (transfersession.View, int, bool) {
+	own, err := m.src.PlacementID(ctx)
+	if err != nil {
+		return transfersession.View{}, m.fail(fmt.Errorf("read this placement's id: %w", err)), true
+	}
+	v, code, err := m.call(ctx, http.MethodPost, st.SessionURL+"/source", st.Grant,
+		jsonBody(transfersession.Source{PlacementID: own, PersonaID: m.personaID}), "application/json")
+	switch {
+	case err != nil:
+		return v, m.stopped(ctx, err), true
+	case code == http.StatusConflict:
+		if v.Source != nil && v.Source.PersonaID != m.personaID {
+			return v, m.refusedURL(st, v.Source), true
+		}
+		// Refused for another reason — the session already carries a
+		// secretary, or this credential's account now exists. Either way
+		// nothing was sealed here, so say what Cloud actually reported.
+		return v, m.fail(fmt.Errorf("Cloud refused this move URL for this secretary: the session is %s; nothing was sealed and the secretary stays active on Local", v.Status)), true
+	case code == http.StatusGone:
+		// Cancelled or expired before this placement took it; the caller
+		// reads the returned status and answers through the unsealed path.
+		return v, 0, false
+	case code != http.StatusOK:
+		return v, m.fail(fmt.Errorf("Cloud answered HTTP %d taking the move URL; nothing was sealed and the secretary stays active on Local", code)), true
+	}
+	if !st.Bound {
+		st.Bound = true
+		if err := m.save(st); err != nil {
+			return v, m.fail(err), true
+		}
+	}
+	return v, 0, false
+}
+
+// refusedURL explains a move URL that belongs to another Sumi Local install.
+// Nothing was sealed here, so the secretary keeps answering and the person
+// only needs a move URL of its own.
+func (m *mover) refusedURL(st *moveState, held *transfersession.Source) int {
+	who := ""
+	if held != nil && held.PersonaID != m.personaID {
+		who = fmt.Sprintf(" It is moving secretary %s from placement %s.", held.PersonaID, held.PlacementID)
+	}
+	m.say("This move URL is already in use by another Sumi Local.%s Nothing was sealed here: secretary %s stays active on this Local and keeps answering. To move this one instead, get a new move URL in the Sumi Cloud registration and paste that one here.", who, m.personaID)
+	m.discard(st)
+	return exitError
+}
+
+// discard removes a move record that never took the session and never sealed
+// anything. Keeping it would only make the next resume or cancel act on a
+// session that belongs to a different Local placement.
+func (m *mover) discard(st *moveState) {
+	if st.Bound {
+		return
+	}
+	if _, err := m.src.Status(context.Background(), "export", st.SessionID); err == nil {
+		return
+	}
+	_ = os.Remove(m.statePath())
+}
+
 func (m *mover) seal(ctx context.Context, st *moveState, v transfersession.View) (int, bool) {
 	m.say("Sealing the secretary for Sumi Cloud. Carried: core state only (journal, inputs, turns, plans, operations, approvals, reminders, outbox, memory).")
 	for _, x := range v.NotIncluded {
@@ -509,15 +635,79 @@ func (m *mover) transferKey(ctx context.Context, st *moveState) (string, error) 
 	return hdr.TransferKey, nil
 }
 
+// progress remembers when the request body last moved, so a stalled
+// connection is told apart from a slow one.
+type progress struct {
+	r    io.Reader
+	last atomic.Int64
+	done atomic.Bool
+}
+
+func (p *progress) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.last.Store(time.Now().UnixNano())
+	}
+	if err != nil {
+		p.done.Store(true)
+	}
+	return n, err
+}
+
+// upload sends the sealed bundle. It has no whole-upload deadline: a large
+// secretary on a slow link may take as long as it keeps making progress. What
+// it does have is two bounds on silence — m.stall with no byte accepted while
+// the body is going out, and answerTimeout for a Cloud that swallowed the
+// whole bundle and then said nothing. Either ends the attempt without
+// touching the seal: the secretary stays sealed, the export ledger is
+// unchanged, and the next attempt — or the next resume, hours later — sends
+// the same bundle again.
 func (m *mover) upload(ctx context.Context, st *moveState) error {
 	m.say("Uploading the sealed secretary to Sumi Cloud.")
+	uctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	pr, pw := io.Pipe()
 	go func() {
-		_, err := m.src.Export(ctx, m.personaID, st.SessionID, pw)
+		_, err := m.src.Export(uctx, m.personaID, st.SessionID, pw)
 		pw.CloseWithError(err)
 	}()
 	defer pr.Close()
-	v, code, err := m.call(ctx, http.MethodPut, st.SessionURL+"/bundle", st.Grant, pr, "application/x-ndjson")
+
+	body := &progress{r: pr}
+	body.last.Store(time.Now().UnixNano())
+	var stalled atomic.Bool
+	watch := make(chan struct{})
+	defer close(watch)
+	go func() {
+		tick := time.NewTicker(max(m.stall/4, 10*time.Millisecond))
+		defer tick.Stop()
+		for {
+			select {
+			case <-watch:
+				return
+			case <-uctx.Done():
+				return
+			case <-tick.C:
+				if body.done.Load() {
+					// The whole bundle is out. Waiting for the answer is
+					// not a stall — Cloud is verifying and importing it —
+					// and answerTimeout bounds that wait instead.
+					return
+				}
+				if time.Since(time.Unix(0, body.last.Load())) >= m.stall {
+					stalled.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	v, code, err := m.call(uctx, http.MethodPut, st.SessionURL+"/bundle", st.Grant, body, "application/x-ndjson")
+	if stalled.Load() && ctx.Err() == nil {
+		return fmt.Errorf("%w: %v for %s; the secretary stays sealed and the bundle is sent again",
+			errUnreachable, errStalled, m.stall)
+	}
 	if err != nil {
 		return err
 	}
@@ -580,7 +770,12 @@ func (m *mover) call(ctx context.Context, method, target, grant string, body io.
 		return v, 0, fmt.Errorf("%w: %v", errUnreachable, err)
 	}
 	defer res.Body.Close()
+	// A peer that answers the headers and then goes silent is the same
+	// failure as one that never answers: bound that wait too. Closing the
+	// body is what unblocks the read.
+	silent := time.AfterFunc(m.answer, func() { _ = res.Body.Close() })
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	silent.Stop()
 	if err != nil {
 		return v, 0, fmt.Errorf("%w: %v", errUnreachable, err)
 	}
@@ -640,6 +835,15 @@ func (m *mover) Cancel(ctx context.Context) int {
 	}
 	exp, err := m.src.Status(ctx, "export", st.SessionID)
 	if errors.Is(err, portable.ErrTransferNotFound) {
+		if !st.Bound {
+			// Cloud never accepted this placement as the session's source,
+			// so this record stands for nothing there — and the session may
+			// well belong to another Sumi Local. Cancelling it would cancel
+			// that move. Drop the local record instead.
+			_ = os.Remove(m.statePath())
+			m.say("Nothing was sealed here and Sumi Cloud never accepted this Local placement for that move URL, so the record was discarded. The secretary stays active on Local.")
+			return exitDone
+		}
 		v, code, err := m.call(ctx, http.MethodPost, st.SessionURL+"/cancel", st.Grant, jsonBody(map[string]string{}), "application/json")
 		switch {
 		case err != nil && errors.Is(err, errUnreachable):

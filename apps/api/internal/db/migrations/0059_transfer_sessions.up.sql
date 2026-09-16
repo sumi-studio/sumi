@@ -9,6 +9,13 @@
 -- proving the same credential may claim the staged secretary.
 -- grant_hash is SHA-256 of the scoped grant handed to the Local source; the
 -- grant itself is never stored.
+--
+-- source_placement_id/source_persona_id is the one Local source this session
+-- accepts a bundle from. The Local command records it before it seals, so a
+-- move URL pasted into a second Local placement is refused while that
+-- secretary is still active there instead of sealing a secretary whose bundle
+-- could never be admitted. The binding is also the admission gate: an upload
+-- whose bundle header names another persona is refused before it is read.
 --   awaiting_bundle  admission open until admit_until
 --   staged           the import committed; claimable until claim_until
 --   provisioned      the account transaction bound the persona to human_id;
@@ -23,12 +30,18 @@ CREATE TABLE transfer_sessions (
     status         text        NOT NULL
         CHECK (status IN ('awaiting_bundle','staged','provisioned','activated','cancelled','expired')),
     human_id       uuidv7      REFERENCES humans(human_id),
+    source_placement_id uuidv7,
+    source_persona_id   uuidv7,
+    source_bound_at     timestamptz,
     admit_until    timestamptz NOT NULL,
     claim_until    timestamptz,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
     CHECK ((status IN ('provisioned','activated')) = (human_id IS NOT NULL)),
-    CHECK (status <> 'staged' OR claim_until IS NOT NULL)
+    CHECK (status <> 'staged' OR claim_until IS NOT NULL),
+    -- The three source columns are written once, together.
+    CHECK ((source_placement_id IS NULL) = (source_persona_id IS NULL)),
+    CHECK ((source_placement_id IS NULL) = (source_bound_at IS NULL))
 );
 
 -- One open registration transfer per credential: the staged receipt a fresh

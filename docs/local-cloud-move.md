@@ -30,9 +30,11 @@ in Cloud until a model connection is selected there.
    The grant is in the fragment, so it never reaches a request line or an
    access log.
 2. On the Local host: `sumi-local-move start`, then paste the URL. The
-   command seals the secretary for the Cloud placement named by the session
-   (from then on it does not answer on Local and new messages are refused),
-   uploads the sealed state, and waits.
+   command first takes the session for this placement — Cloud records the
+   source placement id and persona id on the session — and only then seals
+   the secretary for the Cloud placement named by the session (from then on
+   it does not answer on Local and new messages are refused), uploads the
+   sealed state, and waits.
 3. Cloud stages the import (nothing runs yet). The person finishes
    registration; the account transaction claims the staged secretary for the
    proven credential and binds it to the new human (`provisioned`).
@@ -64,6 +66,21 @@ Exit status 3 means "not finished yet; run resume later".
   not a policy for a destination that is gone for good; that recovery needs
   its own authority proof, fencing and backup contract and is not
   implemented.
+- One move URL belongs to one Sumi Local placement at a time. `start` takes
+  the session (`POST .../sessions/{id}/source` with the placement and
+  persona ids) before anything is sealed. Pasting the same URL into a
+  second Local is refused there: that secretary is never sealed and keeps
+  answering, and its move record is dropped so it can start over with a URL
+  of its own. The take is idempotent for the placement that holds it, so a
+  lost answer, a retry or a restart continues the same move. A bundle
+  upload is also checked against the recorded source, so a second placement
+  cannot slip an import in after the winner staged.
+- An upload attempt is bounded by silence, not by total time: if the
+  connection carries no bundle bytes for two minutes the attempt is given
+  up and retried, and the wait for Cloud's answer once the request is
+  written is bounded separately. A slow upload that keeps moving is not
+  interrupted. An interrupted attempt never changes Local authority — the
+  secretary stays sealed and `resume` continues the same transfer.
 - The registering browser's cancel may carry `expect_status` (the status
   the person was shown). It commits only while the session is still in that
   status; an import that already committed counts as `staged`. A session
@@ -78,7 +95,7 @@ The registration UI decides from `session.status`:
 
 | `session.status` | Meaning | What the UI must do |
 | --- | --- | --- |
-| `awaiting_bundle` | No bundle has arrived. Cloud cannot tell whether a Local command already sealed with the URL (a seal is invisible until upload). | Offer an explicit **"Get a new move URL"** choice, saying a URL pasted earlier stops working and that Local then returns to active by itself. On that choice: `POST /sessions/{id}/cancel {flow_id, nonce, expect_status: "awaiting_bundle"}`, then `POST /sessions`. Never do this on a retry alone. |
+| `awaiting_bundle` | No bundle has arrived. The session may already record which Local placement took the URL, but Cloud cannot tell whether that command already sealed (a seal is invisible until upload). | Offer an explicit **"Get a new move URL"** choice, saying a URL pasted earlier stops working and that Local then returns to active by itself. On that choice: `POST /sessions/{id}/cancel {flow_id, nonce, expect_status: "awaiting_bundle"}`, then `POST /sessions`. Never do this on a retry alone. |
 | `staged` / `provisioned` | The secretary arrived; the browser no longer needs the grant. | Continue registration with the carried secretary. Do not offer replacement; cancelling it is the separate, explicit "don't bring it" choice (`expect_status: "staged"`). |
 | (no open session, `POST /sessions` → 201) | The earlier session closed. | Show the new URL. |
 
@@ -92,7 +109,8 @@ URL.
 
 | What happened | What converges it |
 | --- | --- |
-| Upload connection cut, or the Local process stopped | `resume` re-seals idempotently (same cut) and uploads again |
+| Upload connection cut, silent, stalled, or the Local process stopped | the attempt is bounded by the silence window; `resume` re-seals idempotently (same cut) and uploads again |
+| The move URL was pasted into a second Sumi Local | the second `start` is refused before sealing; that secretary stays active and needs a URL of its own |
 | Upload committed but its response was lost | the next status read shows `staged`; a duplicate upload returns the current view |
 | Cloud crashed between the import and the session update | the next status read, upload or sweep promotes the session |
 | A cancel or expiry landed while an import was running | the import finishes, Cloud retires the late stage before answering; the sweep retires it after a crash |

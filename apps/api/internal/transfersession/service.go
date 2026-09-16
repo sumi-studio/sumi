@@ -11,6 +11,13 @@
 //	      │                     │          (account transaction)
 //	      └──cancel/expiry──────┴──▶ cancelled / expired ─▶ staged import retired
 //
+// Before any of that, one Local placement takes the session with BindSource
+// and every later bundle is admitted only for that placement's secretary.
+// The binding is what a move URL pasted into a second Local install meets:
+// it is refused there while that secretary is still active, rather than
+// discovering the conflict with a sealed secretary and a bundle nothing can
+// admit.
+//
 // Authority stays with the portable contract: the Local source leaves
 // "sealed" only with the destination's activate_proof (after activation
 // committed here) or retire_proof (after the staged copy was deleted or a
@@ -56,6 +63,8 @@ var (
 	ErrExpired       = errors.New("transfer session deadline passed")
 	ErrConflict      = errors.New("transfer session conflict")
 	ErrOpenSession   = errors.New("this credential already has an open transfer session")
+	ErrSourceBound   = errors.New("this move URL already belongs to another Sumi Local placement")
+	ErrSourceUnbound = errors.New("this move URL has not been taken by a Sumi Local placement yet")
 	ErrAccountExists = errors.New("this credential already has an account; bringing a secretary into an existing account is not supported")
 	ErrBadRequest    = errors.New("bad request")
 )
@@ -103,6 +112,12 @@ type Config struct {
 	ClaimTTL time.Duration
 }
 
+// rowQuerier is the pool or a transaction: the same checks run inside and
+// outside one.
+type rowQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
 type Service struct {
 	pool     *pgxpool.Pool
 	portable *portable.Service
@@ -140,6 +155,38 @@ type View struct {
 	NotIncluded   []portable.Exclusion `json:"not_included"`
 	ActivateProof string               `json:"activate_proof,omitempty"`
 	RetireProof   string               `json:"retire_proof,omitempty"`
+	// Source is the Local placement this session accepts a bundle from,
+	// once one has taken it. It appears only in the grant holder's view:
+	// it is what the Local command compares itself against, and nothing a
+	// registering browser uses.
+	Source *Source `json:"source,omitempty"`
+}
+
+// Source identifies one Local placement's copy of one secretary: the
+// placement id its portable service minted (core_placement) and the persona
+// it would seal. Neither is secret — the destination's own placement id
+// travels in every bundle header — but the pair is what makes "this move URL
+// is already taken by another Local" a decidable statement instead of a
+// guess. A persona id alone is not enough: the same secretary keeps its id
+// across placements it has moved through.
+type Source struct {
+	PlacementID string `json:"placement_id"`
+	PersonaID   string `json:"persona_id"`
+}
+
+func (s Source) valid() bool {
+	return uuidv7Re.MatchString(s.PlacementID) && uuidv7Re.MatchString(s.PersonaID)
+}
+
+func (s Source) same(other Source) bool {
+	return s.PlacementID == other.PlacementID && s.PersonaID == other.PersonaID
+}
+
+func (r row) source() (Source, bool) {
+	if r.srcPlace == nil || r.srcPersona == nil {
+		return Source{}, false
+	}
+	return Source{PlacementID: *r.srcPlace, PersonaID: *r.srcPersona}, true
 }
 
 // Arrival summarizes the verified import.
@@ -161,13 +208,16 @@ type row struct {
 	status     string
 	admitUntil time.Time
 	claimUntil *time.Time
+	srcPlace   *string
+	srcPersona *string
 }
 
-const rowCols = `session_id, claim_provider, claim_subject, grant_hash, status, admit_until, claim_until`
+const rowCols = `session_id, claim_provider, claim_subject, grant_hash, status, admit_until, claim_until, source_placement_id, source_persona_id`
 
 func scanRow(r pgx.Row) (row, error) {
 	var x row
-	err := r.Scan(&x.id, &x.provider, &x.subject, &x.grantHash, &x.status, &x.admitUntil, &x.claimUntil)
+	err := r.Scan(&x.id, &x.provider, &x.subject, &x.grantHash, &x.status, &x.admitUntil, &x.claimUntil,
+		&x.srcPlace, &x.srcPersona)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return x, ErrNotFound
 	}
@@ -224,9 +274,9 @@ type Created struct {
 }
 
 // Create opens a session for a credential a trusted flow proved. It refuses a
-// credential that already has an account — choosing or employing a secretary
-// in an existing account is a separate product decision — and a credential
-// with an open session, whose id is reported so that session can be
+// credential that already has an account, linked or unlinked — choosing or
+// employing a secretary in an existing account is a separate product
+// decision — and a credential with an open session, whose id is reported so that session can be
 // continued or cancelled.
 //
 // Create is not idempotent and never cancels anything: the grant exists only
@@ -240,42 +290,157 @@ func (s *Service) Create(ctx context.Context, subj Subject) (Created, string, er
 	if !subj.valid() {
 		return Created{}, "", fmt.Errorf("%w: unsupported credential subject", ErrBadRequest)
 	}
-	var hasAccount bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM credentials
-		WHERE provider = $1 AND external_subject = $2 AND active)`, subj.Provider, subj.Subject).Scan(&hasAccount); err != nil {
+	// The whole row is the account, not its active flag. credentials is
+	// UNIQUE (provider, external_subject) and a trigger refuses rebinding to
+	// a different human (0002), so an unlinked row still names the one human
+	// this credential will ever belong to: koseki re-activates it for that
+	// human and refuses it for anyone else. Admitting it here would let the
+	// registrant seal and stage a secretary whose account transaction can
+	// never bind the credential.
+	if err := refuseExistingAccount(ctx, s.pool, subj); err != nil {
 		return Created{}, "", err
 	}
-	if hasAccount {
-		return Created{}, "", ErrAccountExists
-	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return Created{}, "", err
-	}
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return Created{}, "", err
-	}
-	grant := base64.RawURLEncoding.EncodeToString(raw)
-	_, err = s.pool.Exec(ctx, `INSERT INTO transfer_sessions
-		(session_id, claim_provider, claim_subject, grant_hash, status, admit_until)
-		VALUES ($1, $2, $3, $4, 'awaiting_bundle', now() + $5::bigint * interval '1 millisecond')`,
-		id.String(), subj.Provider, subj.Subject, hashGrant(grant), s.admitTTL.Milliseconds())
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		var open string
-		if qerr := s.pool.QueryRow(ctx, `SELECT session_id FROM transfer_sessions
-			WHERE claim_provider = $1 AND claim_subject = $2
-			  AND status IN ('awaiting_bundle','staged','provisioned')`, subj.Provider, subj.Subject).Scan(&open); qerr != nil {
+	// Two attempts: the open session named by the unique index can close
+	// between the refused insert and the read, and the answer for that is a
+	// fresh session, not a 500.
+	for attempt := 0; ; attempt++ {
+		id, err := uuid.NewV7()
+		if err != nil {
 			return Created{}, "", err
 		}
-		return Created{}, open, ErrOpenSession
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return Created{}, "", err
+		}
+		grant := base64.RawURLEncoding.EncodeToString(raw)
+		_, err = s.pool.Exec(ctx, `INSERT INTO transfer_sessions
+			(session_id, claim_provider, claim_subject, grant_hash, status, admit_until)
+			VALUES ($1, $2, $3, $4, 'awaiting_bundle', now() + $5::bigint * interval '1 millisecond')`,
+			id.String(), subj.Provider, subj.Subject, hashGrant(grant), s.admitTTL.Milliseconds())
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			var open string
+			qerr := s.pool.QueryRow(ctx, `SELECT session_id FROM transfer_sessions
+				WHERE claim_provider = $1 AND claim_subject = $2
+				  AND status IN ('awaiting_bundle','staged','provisioned')`, subj.Provider, subj.Subject).Scan(&open)
+			if errors.Is(qerr, pgx.ErrNoRows) && attempt == 0 {
+				continue
+			}
+			if qerr != nil {
+				return Created{}, "", err
+			}
+			return Created{}, open, ErrOpenSession
+		}
+		if err != nil {
+			return Created{}, "", err
+		}
+		v, err := s.view(ctx, id.String(), false)
+		return Created{Grant: grant, View: v}, "", err
 	}
+}
+
+// refuseExistingAccount reports ErrAccountExists when this credential is
+// already recorded against a human, linked or unlinked. Bringing a Local
+// secretary into an account that exists is a separate product decision; this
+// session only serves a registration that creates one.
+func refuseExistingAccount(ctx context.Context, q rowQuerier, subj Subject) error {
+	var owned bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM credentials
+		WHERE provider = $1 AND external_subject = $2)`, subj.Provider, subj.Subject).Scan(&owned); err != nil {
+		return err
+	}
+	if owned {
+		return ErrAccountExists
+	}
+	return nil
+}
+
+// BindSource records the one Local placement that may seal for this session,
+// before it seals. It is the whole answer to a move URL pasted into two Local
+// installs: the second placement learns that the URL is taken while its
+// secretary is still active, instead of sealing a secretary whose bundle the
+// destination can never admit.
+//
+// The binding is durable session state, not an observation of who is running
+// now, and Upload re-reads it, so it also fences a bundle that arrives later
+// from a placement that never bound. It is idempotent for the placement that
+// holds it: a lost answer, a retry, a restart or a repeated "start" of the
+// same move URL on the same placement all reach the same row.
+//
+// It is taken under the session row lock, so two placements racing for one
+// URL produce exactly one winner and one ErrSourceBound — never two seals.
+// A closed or already-staged session binds nothing: by then the question is
+// no longer which placement may seal.
+//
+// Binding also re-checks credential ownership, which is the last moment
+// before a seal at which an account created since Create can still be
+// answered without any Local authority having moved.
+func (s *Service) BindSource(ctx context.Context, sessionID, grant string, src Source) (View, error) {
+	r, err := s.authorize(ctx, sessionID, grant)
 	if err != nil {
-		return Created{}, "", err
+		return View{}, err
 	}
-	v, err := s.view(ctx, id.String(), false)
-	return Created{Grant: grant, View: v}, "", err
+	if !src.valid() {
+		return View{}, fmt.Errorf("%w: placement_id and persona_id must be uuidv7", ErrBadRequest)
+	}
+	// Converge first: a session whose import committed, whose deadline
+	// passed or whose cancel is still un-retired must answer from what
+	// actually happened, not from a stale row.
+	if err := s.Reconcile(ctx, sessionID); err != nil {
+		return View{}, err
+	}
+	if err := s.bind(ctx, sessionID, Subject{Provider: r.provider, Subject: r.subject}, src); err != nil {
+		v, verr := s.view(ctx, sessionID, true)
+		if verr != nil {
+			return View{}, verr
+		}
+		return v, err
+	}
+	return s.reconciledView(ctx, sessionID, true)
+}
+
+func (s *Service) bind(ctx context.Context, sessionID string, subj Subject, src Source) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	r, err := scanRow(tx.QueryRow(ctx, `SELECT `+rowCols+` FROM transfer_sessions WHERE session_id = $1 FOR UPDATE`, sessionID))
+	if err != nil {
+		return err
+	}
+	if bound, ok := r.source(); ok {
+		if !bound.same(src) {
+			return fmt.Errorf("%w: it is held by secretary %s on placement %s",
+				ErrSourceBound, bound.PersonaID, bound.PlacementID)
+		}
+		// Already ours. Re-reporting the status is the caller's business;
+		// a staged or closed session is not an error for the holder.
+		return tx.Commit(ctx)
+	}
+	switch r.status {
+	case StatusAwaitingBundle:
+	case StatusCancelled, StatusExpired:
+		return fmt.Errorf("%w: the session is %s", ErrClosed, r.status)
+	default:
+		return fmt.Errorf("%w: the session is already %s", ErrConflict, r.status)
+	}
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT admit_until > now() FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&live); err != nil {
+		return err
+	}
+	if !live {
+		return fmt.Errorf("%w: the bundle deadline passed", ErrExpired)
+	}
+	if err := refuseExistingAccount(ctx, tx, subj); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE transfer_sessions
+		SET source_placement_id = $2, source_persona_id = $3, source_bound_at = now(), updated_at = now()
+		WHERE session_id = $1`, sessionID, src.PlacementID, src.PersonaID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // Status is the grant holder's view, after reconciling. It stays readable
@@ -328,21 +493,23 @@ func (s *Service) Upload(ctx context.Context, sessionID, grant string, body io.R
 	}
 	var admitted bool
 	var status string
-	if err := s.pool.QueryRow(ctx, `SELECT status, status = 'awaiting_bundle' AND admit_until > now()
-		FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&status, &admitted); err != nil {
+	var boundPersona *string
+	if err := s.pool.QueryRow(ctx, `SELECT status, status = 'awaiting_bundle' AND admit_until > now(), source_persona_id
+		FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&status, &admitted, &boundPersona); err != nil {
 		return View{}, false, err
 	}
-	if !admitted {
+	// A closed session answers first: its source needs the tombstone path,
+	// not a lecture about who holds the URL.
+	if status == StatusCancelled || status == StatusExpired {
 		v, err := s.view(ctx, sessionID, true)
 		if err != nil {
 			return View{}, false, err
 		}
-		if status == StatusCancelled || status == StatusExpired || status == StatusAwaitingBundle {
-			return v, false, ErrClosed
-		}
-		return v, false, nil
+		return v, false, ErrClosed
 	}
 
+	// Read the header before deciding anything else: it names the secretary
+	// this bundle carries, and one line is all it costs.
 	br := bufio.NewReaderSize(body, 1<<16)
 	line, err := br.ReadSlice('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -353,12 +520,37 @@ func (s *Service) Upload(ctx context.Context, sessionID, grant string, body io.R
 	}
 	var hdr struct {
 		TransferID string `json:"transfer_id"`
+		PersonaID  string `json:"persona_id"`
 	}
 	if len(line) > maxHeader || json.Unmarshal(bytes.TrimSpace(line), &hdr) != nil {
 		return View{}, false, fmt.Errorf("%w: the first line must be the bundle header", portable.ErrBadBundle)
 	}
 	if hdr.TransferID != sessionID {
 		return View{}, false, fmt.Errorf("%w: bundle transfer_id %q is not this session's transfer", portable.ErrBadBundle, hdr.TransferID)
+	}
+	// Admission belongs to the placement that took this move URL before it
+	// sealed, at every status — a second placement uploading after the first
+	// one staged must be told that, not handed the winner's view and left to
+	// discover the substitution at Complete.
+	switch {
+	case boundPersona == nil:
+		return View{}, false, fmt.Errorf("%w: no Sumi Local placement has taken this move URL, so its bundle cannot be admitted "+
+			"(run sumi-local-move start, which takes it before it seals)", ErrSourceUnbound)
+	case *boundPersona != hdr.PersonaID:
+		return View{}, false, fmt.Errorf("%w: it accepts secretary %s, and this bundle carries %s; nothing was imported",
+			ErrSourceBound, *boundPersona, hdr.PersonaID)
+	}
+	if !admitted {
+		// The bound source's own repeat: a staged session answers its view,
+		// and an admission deadline that passed without an import is closed.
+		v, err := s.view(ctx, sessionID, true)
+		if err != nil {
+			return View{}, false, err
+		}
+		if status == StatusAwaitingBundle {
+			return v, false, ErrClosed
+		}
+		return v, false, nil
 	}
 	_, created, importErr := s.portable.Import(ctx, io.MultiReader(bytes.NewReader(append([]byte(nil), line...)), br), nil, false)
 	if importErr != nil && !errors.Is(importErr, portable.ErrTransferConflict) {
@@ -387,11 +579,19 @@ func (s *Service) Upload(ctx context.Context, sessionID, grant string, body io.R
 // let this placement record the tombstone whose retire_proof the source
 // needs, and a late upload of that transfer is refused forever.
 func (s *Service) CancelByGrant(ctx context.Context, sessionID, grant, personaID, transferKey string) (View, error) {
-	if _, err := s.authorize(ctx, sessionID, grant); err != nil {
+	r, err := s.authorize(ctx, sessionID, grant)
+	if err != nil {
 		return View{}, err
 	}
 	if (personaID == "") != (transferKey == "") {
 		return View{}, fmt.Errorf("%w: persona_id and transfer_key are given together", ErrBadRequest)
+	}
+	// A tombstone forecloses this transfer for good. Only the placement that
+	// took the move URL may write one, so a second placement's mistaken
+	// cancel cannot foreclose the transfer the bound source is still moving.
+	if bound, ok := r.source(); ok && personaID != "" && bound.PersonaID != personaID {
+		return View{}, fmt.Errorf("%w: it accepts secretary %s, and the cancel names %s; nothing was retired",
+			ErrSourceBound, bound.PersonaID, personaID)
 	}
 	if err := s.cancel(ctx, sessionID, ""); errors.Is(err, ErrConflict) {
 		v, verr := s.reconciledView(ctx, sessionID, true)
@@ -647,6 +847,9 @@ func (s *Service) view(ctx context.Context, sessionID string, proofs bool) (View
 	if r.claimUntil != nil {
 		t := r.claimUntil.UTC()
 		v.ClaimUntil = &t
+	}
+	if src, ok := r.source(); ok && proofs {
+		v.Source = &src
 	}
 	rec, err := s.portable.Status(ctx, "import", sessionID)
 	if errors.Is(err, portable.ErrTransferNotFound) {

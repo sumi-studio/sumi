@@ -73,6 +73,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+RoutePrefix+"/sessions", s.create)
 	mux.HandleFunc("POST "+RoutePrefix+"/registrant/session", s.registrant)
 	mux.HandleFunc("GET "+RoutePrefix+"/sessions/{session}", s.status)
+	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/source", s.source)
 	mux.HandleFunc("PUT "+RoutePrefix+"/sessions/{session}/bundle", s.bundle)
 	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/cancel", s.cancel)
 }
@@ -180,6 +181,27 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 
+// source takes the move URL for one Local placement, before it seals. The
+// Local command calls it first; a second placement is answered 409 while its
+// secretary is still active there.
+func (s *Server) source(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	var body Source
+	if !decode(w, r, &body) {
+		return
+	}
+	v, err := s.svc.BindSource(r.Context(), r.PathValue("session"), grant, body)
+	if err != nil {
+		s.writeErr(w, err, &v)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
 func (s *Server) bundle(w http.ResponseWriter, r *http.Request) {
 	grant, ok := bearer(r)
 	if !ok {
@@ -262,6 +284,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 	case errors.Is(err, ErrClosed), errors.Is(err, ErrExpired):
 		code = http.StatusGone
 	case errors.Is(err, ErrConflict), errors.Is(err, ErrAccountExists),
+		errors.Is(err, ErrSourceBound), errors.Is(err, ErrSourceUnbound),
 		errors.Is(err, portable.ErrTransferConflict), errors.Is(err, portable.ErrPersonaExists):
 		code = http.StatusConflict
 	case errors.Is(err, ErrBadRequest), errors.Is(err, portable.ErrBadRequest), errors.Is(err, portable.ErrMissingProof):

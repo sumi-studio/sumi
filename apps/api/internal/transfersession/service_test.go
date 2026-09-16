@@ -158,8 +158,30 @@ func (h *harness) create(uid string) (string, string) {
 	return v.SessionID, strings.TrimPrefix(out.MoveURL, prefix)
 }
 
-func (h *harness) seal(sessionID string) []byte {
+// bind takes the session for the local placement, the way sumi-local-move
+// does before it seals anything.
+func (h *harness) bind(sessionID, grant string) (int, transfersession.View) {
 	h.t.Helper()
+	own, err := h.local.svc.PlacementID(h.ctx)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return h.bindAs(sessionID, grant, transfersession.Source{PlacementID: own, PersonaID: h.pid})
+}
+
+func (h *harness) bindAs(sessionID, grant string, src transfersession.Source) (int, transfersession.View) {
+	h.t.Helper()
+	code, raw := h.request("POST", "/api/secretary-transfer/sessions/"+sessionID+"/source", grant, jsonBody(src))
+	return code, asView(h.t, raw)
+}
+
+// seal takes the session for this placement and then seals, in that order —
+// the order sumi-local-move uses, and the only order the destination admits.
+func (h *harness) seal(sessionID, grant string) []byte {
+	h.t.Helper()
+	if code, v := h.bind(sessionID, grant); code != http.StatusOK {
+		h.t.Fatalf("bind source: %d %+v", code, v)
+	}
 	dest, err := h.cloud.svc.PlacementID(h.ctx)
 	if err != nil {
 		h.t.Fatal(err)
@@ -183,7 +205,7 @@ func (h *harness) upload(sessionID, grant string, body io.Reader) (int, transfer
 func (h *harness) stage(uid string) (string, string, []byte) {
 	h.t.Helper()
 	sid, grant := h.create(uid)
-	bundle := h.seal(sid)
+	bundle := h.seal(sid, grant)
 	if code, v := h.upload(sid, grant, bytes.NewReader(bundle)); code != http.StatusCreated || v.Status != "staged" {
 		h.t.Fatalf("upload: %d %+v", code, v)
 	}
@@ -197,6 +219,37 @@ func (h *harness) view(sessionID, grant string) transfersession.View {
 		h.t.Fatalf("status: %d %s", code, raw)
 	}
 	return asView(h.t, raw)
+}
+
+// waitClaimDeadline blocks until the session's committed claim_until has
+// passed, so a sweep started afterwards is genuinely due.
+func (h *harness) waitClaimDeadline(sessionID string, within time.Duration) {
+	h.t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		var due bool
+		if err := h.cloud.pool.QueryRow(h.ctx,
+			`SELECT claim_until <= now() FROM transfer_sessions WHERE session_id = $1`, sessionID).Scan(&due); err != nil {
+			h.t.Fatal(err)
+		}
+		if due {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("claim deadline for %s did not pass within %s", sessionID, within)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (h *harness) importRows(sessionID string) int {
+	h.t.Helper()
+	var n int
+	if err := h.cloud.pool.QueryRow(h.ctx,
+		`SELECT count(*) FROM core_transfers WHERE direction = 'import' AND transfer_id = $1`, sessionID).Scan(&n); err != nil {
+		h.t.Fatal(err)
+	}
+	return n
 }
 
 func (h *harness) dbStatus(sessionID string) string {
@@ -276,7 +329,7 @@ func TestRegistrationBringsTheSameSecretary(t *testing.T) {
 		t.Fatalf("new session view: %+v", v)
 	}
 
-	bundle := h.seal(sid)
+	bundle := h.seal(sid, grant)
 	if bytes.Contains(bundle, []byte(grant)) {
 		t.Fatal("the bundle carries the Cloud grant")
 	}
@@ -356,7 +409,7 @@ func TestRegistrationBringsTheSameSecretary(t *testing.T) {
 func TestExpiredAdmissionKeepsReceiptAccess(t *testing.T) {
 	h := setup(t, transfersession.Config{})
 	sid, grant := h.create(uidFor(t, "late"))
-	bundle := h.seal(sid)
+	bundle := h.seal(sid, grant)
 	if _, err := h.cloud.pool.Exec(h.ctx, `UPDATE transfer_sessions SET admit_until = now() - interval '1 second' WHERE session_id = $1`, sid); err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +448,7 @@ func TestExpiredAdmissionKeepsReceiptAccess(t *testing.T) {
 func TestPartialAndMisaddressedBundles(t *testing.T) {
 	h := setup(t, transfersession.Config{})
 	sid, grant := h.create(uidFor(t, "partial"))
-	bundle := h.seal(sid)
+	bundle := h.seal(sid, grant)
 	if code, _ := h.upload(sid, grant, bytes.NewReader(bundle[:len(bundle)/2])); code != http.StatusUnprocessableEntity {
 		t.Fatalf("truncated upload: %d", code)
 	}
@@ -440,7 +493,7 @@ func TestCancelDuringImportRetiresTheLateStage(t *testing.T) {
 			h := setup(t, transfersession.Config{})
 			uid := uidFor(t, "race")
 			sid, grant := h.create(uid)
-			bundle := h.seal(sid)
+			bundle := h.seal(sid, grant)
 			nl := bytes.IndexByte(bundle, '\n') + 1
 			pr, pw := io.Pipe()
 			uploaded := make(chan result, 1)
@@ -509,7 +562,7 @@ func TestCrashBetweenImportAndSessionUpdate(t *testing.T) {
 	t.Run("the next read promotes the committed import", func(t *testing.T) {
 		h := setup(t, transfersession.Config{})
 		sid, grant := h.create(uidFor(t, "crash"))
-		bundle := h.seal(sid)
+		bundle := h.seal(sid, grant)
 		// The upload's import commits; the handler dies before the session update.
 		if _, _, err := h.cloud.svc.Import(h.ctx, bytes.NewReader(bundle), nil, false); err != nil {
 			t.Fatal(err)
@@ -527,7 +580,7 @@ func TestCrashBetweenImportAndSessionUpdate(t *testing.T) {
 	t.Run("a session closed before the update retires the orphan", func(t *testing.T) {
 		h := setup(t, transfersession.Config{})
 		sid, grant := h.create(uidFor(t, "orphan"))
-		bundle := h.seal(sid)
+		bundle := h.seal(sid, grant)
 		if _, _, err := h.cloud.svc.Import(h.ctx, bytes.NewReader(bundle), nil, false); err != nil {
 			t.Fatal(err)
 		}
@@ -606,7 +659,12 @@ func TestAccountTransactionHoldsTheSession(t *testing.T) {
 		sid, grant, _ := h.stage(uid)
 		swept := make(chan error, 1)
 		_, _, err := h.provision(uid, sid, func(pgx.Tx) error {
-			time.Sleep(1700 * time.Millisecond)
+			// Wait for the claim deadline the committed row actually
+			// carries, not for a duration counted from when this test
+			// started: on a loaded host the staged promotion lands well
+			// after the upload, and a fixed sleep then sweeps a session
+			// that is not due yet and proves nothing.
+			h.waitClaimDeadline(sid, 10*time.Second)
 			go func() {
 				_, err := h.sessions.Sweep(h.ctx)
 				swept <- err
