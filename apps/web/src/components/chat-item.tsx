@@ -6,11 +6,13 @@ import {
   MessageMetadata,
   MessageResponse,
 } from "@sumi/ui/ai-elements/message";
+import { Button } from "@sumi/ui/components/button";
 import { Marker, MarkerContent } from "@sumi/ui/components/marker";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import type { ChatItem } from "../agent/model";
 import { userItemSourceLabel, userItemText } from "../lib/user-item-text";
 import { ApprovalConfirmation } from "./approval-confirmation";
+import { ModelProviderSettings } from "./model-provider-settings";
 import { TraceRow } from "./work-summary";
 
 export interface ChatItemViewProps {
@@ -145,6 +147,9 @@ export function ChatItemView({
         </Marker>
       );
     case "error":
+      if (item.cause === "no_model_connection") {
+        return <NoModelConnectionError />;
+      }
       return (
         <div
           role="alert"
@@ -154,4 +159,40 @@ export function ChatItemView({
         </div>
       );
   }
+}
+
+/**
+ * The one classified failure the user can fix themselves: no model
+ * connection is selected. States the cause in Japanese and opens the
+ * existing connection settings — the committed turn stays visible above,
+ * so the copy says nothing about resending and nothing about work already
+ * applied.
+ */
+function NoModelConnectionError() {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  return (
+    <>
+      <div
+        role="alert"
+        className="my-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-red-700 text-sm"
+      >
+        <p>モデル接続が選択されていないため、応答できませんでした。</p>
+        <p className="mt-1">
+          「AIの接続」で使う接続を選ぶと、次のメッセージに応答できるようになります。
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2 border-red-300 bg-white text-red-700 hover:bg-red-100 hover:text-red-800"
+          onClick={() => setSettingsOpen(true)}
+        >
+          接続設定を開く
+        </Button>
+      </div>
+      <ModelProviderSettings
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+      />
+    </>
+  );
 }

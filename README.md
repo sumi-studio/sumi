@@ -37,7 +37,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 ### Not available yet
 
-- **Using the full Web app on the new core as a product.** Connecting the existing Web app to the new core for everyday use is still being verified. No documented local setup runs the full Web app on it yet.
+- **Using the full Web app on the new core as a product.** `make dev-core` runs the Web app on the new core for development. Direct Chat runs on the core; Messaging's core path currently covers attention intake and secretary replies only — shared Messaging history/search and accepting workspace invitations are still served by the existing surfaces, not the core. Connecting it for everyday use is still being verified.
 - **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
@@ -65,9 +65,9 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 ## Run the Web app from source
 
-`make dev` starts the full Web app with one real secretary on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor, and Vite. This developer stack runs the secretary on the Rust agent runtime (`apps/agent`), not on the new TypeScript secretary core used by the Local host and Sumi Cloud.
+`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor (`apps/agent`), and Vite. `make dev-core` runs the same app on the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — while its Direct Chat adoption is being proven.
 
-Requirements: Node.js 20.19 or newer, pnpm 11, Go, Rust stable, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; and model-provider credentials for the conversation model and for two separate review models.
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; Rust stable and model-provider credentials for the conversation model and two separate review models. `make dev-core` needs no model credential for the default deterministic provider.
 
 ```sh
 make setup
@@ -89,7 +89,7 @@ apps/
   api/                Go API: sign-in sessions, identity, Workspaces, Messaging, approvals,
                       model connections, usage, and the state service the secretary core uses
   core/               TypeScript secretary core: Node.js hosts and the Cloudflare Durable Object host
-  agent/              Rust agent runtime and isolated tool executor used by `make dev`
+  agent/              Rust agent runtime and isolated tool executor used by `make dev-rust`
 packages/
   ui/                 @sumi/ui component catalog (based on shadcn/ui)
   sdui/               @sumi/sdui declarative UI schema (zod) and renderer
@@ -111,7 +111,7 @@ CONTEXT.md            domain glossary (Japanese)
 | Sign-in | Firebase Authentication, with sessions issued by the Go API |
 | API and canonical state | Go, PostgreSQL |
 | Secretary core | TypeScript on Node.js (Local) and Cloudflare Workers Durable Objects (Cloud) |
-| Agent runtime for the developer stack | Rust |
+| Transitional agent runtime (`make dev-rust`) | Rust |
 | Calls | LiveKit |
 | Contracts | OpenAPI, JSON Schema |
 | Monorepo and tooling | pnpm workspaces, Turborepo, Biome |

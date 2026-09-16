@@ -386,7 +386,7 @@ export class SelectedModelProvider implements ModelProvider {
     switch (binding.selection) {
       case "unset":
         if (this.opts.fallback instanceof NoSelectionProvider) {
-          throw unusable(NO_SELECTION_MESSAGE);
+          throw unusable(NO_SELECTION_MESSAGE, "no_model_connection");
         }
         return {
           provider: this.opts.fallback,
@@ -404,6 +404,7 @@ export class SelectedModelProvider implements ModelProvider {
       case "none":
         throw unusable(
           "the selected model connection is 接続しない (none); choose a connection to let the secretary answer",
+          "no_model_connection",
         );
       case "chatgpt":
         throw unusable(
@@ -472,8 +473,12 @@ export class SelectedModelProvider implements ModelProvider {
   }
 }
 
-function unusable(message: string): ModelError {
-  return new ModelError(message, { retryable: false, unavailable: true });
+function unusable(message: string, cause?: "no_model_connection"): ModelError {
+  return new ModelError(message, {
+    retryable: false,
+    unavailable: true,
+    cause,
+  });
 }
 
 const NO_SELECTION_MESSAGE =
@@ -486,7 +491,8 @@ export class NoSelectionProvider implements ModelProvider {
   stream(_request: ModelRequest): AsyncIterable<ModelEvent> {
     return {
       [Symbol.asyncIterator]: () => ({
-        next: () => Promise.reject(unusable(NO_SELECTION_MESSAGE)),
+        next: () =>
+          Promise.reject(unusable(NO_SELECTION_MESSAGE, "no_model_connection")),
       }),
     };
   }

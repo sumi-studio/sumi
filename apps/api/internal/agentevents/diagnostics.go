@@ -57,7 +57,7 @@ func (g *DurableGateway) DiagnosticObservation(ctx context.Context, personalityA
 	// missing field honestly records that this process has not observed runs.
 	if g.mu.TryLock() {
 		g.stateMu.RLock()
-		if g.stateRebuilt[personalityAgentID] {
+		if st, ok := g.tails[personalityAgentID]; ok && st.tailObserved {
 			running := g.runInFlight[personalityAgentID]
 			result.RunInFlight = &running
 		}
