@@ -94,30 +94,48 @@ export class SumiSessionCompensationFailedError extends AggregateError {
   }
 }
 
+let csrfFetchInFlight: Promise<string> | null = null;
+
 export async function fetchCSRFToken(
   options: { fetcher?: typeof fetch; signal?: AbortSignal } = {},
 ): Promise<string> {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
-  const response = await fetcher("/auth/csrf", {
-    credentials: "include",
-    cache: "no-store",
-    headers: { Accept: "application/json" },
-    signal: options.signal
-      ? AbortSignal.any([options.signal, authRequestSignal()])
-      : authRequestSignal(),
+  const request = async () => {
+    const response = await fetcher("/auth/csrf", {
+      credentials: "include",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: options.signal
+        ? AbortSignal.any([options.signal, authRequestSignal()])
+        : authRequestSignal(),
+    });
+    if (!response.ok) {
+      throw await authAPIError(response);
+    }
+    const body = await readAuthJSON(response);
+    if (
+      !isObject(body) ||
+      typeof body.csrf_token !== "string" ||
+      !csrfTokenPattern.test(body.csrf_token)
+    ) {
+      throw new AuthAPIError(
+        "Invalid authentication response.",
+        response.status,
+      );
+    }
+    return body.csrf_token;
+  };
+  // Each /auth/csrf response rotates the cookie, so concurrent fetches race:
+  // the later Set-Cookie invalidates the earlier caller's header. Sharing one
+  // in-flight fetch keeps every waiting caller on the token that the jar ends
+  // up holding.
+  if (options.fetcher || options.signal) {
+    return request();
+  }
+  csrfFetchInFlight ??= request().finally(() => {
+    csrfFetchInFlight = null;
   });
-  if (!response.ok) {
-    throw await authAPIError(response);
-  }
-  const body = await readAuthJSON(response);
-  if (
-    !isObject(body) ||
-    typeof body.csrf_token !== "string" ||
-    !csrfTokenPattern.test(body.csrf_token)
-  ) {
-    throw new AuthAPIError("Invalid authentication response.", response.status);
-  }
-  return body.csrf_token;
+  return csrfFetchInFlight;
 }
 
 export async function postAuthJSON(

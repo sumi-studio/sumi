@@ -39,6 +39,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 	"github.com/sumi-studio/sumi/apps/api/internal/usageview"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 	"golang.org/x/sys/unix"
@@ -112,6 +113,11 @@ func run(ctx context.Context) (runErr error) {
 	app.startWarmReconciliation()
 	app.startPendingWorkReconciliation()
 	app.startEmailDelivery()
+	if app.transferSessions != nil {
+		// Owes activation after a committed account claim, retires staged
+		// copies of closed sessions, and promotes interrupted imports.
+		go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+	}
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
 		defer cancelReaper()
@@ -261,6 +267,7 @@ type application struct {
 	cleanupFeedbackAttachments func(context.Context) error
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
+	transferSessions           *transfersession.Service
 	coreDirectChat             *agentevents.CoreDirectChat
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
@@ -442,9 +449,10 @@ func newApplicationFromEnv() (*application, error) {
 		return nil, err
 	}
 	var authServer *agentevents.BrowserAuthServer
+	var secretaryTransfer *secretaryTransferMount
 	var authEnabled bool
 	if browserAuthConfiguredFromEnv() {
-		authServer, authEnabled, err = browserAuthServerFromEnvWithDB(
+		authServer, secretaryTransfer, authEnabled, err = browserAuthServerFromEnvWithDB(
 			context.Background(), sv, browserOrigins, databasePool, directChatLifecycle,
 		)
 		if err != nil {
@@ -454,6 +462,9 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
+		if secretaryTransfer != nil {
+			secretaryTransfer.server.RegisterRoutes(mux)
+		}
 		if database != nil {
 			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
 		}
@@ -817,11 +828,15 @@ func newApplicationFromEnv() (*application, error) {
 			return messagingServer.Store.DeliverAgentAttention(ctx, delivery, 25)
 		}
 	}
+	var transferSessions *transfersession.Service
+	if secretaryTransfer != nil {
+		transferSessions = secretaryTransfer.service
+	}
 	if workspaceStore != nil && coreServer != nil {
 		// The secretary's Workspace invitation list/accept on the core: the
-		// delegated effects run inside the operation-claim transaction, so a
-		// committed membership is always paired with its operation record —
-		// the same atomicity the runtime's local-control calls gave.
+		// delegated effects run inside the operation-claim transaction — the
+		// same membership+invitation atomicity the runtime's local-control
+		// calls gave, now additionally pairing the operation receipt itself.
 		for tool, effect := range workspaceStore.CoreInvitationToolEffects() {
 			if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
 				stopBackground()
@@ -848,6 +863,7 @@ func newApplicationFromEnv() (*application, error) {
 		emailDelivery:              emailDeliveryWorkerFor(authServer),
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
+		transferSessions:           transferSessions,
 		coreDirectChat:             coreDirectChat,
 		publicMux:                  mux,
 		localMux:                   localMux,

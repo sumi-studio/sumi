@@ -67,6 +67,12 @@ var (
 	ErrSourceUnbound = errors.New("this move URL has not been taken by a Sumi Local placement yet")
 	ErrAccountExists = errors.New("this credential already has an account; bringing a secretary into an existing account is not supported")
 	ErrBadRequest    = errors.New("bad request")
+	// ErrPending is the account transaction's answer to a subject whose
+	// session is still awaiting_bundle: the move URL was never used or the
+	// upload has not committed. Registration may finish without a transfer
+	// only after the registrant cancels or replaces that session — an
+	// abandoned one cannot silently decide which secretary the account gets.
+	ErrPending = errors.New("the secretary has not arrived yet; run the move command or cancel the transfer")
 )
 
 const (
@@ -874,6 +880,93 @@ type Claim struct {
 	SessionID string
 	PersonaID string
 	subject   Subject
+}
+
+// ClaimForSubjectInTx is the account transaction's claim for the open
+// session the proved credential chose: the subject — not a request body —
+// selects it. ok is false when the credential has no open session and the
+// account mints a fresh secretary. An awaiting session answers ErrPending
+// (the registrant must still run the move or cancel it), a provisioned one
+// ErrConflict (its account transaction already ran), and a staged one is
+// locked and claimed exactly as ClaimInTx does.
+func (s *Service) ClaimForSubjectInTx(ctx context.Context, tx pgx.Tx, subj Subject) (Claim, bool, error) {
+	if !subj.valid() {
+		return Claim{}, false, fmt.Errorf("%w: unsupported credential subject", ErrBadRequest)
+	}
+	var sessionID, status string
+	err := tx.QueryRow(ctx, `SELECT session_id, status FROM transfer_sessions
+		WHERE claim_provider = $1 AND claim_subject = $2
+		  AND status IN ('awaiting_bundle','staged','provisioned')`, subj.Provider, subj.Subject).
+		Scan(&sessionID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Claim{}, false, nil
+	}
+	if err != nil {
+		return Claim{}, false, err
+	}
+	switch status {
+	case StatusStaged:
+		claim, err := ClaimInTx(ctx, tx, sessionID, subj)
+		if err != nil {
+			return Claim{}, false, err
+		}
+		return claim, true, nil
+	case StatusAwaitingBundle:
+		// The session may still sit on awaiting_bundle while its import
+		// already committed (the promotion was interrupted). Decide under
+		// the session row lock so a staging that committed between the
+		// read and here still claims rather than answering ErrPending.
+		r, lerr := scanRow(tx.QueryRow(ctx, `SELECT `+rowCols+` FROM transfer_sessions WHERE session_id = $1 FOR UPDATE`, sessionID))
+		if lerr != nil {
+			return Claim{}, false, lerr
+		}
+		switch r.status {
+		case StatusAwaitingBundle:
+			var arrived bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM core_transfers
+				WHERE direction = 'import' AND transfer_id = $1 AND status = 'staged')`, sessionID).Scan(&arrived); err != nil {
+				return Claim{}, false, err
+			}
+			if !arrived {
+				// No committed import and the admission deadline passed: this
+				// is what the sweep writes, decided under the claim's own row
+				// lock so the deadline answer never waits on a sweep tick —
+				// or on a deployment that runs no sweep. An import committed
+				// before promotion still promotes and claims above: admission
+				// is enforced at upload, so a staged import always arrived in
+				// time.
+				expired, err := tx.Exec(ctx, `UPDATE transfer_sessions
+					SET status = 'expired', updated_at = now()
+					WHERE session_id = $1 AND status = 'awaiting_bundle' AND admit_until <= now()`, sessionID)
+				if err != nil {
+					return Claim{}, false, err
+				}
+				if expired.RowsAffected() == 0 {
+					return Claim{}, false, ErrPending
+				}
+				return Claim{}, false, nil
+			}
+			// The import committed but the promotion did not: promote now,
+			// inside the claim's own lock, with the service's claim
+			// deadline — Reconcile would write the same row.
+			if _, err := tx.Exec(ctx, `UPDATE transfer_sessions
+				SET status = 'staged', claim_until = now() + $2::bigint * interval '1 millisecond', updated_at = now()
+				WHERE session_id = $1 AND status = 'awaiting_bundle'`, sessionID, s.claimTTL.Milliseconds()); err != nil {
+				return Claim{}, false, err
+			}
+			fallthrough
+		case StatusStaged:
+			claim, err := ClaimInTx(ctx, tx, sessionID, subj)
+			if err != nil {
+				return Claim{}, false, err
+			}
+			return claim, true, nil
+		default:
+			return Claim{}, false, fmt.Errorf("%w: session is already %s", ErrConflict, r.status)
+		}
+	default:
+		return Claim{}, false, fmt.Errorf("%w: session is already %s", ErrConflict, status)
+	}
 }
 
 // ClaimInTx locks a staged session for the account transaction of a live

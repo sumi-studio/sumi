@@ -76,6 +76,10 @@ const emailErrorMessages: Record<string, string> = {
     "別のアカウントでログインしています。切り替える場合は、現在のセッションを終了してください。",
   flow_consumed: "このログインはすでに完了しています。",
   flow_closed: "このログインは取り消されました。もう一度お試しください。",
+  transfer_pending:
+    "Localの秘書がまだ届いていません。Local側の移動コマンドを確認してください。",
+  transfer_unavailable:
+    "この秘書の移動はもう登録に使えません。移動の状態を確認してください。",
 };
 
 function emailAuthErrorMessage(error: AuthAPIError): string | null {
