@@ -157,6 +157,44 @@ describe("MessageSearch", () => {
     expect(screen.queryByText(/「予定」の検索結果/)).not.toBeInTheDocument();
   });
 
+  it("ignores an older query's response arriving after a newer one", async () => {
+    let resolveOld!: (results: MessageSearchResult[]) => void;
+    let resolveNew!: (results: MessageSearchResult[]) => void;
+    mocks.searchMessages
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveNew = resolve;
+        }),
+      );
+    render(<MessageSearch onJump={vi.fn()} />);
+    const input = screen.getByPlaceholderText("検索");
+
+    fireEvent.change(input, { target: { value: "alpha" } });
+    await advance(300);
+    fireEvent.change(input, { target: { value: "beta" } });
+    await advance(300);
+    expect(mocks.searchMessages).toHaveBeenNthCalledWith(1, "alpha");
+    expect(mocks.searchMessages).toHaveBeenNthCalledWith(2, "beta");
+
+    // Both responses are genuinely in flight; the newer one lands first.
+    await act(async () =>
+      resolveNew([{ ...result(), snippet: "newer-response-marker" }]),
+    );
+    expect(screen.getByText(/newer-response-marker/)).toBeInTheDocument();
+
+    // The stale older response must not overwrite it.
+    await act(async () =>
+      resolveOld([{ ...result(), snippet: "stale-response-marker" }]),
+    );
+    expect(screen.getByText(/newer-response-marker/)).toBeInTheDocument();
+    expect(screen.queryByText(/stale-response-marker/)).toBeNull();
+  });
+
   it("forgets snippets, controls, and in-flight results when authority changes", async () => {
     let resolveSearch!: (results: MessageSearchResult[]) => void;
     mocks.searchMessages.mockReturnValueOnce(
