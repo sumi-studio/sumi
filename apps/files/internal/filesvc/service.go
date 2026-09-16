@@ -55,7 +55,6 @@ func NewAt(root string, store VersionStore, tokens map[string]map[string]bool) (
 	if err != nil {
 		return nil, err
 	}
-	r.sweepStaging()
 	return &Service{root: r, store: store, tokens: tokens}, nil
 }
 

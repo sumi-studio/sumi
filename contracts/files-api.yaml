@@ -202,10 +202,13 @@ info:
     containing such a segment (400 reserved_name), nested or not,
     whether or not the object exists. Recovery names are not
     user-addressable: they are hidden from listings, and only the
-    service's own recovery paths may move objects out of them or delete
-    them. Unattributable objects do not stay hidden: the reconciler
-    surfaces them at public recovered-* names (above), so private names
-    never retain content indefinitely.
+    service's own recovery paths may move objects out of them; recovery
+    never deletes — a stat-then-unlink cannot prove the object still
+    beneath a private name is the verified one against an interloper
+    swap, so uncertain or duplicate objects surface at public
+    recovered-* names instead. Unattributable objects do not stay
+    hidden: the reconciler surfaces them at public recovered-* names
+    (above), so private names never retain content indefinitely.
     Dead-owner intents are settled by
     the live reconciler after the settle grace; settlement claims the
     intent atomically and write intents verify the landed bytes' hash, so

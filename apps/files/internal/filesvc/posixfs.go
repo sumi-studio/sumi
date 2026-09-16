@@ -538,8 +538,8 @@ func syncDir(dfd *os.File) {
 
 // unixToFileMode converts a raw unix mode word (S_IFMT type bits in the low
 // range) to fs.FileMode (type bits in the high range). A raw cast leaves
-// IsDir/IsRegular wrong — which misclassified every list entry and stopped
-// sweepDir from recursing (operation-review B F2).
+// IsDir/IsRegular wrong — which misclassified every list entry (operation-
+// review B F2).
 func unixToFileMode(m uint32) fs.FileMode {
 	fm := fs.FileMode(m & 0o7777)
 	switch m & unix.S_IFMT {
@@ -1261,43 +1261,6 @@ func (v *rootView) MoveStaged(scope, from, to string) error {
 	}
 	syncDir(tpfd)
 	return nil
-}
-
-// RemoveName deletes the object at an owned private name beneath the
-// pinned root. Only recovery ever calls it, and only on names recorded
-// in the intent's journal as owned by this instance — nothing else may
-// write those names, so an in-place verified unlink is definitive. A
-// directory is removed only when empty; a non-empty dir reports
-// ErrNotEmpty and the caller surfaces the container instead.
-func (v *rootView) RemoveName(scope, path string) error {
-	sfd, err := scopeDirFrom(v.rfd, scope, false)
-	if err != nil {
-		return err
-	}
-	defer sfd.Close()
-	rel, err := relPath(path)
-	if err != nil {
-		return err
-	}
-	dirRel, name := splitRel(rel)
-	pfd, err := openDirBeneath(sfd, dirRel, false)
-	if err != nil {
-		return err
-	}
-	defer pfd.Close()
-	err = unix.Unlinkat(int(pfd.Fd()), name, 0)
-	if errors.Is(err, unix.EISDIR) {
-		err = unix.Unlinkat(int(pfd.Fd()), name, unix.AT_REMOVEDIR)
-	}
-	switch {
-	case err == nil, errors.Is(err, unix.ENOENT):
-		syncDir(pfd)
-		return nil
-	case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
-		return ErrNotEmpty
-	default:
-		return mapPathErr(err)
-	}
 }
 
 // ListStaged returns the base names in dir that begin with prefix,
@@ -2128,58 +2091,8 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 		DevIno: devIno(st), Oid: oid, Nlink: nlink}, true, nil
 }
 
-// sweepStaging removes service staging files older than 10 minutes — e.g.
-// left behind by a SIGKILL mid-write. Run at startup and periodically.
-// Safe while the service is live only because the prefix is reserved.
-// The walk stays fd-relative, so even this background cleanup cannot be
-// redirected outside the root by a racing symlink swap.
-func (p *posixRoot) sweepStaging() {
-	rfd, err := p.rootFD()
-	if err != nil {
-		return
-	}
-	defer rfd.Close()
-	d, err := openBeneath(rfd, ".", unix.O_RDONLY|unix.O_DIRECTORY, 0)
-	if err != nil {
-		return
-	}
-	names, err := d.Readdirnames(-1)
-	d.Close()
-	if err != nil {
-		return
-	}
-	cutoff := time.Now().Add(-10 * time.Minute)
-	for _, sc := range names {
-		sd, err := openBeneath(rfd, sc, unix.O_RDONLY|unix.O_DIRECTORY, 0)
-		if err != nil {
-			continue
-		}
-		sweepDir(sd, cutoff)
-	}
-}
-
-func sweepDir(dfd *os.File, cutoff time.Time) {
-	defer dfd.Close()
-	names, err := dfd.Readdirnames(-1)
-	if err != nil {
-		return
-	}
-	for _, n := range names {
-		mode, _, mtim, _, err := statAt(dfd, n)
-		if err != nil {
-			continue
-		}
-		if mode.IsDir() {
-			sub, err := openBeneath(dfd, n, unix.O_RDONLY|unix.O_DIRECTORY, 0)
-			if err != nil {
-				continue
-			}
-			sweepDir(sub, cutoff)
-			continue
-		}
-		if strings.HasPrefix(n, stagingPrefix) &&
-			time.Unix(0, mtim).Before(cutoff) {
-			unix.Unlinkat(int(dfd.Fd()), n, 0)
-		}
-	}
-}
+// The .filesv-tmp- prefix remains reserved (checkReserved and the
+// listings filter) but nothing mints it and nothing deletes it: a
+// vestigial startup sweep that unlinked aged names once lived here —
+// it destroyed foreign deposits whose disposal was never authorized
+// (F258/B-N3), so it was removed rather than re-gated.

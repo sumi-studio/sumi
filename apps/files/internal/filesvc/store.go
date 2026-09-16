@@ -101,9 +101,12 @@ type HashFn func(scope, path string) (string, error)
 // runs the mount check before pinning.
 //
 // The view only ever moves objects between OWNED private names and
-// public paths that are verified empty (MoveStaged is NOREPLACE), and
-// only ever deletes beneath owned private names (RemoveName). It has no
-// operation that can evict or overwrite a public-name occupant.
+// public paths that are verified empty (MoveStaged is NOREPLACE — never
+// overwrites). It has no deletion operation at all: recovery never
+// unlinks — a stat-then-unlink cannot atomically prove the object under
+// an owned private name is still the verified one when an interloper
+// can swap it in (F256/B-N1), so uncertain or duplicate objects
+// surface visibly instead.
 type ReconView interface {
 	Stat(scope, path string) (FileInfo, error)
 	Hash(scope, path string) (string, error)
@@ -112,12 +115,6 @@ type ReconView interface {
 	// to restore parked content to its home or to a visible surface
 	// name.
 	MoveStaged(scope, from, to string) error
-	// RemoveName deletes the object at an owned private name beneath the
-	// pinned root (unlinks in place; a directory is removed with
-	// AT_REMOVEDIR; nonempty maps to ErrNotEmpty; ENOENT reports nil).
-	// Callers verify identity before invoking it — the name is a
-	// single-epoch record, so nothing else may populate it.
-	RemoveName(scope, path string) error
 	// ListStaged returns base names in dir (a path beneath the scope
 	// root) beginning with prefix — used to enumerate private recovery
 	// names.
@@ -1542,20 +1539,6 @@ func (s *Store) markStalled(ctx context.Context, it intent, cause error) {
 	}
 }
 
-// sameObjectAt reports whether dst is the same object as st — the
-// "still at its recorded home" check. The comparison is the complete
-// live object identity dev:ino: an inode number alone is per-filesystem,
-// so a foreign-device object with a colliding inode is correctly NOT
-// the same. Missing device evidence fails closed — without dev:ino the
-// stats cannot prove the same live object — and callers on
-// delete-authorizing paths treat "not proven same" as "keep". Restore
-// paths still converge: a genuinely-at-home occupant is protected from
-// a swap by parkedOwnsRow's fingerprint evidence.
-func sameObjectAt(st, dst FileInfo) bool {
-	return st.Kind == dst.Kind && st.DevIno != "" &&
-		st.DevIno == dst.DevIno
-}
-
 // intentApplied reports whether this intent's effect committed and was
 // recorded: its apply journaled the file_event row AND removed the intent
 // row, in one transaction. The event alone is not that proof — a diverged
@@ -2024,9 +2007,17 @@ func obsFPMatch(rec nameRec, fp string) bool {
 // bookkeeping is terminal (F237).
 func (s *Store) settleNames(ctx context.Context, it intent, view ReconView, tombstoned bool) {
 	names := it.names
+	loaded := len(names) // records appended this pass were already
+	// handled by the capture+judge that appended them — re-entering a
+	// done fresh record would re-capture its own name without end
+	// (unbounded journal and filesystem churn while the deferring
+	// condition persists).
 	for i := 0; i < len(names); i++ {
 		rec := names[i]
 		if rec.Done {
+			if i >= loaded {
+				continue
+			}
 			// A drained name can still be repopulated by a delayed
 			// filesystem effect or a direct deposit (F244): re-stat it.
 			// An occupant here is unattributable — the record's acts
@@ -2072,6 +2063,7 @@ func (s *Store) settleNames(ctx context.Context, it intent, view ReconView, tomb
 			}
 			continue
 		case serr != nil:
+			log.Printf("reconcile: intent %d name %s unverifiable this pass: %v", it.id, rel, serr)
 			continue // unverifiable this pass — retry later
 		}
 		// The name is populated. A tombstone only recorded an empty
@@ -2150,6 +2142,7 @@ func (s *Store) captureName(ctx context.Context, it *intent, names *[]nameRec, v
 		case errors.Is(err, ErrConflict):
 			continue // fresh-name collision — try another suffix
 		default:
+			log.Printf("reconcile: intent %d capture %s -> %s deferred: %v", it.id, rel, frel, err)
 			return 0, "", FileInfo{}, false
 		}
 	}
@@ -2173,14 +2166,16 @@ func (s *Store) captureName(ctx context.Context, it *intent, names *[]nameRec, v
 // The reconciler never deletes a populated private occupant: an event,
 // a product-row hash, or a committed operation is not disposal
 // authority for bytes the current-occupant check did not prove (F236,
-// F243, B-F5). The single remaining deletion is the hardlink-sibling
-// dedup in settleObject — the private name and the home's occupant are
-// the same inode, so removing a duplicate link destroys nothing.
+// F243, B-F5). No deletion path remains anywhere in recovery — even a
+// proven duplicate link cannot be unlinked safely because the check and
+// the unlink are not atomic against an interloper swap (F256/B-N1), so
+// every uncertain or duplicate object surfaces visibly instead.
 func (s *Store) judgeName(ctx context.Context, it *intent, names *[]nameRec, view ReconView, i int, rel string, st FileInfo, prov nameRec) {
 	sha := ""
 	if st.Kind == "file" {
 		h, herr := view.Hash(it.scope, rel)
 		if herr != nil {
+			log.Printf("reconcile: intent %d name %s hash unverifiable this pass: %v", it.id, rel, herr)
 			return // content unverifiable — retry next pass
 		}
 		sha = h
@@ -2194,10 +2189,9 @@ func (s *Store) judgeName(ctx context.Context, it *intent, names *[]nameRec, vie
 		// visibly under a fresh truthful identity: the reconciler
 		// NEVER destroys a populated private occupant — an event, a
 		// product-row hash, or a committed op is never disposal
-		// authority (F236/F243/B-F3/B-F5). The only reconciler
-		// deletion left is the proven hardlink-sibling dedup inside
-		// settleObject (the name and the home's occupant are the
-		// same inode — removing a duplicate link destroys nothing).
+		// authority (F236/F243/B-F3/B-F5). No reconciler path unlinks
+		// anything: a stat-then-unlink on an owned private name still
+		// races an interloper swap, so duplicates surface too (F256).
 		if s.rowClaimsObject(ctx, *it, m.home, st) {
 			s.settleObject(ctx, it, names, i, view, rel, st, m.home, true)
 		} else {
@@ -2213,7 +2207,10 @@ func (s *Store) judgeName(ctx context.Context, it *intent, names *[]nameRec, vie
 // records its row. The destination is committed to rec.Home BEFORE the
 // move so a post-move/pre-PG crash retries through finishSettlement
 // instead of losing the row. An occupied authorized home is never
-// evicted; the object surfaces beside it.
+// evicted; the object surfaces beside it — even when the occupant is
+// this same object via a duplicate link: a stat-then-unlink cannot
+// distinguish that from an interloper swapped in between the checks,
+// so surfacing is the only non-destructive disposition (F256/B-N1).
 func (s *Store) settleObject(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rel string, st FileInfo, home string, homeOK bool) {
 	rec := (*names)[i]
 	target := home
@@ -2221,19 +2218,10 @@ func (s *Store) settleObject(ctx context.Context, it *intent, names *[]nameRec, 
 	case target == "":
 		target = s.surfaceTarget(*it, rec, rel)
 	default:
-		ost, serr := view.Stat(it.scope, home)
-		switch {
+		switch _, serr := view.Stat(it.scope, home); {
 		case absentVerdict(serr):
 		case serr != nil:
 			return // home unverifiable — retry next pass
-		case sameObjectAt(st, ost):
-			// The home's occupant IS this object (a hardlink sibling —
-			// the private name is a duplicate link). Removing our name
-			// is operation-bound disposal, not recovery.
-			if err := view.RemoveName(it.scope, rel); err == nil {
-				it.journal.done(i)
-			}
-			return
 		default:
 			target = s.surfaceTarget(*it, rec, home)
 			homeOK = false
@@ -2245,7 +2233,7 @@ func (s *Store) settleObject(ctx context.Context, it *intent, names *[]nameRec, 
 	if d, _ := splitRel(target); d != "" {
 		_ = view.EnsureDir(it.scope, d)
 	}
-	landed, err := s.moveSettled(ctx, it, names, i, view, rel, st, target)
+	landed, err := s.moveSettled(ctx, it, names, i, view, rel, target)
 	if err != nil {
 		return // the journaled home retries next pass
 	}
@@ -2256,18 +2244,19 @@ func (s *Store) settleObject(ctx context.Context, it *intent, names *[]nameRec, 
 }
 
 // moveSettled lands the object at target via NOREPLACE, rotating to a
-// fresh surface sibling (journaled each time) when the destination is
-// occupied by a different object. Returns the final destination.
-func (s *Store) moveSettled(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rel string, st FileInfo, target string) (string, error) {
+// fresh surface sibling (journaled each time) whenever the destination
+// is occupied — by any object. Treating "occupied by this same object
+// via a duplicate link" as already-landed would strand the private
+// link at rel, which a later done-record restat would re-capture
+// without end; surfacing it keeps every link accounted for (F256).
+// Returns the final destination.
+func (s *Store) moveSettled(ctx context.Context, it *intent, names *[]nameRec, i int, view ReconView, rel string, target string) (string, error) {
 	for try := 0; try < 4; try++ {
 		err := view.MoveStaged(it.scope, rel, target)
 		switch {
 		case err == nil:
 			return target, nil
 		case errors.Is(err, ErrConflict):
-			if ost, serr := view.Stat(it.scope, target); serr == nil && sameObjectAt(st, ost) {
-				return target, nil // the object is already there
-			}
 			target = s.surfaceTarget(*it, (*names)[i], target)
 			if jerr := it.journal.home(i, target); jerr != nil {
 				return "", jerr
@@ -2295,7 +2284,7 @@ func (s *Store) finishSettlement(ctx context.Context, it *intent, names *[]nameR
 		if d, _ := splitRel(rec.Home); d != "" {
 			_ = view.EnsureDir(it.scope, d)
 		}
-		landed, merr := s.moveSettled(ctx, it, names, i, view, rel, st, rec.Home)
+		landed, merr := s.moveSettled(ctx, it, names, i, view, rel, rec.Home)
 		if merr != nil {
 			return
 		}
@@ -2412,6 +2401,14 @@ func (s *Store) settleRow(ctx context.Context, it intent, view ReconView, rec na
 		it.scope, target, nameRel(it, rec)).Scan(&ev)
 	switch {
 	case err == nil:
+		// Row+event are already durable — but an earlier pass may
+		// have committed them and then died or failed before the
+		// follow-up bookkeeping completed (F257/B-N2). The event's
+		// presence is not proof the cleanup ran; finish it now and
+		// report terminal only once it converges.
+		if !home && !s.surfaceBookkeeping(ctx, it, view, target, live, sha) {
+			return false, true
+		}
 		return true, false
 	case !errors.Is(err, pgx.ErrNoRows):
 		return false, true
@@ -2450,17 +2447,29 @@ func (s *Store) settleRow(ctx context.Context, it intent, view ReconView, rec na
 		log.Printf("reconcile: settled %s row commit: %v", target, err)
 		return false, true
 	}
-	if !home {
-		// The object now holds a fresh truthful row at its surface
-		// name — a row that provably describes THIS object but claims
-		// an absent path is falsified evidence: drop it so the stale
-		// claim cannot shadow the surfaced recovery.
-		s.dropStaleClaims(ctx, it, view, target, live, sha)
-		if live.Kind == "dir" {
-			s.mintMemberRows(ctx, it, view, target)
-		}
+	if !home && !s.surfaceBookkeeping(ctx, it, view, target, live, sha) {
+		return false, true // cleanup outstanding — retry, never done
 	}
 	return true, false
+}
+
+// surfaceBookkeeping finishes the record-keeping a surfaced object
+// needs beyond its own row+event: stale claims that provably describe
+// this object at absent paths are dropped, and a surfaced directory's
+// members mint truthful rows. Every step is idempotent — safe to rerun
+// after a crash — and any failed or unverifiable step reports false so
+// the journal record stays live and retries (F257/B-N2) instead of
+// draining with the bookkeeping half-done.
+func (s *Store) surfaceBookkeeping(ctx context.Context, it intent, view ReconView, target string, live FileInfo, sha string) bool {
+	// The object holds a fresh truthful row at its surface name — a
+	// row that provably describes THIS object but claims an absent
+	// path is falsified evidence: drop it so the stale claim cannot
+	// shadow the surfaced recovery.
+	ok := s.dropStaleClaims(ctx, it, view, target, live, sha)
+	if live.Kind == "dir" && !s.mintMemberRows(ctx, it, view, target) {
+		ok = false
+	}
+	return ok
 }
 
 // dropStaleClaims removes version rows that provably describe the
@@ -2469,9 +2478,9 @@ func (s *Store) settleRow(ctx context.Context, it intent, view ReconView, rec na
 // the row's own fp so a row rewritten since our read is left alone.
 // Only ever applied to rows describing the object we hold — never used
 // to elect a home.
-func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, keep string, live FileInfo, sha string) {
+func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, keep string, live FileInfo, sha string) bool {
 	if s.pool == nil {
-		return
+		return true
 	}
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
@@ -2480,7 +2489,7 @@ func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, 
 		  WHERE scope=$1 AND path<>$2 AND content_sha=$3`,
 		it.scope, keep, sha)
 	if err != nil {
-		return
+		return false
 	}
 	type claim struct{ path, fp, oid string }
 	var cands []claim
@@ -2491,6 +2500,7 @@ func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, 
 		}
 	}
 	rows.Close()
+	ok := true
 	for _, c := range cands {
 		match := false
 		if live.Oid != "" && c.oid != "" {
@@ -2501,15 +2511,22 @@ func (s *Store) dropStaleClaims(ctx context.Context, it intent, view ReconView, 
 		if !match {
 			continue
 		}
-		if _, serr := view.Stat(it.scope, c.path); !absentVerdict(serr) {
-			continue // present or unverifiable — the claim may still stand
+		switch _, serr := view.Stat(it.scope, c.path); {
+		case absentVerdict(serr):
+		case serr != nil:
+			ok = false // claim path unverifiable — cannot certify absence
+			continue
+		default:
+			continue // present — the claim may still stand
 		}
 		if _, err := s.pool.Exec(dctx,
 			`DELETE FROM file_version WHERE scope=$1 AND path=$2 AND fp=$3`,
 			it.scope, c.path, c.fp); err != nil {
 			log.Printf("reconcile: drop stale claim %s: %v", c.path, err)
+			ok = false
 		}
 	}
+	return ok
 }
 
 // rowClaimsObject reports whether the version row at path provably
@@ -2636,7 +2653,7 @@ func (s *Store) surfaceRowTx(ctx context.Context, tx pgx.Tx, it intent, target s
 // objects — minted only where no row exists, bounded in depth and
 // deduplicated by object identity. A member never moves: the container
 // carries it, and its recorded path (if any) keeps its own stale row.
-func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, root string) {
+func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, root string) bool {
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	type member struct {
@@ -2645,6 +2662,7 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 	}
 	var members []member
 	seen := map[string]struct{}{}
+	ok := true
 	var walk func(rel string, depth int)
 	walk = func(rel string, depth int) {
 		if depth > 256 {
@@ -2652,18 +2670,21 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 		}
 		ents, err := view.ListDir(it.scope, rel)
 		if err != nil {
+			ok = false // subtree unobservable — the mint is incomplete
 			return
 		}
 		for _, m := range ents {
 			mrel := rel + "/" + m
 			st, serr := view.Stat(it.scope, mrel)
 			if serr != nil {
+				ok = false
 				continue
 			}
 			msha := "dir"
 			if st.Kind == "file" {
 				h, herr := view.Hash(it.scope, mrel)
 				if herr != nil {
+					ok = false
 					continue
 				}
 				msha = h
@@ -2681,17 +2702,19 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 	for _, m := range members {
 		tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
 		if err != nil {
-			return
+			return false
+		}
+		fail := func() bool {
+			tx.Rollback(dctx)
+			return false
 		}
 		if err := s.checkOwnerTx(dctx, tx); err != nil {
-			tx.Rollback(dctx)
-			return
+			return fail()
 		}
 		var ver int64
 		if err := tx.QueryRow(dctx,
 			`SELECT nextval('file_version_seq')`).Scan(&ver); err != nil {
-			tx.Rollback(dctx)
-			return
+			return fail()
 		}
 		tag, err := tx.Exec(dctx,
 			`INSERT INTO file_version (scope, path, version, fp, content_sha, oid)
@@ -2699,7 +2722,7 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 			 ON CONFLICT (scope, path) DO NOTHING`,
 			it.scope, m.rel, ver, m.st.Fingerprint, m.sha, m.st.Oid)
 		if err != nil {
-			tx.Rollback(dctx)
+			ok = fail()
 			continue
 		}
 		if tag.RowsAffected() == 1 {
@@ -2707,14 +2730,16 @@ func (s *Store) mintMemberRows(ctx context.Context, it intent, view ReconView, r
 				`INSERT INTO file_event (scope, path, from_path, op, version)
 				 VALUES ($1,$2,$3,'recover',$4)`,
 				it.scope, m.rel, root, ver); err != nil {
-				tx.Rollback(dctx)
+				ok = fail()
 				continue
 			}
 		}
 		if err := tx.Commit(dctx); err != nil {
 			log.Printf("reconcile: member row %s: %v", m.rel, err)
+			ok = false
 		}
 	}
+	return ok
 }
 
 // sweepOrphanNames discovers .filesv-op-* objects whose owning intent no
@@ -3094,7 +3119,6 @@ type funcView struct {
 func (v funcView) Stat(scope, path string) (FileInfo, error) { return v.stat(scope, path) }
 func (v funcView) Hash(scope, path string) (string, error)   { return v.hash(scope, path) }
 func (v funcView) MoveStaged(scope, from, to string) error   { return ErrUnavailable }
-func (v funcView) RemoveName(scope, path string) error       { return ErrUnavailable }
 func (v funcView) ListStaged(scope, dir, prefix string) ([]string, error) {
 	return nil, nil
 }

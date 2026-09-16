@@ -2300,10 +2300,30 @@ func TestPGReconcileRenameRecordedDstFP(t *testing.T) {
 	if err := os.Rename(dir+"/ws/new.txt", dir+"/ws/"+slot); err != nil {
 		t.Fatal(err)
 	}
-	s.Reconcile(ctx)
-	if got := durRead(t, dir, "ws/new.txt"); got != "D0" {
-		t.Fatalf("new.txt = %q — uncommitted rename destroyed recorded destination content", got)
+	// The durable contract is bounded convergence, not single-pass
+	// atomicity: any transient filesystem or database error inside the
+	// attach → capture → judge → settle chain defers the journaled
+	// record to a later pass by design (every deferral point retries).
+	// What is never acceptable is loss — D0 must remain somewhere under
+	// the scope after every pass, and the recorded home must hold it
+	// within bounded reconciliation (F253).
+	for pass := 0; pass < 4; pass++ {
+		s.Reconcile(ctx)
+		if durExists(t, dir, "ws/new.txt") && durRead(t, dir, "ws/new.txt") == "D0" {
+			// Converged — the row at the recorded home must truthfully
+			// record D0's object identity (fp3 — the settle may refresh
+			// the mtime leg after the move).
+			_, fp, ok := authRow(t, s, "new.txt")
+			if !ok || fp3(fp) != fp3(fpD.Fingerprint) {
+				t.Fatalf("new.txt row = %q present=%v, want recorded object %s", fp, ok, fpD.Fingerprint)
+			}
+			return
+		}
+		if where := scanTreeFor(t, dir, "ws", []byte("D0")); where == "" {
+			t.Fatalf("pass %d: D0 destroyed — uncommitted rename must never lose recorded destination content", pass)
+		}
 	}
+	t.Fatal("D0 not restored to its recorded home within bounded reconciliation")
 }
 
 // Database-read failure must not authorize deletion: with the store's

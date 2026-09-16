@@ -475,16 +475,19 @@ func TestStagingHygiene(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("reserved name must 400, got %d", w.Code)
 	}
-	// a stale staging file older than the sweep cutoff is removed at startup
+	// A foreign .filesv-tmp- deposit is preserved, however old — no
+	// production path mints the prefix, so the service holds no discard
+	// authority over it and startup must not delete it (F258/B-N3).
 	os.MkdirAll(filepath.Join(dir, "ws1"), 0o755)
 	stale := filepath.Join(dir, "ws1", stagingPrefix+"deadbeef")
 	os.WriteFile(stale, []byte("partial"), 0o644)
 	old := time.Now().Add(-time.Hour)
 	os.Chtimes(stale, old, old)
-	r, _ := newRoot(dir)
-	r.sweepStaging()
-	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
-		t.Fatal("stale staging file survived sweep")
+	if _, err := NewAt(dir, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stale); err != nil {
+		t.Fatalf("startup destroyed a foreign deposit: %v", err)
 	}
 }
 
@@ -937,8 +940,10 @@ func TestSweepNestedStaging(t *testing.T) {
 	if _, err := NewAt(dir, newFakeStore(), map[string]map[string]bool{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("nested staging file not swept: %v", err)
+	// A nested .filesv-tmp- deposit is foreign content — no production
+	// path mints the prefix, so startup preserves it (F258/B-N3).
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("startup destroyed a nested foreign deposit: %v", err)
 	}
 }
 

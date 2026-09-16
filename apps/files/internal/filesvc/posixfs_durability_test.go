@@ -378,19 +378,21 @@ func TestUndoDisplacedClean(t *testing.T) {
 	}
 }
 
-// A parked recovery object survives the staging sweeper — the 10-minute
-// staging cleanup must never touch .filesv-op- names.
-func TestOpStageNotSwept(t *testing.T) {
-	p, dir := durRoot(t)
+// A parked recovery object survives service startup — nothing in the
+// startup path deletes private or temp-prefixed names.
+func TestOpStageSurvivesStartup(t *testing.T) {
+	_, dir := durRoot(t)
 	if err := os.MkdirAll(filepath.Join(dir, "ws"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "ws", opStagePrefix+"9"), []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	p.sweepStaging()
+	if _, err := NewAt(dir, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	if !durExists(t, dir, "ws/"+opStagePrefix+"9") {
-		t.Fatal("sweeper removed a recovery object")
+		t.Fatal("startup removed a recovery object")
 	}
 }
 
